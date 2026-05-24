@@ -3,10 +3,13 @@ use crate::termwindow::{
     GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
-    WindowDecorations, WindowOps, WindowState,
+    ContextMenuItem, MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK,
+    MousePress, WindowDecorations, WindowOps, WindowState,
 };
-use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
+use config::keyassignment::{
+    ClipboardPasteSource, KeyAssignment, MouseEventTrigger, PaneDirection, SpawnCommand,
+    SpawnTabDomain, SplitPane, SplitSize,
+};
 use config::MouseEventAltScreen;
 use mux::pane::{Pane, WithPaneLines};
 use mux::tab::SplitDirection;
@@ -645,6 +648,40 @@ impl super::TermWindow {
         }
     }
 
+    fn terminal_context_menu_items(&self) -> Vec<ContextMenuItem> {
+        fn split_item(label: &str, icon: &str, direction: PaneDirection) -> ContextMenuItem {
+            ContextMenuItem::item_with_icon(
+                label,
+                icon,
+                KeyAssignment::SplitPane(SplitPane {
+                    direction,
+                    size: SplitSize::Percent(50),
+                    command: SpawnCommand::default(),
+                    top_level: false,
+                }),
+            )
+        }
+
+        vec![
+            ContextMenuItem::item_with_icon(
+                "Paste",
+                "doc.on.clipboard",
+                KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard),
+            ),
+            ContextMenuItem::Separator,
+            split_item("Split Right", "rectangle.split.2x1", PaneDirection::Right),
+            split_item("Split Left", "rectangle.split.2x1", PaneDirection::Left),
+            split_item("Split Down", "rectangle.split.1x2", PaneDirection::Down),
+            split_item("Split Up", "rectangle.split.1x2", PaneDirection::Up),
+            ContextMenuItem::Separator,
+            ContextMenuItem::item_with_icon(
+                "Reset Terminal",
+                "arrow.clockwise",
+                KeyAssignment::ResetTerminal,
+            ),
+        ]
+    }
+
     fn mouse_event_terminal(
         &mut self,
         mut pane: Arc<dyn Pane>,
@@ -986,6 +1023,14 @@ impl super::TermWindow {
                     return;
                 }
             }
+        }
+
+        if allow_action
+            && matches!(event.kind, WMEK::Release(MousePress::Right))
+            && !pane.is_mouse_grabbed()
+        {
+            context.show_context_menu(event.coords, self.terminal_context_menu_items());
+            return;
         }
 
         let mouse_event = wezterm_term::MouseEvent {

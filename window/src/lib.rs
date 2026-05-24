@@ -57,6 +57,38 @@ pub struct Dimensions {
     pub dpi: usize,
 }
 
+#[derive(Debug, Clone)]
+pub enum ContextMenuItem {
+    Item {
+        label: String,
+        icon: Option<String>,
+        action: config::keyassignment::KeyAssignment,
+    },
+    Separator,
+}
+
+impl ContextMenuItem {
+    pub fn item(label: impl Into<String>, action: config::keyassignment::KeyAssignment) -> Self {
+        Self::Item {
+            label: label.into(),
+            icon: None,
+            action,
+        }
+    }
+
+    pub fn item_with_icon(
+        label: impl Into<String>,
+        icon: impl Into<String>,
+        action: config::keyassignment::KeyAssignment,
+    ) -> Self {
+        Self::Item {
+            label: label.into(),
+            icon: Some(icon.into()),
+            action,
+        }
+    }
+}
+
 pub type ULength = euclid::Length<usize, PixelUnit>;
 pub type Rect = euclid::Rect<isize, PixelUnit>;
 pub type RectF = euclid::Rect<f32, PixelUnit>;
@@ -272,6 +304,9 @@ pub trait WindowOps {
 
     /// Change the cursor
     fn set_cursor(&self, cursor: Option<MouseCursor>);
+
+    /// Show a native context menu at the specified client-area pixel coordinate.
+    fn show_context_menu(&self, _coords: Point, _items: Vec<ContextMenuItem>) {}
 
     /// Invalidate the window so that the entire client area will
     /// be repainted shortly

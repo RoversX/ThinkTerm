@@ -4,7 +4,7 @@ pub use cocoa::appkit::NSEventModifierFlags;
 use cocoa::appkit::{NSApp, NSApplication, NSMenu, NSMenuItem};
 pub use cocoa::base::SEL;
 use cocoa::base::{id, nil};
-use cocoa::foundation::NSInteger;
+use cocoa::foundation::{NSInteger, NSPoint};
 use config::keyassignment::KeyAssignment;
 use objc::declare::ClassDecl;
 use objc::rc::StrongPtr;
@@ -93,6 +93,18 @@ impl Menu {
     pub fn add_item(&self, item: &MenuItem) {
         unsafe {
             self.menu.addItem_(*item.item);
+        }
+    }
+
+    pub fn pop_up_at(&self, view: id, x: f64, y: f64) {
+        unsafe {
+            let point = NSPoint::new(x, y);
+            let _: BOOL = msg_send![
+                *self.menu,
+                popUpMenuPositioningItem:nil
+                atLocation:point
+                inView:view
+            ];
         }
     }
 
@@ -212,7 +224,7 @@ impl MenuItem {
     }
 
     pub fn new_separator() -> Self {
-        let item = unsafe { StrongPtr::new(NSMenuItem::separatorItem(nil)) };
+        let item = unsafe { StrongPtr::retain(NSMenuItem::separatorItem(nil)) };
         Self { item }
     }
 
@@ -251,6 +263,33 @@ impl MenuItem {
     pub fn set_target(&self, target: id) {
         unsafe {
             self.item.setTarget_(target);
+        }
+    }
+
+    pub fn set_system_symbol_image(&self, symbol_name: &str) {
+        unsafe {
+            let ns_image_cls = class!(NSImage);
+            let supports_system_symbols: BOOL = msg_send![
+                ns_image_cls,
+                respondsToSelector: sel!(imageWithSystemSymbolName:accessibilityDescription:)
+            ];
+
+            if supports_system_symbols == NO {
+                return;
+            }
+
+            let image: id = msg_send![
+                ns_image_cls,
+                imageWithSystemSymbolName:*nsstring(symbol_name)
+                accessibilityDescription:nil
+            ];
+
+            if image.is_null() {
+                return;
+            }
+
+            let () = msg_send![image, setTemplate:YES];
+            let () = msg_send![*self.item, setImage:image];
         }
     }
 

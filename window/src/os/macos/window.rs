@@ -5,13 +5,13 @@ use super::keycodes::*;
 use super::{nsstring, nsstring_to_str};
 use crate::clipboard::Clipboard as ClipboardContext;
 use crate::connection::ConnectionOps;
-use crate::os::macos::menu::{MenuItem, RepresentedItem};
+use crate::os::macos::menu::{Menu, MenuItem, RepresentedItem};
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
-    Clipboard, Connection, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent, Modifiers,
-    MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point, RawKeyEvent, Rect,
-    RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint, Size, ULength,
-    WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
+    Clipboard, Connection, ContextMenuItem, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent,
+    Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point,
+    RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint,
+    Size, ULength, WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -769,6 +769,13 @@ impl WindowOps for Window {
         });
     }
 
+    fn show_context_menu(&self, coords: Point, items: Vec<ContextMenuItem>) {
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.show_context_menu(coords, items);
+            Ok(())
+        });
+    }
+
     fn invalidate(&self) {
         Connection::with_window_inner(self.id, |inner| {
             inner.invalidate();
@@ -1226,6 +1233,56 @@ impl WindowInner {
             } else {
                 let () = msg_send![ns_cursor_cls, setHiddenUntilMouseMoves: YES];
             }
+        }
+    }
+
+    fn show_context_menu(&mut self, coords: Point, items: Vec<ContextMenuItem>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let menu = Menu::new_with_title("");
+        let mut has_items = false;
+
+        for item in items {
+            match item {
+                ContextMenuItem::Item {
+                    label,
+                    icon,
+                    action,
+                } => {
+                    let menu_item =
+                        MenuItem::new_with(&label, Some(sel!(weztermPerformKeyAssignment:)), "");
+                    if let Some(icon) = icon {
+                        menu_item.set_system_symbol_image(&icon);
+                    }
+                    menu_item.set_target(*self.view);
+                    menu_item.set_represented_item(RepresentedItem::KeyAssignment(action));
+                    menu.add_item(&menu_item);
+                    has_items = true;
+                }
+                ContextMenuItem::Separator => {
+                    if has_items {
+                        menu.add_item(&MenuItem::new_separator());
+                    }
+                }
+            }
+        }
+
+        if !has_items {
+            return;
+        }
+
+        unsafe {
+            let frame = NSView::frame(*self.view as *mut _);
+            let backing_frame = NSView::convertRectToBacking(*self.view as *mut _, frame);
+            let scale = if frame.size.width > 0.0 {
+                backing_frame.size.width / frame.size.width
+            } else {
+                1.0
+            };
+
+            menu.pop_up_at(*self.view, coords.x as f64 / scale, coords.y as f64 / scale);
         }
     }
 
