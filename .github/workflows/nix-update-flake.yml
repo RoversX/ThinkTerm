@@ -1,10 +1,15 @@
 name: update-flake-lock
 on:
   workflow_dispatch:
-  schedule:
-    # once a month
-    - cron: '0 0 1 * *'
 
+# Automatic triggers are intentionally disabled for this fork.
+# Original upstream trigger block:
+# on:
+#   workflow_dispatch:
+#   schedule:
+#     # once a month
+#     - cron: '0 0 1 * *'
+# 
 jobs:
   lockfile:
     runs-on: ubuntu-latest

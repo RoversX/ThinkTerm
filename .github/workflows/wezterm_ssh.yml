@@ -1,27 +1,32 @@
 name: wezterm-ssh
 
 on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "wezterm-ssh/**"
-      - "filedescriptor/**"
-      - "pty/**"
-      - "async_ossl/**"
-      - "termwiz/**"
-      - ".github/workflows/wezterm_ssh.yml"
-  push:
-    branches:
-      - main
-    paths:
-      - "wezterm-ssh/**"
-      - "filedescriptor/**"
-      - "pty/**"
-      - "async_ossl/**"
-      - "termwiz/**"
-      - ".github/workflows/wezterm_ssh.yml"
+  workflow_dispatch:
 
+# Automatic triggers are intentionally disabled for this fork.
+# Original upstream trigger block:
+# on:
+#   pull_request:
+#     branches:
+#       - main
+#     paths:
+#       - "wezterm-ssh/**"
+#       - "filedescriptor/**"
+#       - "pty/**"
+#       - "async_ossl/**"
+#       - "termwiz/**"
+#       - ".github/workflows/wezterm_ssh.yml"
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - "wezterm-ssh/**"
+#       - "filedescriptor/**"
+#       - "pty/**"
+#       - "async_ossl/**"
+#       - "termwiz/**"
+#       - ".github/workflows/wezterm_ssh.yml"
+# 
 jobs:
   build-wezterm-ssh-feature-libssh-rs:
     runs-on: ubuntu-latest

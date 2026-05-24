@@ -8,18 +8,23 @@ permissions:
 # Both `issue_comment` and `scheduled` event types are required for this Action
 # to work properly.
 on:
-  issue_comment:
-    types: [created]
   workflow_dispatch:
-  schedule:
-    # Schedule for five minutes after the hour, every hour
-    - cron: '5 * * * *'
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/no-response.yml'
 
+# Automatic triggers are intentionally disabled for this fork.
+# Original upstream trigger block:
+# on:
+#   issue_comment:
+#     types: [created]
+#   workflow_dispatch:
+#   schedule:
+#     # Schedule for five minutes after the hour, every hour
+#     - cron: '5 * * * *'
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - '.github/workflows/no-response.yml'
+# 
 jobs:
   noResponse:
     runs-on: ubuntu-latest

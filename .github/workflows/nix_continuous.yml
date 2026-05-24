@@ -1,17 +1,22 @@
 name: nix_continuous
 
 on:
-  schedule:
-    - cron: "10 3 * * *"
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - '**/*.rs'
-      - '.github/workflows/nix_continuous.yml'
-      - 'nix/**'
 
+# Automatic triggers are intentionally disabled for this fork.
+# Original upstream trigger block:
+# on:
+#   schedule:
+#     - cron: "10 3 * * *"
+#   workflow_dispatch:
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - '**/*.rs'
+#       - '.github/workflows/nix_continuous.yml'
+#       - 'nix/**'
+# 
 jobs:
   lints:
     name: Build

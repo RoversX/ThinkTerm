@@ -1,19 +1,24 @@
 name: fmt
 
 on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "**/*.rs"
-      - ".github/workflows/fmt.yml"
-  push:
-    branches:
-      - main
-    paths:
-      - "**/*.rs"
-      - ".github/workflows/fmt.yml"
+  workflow_dispatch:
 
+# Automatic triggers are intentionally disabled for this fork.
+# Original upstream trigger block:
+# on:
+#   pull_request:
+#     branches:
+#       - main
+#     paths:
+#       - "**/*.rs"
+#       - ".github/workflows/fmt.yml"
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - "**/*.rs"
+#       - ".github/workflows/fmt.yml"
+# 
 jobs:
   check-code-formatting:
     runs-on: ubuntu-latest

@@ -1,23 +1,28 @@
 name: macos
 
 on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.lock"
-      - "**/Cargo.toml"
-      - ".cargo/config.toml"
-      - ".github/workflows/gen_macos.yml"
-      - "assets/fonts/**/*"
-      - "assets/icon/*"
-      - "assets/macos/**/*"
-      - "ci/deploy.sh"
-      - "ci/macos-entitlement.plist"
-      - "ci/tag-name.sh"
-      - "get-deps"
+  workflow_dispatch:
 
+# Automatic triggers are intentionally disabled for this fork.
+# Original upstream trigger block:
+# on:
+#   pull_request:
+#     branches:
+#       - main
+#     paths:
+#       - "**/*.rs"
+#       - "**/Cargo.lock"
+#       - "**/Cargo.toml"
+#       - ".cargo/config.toml"
+#       - ".github/workflows/gen_macos.yml"
+#       - "assets/fonts/**/*"
+#       - "assets/icon/*"
+#       - "assets/macos/**/*"
+#       - "ci/deploy.sh"
+#       - "ci/macos-entitlement.plist"
+#       - "ci/tag-name.sh"
+#       - "get-deps"
+# 
 jobs:
   build:
     runs-on: "macos-latest"

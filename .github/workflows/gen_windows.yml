@@ -1,21 +1,26 @@
 name: windows
 
 on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.lock"
-      - "**/Cargo.toml"
-      - ".cargo/config.toml"
-      - ".github/workflows/gen_windows.yml"
-      - "assets/fonts/**/*"
-      - "assets/icon/*"
-      - "assets/windows/**/*"
-      - "ci/deploy.sh"
-      - "ci/windows-installer.iss"
+  workflow_dispatch:
 
+# Automatic triggers are intentionally disabled for this fork.
+# Original upstream trigger block:
+# on:
+#   pull_request:
+#     branches:
+#       - main
+#     paths:
+#       - "**/*.rs"
+#       - "**/Cargo.lock"
+#       - "**/Cargo.toml"
+#       - ".cargo/config.toml"
+#       - ".github/workflows/gen_windows.yml"
+#       - "assets/fonts/**/*"
+#       - "assets/icon/*"
+#       - "assets/windows/**/*"
+#       - "ci/deploy.sh"
+#       - "ci/windows-installer.iss"
+# 
 jobs:
   build:
     runs-on: "windows-2022"

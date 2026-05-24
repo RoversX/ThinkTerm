@@ -1,22 +1,27 @@
 name: Nix
 
 on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - '**/*.rs'
-      - '.github/workflows/nix.yml'
-      - 'nix/**'
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - '**/*.rs'
-      - '.github/workflows/nix.yml'
-      - 'nix/**'
 
+# Automatic triggers are intentionally disabled for this fork.
+# Original upstream trigger block:
+# on:
+#   pull_request:
+#     branches:
+#       - main
+#     paths:
+#       - '**/*.rs'
+#       - '.github/workflows/nix.yml'
+#       - 'nix/**'
+#   workflow_dispatch:
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - '**/*.rs'
+#       - '.github/workflows/nix.yml'
+#       - 'nix/**'
+# 
 jobs:
   lints:
     name: Build
