@@ -1,6 +1,10 @@
+use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
+use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
+use crate::termwindow::ui::tokens::{PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_MAX_WIDTH};
 use crate::termwindow::{
-    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TermWindowNotif, UIItem,
+    UIItemType, TMB,
 };
 use ::window::{
     ContextMenuItem, MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK,
@@ -12,7 +16,7 @@ use config::keyassignment::{
 };
 use config::MouseEventAltScreen;
 use mux::pane::{Pane, WithPaneLines};
-use mux::tab::SplitDirection;
+use mux::tab::{PositionedPane, SplitDirection};
 use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
@@ -27,6 +31,221 @@ use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
+    fn tab_scroll_pixels(amount: i16) -> f32 {
+        let steps = amount.unsigned_abs().max(1) as f32;
+        let delta = (steps * 56.0).min(280.0);
+        if amount < 0 {
+            delta
+        } else {
+            -delta
+        }
+    }
+
+    pub(super) fn window_tab_width_pixels(&self) -> f32 {
+        let cell_width = self.render_metrics.cell_size.width.max(1) as f32;
+        (self.config.tab_max_width as f32 * cell_width)
+            .max(cell_width * 15.0)
+            .max(176.0)
+            .ceil()
+    }
+
+    pub(super) fn window_tab_left_padding_pixels(&self) -> f32 {
+        if self.workspace_sidebar_width() > 0 {
+            return 0.0;
+        }
+
+        let cell_width = self.render_metrics.cell_size.width.max(1) as f32;
+        if self
+            .config
+            .window_decorations
+            .contains(WindowDecorations::INTEGRATED_BUTTONS)
+            && (self.config.integrated_title_button_alignment
+                == window::IntegratedTitleButtonAlignment::Left
+                || self.config.integrated_title_button_style
+                    == window::IntegratedTitleButtonStyle::MacOsNative)
+        {
+            if self.config.integrated_title_button_style
+                == window::IntegratedTitleButtonStyle::MacOsNative
+            {
+                if self.window_state.contains(WindowState::FULL_SCREEN) {
+                    cell_width * 0.5
+                } else {
+                    70.0
+                }
+            } else {
+                0.0
+            }
+        } else {
+            cell_width * 0.5
+        }
+    }
+
+    pub(super) fn window_tab_viewport_width(&self) -> f32 {
+        let border = self.get_os_border();
+        let left_padding = self.window_tab_left_padding_pixels();
+
+        self.dimensions
+            .pixel_width
+            .saturating_sub(self.tab_bar_left_edge())
+            .saturating_sub(border.right.get() as usize)
+            .saturating_sub(left_padding.max(0.0) as usize)
+            .max(1) as f32
+    }
+
+    pub(super) fn max_window_tab_scroll_offset(&self) -> f32 {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return 0.0;
+        };
+        let tab_count = window.len();
+        if tab_count <= 1 {
+            return 0.0;
+        }
+
+        let tab_width = self.window_tab_width_pixels();
+        let total_width = tab_count as f32 * tab_width;
+        let available_width = self.window_tab_viewport_width();
+
+        (total_width - available_width).max(0.0)
+    }
+
+    fn scroll_window_tab_bar(&mut self, amount: i16, context: &dyn WindowOps) {
+        let max_offset = self.max_window_tab_scroll_offset();
+        let offset =
+            (self.tab_bar_scroll_target + Self::tab_scroll_pixels(amount)).clamp(0.0, max_offset);
+        if (offset - self.tab_bar_scroll_target).abs() > f32::EPSILON
+            || (offset - self.tab_bar_scroll_offset).abs() > f32::EPSILON
+        {
+            self.tab_bar_scroll_target = offset;
+            self.tab_bar_scroll_offset = offset;
+            self.invalidate_fancy_tab_bar();
+            context.invalidate();
+        }
+    }
+
+    fn max_pane_nav_tab_scroll_offset(&self, pane_id: mux::pane::PaneId) -> f32 {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return 0.0;
+        };
+
+        let tab_count = Mux::get().pane_stack_tabs(pane_id).len();
+        if tab_count <= 1 {
+            return 0.0;
+        }
+
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let pane_width = tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .find(|pos| pos.pane.pane_id() == pane_id)
+            .map(|pos| pos.width as f32 * cell_width)
+            .unwrap_or(0.0);
+        if pane_width <= 0.0 {
+            return 0.0;
+        }
+
+        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics);
+        let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
+        let button_size = (icon_size + 10)
+            .min(nav_height.saturating_sub(4))
+            .max(icon_size);
+        let controls_width = (button_size + PANE_NAV_BUTTON_GAP)
+            .saturating_mul(2)
+            .saturating_add(PANE_NAV_INSET * 2);
+        let viewport_width = (pane_width as usize).saturating_sub(controls_width).max(1) as f32;
+        let tab_width = PANE_NAV_TAB_MAX_WIDTH as f32;
+        let total_width = tab_count as f32 * tab_width
+            + tab_count.saturating_sub(1) as f32 * PANE_NAV_BUTTON_GAP as f32;
+
+        (total_width - viewport_width).max(0.0)
+    }
+
+    fn scroll_pane_nav_tabs(
+        &mut self,
+        pane_id: mux::pane::PaneId,
+        amount: i16,
+        context: &dyn WindowOps,
+    ) {
+        let current = self
+            .pane_nav_tab_scroll_targets
+            .get(&pane_id)
+            .copied()
+            .or_else(|| self.pane_nav_tab_scroll_offsets.get(&pane_id).copied())
+            .unwrap_or(0.0);
+        let max_offset = self.max_pane_nav_tab_scroll_offset(pane_id);
+        let offset = (current + Self::tab_scroll_pixels(amount)).clamp(0.0, max_offset.max(0.0));
+        if (offset - current).abs() > f32::EPSILON
+            || self
+                .pane_nav_tab_scroll_offsets
+                .get(&pane_id)
+                .is_some_and(|current| (offset - current).abs() > f32::EPSILON)
+        {
+            self.pane_nav_tab_scroll_targets.insert(pane_id, offset);
+            self.pane_nav_tab_scroll_offsets.insert(pane_id, offset);
+            context.invalidate();
+        }
+    }
+
+    fn wheel_amount(event: &MouseEvent) -> Option<i16> {
+        match event.kind {
+            WMEK::VertWheel(amount) | WMEK::HorzWheel(amount) => Some(amount),
+            _ => None,
+        }
+    }
+
+    fn mouse_wheel_tab_surfaces(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
+        let Some(amount) = Self::wheel_amount(event) else {
+            return false;
+        };
+
+        if self.show_tab_bar {
+            let border = self.get_os_border();
+            let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+            let tab_bar_y = if self.config.tab_bar_at_bottom {
+                self.dimensions.pixel_height as f32 - tab_bar_height - border.bottom.get() as f32
+            } else {
+                border.top.get() as f32
+            };
+            let y = event.coords.y as f32;
+            if event.coords.x >= self.tab_bar_left_edge() as isize
+                && y >= tab_bar_y
+                && y < tab_bar_y + tab_bar_height
+            {
+                self.scroll_window_tab_bar(amount, context);
+                return true;
+            }
+        }
+
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return false;
+        };
+
+        let border = self.get_os_border();
+        let top_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.0
+        };
+        let (padding_left, _) = self.padding_left_top();
+        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics) as f32;
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        let x = event.coords.x as f32;
+        let y = event.coords.y as f32;
+
+        for pos in tab.iter_panes_ignoring_zoom() {
+            let pane_x = padding_left + border.left.get() as f32 + pos.left as f32 * cell_width;
+            let pane_y = top_bar_height + border.top.get() as f32 + pos.top as f32 * cell_height;
+            let pane_width = pos.width as f32 * cell_width;
+            if x >= pane_x && x < pane_x + pane_width && y >= pane_y && y < pane_y + nav_height {
+                self.scroll_pane_nav_tabs(pos.pane.pane_id(), amount, context);
+                return true;
+            }
+        }
+
+        false
+    }
+
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
         let y = event.coords.y;
@@ -43,6 +262,10 @@ impl super::TermWindow {
                 self.update_title_post_status();
             }
             UIItemType::CloseTab(_)
+            | UIItemType::PaneNav { .. }
+            | UIItemType::WorkspaceSidebar(_)
+            | UIItemType::WorkspaceSidebarBackground
+            | UIItemType::WorkspaceSidebarResize
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -54,10 +277,76 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::TabBar(_) => {}
             UIItemType::CloseTab(_)
+            | UIItemType::PaneNav { .. }
+            | UIItemType::WorkspaceSidebar(_)
+            | UIItemType::WorkspaceSidebarBackground
+            | UIItemType::WorkspaceSidebarResize
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::Split(_) => {}
+        }
+    }
+
+    fn click_position_for_pane(
+        &self,
+        event: &MouseEvent,
+        pane: &Arc<dyn Pane>,
+        pos: &PositionedPane,
+    ) -> ClickPosition {
+        let border = self.get_os_border();
+        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.) as isize
+        } else {
+            0
+        } + border.top.get() as isize;
+        let (padding_left, padding_top) = self.padding_left_top();
+
+        let global_cell_size = self.render_metrics.cell_size;
+        let pane_font_scale = self.pane_font_scale(pos.pane.pane_id());
+        let pane_cell_size = if pane_font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
+            global_cell_size
+        } else {
+            self.pane_font_resources(pane_font_scale)
+                .map(|(_, metrics)| metrics.cell_size)
+                .unwrap_or(global_cell_size)
+        };
+
+        let pane_left = (padding_left + border.left.get() as f32) as isize
+            + (pos.left as isize * global_cell_size.width);
+        let pane_top =
+            padding_top as isize + first_line_offset + (pos.top as isize * global_cell_size.height);
+        let pane_nav_height = pane_nav_bar_height_for_metrics(self.render_metrics) as isize;
+
+        let local_x = event.coords.x.sub(pane_left);
+        let local_y = event.coords.y.sub(pane_top + pane_nav_height);
+
+        let x = (local_x.max(0) as f32) / pane_cell_size.width.max(1) as f32;
+        let column = if !pane.is_mouse_grabbed() {
+            x.round()
+        } else {
+            x
+        }
+        .trunc() as usize;
+
+        let row = (local_y.max(0) / pane_cell_size.height.max(1)) as i64;
+
+        let x_pixel_offset = if column > 0 {
+            local_x.max(0) % pane_cell_size.width.max(1)
+        } else {
+            local_x
+        };
+        let y_pixel_offset = if row > 0 {
+            local_y.max(0) % pane_cell_size.height.max(1)
+        } else {
+            local_y
+        };
+
+        ClickPosition {
+            column,
+            row,
+            x_pixel_offset,
+            y_pixel_offset,
         }
     }
 
@@ -69,6 +358,10 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+
+        if self.mouse_wheel_tab_surfaces(&event, context) {
+            return;
+        }
 
         let border = self.get_os_border();
 
@@ -351,10 +644,30 @@ impl super::TermWindow {
             UIItemType::ScrollThumb => {
                 self.drag_scroll_thumb(item, start_event, event, context);
             }
+            UIItemType::WorkspaceSidebarResize => {
+                self.drag_workspace_sidebar_resize(item, start_event, event, context);
+            }
+            UIItemType::PaneNav { .. } => {}
             _ => {
                 log::error!("drag not implemented for {:?}", item);
             }
         }
+    }
+
+    fn drag_workspace_sidebar_resize(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let left_edge = self.get_os_border().left.get() as isize;
+        let width = event.coords.x.saturating_sub(left_edge).max(0) as usize;
+        self.expand_workspace_sidebar();
+        self.set_workspace_sidebar_width(width);
+        self.reflow_workspace_sidebar(context);
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        self.dragging.replace((item, start_event));
     }
 
     fn mouse_event_ui_item(
@@ -385,7 +698,186 @@ impl super::TermWindow {
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
             }
+            UIItemType::PaneNav {
+                pane_id,
+                pane_index,
+                action,
+            } => {
+                self.mouse_event_pane_nav(pane_id, pane_index, action, event, context);
+            }
+            UIItemType::WorkspaceSidebar(workspace) => {
+                self.mouse_event_workspace_sidebar(workspace, event, context);
+            }
+            UIItemType::WorkspaceSidebarBackground => {
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
+            UIItemType::WorkspaceSidebarResize => {
+                self.mouse_event_workspace_sidebar_resize(item, event, context);
+            }
         }
+    }
+
+    fn reflow_workspace_sidebar(&mut self, context: &dyn WindowOps) {
+        if let Some(window) = self.window.as_ref().cloned() {
+            let dimensions = self.dimensions;
+            self.apply_dimensions(&dimensions, None, &window);
+        }
+        context.invalidate();
+    }
+
+    pub fn mouse_event_workspace_sidebar_resize(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
+    pub fn mouse_event_workspace_sidebar(
+        &mut self,
+        workspace: String,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if let WMEK::Press(MousePress::Left) = event.kind {
+            if Mux::get().active_workspace() != workspace {
+                front_end().switch_workspace(&workspace);
+            }
+            context.invalidate();
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn pane_nav_tab_context_menu_items(&self, pane_id: mux::pane::PaneId) -> Vec<ContextMenuItem> {
+        vec![ContextMenuItem::item_with_icon(
+            "Rename Tab...",
+            "pencil",
+            KeyAssignment::PromptRenamePaneTab(pane_id),
+        )]
+    }
+
+    pub fn mouse_event_pane_nav(
+        &mut self,
+        pane_id: mux::pane::PaneId,
+        pane_index: usize,
+        action: PaneNavAction,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Arrow));
+
+        match event.kind {
+            WMEK::VertWheel(amount) | WMEK::HorzWheel(amount) => {
+                self.scroll_pane_nav_tabs(pane_id, amount, context);
+                return;
+            }
+            _ => {}
+        }
+
+        if event.kind == WMEK::Press(MousePress::Right) {
+            if let PaneNavAction::Activate(target_pane_id) = action {
+                context.show_context_menu(
+                    event.coords,
+                    self.pane_nav_tab_context_menu_items(target_pane_id),
+                );
+            }
+            return;
+        }
+
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+
+        let mux = Mux::get();
+        if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+            tab.set_active_idx(pane_index);
+        }
+
+        match action {
+            PaneNavAction::Background => {
+                if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
+                    self.spawn_pane_nav_tab(pane_id, pane_index);
+                }
+            }
+            PaneNavAction::Activate(target_pane_id) => {
+                if target_pane_id != pane_id {
+                    if let Err(err) = mux.activate_pane_in_stack(target_pane_id) {
+                        log::error!("pane nav activate failed: {err:#}");
+                    }
+                }
+            }
+            PaneNavAction::Close(target_pane_id) => {
+                if let Some(pane) = mux.get_pane(target_pane_id) {
+                    self.close_pane(pane, true);
+                }
+            }
+            PaneNavAction::NewTab => self.spawn_pane_nav_tab(pane_id, pane_index),
+            PaneNavAction::SplitRight | PaneNavAction::SplitDown => {
+                let pane = match mux.get_pane(pane_id) {
+                    Some(pane) => pane,
+                    None => return,
+                };
+                let direction = match action {
+                    PaneNavAction::SplitRight => PaneDirection::Right,
+                    PaneNavAction::SplitDown => PaneDirection::Down,
+                    _ => unreachable!(),
+                };
+                let assignment = KeyAssignment::SplitPane(SplitPane {
+                    direction,
+                    size: SplitSize::Percent(50),
+                    command: SpawnCommand::default(),
+                    top_level: false,
+                });
+                if let Err(err) = self.perform_key_assignment(&pane, &assignment) {
+                    log::error!("pane nav action failed: {err:#}");
+                }
+            }
+        }
+
+        context.invalidate();
+    }
+
+    fn spawn_pane_nav_tab(&mut self, pane_id: mux::pane::PaneId, pane_index: usize) {
+        let mux = Mux::get();
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+        let panes = tab.iter_panes_ignoring_zoom();
+        let pos = panes
+            .iter()
+            .find(|pos| pos.pane.pane_id() == pane_id)
+            .or_else(|| panes.get(pane_index))
+            .cloned();
+        let pos = match pos {
+            Some(pos) => pos,
+            None => return,
+        };
+        let size = self.terminal_size_for_positioned_pane(&pos, self.render_metrics);
+        let window = GuiWin::new(self);
+
+        promise::spawn::spawn(async move {
+            if let Err(err) = Mux::get()
+                .spawn_pane_in_stack(pane_id, SpawnTabDomain::CurrentPaneDomain, None, None, size)
+                .await
+            {
+                log::error!("pane nav new terminal failed: {err:#}");
+                return;
+            }
+            window
+                .window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.update_title();
+                    if let Some(window) = term_window.window.as_ref() {
+                        window.invalidate();
+                    }
+                })));
+        })
+        .detach();
     }
 
     pub fn mouse_event_close_tab(
@@ -456,6 +948,130 @@ impl super::TermWindow {
         .detach();
     }
 
+    fn spawn_window_tab_from_active_pane(&mut self) {
+        let pane = match self.get_active_pane_or_overlay() {
+            Some(pane) => pane,
+            None => return,
+        };
+        let assignment = KeyAssignment::SpawnTab(SpawnTabDomain::CurrentPaneDomain);
+        if let Err(err) = self.perform_key_assignment(&pane, &assignment) {
+            log::error!("tab bar double-click new tab failed: {err:#}");
+        }
+    }
+
+    fn tab_context_action(tab_idx: usize, action: KeyAssignment) -> KeyAssignment {
+        KeyAssignment::Multiple(vec![KeyAssignment::ActivateTab(tab_idx as isize), action])
+    }
+
+    fn close_tabs_to_left_action(tab_idx: usize) -> Option<KeyAssignment> {
+        if tab_idx == 0 {
+            return None;
+        }
+
+        let mut actions = Vec::with_capacity(tab_idx * 2);
+        for _ in 0..tab_idx {
+            actions.push(KeyAssignment::ActivateTab(0));
+            actions.push(KeyAssignment::CloseCurrentTab { confirm: false });
+        }
+        Some(KeyAssignment::Multiple(actions))
+    }
+
+    fn close_tabs_to_right_action(tab_idx: usize, tab_count: usize) -> Option<KeyAssignment> {
+        if tab_idx + 1 >= tab_count {
+            return None;
+        }
+
+        let mut actions = Vec::with_capacity((tab_count - tab_idx - 1) * 2);
+        for _ in tab_idx + 1..tab_count {
+            actions.push(KeyAssignment::ActivateTab((tab_idx + 1) as isize));
+            actions.push(KeyAssignment::CloseCurrentTab { confirm: false });
+        }
+        Some(KeyAssignment::Multiple(actions))
+    }
+
+    fn close_other_tabs_action(tab_idx: usize, tab_count: usize) -> Option<KeyAssignment> {
+        if tab_count <= 1 {
+            return None;
+        }
+
+        let mut actions = vec![];
+        if let Some(KeyAssignment::Multiple(mut right)) =
+            Self::close_tabs_to_right_action(tab_idx, tab_count)
+        {
+            actions.append(&mut right);
+        }
+        if let Some(KeyAssignment::Multiple(mut left)) = Self::close_tabs_to_left_action(tab_idx) {
+            actions.append(&mut left);
+        }
+        Some(KeyAssignment::Multiple(actions))
+    }
+
+    fn tab_context_menu_items(&self, tab_idx: usize) -> Vec<ContextMenuItem> {
+        let tab_count = Mux::get()
+            .get_window(self.mux_window_id)
+            .map(|window| window.len())
+            .unwrap_or(0);
+        if tab_count == 0 || tab_idx >= tab_count {
+            return vec![];
+        }
+
+        let mut items = vec![ContextMenuItem::item_with_icon(
+            "Rename Tab...",
+            "pencil",
+            Self::tab_context_action(tab_idx, KeyAssignment::PromptRenameTab),
+        )];
+
+        let mut close_items = vec![];
+        if let Some(action) = Self::close_tabs_to_left_action(tab_idx) {
+            close_items.push(ContextMenuItem::item("Close Tabs to Left", action));
+        }
+        if let Some(action) = Self::close_tabs_to_right_action(tab_idx, tab_count) {
+            close_items.push(ContextMenuItem::item("Close Tabs to Right", action));
+        }
+        if let Some(action) = Self::close_other_tabs_action(tab_idx, tab_count) {
+            close_items.push(ContextMenuItem::item("Close Other Tabs", action));
+        }
+        if !close_items.is_empty() {
+            items.push(ContextMenuItem::Separator);
+            items.append(&mut close_items);
+        }
+
+        let mut move_items = vec![];
+        if tab_idx > 0 {
+            move_items.push(ContextMenuItem::item(
+                "Move Tab Left",
+                Self::tab_context_action(tab_idx, KeyAssignment::MoveTab(tab_idx - 1)),
+            ));
+        }
+        if tab_idx + 1 < tab_count {
+            move_items.push(ContextMenuItem::item(
+                "Move Tab Right",
+                Self::tab_context_action(tab_idx, KeyAssignment::MoveTab(tab_idx + 1)),
+            ));
+        }
+        if !move_items.is_empty() {
+            items.push(ContextMenuItem::Separator);
+            items.append(&mut move_items);
+        }
+
+        items.push(ContextMenuItem::Separator);
+        items.push(ContextMenuItem::item_with_icon(
+            "New Terminal Tab to Right",
+            "plus.square",
+            Self::tab_context_action(
+                tab_idx,
+                KeyAssignment::SpawnTabToRight(SpawnTabDomain::CurrentPaneDomain),
+            ),
+        ));
+        items.push(ContextMenuItem::Separator);
+        items.push(ContextMenuItem::item(
+            "Zoom Pane",
+            Self::tab_context_action(tab_idx, KeyAssignment::TogglePaneZoomState),
+        ));
+
+        items
+    }
+
     pub fn mouse_event_tab_bar(
         &mut self,
         item: TabBarItem,
@@ -471,6 +1087,13 @@ impl super::TermWindow {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
+                    if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
+                        self.window_drag_position.take();
+                        self.spawn_window_tab_from_active_pane();
+                        context.invalidate();
+                        return;
+                    }
+
                     let maximized = self
                         .window_state
                         .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
@@ -526,8 +1149,8 @@ impl super::TermWindow {
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match item {
-                TabBarItem::Tab { .. } => {
-                    self.show_tab_navigator();
+                TabBarItem::Tab { tab_idx, .. } => {
+                    context.show_context_menu(event.coords, self.tab_context_menu_items(tab_idx));
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Right);
@@ -555,11 +1178,8 @@ impl super::TermWindow {
                 | TabBarItem::Tab { .. }
                 | TabBarItem::NewTabButton { .. } => {}
             },
-            WMEK::VertWheel(n) => {
-                if self.config.mouse_wheel_scrolls_tabs {
-                    self.activate_tab_relative(if n < 1 { 1 } else { -1 }, true)
-                        .ok();
-                }
+            WMEK::VertWheel(amount) | WMEK::HorzWheel(amount) => {
+                self.scroll_window_tab_bar(amount, context);
             }
             _ => {}
         }
@@ -741,22 +1361,18 @@ impl super::TermWindow {
                         }
                     }
                 }
-                column = column.saturating_sub(pos.left);
-                row = row.saturating_sub(pos.top as i64);
+                let position = self.click_position_for_pane(&event, &pane, &pos);
+                column = position.column;
+                row = position.row;
+                x_pixel_offset = position.x_pixel_offset;
+                y_pixel_offset = position.y_pixel_offset;
                 break;
             } else if is_already_captured && pane.pane_id() == pos.pane.pane_id() {
-                column = column.saturating_sub(pos.left);
-                row = row.saturating_sub(pos.top as i64).max(0);
-
-                if position.column < pos.left {
-                    x_pixel_offset -= self.render_metrics.cell_size.width
-                        * (pos.left as isize - position.column as isize);
-                }
-                if position.row < pos.top as i64 {
-                    y_pixel_offset -= self.render_metrics.cell_size.height
-                        * (pos.top as isize - position.row as isize);
-                }
-
+                let position = self.click_position_for_pane(&event, &pane, &pos);
+                column = position.column;
+                row = position.row;
+                x_pixel_offset = position.x_pixel_offset;
+                y_pixel_offset = position.y_pixel_offset;
                 break;
             }
         }

@@ -243,12 +243,8 @@ impl TmuxDomainState {
             None => anyhow::bail!("Invalid tab id {}", tab_id),
         };
 
-        let pane_index = match tab
-            .iter_panes_ignoring_zoom()
-            .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
-        {
-            Some(p) => p.index,
+        let pane_index = match tab.pane_index_for_pane(pane_id) {
+            Some(index) => index,
             None => anyhow::bail!("invalid pane id {}", pane_id),
         };
 
@@ -475,12 +471,8 @@ impl TmuxDomainState {
                             None => anyhow::bail!("cannot find the local pane for {}", p.pane_id),
                         };
 
-                        split_pane_index = match tab
-                            .iter_panes_ignoring_zoom()
-                            .iter()
-                            .find(|x| x.pane.pane_id() == local_pane_id)
-                        {
-                            Some(x) => x.index,
+                        split_pane_index = match tab.pane_index_for_pane(local_pane_id) {
+                            Some(index) => index,
                             None => {
                                 log::info!("invalid pane id {local_pane_id}");
                                 continue;

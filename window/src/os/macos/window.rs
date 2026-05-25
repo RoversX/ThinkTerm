@@ -2,14 +2,15 @@
 #![allow(clippy::let_unit_value)]
 
 use super::keycodes::*;
-use super::{nsstring, nsstring_to_str};
+use super::{nsstring, nsstring_to_str, BitmapRef};
+use crate::bitmaps::BitmapImage;
 use crate::clipboard::Clipboard as ClipboardContext;
 use crate::connection::ConnectionOps;
 use crate::os::macos::menu::{Menu, MenuItem, RepresentedItem};
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
-    Clipboard, Connection, ContextMenuItem, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent,
-    Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point,
+    Clipboard, Connection, ContextMenuItem, DeadKeyStatus, Dimensions, Handled, Image, KeyCode,
+    KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point,
     RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint,
     Size, ULength, WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
@@ -18,8 +19,9 @@ use async_trait::async_trait;
 use cocoa::appkit::{
     self, CGFloat, NSApplication, NSApplicationActivateIgnoringOtherApps,
     NSApplicationPresentationOptions, NSBackingStoreBuffered, NSEvent, NSEventModifierFlags,
-    NSOpenGLContext, NSOpenGLPixelFormat, NSPasteboard, NSRunningApplication, NSScreen, NSView,
-    NSViewHeightSizable, NSViewWidthSizable, NSWindow, NSWindowStyleMask,
+    NSImage, NSImageNameApplicationIcon, NSOpenGLContext, NSOpenGLPixelFormat, NSPasteboard,
+    NSRunningApplication, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable, NSWindow,
+    NSWindowStyleMask,
 };
 use cocoa::base::*;
 use cocoa::foundation::{
@@ -33,6 +35,7 @@ use core_foundation::bundle::{CFBundleGetBundleWithIdentifier, CFBundleGetFuncti
 use core_foundation::data::{CFData, CFDataGetBytePtr, CFDataRef};
 use core_foundation::string::{CFString, CFStringRef, UniChar};
 use core_foundation::{declare_TCFType, impl_TCFType};
+use foreign_types::ForeignType;
 use objc::declare::ClassDecl;
 use objc::rc::{StrongPtr, WeakPtr};
 use objc::runtime::{Class, Object, Protocol, Sel};
@@ -45,7 +48,7 @@ use raw_window_handle::{
 use std::any::Any;
 use std::cell::RefCell;
 use std::ffi::{c_void, CStr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -57,6 +60,29 @@ use wezterm_input_types::{is_ascii_control, IntegratedTitleButtonStyle, Keyboard
 const NSViewLayerContentsPlacementTopLeft: NSInteger = 11;
 #[allow(non_upper_case_globals)]
 const NSViewLayerContentsRedrawDuringViewResize: NSInteger = 2;
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FALLBACK_X: f64 = 96.0;
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FULLSCREEN_X: f64 = 22.0;
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_GAP: f64 = 8.0;
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE: f64 = 30.0;
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG: NSInteger = 0x7474_7362;
+
+pub fn set_application_icon_from_file(path: &Path) -> anyhow::Result<()> {
+    let path_string = path.to_string_lossy();
+
+    unsafe {
+        let ns_image = NSImage::alloc(nil).initWithContentsOfFile_(*nsstring(path_string.as_ref()));
+        if ns_image == nil {
+            bail!("failed to load application icon from {}", path.display());
+        }
+
+        let ns_image = StrongPtr::new(ns_image);
+        let _: BOOL = msg_send![*ns_image, setName:NSImageNameApplicationIcon];
+        let app = NSApplication::sharedApplication(nil);
+        app.setApplicationIconImage_(*ns_image);
+    }
+
+    Ok(())
+}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -374,6 +400,7 @@ pub(crate) struct WindowInner {
     view: StrongPtr,
     window: StrongPtr,
     config: ConfigHandle,
+    titlebar_sidebar_button_visible: bool,
 }
 
 fn function_key_to_keycode(function_key: char) -> KeyCode {
@@ -634,6 +661,7 @@ impl Window {
                 window,
                 view,
                 config: config.clone(),
+                titlebar_sidebar_button_visible: false,
             }));
             inner.borrow_mut().window.replace(weak_window);
             conn.windows
@@ -787,6 +815,34 @@ impl WindowOps for Window {
         let title = title.to_owned();
         Connection::with_window_inner(self.id, move |inner| {
             inner.set_title(&title);
+            Ok(())
+        });
+    }
+
+    fn set_icon(&self, image: Image) {
+        let (width, height) = image.image_dimensions();
+        let bitmap = BitmapRef::with_image(&image);
+
+        unsafe {
+            let size = NSSize::new(width as CGFloat, height as CGFloat);
+            let ns_image: id = msg_send![
+                NSImage::alloc(nil),
+                initWithCGImage: bitmap.as_ptr()
+                size: size
+            ];
+
+            if ns_image != nil {
+                let ns_image = StrongPtr::new(ns_image);
+                let _: BOOL = msg_send![*ns_image, setName:NSImageNameApplicationIcon];
+                let app = NSApplication::sharedApplication(nil);
+                app.setApplicationIconImage_(*ns_image);
+            }
+        }
+    }
+
+    fn set_titlebar_sidebar_button_visible(&self, visible: bool) {
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.set_titlebar_sidebar_button_visible(visible);
             Ok(())
         });
     }
@@ -997,6 +1053,20 @@ impl WindowInner {
                 self.config.window_decorations,
                 self.config.integrated_title_button_style,
             );
+            self.update_titlebar_sidebar_button();
+        }
+    }
+
+    fn set_titlebar_sidebar_button_visible(&mut self, visible: bool) {
+        self.titlebar_sidebar_button_visible = visible;
+        self.update_titlebar_sidebar_button();
+    }
+
+    fn update_titlebar_sidebar_button(&mut self) {
+        if self.titlebar_sidebar_button_visible {
+            install_thinkterm_titlebar_sidebar_button(&self.window, *self.view);
+        } else {
+            remove_thinkterm_titlebar_sidebar_button(&self.window);
         }
     }
 
@@ -1188,6 +1258,7 @@ impl WindowInner {
             );
 
             self.update_titlebar_background();
+            self.update_titlebar_sidebar_button();
 
             self.window.makeKeyAndOrderFront_(nil)
         }
@@ -1449,11 +1520,7 @@ fn apply_decorations_to_window(
             let _: () = msg_send![button, setHidden: hidden];
         }
 
-        window.setTitleVisibility_(if decorations.contains(WindowDecorations::TITLE) {
-            appkit::NSWindowTitleVisibility::NSWindowTitleVisible
-        } else {
-            appkit::NSWindowTitleVisibility::NSWindowTitleHidden
-        });
+        window.setTitleVisibility_(appkit::NSWindowTitleVisibility::NSWindowTitleHidden);
 
         if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
             || decorations.contains(WindowDecorations::MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR)
@@ -1462,6 +1529,161 @@ fn apply_decorations_to_window(
         } else {
             window.setTitlebarAppearsTransparent_(hidden);
         }
+    }
+}
+
+fn install_thinkterm_titlebar_sidebar_button(window: &StrongPtr, target: id) {
+    unsafe {
+        let Some(titlebar_view_container) = get_titlebar_view_container(window) else {
+            return;
+        };
+        let titlebar_view_container = titlebar_view_container.load();
+        if titlebar_view_container.is_null() {
+            return;
+        }
+        let titlebar_view_container_id = *titlebar_view_container;
+        if let Some(button) = thinkterm_titlebar_sidebar_button(&titlebar_view_container) {
+            position_thinkterm_titlebar_sidebar_button(window, titlebar_view_container_id, button);
+            return;
+        }
+
+        let button: id = msg_send![
+            class!(NSButton),
+            buttonWithTitle: *nsstring("")
+            target: target
+            action: sel!(thinktermToggleWorkspaceSidebar:)
+        ];
+        if button.is_null() {
+            return;
+        }
+
+        position_thinkterm_titlebar_sidebar_button(window, titlebar_view_container_id, button);
+        let () = msg_send![button, setBordered: NO];
+        let () = msg_send![button, setBezelStyle: 0isize];
+        let () = msg_send![button, setImagePosition: 1isize];
+        let () = msg_send![button, setTag: THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG];
+
+        let image_class = class!(NSImage);
+        let supports_symbol_images: BOOL = msg_send![
+            image_class,
+            respondsToSelector: sel!(imageWithSystemSymbolName:accessibilityDescription:)
+        ];
+        if supports_symbol_images == YES {
+            let image: id = msg_send![
+                image_class,
+                imageWithSystemSymbolName: *nsstring("sidebar.left")
+                accessibilityDescription: *nsstring("Toggle sidebar")
+            ];
+            if !image.is_null() {
+                let () = msg_send![button, setImage: image];
+            } else {
+                let () = msg_send![button, setTitle: *nsstring("▣")];
+            }
+        } else {
+            let () = msg_send![button, setTitle: *nsstring("▣")];
+        }
+
+        let () = msg_send![titlebar_view_container_id, addSubview: button];
+    }
+}
+
+fn position_thinkterm_titlebar_sidebar_button(
+    window: &StrongPtr,
+    titlebar_view_container_id: id,
+    button: id,
+) {
+    unsafe {
+        let titlebar_frame = NSView::frame(titlebar_view_container_id);
+        let zoom_button = window.standardWindowButton_(appkit::NSWindowButton::NSWindowZoomButton);
+        let is_fullscreen =
+            NSWindow::styleMask(**window).contains(NSWindowStyleMask::NSFullScreenWindowMask);
+        let zoom_button_hidden = if zoom_button.is_null() {
+            false
+        } else {
+            let hidden: BOOL = msg_send![zoom_button, isHidden];
+            hidden == YES
+        };
+        let x = if zoom_button.is_null() {
+            if is_fullscreen {
+                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FULLSCREEN_X
+            } else {
+                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FALLBACK_X
+            }
+        } else {
+            let zoom_frame = NSView::frame(zoom_button);
+            if zoom_button_hidden && zoom_frame.size.width <= 0.0 {
+                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FULLSCREEN_X
+            } else {
+                zoom_frame.origin.x + zoom_frame.size.width + THINKTERM_TITLEBAR_SIDEBAR_BUTTON_GAP
+            }
+        };
+        let y =
+            ((titlebar_frame.size.height - THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE) / 2.0).max(0.0);
+        let frame = NSRect::new(
+            NSPoint::new(x, y),
+            NSSize::new(
+                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE,
+                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE,
+            ),
+        );
+        let () = msg_send![button, setFrame: frame];
+    }
+}
+
+fn reposition_thinkterm_titlebar_sidebar_button_if_present(window: &StrongPtr) {
+    let Some(titlebar_view_container) = get_titlebar_view_container(window) else {
+        return;
+    };
+    let titlebar_view_container = titlebar_view_container.load();
+    if titlebar_view_container.is_null() {
+        return;
+    }
+
+    let Some(button) = thinkterm_titlebar_sidebar_button(&titlebar_view_container) else {
+        return;
+    };
+
+    position_thinkterm_titlebar_sidebar_button(window, *titlebar_view_container, button);
+}
+
+fn remove_thinkterm_titlebar_sidebar_button(window: &StrongPtr) {
+    unsafe {
+        let Some(titlebar_view_container) = get_titlebar_view_container(window) else {
+            return;
+        };
+        let titlebar_view_container = titlebar_view_container.load();
+        if titlebar_view_container.is_null() {
+            return;
+        }
+
+        let Some(button) = thinkterm_titlebar_sidebar_button(&titlebar_view_container) else {
+            return;
+        };
+        let () = msg_send![button, removeFromSuperview];
+    }
+}
+
+fn thinkterm_titlebar_sidebar_button(titlebar_view_container: &StrongPtr) -> Option<id> {
+    unsafe {
+        let Some(subviews) = get_view_subviews(titlebar_view_container) else {
+            return None;
+        };
+        let subviews = subviews.load();
+        let count = subviews.count();
+
+        for i in 0..count {
+            let subview: id = subviews.objectAtIndex(i);
+            if subview.is_null() {
+                continue;
+            }
+
+            let tag: NSInteger = msg_send![subview, tag];
+            if tag == THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG {
+                return Some(subview);
+            }
+        }
+
+        None
     }
 }
 
@@ -2355,6 +2577,15 @@ impl WindowView {
         }
     }
 
+    extern "C" fn thinkterm_toggle_workspace_sidebar(this: &mut Object, _sel: Sel, _sender: id) {
+        if let Some(this) = Self::get_this(this) {
+            this.inner
+                .borrow_mut()
+                .events
+                .dispatch(WindowEvent::ToggleWorkspaceSidebar);
+        }
+    }
+
     extern "C" fn window_will_close(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
             // Advise the window of its impending death
@@ -3025,6 +3256,9 @@ impl WindowView {
                 (_, true) => WindowState::MAXIMIZED,
                 _ => WindowState::default(),
             };
+            if let Some(window) = inner.window.as_ref() {
+                reposition_thinkterm_titlebar_sidebar_button_if_present(&window.load());
+            }
 
             let dpi = inner
                 .window
@@ -3253,6 +3487,10 @@ impl WindowView {
                 sel!(weztermPerformKeyAssignment:),
                 Self::wezterm_perform_key_assignment
                     as extern "C" fn(&mut Object, Sel, *mut Object),
+            );
+            cls.add_method(
+                sel!(thinktermToggleWorkspaceSidebar:),
+                Self::thinkterm_toggle_workspace_sidebar as extern "C" fn(&mut Object, Sel, id),
             );
 
             cls.add_method(

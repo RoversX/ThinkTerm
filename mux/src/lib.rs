@@ -836,8 +836,8 @@ impl Mux {
         }
 
         let mut pane_ids = vec![];
-        for pos in tab.iter_panes_ignoring_zoom() {
-            pane_ids.push(pos.pane.pane_id());
+        for pane in tab.iter_all_panes() {
+            pane_ids.push(pane.pane_id());
         }
         log::debug!("panes to remove: {pane_ids:?}");
         for pane_id in pane_ids {
@@ -856,8 +856,8 @@ impl Mux {
             // Gather all the domains referenced by this window
             let mut domains_of_window = HashSet::new();
             for tab in window.iter() {
-                for pane in tab.iter_panes_ignoring_zoom() {
-                    domains_of_window.insert(pane.pane.domain_id());
+                for pane in tab.iter_all_panes() {
+                    domains_of_window.insert(pane.domain_id());
                 }
             }
 
@@ -1071,9 +1071,9 @@ impl Mux {
     pub fn resolve_pane_id(&self, pane_id: PaneId) -> Option<(DomainId, WindowId, TabId)> {
         let mut ids = None;
         for tab in self.tabs.read().values() {
-            for p in tab.iter_panes_ignoring_zoom() {
-                if p.pane.pane_id() == pane_id {
-                    ids = Some((tab.tab_id(), p.pane.domain_id()));
+            for pane in tab.iter_all_panes() {
+                if pane.pane_id() == pane_id {
+                    ids = Some((tab.tab_id(), pane.domain_id()));
                     break;
                 }
             }
@@ -1081,6 +1081,26 @@ impl Mux {
         let (tab_id, domain_id) = ids?;
         let window_id = self.window_containing_tab(tab_id)?;
         Some((domain_id, window_id, tab_id))
+    }
+
+    pub fn pane_stack_tabs(&self, pane_id: PaneId) -> Vec<crate::tab::PaneStackTab> {
+        let Some((_domain_id, _window_id, tab_id)) = self.resolve_pane_id(pane_id) else {
+            return vec![];
+        };
+        self.get_tab(tab_id)
+            .map(|tab| tab.pane_stack_tabs(pane_id))
+            .unwrap_or_default()
+    }
+
+    pub fn activate_pane_in_stack(&self, pane_id: PaneId) -> anyhow::Result<()> {
+        let (_domain_id, _window_id, tab_id) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+        let tab = self
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("tab_id {} invalid", tab_id))?;
+        tab.activate_pane_in_stack(pane_id)?;
+        Ok(())
     }
 
     pub fn domain_was_detached(&self, domain: DomainId) {
@@ -1243,6 +1263,70 @@ impl Mux {
         };
 
         Ok((pane, size))
+    }
+
+    pub async fn spawn_pane_in_stack(
+        &self,
+        pane_id: PaneId,
+        domain: SpawnTabDomain,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        size: TerminalSize,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let (pane_domain_id, window_id, tab_id) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+        let tab = self
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("tab_id {} invalid", tab_id))?;
+
+        if tab.get_zoomed_pane().is_some() {
+            anyhow::bail!("cannot create pane tab while zoomed");
+        }
+        if tab.pane_index_for_pane(pane_id).is_none() {
+            anyhow::bail!("pane_id {} is not in tab {}", pane_id, tab_id);
+        }
+
+        let domain = self
+            .resolve_spawn_tab_domain(Some(pane_id), &domain)
+            .context("resolve_spawn_tab_domain")?;
+
+        if domain.state() == DomainState::Detached {
+            domain.attach(Some(window_id)).await?;
+        }
+
+        let current_pane = self
+            .get_pane(pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
+        let term_config = current_pane.get_config();
+        let cwd = self.resolve_cwd(
+            command_dir,
+            if pane_domain_id == domain.domain_id() {
+                Some(current_pane)
+            } else {
+                None
+            },
+            domain.domain_id(),
+            CachePolicy::FetchImmediate,
+        );
+
+        let pane = domain
+            .spawn_pane(size, command.clone(), cwd.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "Spawning pane in domain `{}`: {size:?} command={command:?} cwd={cwd:?}",
+                    domain.domain_name()
+                )
+            })?;
+
+        if let Some(config) = term_config {
+            pane.set_config(config);
+        }
+
+        tab.add_pane_to_stack(pane_id, Arc::clone(&pane))?;
+
+        Ok(pane)
     }
 
     pub async fn move_pane_to_new_tab(

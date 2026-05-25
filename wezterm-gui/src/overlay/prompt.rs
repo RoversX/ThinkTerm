@@ -48,7 +48,7 @@ impl LineEditorHost for PromptHost {
 }
 
 pub fn show_line_prompt_overlay(
-    mut term: TermWizTerminal,
+    term: TermWizTerminal,
     args: PromptInputLine,
     window: GuiWin,
     pane: MuxPane,
@@ -60,16 +60,12 @@ pub fn show_line_prompt_overlay(
         ),
     };
 
-    term.no_grab_mouse_in_raw_mode();
-    let mut text = args.description.replace("\r\n", "\n").replace("\n", "\r\n");
-    text.push_str("\r\n");
-    term.render(&[Change::Text(text)])?;
-
-    let mut host = PromptHost::new();
-    let mut editor = LineEditor::new(&mut term);
-    editor.set_prompt(&args.prompt);
-    let line =
-        editor.read_line_with_optional_initial_value(&mut host, args.initial_value.as_deref())?;
+    let line = read_line_prompt_overlay(
+        term,
+        &args.description,
+        &args.prompt,
+        args.initial_value.as_deref(),
+    )?;
 
     promise::spawn::spawn_into_main_thread(async move {
         trampoline(name, window, pane, line);
@@ -78,6 +74,23 @@ pub fn show_line_prompt_overlay(
     .detach();
 
     Ok(())
+}
+
+pub fn read_line_prompt_overlay(
+    mut term: TermWizTerminal,
+    description: &str,
+    prompt: &str,
+    initial_value: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    term.no_grab_mouse_in_raw_mode();
+    let mut text = description.replace("\r\n", "\n").replace("\n", "\r\n");
+    text.push_str("\r\n");
+    term.render(&[Change::Text(text)])?;
+
+    let mut host = PromptHost::new();
+    let mut editor = LineEditor::new(&mut term);
+    editor.set_prompt(prompt);
+    Ok(editor.read_line_with_optional_initial_value(&mut host, initial_value)?)
 }
 
 fn trampoline(name: String, window: GuiWin, pane: MuxPane, line: Option<String>) {

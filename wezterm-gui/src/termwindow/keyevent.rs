@@ -1,6 +1,7 @@
 use crate::termwindow::InputMap;
 use ::window::{
-    DeadKeyStatus, KeyCode, KeyEvent, KeyboardLedStatus, Modifiers, RawKeyEvent, WindowOps,
+    Clipboard, DeadKeyStatus, KeyCode, KeyEvent, KeyboardLedStatus, Modifiers, RawKeyEvent,
+    WindowOps,
 };
 use anyhow::Context;
 use config::keyassignment::{KeyAssignment, KeyTableEntry};
@@ -188,6 +189,170 @@ enum OnlyKeyBindings {
 }
 
 impl super::TermWindow {
+    fn paste_text_into_inline_tab_rename(&mut self, text: &str) {
+        if let Some(rename) = self.inline_tab_rename.as_mut() {
+            rename.insert(text);
+            self.update_title_impl();
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+    }
+
+    fn handle_inline_tab_rename_key(
+        &mut self,
+        window_key: &KeyEvent,
+        context: &dyn WindowOps,
+    ) -> bool {
+        if self.inline_tab_rename.is_none() {
+            return false;
+        }
+
+        if !window_key.key_is_down {
+            return true;
+        }
+
+        let mut shortcut_mods = window_key.modifiers;
+        shortcut_mods.remove(Modifiers::SHIFT | Modifiers::LEFT_SHIFT | Modifiers::RIGHT_SHIFT);
+        let super_only = shortcut_mods == Modifiers::SUPER;
+        if super_only {
+            match &window_key.key {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    if let Some(rename) = self.inline_tab_rename.as_mut() {
+                        rename.select_all();
+                        self.update_title_impl();
+                        context.invalidate();
+                    }
+                    return true;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    if let Some(rename) = self.inline_tab_rename.as_ref() {
+                        let text = rename
+                            .selected_text()
+                            .unwrap_or_else(|| rename.text.clone());
+                        context.set_clipboard(Clipboard::Clipboard, text);
+                    }
+                    return true;
+                }
+                KeyCode::Char('x') | KeyCode::Char('X') => {
+                    if let Some(rename) = self.inline_tab_rename.as_mut() {
+                        let text = rename
+                            .selected_text()
+                            .unwrap_or_else(|| rename.text.clone());
+                        context.set_clipboard(Clipboard::Clipboard, text);
+                        if rename.has_selection() {
+                            rename.delete_selection();
+                        } else {
+                            rename.text.clear();
+                            rename.cursor = 0;
+                        }
+                        self.update_title_impl();
+                        context.invalidate();
+                    }
+                    return true;
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    if let Some(window) = self.window.as_ref().cloned() {
+                        let future = window.get_clipboard(Clipboard::Clipboard);
+                        promise::spawn::spawn(async move {
+                            if let Ok(text) = future.await {
+                                window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                                    move |term_window| {
+                                        term_window.paste_text_into_inline_tab_rename(&text);
+                                    },
+                                )));
+                            }
+                        })
+                        .detach();
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        let text_mod_blockers = Modifiers::ALT
+            | Modifiers::CTRL
+            | Modifiers::SUPER
+            | Modifiers::LEADER
+            | Modifiers::LEFT_ALT
+            | Modifiers::RIGHT_ALT
+            | Modifiers::LEFT_CTRL
+            | Modifiers::RIGHT_CTRL;
+
+        let mut dirty = false;
+        match &window_key.key {
+            KeyCode::Char('\r') => {
+                self.finish_inline_tab_rename(true);
+                context.invalidate();
+                return true;
+            }
+            KeyCode::Char('\u{1b}') => {
+                self.finish_inline_tab_rename(false);
+                context.invalidate();
+                return true;
+            }
+            KeyCode::Char('\u{8}') => {
+                if let Some(rename) = self.inline_tab_rename.as_mut() {
+                    rename.backspace();
+                    dirty = true;
+                }
+            }
+            KeyCode::Char('\u{7f}') => {
+                if let Some(rename) = self.inline_tab_rename.as_mut() {
+                    rename.delete();
+                    dirty = true;
+                }
+            }
+            KeyCode::LeftArrow => {
+                if let Some(rename) = self.inline_tab_rename.as_mut() {
+                    rename.move_left();
+                    dirty = true;
+                }
+            }
+            KeyCode::RightArrow => {
+                if let Some(rename) = self.inline_tab_rename.as_mut() {
+                    rename.move_right();
+                    dirty = true;
+                }
+            }
+            KeyCode::Home => {
+                if let Some(rename) = self.inline_tab_rename.as_mut() {
+                    rename.cursor = 0;
+                    dirty = true;
+                }
+            }
+            KeyCode::End => {
+                if let Some(rename) = self.inline_tab_rename.as_mut() {
+                    rename.cursor = rename.text.chars().count();
+                    dirty = true;
+                }
+            }
+            KeyCode::Char(c)
+                if !window_key.modifiers.intersects(text_mod_blockers) && !c.is_control() =>
+            {
+                if let Some(rename) = self.inline_tab_rename.as_mut() {
+                    rename.insert(&c.to_string());
+                    dirty = true;
+                }
+            }
+            KeyCode::Composed(text) if !window_key.modifiers.intersects(text_mod_blockers) => {
+                if let Some(rename) = self.inline_tab_rename.as_mut() {
+                    rename.insert(text);
+                    dirty = true;
+                }
+            }
+            _ => {}
+        }
+
+        if dirty {
+            self.update_title_impl();
+            context.invalidate();
+        }
+
+        true
+    }
+
     fn encode_win32_input(&self, pane: &Arc<dyn Pane>, key: &KeyEvent) -> Option<String> {
         if !self.config.allow_win32_input_mode
             || pane.get_keyboard_encoding() != KeyboardEncoding::Win32
@@ -597,6 +762,10 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
+        if self.handle_inline_tab_rename_key(&window_key, context) {
+            return;
+        }
+
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -768,7 +937,7 @@ impl super::TermWindow {
             WK::Char('\u{1b}') => KC::Escape,
             WK::RawCode(_) => return Key::None,
             WK::Physical(phys) => {
-                return self.win_key_code_to_termwiz_key_code(&phys.to_key_code())
+                return self.win_key_code_to_termwiz_key_code(&phys.to_key_code());
             }
 
             WK::Char(c) => KC::Char(*c),

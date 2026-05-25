@@ -48,6 +48,7 @@ mod resize_increment_calculator;
 mod scripting;
 mod scrollbar;
 mod selection;
+mod settings_window;
 mod shapecache;
 mod spawn;
 mod stats;
@@ -67,7 +68,7 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
+    about = "ThinkTerm - a workspace-first terminal\nhttps://github.com/RoversX/thinkterm",
     version = config::wezterm_version()
 )]
 struct Opt {
@@ -578,10 +579,12 @@ impl Publish {
                                     let mut cursor = tabroot.into_tree().cursor();
 
                                     loop {
-                                        if let Some(entry) = cursor.leaf_mut() {
-                                            if entry.pane_id == pane_id {
-                                                window_id.replace(entry.window_id);
-                                                break 'outer;
+                                        if let Some(stack) = cursor.leaf_mut() {
+                                            for entry in &stack.panes {
+                                                if entry.pane_id == pane_id {
+                                                    window_id.replace(entry.window_id);
+                                                    break 'outer;
+                                                }
                                             }
                                         }
                                         match cursor.preorder_next() {

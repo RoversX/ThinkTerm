@@ -23,7 +23,7 @@ mod cli;
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
+    about = "ThinkTerm - a workspace-first terminal\nhttps://github.com/RoversX/thinkterm",
     version = wezterm_version()
 )]
 pub struct Opt {

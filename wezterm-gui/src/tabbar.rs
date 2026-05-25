@@ -1,3 +1,4 @@
+use crate::termwindow::ui::terminal_title_for_display;
 use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors};
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -11,6 +12,8 @@ use termwiz::surface::SEQ_ZERO;
 use termwiz_funcs::{format_as_escapes, FormatColor, FormatItem};
 use wezterm_term::{Line, Progress};
 use window::{IntegratedTitleButton, IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle};
+
+const TERMINAL_TAB_ICON: &str = "\u{f120} ";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TabBarState {
@@ -148,13 +151,13 @@ fn compute_tab_title(
 
             if let Some(pane) = &tab.active_pane {
                 let mut title = if tab.tab_title.is_empty() {
-                    pane.title.clone()
+                    terminal_title_for_display(&pane.title).to_string()
                 } else {
                     tab.tab_title.clone()
                 };
 
                 let classic_spacing = if config.use_fancy_tab_bar { "" } else { " " };
-                if config.show_tab_index_in_tab_bar {
+                if config.show_tab_index_in_tab_bar && !config.use_fancy_tab_bar {
                     let index = format!(
                         "{classic_spacing}{}: ",
                         tab.tab_index
@@ -189,6 +192,11 @@ fn compute_tab_title(
                     }
                 }
 
+                if !config.use_fancy_tab_bar {
+                    len += unicode_column_width(TERMINAL_TAB_ICON, None);
+                    items.push(FormatItem::Text(TERMINAL_TAB_ICON.to_string()));
+                }
+
                 // We have a preferred soft minimum on tab width to make it
                 // easier to click on tab titles, but we'll still go below
                 // this if there are too many tabs to fit the window at
@@ -216,6 +224,50 @@ fn is_tab_hover(mouse_x: Option<usize>, x: usize, tab_title_len: usize) -> bool 
     return mouse_x
         .map(|mouse_x| mouse_x >= x && mouse_x < x + tab_title_len)
         .unwrap_or(false);
+}
+
+fn visible_tab_range_from_scroll(
+    tab_titles: &[TitleText],
+    scroll_offset: usize,
+    tab_width_max: usize,
+    available_cells: usize,
+) -> std::ops::Range<usize> {
+    if tab_titles.is_empty() {
+        return 0..0;
+    }
+
+    let widths: Vec<usize> = tab_titles
+        .iter()
+        .map(|title| title.len.min(tab_width_max).max(1))
+        .collect();
+    let total_width: usize = widths.iter().sum::<usize>() + tab_titles.len().saturating_sub(1);
+    if total_width <= available_cells {
+        return 0..tab_titles.len();
+    }
+
+    let mut start = scroll_offset.min(tab_titles.len().saturating_sub(1));
+    let mut end = start;
+    let mut used = 0usize;
+
+    while end < widths.len() {
+        let width = widths[end] + usize::from(used > 0);
+        if used > 0 && used.saturating_add(width) > available_cells {
+            break;
+        }
+        used += width;
+        end += 1;
+    }
+
+    while start > 0 && end == widths.len() {
+        let width = widths[start - 1] + usize::from(used > 0);
+        if used.saturating_add(width) > available_cells {
+            break;
+        }
+        used += width;
+        start -= 1;
+    }
+
+    start..end.max(start + 1).min(tab_titles.len())
 }
 
 impl TabBarState {
@@ -337,6 +389,7 @@ impl TabBarState {
         pane_info: &[PaneInformation],
         colors: Option<&TabBarColors>,
         config: &ConfigHandle,
+        tab_scroll_offset: f32,
         left_status: &str,
         right_status: &str,
     ) -> Self {
@@ -397,19 +450,28 @@ impl TabBarState {
         } else {
             vec![]
         };
-        let titles_len: usize = tab_titles.iter().map(|s| s.len).sum();
         let number_of_tabs = tab_titles.len();
+        let show_new_tab_button = false;
 
-        let available_cells =
-            title_width.saturating_sub(number_of_tabs.saturating_sub(1) + new_tab.len());
-        let tab_width_max = if config.use_fancy_tab_bar || available_cells >= titles_len {
-            // We can render each title with its full width
-            usize::max_value()
+        let available_cells = title_width.saturating_sub(
+            number_of_tabs.saturating_sub(1)
+                + if show_new_tab_button {
+                    new_tab.len()
+                } else {
+                    0
+                },
+        );
+        let tab_width_max = config.tab_max_width;
+        let visible_tab_range = if config.use_fancy_tab_bar {
+            0..tab_titles.len()
         } else {
-            // We need to clamp the length to balance them out
-            available_cells / number_of_tabs
-        }
-        .min(config.tab_max_width);
+            visible_tab_range_from_scroll(
+                &tab_titles,
+                tab_scroll_offset.max(0.0).floor() as usize,
+                tab_width_max,
+                available_cells,
+            )
+        };
 
         let mut line = Line::with_width(0, SEQ_ZERO);
 
@@ -453,7 +515,11 @@ impl TabBarState {
         }
 
         for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
-            let tab_title_len = tab_title.len.min(tab_width_max);
+            if !visible_tab_range.contains(&tab_idx) {
+                continue;
+            }
+
+            let tab_title_len = tab_title.len.min(tab_width_max).min(available_cells.max(1));
             let active = tab_idx == active_tab_no;
             let hover = !active && is_tab_hover(mouse_x, x, tab_title_len);
 
@@ -507,7 +573,7 @@ impl TabBarState {
         }
 
         // New tab button
-        if config.show_new_tab_button_in_tab_bar {
+        if config.show_new_tab_button_in_tab_bar && show_new_tab_button {
             let hover = is_tab_hover(mouse_x, x, new_tab_hover.len());
 
             let new_tab_button = if hover { &new_tab_hover } else { &new_tab };
@@ -606,12 +672,18 @@ impl TabBarState {
         Self { line, items }
     }
 
-    pub fn compute_ui_items(&self, y: usize, cell_height: usize, cell_width: usize) -> Vec<UIItem> {
+    pub fn compute_ui_items(
+        &self,
+        y: usize,
+        cell_height: usize,
+        cell_width: usize,
+        x_offset: usize,
+    ) -> Vec<UIItem> {
         let mut items = vec![];
 
         for entry in self.items.iter() {
             items.push(UIItem {
-                x: entry.x * cell_width,
+                x: x_offset + entry.x * cell_width,
                 width: entry.width * cell_width,
                 y,
                 height: cell_height,

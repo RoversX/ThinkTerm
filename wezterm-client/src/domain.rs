@@ -48,8 +48,8 @@ impl ClientInner {
             .retain(
                 |remote_tab_id, local_tab_id| match mux.get_tab(*local_tab_id) {
                     Some(tab) => {
-                        for pos in tab.iter_panes_ignoring_zoom() {
-                            if pos.pane.domain_id() == self.local_domain_id {
+                        for pane in tab.iter_all_panes() {
+                            if pane.domain_id() == self.local_domain_id {
                                 return true;
                             }
                         }
@@ -72,8 +72,8 @@ impl ClientInner {
                 |_remote_window_id, local_window_id| match mux.get_window(*local_window_id) {
                     Some(w) => {
                         for tab in w.iter() {
-                            for pos in tab.iter_panes_ignoring_zoom() {
-                                if pos.pane.domain_id() == self.local_domain_id {
+                            for pane in tab.iter_all_panes() {
+                                if pane.domain_id() == self.local_domain_id {
                                     return true;
                                 }
                             }

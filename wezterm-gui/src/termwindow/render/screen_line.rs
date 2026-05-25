@@ -148,6 +148,11 @@ impl crate::TermWindow {
                 window_is_transparent: params.window_is_transparent,
                 reverse_video: params.dims.reverse_video,
                 shape_key: &params.shape_key,
+                font: params.font.as_ref(),
+                style: params.style,
+                font_config: params.font_config.as_ref(),
+                render_metrics: params.render_metrics,
+                font_identity: params.font_identity,
             };
 
             let (shaped, invalidate_on_hover) = self.build_line_element_shape(params)?;
@@ -372,8 +377,10 @@ impl crate::TermWindow {
                             &TextStyle::default(),
                             &attrs,
                             params.font.as_ref(),
+                            params.font_config.as_ref(),
                             gl_state,
                             &params.render_metrics,
+                            params.font_identity,
                         )
                         .context("resolve_lock_glyph")?;
 
@@ -750,7 +757,12 @@ impl crate::TermWindow {
             if !matches!(last_style.as_ref(), Some(ClusterStyleCache{attrs,..}) if *attrs == &cluster.attrs)
             {
                 let attrs = &cluster.attrs;
-                let style = self.fonts.match_style(params.config, attrs);
+                let style = params.style.unwrap_or_else(|| {
+                    params
+                        .font_config
+                        .unwrap_or(&self.fonts)
+                        .match_style(params.config, attrs)
+                });
                 let hyperlink = attrs.hyperlink();
                 let is_highlited_hyperlink =
                     same_hyperlink(hyperlink, self.current_highlight.as_ref());
@@ -766,7 +778,7 @@ impl crate::TermWindow {
                         attrs.strikethrough(),
                         attrs.underline(),
                         attrs.overline(),
-                        &self.render_metrics,
+                        &params.render_metrics,
                     )?
                     .texture_coords();
                 let bg_is_default = attrs.background() == ColorAttribute::Default;
@@ -859,8 +871,10 @@ impl crate::TermWindow {
                 style_params.style,
                 &cluster,
                 &gl_state,
-                None,
-                &self.render_metrics,
+                params.font,
+                params.font_config,
+                &params.render_metrics,
+                params.font_identity,
             )?;
             let pixel_width = glyph_info
                 .iter()

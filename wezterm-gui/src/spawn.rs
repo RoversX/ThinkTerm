@@ -14,6 +14,7 @@ use wezterm_term::TerminalSize;
 pub enum SpawnWhere {
     NewWindow,
     NewTab,
+    NewTabAt(usize),
     SplitPane(SplitRequest),
 }
 
@@ -123,7 +124,7 @@ pub async fn spawn_command_internal(
             }
         }
         _ => {
-            let (_tab, pane, window_id) = mux
+            let (tab, pane, window_id) = mux
                 .spawn_tab_or_window(
                     match spawn_where {
                         SpawnWhere::NewWindow => None,
@@ -145,6 +146,17 @@ pub async fn spawn_command_internal(
             // the new window being created.
             if Some(window_id) == src_window_id {
                 pane.set_config(term_config);
+
+                if let SpawnWhere::NewTabAt(insert_idx) = spawn_where {
+                    if let Some(mut window) = mux.get_window_mut(window_id) {
+                        if let Some(tab_idx) = window.idx_by_id(tab.tab_id()) {
+                            let tab_inst = window.remove_by_idx(tab_idx);
+                            let insert_idx = insert_idx.min(window.len());
+                            window.insert(insert_idx, &tab_inst);
+                            window.set_active_without_saving(insert_idx);
+                        }
+                    }
+                }
             }
         }
     };

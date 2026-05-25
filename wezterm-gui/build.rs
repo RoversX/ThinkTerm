@@ -165,20 +165,31 @@ END
         let src_plist = repo_dir
             .join("assets")
             .join("macos")
-            .join("WezTerm.app")
+            .join("ThinkTerm.app")
             .join("Contents")
             .join("Info.plist");
         let build_target_dir = std::env::var("CARGO_TARGET_DIR")
             .and_then(|s| Ok(std::path::PathBuf::from(s)))
             .unwrap_or(repo_dir.join("target").join(profile));
         let dest_plist = build_target_dir.join("Info.plist");
-        println!("cargo:rerun-if-changed=assets/macos/WezTerm.app/Contents/Info.plist");
+        let src_icon = repo_dir.join("assets").join("icon").join("ThinkTerm.icns");
+        let dest_icon = build_target_dir.join("ThinkTerm.icns");
+        println!("cargo:rerun-if-changed=assets/macos/ThinkTerm.app/Contents/Info.plist");
+        println!("cargo:rerun-if-changed=assets/icon/ThinkTerm.icns");
 
         std::fs::copy(&src_plist, &dest_plist)
             .context(format!(
                 "copy {} -> {}",
                 src_plist.display(),
                 dest_plist.display()
+            ))
+            .unwrap();
+
+        std::fs::copy(&src_icon, &dest_icon)
+            .context(format!(
+                "copy {} -> {}",
+                src_icon.display(),
+                dest_icon.display()
             ))
             .unwrap();
     }

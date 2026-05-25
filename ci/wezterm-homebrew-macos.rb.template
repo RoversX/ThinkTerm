@@ -1,43 +1,46 @@
 # Note: if you are viewing this from the tap repo, this file is automatically
 # updated from:
-# https://github.com/wezterm/wezterm/blob/main/ci/wezterm-homebrew-macos.rb.template
-# by automation in the wezterm repo.
+# https://github.com/RoversX/thinkterm/blob/main/ci/wezterm-homebrew-macos.rb.template
+# by automation in the thinkterm repo.
 # vim:ft=ruby:
-cask "wezterm" do
+cask "thinkterm" do
   version "@TAG@"
   sha256 "@SHA256@"
 
-  url "https://github.com/wezterm/wezterm/releases/download/#{version}/WezTerm-macos-#{version}.zip"
-  name "WezTerm"
-  desc "A GPU-accelerated cross-platform terminal emulator and multiplexer written by @wez and implemented in Rust"
-  homepage "https://wezterm.org/"
+  url "https://github.com/RoversX/thinkterm/releases/download/#{version}/ThinkTerm-macos-#{version}.zip"
+  name "ThinkTerm"
+  desc "A workspace-first terminal based on WezTerm"
+  homepage "https://github.com/RoversX/thinkterm"
 
-  conflicts_with cask: "wezterm/wezterm/wezterm-nightly"
+  conflicts_with cask: [
+    "wezterm/wezterm/wezterm",
+    "wezterm/wezterm/wezterm-nightly",
+  ]
 
   # Unclear what the minimal OS version is
   # depends_on macos: ">= :sierra"
 
-  app "WezTerm.app"
+  app "ThinkTerm.app"
   [
     "wezterm",
     "wezterm-gui",
     "wezterm-mux-server",
     "strip-ansi-escapes"
   ].each do |tool|
-    binary "#{appdir}/WezTerm.app/Contents/MacOS/#{tool}"
+    binary "#{appdir}/ThinkTerm.app/Contents/MacOS/#{tool}"
   end
 
   preflight do
-    # Move "WezTerm-macos-#{version}/WezTerm.app" out of the subfolder
-    staged_subfolder = staged_path.glob(["WezTerm-*", "wezterm-*"]).first
+    # Move "ThinkTerm-macos-#{version}/ThinkTerm.app" out of the subfolder
+    staged_subfolder = staged_path.glob(["ThinkTerm-*", "thinkterm-*"]).first
     if staged_subfolder
-      FileUtils.mv(staged_subfolder/"WezTerm.app", staged_path)
+      FileUtils.mv(staged_subfolder/"ThinkTerm.app", staged_path)
       FileUtils.rm_rf(staged_subfolder)
     end
   end
 
   zap trash: [
-    "~/Library/Saved Application State/com.github.wez.wezterm.savedState",
+    "~/Library/Saved Application State/com.roversx.thinkterm.savedState",
   ]
 
   def caveats; <<~EOS

@@ -3,17 +3,26 @@ use crate::macos::menu::RepresentedItem;
 use crate::macos::{nsstring, nsstring_to_str};
 use crate::menu::{Menu, MenuItem};
 use crate::{ApplicationEvent, Connection};
-use cocoa::appkit::NSApplicationTerminateReply;
-use cocoa::base::id;
-use cocoa::foundation::NSInteger;
+use cocoa::appkit::{NSApp, NSApplicationTerminateReply, NSImage, NSImageNameApplicationIcon};
+use cocoa::base::{id, nil};
+use cocoa::foundation::{NSDictionary, NSInteger, NSUInteger};
 use config::keyassignment::KeyAssignment;
 use config::WindowCloseConfirmation;
 use objc::declare::ClassDecl;
 use objc::rc::StrongPtr;
 use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::*;
+use std::path::{Path, PathBuf};
 
 const CLS_NAME: &str = "WezTermAppDelegate";
+
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    static NSAboutPanelOptionApplicationName: id;
+    static NSAboutPanelOptionApplicationIcon: id;
+    static NSAboutPanelOptionApplicationVersion: id;
+    static NSAboutPanelOptionVersion: id;
+}
 
 extern "C" fn application_should_terminate(
     _self: &mut Object,
@@ -58,6 +67,40 @@ fn terminate_now() -> u64 {
         conn.terminate_message_loop();
     }
     NSApplicationTerminateReply::NSTerminateNow as u64
+}
+
+fn thinkterm_icon_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let mut candidates = vec![exe_dir.join("ThinkTerm.icns")];
+
+    if let Some(contents_dir) = exe_dir.parent() {
+        candidates.push(contents_dir.join("Resources").join("ThinkTerm.icns"));
+    }
+
+    if let Some(repo_dir) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent() {
+        candidates.push(repo_dir.join("assets").join("icon").join("ThinkTerm.icns"));
+    }
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn load_thinkterm_icon(path: &Path) -> Option<StrongPtr> {
+    let path_string = path.to_string_lossy();
+
+    unsafe {
+        let ns_image = cocoa::appkit::NSImage::initWithContentsOfFile_(
+            NSImage::alloc(nil),
+            *nsstring(path_string.as_ref()),
+        );
+        if ns_image == nil {
+            None
+        } else {
+            let ns_image = StrongPtr::new(ns_image);
+            let _: BOOL = msg_send![*ns_image, setName:NSImageNameApplicationIcon];
+            Some(ns_image)
+        }
+    }
 }
 
 extern "C" fn application_will_finish_launching(
@@ -109,6 +152,46 @@ extern "C" fn wezterm_perform_key_assignment(
             }
         }
         None => {}
+    }
+}
+
+extern "C" fn thinkterm_order_front_standard_about_panel(
+    _self: &mut Object,
+    _sel: Sel,
+    _sender: *mut Object,
+) {
+    unsafe {
+        let app = NSApp();
+        let app_name = nsstring("ThinkTerm");
+        let empty_app_version = nsstring("");
+        let empty_build_version = nsstring("");
+        let loaded_icon = thinkterm_icon_path().and_then(|path| load_thinkterm_icon(&path));
+
+        let mut keys = vec![
+            NSAboutPanelOptionApplicationName,
+            NSAboutPanelOptionApplicationVersion,
+            NSAboutPanelOptionVersion,
+        ];
+        let mut objects = vec![*app_name, *empty_app_version, *empty_build_version];
+
+        let app_icon = if let Some(icon) = loaded_icon.as_ref() {
+            **icon
+        } else {
+            msg_send![app, applicationIconImage]
+        };
+        if app_icon != nil {
+            let () = msg_send![app, setApplicationIconImage: app_icon];
+            keys.push(NSAboutPanelOptionApplicationIcon);
+            objects.push(app_icon);
+        }
+
+        let options = NSDictionary::dictionaryWithObjects_forKeys_count_(
+            nil,
+            objects.as_ptr(),
+            keys.as_ptr(),
+            objects.len() as NSUInteger,
+        );
+        let () = msg_send![app, orderFrontStandardAboutPanelWithOptions: options];
     }
 }
 
@@ -174,6 +257,11 @@ fn get_class() -> &'static Class {
             cls.add_method(
                 sel!(weztermPerformKeyAssignment:),
                 wezterm_perform_key_assignment as extern "C" fn(&mut Object, Sel, *mut Object),
+            );
+            cls.add_method(
+                sel!(thinktermOrderFrontStandardAboutPanel:),
+                thinkterm_order_front_standard_about_panel
+                    as extern "C" fn(&mut Object, Sel, *mut Object),
             );
             cls.add_method(
                 sel!(applicationOpenUntitledFile:),

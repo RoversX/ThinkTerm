@@ -40,10 +40,12 @@ impl ZoomPane {
             let mut cursor = tabroot.into_tree().cursor();
 
             loop {
-                if let Some(entry) = cursor.leaf_mut() {
-                    pane_id_to_tab_id.insert(entry.pane_id, entry.tab_id);
-                    if entry.is_active_pane && entry.is_zoomed_pane {
-                        tab_id_to_active_zoomed_pane_id.insert(entry.tab_id, entry.pane_id);
+                if let Some(stack) = cursor.leaf_mut() {
+                    for entry in &stack.panes {
+                        pane_id_to_tab_id.insert(entry.pane_id, entry.tab_id);
+                        if entry.is_active_pane && entry.is_zoomed_pane {
+                            tab_id_to_active_zoomed_pane_id.insert(entry.tab_id, entry.pane_id);
+                        }
                     }
                 }
                 match cursor.preorder_next() {

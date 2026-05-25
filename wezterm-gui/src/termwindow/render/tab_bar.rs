@@ -1,5 +1,6 @@
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::render::RenderScreenLineParams;
+use crate::termwindow::theme_aligned_tab_bar_colors_from_palette;
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use mux::renderable::RenderableDimensions;
@@ -9,13 +10,8 @@ use window::color::LinearRgba;
 impl crate::TermWindow {
     pub fn paint_tab_bar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         if self.config.use_fancy_tab_bar {
-            if self.fancy_tab_bar.is_none() {
-                let palette = self.palette().clone();
-                let tab_bar = self.build_fancy_tab_bar(&palette)?;
-                self.fancy_tab_bar.replace(tab_bar);
-            }
-
-            self.ui_items.append(&mut self.paint_fancy_tab_bar()?);
+            let mut tab_bar_items = self.paint_fancy_tab_bar(layers)?;
+            self.ui_items.append(&mut tab_bar_items);
             return Ok(());
         }
 
@@ -29,12 +25,15 @@ impl crate::TermWindow {
         } else {
             border.top.get() as f32
         };
+        let tab_bar_x = self.tab_bar_left_edge();
+        let tab_bar_width = self.dimensions.pixel_width.saturating_sub(tab_bar_x).max(1);
 
         // Register the tab bar location
         self.ui_items.append(&mut self.tab_bar.compute_ui_items(
             tab_bar_y as usize,
             self.render_metrics.cell_size.height as usize,
             self.render_metrics.cell_size.width as usize,
+            tab_bar_x,
         ));
 
         let window_is_transparent =
@@ -42,6 +41,28 @@ impl crate::TermWindow {
         let gl_state = self.render_state.as_ref().unwrap();
         let white_space = gl_state.util_sprites.white_space.texture_coords();
         let filled_box = gl_state.util_sprites.filled_box.texture_coords();
+        let tab_bar_colors = self
+            .config
+            .resolved_palette
+            .tab_bar
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| theme_aligned_tab_bar_colors_from_palette(&palette));
+        let tab_bar_bg = tab_bar_colors
+            .background()
+            .to_linear()
+            .mul_alpha(self.config.window_background_opacity);
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(
+                tab_bar_x as f32,
+                tab_bar_y,
+                tab_bar_width as f32,
+                tab_bar_height,
+            ),
+            tab_bar_bg,
+        )?;
         let default_bg = palette
             .resolve_bg(ColorAttribute::Default)
             .to_linear()
@@ -54,23 +75,22 @@ impl crate::TermWindow {
         self.render_screen_line(
             RenderScreenLineParams {
                 top_pixel_y: tab_bar_y,
-                left_pixel_x: 0.,
-                pixel_width: self.dimensions.pixel_width as f32,
+                left_pixel_x: tab_bar_x as f32,
+                pixel_width: tab_bar_width as f32,
                 stable_line_idx: None,
                 line: self.tab_bar.line(),
                 selection: 0..0,
                 cursor: &Default::default(),
                 palette: &palette,
                 dims: &RenderableDimensions {
-                    cols: self.dimensions.pixel_width
-                        / self.render_metrics.cell_size.width as usize,
+                    cols: (tab_bar_width / self.render_metrics.cell_size.width as usize).max(1),
                     physical_top: 0,
                     scrollback_rows: 0,
                     scrollback_top: 0,
                     viewport_rows: 1,
                     dpi: self.terminal_size.dpi,
                     pixel_height: self.render_metrics.cell_size.height as usize,
-                    pixel_width: self.terminal_size.pixel_width,
+                    pixel_width: tab_bar_width,
                     reverse_video: false,
                 },
                 config: &self.config,
@@ -91,6 +111,8 @@ impl crate::TermWindow {
                 font: None,
                 use_pixel_positioning: self.config.experimental_pixel_positioning,
                 render_metrics: self.render_metrics,
+                font_config: None,
+                font_identity: self.fonts.get_font_scale().to_bits(),
                 shape_key: None,
                 password_input: false,
             },
@@ -107,7 +129,7 @@ impl crate::TermWindow {
     ) -> anyhow::Result<f32> {
         if config.use_fancy_tab_bar {
             let font = fontconfig.title_font()?;
-            Ok((font.metrics().cell_height.get() as f32 * 1.75).ceil())
+            Ok((font.metrics().cell_height.get() as f32 * 2.05).ceil())
         } else {
             Ok(render_metrics.cell_size.height as f32)
         }

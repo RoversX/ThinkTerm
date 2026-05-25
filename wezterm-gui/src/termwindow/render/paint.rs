@@ -14,6 +14,43 @@ pub enum AllowImage {
 }
 
 impl crate::TermWindow {
+    fn damp_scroll_value(current: f32, target: f32) -> (f32, bool) {
+        let delta = target - current;
+        if delta.abs() <= 0.75 {
+            (target, false)
+        } else {
+            (current + delta * 0.38, true)
+        }
+    }
+
+    fn advance_tab_scroll_animation(&mut self, now: Instant) {
+        let mut animating = false;
+        let (next_window_scroll, window_animating) =
+            Self::damp_scroll_value(self.tab_bar_scroll_offset, self.tab_bar_scroll_target);
+        if (next_window_scroll - self.tab_bar_scroll_offset).abs() > f32::EPSILON {
+            self.tab_bar_scroll_offset = next_window_scroll;
+            self.invalidate_fancy_tab_bar();
+        }
+        animating |= window_animating;
+
+        for (pane_id, target) in self.pane_nav_tab_scroll_targets.clone() {
+            let current = self
+                .pane_nav_tab_scroll_offsets
+                .get(&pane_id)
+                .copied()
+                .unwrap_or(0.0);
+            let (next, pane_animating) = Self::damp_scroll_value(current, target);
+            if (next - current).abs() > f32::EPSILON {
+                self.pane_nav_tab_scroll_offsets.insert(pane_id, next);
+            }
+            animating |= pane_animating;
+        }
+
+        if animating {
+            self.update_next_frame_time(Some(now + Duration::from_millis(16)));
+        }
+    }
+
     pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
         self.num_frames += 1;
         // If nothing on screen needs animating, then we can avoid
@@ -23,6 +60,7 @@ impl crate::TermWindow {
         self.allow_images = AllowImage::Yes;
 
         let start = Instant::now();
+        self.advance_tab_scroll_animation(start);
 
         {
             let diff = start.duration_since(self.last_fps_check_time);
@@ -169,6 +207,7 @@ impl crate::TermWindow {
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
 
+        self.sync_pane_font_sizes();
         let panes = self.get_panes_to_render();
         let focused = self.focused.is_some();
         let window_is_transparent =
@@ -264,6 +303,9 @@ impl crate::TermWindow {
                     .context("paint_split")?;
             }
         }
+
+        self.paint_workspace_sidebar(&mut layers)
+            .context("paint_workspace_sidebar")?;
 
         if self.show_tab_bar {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;

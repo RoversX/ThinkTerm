@@ -7,11 +7,11 @@
 	<key>CFBundleExecutable</key>
 	<string>wezterm-gui</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.github.wez.wezterm</string>
+	<string>com.roversx.thinkterm</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>WezTerm</string>
+	<string>ThinkTerm</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -23,7 +23,7 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>CFBundleIconFile</key>
-	<string>terminal.icns</string>
+	<string>ThinkTerm.icns</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>NSHighResolutionCapable</key>
@@ -33,35 +33,35 @@
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 	<key>CFBundleDisplayName</key>
-	<string>WezTerm</string>
+	<string>ThinkTerm</string>
 	<key>NSRequiresAquaSystemAppearance</key>
 	<string>NO</string>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>An application launched via WezTerm would like to access AppleScript.</string>
+	<string>An application launched via ThinkTerm would like to access AppleScript.</string>
 	<key>NSCalendarsUsageDescription</key>
-	<string>An application launched via WezTerm would like to access calendar data.</string>
+	<string>An application launched via ThinkTerm would like to access calendar data.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>An application launched via WezTerm would like to access the camera.</string>
+	<string>An application launched via ThinkTerm would like to access the camera.</string>
 	<key>NSContactsUsageDescription</key>
-	<string>An application launched via WezTerm wants to access your contacts.</string>
+	<string>An application launched via ThinkTerm wants to access your contacts.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
-	<string>An application launched via WezTerm would like to access your location information, even in the background.</string>
+	<string>An application launched via ThinkTerm would like to access your location information, even in the background.</string>
 	<key>NSLocationUsageDescription</key>
-	<string>An application launched via WezTerm would like to access your location information.</string>
+	<string>An application launched via ThinkTerm would like to access your location information.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>An application launched via WezTerm would like to access your location information while active.</string>
+	<string>An application launched via ThinkTerm would like to access your location information while active.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>An application launched via WezTerm would like to access your microphone.</string>
+	<string>An application launched via ThinkTerm would like to access your microphone.</string>
 	<key>NSRemindersUsageDescription</key>
-	<string>An application launched via WezTerm would like to access your reminders.</string>
+	<string>An application launched via ThinkTerm would like to access your reminders.</string>
 	<key>NSDocumentsFolderUsageDescription</key>
-	<string>An application launched via WezTerm would like to access your Documents folder.</string>
+	<string>An application launched via ThinkTerm would like to access your Documents folder.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
-	<string>An application launched via WezTerm would like to access your Downloads folder.</string>
+	<string>An application launched via ThinkTerm would like to access your Downloads folder.</string>
 	<key>NSSystemAdministrationUsageDescription</key>
-	<string>An application launched via WezTerm requires elevated permission.</string>
+	<string>An application launched via ThinkTerm requires elevated permission.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>An application launched via WezTerm would like to access the local network.</string>
+	<string>An application launched via ThinkTerm would like to access the local network.</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -70,7 +70,7 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleTypeIconFile</key>
-			<string>terminal.icns</string>
+			<string>ThinkTerm.icns</string>
 			<key>CFBundleTypeExtensions</key>
 			<array>
 				<string>command</string>

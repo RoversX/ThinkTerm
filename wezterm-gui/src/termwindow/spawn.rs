@@ -33,4 +33,19 @@ impl super::TermWindow {
             SpawnWhere::NewTab,
         );
     }
+
+    pub fn spawn_tab_to_right(&mut self, domain: &SpawnTabDomain) {
+        let insert_idx = mux::Mux::get()
+            .get_window(self.mux_window_id)
+            .map(|window| window.get_active_idx().saturating_add(1))
+            .unwrap_or(0);
+
+        self.spawn_command(
+            &SpawnCommand {
+                domain: domain.clone(),
+                ..Default::default()
+            },
+            SpawnWhere::NewTabAt(insert_idx),
+        );
+    }
 }

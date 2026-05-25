@@ -557,19 +557,45 @@ impl FontConfigInner {
     }
 
     fn compute_title_font(&self, config: &ConfigHandle, make_bold: bool) -> (TextStyle, f64) {
-        fn bold(family: &str) -> FontAttributes {
+        fn weighted(family: &str, weight: FontWeight) -> FontAttributes {
             FontAttributes {
                 family: family.to_string(),
-                weight: FontWeight::BOLD,
+                weight,
                 ..Default::default()
             }
         }
 
-        let mut fonts = vec![if make_bold {
-            bold("Roboto")
+        let mut fonts = vec![if cfg!(target_os = "macos") {
+            weighted(
+                ".AppleSystemUIFont",
+                if make_bold {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::REGULAR
+                },
+            )
+        } else if make_bold {
+            weighted("Roboto", FontWeight::BOLD)
         } else {
             FontAttributes::new("Roboto")
         }];
+
+        if cfg!(target_os = "macos") {
+            let mut fallback = weighted(
+                "Helvetica Neue",
+                if make_bold {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::REGULAR
+                },
+            );
+            fallback.is_fallback = true;
+            fonts.push(fallback);
+
+            let mut fallback = weighted(".Lucida Grande UI", FontWeight::MEDIUM);
+            fallback.is_fallback = true;
+            fonts.push(fallback);
+        }
 
         // Fallback to their main font selection, so that we can pick up
         // any fallback fonts they might have configured in the main
@@ -949,12 +975,19 @@ impl FontConfigInner {
     pub fn change_scaling(&self, font_scale: f64, dpi: usize) -> (f64, usize) {
         let prior_font = *self.font_scale.borrow();
         let prior_dpi = *self.dpi.borrow();
+        let dpi_changed = prior_dpi != dpi;
 
         *self.dpi.borrow_mut() = dpi;
         *self.font_scale.borrow_mut() = font_scale;
         self.fonts.borrow_mut().clear();
         self.metrics.borrow_mut().take();
-        self.title_font.borrow_mut().take();
+
+        if dpi_changed {
+            self.title_font.borrow_mut().take();
+            self.pane_select_font.borrow_mut().take();
+            self.char_select_font.borrow_mut().take();
+            self.command_palette_font.borrow_mut().take();
+        }
 
         (prior_font, prior_dpi)
     }

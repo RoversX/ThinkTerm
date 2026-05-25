@@ -66,10 +66,12 @@ impl SpawnCommand {
                         let mut cursor = tabroot.into_tree().cursor();
 
                         loop {
-                            if let Some(entry) = cursor.leaf_mut() {
-                                if entry.pane_id == pane_id {
-                                    window_id.replace(entry.window_id);
-                                    break 'outer;
+                            if let Some(stack) = cursor.leaf_mut() {
+                                for entry in &stack.panes {
+                                    if entry.pane_id == pane_id {
+                                        window_id.replace(entry.window_id);
+                                        break 'outer;
+                                    }
                                 }
                             }
                             match cursor.preorder_next() {

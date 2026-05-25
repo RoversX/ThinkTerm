@@ -2,6 +2,7 @@ use super::utilsprites::RenderMetrics;
 use crate::customglyph::*;
 use crate::renderstate::RenderContext;
 use crate::termwindow::render::paint::AllowImage;
+use crate::termwindow::ui::icons::SvgIcon;
 use ::window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
 use ::window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
 use ::window::color::SrgbaPixel;
@@ -69,6 +70,12 @@ impl From<&RenderMetrics> for CellMetricKey {
 pub struct SizedBlockKey {
     pub block: BlockKey,
     pub size: CellMetricKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SizedSvgIconKey {
+    pub icon: SvgIcon,
+    pub size: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -565,6 +572,7 @@ pub struct GlyphCache {
     frame_cache: HashMap<[u8; 32], Sprite>,
     line_glyphs: HashMap<LineKey, Sprite>,
     pub block_glyphs: HashMap<SizedBlockKey, Sprite>,
+    pub svg_icons: HashMap<SizedSvgIconKey, Sprite>,
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
     min_frame_duration: Duration,
@@ -588,6 +596,7 @@ impl GlyphCache {
             atlas,
             line_glyphs: HashMap::new(),
             block_glyphs: HashMap::new(),
+            svg_icons: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
@@ -617,6 +626,7 @@ impl GlyphCache {
             atlas,
             line_glyphs: HashMap::new(),
             block_glyphs: HashMap::new(),
+            svg_icons: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
@@ -1131,6 +1141,23 @@ impl GlyphCache {
 
         let sprite = self.atlas.allocate(&image)?;
         self.color.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    pub fn cached_svg_icon(&mut self, icon: SvgIcon, size: usize) -> anyhow::Result<Sprite> {
+        let size = size.max(1).min(u16::MAX as usize);
+        let key = SizedSvgIconKey {
+            icon,
+            size: size as u16,
+        };
+
+        if let Some(sprite) = self.svg_icons.get(&key) {
+            return Ok(sprite.clone());
+        }
+
+        let image = icon.rasterize(size)?;
+        let sprite = self.atlas.allocate(&image)?;
+        self.svg_icons.insert(key, sprite.clone());
         Ok(sprite)
     }
 

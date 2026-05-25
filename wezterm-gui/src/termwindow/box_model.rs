@@ -3,6 +3,7 @@ use crate::color::LinearRgba;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
 use crate::quad::{QuadImpl, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::{
     ColorEase, MouseCapture, RenderState, TermWindowNotif, UIItem, UIItemType,
 };
@@ -394,6 +395,7 @@ pub enum ElementContent {
     Text(String),
     Children(Vec<Element>),
     Poly { line_width: isize, poly: SizedPoly },
+    Icon { icon: SvgIcon, size: Dimension },
 }
 
 pub struct LayoutContext<'a> {
@@ -441,6 +443,7 @@ impl ComputedElement {
             }
             ComputedElementContent::Text(_) => {}
             ComputedElementContent::Poly { .. } => {}
+            ComputedElementContent::Icon { .. } => {}
         }
     }
 
@@ -469,6 +472,7 @@ impl ComputedElement {
                 }
             }
             ComputedElementContent::Poly { .. } => {}
+            ComputedElementContent::Icon { .. } => {}
         }
     }
 }
@@ -480,6 +484,10 @@ pub enum ComputedElementContent {
     Poly {
         line_width: isize,
         poly: PixelSizedPoly,
+    },
+    Icon {
+        icon: SvgIcon,
+        size: f32,
     },
 }
 
@@ -820,6 +828,26 @@ impl super::TermWindow {
                     },
                 })
             }
+            ElementContent::Icon { icon, size } => {
+                let size = size.evaluate_as_pixels(context.height).max(1.0);
+                let content_rect = euclid::rect(0., 0., size.max(min_width), size.max(min_height));
+                let rects = element.compute_rects(context, content_rect);
+
+                Ok(ComputedElement {
+                    item_type: element.item_type.clone(),
+                    zindex: element.zindex + context.zindex,
+                    baseline,
+                    border,
+                    border_corners,
+                    colors: element.colors.clone(),
+                    hover_colors: element.hover_colors.clone(),
+                    bounds: rects.bounds,
+                    border_rect: rects.border_rect,
+                    padding: rects.padding,
+                    content_rect: rects.content_rect,
+                    content: ComputedElementContent::Icon { icon: *icon, size },
+                })
+            }
         }
     }
 
@@ -939,6 +967,26 @@ impl super::TermWindow {
                     )?;
                     self.resolve_text(colors, inherited_colors).apply(&mut quad);
                 }
+            }
+            ComputedElementContent::Icon { icon, size } => {
+                let size = (*size).round().max(1.0) as usize;
+                let sprite = gl_state
+                    .glyph_cache
+                    .borrow_mut()
+                    .cached_svg_icon(*icon, size)?
+                    .texture_coords();
+                let mut quad = layers.allocate(2)?;
+                let icon_size = size as f32;
+                quad.set_position(
+                    element.content_rect.min_x() + left,
+                    element.content_rect.min_y() + top,
+                    element.content_rect.min_x() + left + icon_size,
+                    element.content_rect.min_y() + top + icon_size,
+                );
+                self.resolve_text(colors, inherited_colors).apply(&mut quad);
+                quad.set_texture(sprite);
+                quad.set_hsv(None);
+                quad.set_grayscale();
             }
         }
 

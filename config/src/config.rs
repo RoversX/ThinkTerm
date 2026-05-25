@@ -48,6 +48,8 @@ use wezterm_input_types::{
 };
 use wezterm_term::TerminalSize;
 
+const MACOS_DEFAULT_COLOR_SCHEME: &str = "Apple System Colors";
+
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
 pub struct Config {
     /// The font size, measured in points
@@ -753,7 +755,7 @@ pub struct Config {
     #[dynamic(default)]
     pub window_close_confirmation: WindowCloseConfirmation,
 
-    #[dynamic(default)]
+    #[dynamic(default = "default_true")]
     pub native_macos_fullscreen_mode: bool,
 
     #[dynamic(default)]
@@ -1386,6 +1388,14 @@ impl Config {
         // Load any additional color schemes into the color_schemes map
         cfg.load_color_schemes(&cfg.compute_color_scheme_dirs())
             .ok();
+
+        if cfg!(target_os = "macos") && cfg.color_scheme.is_none() && cfg.colors.is_none() {
+            cfg.color_scheme = Some(MACOS_DEFAULT_COLOR_SCHEME.to_string());
+        }
+
+        if cfg!(target_os = "macos") && cfg.adjust_window_size_when_changing_font_size.is_none() {
+            cfg.adjust_window_size_when_changing_font_size = Some(false);
+        }
 
         if let Some(scheme) = cfg.color_scheme.as_ref() {
             match cfg.resolve_color_scheme() {

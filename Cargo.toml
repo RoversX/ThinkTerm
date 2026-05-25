@@ -97,6 +97,7 @@ fixed = "1.23"
 fixedbitset = {version="0.4", default-features=false}
 flume = "0.11"
 fnv = "1.0"
+foreign-types = "0.5"
 fontconfig = { path = "deps/fontconfig" }
 frecency = { path = "frecency" }
 freetype = { path = "deps/freetype" }
@@ -183,6 +184,7 @@ rcgen = "0.12"
 regex = "1"
 reqwest = "0.12"
 resize = "0.5"
+resvg = { version = "0.45.1", default-features = false }
 rstest = "0.21"
 rusqlite = "0.32"
 serde = {version="1.0", default-features=false, features = ["derive"]}

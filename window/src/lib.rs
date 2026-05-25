@@ -230,6 +230,8 @@ pub enum WindowEvent {
 
     AppearanceChanged(Appearance),
 
+    ToggleWorkspaceSidebar,
+
     Notification(Box<dyn Any + Send + Sync>),
 
     // Called when the files are being dragged into the window
@@ -361,6 +363,9 @@ pub trait WindowOps {
     /// Depending on the system this may be shown in its titlebar
     /// and/or in the task manager/task switcher
     fn set_icon(&self, _image: Image) {}
+
+    /// Shows or hides ThinkTerm's terminal workspace sidebar button.
+    fn set_titlebar_sidebar_button_visible(&self, _visible: bool) {}
 
     fn maximize(&self) {}
     fn restore(&self) {}

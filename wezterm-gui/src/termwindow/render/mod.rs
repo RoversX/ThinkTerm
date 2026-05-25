@@ -29,7 +29,7 @@ use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::{CursorShape, CursorVisibility, SequenceNo};
 use wezterm_font::shaper::PresentationWidth;
 use wezterm_font::units::{IntPixelLength, PixelLength};
-use wezterm_font::{ClearShapeCache, GlyphInfo, LoadedFont};
+use wezterm_font::{ClearShapeCache, FontConfiguration, GlyphInfo, LoadedFont};
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{CellAttributes, Line, StableRowIndex};
 use window::color::LinearRgba;
@@ -62,6 +62,7 @@ pub struct LineQuadCacheKey {
     pub composing: Option<String>,
     pub selection: Range<usize>,
     pub shape_hash: [u8; 16],
+    pub font_identity: u64,
     pub top_pixel_y: NotNan<f32>,
     pub left_pixel_x: NotNan<f32>,
     pub phys_line_idx: usize,
@@ -90,6 +91,11 @@ pub struct LineToElementParams<'a> {
     pub window_is_transparent: bool,
     pub reverse_video: bool,
     pub shape_key: &'a Option<LineToEleShapeCacheKey>,
+    pub font: Option<&'a Rc<LoadedFont>>,
+    pub style: Option<&'a TextStyle>,
+    pub font_config: Option<&'a Rc<FontConfiguration>>,
+    pub render_metrics: RenderMetrics,
+    pub font_identity: u64,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -97,6 +103,7 @@ pub struct LineToEleShapeCacheKey {
     pub shape_hash: [u8; 16],
     pub composing: Option<(usize, String)>,
     pub shape_generation: usize,
+    pub font_identity: u64,
 }
 
 pub struct LineToElementShapeItem {
@@ -166,6 +173,8 @@ pub struct RenderScreenLineParams<'a> {
     pub use_pixel_positioning: bool,
 
     pub render_metrics: RenderMetrics,
+    pub font_config: Option<Rc<FontConfiguration>>,
+    pub font_identity: u64,
     pub shape_key: Option<LineToEleShapeCacheKey>,
     pub password_input: bool,
 }
@@ -354,7 +363,8 @@ impl crate::TermWindow {
             .config
             .window_padding
             .left
-            .evaluate_as_pixels(h_context);
+            .evaluate_as_pixels(h_context)
+            + self.workspace_sidebar_width() as f32;
         let padding_right = self.config.window_padding.right;
         let padding_top = self.config.window_padding.top.evaluate_as_pixels(v_context);
         let padding_bottom = self
@@ -399,13 +409,23 @@ impl crate::TermWindow {
         style: &TextStyle,
         attrs: &CellAttributes,
         font: Option<&Rc<LoadedFont>>,
+        font_config: Option<&Rc<FontConfiguration>>,
         gl_state: &RenderState,
         metrics: &RenderMetrics,
+        font_identity: u64,
     ) -> anyhow::Result<Rc<CachedGlyph>> {
         let fa_lock = "\u{f023}";
         let line = Line::from_text(fa_lock, attrs, 0, None);
         let cluster = line.cluster(None);
-        let shape_info = self.cached_cluster_shape(style, &cluster[0], gl_state, font, metrics)?;
+        let shape_info = self.cached_cluster_shape(
+            style,
+            &cluster[0],
+            gl_state,
+            font,
+            font_config,
+            metrics,
+            font_identity,
+        )?;
         Ok(Rc::clone(&shape_info[0].glyph))
     }
 
@@ -784,10 +804,13 @@ impl crate::TermWindow {
         cluster: &CellCluster,
         gl_state: &RenderState,
         font: Option<&Rc<LoadedFont>>,
+        font_config: Option<&Rc<FontConfiguration>>,
         metrics: &RenderMetrics,
+        font_identity: u64,
     ) -> anyhow::Result<Rc<Vec<ShapedInfo>>> {
         let shape_resolve_start = Instant::now();
         let key = BorrowedShapeCacheKey {
+            font_identity,
             style,
             text: &cluster.text,
         };
@@ -797,7 +820,7 @@ impl crate::TermWindow {
             None => {
                 let font = match font {
                     Some(f) => Rc::clone(f),
-                    None => self.fonts.resolve_font(style)?,
+                    None => font_config.unwrap_or(&self.fonts).resolve_font(style)?,
                 };
                 let window = self.window.as_ref().unwrap().clone();
 

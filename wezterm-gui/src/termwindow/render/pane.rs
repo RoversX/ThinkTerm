@@ -1,11 +1,20 @@
-use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
+use crate::quad::{
+    HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
+};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::{
     same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     RenderScreenLineParams,
 };
-use crate::termwindow::{ScrollHit, UIItem, UIItemType};
+use crate::termwindow::ui::icons::SvgIcon;
+use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
+use crate::termwindow::ui::tokens::{
+    PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_MAX_WIDTH,
+    PANE_NAV_TAB_MIN_WIDTH, PANE_NAV_TAB_RADIUS,
+};
+use crate::termwindow::{PaneNavAction, ScrollHit, UIItem, UIItemType};
+use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::TextureRect;
 use ::window::DeadKeyStatus;
 use anyhow::Context;
@@ -13,14 +22,450 @@ use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::PositionedPane;
+use mux::Mux;
 use ordered_float::NotNan;
+use std::rc::Rc;
 use std::time::Instant;
 use wezterm_dynamic::Value;
+use wezterm_font::{FontConfiguration, LoadedFont};
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 
 impl crate::TermWindow {
+    fn pane_nav_bar_height(&self, pos: &PositionedPane) -> usize {
+        pane_nav_bar_height_for_metrics(self.render_metrics).min(
+            pos.pixel_height
+                .saturating_sub(self.render_metrics.cell_size.height.max(1) as usize),
+        )
+    }
+
+    fn pane_content_origin(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {
+        let tab_bar_height = if self.show_tab_bar {
+            self.tab_bar_pixel_height()
+                .context("tab_bar_pixel_height")?
+        } else {
+            0.
+        };
+        let top_bar_height = if self.config.tab_bar_at_bottom {
+            0.0
+        } else {
+            tab_bar_height
+        };
+        let border = self.get_os_border();
+        let (padding_left, _) = self.padding_left_top();
+        Ok((
+            padding_left
+                + border.left.get() as f32
+                + (pos.left as f32 * self.render_metrics.cell_size.width as f32),
+            top_bar_height
+                + border.top.get() as f32
+                + (pos.top as f32 * self.render_metrics.cell_size.height as f32),
+        ))
+    }
+
+    fn paint_pane_nav_bar(
+        &mut self,
+        pos: &PositionedPane,
+        layers: &mut TripleLayerQuadAllocator,
+        palette: &ColorPalette,
+    ) -> anyhow::Result<usize> {
+        let nav_height = self.pane_nav_bar_height(pos);
+        if nav_height == 0 {
+            return Ok(0);
+        }
+
+        let (pane_x, pane_y) = self.pane_content_origin(pos)?;
+        let pane_width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
+        if pane_width <= 0.0 {
+            return Ok(0);
+        }
+
+        let background = palette
+            .resolve_bg(ColorAttribute::Default)
+            .to_linear()
+            .mul_alpha(self.config.window_background_opacity);
+        let foreground = palette.foreground.to_linear();
+        let nav_bg = background;
+        let divider = foreground.mul_alpha(0.08);
+        let muted_fg = foreground.mul_alpha(0.66);
+        let tab_bg = background;
+        let tab_fg = if pos.is_active { foreground } else { muted_fg };
+
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(pane_x, pane_y, pane_width, nav_height as f32),
+            nav_bg,
+        )
+        .context("pane nav background")?;
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(
+                pane_x,
+                pane_y + nav_height.saturating_sub(1) as f32,
+                pane_width,
+                1.0,
+            ),
+            divider,
+        )
+        .context("pane nav divider")?;
+        self.ui_items.push(UIItem {
+            x: pane_x.max(0.0) as usize,
+            y: pane_y.max(0.0) as usize,
+            width: pane_width.max(0.0) as usize,
+            height: nav_height,
+            item_type: UIItemType::PaneNav {
+                pane_id: pos.pane.pane_id(),
+                pane_index: pos.index,
+                action: PaneNavAction::Background,
+            },
+        });
+
+        let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
+        let button_size = (icon_size + 10)
+            .min(nav_height.saturating_sub(4))
+            .max(icon_size);
+        let button_y = pane_y as usize + (nav_height.saturating_sub(button_size) / 2);
+        let mut button_x = (pane_x + pane_width) as usize;
+        for (icon, action) in [
+            (SvgIcon::SplitVertical, PaneNavAction::SplitDown),
+            (SvgIcon::SplitHorizontal, PaneNavAction::SplitRight),
+        ] {
+            button_x = button_x.saturating_sub(button_size + PANE_NAV_BUTTON_GAP);
+            self.paint_pane_nav_icon_button(
+                layers,
+                icon,
+                button_x,
+                button_y,
+                button_size,
+                icon_size,
+                muted_fg,
+                pos,
+                action,
+            )?;
+        }
+
+        let tabs = Mux::get().pane_stack_tabs(pos.pane.pane_id());
+        let tab_start = pane_x as usize + PANE_NAV_INSET;
+        let tab_width = PANE_NAV_TAB_MAX_WIDTH.max(PANE_NAV_TAB_MIN_WIDTH);
+        let tab_step = tab_width + PANE_NAV_BUTTON_GAP;
+        let total_tab_width = tabs.len().saturating_mul(tab_width).saturating_add(
+            tabs.len()
+                .saturating_sub(1)
+                .saturating_mul(PANE_NAV_BUTTON_GAP),
+        );
+        let max_tab_right = button_x.saturating_sub(PANE_NAV_INSET);
+        let viewport_width = max_tab_right.saturating_sub(tab_start);
+        let max_scroll = total_tab_width.saturating_sub(viewport_width) as f32;
+        let scroll_offset = self
+            .pane_nav_tab_scroll_offsets
+            .get(&pos.pane.pane_id())
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, max_scroll.max(0.0));
+        let tab_height = button_size;
+        let tab_y = button_y;
+        for (idx, tab) in tabs.into_iter().enumerate() {
+            if tab_width <= icon_size + PANE_NAV_ICON_GAP + button_size || viewport_width == 0 {
+                break;
+            }
+
+            let virtual_x = idx.saturating_mul(tab_step) as f32;
+            let tab_left = tab_start as f32 + virtual_x - scroll_offset;
+            let tab_right = tab_left + tab_width as f32;
+            if tab_right <= tab_start as f32 || tab_left >= max_tab_right as f32 {
+                continue;
+            }
+
+            let visible_left = tab_left.max(tab_start as f32);
+            let visible_right = tab_right.min(max_tab_right as f32);
+            let visible_width = (visible_right - visible_left).max(0.0);
+            if visible_width <= 1.0 {
+                continue;
+            }
+
+            let visible_active_tab = tab.is_active && pos.is_active;
+            let is_renaming_tab = self.is_renaming_pane_nav_tab(tab.pane_id);
+            let this_tab_bg = tab_bg;
+            let this_tab_fg = if visible_active_tab { tab_fg } else { muted_fg };
+            let active_edge = foreground.mul_alpha(0.20);
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(visible_left, tab_y as f32, visible_width, tab_height as f32),
+                this_tab_bg,
+                PANE_NAV_TAB_RADIUS,
+            )
+            .context("pane nav tab")?;
+            if visible_active_tab {
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(
+                        visible_left,
+                        tab_y as f32 + (tab_height as f32 - 3.0).max(0.0),
+                        visible_width,
+                        3.0,
+                    ),
+                    palette.selection_bg.to_linear(),
+                )
+                .context("pane nav active tab accent")?;
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(visible_left, tab_y as f32, 1.0, tab_height as f32),
+                    active_edge,
+                )
+                .context("pane nav active tab left edge")?;
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(
+                        (visible_left + visible_width - 1.0).max(visible_left),
+                        tab_y as f32,
+                        1.0,
+                        tab_height as f32,
+                    ),
+                    active_edge,
+                )
+                .context("pane nav active tab right edge")?;
+            }
+            self.ui_items.push(UIItem {
+                x: visible_left.max(0.0) as usize,
+                y: tab_y,
+                width: visible_width.max(0.0) as usize,
+                height: tab_height,
+                item_type: UIItemType::PaneNav {
+                    pane_id: pos.pane.pane_id(),
+                    pane_index: pos.index,
+                    action: PaneNavAction::Activate(tab.pane_id),
+                },
+            });
+
+            let draw_tab_x = tab_left.max(0.0) as usize;
+            let title_icon_x = draw_tab_x + PANE_NAV_INSET;
+            let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
+            if title_icon_x >= tab_start && title_icon_x.saturating_add(icon_size) <= max_tab_right
+            {
+                self.paint_pane_nav_icon(
+                    layers,
+                    SvgIcon::SquareTerminal,
+                    title_icon_x,
+                    title_icon_y,
+                    icon_size,
+                    this_tab_fg,
+                )?;
+            }
+
+            let close_x = draw_tab_x + tab_width - button_size;
+            if !is_renaming_tab {
+                if close_x >= tab_start && close_x.saturating_add(button_size) <= max_tab_right {
+                    self.ui_items.push(UIItem {
+                        x: close_x,
+                        y: tab_y,
+                        width: button_size,
+                        height: button_size,
+                        item_type: UIItemType::PaneNav {
+                            pane_id: pos.pane.pane_id(),
+                            pane_index: pos.index,
+                            action: PaneNavAction::Close(tab.pane_id),
+                        },
+                    });
+                    self.paint_pane_nav_icon(
+                        layers,
+                        SvgIcon::X,
+                        close_x + ((button_size.saturating_sub(icon_size)) / 2),
+                        title_icon_y,
+                        icon_size,
+                        muted_fg,
+                    )?;
+                }
+            }
+
+            let ui_font = self.fonts.title_font().context("pane nav title font")?;
+            let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
+            let text_x = title_icon_x + icon_size + PANE_NAV_ICON_GAP;
+            let text_right = if is_renaming_tab {
+                draw_tab_x + tab_width - PANE_NAV_INSET
+            } else {
+                close_x
+            };
+            let text_width = text_right
+                .min(max_tab_right)
+                .saturating_sub(text_x + PANE_NAV_ICON_GAP);
+            let text_y =
+                tab_y + ((tab_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2);
+            let title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
+            if text_x >= tab_start && text_x < max_tab_right && text_width > 0 {
+                let text_fg = if is_renaming_tab {
+                    self.fill_rounded_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            text_x.saturating_sub(3) as f32,
+                            text_y as f32,
+                            text_width.saturating_add(6) as f32,
+                            ui_metrics.cell_size.height as f32,
+                        ),
+                        palette.selection_bg.to_linear(),
+                        4.0,
+                    )
+                    .context("pane nav rename selection")?;
+                    palette.selection_fg.to_linear()
+                } else {
+                    this_tab_fg
+                };
+                self.paint_pane_nav_text(
+                    layers, &ui_font, ui_metrics, &title, text_x, text_y, text_width, text_fg,
+                )?;
+            }
+        }
+
+        let fade_width = 18.0_f32.min(viewport_width as f32 / 3.0);
+        if fade_width > 1.0 && scroll_offset > 0.0 {
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(tab_start as f32, pane_y, fade_width, nav_height as f32),
+                nav_bg.mul_alpha(0.94),
+            )
+            .context("pane nav left overflow shade")?;
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    tab_start as f32 + fade_width - 2.0,
+                    pane_y,
+                    2.0,
+                    nav_height as f32,
+                ),
+                divider,
+            )
+            .context("pane nav left overflow edge")?;
+        }
+        if fade_width > 1.0 && scroll_offset < max_scroll {
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    max_tab_right as f32 - fade_width,
+                    pane_y,
+                    fade_width,
+                    nav_height as f32,
+                ),
+                nav_bg.mul_alpha(0.94),
+            )
+            .context("pane nav right overflow shade")?;
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    max_tab_right as f32 - fade_width,
+                    pane_y,
+                    2.0,
+                    nav_height as f32,
+                ),
+                divider,
+            )
+            .context("pane nav right overflow edge")?;
+        }
+
+        Ok(nav_height)
+    }
+
+    fn paint_pane_nav_icon_button(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        icon: SvgIcon,
+        x: usize,
+        y: usize,
+        button_size: usize,
+        icon_size: usize,
+        color: LinearRgba,
+        pos: &PositionedPane,
+        action: PaneNavAction,
+    ) -> anyhow::Result<()> {
+        self.ui_items.push(UIItem {
+            x,
+            y,
+            width: button_size,
+            height: button_size,
+            item_type: UIItemType::PaneNav {
+                pane_id: pos.pane.pane_id(),
+                pane_index: pos.index,
+                action,
+            },
+        });
+
+        self.paint_pane_nav_icon(
+            layers,
+            icon,
+            x + ((button_size.saturating_sub(icon_size)) / 2),
+            y + ((button_size.saturating_sub(icon_size)) / 2),
+            icon_size,
+            color,
+        )
+    }
+
+    fn paint_pane_nav_text(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: RenderMetrics,
+        text: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if width == 0 {
+            return Ok(());
+        }
+
+        let cell_width = (metrics.cell_size.width as usize).max(1);
+        if width < cell_width {
+            return Ok(());
+        }
+
+        self.paint_ui_title_text(layers, font, &metrics, text, x, y, width, foreground)
+    }
+
+    fn paint_pane_nav_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        icon: SvgIcon,
+        x: usize,
+        y: usize,
+        size: usize,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        let gl_state = self.render_state.as_ref().unwrap();
+        let sprite = gl_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_svg_icon(icon, size)?
+            .texture_coords();
+
+        let mut quad = layers.allocate(2)?;
+        quad.set_position(
+            x as f32 - left_offset,
+            y as f32 - top_offset,
+            x as f32 + size as f32 - left_offset,
+            y as f32 + size as f32 - top_offset,
+        );
+        quad.set_texture(sprite);
+        quad.set_fg_color(color);
+        quad.set_alt_color_and_mix_value(color, 0.0);
+        quad.set_hsv(None);
+        quad.set_grayscale();
+
+        Ok(())
+    }
+
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
         let computed = self.build_pane(pos)?;
         let mut ui_items = computed.ui_items();
@@ -85,6 +530,16 @@ impl crate::TermWindow {
         let pane_id = pos.pane.pane_id();
         let current_viewport = self.get_viewport(pane_id);
         let dims = pos.pane.get_dimensions();
+        let global_render_metrics = self.render_metrics;
+        let pane_font_scale = self.pane_font_scale(pane_id);
+        let (pane_font_config, pane_render_metrics) =
+            if pane_font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
+                (None, global_render_metrics)
+            } else {
+                let (fonts, metrics) = self.pane_font_resources(pane_font_scale)?;
+                (Some(fonts), metrics)
+            };
+        let render_dims = dims;
 
         let gl_state = self.render_state.as_ref().unwrap();
 
@@ -221,6 +676,10 @@ impl crate::TermWindow {
             }
         }
 
+        let pane_nav_height = self
+            .paint_pane_nav_bar(pos, layers, &palette)
+            .context("paint_pane_nav_bar")?;
+
         // TODO: we only have a single scrollbar in a single position.
         // We only update it for the active pane, but we should probably
         // do a per-pane scrollbar.  That will require more extensive
@@ -304,8 +763,11 @@ impl crate::TermWindow {
 
         {
             let stable_range = match current_viewport {
-                Some(top) => top..top + dims.viewport_rows as StableRowIndex,
-                None => dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
+                Some(top) => top..top + render_dims.viewport_rows as StableRowIndex,
+                None => {
+                    dims.physical_top
+                        ..dims.physical_top + render_dims.viewport_rows as StableRowIndex
+                }
             };
 
             pos.pane
@@ -318,6 +780,9 @@ impl crate::TermWindow {
                 dims: RenderableDimensions,
                 top_pixel_y: f32,
                 left_pixel_x: f32,
+                render_metrics: RenderMetrics,
+                font_config: Option<Rc<FontConfiguration>>,
+                font_identity: u64,
                 pos: &'a PositionedPane,
                 pane_id: PaneId,
                 cursor: &'a StableCursorPosition,
@@ -339,15 +804,21 @@ impl crate::TermWindow {
 
             let left_pixel_x = padding_left
                 + border.left.get() as f32
-                + (pos.left as f32 * self.render_metrics.cell_size.width as f32);
+                + (pos.left as f32 * global_render_metrics.cell_size.width as f32);
+            let pane_top_pixel_y = top_pixel_y
+                + (pos.top as f32 * global_render_metrics.cell_size.height as f32)
+                + pane_nav_height as f32;
 
             let mut render = LineRender {
                 term_window: self,
                 selrange,
                 rectangular,
-                dims,
-                top_pixel_y,
+                dims: render_dims,
+                top_pixel_y: pane_top_pixel_y,
                 left_pixel_x,
+                render_metrics: pane_render_metrics,
+                font_config: pane_font_config,
+                font_identity: pane_font_scale.to_bits(),
                 pos,
                 pane_id,
                 cursor: &cursor,
@@ -430,13 +901,13 @@ impl crate::TermWindow {
                         config_generation: self.term_window.config.generation(),
                         shape_generation: self.term_window.shape_generation,
                         quad_generation: self.term_window.quad_generation,
+                        font_identity: self.font_identity,
                         composing: composing.clone(),
                         selection: selrange.clone(),
                         cursor,
                         shape_hash,
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
-                            + (line_idx + self.pos.top) as f32
-                                * self.term_window.render_metrics.cell_size.height as f32,
+                            + line_idx as f32 * self.render_metrics.cell_size.height as f32,
                         left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
                         phys_line_idx: line_idx,
                         reverse_video: self.dims.reverse_video,
@@ -473,6 +944,7 @@ impl crate::TermWindow {
                     let shape_key = LineToEleShapeCacheKey {
                         shape_hash,
                         shape_generation: quad_key.shape_generation,
+                        font_identity: self.font_identity,
                         composing: if self.cursor.y == stable_row && self.pos.is_active {
                             if let DeadKeyStatus::Composing(composing) =
                                 &self.term_window.dead_key_status
@@ -493,7 +965,7 @@ impl crate::TermWindow {
                                 top_pixel_y: *quad_key.top_pixel_y,
                                 left_pixel_x: self.left_pixel_x,
                                 pixel_width: self.dims.cols as f32
-                                    * self.term_window.render_metrics.cell_size.width as f32,
+                                    * self.render_metrics.cell_size.width as f32,
                                 stable_line_idx: Some(stable_row),
                                 line: &line,
                                 selection: selrange.clone(),
@@ -520,7 +992,9 @@ impl crate::TermWindow {
                                     .term_window
                                     .config
                                     .experimental_pixel_positioning,
-                                render_metrics: self.term_window.render_metrics,
+                                render_metrics: self.render_metrics,
+                                font_config: self.font_config.clone(),
+                                font_identity: self.font_identity,
                                 shape_key: Some(shape_key),
                                 password_input,
                             },

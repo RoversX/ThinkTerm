@@ -385,6 +385,8 @@ impl CommandDef {
         let mut candidates_for_removal = vec![];
         #[allow(unexpected_cfgs)] // <https://github.com/SSheldon/rust-objc/issues/125>
         let wezterm_perform_key_assignment_sel = sel!(weztermPerformKeyAssignment:);
+        #[allow(unexpected_cfgs)] // <https://github.com/SSheldon/rust-objc/issues/125>
+        let thinkterm_about_sel = sel!(thinktermOrderFrontStandardAboutPanel:);
 
         /// Mark menu items as candidates for removal
         fn mark_candidates(menu: &Menu, candidates: &mut Vec<MenuItem>, action: SEL) {
@@ -420,7 +422,7 @@ impl CommandDef {
         commands.retain(|cmd| !cmd.menubar.is_empty());
 
         // Prefer to put the menus in this order
-        let mut order: Vec<&'static str> = vec!["WezTerm", "Shell", "Edit", "View", "Window"];
+        let mut order: Vec<&'static str> = vec!["ThinkTerm", "Shell", "Edit", "View", "Window"];
         // Add any other menus on the end
         for cmd in &commands {
             if !order.contains(&cmd.menubar[0]) {
@@ -440,21 +442,13 @@ impl CommandDef {
                         // macOS will insert stuff at the top and bottom, so we add
                         // a separator to tidy things up a bit
                         menu.add_item(&MenuItem::new_separator());
-                    } else if cmd.menubar[0] == "WezTerm" {
+                    } else if cmd.menubar[0] == "ThinkTerm" {
                         menu.assign_as_app_menu();
 
-                        let about_item = MenuItem::new_with(
-                            &format!("WezTerm {}", config::wezterm_version()),
-                            Some(wezterm_perform_key_assignment_sel),
-                            "",
-                        );
-                        about_item.set_tool_tip("Click to copy version number");
-                        about_item.set_represented_item(RepresentedItem::KeyAssignment(
-                            KeyAssignment::CopyTextTo {
-                                text: config::wezterm_version().to_string(),
-                                destination: ClipboardCopyDestination::ClipboardAndPrimarySelection,
-                            },
-                        ));
+                        let about_item =
+                            MenuItem::new_with("About ThinkTerm", Some(thinkterm_about_sel), "");
+                        about_item.set_target_application_delegate();
+                        about_item.set_system_symbol_image("info.circle");
 
                         menu.add_item(&about_item);
                         menu.add_item(&MenuItem::new_separator());
@@ -745,8 +739,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 .into(),
             keys: vec![(Modifiers::SUPER, "h".into())],
             args: &[],
-            menubar: &["WezTerm"],
+            menubar: &["ThinkTerm"],
             icon: None,
+        },
+        OpenSettings => CommandDef {
+            brief: "Settings...".into(),
+            doc: "Opens the ThinkTerm settings UI".into(),
+            keys: vec![(Modifiers::SUPER, ",".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["ThinkTerm"],
+            icon: Some("cod_settings_gear"),
         },
         SpawnWindow => CommandDef {
             brief: "New Window".into(),
@@ -821,6 +823,22 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             args: &[ArgType::ActiveWindow],
             menubar: &[],
             icon: None,
+        },
+        PromptRenameTab => CommandDef {
+            brief: "Rename Tab".into(),
+            doc: "Prompts for a new title for the current tab".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveTab],
+            menubar: &[],
+            icon: Some("md_edit"),
+        },
+        PromptRenamePaneTab(_) => CommandDef {
+            brief: "Rename Pane Tab".into(),
+            doc: "Prompts for a new title for the pane-local tab".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &[],
+            icon: Some("md_edit"),
         },
         QuickSelect => CommandDef {
             brief: "Enter QuickSelect mode".into(),
@@ -941,6 +959,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             args: &[ArgType::ActiveWindow],
             menubar: &["View", "Font Size"],
             icon: Some("md_format_size"),
+        },
+        SpawnTabToRight(_) => CommandDef {
+            brief: "New Terminal Tab to Right".into(),
+            doc: "Create a new tab immediately to the right of the current tab".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_tab_plus"),
         },
         SpawnTab(SpawnTabDomain::CurrentPaneDomain) => CommandDef {
             brief: "New Tab".into(),
@@ -1268,15 +1294,15 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             doc: "Reloads the configuration file".into(),
             keys: vec![(Modifiers::SUPER, "r".into())],
             args: &[],
-            menubar: &["WezTerm"],
+            menubar: &["ThinkTerm"],
             icon: Some("md_reload"),
         },
         QuitApplication => CommandDef {
-            brief: "Quit WezTerm".into(),
-            doc: "Quits WezTerm".into(),
+            brief: "Quit ThinkTerm".into(),
+            doc: "Quits ThinkTerm".into(),
             keys: vec![(Modifiers::SUPER, "q".into())],
             args: &[],
-            menubar: &["WezTerm"],
+            menubar: &["ThinkTerm"],
             icon: Some("oct_stop"),
         },
         MoveTabRelative(-1) => CommandDef {
@@ -2019,8 +2045,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
 fn compute_default_actions() -> Vec<KeyAssignment> {
     // These are ordered by their position within the various menus
     return vec![
-        // ----------------- WezTerm
+        // ----------------- ThinkTerm
         ReloadConfiguration,
+        OpenSettings,
         #[cfg(target_os = "macos")]
         HideApplication,
         #[cfg(target_os = "macos")]

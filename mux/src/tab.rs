@@ -14,10 +14,12 @@ use std::sync::Arc;
 use url::Url;
 use wezterm_term::{StableRowIndex, TerminalSize};
 
-pub type Tree = bintree::Tree<Arc<dyn Pane>, SplitDirectionAndSize>;
-pub type Cursor = bintree::Cursor<Arc<dyn Pane>, SplitDirectionAndSize>;
+pub type PaneStackId = usize;
+pub type Tree = bintree::Tree<PaneStack, SplitDirectionAndSize>;
+pub type Cursor = bintree::Cursor<PaneStack, SplitDirectionAndSize>;
 
 static TAB_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+static PANE_STACK_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type TabId = usize;
 
 #[derive(Default)]
@@ -34,6 +36,144 @@ impl Recency {
 
     fn score(&self, idx: usize) -> usize {
         self.by_idx.get(&idx).copied().unwrap_or(0)
+    }
+}
+
+#[derive(Clone)]
+pub struct PaneStack {
+    id: PaneStackId,
+    panes: Vec<Arc<dyn Pane>>,
+    active: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneStackTab {
+    pub pane_id: PaneId,
+    pub title: String,
+    pub is_active: bool,
+}
+
+impl PaneStack {
+    fn new(pane: Arc<dyn Pane>) -> Self {
+        Self::from_panes(vec![pane], 0)
+    }
+
+    fn from_panes(panes: Vec<Arc<dyn Pane>>, active: usize) -> Self {
+        Self {
+            id: PANE_STACK_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed),
+            active: active.min(panes.len().saturating_sub(1)),
+            panes,
+        }
+    }
+
+    pub fn id(&self) -> PaneStackId {
+        self.id
+    }
+
+    fn len(&self) -> usize {
+        self.panes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.panes.is_empty()
+    }
+
+    fn active_index(&self) -> usize {
+        self.active.min(self.panes.len().saturating_sub(1))
+    }
+
+    fn active_pane(&self) -> Option<Arc<dyn Pane>> {
+        self.panes.get(self.active_index()).map(Arc::clone)
+    }
+
+    fn contains_pane(&self, pane_id: PaneId) -> bool {
+        self.panes.iter().any(|pane| pane.pane_id() == pane_id)
+    }
+
+    fn pane_index(&self, pane_id: PaneId) -> Option<usize> {
+        self.panes.iter().position(|pane| pane.pane_id() == pane_id)
+    }
+
+    fn set_active_pane(&mut self, pane_id: PaneId) -> bool {
+        match self.pane_index(pane_id) {
+            Some(index) => {
+                self.active = index;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn push_and_activate(&mut self, pane: Arc<dyn Pane>) {
+        self.panes.push(pane);
+        self.active = self.panes.len().saturating_sub(1);
+    }
+
+    fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+        for pane in &self.panes {
+            pane.resize(size)?;
+        }
+        Ok(())
+    }
+
+    fn tabs(&self) -> Vec<PaneStackTab> {
+        let active = self.active_index();
+        self.panes
+            .iter()
+            .enumerate()
+            .map(|(idx, pane)| PaneStackTab {
+                pane_id: pane.pane_id(),
+                title: pane.get_title(),
+                is_active: idx == active,
+            })
+            .collect()
+    }
+
+    fn remove_matching<F>(
+        &mut self,
+        pane_index: usize,
+        f: &F,
+        zoomed_pane: Option<PaneId>,
+    ) -> (Vec<Arc<dyn Pane>>, bool)
+    where
+        F: Fn(usize, &Arc<dyn Pane>) -> bool,
+    {
+        let mut removed = vec![];
+        let mut idx = 0;
+        let active = self.active_index();
+        let mut removed_before_active = 0;
+        let mut removed_active = false;
+
+        self.panes.retain(|pane| {
+            let should_remove = f(pane_index, pane);
+            if should_remove {
+                if idx < active {
+                    removed_before_active += 1;
+                }
+                if idx == active || Some(pane.pane_id()) == zoomed_pane {
+                    removed_active = true;
+                }
+                removed.push(Arc::clone(pane));
+            }
+            idx += 1;
+            !should_remove
+        });
+
+        if self.panes.is_empty() {
+            self.active = 0;
+        } else if removed_active {
+            self.active = self
+                .active_index()
+                .saturating_sub(1)
+                .min(self.panes.len().saturating_sub(1));
+        } else {
+            self.active = active
+                .saturating_sub(removed_before_active)
+                .min(self.panes.len().saturating_sub(1));
+        }
+
+        let became_empty = self.panes.is_empty();
+        (removed, became_empty)
     }
 }
 
@@ -223,6 +363,44 @@ fn pane_tree(
     left_col: usize,
     top_row: usize,
 ) -> PaneNode {
+    fn pane_entry(
+        pane: &Arc<dyn Pane>,
+        tab_id: TabId,
+        window_id: WindowId,
+        active: Option<&Arc<dyn Pane>>,
+        zoomed: Option<&Arc<dyn Pane>>,
+        workspace: &str,
+        left_col: usize,
+        top_row: usize,
+    ) -> PaneEntry {
+        let dims = pane.get_dimensions();
+        let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
+        let cursor_pos = pane.get_cursor_position();
+
+        PaneEntry {
+            window_id,
+            tab_id,
+            pane_id: pane.pane_id(),
+            title: pane.get_title(),
+            is_active_pane: is_pane(pane, &active),
+            is_zoomed_pane: is_pane(pane, &zoomed),
+            size: TerminalSize {
+                cols: dims.cols,
+                rows: dims.viewport_rows,
+                pixel_height: dims.pixel_height,
+                pixel_width: dims.pixel_width,
+                dpi: dims.dpi,
+            },
+            working_dir: working_dir.map(Into::into),
+            workspace: workspace.to_string(),
+            cursor_pos,
+            physical_top: dims.physical_top,
+            left_col,
+            top_row,
+            tty_name: pane.tty_name(),
+        }
+    }
+
     match tree {
         Tree::Empty => PaneNode::Empty,
         Tree::Node { left, right, data } => {
@@ -252,39 +430,31 @@ fn pane_tree(
                 node: data,
             }
         }
-        Tree::Leaf(pane) => {
-            let dims = pane.get_dimensions();
-            let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
-            let cursor_pos = pane.get_cursor_position();
+        Tree::Leaf(stack) => {
+            let entries: Vec<_> = stack
+                .panes
+                .iter()
+                .map(|pane| {
+                    pane_entry(
+                        pane, tab_id, window_id, active, zoomed, workspace, left_col, top_row,
+                    )
+                })
+                .collect();
 
-            PaneNode::Leaf(PaneEntry {
-                window_id,
-                tab_id,
-                pane_id: pane.pane_id(),
-                title: pane.get_title(),
-                is_active_pane: is_pane(pane, &active),
-                is_zoomed_pane: is_pane(pane, &zoomed),
-                size: TerminalSize {
-                    cols: dims.cols,
-                    rows: dims.viewport_rows,
-                    pixel_height: dims.pixel_height,
-                    pixel_width: dims.pixel_width,
-                    dpi: dims.dpi,
-                },
-                working_dir: working_dir.map(Into::into),
-                workspace: workspace.to_string(),
-                cursor_pos,
-                physical_top: dims.physical_top,
-                left_col,
-                top_row,
-                tty_name: pane.tty_name(),
-            })
+            if entries.len() == 1 {
+                PaneNode::Leaf(entries.into_iter().next().unwrap())
+            } else {
+                PaneNode::Stack(PaneStackEntry {
+                    active: stack.active_index(),
+                    panes: entries,
+                })
+            }
         }
     }
 }
 
 fn build_from_pane_tree<F>(
-    tree: bintree::Tree<PaneEntry, SplitDirectionAndSize>,
+    tree: bintree::Tree<PaneStackEntry, SplitDirectionAndSize>,
     active: &mut Option<Arc<dyn Pane>>,
     zoomed: &mut Option<Arc<dyn Pane>>,
     make_pane: &mut F,
@@ -300,16 +470,27 @@ where
             data,
         },
         bintree::Tree::Leaf(entry) => {
-            let is_zoomed_pane = entry.is_zoomed_pane;
-            let is_active_pane = entry.is_active_pane;
-            let pane = make_pane(entry);
-            if is_zoomed_pane {
-                zoomed.replace(Arc::clone(&pane));
+            let active_index = entry.active.min(entry.panes.len().saturating_sub(1));
+            let mut panes = vec![];
+
+            for pane_entry in entry.panes {
+                let is_zoomed_pane = pane_entry.is_zoomed_pane;
+                let is_active_pane = pane_entry.is_active_pane;
+                let pane = make_pane(pane_entry);
+                if is_zoomed_pane {
+                    zoomed.replace(Arc::clone(&pane));
+                }
+                if is_active_pane {
+                    active.replace(Arc::clone(&pane));
+                }
+                panes.push(pane);
             }
-            if is_active_pane {
-                active.replace(Arc::clone(&pane));
+
+            if panes.is_empty() {
+                Tree::Empty
+            } else {
+                Tree::Leaf(PaneStack::from_panes(panes, active_index))
             }
-            Tree::Leaf(pane)
         }
     }
 }
@@ -478,22 +659,23 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
     }
 }
 
-fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
+fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) -> anyhow::Result<()> {
     match tree {
-        Tree::Empty => return,
-        Tree::Node { data: None, .. } => return,
+        Tree::Empty => return Ok(()),
+        Tree::Node { data: None, .. } => return Ok(()),
         Tree::Node {
             left,
             right,
             data: Some(data),
         } => {
-            apply_sizes_from_splits(&*left, &data.first);
-            apply_sizes_from_splits(&*right, &data.second);
+            apply_sizes_from_splits(&*left, &data.first)?;
+            apply_sizes_from_splits(&*right, &data.second)?;
         }
-        Tree::Leaf(pane) => {
-            pane.resize(*size).ok();
+        Tree::Leaf(stack) => {
+            stack.resize(*size)?;
         }
     }
+    Ok(())
 }
 
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
@@ -579,6 +761,18 @@ impl Tab {
 
     pub fn iter_panes_ignoring_zoom(&self) -> Vec<PositionedPane> {
         self.inner.lock().iter_panes_ignoring_zoom()
+    }
+
+    pub fn iter_all_panes(&self) -> Vec<Arc<dyn Pane>> {
+        self.inner.lock().iter_all_panes()
+    }
+
+    pub fn pane_stack_tabs(&self, pane_id: PaneId) -> Vec<PaneStackTab> {
+        self.inner.lock().pane_stack_tabs(pane_id)
+    }
+
+    pub fn pane_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
+        self.inner.lock().pane_index_for_pane(pane_id)
     }
 
     pub fn rotate_counter_clockwise(&self) {
@@ -706,6 +900,18 @@ impl Tab {
         self.inner.lock().set_active_idx(pane_index)
     }
 
+    pub fn add_pane_to_stack(
+        &self,
+        base_pane_id: PaneId,
+        pane: Arc<dyn Pane>,
+    ) -> anyhow::Result<usize> {
+        self.inner.lock().add_pane_to_stack(base_pane_id, pane)
+    }
+
+    pub fn activate_pane_in_stack(&self, pane_id: PaneId) -> anyhow::Result<usize> {
+        self.inner.lock().activate_pane_in_stack(pane_id)
+    }
+
     /// Assigns the root pane.
     /// This is suitable when creating a new tab and then assigning
     /// the initial pane
@@ -784,8 +990,8 @@ impl TabInner {
             // Resolve the active pane to its index
             let mut index = 0;
             loop {
-                if let Some(pane) = cursor.leaf_mut() {
-                    if active.pane_id() == pane.pane_id() {
+                if let Some(stack) = cursor.leaf_mut() {
+                    if stack.set_active_pane(active.pane_id()) {
                         // Found it
                         self.active = index;
                         self.recency.tag(index);
@@ -865,7 +1071,7 @@ impl TabInner {
 
         loop {
             if cursor.is_leaf() {
-                count += 1;
+                count += cursor.leaf_mut().unwrap().len();
             }
             match cursor.preorder_next() {
                 Ok(c) => cursor = c,
@@ -904,7 +1110,9 @@ impl TabInner {
             self.size_before_zoom = size;
             if let Some(pane) = self.get_active_pane() {
                 pane.set_zoomed(true);
-                pane.resize(size).ok();
+                if let Err(err) = pane.resize(size) {
+                    log::error!("failed to resize zoomed pane: {err:#}");
+                }
                 self.zoomed.replace(pane);
             }
         }
@@ -916,7 +1124,7 @@ impl TabInner {
             match tree {
                 Tree::Empty => false,
                 Tree::Node { left, right, .. } => contains(left, pane) || contains(right, pane),
-                Tree::Leaf(p) => p.pane_id() == pane,
+                Tree::Leaf(stack) => stack.contains_pane(pane),
             }
         }
         match &self.pane {
@@ -937,23 +1145,111 @@ impl TabInner {
         self.iter_panes_impl(false)
     }
 
+    fn iter_all_panes(&mut self) -> Vec<Arc<dyn Pane>> {
+        let mut panes = vec![];
+        let mut cursor = self.pane.take().unwrap().cursor();
+
+        loop {
+            if cursor.is_leaf() {
+                panes.extend(cursor.leaf_mut().unwrap().panes.iter().cloned());
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(c) => {
+                    self.pane.replace(c.tree());
+                    break;
+                }
+            }
+        }
+
+        panes
+    }
+
+    fn pane_stack_tabs(&mut self, pane_id: PaneId) -> Vec<PaneStackTab> {
+        let mut tabs = vec![];
+        let mut cursor = self.pane.take().unwrap().cursor();
+
+        loop {
+            if cursor.is_leaf() {
+                let stack = cursor.leaf_mut().unwrap();
+                if stack.contains_pane(pane_id) {
+                    tabs = stack.tabs();
+                }
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) if tabs.is_empty() => cursor = c,
+                Ok(c) | Err(c) => {
+                    self.pane.replace(c.tree());
+                    break;
+                }
+            }
+        }
+
+        tabs
+    }
+
+    fn pane_index_for_pane(&mut self, pane_id: PaneId) -> Option<usize> {
+        let mut cursor = self.pane.take().unwrap().cursor();
+        let mut pane_index = 0;
+        let mut found = None;
+
+        loop {
+            if cursor.is_leaf() {
+                if cursor.leaf_mut().unwrap().contains_pane(pane_id) {
+                    found = Some(pane_index);
+                }
+                pane_index += 1;
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) if found.is_none() => cursor = c,
+                Ok(c) | Err(c) => {
+                    self.pane.replace(c.tree());
+                    break;
+                }
+            }
+        }
+
+        found
+    }
+
+    fn iter_stacks(&mut self) -> Vec<PaneStack> {
+        let mut stacks = vec![];
+        let mut cursor = self.pane.take().unwrap().cursor();
+
+        loop {
+            if cursor.is_leaf() {
+                stacks.push(cursor.leaf_mut().unwrap().clone());
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(c) => {
+                    self.pane.replace(c.tree());
+                    break;
+                }
+            }
+        }
+
+        stacks
+    }
+
     fn rotate_counter_clockwise(&mut self) {
-        let panes = self.iter_panes_ignoring_zoom();
-        if panes.is_empty() {
+        let stacks = self.iter_stacks();
+        if stacks.is_empty() {
             // Shouldn't happen, but we check for this here so that the
             // expect below cannot trigger a panic
             return;
         }
-        let mut pane_to_swap = panes
-            .first()
-            .map(|p| p.pane.clone())
-            .expect("at least one pane");
+        let mut stack_to_swap = stacks.first().cloned().expect("at least one pane");
 
         let mut cursor = self.pane.take().unwrap().cursor();
 
         loop {
             if cursor.is_leaf() {
-                std::mem::swap(&mut pane_to_swap, cursor.leaf_mut().unwrap());
+                std::mem::swap(&mut stack_to_swap, cursor.leaf_mut().unwrap());
             }
 
             match cursor.postorder_next() {
@@ -961,7 +1257,9 @@ impl TabInner {
                 Err(c) => {
                     self.pane.replace(c.tree());
                     let size = self.size;
-                    apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
+                    if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+                        log::error!("failed to resize panes after rotation: {err:#}");
+                    }
                     break;
                 }
             }
@@ -969,22 +1267,19 @@ impl TabInner {
     }
 
     fn rotate_clockwise(&mut self) {
-        let panes = self.iter_panes_ignoring_zoom();
-        if panes.is_empty() {
+        let stacks = self.iter_stacks();
+        if stacks.is_empty() {
             // Shouldn't happen, but we check for this here so that the
             // expect below cannot trigger a panic
             return;
         }
-        let mut pane_to_swap = panes
-            .last()
-            .map(|p| p.pane.clone())
-            .expect("at least one pane");
+        let mut stack_to_swap = stacks.last().cloned().expect("at least one pane");
 
         let mut cursor = self.pane.take().unwrap().cursor();
 
         loop {
             if cursor.is_leaf() {
-                std::mem::swap(&mut pane_to_swap, cursor.leaf_mut().unwrap());
+                std::mem::swap(&mut stack_to_swap, cursor.leaf_mut().unwrap());
             }
 
             match cursor.preorder_next() {
@@ -992,7 +1287,9 @@ impl TabInner {
                 Err(c) => {
                     self.pane.replace(c.tree());
                     let size = self.size;
-                    apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
+                    if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+                        log::error!("failed to resize panes after rotation: {err:#}");
+                    }
                     break;
                 }
             }
@@ -1049,21 +1346,22 @@ impl TabInner {
                     }
                 }
 
-                let pane = Arc::clone(cursor.leaf_mut().unwrap());
-                let dims = parent_size.unwrap_or_else(|| root_size);
+                if let Some(pane) = cursor.leaf_mut().unwrap().active_pane() {
+                    let dims = parent_size.unwrap_or_else(|| root_size);
 
-                panes.push(PositionedPane {
-                    index,
-                    is_active: index == active_idx,
-                    is_zoomed: zoomed_id == Some(pane.pane_id()),
-                    left,
-                    top,
-                    width: dims.cols as _,
-                    height: dims.rows as _,
-                    pixel_width: dims.pixel_width as _,
-                    pixel_height: dims.pixel_height as _,
-                    pane,
-                });
+                    panes.push(PositionedPane {
+                        index,
+                        is_active: index == active_idx,
+                        is_zoomed: zoomed_id == Some(pane.pane_id()),
+                        left,
+                        top,
+                        width: dims.cols as _,
+                        height: dims.rows as _,
+                        pixel_width: dims.pixel_width as _,
+                        pixel_height: dims.pixel_height as _,
+                        pane,
+                    });
+                }
             }
 
             match cursor.preorder_next() {
@@ -1144,7 +1442,9 @@ impl TabInner {
 
         if let Some(zoomed) = &self.zoomed {
             self.size = size;
-            zoomed.resize(size).ok();
+            if let Err(err) = zoomed.resize(size) {
+                log::error!("failed to resize zoomed pane: {err:#}");
+            }
         } else {
             let dims = cell_dimensions(&size);
             let (min_x, min_y) = compute_min_size(self.pane.as_mut().unwrap());
@@ -1176,7 +1476,9 @@ impl TabInner {
             self.size = size;
 
             // And then resize the individual panes to match
-            apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
+            if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+                log::error!("failed to resize panes after split adjustment: {err:#}");
+            }
         }
 
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
@@ -1223,7 +1525,8 @@ impl TabInner {
         fn compute_size(node: &mut Tree) -> Option<TerminalSize> {
             match node {
                 Tree::Empty => None,
-                Tree::Leaf(pane) => {
+                Tree::Leaf(stack) => {
+                    let pane = stack.active_pane()?;
                     let dims = pane.get_dimensions();
                     let size = TerminalSize {
                         cols: dims.cols,
@@ -1359,7 +1662,11 @@ impl TabInner {
 
             if cursor.is_leaf() {
                 // Apply our size to the tty
-                cursor.leaf_mut().map(|pane| pane.resize(pane_size));
+                if let Some(stack) = cursor.leaf_mut() {
+                    if let Err(err) = stack.resize(pane_size) {
+                        log::error!("failed to resize pane stack: {err:#}");
+                    }
+                }
             } else {
                 self.apply_pane_size(pane_size, &mut cursor);
             }
@@ -1607,6 +1914,7 @@ impl TabInner {
     {
         let mut dead_panes = vec![];
         let zoomed_pane = self.zoomed.as_ref().map(|p| p.pane_id());
+        let prior = self.get_active_pane();
 
         {
             let root_size = self.size;
@@ -1629,17 +1937,28 @@ impl TabInner {
                 };
 
                 if cursor.is_leaf() {
-                    let pane = Arc::clone(cursor.leaf_mut().unwrap());
-                    if f(pane_index, &pane) {
-                        removed_indices.push(pane_index);
-                        if Some(pane.pane_id()) == zoomed_pane {
+                    let (removed, stack_became_empty) =
+                        cursor
+                            .leaf_mut()
+                            .unwrap()
+                            .remove_matching(pane_index, &f, zoomed_pane);
+                    if !removed.is_empty() {
+                        if removed
+                            .iter()
+                            .any(|pane| Some(pane.pane_id()) == zoomed_pane)
+                        {
                             // If we removed the zoomed pane, un-zoom our state!
                             self.zoomed.take();
                         }
+                        dead_panes.extend(removed);
+                    }
+
+                    if stack_became_empty {
+                        removed_indices.push(pane_index);
                         let parent;
                         match cursor.unsplit_leaf() {
                             Ok((c, dead, p)) => {
-                                dead_panes.push(dead);
+                                dead_panes.extend(dead.panes);
                                 parent = p.unwrap();
                                 cursor = c;
                             }
@@ -1647,7 +1966,6 @@ impl TabInner {
                                 // We might be the root, for example
                                 if c.is_top() && c.is_leaf() {
                                     self.pane.replace(Tree::Empty);
-                                    dead_panes.push(pane);
                                 } else {
                                     self.pane.replace(c.tree());
                                 }
@@ -1665,14 +1983,20 @@ impl TabInner {
                             dpi: cell_dims.dpi,
                         };
 
-                        if let Some(unsplit) = cursor.leaf_mut() {
-                            unsplit.resize(size).ok();
+                        if let Some(stack) = cursor.leaf_mut() {
+                            if let Err(err) = stack.resize(size) {
+                                log::error!("failed to resize pane stack after removal: {err:#}");
+                            }
                         } else {
                             self.apply_pane_size(size, &mut cursor);
                         }
                     } else if !dead_panes.is_empty() {
                         // Apply our revised size to the tty
-                        pane.resize(pane_size).ok();
+                        if let Some(stack) = cursor.leaf_mut() {
+                            if let Err(err) = stack.resize(pane_size) {
+                                log::error!("failed to resize pane stack after removal: {err:#}");
+                            }
+                        }
                     }
 
                     pane_index += 1;
@@ -1696,6 +2020,10 @@ impl TabInner {
             self.active = active_idx.saturating_sub(removed_indices.len());
         }
 
+        if !dead_panes.is_empty() {
+            self.advise_focus_change(prior);
+        }
+
         if !dead_panes.is_empty() && kill {
             let to_kill: Vec<_> = dead_panes.iter().map(|p| p.pane_id()).collect();
             promise::spawn::spawn_into_main_thread(async move {
@@ -1710,9 +2038,9 @@ impl TabInner {
     }
 
     fn can_close_without_prompting(&mut self, reason: CloseReason) -> bool {
-        let panes = self.iter_panes_ignoring_zoom();
-        for pos in &panes {
-            if !pos.pane.can_close_without_prompting(reason) {
+        let panes = self.iter_all_panes();
+        for pane in &panes {
+            if !pane.can_close_without_prompting(reason) {
                 return false;
             }
         }
@@ -1722,10 +2050,10 @@ impl TabInner {
     fn is_dead(&mut self) -> bool {
         // Make sure we account for all panes, so that we don't
         // kill the whole tab if the zoomed pane is dead!
-        let panes = self.iter_panes_ignoring_zoom();
+        let panes = self.iter_all_panes();
         let mut dead_count = 0;
-        for pos in &panes {
-            if pos.pane.is_dead() {
+        for pane in &panes {
+            if pane.is_dead() {
                 dead_count += 1;
             }
         }
@@ -1761,15 +2089,53 @@ impl TabInner {
             self.toggle_zoom();
         }
 
-        if let Some(item) = self
-            .iter_panes_ignoring_zoom()
-            .iter()
-            .find(|p| p.pane.pane_id() == pane.pane_id())
-        {
-            self.active = item.index;
-            self.recency.tag(item.index);
+        if let Some(pane_index) = self.activate_pane_in_stack_impl(pane.pane_id()) {
+            self.active = pane_index;
+            self.recency.tag(pane_index);
             self.advise_focus_change(prior);
         }
+    }
+
+    fn activate_pane_in_stack(&mut self, pane_id: PaneId) -> anyhow::Result<usize> {
+        if self.zoomed.is_some() {
+            anyhow::bail!("cannot switch pane tab while zoomed");
+        }
+
+        let prior = self.get_active_pane();
+        let pane_index = self
+            .activate_pane_in_stack_impl(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {} not found in tab", pane_id))?;
+        self.active = pane_index;
+        self.recency.tag(pane_index);
+        self.advise_focus_change(prior);
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+
+        Ok(pane_index)
+    }
+
+    fn activate_pane_in_stack_impl(&mut self, pane_id: PaneId) -> Option<usize> {
+        let mut cursor = self.pane.take().unwrap().cursor();
+        let mut pane_index = 0;
+        let mut found = None;
+
+        loop {
+            if cursor.is_leaf() {
+                if cursor.leaf_mut().unwrap().set_active_pane(pane_id) {
+                    found = Some(pane_index);
+                }
+                pane_index += 1;
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) if found.is_none() => cursor = c,
+                Ok(c) | Err(c) => {
+                    self.pane.replace(c.tree());
+                    break;
+                }
+            }
+        }
+
+        found
     }
 
     fn advise_focus_change(&mut self, prior: Option<Arc<dyn Pane>>) {
@@ -1801,8 +2167,68 @@ impl TabInner {
         self.advise_focus_change(prior);
     }
 
+    fn add_pane_to_stack(
+        &mut self,
+        base_pane_id: PaneId,
+        pane: Arc<dyn Pane>,
+    ) -> anyhow::Result<usize> {
+        if self.zoomed.is_some() {
+            anyhow::bail!("cannot create pane tab while zoomed");
+        }
+
+        let prior = self.get_active_pane();
+        let mut cursor = self.pane.take().unwrap().cursor();
+        let mut pane_index = 0;
+        let mut found = false;
+
+        loop {
+            if cursor.is_leaf() {
+                let stack = cursor.leaf_mut().unwrap();
+                if stack.contains_pane(base_pane_id) {
+                    if let Some(base) = stack.active_pane() {
+                        let dims = base.get_dimensions();
+                        pane.resize(TerminalSize {
+                            rows: dims.viewport_rows,
+                            cols: dims.cols,
+                            pixel_height: dims.pixel_height,
+                            pixel_width: dims.pixel_width,
+                            dpi: dims.dpi,
+                        })?;
+                    }
+                    stack.push_and_activate(Arc::clone(&pane));
+                    found = true;
+                }
+                if !found {
+                    pane_index += 1;
+                }
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) if !found => cursor = c,
+                Ok(c) | Err(c) => {
+                    self.pane.replace(c.tree());
+                    break;
+                }
+            }
+        }
+
+        if !found {
+            anyhow::bail!("pane {} not found in tab", base_pane_id);
+        }
+
+        self.active = pane_index;
+        self.recency.tag(pane_index);
+        self.advise_focus_change(prior);
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+
+        Ok(pane_index)
+    }
+
     fn assign_pane(&mut self, pane: &Arc<dyn Pane>) {
-        match Tree::new().cursor().assign_top(Arc::clone(pane)) {
+        match Tree::new()
+            .cursor()
+            .assign_top(PaneStack::new(Arc::clone(pane)))
+        {
             Ok(c) => self.pane = Some(c.tree()),
             Err(_) => panic!("tried to assign root pane to non-empty tree"),
         }
@@ -1814,7 +2240,8 @@ impl TabInner {
 
     fn swap_active_with_index(&mut self, pane_index: usize, keep_focus: bool) -> Option<()> {
         let active_idx = self.get_active_idx();
-        let mut pane = self.get_active_pane()?;
+        let prior = self.get_active_pane()?;
+        let mut stack = self.iter_stacks().into_iter().nth(active_idx)?;
         log::trace!(
             "swap_active_with_index: pane_index {} active {}",
             pane_index,
@@ -1834,7 +2261,7 @@ impl TabInner {
                 }
             };
 
-            std::mem::swap(&mut pane, cursor.leaf_mut().unwrap());
+            std::mem::swap(&mut stack, cursor.leaf_mut().unwrap());
 
             // re-position to the root
             cursor = cursor.tree().cursor();
@@ -1849,19 +2276,21 @@ impl TabInner {
                 }
             };
 
-            std::mem::swap(&mut pane, cursor.leaf_mut().unwrap());
+            std::mem::swap(&mut stack, cursor.leaf_mut().unwrap());
             self.pane.replace(cursor.tree());
 
             // Advise the panes of their new sizes
             let size = self.size;
-            apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
+            if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+                log::error!("failed to resize panes after moving active pane: {err:#}");
+            }
         }
 
         // And update focus
         if keep_focus {
             self.set_active_idx(pane_index);
         } else {
-            self.advise_focus_change(Some(pane));
+            self.advise_focus_change(Some(prior));
         }
         None
     }
@@ -2014,10 +2443,11 @@ impl TabInner {
             let mut cursor = self.pane.take().unwrap().cursor();
 
             if request.top_level && !cursor.is_leaf() {
+                let new_stack = PaneStack::new(Arc::clone(&pane));
                 let result = if request.target_is_second {
-                    cursor.split_node_and_insert_right(Arc::clone(&pane))
+                    cursor.split_node_and_insert_right(new_stack)
                 } else {
-                    cursor.split_node_and_insert_left(Arc::clone(&pane))
+                    cursor.split_node_and_insert_left(new_stack)
                 };
                 cursor = match result {
                     Ok(c) => {
@@ -2049,20 +2479,21 @@ impl TabInner {
                 }
             };
 
-            let existing_pane = Arc::clone(cursor.leaf_mut().unwrap());
+            let existing_stack = cursor.leaf_mut().unwrap().clone();
+            let new_stack = PaneStack::new(pane);
 
-            let (pane1, pane2) = if request.target_is_second {
-                (existing_pane, pane)
+            let (stack1, stack2) = if request.target_is_second {
+                (existing_stack, new_stack)
             } else {
-                (pane, existing_pane)
+                (new_stack, existing_stack)
             };
 
-            pane1.resize(split_info.first)?;
-            pane2.resize(split_info.second.clone())?;
+            stack1.resize(split_info.first)?;
+            stack2.resize(split_info.second)?;
 
-            *cursor.leaf_mut().unwrap() = pane1;
+            *cursor.leaf_mut().unwrap() = stack1;
 
-            match cursor.split_leaf_and_insert_right(pane2) {
+            match cursor.split_leaf_and_insert_right(stack2) {
                 Ok(c) => cursor = c,
                 Err(c) => {
                     self.pane.replace(c.tree());
@@ -2108,10 +2539,11 @@ pub enum PaneNode {
         node: SplitDirectionAndSize,
     },
     Leaf(PaneEntry),
+    Stack(PaneStackEntry),
 }
 
 impl PaneNode {
-    pub fn into_tree(self) -> bintree::Tree<PaneEntry, SplitDirectionAndSize> {
+    pub fn into_tree(self) -> bintree::Tree<PaneStackEntry, SplitDirectionAndSize> {
         match self {
             PaneNode::Empty => bintree::Tree::Empty,
             PaneNode::Split { left, right, node } => bintree::Tree::Node {
@@ -2119,7 +2551,11 @@ impl PaneNode {
                 right: Box::new((*right).into_tree()),
                 data: Some(node),
             },
-            PaneNode::Leaf(e) => bintree::Tree::Leaf(e),
+            PaneNode::Leaf(e) => bintree::Tree::Leaf(PaneStackEntry {
+                active: 0,
+                panes: vec![e],
+            }),
+            PaneNode::Stack(stack) => bintree::Tree::Leaf(stack),
         }
     }
 
@@ -2128,6 +2564,11 @@ impl PaneNode {
             PaneNode::Empty => None,
             PaneNode::Split { node, .. } => Some(node.size()),
             PaneNode::Leaf(entry) => Some(entry.size),
+            PaneNode::Stack(stack) => stack
+                .panes
+                .get(stack.active)
+                .or_else(|| stack.panes.first())
+                .map(|entry| entry.size),
         }
     }
 
@@ -2139,8 +2580,21 @@ impl PaneNode {
                 None => right.window_and_tab_ids(),
             },
             PaneNode::Leaf(entry) => Some((entry.window_id, entry.tab_id)),
+            PaneNode::Stack(stack) => stack
+                .panes
+                .get(stack.active)
+                .or_else(|| stack.panes.first())
+                .map(|entry| (entry.window_id, entry.tab_id)),
         }
     }
+}
+
+/// This type is used directly by the codec, take care to bump
+/// the codec version if you change this
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct PaneStackEntry {
+    pub active: usize,
+    pub panes: Vec<PaneEntry>,
 }
 
 /// This type is used directly by the codec, take care to bump
@@ -2227,7 +2681,7 @@ mod test {
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
-            unimplemented!();
+            StableCursorPosition::default()
         }
 
         fn get_current_seqno(&self) -> SequenceNo {
@@ -2267,11 +2721,22 @@ mod test {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
-            unimplemented!();
+            let size = *self.size.lock();
+            RenderableDimensions {
+                cols: size.cols,
+                viewport_rows: size.rows,
+                scrollback_rows: size.rows,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: size.dpi,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
+                reverse_video: false,
+            }
         }
 
         fn get_title(&self) -> String {
-            unimplemented!()
+            format!("pane {}", self.id)
         }
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
             unimplemented!()
@@ -2279,7 +2744,7 @@ mod test {
         fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
             Ok(None)
         }
-        fn writer(&self) -> MappedMutexGuard<dyn std::io::Write> {
+        fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
             unimplemented!()
         }
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
@@ -2318,13 +2783,7 @@ mod test {
 
     #[test]
     fn tab_splitting() {
-        let size = TerminalSize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 800,
-            pixel_height: 600,
-            dpi: 96,
-        };
+        let size = test_size();
 
         let tab = Tab::new(&size);
         tab.assign_pane(&FakePane::new(1, size));
@@ -2515,6 +2974,142 @@ mod test {
         assert_eq!(24, panes[2].height);
         assert_eq!(400, panes[2].pixel_width);
         assert_eq!(600, panes[2].pixel_height);
+    }
+
+    fn test_size() -> TerminalSize {
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        }
+    }
+
+    struct MuxTestGuard;
+
+    impl Drop for MuxTestGuard {
+        fn drop(&mut self) {
+            Mux::shutdown();
+        }
+    }
+
+    fn install_mux() -> MuxTestGuard {
+        Mux::set_mux(&Arc::new(Mux::new(None)));
+        MuxTestGuard
+    }
+
+    #[test]
+    fn pane_stack_add_switch_and_remove() {
+        let _mux = install_mux();
+        let size = test_size();
+        let tab = Tab::new(&size);
+        let pane_1 = FakePane::new(100, size);
+        let pane_2 = FakePane::new(101, size);
+
+        tab.assign_pane(&pane_1);
+        assert_eq!(tab.add_pane_to_stack(100, Arc::clone(&pane_2)).unwrap(), 0);
+        assert_eq!(tab.count_panes(), Some(2));
+        assert_eq!(tab.pane_index_for_pane(100), Some(0));
+        assert_eq!(tab.pane_index_for_pane(101), Some(0));
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane.pane_id(), 101);
+        assert!(panes[0].is_active);
+
+        let tabs = tab.pane_stack_tabs(100);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].pane_id, 100);
+        assert!(!tabs[0].is_active);
+        assert_eq!(tabs[1].pane_id, 101);
+        assert!(tabs[1].is_active);
+
+        tab.activate_pane_in_stack(100).unwrap();
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 100);
+
+        let removed = tab.remove_pane(101).unwrap();
+        assert_eq!(removed.pane_id(), 101);
+        assert_eq!(tab.count_panes(), Some(1));
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 100);
+
+        let pane_3 = FakePane::new(102, size);
+        tab.add_pane_to_stack(100, Arc::clone(&pane_3)).unwrap();
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 102);
+
+        let removed_active = tab.remove_pane(102).unwrap();
+        assert_eq!(removed_active.pane_id(), 102);
+        assert_eq!(tab.count_panes(), Some(1));
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 100);
+
+        tab.set_zoomed(true);
+        assert!(tab
+            .add_pane_to_stack(100, FakePane::new(103, size))
+            .is_err());
+        assert!(tab.activate_pane_in_stack(100).is_err());
+    }
+
+    fn pane_entry(pane_id: PaneId, size: TerminalSize, is_active_pane: bool) -> PaneEntry {
+        PaneEntry {
+            window_id: 1,
+            tab_id: 1,
+            pane_id,
+            title: format!("pane {pane_id}"),
+            size,
+            working_dir: None,
+            is_active_pane,
+            is_zoomed_pane: false,
+            workspace: "default".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        }
+    }
+
+    #[test]
+    fn sync_with_pane_tree_preserves_stack_order_and_active_pane() {
+        let size = test_size();
+        let tab = Tab::new(&size);
+        let root = PaneNode::Split {
+            left: Box::new(PaneNode::Stack(PaneStackEntry {
+                active: 1,
+                panes: vec![pane_entry(200, size, false), pane_entry(201, size, true)],
+            })),
+            right: Box::new(PaneNode::Leaf(pane_entry(202, size, false))),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: size,
+                second: size,
+            },
+        };
+
+        tab.sync_with_pane_tree(size, root, |entry| FakePane::new(entry.pane_id, entry.size));
+
+        let all_panes: Vec<_> = tab
+            .iter_all_panes()
+            .iter()
+            .map(|pane| pane.pane_id())
+            .collect();
+        assert_eq!(all_panes, vec![200, 201, 202]);
+        assert_eq!(tab.pane_index_for_pane(200), Some(0));
+        assert_eq!(tab.pane_index_for_pane(201), Some(0));
+        assert_eq!(tab.pane_index_for_pane(202), Some(1));
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].pane.pane_id(), 201);
+        assert!(panes[0].is_active);
+        assert_eq!(panes[1].pane.pane_id(), 202);
+        assert!(!panes[1].is_active);
+
+        let tabs = tab.pane_stack_tabs(200);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].pane_id, 200);
+        assert!(!tabs[0].is_active);
+        assert_eq!(tabs[1].pane_id, 201);
+        assert!(tabs[1].is_active);
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {

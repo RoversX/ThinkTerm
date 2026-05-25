@@ -143,8 +143,8 @@
             ''
             + lib.optionalString stdenv.isDarwin /* bash */ ''
               mkdir -p "$out/Applications"
-              OUT_APP="$out/Applications/WezTerm.app"
-              cp -r assets/macos/WezTerm.app "$OUT_APP"
+              OUT_APP="$out/Applications/ThinkTerm.app"
+              cp -r assets/macos/ThinkTerm.app "$OUT_APP"
               rm $OUT_APP/*.dylib
               cp -r assets/shell-integration/* "$OUT_APP"
               # macOS will only recognize our application bundle

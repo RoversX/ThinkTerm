@@ -56,20 +56,29 @@ pub struct ClientInfo {
 
 impl ClientInfo {
     pub fn new(client_id: Arc<ClientId>) -> Self {
+        let now = utc_now();
         Self {
             client_id,
-            connected_at: Utc::now(),
+            connected_at: now,
             active_workspace: None,
-            last_input: Utc::now(),
+            last_input: now,
             focused_pane_id: None,
         }
     }
 
     pub fn update_last_input(&mut self) {
-        self.last_input = Utc::now();
+        self.last_input = utc_now();
     }
 
     pub fn update_focused_pane(&mut self, pane_id: PaneId) {
         self.focused_pane_id.replace(pane_id);
     }
+}
+
+fn utc_now() -> DateTime<Utc> {
+    let duration = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    DateTime::<Utc>::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
+        .expect("system time should fit chrono timestamp range")
 }

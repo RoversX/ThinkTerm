@@ -24,17 +24,19 @@ impl ListCommand {
             let mut cursor = tabroot.into_tree().cursor();
 
             loop {
-                if let Some(entry) = cursor.leaf_mut() {
-                    let window_title = panes
-                        .window_titles
-                        .get(&entry.window_id)
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    output_items.push(CliListResultItem::from(
-                        entry.clone(),
-                        tab_title,
-                        window_title,
-                    ));
+                if let Some(stack) = cursor.leaf_mut() {
+                    for entry in &stack.panes {
+                        let window_title = panes
+                            .window_titles
+                            .get(&entry.window_id)
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        output_items.push(CliListResultItem::from(
+                            entry.clone(),
+                            tab_title,
+                            window_title,
+                        ));
+                    }
                 }
                 match cursor.preorder_next() {
                     Ok(c) => cursor = c,

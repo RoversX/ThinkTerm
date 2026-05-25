@@ -7,6 +7,7 @@ use wezterm_font::units::*;
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct ShapeCacheKey {
+    pub font_identity: u64,
     pub style: TextStyle,
     pub text: String,
 }
@@ -60,6 +61,7 @@ impl ShapedInfo {
 /// <https://github.com/sunshowers/borrow-complex-key-example/blob/master/src/lib.rs>
 #[derive(Copy, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BorrowedShapeCacheKey<'a> {
+    pub font_identity: u64,
     pub style: &'a TextStyle,
     pub text: &'a str,
 }
@@ -67,6 +69,7 @@ pub struct BorrowedShapeCacheKey<'a> {
 impl<'a> BorrowedShapeCacheKey<'a> {
     pub fn to_owned(&self) -> ShapeCacheKey {
         ShapeCacheKey {
+            font_identity: self.font_identity,
             style: self.style.clone(),
             text: self.text.to_owned(),
         }
@@ -80,6 +83,7 @@ pub trait ShapeCacheKeyTrait: std::fmt::Debug {
 impl ShapeCacheKeyTrait for ShapeCacheKey {
     fn key<'k>(&'k self) -> BorrowedShapeCacheKey<'k> {
         BorrowedShapeCacheKey {
+            font_identity: self.font_identity,
             style: &self.style,
             text: &self.text,
         }

@@ -32,8 +32,10 @@ impl SetWindowTitle {
             let mut cursor = tabroot.into_tree().cursor();
 
             loop {
-                if let Some(entry) = cursor.leaf_mut() {
-                    pane_id_to_window_id.insert(entry.pane_id, entry.window_id);
+                if let Some(stack) = cursor.leaf_mut() {
+                    for entry in &stack.panes {
+                        pane_id_to_window_id.insert(entry.pane_id, entry.window_id);
+                    }
                 }
                 match cursor.preorder_next() {
                     Ok(c) => cursor = c,

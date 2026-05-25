@@ -19,6 +19,7 @@ dhat-heap.json
 /termwiz/codegen/Cargo.lock
 /gh_pages/
 /.cache/
+/.soul/
 /docs/releases.json
 /docs/SUMMARY.md
 /docs/cli/cli/index.md

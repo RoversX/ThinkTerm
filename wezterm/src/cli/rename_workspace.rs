@@ -32,8 +32,10 @@ impl RenameWorkspace {
             let mut cursor = tabroot.into_tree().cursor();
 
             loop {
-                if let Some(entry) = cursor.leaf_mut() {
-                    pane_id_to_workspace.insert(entry.pane_id, entry.workspace.to_string());
+                if let Some(stack) = cursor.leaf_mut() {
+                    for entry in &stack.panes {
+                        pane_id_to_workspace.insert(entry.pane_id, entry.workspace.to_string());
+                    }
                 }
                 match cursor.preorder_next() {
                     Ok(c) => cursor = c,

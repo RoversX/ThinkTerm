@@ -27,6 +27,7 @@ use crate::termwindow::render::{
 };
 use crate::termwindow::webgpu::WebGpuState;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
+use ::window::color::LinearRgba;
 use ::window::*;
 use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
@@ -36,7 +37,8 @@ use config::keyassignment::{
 use config::window::WindowLevel;
 use config::{
     configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection,
-    GeometryOrigin, GuiPosition, TermConfig, WindowCloseConfirmation,
+    GeometryOrigin, GuiPosition, RgbaColor, TabBarColor, TabBarColors, TermConfig,
+    WindowCloseConfirmation,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -56,6 +58,7 @@ use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
 use std::ops::Add;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,7 +67,7 @@ use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
 use wezterm_font::FontConfiguration;
-use wezterm_term::color::ColorPalette;
+use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 
@@ -82,7 +85,49 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+pub mod ui;
 pub mod webgpu;
+
+pub(crate) fn theme_aligned_tab_bar_colors_from_palette(palette: &ColorPalette) -> TabBarColors {
+    fn rgba(color: LinearRgba) -> RgbaColor {
+        color.to_srgb().into()
+    }
+
+    let background = palette.resolve_bg(ColorAttribute::Default).to_linear();
+    let foreground = palette.foreground.to_linear();
+    let muted = foreground.mul_alpha(0.68);
+
+    TabBarColors {
+        background: Some(rgba(background)),
+        active_tab: Some(TabBarColor {
+            bg_color: rgba(background),
+            fg_color: palette.foreground.into(),
+            ..TabBarColor::default()
+        }),
+        inactive_tab: Some(TabBarColor {
+            bg_color: rgba(background),
+            fg_color: rgba(muted),
+            ..TabBarColor::default()
+        }),
+        inactive_tab_hover: Some(TabBarColor {
+            bg_color: rgba(background),
+            fg_color: palette.foreground.into(),
+            ..TabBarColor::default()
+        }),
+        new_tab: Some(TabBarColor {
+            bg_color: rgba(background),
+            fg_color: rgba(muted),
+            ..TabBarColor::default()
+        }),
+        new_tab_hover: Some(TabBarColor {
+            bg_color: rgba(background),
+            fg_color: palette.foreground.into(),
+            ..TabBarColor::default()
+        }),
+        inactive_tab_edge: Some(rgba(background)),
+        inactive_tab_edge_hover: Some(rgba(background)),
+    }
+}
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
@@ -93,7 +138,7 @@ lazy_static::lazy_static! {
     static ref POSITION: Mutex<Option<GuiPosition>> = Mutex::new(None);
 }
 
-pub const ICON_DATA: &'static [u8] = include_bytes!("../../../assets/icon/terminal.png");
+pub const ICON_DATA: &'static [u8] = include_bytes!("../../../assets/icon/ThinkTerm.png");
 
 pub fn set_window_position(pos: GuiPosition) {
     POSITION.lock().unwrap().replace(pos);
@@ -155,10 +200,183 @@ pub enum TermWindowNotif {
 pub enum UIItemType {
     TabBar(TabBarItem),
     CloseTab(usize),
+    PaneNav {
+        pane_id: PaneId,
+        pane_index: usize,
+        action: PaneNavAction,
+    },
+    WorkspaceSidebar(String),
+    WorkspaceSidebarBackground,
+    WorkspaceSidebarResize,
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneNavAction {
+    Background,
+    Activate(PaneId),
+    Close(PaneId),
+    NewTab,
+    SplitRight,
+    SplitDown,
+}
+
+#[derive(Clone, Debug)]
+enum InlineTabRenameTarget {
+    WindowTab(TabId),
+    PaneTab(PaneId),
+}
+
+#[derive(Clone, Debug)]
+struct InlineTabRename {
+    target: InlineTabRenameTarget,
+    text: String,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+}
+
+impl InlineTabRename {
+    fn new(target: InlineTabRenameTarget, text: String) -> Self {
+        let cursor = text.chars().count();
+        Self {
+            target,
+            text,
+            cursor,
+            selection_anchor: Some(0),
+        }
+    }
+
+    fn display_text(&self) -> String {
+        if self.has_selection() {
+            return if self.text.is_empty() {
+                "|".to_string()
+            } else {
+                self.text.clone()
+            };
+        }
+
+        let mut text = String::new();
+        let mut inserted_cursor = false;
+        for (idx, ch) in self.text.chars().enumerate() {
+            if idx == self.cursor {
+                text.push('|');
+                inserted_cursor = true;
+            }
+            text.push(ch);
+        }
+        if !inserted_cursor {
+            text.push('|');
+        }
+        text
+    }
+
+    fn len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn byte_idx(&self, char_idx: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(char_idx)
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| self.text.len())
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            None
+        } else if anchor < self.cursor {
+            Some((anchor, self.cursor))
+        } else {
+            Some((self.cursor, anchor))
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        Some(
+            self.text
+                .chars()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect(),
+        )
+    }
+
+    fn select_all(&mut self) {
+        self.selection_anchor = Some(0);
+        self.cursor = self.len();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_range() else {
+            return false;
+        };
+        let start_byte = self.byte_idx(start);
+        let end_byte = self.byte_idx(end);
+        self.text.replace_range(start_byte..end_byte, "");
+        self.cursor = start;
+        self.clear_selection();
+        true
+    }
+
+    fn insert(&mut self, text: &str) {
+        self.delete_selection();
+        for ch in text.chars() {
+            if matches!(ch, '\r' | '\n') {
+                continue;
+            }
+            let byte_idx = self.byte_idx(self.cursor);
+            self.text.insert(byte_idx, ch);
+            self.cursor += 1;
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        let remove_idx = self.cursor - 1;
+        let byte_idx = self.byte_idx(remove_idx);
+        self.text.remove(byte_idx);
+        self.cursor = remove_idx;
+    }
+
+    fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let byte_idx = self.byte_idx(self.cursor);
+        if byte_idx == self.text.len() {
+            return;
+        }
+        self.text.remove(byte_idx);
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+        self.clear_selection();
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = self.cursor.saturating_add(1).min(self.len());
+        self.clear_selection();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +422,20 @@ pub struct PaneState {
 
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
+    pub font_scale: Option<f64>,
+}
+
+#[derive(Clone)]
+pub struct PaneFontEntry {
+    pub fonts: Rc<FontConfiguration>,
+    pub render_metrics: RenderMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PaneFontKey {
+    font_scale_bits: u64,
+    dpi: usize,
+    config_generation: usize,
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -391,6 +623,12 @@ pub struct TermWindow {
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
+    tab_bar_scroll_offset: f32,
+    tab_bar_scroll_target: f32,
+    pane_nav_tab_scroll_offsets: HashMap<PaneId, f32>,
+    pane_nav_tab_scroll_targets: HashMap<PaneId, f32>,
+    inline_tab_rename: Option<InlineTabRename>,
+    pane_tab_title_overrides: HashMap<PaneId, String>,
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
@@ -405,6 +643,7 @@ pub struct TermWindow {
 
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
+    pane_font_cache: RefCell<HashMap<PaneFontKey, PaneFontEntry>>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
     window_background: Vec<LoadedBackgroundLayer>,
@@ -440,6 +679,8 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     dragging: Option<(UIItem, MouseEvent)>,
+    workspace_sidebar_width: usize,
+    workspace_sidebar_collapsed: bool,
 
     modal: RefCell<Option<Rc<dyn Modal>>>,
 
@@ -641,6 +882,7 @@ impl TermWindow {
             pixel_cell: render_metrics.cell_size.width as f32,
         };
         let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
+        let workspace_sidebar_width = ui::workspace_sidebar_width_for_metrics(&render_metrics);
         let padding_right = resize::effective_right_padding(&config, h_context) as usize;
         let v_context = DimensionContext {
             dpi: dpi as f32,
@@ -651,7 +893,10 @@ impl TermWindow {
         let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
 
         let mut dimensions = Dimensions {
-            pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize,
+            pixel_width: (terminal_size.pixel_width
+                + workspace_sidebar_width
+                + padding_left
+                + padding_right) as usize,
             pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
@@ -712,6 +957,12 @@ impl TermWindow {
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
+            tab_bar_scroll_offset: 0.0,
+            tab_bar_scroll_target: 0.0,
+            pane_nav_tab_scroll_offsets: HashMap::new(),
+            pane_nav_tab_scroll_targets: HashMap::new(),
+            inline_tab_rename: None,
+            pane_tab_title_overrides: HashMap::new(),
             right_status: String::new(),
             left_status: String::new(),
             last_mouse_coords: (0, -1),
@@ -722,6 +973,7 @@ impl TermWindow {
             last_scroll_info: RenderableDimensions::default(),
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
+            pane_font_cache: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
             last_mouse_click: None,
@@ -783,6 +1035,8 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             dragging: None,
+            workspace_sidebar_width,
+            workspace_sidebar_collapsed: false,
             last_ui_item: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),
@@ -830,6 +1084,7 @@ impl TermWindow {
             },
         )
         .await?;
+        window.set_titlebar_sidebar_button_visible(true);
         tw.borrow_mut().window.replace(window.clone());
 
         Self::apply_icon(&window)?;
@@ -944,6 +1199,13 @@ impl TermWindow {
             }
             WindowEvent::MouseEvent(event) => {
                 self.mouse_event_impl(event, window);
+                Ok(true)
+            }
+            WindowEvent::ToggleWorkspaceSidebar => {
+                self.toggle_workspace_sidebar();
+                let dimensions = self.dimensions;
+                self.apply_dimensions(&dimensions, None, window);
+                window.invalidate();
                 Ok(true)
             }
             WindowEvent::MouseLeave => {
@@ -1394,6 +1656,17 @@ impl TermWindow {
     }
 
     fn apply_icon(window: &Window) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(path) = Self::macos_application_icon_path() {
+            match ::window::set_application_icon_from_file(&path) {
+                Ok(()) => return Ok(()),
+                Err(err) => log::warn!(
+                    "failed to load macOS application icon from {}: {err:#}",
+                    path.display()
+                ),
+            }
+        }
+
         let image = image::load_from_memory(ICON_DATA)?.into_rgba8();
         let (width, height) = image.dimensions();
         window.set_icon(Image::with_rgba32(
@@ -1403,6 +1676,23 @@ impl TermWindow {
             image.as_raw(),
         ));
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_application_icon_path() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let exe_dir = exe.parent()?;
+        let mut candidates = vec![exe_dir.join("ThinkTerm.icns")];
+
+        if let Some(contents_dir) = exe_dir.parent() {
+            candidates.push(contents_dir.join("Resources").join("ThinkTerm.icns"));
+        }
+
+        if let Some(repo_dir) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent() {
+            candidates.push(repo_dir.join("assets").join("icon").join("ThinkTerm.icns"));
+        }
+
+        candidates.into_iter().find(|path| path.exists())
     }
 
     fn schedule_status_update(&self) {
@@ -1788,6 +2078,7 @@ impl TermWindow {
         self.line_to_ele_shape_cache
             .borrow_mut()
             .update_config(&config);
+        self.pane_font_cache.borrow_mut().clear();
         self.fancy_tab_bar.take();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
@@ -1958,6 +2249,11 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    fn theme_aligned_tab_bar_colors(&mut self) -> TabBarColors {
+        let palette = self.palette().clone();
+        theme_aligned_tab_bar_colors_from_palette(&palette)
+    }
+
     fn update_title_impl(&mut self) {
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
@@ -1979,26 +2275,47 @@ impl TermWindow {
         };
 
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let tab_bar_x = self.tab_bar_left_edge();
+        let tab_bar_width = self.dimensions.pixel_width.saturating_sub(tab_bar_x).max(1);
 
         let hovering_in_tab_bar = match &self.current_mouse_event {
             Some(event) => {
                 let mouse_y = event.coords.y as f32;
-                mouse_y >= tab_bar_y as f32 && mouse_y < tab_bar_y as f32 + tab_bar_height
+                let mouse_x = event.coords.x.max(0) as usize;
+                mouse_x >= tab_bar_x
+                    && mouse_y >= tab_bar_y as f32
+                    && mouse_y < tab_bar_y as f32 + tab_bar_height
             }
             None => false,
         };
 
+        let has_explicit_tab_colors = self.config.resolved_palette.tab_bar.is_some();
+        let themed_tab_bar_colors = if has_explicit_tab_colors {
+            None
+        } else {
+            Some(self.theme_aligned_tab_bar_colors())
+        };
+        let tab_bar_colors = if has_explicit_tab_colors {
+            self.config.resolved_palette.tab_bar.as_ref()
+        } else {
+            themed_tab_bar_colors.as_ref()
+        };
+
         let new_tab_bar = TabBarState::new(
-            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
+            (tab_bar_width / self.render_metrics.cell_size.width as usize).max(1),
             if hovering_in_tab_bar {
-                Some(self.last_mouse_coords.0)
+                self.current_mouse_event.as_ref().map(|event| {
+                    event.coords.x.saturating_sub(tab_bar_x as isize).max(0) as usize
+                        / self.render_metrics.cell_size.width as usize
+                })
             } else {
                 None
             },
             &tabs,
             &panes,
-            self.config.resolved_palette.tab_bar.as_ref(),
+            tab_bar_colors,
             &self.config,
+            self.tab_bar_scroll_offset,
             &self.left_status,
             &self.right_status,
         );
@@ -2324,6 +2641,113 @@ impl TermWindow {
         promise::spawn::spawn(future).detach();
     }
 
+    fn prompt_rename_current_tab(&mut self) {
+        let mux = Mux::get();
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+
+        let tab_id = tab.tab_id();
+        let mut initial_title = tab.get_title();
+        if initial_title.is_empty() {
+            initial_title = tab
+                .get_active_pane()
+                .map(|pane| pane.get_title())
+                .unwrap_or_default();
+        }
+
+        self.inline_tab_rename = Some(InlineTabRename::new(
+            InlineTabRenameTarget::WindowTab(tab_id),
+            initial_title,
+        ));
+        self.update_title_impl();
+    }
+
+    fn prompt_rename_pane_tab(&mut self, pane_id: PaneId) {
+        let initial_title = self
+            .pane_tab_title_overrides
+            .get(&pane_id)
+            .cloned()
+            .or_else(|| {
+                Mux::get()
+                    .get_pane(pane_id)
+                    .map(|pane| ui::terminal_title_for_display(&pane.get_title()).to_string())
+            })
+            .unwrap_or_default();
+
+        self.inline_tab_rename = Some(InlineTabRename::new(
+            InlineTabRenameTarget::PaneTab(pane_id),
+            initial_title,
+        ));
+        self.update_title_impl();
+    }
+
+    fn finish_inline_tab_rename(&mut self, commit: bool) {
+        let rename = match self.inline_tab_rename.take() {
+            Some(rename) => rename,
+            None => return,
+        };
+
+        if commit {
+            let title = rename.text.trim().to_string();
+            match rename.target {
+                InlineTabRenameTarget::WindowTab(tab_id) => {
+                    if let Some(tab) = Mux::get().get_tab(tab_id) {
+                        tab.set_title(&title);
+                    }
+                }
+                InlineTabRenameTarget::PaneTab(pane_id) => {
+                    if title.is_empty() {
+                        self.pane_tab_title_overrides.remove(&pane_id);
+                    } else {
+                        self.pane_tab_title_overrides.insert(pane_id, title);
+                    }
+                }
+            }
+        }
+
+        self.update_title_impl();
+    }
+
+    fn inline_window_tab_rename_title(&self, tab_id: TabId) -> Option<String> {
+        self.inline_tab_rename
+            .as_ref()
+            .filter(|rename| matches!(rename.target, InlineTabRenameTarget::WindowTab(id) if id == tab_id))
+            .map(|rename| rename.display_text())
+    }
+
+    fn inline_window_tab_rename_tab_id(&self) -> Option<TabId> {
+        self.inline_tab_rename
+            .as_ref()
+            .and_then(|rename| match rename.target {
+                InlineTabRenameTarget::WindowTab(tab_id) => Some(tab_id),
+                InlineTabRenameTarget::PaneTab(_) => None,
+            })
+    }
+
+    pub fn pane_nav_tab_title(&self, pane_id: PaneId, title: &str) -> String {
+        if let Some(title) = self
+            .inline_tab_rename
+            .as_ref()
+            .filter(|rename| matches!(rename.target, InlineTabRenameTarget::PaneTab(id) if id == pane_id))
+            .map(|rename| rename.display_text())
+        {
+            return title;
+        }
+
+        self.pane_tab_title_overrides
+            .get(&pane_id)
+            .cloned()
+            .unwrap_or_else(|| ui::terminal_title_for_display(title).to_string())
+    }
+
+    pub fn is_renaming_pane_nav_tab(&self, pane_id: PaneId) -> bool {
+        self.inline_tab_rename.as_ref().is_some_and(
+            |rename| matches!(rename.target, InlineTabRenameTarget::PaneTab(id) if id == pane_id),
+        )
+    }
+
     fn show_confirmation(&mut self, args: &Confirmation) {
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
@@ -2640,6 +3064,9 @@ impl TermWindow {
             SpawnTab(spawn_where) => {
                 self.spawn_tab(spawn_where);
             }
+            SpawnTabToRight(spawn_where) => {
+                self.spawn_tab_to_right(spawn_where);
+            }
             SpawnWindow => {
                 self.spawn_command(&SpawnCommand::default(), SpawnWhere::NewWindow);
             }
@@ -2776,6 +3203,8 @@ impl TermWindow {
             ScrollToTop => self.scroll_to_top(pane),
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
+            PromptRenameTab => self.prompt_rename_current_tab(),
+            PromptRenamePaneTab(pane_id) => self.prompt_rename_pane_tab(*pane_id),
             ShowDebugOverlay => self.show_debug_overlay(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {
@@ -3155,6 +3584,9 @@ impl TermWindow {
             OpenUri(link) => {
                 wezterm_open_url::open_url(link);
             }
+            OpenSettings => {
+                crate::settings_window::show();
+            }
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
                 self.set_modal(Rc::new(modal));
@@ -3221,6 +3653,12 @@ impl TermWindow {
             None => return,
         };
 
+        self.close_pane(pane, confirm);
+    }
+
+    fn close_pane(&mut self, pane: Arc<dyn Pane>, confirm: bool) {
+        let mux_window_id = self.mux_window_id;
+        let mux = Mux::get();
         let pane_id = pane.pane_id();
         if confirm && !pane.can_close_without_prompting(CloseReason::Pane) {
             let window = self.window.clone().unwrap();
@@ -3289,6 +3727,46 @@ impl TermWindow {
         RefMut::map(self.pane_state.borrow_mut(), |state| {
             state.entry(pane_id).or_insert_with(PaneState::default)
         })
+    }
+
+    pub fn pane_font_scale(&self, pane_id: PaneId) -> f64 {
+        self.pane_state
+            .borrow()
+            .get(&pane_id)
+            .and_then(|state| state.font_scale)
+            .unwrap_or_else(|| self.fonts.get_font_scale())
+    }
+
+    pub fn pane_font_resources(
+        &self,
+        font_scale: f64,
+    ) -> anyhow::Result<(Rc<FontConfiguration>, RenderMetrics)> {
+        let key = PaneFontKey {
+            font_scale_bits: font_scale.to_bits(),
+            dpi: self.dimensions.dpi,
+            config_generation: self.config.generation(),
+        };
+
+        if let Some(entry) = self.pane_font_cache.borrow().get(&key) {
+            return Ok((Rc::clone(&entry.fonts), entry.render_metrics));
+        }
+
+        let fonts = Rc::new(FontConfiguration::new(
+            Some(self.config.clone()),
+            self.dimensions.dpi,
+        )?);
+        fonts.change_scaling(font_scale, self.dimensions.dpi);
+        let render_metrics = RenderMetrics::new(&fonts)?;
+
+        self.pane_font_cache.borrow_mut().insert(
+            key,
+            PaneFontEntry {
+                fonts: Rc::clone(&fonts),
+                render_metrics,
+            },
+        );
+
+        Ok((fonts, render_metrics))
     }
 
     pub fn tab_state(&self, tab_id: TabId) -> RefMut<'_, TabState> {
@@ -3467,17 +3945,21 @@ impl TermWindow {
             .enumerate()
             .map(|(idx, tab)| {
                 let panes = self.get_pos_panes_for_tab(tab);
+                let tab_id = tab.tab_id();
+                let tab_title = self
+                    .inline_window_tab_rename_title(tab_id)
+                    .unwrap_or_else(|| tab.get_title());
 
                 TabInformation {
                     tab_index: idx,
-                    tab_id: tab.tab_id(),
+                    tab_id,
                     is_active: tab_index == idx,
                     is_last_active: window
                         .get_last_active_idx()
                         .map(|last_active| last_active == idx)
                         .unwrap_or(false),
                     window_id: self.mux_window_id,
-                    tab_title: tab.get_title(),
+                    tab_title,
                     active_pane: panes
                         .iter()
                         .find(|p| p.is_active)

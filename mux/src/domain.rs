@@ -84,12 +84,8 @@ pub trait Domain: Downcast + Send + Sync {
             None => anyhow::bail!("Invalid tab id {}", tab),
         };
 
-        let pane_index = match tab
-            .iter_panes_ignoring_zoom()
-            .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
-        {
-            Some(p) => p.index,
+        let pane_index = match tab.pane_index_for_pane(pane_id) {
+            Some(index) => index,
             None => anyhow::bail!("invalid pane id {}", pane_id),
         };
 
@@ -128,12 +124,8 @@ pub trait Domain: Downcast + Send + Sync {
         };
 
         // pane_index may have changed if src_pane was also in the same tab
-        let final_pane_index = match tab
-            .iter_panes_ignoring_zoom()
-            .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
-        {
-            Some(p) => p.index,
+        let final_pane_index = match tab.pane_index_for_pane(pane_id) {
+            Some(index) => index,
             None => anyhow::bail!("invalid pane id {}", pane_id),
         };
 

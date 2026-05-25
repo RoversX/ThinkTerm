@@ -266,6 +266,19 @@ impl MenuItem {
         }
     }
 
+    pub fn set_target_application(&self) {
+        unsafe {
+            self.item.setTarget_(NSApp());
+        }
+    }
+
+    pub fn set_target_application_delegate(&self) {
+        unsafe {
+            let delegate: id = msg_send![NSApp(), delegate];
+            self.item.setTarget_(delegate);
+        }
+    }
+
     pub fn set_system_symbol_image(&self, symbol_name: &str) {
         unsafe {
             let ns_image_cls = class!(NSImage);

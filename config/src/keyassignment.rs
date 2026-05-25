@@ -534,6 +534,7 @@ fn default_message() -> String {
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub enum KeyAssignment {
     SpawnTab(SpawnTabDomain),
+    SpawnTabToRight(SpawnTabDomain),
     SpawnWindow,
     ToggleFullScreen,
     ToggleAlwaysOnTop,
@@ -572,6 +573,8 @@ pub enum KeyAssignment {
     ScrollToTop,
     ScrollToBottom,
     ShowTabNavigator,
+    PromptRenameTab,
+    PromptRenamePaneTab(usize),
     ShowDebugOverlay,
     HideApplication,
     QuitApplication,
@@ -639,6 +642,7 @@ pub enum KeyAssignment {
 
     ResetTerminal,
     OpenUri(String),
+    OpenSettings,
     ActivateCommandPalette,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),

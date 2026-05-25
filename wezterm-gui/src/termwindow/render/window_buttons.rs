@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::customglyph::*;
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::corners::*;

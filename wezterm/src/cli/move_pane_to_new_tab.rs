@@ -44,10 +44,12 @@ impl MovePaneToNewTab {
                         let mut cursor = tabroot.into_tree().cursor();
 
                         loop {
-                            if let Some(entry) = cursor.leaf_mut() {
-                                if entry.pane_id == pane_id {
-                                    window_id.replace(entry.window_id);
-                                    break 'outer_move;
+                            if let Some(stack) = cursor.leaf_mut() {
+                                for entry in &stack.panes {
+                                    if entry.pane_id == pane_id {
+                                        window_id.replace(entry.window_id);
+                                        break 'outer_move;
+                                    }
                                 }
                             }
                             match cursor.preorder_next() {
