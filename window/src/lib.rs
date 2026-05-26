@@ -310,6 +310,11 @@ pub trait WindowOps {
     /// Show a native context menu at the specified client-area pixel coordinate.
     fn show_context_menu(&self, _coords: Point, _items: Vec<ContextMenuItem>) {}
 
+    /// Show a native folder picker and invoke the callback with the selected directory.
+    fn pick_folder_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        callback(None);
+    }
+
     /// Invalidate the window so that the entire client area will
     /// be repainted shortly
     fn invalidate(&self);

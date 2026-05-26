@@ -559,7 +559,7 @@ impl Mux {
             .get_tab(tab_id)
             .ok_or_else(|| anyhow::anyhow!("tab {tab_id} not found"))?;
 
-        tab.set_active_pane(&pane);
+        tab.set_active_pane_silent(&pane);
 
         Ok(())
     }
@@ -1090,6 +1090,11 @@ impl Mux {
         self.get_tab(tab_id)
             .map(|tab| tab.pane_stack_tabs(pane_id))
             .unwrap_or_default()
+    }
+
+    pub fn pane_stack_id(&self, pane_id: PaneId) -> Option<crate::tab::PaneStackId> {
+        let (_domain_id, _window_id, tab_id) = self.resolve_pane_id(pane_id)?;
+        self.get_tab(tab_id)?.pane_stack_id(pane_id)
     }
 
     pub fn activate_pane_in_stack(&self, pane_id: PaneId) -> anyhow::Result<()> {

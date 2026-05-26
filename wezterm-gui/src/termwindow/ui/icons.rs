@@ -4,8 +4,12 @@ use window::Image;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SvgIcon {
+    Archive,
+    ChevronDown,
+    ChevronRight,
     ExternalLink,
     FolderOpen,
+    FolderPlus,
     Globe,
     PanelRightClose,
     PanelRightOpen,
@@ -14,17 +18,28 @@ pub enum SvgIcon {
     SplitHorizontal,
     SplitVertical,
     Terminal,
+    Trash2,
     X,
 }
 
 impl SvgIcon {
     pub fn bytes(self) -> &'static [u8] {
         match self {
+            Self::Archive => include_bytes!("../../../../third_party/lucide/icons/archive.svg"),
+            Self::ChevronDown => {
+                include_bytes!("../../../../third_party/lucide/icons/chevron-down.svg")
+            }
+            Self::ChevronRight => {
+                include_bytes!("../../../../third_party/lucide/icons/chevron-right.svg")
+            }
             Self::ExternalLink => {
                 include_bytes!("../../../../third_party/lucide/icons/external-link.svg")
             }
             Self::FolderOpen => {
                 include_bytes!("../../../../third_party/lucide/icons/folder-open.svg")
+            }
+            Self::FolderPlus => {
+                include_bytes!("../../../../third_party/lucide/icons/folder-plus.svg")
             }
             Self::Globe => include_bytes!("../../../../third_party/lucide/icons/globe.svg"),
             Self::PanelRightClose => {
@@ -44,6 +59,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/square-split-vertical.svg")
             }
             Self::Terminal => include_bytes!("../../../../third_party/lucide/icons/terminal.svg"),
+            Self::Trash2 => include_bytes!("../../../../third_party/lucide/icons/trash-2.svg"),
             Self::X => include_bytes!("../../../../third_party/lucide/icons/x.svg"),
         }
     }
@@ -76,8 +92,12 @@ mod tests {
     #[test]
     fn svg_icons_rasterize() {
         for icon in [
+            SvgIcon::Archive,
             SvgIcon::ExternalLink,
+            SvgIcon::ChevronDown,
+            SvgIcon::ChevronRight,
             SvgIcon::FolderOpen,
+            SvgIcon::FolderPlus,
             SvgIcon::Globe,
             SvgIcon::PanelRightClose,
             SvgIcon::PanelRightOpen,
@@ -86,6 +106,7 @@ mod tests {
             SvgIcon::SplitHorizontal,
             SvgIcon::SplitVertical,
             SvgIcon::Terminal,
+            SvgIcon::Trash2,
             SvgIcon::X,
         ] {
             let data: Vec<u8> = icon.rasterize(24).unwrap().into();

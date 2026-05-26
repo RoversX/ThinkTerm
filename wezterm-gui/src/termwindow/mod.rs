@@ -47,8 +47,8 @@ use mux::pane::{
 };
 use mux::renderable::RenderableDimensions;
 use mux::tab::{
-    PositionedPane, PositionedSplit, SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab,
-    TabId,
+    PaneStackId, PositionedPane, PositionedSplit, SplitDirection, SplitRequest,
+    SplitSize as MuxSplitSize, Tab, TabId,
 };
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
@@ -188,6 +188,7 @@ pub enum TermWindowNotif {
     },
     MuxNotification(MuxNotification),
     EmitStatusUpdate,
+    OpenProjectPath(PathBuf),
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
     SwitchToMuxWindow(MuxWindowId),
     SetInnerSize {
@@ -205,7 +206,14 @@ pub enum UIItemType {
         pane_index: usize,
         action: PaneNavAction,
     },
-    WorkspaceSidebar(String),
+    ProjectNew,
+    ProjectToggleSessions(String),
+    Project(String),
+    ProjectSession(String),
+    ProjectSessionArchive(String),
+    ProjectSessionNew(String),
+    WorkspaceSidebarScrollTrack,
+    WorkspaceSidebarScrollThumb,
     WorkspaceSidebarBackground,
     WorkspaceSidebarResize,
     AboveScrollThumb,
@@ -222,6 +230,12 @@ pub enum PaneNavAction {
     NewTab,
     SplitRight,
     SplitDown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabWheelSurface {
+    Window,
+    PaneStack(PaneStackId),
 }
 
 #[derive(Clone, Debug)]
@@ -627,6 +641,8 @@ pub struct TermWindow {
     tab_bar_scroll_target: f32,
     pane_nav_tab_scroll_offsets: HashMap<PaneId, f32>,
     pane_nav_tab_scroll_targets: HashMap<PaneId, f32>,
+    tab_wheel_surface_lock: Option<(TabWheelSurface, Instant)>,
+    tab_wheel_direction_lock: Option<(TabWheelSurface, i16, Instant)>,
     inline_tab_rename: Option<InlineTabRename>,
     pane_tab_title_overrides: HashMap<PaneId, String>,
     pub right_status: String,
@@ -681,6 +697,8 @@ pub struct TermWindow {
     dragging: Option<(UIItem, MouseEvent)>,
     workspace_sidebar_width: usize,
     workspace_sidebar_collapsed: bool,
+    workspace_sidebar_scroll_offset: f32,
+    workspace_sidebar_scrollbar_visible_until: Option<Instant>,
 
     modal: RefCell<Option<Rc<dyn Modal>>>,
 
@@ -961,6 +979,8 @@ impl TermWindow {
             tab_bar_scroll_target: 0.0,
             pane_nav_tab_scroll_offsets: HashMap::new(),
             pane_nav_tab_scroll_targets: HashMap::new(),
+            tab_wheel_surface_lock: None,
+            tab_wheel_direction_lock: None,
             inline_tab_rename: None,
             pane_tab_title_overrides: HashMap::new(),
             right_status: String::new(),
@@ -1037,6 +1057,8 @@ impl TermWindow {
             dragging: None,
             workspace_sidebar_width,
             workspace_sidebar_collapsed: false,
+            workspace_sidebar_scroll_offset: 0.0,
+            workspace_sidebar_scrollbar_visible_until: None,
             last_ui_item: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),
@@ -1580,6 +1602,13 @@ impl TermWindow {
             },
             TermWindowNotif::EmitStatusUpdate => {
                 self.emit_status_event();
+            }
+            TermWindowNotif::OpenProjectPath(path) => {
+                let path = path.to_string_lossy();
+                match crate::project_sessions::create_project_from_path(path.as_ref()) {
+                    Ok(session_id) => self.activate_project_session(session_id, window),
+                    Err(err) => log::error!("failed to create ThinkTerm project: {err:#}"),
+                }
             }
             TermWindowNotif::GetSelectionForPane { pane_id, tx } => {
                 let mux = Mux::get();
@@ -2683,6 +2712,44 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    fn prompt_rename_project_session(&mut self, session_id: String) {
+        let mux = Mux::get();
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+
+        let initial_title = crate::project_sessions::session_name(&session_id).unwrap_or_default();
+        let description = "Rename Session".to_string();
+        let prompt = "Name: ".to_string();
+
+        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+            let line = crate::overlay::prompt::read_line_prompt_overlay(
+                term,
+                &description,
+                &prompt,
+                Some(&initial_title),
+            )?;
+            if let Some(line) = line {
+                crate::project_sessions::rename_session(&session_id, line);
+            }
+            Ok(())
+        });
+        self.assign_overlay(tab.tab_id(), overlay);
+        promise::spawn::spawn(future).detach();
+    }
+
+    pub(crate) fn prompt_create_project(&mut self, context: &dyn WindowOps) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        context.pick_folder_async(Box::new(move |path| {
+            if let Some(path) = path {
+                window.notify(TermWindowNotif::OpenProjectPath(path));
+            }
+        }));
+    }
+
     fn finish_inline_tab_rename(&mut self, commit: bool) {
         let rename = match self.inline_tab_rename.take() {
             Some(rename) => rename,
@@ -3205,6 +3272,46 @@ impl TermWindow {
             ShowTabNavigator => self.show_tab_navigator(),
             PromptRenameTab => self.prompt_rename_current_tab(),
             PromptRenamePaneTab(pane_id) => self.prompt_rename_pane_tab(*pane_id),
+            PromptRenameProjectSession(session_id) => {
+                self.prompt_rename_project_session(session_id.clone())
+            }
+            ToggleProjectSessionPinned(session_id) => {
+                crate::project_sessions::toggle_session_pinned(session_id);
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            ArchiveProjectSession(session_id) => {
+                crate::project_sessions::archive_session(session_id);
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            DeleteProjectSession(session_id) => {
+                if let Some(deleted) = crate::project_sessions::delete_session(session_id) {
+                    if deleted.was_active {
+                        if let (Some(next_session_id), Some(window)) =
+                            (deleted.next_session_id, window.as_ref())
+                        {
+                            self.activate_project_session(next_session_id, window);
+                        }
+                    } else if let Some(workspace) = deleted.materialized_workspace_name {
+                        let mux = Mux::get();
+                        for window_id in mux.iter_windows_in_workspace(&workspace) {
+                            mux.kill_window(window_id);
+                        }
+                    }
+                    if let Some(window) = window.as_ref() {
+                        window.invalidate();
+                    }
+                }
+            }
+            MarkProjectSessionUnread(session_id) => {
+                crate::project_sessions::mark_session_unread(session_id);
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
+                }
+            }
             ShowDebugOverlay => self.show_debug_overlay(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {
@@ -3987,6 +4094,7 @@ impl TermWindow {
         {
             let size = tab.get_size();
             vec![PositionedPane {
+                pane_stack_id: pane.pane_id(),
                 index: 0,
                 is_active: true,
                 is_zoomed: false,

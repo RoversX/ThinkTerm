@@ -2,6 +2,11 @@ use crate::customglyph::BlockKey;
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::ui::icons::SvgIcon;
+use crate::termwindow::ui::tokens::{
+    active_capsule_bg, capsule_border, CAPSULE_BORDER_WIDTH, TAB_CLOSE_HOVER_INSET,
+    TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
+    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP, WINDOW_TAB_RADIUS,
+};
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
@@ -10,14 +15,13 @@ use std::rc::Rc;
 use termwiz::cell::grapheme_column_width;
 use wezterm_bidi::Direction;
 use wezterm_font::LoadedFont;
-use wezterm_term::Line;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
-use window::WindowOps;
+use wezterm_term::Line;
 use window::color::LinearRgba;
+use window::WindowOps;
 
 const WINDOW_TAB_INSET: usize = 8;
 const WINDOW_TAB_ICON_GAP: usize = 8;
-const WINDOW_TAB_BUTTON_GAP: usize = 6;
 const WINDOW_TAB_MIN_TEXT_COLS: usize = 3;
 
 impl crate::TermWindow {
@@ -38,8 +42,8 @@ impl crate::TermWindow {
         let font = self.fonts.title_font()?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let icon_size = fancy_tab_icon_size(&metrics, row_height as f32) as usize;
-        let button_size = (icon_size + 10)
-            .min(row_height.saturating_sub(6))
+        let button_size = row_height
+            .saturating_sub(TAB_VERTICAL_PADDING * 2)
             .max(icon_size);
         let tab_width = self.window_tab_width_pixels().ceil() as usize;
 
@@ -49,9 +53,6 @@ impl crate::TermWindow {
             .mul_alpha(self.config.window_background_opacity);
         let foreground = palette.foreground.to_linear();
         let muted_fg = foreground.mul_alpha(0.66);
-        let divider = foreground.mul_alpha(0.14);
-        let active_edge = foreground.mul_alpha(0.20);
-        let accent = palette.selection_bg.to_linear();
 
         let border = self.get_os_border();
         let row_x = self.tab_bar_left_edge();
@@ -68,8 +69,9 @@ impl crate::TermWindow {
             .saturating_sub(row_x + border.right.get() as usize)
             .max(1);
         let row_right = row_x + row_width;
-        let viewport_left = (row_x as f32 + self.window_tab_left_padding_pixels()).ceil() as usize;
-        let viewport_right = row_right;
+        let viewport_left = (row_x as f32 + self.window_tab_left_padding_pixels()).ceil() as usize
+            + TAB_ROW_START_PADDING;
+        let viewport_right = row_right.saturating_sub(WINDOW_TAB_ACTION_RESERVED_WIDTH);
         let viewport_width = viewport_right.saturating_sub(viewport_left);
 
         self.filled_rectangle(
@@ -84,19 +86,6 @@ impl crate::TermWindow {
             background,
         )
         .context("fancy tab bar background")?;
-        self.filled_rectangle(
-            layers,
-            1,
-            euclid::rect(
-                row_x as f32,
-                (row_y + row_height.saturating_sub(1)) as f32,
-                row_width as f32,
-                1.0,
-            ),
-            divider,
-        )
-        .context("fancy tab bar divider")?;
-
         let mut ui_items = vec![UIItem {
             x: row_x,
             y: row_y,
@@ -117,13 +106,14 @@ impl crate::TermWindow {
                 .and_then(|window| window.idx_by_id(tab_id))
         });
 
+        let tab_step = tab_width + WINDOW_TAB_GAP;
         let mut tab_sequence_idx = 0usize;
         for item in self.tab_bar.items() {
             let TabBarItem::Tab { tab_idx, active } = item.item else {
                 continue;
             };
 
-            let virtual_left = tab_sequence_idx as f32 * tab_width as f32 - scroll_offset;
+            let virtual_left = tab_sequence_idx as f32 * tab_step as f32 - scroll_offset;
             tab_sequence_idx += 1;
 
             let tab_left = viewport_left as f32 + virtual_left;
@@ -161,21 +151,19 @@ impl crate::TermWindow {
                 &palette,
                 background,
                 if active { foreground } else { muted_fg },
-                active_edge,
-                accent,
             )?;
         }
 
-        self.paint_fancy_tab_bar_overflow(
+        self.paint_window_tab_new_button(
             layers,
+            &mut ui_items,
+            row_right,
             row_y,
             row_height,
-            viewport_left,
-            viewport_width,
-            scroll_offset,
-            max_scroll,
-            background,
-            divider,
+            button_size,
+            icon_size,
+            foreground,
+            muted_fg,
         )?;
 
         Ok(ui_items)
@@ -205,8 +193,6 @@ impl crate::TermWindow {
         palette: &ColorPalette,
         background: LinearRgba,
         foreground: LinearRgba,
-        active_edge: LinearRgba,
-        accent: LinearRgba,
     ) -> anyhow::Result<()> {
         self.filled_rectangle(
             layers,
@@ -216,52 +202,37 @@ impl crate::TermWindow {
         )
         .context("window tab background")?;
 
-        if active {
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(visible_left, row_y as f32, 1.0, row_height as f32),
-                active_edge,
-            )
-            .context("window tab active left edge")?;
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(
-                    (visible_left + visible_width - 1.0).max(visible_left),
-                    row_y as f32,
-                    1.0,
-                    row_height as f32,
-                ),
-                active_edge,
-            )
-            .context("window tab active right edge")?;
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(
-                    visible_left,
-                    row_y as f32 + row_height.saturating_sub(3) as f32,
-                    visible_width,
-                    3.0,
-                ),
-                accent,
-            )
-            .context("window tab active indicator")?;
+        let hover_x = visible_left.max(0.0) as usize;
+        let hover_width = visible_width.max(0.0) as usize;
+        let is_hovered = self.is_pointer_over_ui_rect(hover_x, row_y, hover_width, row_height);
+        let surface_foreground = palette.foreground.to_linear();
+        let tab_surface_color = if active {
+            active_capsule_bg(background.3)
+        } else if is_hovered && !is_renaming {
+            surface_foreground.mul_alpha(0.055)
         } else {
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(
-                    (visible_left + visible_width - 1.0).max(visible_left),
-                    row_y as f32 + 7.0,
-                    1.0,
-                    row_height.saturating_sub(14) as f32,
-                ),
-                active_edge.mul_alpha(0.55),
-            )
-            .context("window tab separator")?;
-        }
+            surface_foreground.mul_alpha(0.025)
+        };
+        let tab_surface_y = row_y + (row_height.saturating_sub(button_size) / 2);
+        self.fill_rounded_rectangle_with_border(
+            layers,
+            1,
+            euclid::rect(
+                visible_left,
+                tab_surface_y as f32,
+                visible_width,
+                button_size as f32,
+            ),
+            tab_surface_color,
+            if active {
+                capsule_border(surface_foreground, true)
+            } else {
+                LinearRgba::TRANSPARENT
+            },
+            WINDOW_TAB_RADIUS,
+            CAPSULE_BORDER_WIDTH,
+        )
+        .context("window tab surface")?;
 
         ui_items.push(UIItem {
             x: visible_left.max(0.0) as usize,
@@ -287,31 +258,64 @@ impl crate::TermWindow {
 
         let close_x = tab_left
             .saturating_add(tab_width)
-            .saturating_sub(button_size + WINDOW_TAB_BUTTON_GAP);
-        let show_close = self.config.show_close_tab_button_in_tabs && !is_renaming;
+            .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
+        let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
+        let close_slot_reserved = self.config.show_close_tab_button_in_tabs && !is_renaming;
+        let show_close = close_slot_reserved && (active || is_hovered);
         if show_close
             && close_x >= viewport_left
             && close_x.saturating_add(button_size) <= viewport_right
         {
+            let close_hovered =
+                self.is_pointer_over_ui_rect(close_x, close_y, button_size, button_size);
+            if close_hovered {
+                let hover_alpha =
+                    if self.is_pointer_pressing_ui_rect(close_x, close_y, button_size, button_size)
+                    {
+                        0.20
+                    } else {
+                        0.12
+                    };
+                let hover_inset = TAB_CLOSE_HOVER_INSET.min(button_size / 2);
+                let hover_size = button_size.saturating_sub(hover_inset * 2);
+                self.fill_rounded_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(
+                        (close_x + hover_inset) as f32,
+                        (close_y + hover_inset) as f32,
+                        hover_size as f32,
+                        hover_size as f32,
+                    ),
+                    foreground.mul_alpha(hover_alpha),
+                    TAB_CLOSE_HOVER_RADIUS,
+                )
+                .context("window tab close hover")?;
+            }
             ui_items.push(UIItem {
                 x: close_x,
-                y: row_y + (row_height.saturating_sub(button_size) / 2),
+                y: close_y,
                 width: button_size,
                 height: button_size,
                 item_type: UIItemType::CloseTab(tab_idx),
             });
+            let close_fg = if close_hovered {
+                foreground
+            } else {
+                foreground.mul_alpha(0.82)
+            };
             self.paint_fancy_tab_icon(
                 layers,
                 SvgIcon::X,
                 close_x + (button_size.saturating_sub(icon_size) / 2),
                 icon_y,
                 icon_size,
-                foreground.mul_alpha(0.82),
+                close_fg,
             )?;
         }
 
         let text_x = icon_x + icon_size + WINDOW_TAB_ICON_GAP;
-        let text_right = if show_close {
+        let text_right = if close_slot_reserved {
             close_x.saturating_sub(WINDOW_TAB_ICON_GAP)
         } else {
             tab_left
@@ -353,69 +357,59 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_fancy_tab_bar_overflow(
+    fn paint_window_tab_new_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        row_right: usize,
         row_y: usize,
         row_height: usize,
-        viewport_left: usize,
-        viewport_width: usize,
-        scroll_offset: f32,
-        max_scroll: f32,
-        background: LinearRgba,
-        divider: LinearRgba,
+        button_size: usize,
+        icon_size: usize,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
     ) -> anyhow::Result<()> {
-        let fade_width = 22usize.min(viewport_width / 3);
-        if fade_width <= 1 {
-            return Ok(());
-        }
-
-        if scroll_offset > 0.0 {
-            self.filled_rectangle(
+        let button_x = row_right.saturating_sub(WINDOW_TAB_INSET + button_size);
+        let button_y = row_y + (row_height.saturating_sub(button_size) / 2);
+        let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
+        if hovered {
+            let hover_alpha =
+                if self.is_pointer_pressing_ui_rect(button_x, button_y, button_size, button_size) {
+                    0.20
+                } else {
+                    0.12
+                };
+            self.fill_rounded_rectangle(
                 layers,
                 1,
                 euclid::rect(
-                    viewport_left as f32,
-                    row_y as f32,
-                    fade_width as f32,
-                    row_height as f32,
+                    button_x as f32,
+                    button_y as f32,
+                    button_size as f32,
+                    button_size as f32,
                 ),
-                background.mul_alpha(0.94),
+                foreground.mul_alpha(hover_alpha),
+                5.0,
             )
-            .context("window tab left overflow shade")?;
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(
-                    (viewport_left + fade_width.saturating_sub(2)) as f32,
-                    row_y as f32,
-                    2.0,
-                    row_height as f32,
-                ),
-                divider,
-            )
-            .context("window tab left overflow edge")?;
+            .context("window tab new button hover")?;
         }
 
-        if scroll_offset < max_scroll {
-            let x = viewport_left + viewport_width.saturating_sub(fade_width);
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(x as f32, row_y as f32, fade_width as f32, row_height as f32),
-                background.mul_alpha(0.94),
-            )
-            .context("window tab right overflow shade")?;
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(x as f32, row_y as f32, 2.0, row_height as f32),
-                divider,
-            )
-            .context("window tab right overflow edge")?;
-        }
+        ui_items.push(UIItem {
+            x: button_x,
+            y: button_y,
+            width: button_size,
+            height: button_size,
+            item_type: UIItemType::TabBar(TabBarItem::NewTabButton),
+        });
 
-        Ok(())
+        self.paint_fancy_tab_icon(
+            layers,
+            SvgIcon::Plus,
+            button_x + (button_size.saturating_sub(icon_size) / 2),
+            button_y + (button_size.saturating_sub(icon_size) / 2),
+            icon_size,
+            if hovered { foreground } else { muted_fg },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -444,7 +438,7 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn paint_ui_title_text(
+    pub(crate) fn paint_ui_title_text(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         font: &Rc<LoadedFont>,

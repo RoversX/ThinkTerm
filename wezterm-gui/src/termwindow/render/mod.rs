@@ -7,7 +7,9 @@ use crate::quad::{
 };
 use crate::shapecache::*;
 use crate::termwindow::render::paint::AllowImage;
-use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo, TermWindowNotif};
+use crate::termwindow::{
+    BorrowedShapeCacheKey, MouseCapture, RenderState, ShapedInfo, TermWindowNotif,
+};
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
 use ::window::{DeadKeyStatus, PointF, RectF, SizeF, WindowOps};
@@ -293,6 +295,40 @@ impl crate::TermWindow {
         quad.set_fg_color(color);
         quad.set_hsv(None);
         Ok(quad)
+    }
+
+    pub(crate) fn is_pointer_over_ui_rect(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        if width == 0 || height == 0 {
+            return false;
+        }
+        if !matches!(self.current_mouse_capture, None | Some(MouseCapture::UI)) {
+            return false;
+        }
+        let Some(event) = &self.current_mouse_event else {
+            return false;
+        };
+        let mouse_x = event.coords.x;
+        let mouse_y = event.coords.y;
+        mouse_x >= x as isize
+            && mouse_x < x.saturating_add(width) as isize
+            && mouse_y >= y as isize
+            && mouse_y < y.saturating_add(height) as isize
+    }
+
+    pub(crate) fn is_pointer_pressing_ui_rect(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        self.is_pointer_over_ui_rect(x, y, width, height) && !self.current_mouse_buttons.is_empty()
     }
 
     pub fn poly_quad<'a>(

@@ -10,8 +10,9 @@ use crate::termwindow::render::{
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::termwindow::ui::tokens::{
-    PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_MAX_WIDTH,
-    PANE_NAV_TAB_MIN_WIDTH, PANE_NAV_TAB_RADIUS,
+    active_capsule_bg, capsule_border, CAPSULE_BORDER_WIDTH, PANE_NAV_BUTTON_GAP,
+    PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS,
+    TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
@@ -31,6 +32,7 @@ use wezterm_font::{FontConfiguration, LoadedFont};
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
+use window::MouseEventKind as WMEK;
 
 impl crate::TermWindow {
     fn pane_nav_bar_height(&self, pos: &PositionedPane) -> usize {
@@ -75,42 +77,27 @@ impl crate::TermWindow {
             return Ok(0);
         }
 
-        let (pane_x, pane_y) = self.pane_content_origin(pos)?;
-        let pane_width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
-        if pane_width <= 0.0 {
+        let (content_pane_x, pane_y) = self.pane_content_origin(pos)?;
+        let content_pane_width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
+        if content_pane_width <= 0.0 {
             return Ok(0);
         }
+        let content_pane_right = content_pane_x + content_pane_width;
+        let pane_x = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
+            self.tab_bar_left_edge() as f32
+        } else {
+            content_pane_x
+        };
+        let pane_width = (content_pane_right - pane_x).max(1.0);
 
         let background = palette
             .resolve_bg(ColorAttribute::Default)
             .to_linear()
             .mul_alpha(self.config.window_background_opacity);
         let foreground = palette.foreground.to_linear();
-        let nav_bg = background;
-        let divider = foreground.mul_alpha(0.08);
         let muted_fg = foreground.mul_alpha(0.66);
-        let tab_bg = background;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
 
-        self.filled_rectangle(
-            layers,
-            1,
-            euclid::rect(pane_x, pane_y, pane_width, nav_height as f32),
-            nav_bg,
-        )
-        .context("pane nav background")?;
-        self.filled_rectangle(
-            layers,
-            1,
-            euclid::rect(
-                pane_x,
-                pane_y + nav_height.saturating_sub(1) as f32,
-                pane_width,
-                1.0,
-            ),
-            divider,
-        )
-        .context("pane nav divider")?;
         self.ui_items.push(UIItem {
             x: pane_x.max(0.0) as usize,
             y: pane_y.max(0.0) as usize,
@@ -124,8 +111,8 @@ impl crate::TermWindow {
         });
 
         let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
-        let button_size = (icon_size + 10)
-            .min(nav_height.saturating_sub(4))
+        let button_size = nav_height
+            .saturating_sub(TAB_VERTICAL_PADDING * 2)
             .max(icon_size);
         let button_y = pane_y as usize + (nav_height.saturating_sub(button_size) / 2);
         let mut button_x = (pane_x + pane_width) as usize;
@@ -142,29 +129,35 @@ impl crate::TermWindow {
                 button_size,
                 icon_size,
                 muted_fg,
+                foreground,
                 pos,
                 action,
             )?;
         }
 
         let tabs = Mux::get().pane_stack_tabs(pos.pane.pane_id());
-        let tab_start = pane_x as usize + PANE_NAV_INSET;
-        let tab_width = PANE_NAV_TAB_MAX_WIDTH.max(PANE_NAV_TAB_MIN_WIDTH);
-        let tab_step = tab_width + PANE_NAV_BUTTON_GAP;
+        let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos.left);
+        let tab_width = self.window_tab_width_pixels().ceil() as usize;
+        let tab_step = tab_width + PANE_NAV_TAB_GAP;
         let total_tab_width = tabs.len().saturating_mul(tab_width).saturating_add(
             tabs.len()
                 .saturating_sub(1)
-                .saturating_mul(PANE_NAV_BUTTON_GAP),
+                .saturating_mul(PANE_NAV_TAB_GAP),
         );
         let max_tab_right = button_x.saturating_sub(PANE_NAV_INSET);
         let viewport_width = max_tab_right.saturating_sub(tab_start);
         let max_scroll = total_tab_width.saturating_sub(viewport_width) as f32;
         let scroll_offset = self
             .pane_nav_tab_scroll_offsets
-            .get(&pos.pane.pane_id())
+            .get(&pos.pane_stack_id)
             .copied()
             .unwrap_or(0.0)
             .clamp(0.0, max_scroll.max(0.0));
+        let suppress_hover = self
+            .current_mouse_event
+            .as_ref()
+            .is_some_and(|event| matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)))
+            || self.tab_wheel_scroll_active();
         let tab_height = button_size;
         let tab_y = button_y;
         for (idx, tab) in tabs.into_iter().enumerate() {
@@ -186,52 +179,35 @@ impl crate::TermWindow {
                 continue;
             }
 
-            let visible_active_tab = tab.is_active && pos.is_active;
+            let selected_tab = tab.is_active;
             let is_renaming_tab = self.is_renaming_pane_nav_tab(tab.pane_id);
-            let this_tab_bg = tab_bg;
-            let this_tab_fg = if visible_active_tab { tab_fg } else { muted_fg };
-            let active_edge = foreground.mul_alpha(0.20);
-            self.fill_rounded_rectangle(
+            let this_tab_fg = if selected_tab { tab_fg } else { muted_fg };
+            let hover_x = visible_left.max(0.0) as usize;
+            let hover_width = visible_width.max(0.0) as usize;
+            let is_hovered = !suppress_hover
+                && self.is_pointer_over_ui_rect(hover_x, tab_y, hover_width, tab_height);
+            let tab_surface_color = if selected_tab {
+                active_capsule_bg(background.3)
+            } else if is_hovered && !is_renaming_tab {
+                foreground.mul_alpha(0.055)
+            } else {
+                foreground.mul_alpha(0.025)
+            };
+            let tab_border_color = if selected_tab {
+                capsule_border(foreground, true)
+            } else {
+                LinearRgba::TRANSPARENT
+            };
+            self.fill_rounded_rectangle_with_border(
                 layers,
                 1,
                 euclid::rect(visible_left, tab_y as f32, visible_width, tab_height as f32),
-                this_tab_bg,
+                tab_surface_color,
+                tab_border_color,
                 PANE_NAV_TAB_RADIUS,
+                CAPSULE_BORDER_WIDTH,
             )
-            .context("pane nav tab")?;
-            if visible_active_tab {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(
-                        visible_left,
-                        tab_y as f32 + (tab_height as f32 - 3.0).max(0.0),
-                        visible_width,
-                        3.0,
-                    ),
-                    palette.selection_bg.to_linear(),
-                )
-                .context("pane nav active tab accent")?;
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(visible_left, tab_y as f32, 1.0, tab_height as f32),
-                    active_edge,
-                )
-                .context("pane nav active tab left edge")?;
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(
-                        (visible_left + visible_width - 1.0).max(visible_left),
-                        tab_y as f32,
-                        1.0,
-                        tab_height as f32,
-                    ),
-                    active_edge,
-                )
-                .context("pane nav active tab right edge")?;
-            }
+            .context("pane nav tab surface")?;
             self.ui_items.push(UIItem {
                 x: visible_left.max(0.0) as usize,
                 y: tab_y,
@@ -259,9 +235,42 @@ impl crate::TermWindow {
                 )?;
             }
 
-            let close_x = draw_tab_x + tab_width - button_size;
-            if !is_renaming_tab {
+            let close_x = draw_tab_x
+                .saturating_add(tab_width)
+                .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
+            let close_slot_reserved = !is_renaming_tab;
+            let show_close = close_slot_reserved && (selected_tab || is_hovered);
+            if show_close {
                 if close_x >= tab_start && close_x.saturating_add(button_size) <= max_tab_right {
+                    let close_hovered =
+                        self.is_pointer_over_ui_rect(close_x, tab_y, button_size, button_size);
+                    if close_hovered {
+                        let hover_alpha = if self.is_pointer_pressing_ui_rect(
+                            close_x,
+                            tab_y,
+                            button_size,
+                            button_size,
+                        ) {
+                            0.20
+                        } else {
+                            0.12
+                        };
+                        let hover_inset = TAB_CLOSE_HOVER_INSET.min(button_size / 2);
+                        let hover_size = button_size.saturating_sub(hover_inset * 2);
+                        self.fill_rounded_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(
+                                (close_x + hover_inset) as f32,
+                                (tab_y + hover_inset) as f32,
+                                hover_size as f32,
+                                hover_size as f32,
+                            ),
+                            foreground.mul_alpha(hover_alpha),
+                            TAB_CLOSE_HOVER_RADIUS,
+                        )
+                        .context("pane nav close hover")?;
+                    }
                     self.ui_items.push(UIItem {
                         x: close_x,
                         y: tab_y,
@@ -279,7 +288,7 @@ impl crate::TermWindow {
                         close_x + ((button_size.saturating_sub(icon_size)) / 2),
                         title_icon_y,
                         icon_size,
-                        muted_fg,
+                        if close_hovered { foreground } else { muted_fg },
                     )?;
                 }
             }
@@ -287,10 +296,10 @@ impl crate::TermWindow {
             let ui_font = self.fonts.title_font().context("pane nav title font")?;
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
             let text_x = title_icon_x + icon_size + PANE_NAV_ICON_GAP;
-            let text_right = if is_renaming_tab {
-                draw_tab_x + tab_width - PANE_NAV_INSET
-            } else {
+            let text_right = if close_slot_reserved {
                 close_x
+            } else {
+                draw_tab_x + tab_width - PANE_NAV_INSET
             };
             let text_width = text_right
                 .min(max_tab_right)
@@ -323,55 +332,6 @@ impl crate::TermWindow {
             }
         }
 
-        let fade_width = 18.0_f32.min(viewport_width as f32 / 3.0);
-        if fade_width > 1.0 && scroll_offset > 0.0 {
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(tab_start as f32, pane_y, fade_width, nav_height as f32),
-                nav_bg.mul_alpha(0.94),
-            )
-            .context("pane nav left overflow shade")?;
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(
-                    tab_start as f32 + fade_width - 2.0,
-                    pane_y,
-                    2.0,
-                    nav_height as f32,
-                ),
-                divider,
-            )
-            .context("pane nav left overflow edge")?;
-        }
-        if fade_width > 1.0 && scroll_offset < max_scroll {
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(
-                    max_tab_right as f32 - fade_width,
-                    pane_y,
-                    fade_width,
-                    nav_height as f32,
-                ),
-                nav_bg.mul_alpha(0.94),
-            )
-            .context("pane nav right overflow shade")?;
-            self.filled_rectangle(
-                layers,
-                1,
-                euclid::rect(
-                    max_tab_right as f32 - fade_width,
-                    pane_y,
-                    2.0,
-                    nav_height as f32,
-                ),
-                divider,
-            )
-            .context("pane nav right overflow edge")?;
-        }
-
         Ok(nav_height)
     }
 
@@ -384,6 +344,7 @@ impl crate::TermWindow {
         button_size: usize,
         icon_size: usize,
         color: LinearRgba,
+        hover_color: LinearRgba,
         pos: &PositionedPane,
         action: PaneNavAction,
     ) -> anyhow::Result<()> {
@@ -399,13 +360,30 @@ impl crate::TermWindow {
             },
         });
 
+        let hovered = self.is_pointer_over_ui_rect(x, y, button_size, button_size);
+        if hovered {
+            let hover_alpha = if self.is_pointer_pressing_ui_rect(x, y, button_size, button_size) {
+                0.20
+            } else {
+                0.12
+            };
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(x as f32, y as f32, button_size as f32, button_size as f32),
+                color.mul_alpha(hover_alpha),
+                5.0,
+            )
+            .context("pane nav button hover")?;
+        }
+
         self.paint_pane_nav_icon(
             layers,
             icon,
             x + ((button_size.saturating_sub(icon_size)) / 2),
             y + ((button_size.saturating_sub(icon_size)) / 2),
             icon_size,
-            color,
+            if hovered { hover_color } else { color },
         )
     }
 

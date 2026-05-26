@@ -16,6 +16,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
+use block2::RcBlock;
 use cocoa::appkit::{
     self, CGFloat, NSApplication, NSApplicationActivateIgnoringOtherApps,
     NSApplicationPresentationOptions, NSBackingStoreBuffered, NSEvent, NSEventModifierFlags,
@@ -52,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::{is_ascii_control, IntegratedTitleButtonStyle, KeyboardLedStatus};
@@ -752,11 +754,13 @@ impl WindowOps for Window {
     {
         Connection::with_window_inner(self.id, move |inner| {
             if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                window_view
-                    .inner
-                    .borrow_mut()
-                    .events
-                    .dispatch(WindowEvent::Notification(Box::new(t)));
+                if let Ok(mut inner) = window_view.inner.try_borrow_mut() {
+                    inner
+                        .events
+                        .dispatch(WindowEvent::Notification(Box::new(t)));
+                } else {
+                    log::trace!("skipping notification while window is busy");
+                }
             }
             Ok(())
         });
@@ -802,6 +806,52 @@ impl WindowOps for Window {
             inner.show_context_menu(coords, items);
             Ok(())
         });
+    }
+
+    fn pick_folder_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        unsafe {
+            let _pool = NSAutoreleasePool::new(nil);
+            let panel: id = msg_send![class!(NSOpenPanel), openPanel];
+            let panel = StrongPtr::retain(panel);
+            let () = msg_send![*panel, setCanChooseFiles: NO];
+            let () = msg_send![*panel, setCanChooseDirectories: YES];
+            let () = msg_send![*panel, setAllowsMultipleSelection: NO];
+            let () = msg_send![*panel, setCanCreateDirectories: YES];
+            let () = msg_send![*panel, setResolvesAliases: YES];
+            let title = nsstring("Open Project");
+            let prompt = nsstring("Open");
+            let () = msg_send![*panel, setTitle: *title];
+            let () = msg_send![*panel, setPrompt: *prompt];
+
+            const NS_MODAL_RESPONSE_OK: NSInteger = 1;
+            let callback = Arc::new(Mutex::new(Some(callback)));
+            let callback_for_block = callback.clone();
+            let panel_for_block = panel.clone();
+            let block = RcBlock::new(move |result: NSInteger| {
+                let selected_path = if result != NS_MODAL_RESPONSE_OK {
+                    None
+                } else {
+                    let url: id = msg_send![*panel_for_block, URL];
+                    if url == nil {
+                        None
+                    } else {
+                        let path: id = msg_send![url, path];
+                        if path == nil {
+                            None
+                        } else {
+                            Some(PathBuf::from(nsstring_to_str(path)))
+                        }
+                    }
+                };
+
+                if let Ok(mut callback) = callback_for_block.lock() {
+                    if let Some(callback) = callback.take() {
+                        callback(selected_path);
+                    }
+                }
+            });
+            let () = msg_send![*panel, beginWithCompletionHandler: &*block];
+        }
     }
 
     fn invalidate(&self) {
@@ -1677,6 +1727,11 @@ fn thinkterm_titlebar_sidebar_button(titlebar_view_container: &StrongPtr) -> Opt
                 continue;
             }
 
+            let responds_to_tag: BOOL = msg_send![subview, respondsToSelector: sel!(tag)];
+            if responds_to_tag != YES {
+                continue;
+            }
+
             let tag: NSInteger = msg_send![subview, tag];
             if tag == THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG {
                 return Some(subview);
@@ -2493,7 +2548,10 @@ impl WindowView {
         let native_full_screen;
 
         {
-            let inner = self.inner.borrow();
+            let Ok(inner) = self.inner.try_borrow() else {
+                log::trace!("skipping application presentation update while window is busy");
+                return;
+            };
             native_full_screen = inner.config.native_macos_fullscreen_mode;
             is_simple_full_screen = inner.fullscreen.is_some();
         }
@@ -2521,20 +2579,22 @@ impl WindowView {
 
     extern "C" fn did_become_key(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::FocusChanged(true));
+            if let Ok(mut inner) = this.inner.try_borrow_mut() {
+                inner.events.dispatch(WindowEvent::FocusChanged(true));
+            } else {
+                log::trace!("skipping focus gained notification while window is busy");
+            }
             this.update_application_presentation(true);
         }
     }
 
     extern "C" fn did_resign_key(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::FocusChanged(false));
+            if let Ok(mut inner) = this.inner.try_borrow_mut() {
+                inner.events.dispatch(WindowEvent::FocusChanged(false));
+            } else {
+                log::trace!("skipping focus lost notification while window is busy");
+            }
             this.update_application_presentation(true);
         }
     }
@@ -3337,7 +3397,10 @@ impl WindowView {
 
     extern "C" fn draw_rect(view: &mut Object, sel: Sel, _dirty_rect: NSRect) {
         if let Some(this) = Self::get_this(view) {
-            let mut inner = this.inner.borrow_mut();
+            let Ok(mut inner) = this.inner.try_borrow_mut() else {
+                log::trace!("skipping draw while window is busy");
+                return;
+            };
 
             if inner.screen_changed {
                 // If the screen resolution changed (which can also
@@ -3365,12 +3428,15 @@ impl WindowView {
                         .await;
                     Connection::with_window_inner(window_id, move |inner| {
                         if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                            let mut state = window_view.inner.borrow_mut();
-                            state.paint_throttled = false;
-                            if state.invalidated {
-                                unsafe {
-                                    let () = msg_send![*inner.view, setNeedsDisplay: YES];
+                            if let Ok(mut state) = window_view.inner.try_borrow_mut() {
+                                state.paint_throttled = false;
+                                if state.invalidated {
+                                    unsafe {
+                                        let () = msg_send![*inner.view, setNeedsDisplay: YES];
+                                    }
                                 }
+                            } else {
+                                log::trace!("skipping paint throttle update while window is busy");
                             }
                         }
                         Ok(())

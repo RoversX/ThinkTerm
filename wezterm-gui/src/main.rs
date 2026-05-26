@@ -42,6 +42,7 @@ mod frontend;
 mod glyphcache;
 mod inputmap;
 mod overlay;
+mod project_sessions;
 mod quad;
 mod renderstate;
 mod resize_increment_calculator;

@@ -151,7 +151,11 @@ fn compute_tab_title(
 
             if let Some(pane) = &tab.active_pane {
                 let mut title = if tab.tab_title.is_empty() {
-                    terminal_title_for_display(&pane.title).to_string()
+                    if config.use_fancy_tab_bar {
+                        "Terminal".to_string()
+                    } else {
+                        terminal_title_for_display(&pane.title).to_string()
+                    }
                 } else {
                     tab.tab_title.clone()
                 };

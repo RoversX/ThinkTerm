@@ -1,10 +1,13 @@
 use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
-use crate::termwindow::ui::tokens::{PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_MAX_WIDTH};
+use crate::termwindow::ui::tokens::{
+    PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_ROW_START_PADDING,
+    TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
+};
 use crate::termwindow::{
-    GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TermWindowNotif, UIItem,
-    UIItemType, TMB,
+    GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TabWheelSurface,
+    TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     ContextMenuItem, MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK,
@@ -14,7 +17,7 @@ use config::keyassignment::{
     ClipboardPasteSource, KeyAssignment, MouseEventTrigger, PaneDirection, SpawnCommand,
     SpawnTabDomain, SplitPane, SplitSize,
 };
-use config::MouseEventAltScreen;
+use config::{MouseEventAltScreen, TermConfig};
 use mux::pane::{Pane, WithPaneLines};
 use mux::tab::{PositionedPane, SplitDirection};
 use mux::Mux;
@@ -23,17 +26,30 @@ use std::convert::TryInto;
 use std::ops::Sub;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::Line;
 use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
+const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
+const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
+
 impl super::TermWindow {
     fn tab_scroll_pixels(amount: i16) -> f32 {
         let steps = amount.unsigned_abs().max(1) as f32;
         let delta = (steps * 56.0).min(280.0);
+        if amount < 0 {
+            delta
+        } else {
+            -delta
+        }
+    }
+
+    fn sidebar_scroll_pixels(amount: i16) -> f32 {
+        let steps = amount.unsigned_abs().max(1) as f32;
+        let delta = (steps * 6.0).min(42.0);
         if amount < 0 {
             delta
         } else {
@@ -80,6 +96,14 @@ impl super::TermWindow {
         }
     }
 
+    pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize) -> usize {
+        if pane_left == 0 && self.workspace_sidebar_width() > 0 {
+            TAB_ROW_START_PADDING
+        } else {
+            PANE_NAV_INSET
+        }
+    }
+
     pub(super) fn window_tab_viewport_width(&self) -> f32 {
         let border = self.get_os_border();
         let left_padding = self.window_tab_left_padding_pixels();
@@ -89,6 +113,11 @@ impl super::TermWindow {
             .saturating_sub(self.tab_bar_left_edge())
             .saturating_sub(border.right.get() as usize)
             .saturating_sub(left_padding.max(0.0) as usize)
+            .saturating_sub(if self.config.use_fancy_tab_bar {
+                TAB_ROW_START_PADDING + WINDOW_TAB_ACTION_RESERVED_WIDTH
+            } else {
+                0
+            })
             .max(1) as f32
     }
 
@@ -103,7 +132,13 @@ impl super::TermWindow {
         }
 
         let tab_width = self.window_tab_width_pixels();
-        let total_width = tab_count as f32 * tab_width;
+        let tab_gap = if self.config.use_fancy_tab_bar {
+            WINDOW_TAB_GAP as f32
+        } else {
+            0.0
+        };
+        let total_width =
+            tab_count as f32 * tab_width + tab_count.saturating_sub(1) as f32 * tab_gap;
         let available_width = self.window_tab_viewport_width();
 
         (total_width - available_width).max(0.0)
@@ -123,41 +158,141 @@ impl super::TermWindow {
         }
     }
 
-    fn max_pane_nav_tab_scroll_offset(&self, pane_id: mux::pane::PaneId) -> f32 {
+    fn max_pane_nav_tab_scroll_offset_for_stack(&self, stack_id: mux::tab::PaneStackId) -> f32 {
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
             return 0.0;
         };
 
-        let tab_count = Mux::get().pane_stack_tabs(pane_id).len();
+        let Some(pos) = tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .find(|pos| pos.pane_stack_id == stack_id)
+        else {
+            return 0.0;
+        };
+
+        let tab_count = Mux::get().pane_stack_tabs(pos.pane.pane_id()).len();
         if tab_count <= 1 {
             return 0.0;
         }
 
         let cell_width = self.render_metrics.cell_size.width as f32;
-        let pane_width = tab
-            .iter_panes_ignoring_zoom()
-            .into_iter()
-            .find(|pos| pos.pane.pane_id() == pane_id)
-            .map(|pos| pos.width as f32 * cell_width)
-            .unwrap_or(0.0);
+        let content_width = pos.width as f32 * cell_width;
+        let pane_width = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
+            content_width
+                + (self.padding_left_top().0 - self.workspace_sidebar_width() as f32).max(0.0)
+        } else {
+            content_width
+        };
+        let pane_left = pos.left;
         if pane_width <= 0.0 {
             return 0.0;
         }
 
         let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics);
         let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
-        let button_size = (icon_size + 10)
-            .min(nav_height.saturating_sub(4))
+        let button_size = nav_height
+            .saturating_sub(TAB_VERTICAL_PADDING * 2)
             .max(icon_size);
         let controls_width = (button_size + PANE_NAV_BUTTON_GAP)
             .saturating_mul(2)
-            .saturating_add(PANE_NAV_INSET * 2);
+            .saturating_add(PANE_NAV_INSET)
+            .saturating_add(self.pane_nav_tab_left_inset(pane_left));
         let viewport_width = (pane_width as usize).saturating_sub(controls_width).max(1) as f32;
-        let tab_width = PANE_NAV_TAB_MAX_WIDTH as f32;
+        let tab_width = self.window_tab_width_pixels();
         let total_width = tab_count as f32 * tab_width
-            + tab_count.saturating_sub(1) as f32 * PANE_NAV_BUTTON_GAP as f32;
+            + tab_count.saturating_sub(1) as f32 * PANE_NAV_TAB_GAP as f32;
 
         (total_width - viewport_width).max(0.0)
+    }
+
+    fn set_tab_wheel_surface_lock(&mut self, surface: TabWheelSurface) {
+        self.tab_wheel_surface_lock = Some((
+            surface,
+            std::time::Instant::now() + std::time::Duration::from_millis(TAB_WHEEL_SURFACE_LOCK_MS),
+        ));
+    }
+
+    fn locked_tab_wheel_surface(&self) -> Option<TabWheelSurface> {
+        let (surface, until) = self.tab_wheel_surface_lock?;
+        (until > Instant::now()).then_some(surface)
+    }
+
+    fn should_ignore_tab_wheel_amount(&mut self, surface: TabWheelSurface, amount: i16) -> bool {
+        let sign = amount.signum();
+        if sign == 0 {
+            return true;
+        }
+
+        let now = Instant::now();
+        if let Some((locked_surface, locked_sign, until)) = self.tab_wheel_direction_lock {
+            if locked_surface == surface
+                && until > now
+                && locked_sign != sign
+                && amount.unsigned_abs() <= 1
+            {
+                return true;
+            }
+        }
+
+        self.tab_wheel_direction_lock = Some((
+            surface,
+            sign,
+            now + Duration::from_millis(TAB_WHEEL_DIRECTION_LOCK_MS),
+        ));
+        false
+    }
+
+    pub(crate) fn tab_wheel_scroll_active(&self) -> bool {
+        self.locked_tab_wheel_surface().is_some()
+            || self
+                .pane_nav_tab_scroll_targets
+                .iter()
+                .any(|(stack_id, target)| {
+                    let current = self
+                        .pane_nav_tab_scroll_offsets
+                        .get(stack_id)
+                        .copied()
+                        .unwrap_or(0.0);
+                    (current - target).abs() > 0.75
+                })
+    }
+
+    fn scroll_pane_nav_stack_tabs(
+        &mut self,
+        stack_key: mux::tab::PaneStackId,
+        amount: i16,
+        context: &dyn WindowOps,
+    ) {
+        let max_offset = self.max_pane_nav_tab_scroll_offset_for_stack(stack_key);
+        let stored_offset = self
+            .pane_nav_tab_scroll_offsets
+            .get(&stack_key)
+            .copied()
+            .unwrap_or(0.0);
+        let current_offset = stored_offset.clamp(0.0, max_offset.max(0.0));
+        let needs_offset_clamp = (current_offset - stored_offset).abs() > f32::EPSILON;
+        let stored_target = self
+            .pane_nav_tab_scroll_targets
+            .get(&stack_key)
+            .copied()
+            .unwrap_or(current_offset);
+        let current_target = stored_target.clamp(0.0, max_offset.max(0.0));
+        let needs_target_clamp = (current_target - stored_target).abs() > f32::EPSILON;
+        let offset =
+            (current_target + Self::tab_scroll_pixels(amount)).clamp(0.0, max_offset.max(0.0));
+        if (offset - current_target).abs() > f32::EPSILON
+            || needs_offset_clamp
+            || needs_target_clamp
+        {
+            self.pane_nav_tab_scroll_targets.insert(stack_key, offset);
+            if needs_offset_clamp || !self.pane_nav_tab_scroll_offsets.contains_key(&stack_key) {
+                self.pane_nav_tab_scroll_offsets
+                    .insert(stack_key, current_offset);
+            }
+            self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(16)));
+            context.invalidate();
+        }
     }
 
     fn scroll_pane_nav_tabs(
@@ -166,58 +301,59 @@ impl super::TermWindow {
         amount: i16,
         context: &dyn WindowOps,
     ) {
-        let current = self
-            .pane_nav_tab_scroll_targets
-            .get(&pane_id)
-            .copied()
-            .or_else(|| self.pane_nav_tab_scroll_offsets.get(&pane_id).copied())
-            .unwrap_or(0.0);
-        let max_offset = self.max_pane_nav_tab_scroll_offset(pane_id);
-        let offset = (current + Self::tab_scroll_pixels(amount)).clamp(0.0, max_offset.max(0.0));
-        if (offset - current).abs() > f32::EPSILON
-            || self
-                .pane_nav_tab_scroll_offsets
-                .get(&pane_id)
-                .is_some_and(|current| (offset - current).abs() > f32::EPSILON)
-        {
-            self.pane_nav_tab_scroll_targets.insert(pane_id, offset);
-            self.pane_nav_tab_scroll_offsets.insert(pane_id, offset);
+        if let Some(stack_key) = Mux::get().pane_stack_id(pane_id) {
+            self.scroll_tab_wheel_surface(TabWheelSurface::PaneStack(stack_key), amount, context);
+        }
+    }
+
+    fn lock_pane_nav_tab_wheel_surface(
+        &mut self,
+        pane_id: mux::pane::PaneId,
+    ) -> Option<mux::tab::PaneStackId> {
+        let stack_key = Mux::get().pane_stack_id(pane_id)?;
+        self.set_tab_wheel_surface_lock(TabWheelSurface::PaneStack(stack_key));
+        Some(stack_key)
+    }
+
+    fn scroll_tab_wheel_surface(
+        &mut self,
+        surface: TabWheelSurface,
+        amount: i16,
+        context: &dyn WindowOps,
+    ) {
+        if self.should_ignore_tab_wheel_amount(surface, amount) {
             context.invalidate();
+            return;
+        }
+
+        match surface {
+            TabWheelSurface::Window => self.scroll_window_tab_bar(amount, context),
+            TabWheelSurface::PaneStack(stack_id) => {
+                self.scroll_pane_nav_stack_tabs(stack_id, amount, context)
+            }
         }
     }
 
     fn wheel_amount(event: &MouseEvent) -> Option<i16> {
         match event.kind {
-            WMEK::VertWheel(amount) | WMEK::HorzWheel(amount) => Some(amount),
+            WMEK::HorzWheel(amount) => Some(amount),
             _ => None,
         }
     }
 
-    fn mouse_wheel_tab_surfaces(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
-        let Some(amount) = Self::wheel_amount(event) else {
-            return false;
-        };
-
-        if self.show_tab_bar {
-            let border = self.get_os_border();
-            let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-            let tab_bar_y = if self.config.tab_bar_at_bottom {
-                self.dimensions.pixel_height as f32 - tab_bar_height - border.bottom.get() as f32
-            } else {
-                border.top.get() as f32
-            };
-            let y = event.coords.y as f32;
-            if event.coords.x >= self.tab_bar_left_edge() as isize
-                && y >= tab_bar_y
-                && y < tab_bar_y + tab_bar_height
-            {
-                self.scroll_window_tab_bar(amount, context);
-                return true;
-            }
+    fn tab_wheel_surface_at_event(&self, event: &MouseEvent) -> Option<TabWheelSurface> {
+        if let Some(UIItem {
+            item_type: UIItemType::PaneNav { pane_id, .. },
+            ..
+        }) = self.resolve_ui_item(event)
+        {
+            return Mux::get()
+                .pane_stack_id(pane_id)
+                .map(TabWheelSurface::PaneStack);
         }
 
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
-            return false;
+            return None;
         };
 
         let border = self.get_os_border();
@@ -234,16 +370,119 @@ impl super::TermWindow {
         let y = event.coords.y as f32;
 
         for pos in tab.iter_panes_ignoring_zoom() {
-            let pane_x = padding_left + border.left.get() as f32 + pos.left as f32 * cell_width;
+            let content_pane_x =
+                padding_left + border.left.get() as f32 + pos.left as f32 * cell_width;
+            let pane_x = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
+                self.tab_bar_left_edge() as f32
+            } else {
+                content_pane_x
+            };
             let pane_y = top_bar_height + border.top.get() as f32 + pos.top as f32 * cell_height;
-            let pane_width = pos.width as f32 * cell_width;
+            let pane_width = (content_pane_x + pos.width as f32 * cell_width - pane_x).max(1.0);
             if x >= pane_x && x < pane_x + pane_width && y >= pane_y && y < pane_y + nav_height {
-                self.scroll_pane_nav_tabs(pos.pane.pane_id(), amount, context);
-                return true;
+                return Some(TabWheelSurface::PaneStack(pos.pane_stack_id));
             }
         }
 
-        false
+        if self.show_tab_bar {
+            let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+            let tab_bar_y = if self.config.tab_bar_at_bottom {
+                self.dimensions.pixel_height as f32 - tab_bar_height - border.bottom.get() as f32
+            } else {
+                border.top.get() as f32
+            };
+            if event.coords.x >= self.tab_bar_left_edge() as isize
+                && y >= tab_bar_y
+                && y < tab_bar_y + tab_bar_height
+            {
+                return Some(TabWheelSurface::Window);
+            }
+        }
+
+        None
+    }
+
+    fn vertical_wheel_tab_surface_passthrough(&self, event: &MouseEvent, item: &UIItem) -> bool {
+        if !matches!(event.kind, WMEK::VertWheel(_)) {
+            return false;
+        }
+
+        matches!(
+            item.item_type,
+            UIItemType::PaneNav { .. } | UIItemType::TabBar(_)
+        )
+    }
+
+    fn mouse_wheel_tab_surfaces(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
+        if !matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)) {
+            return false;
+        }
+
+        let hovered_surface = self.tab_wheel_surface_at_event(event);
+
+        if let Some(amount) = Self::wheel_amount(event) {
+            match hovered_surface {
+                Some(surface) => {
+                    self.set_tab_wheel_surface_lock(surface);
+                    self.scroll_tab_wheel_surface(surface, amount, context);
+                    true
+                }
+                None => {
+                    self.tab_wheel_surface_lock = None;
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    fn mouse_wheel_workspace_sidebar(
+        &mut self,
+        event: &MouseEvent,
+        context: &dyn WindowOps,
+    ) -> bool {
+        let Some(rect) = self.workspace_sidebar_rect() else {
+            return false;
+        };
+
+        let x = event.coords.x;
+        let y = event.coords.y;
+        if x < rect.x as isize
+            || x >= rect.x.saturating_add(rect.width) as isize
+            || y < rect.y as isize
+            || y >= rect.y.saturating_add(rect.height) as isize
+        {
+            return false;
+        }
+
+        let amount = match event.kind {
+            WMEK::VertWheel(amount) => amount,
+            // Trackpads often emit a little horizontal inertia while the user is
+            // vertically scrolling. Consume it inside the sidebar so it doesn't
+            // leak to tab or terminal wheel handlers at the scroll bounds.
+            WMEK::HorzWheel(_) => return true,
+            _ => return false,
+        };
+        if amount == 0 {
+            return true;
+        }
+
+        let max_offset = self.workspace_sidebar_scroll_max();
+        if max_offset <= 0.0 {
+            return true;
+        }
+
+        self.show_workspace_sidebar_scrollbar();
+        let offset = (self.workspace_sidebar_scroll_offset + Self::sidebar_scroll_pixels(amount))
+            .clamp(0.0, max_offset);
+        if (offset - self.workspace_sidebar_scroll_offset).abs() > f32::EPSILON {
+            self.workspace_sidebar_scroll_offset = offset;
+            context.invalidate();
+        } else {
+            context.invalidate();
+        }
+        true
     }
 
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
@@ -263,7 +502,14 @@ impl super::TermWindow {
             }
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
-            | UIItemType::WorkspaceSidebar(_)
+            | UIItemType::ProjectNew
+            | UIItemType::ProjectToggleSessions(_)
+            | UIItemType::Project(_)
+            | UIItemType::ProjectSession(_)
+            | UIItemType::ProjectSessionArchive(_)
+            | UIItemType::ProjectSessionNew(_)
+            | UIItemType::WorkspaceSidebarScrollTrack
+            | UIItemType::WorkspaceSidebarScrollThumb
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::AboveScrollThumb
@@ -278,7 +524,14 @@ impl super::TermWindow {
             UIItemType::TabBar(_) => {}
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
-            | UIItemType::WorkspaceSidebar(_)
+            | UIItemType::ProjectNew
+            | UIItemType::ProjectToggleSessions(_)
+            | UIItemType::Project(_)
+            | UIItemType::ProjectSession(_)
+            | UIItemType::ProjectSessionArchive(_)
+            | UIItemType::ProjectSessionNew(_)
+            | UIItemType::WorkspaceSidebarScrollTrack
+            | UIItemType::WorkspaceSidebarScrollThumb
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::AboveScrollThumb
@@ -358,6 +611,10 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+
+        if self.mouse_wheel_workspace_sidebar(&event, context) {
+            return;
+        }
 
         if self.mouse_wheel_tab_surfaces(&event, context) {
             return;
@@ -486,7 +743,9 @@ impl super::TermWindow {
         let prior_ui_item = self.last_ui_item.clone();
 
         let ui_item = if matches!(self.current_mouse_capture, None | Some(MouseCapture::UI)) {
-            let ui_item = self.resolve_ui_item(&event);
+            let ui_item = self
+                .resolve_ui_item(&event)
+                .filter(|item| !self.vertical_wheel_tab_surface_passthrough(&event, item));
 
             match (self.last_ui_item.take(), &ui_item) {
                 (Some(prior), Some(item)) => {
@@ -628,6 +887,40 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
+    fn set_workspace_sidebar_scroll_from_thumb_top(
+        &mut self,
+        thumb_top: f32,
+        context: &dyn WindowOps,
+    ) {
+        let Some(scroll) = self.workspace_sidebar_scroll_geometry() else {
+            return;
+        };
+        let travel = (scroll.track_height as f32 - scroll.thumb_height).max(1.0);
+        let relative_top = (thumb_top - scroll.track_y as f32).clamp(0.0, travel);
+        let offset = (relative_top / travel * scroll.max_scroll).clamp(0.0, scroll.max_scroll);
+        self.show_workspace_sidebar_scrollbar();
+        if (offset - self.workspace_sidebar_scroll_offset).abs() > f32::EPSILON {
+            self.workspace_sidebar_scroll_offset = offset;
+            context.invalidate();
+        } else {
+            context.invalidate();
+        }
+    }
+
+    fn drag_workspace_sidebar_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let from_top = start_event.coords.y.saturating_sub(item.y as isize) as f32;
+        let thumb_top = event.coords.y as f32 - from_top;
+        self.set_workspace_sidebar_scroll_from_thumb_top(thumb_top, context);
+        context.set_cursor(Some(MouseCursor::Hand));
+        self.dragging.replace((item, start_event));
+    }
+
     fn drag_ui_item(
         &mut self,
         item: UIItem,
@@ -646,6 +939,9 @@ impl super::TermWindow {
             }
             UIItemType::WorkspaceSidebarResize => {
                 self.drag_workspace_sidebar_resize(item, start_event, event, context);
+            }
+            UIItemType::WorkspaceSidebarScrollThumb => {
+                self.drag_workspace_sidebar_scroll_thumb(item, start_event, event, context);
             }
             UIItemType::PaneNav { .. } => {}
             _ => {
@@ -705,11 +1001,32 @@ impl super::TermWindow {
             } => {
                 self.mouse_event_pane_nav(pane_id, pane_index, action, event, context);
             }
-            UIItemType::WorkspaceSidebar(workspace) => {
-                self.mouse_event_workspace_sidebar(workspace, event, context);
+            UIItemType::ProjectNew => {
+                self.mouse_event_project_new(event, context);
+            }
+            UIItemType::ProjectToggleSessions(project_id) => {
+                self.mouse_event_project_toggle_sessions(project_id, event, context);
+            }
+            UIItemType::Project(project_id) => {
+                self.mouse_event_project(project_id, event, context);
+            }
+            UIItemType::ProjectSession(session_id) => {
+                self.mouse_event_project_session(session_id, event, context);
+            }
+            UIItemType::ProjectSessionArchive(session_id) => {
+                self.mouse_event_project_session_archive(session_id, event, context);
+            }
+            UIItemType::ProjectSessionNew(project_id) => {
+                self.mouse_event_project_session_new(project_id, event, context);
             }
             UIItemType::WorkspaceSidebarBackground => {
                 context.set_cursor(Some(MouseCursor::Arrow));
+            }
+            UIItemType::WorkspaceSidebarScrollTrack => {
+                self.mouse_event_workspace_sidebar_scroll_track(item, event, context);
+            }
+            UIItemType::WorkspaceSidebarScrollThumb => {
+                self.mouse_event_workspace_sidebar_scroll_thumb(item, event, context);
             }
             UIItemType::WorkspaceSidebarResize => {
                 self.mouse_event_workspace_sidebar_resize(item, event, context);
@@ -737,19 +1054,201 @@ impl super::TermWindow {
         }
     }
 
-    pub fn mouse_event_workspace_sidebar(
+    pub fn mouse_event_workspace_sidebar_scroll_thumb(
         &mut self,
-        workspace: String,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        self.show_workspace_sidebar_scrollbar();
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_workspace_sidebar_scroll_track(
+        &mut self,
+        _item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        self.show_workspace_sidebar_scrollbar();
+        if event.kind == WMEK::Press(MousePress::Left) {
+            if let Some(scroll) = self.workspace_sidebar_scroll_geometry() {
+                let thumb_top = event.coords.y as f32 - scroll.thumb_height / 2.0;
+                self.set_workspace_sidebar_scroll_from_thumb_top(thumb_top, context);
+            }
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_project_session_new(
+        &mut self,
+        project_id: String,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
-            if Mux::get().active_workspace() != workspace {
-                front_end().switch_workspace(&workspace);
+            let session_id = crate::project_sessions::create_session(&project_id, None);
+            self.activate_project_session(session_id, context);
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_project_new(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if let WMEK::Press(MousePress::Left) = event.kind {
+            self.prompt_create_project(context);
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_project(
+        &mut self,
+        project_id: String,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if let WMEK::Press(MousePress::Left) = event.kind {
+            if let Some(session_id) =
+                crate::project_sessions::active_session_for_project(&project_id)
+            {
+                self.activate_project_session(session_id, context);
+            } else {
+                context.invalidate();
             }
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_project_toggle_sessions(
+        &mut self,
+        project_id: String,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if let WMEK::Press(MousePress::Left) = event.kind {
+            crate::project_sessions::toggle_project_sessions_collapsed(&project_id);
             context.invalidate();
         }
         context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_project_session(
+        &mut self,
+        session_id: String,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                self.activate_project_session(session_id, context);
+            }
+            WMEK::Press(MousePress::Right) => {
+                context.show_context_menu(
+                    event.coords,
+                    self.project_session_context_menu_items(&session_id),
+                );
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub fn mouse_event_project_session_archive(
+        &mut self,
+        session_id: String,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if let WMEK::Press(MousePress::Left) = event.kind {
+            if crate::project_sessions::archive_session(&session_id) {
+                context.invalidate();
+            }
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn project_session_context_menu_items(&self, session_id: &str) -> Vec<ContextMenuItem> {
+        let session_id = session_id.to_string();
+        vec![
+            ContextMenuItem::item(
+                "Pin Session",
+                KeyAssignment::ToggleProjectSessionPinned(session_id.clone()),
+            ),
+            ContextMenuItem::item_with_icon(
+                "Rename Session...",
+                "pencil",
+                KeyAssignment::PromptRenameProjectSession(session_id.clone()),
+            ),
+            ContextMenuItem::item(
+                "Archive Session",
+                KeyAssignment::ArchiveProjectSession(session_id.clone()),
+            ),
+            ContextMenuItem::item(
+                "Delete Session",
+                KeyAssignment::DeleteProjectSession(session_id.clone()),
+            ),
+            ContextMenuItem::item(
+                "Mark as Unread",
+                KeyAssignment::MarkProjectSessionUnread(session_id),
+            ),
+        ]
+    }
+
+    pub(crate) fn activate_project_session(&mut self, session_id: String, context: &dyn WindowOps) {
+        crate::project_sessions::snapshot_active_session_layout(self.mux_window_id);
+
+        let mux = Mux::get();
+        let live_workspaces = mux.iter_workspaces();
+        let Some(plan) =
+            crate::project_sessions::activate_session_record(&session_id, &live_workspaces)
+        else {
+            context.invalidate();
+            return;
+        };
+
+        if !plan.needs_materialize {
+            if mux.active_workspace() != plan.workspace_name {
+                front_end().switch_workspace(&plan.workspace_name);
+            }
+            context.invalidate();
+            return;
+        }
+
+        let workspace_name = plan.workspace_name.clone();
+        let initial_cwd = plan.project_path.to_str().map(|path| path.to_string());
+        let layout = crate::project_sessions::session_layout(&plan.session_id);
+        let dpi = self.dimensions.dpi as u32;
+        let size = self.config.initial_size(
+            dpi,
+            crate::cell_pixel_dims(&self.config, self.dimensions.dpi as f64).ok(),
+        );
+        let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
+            Arc::new(TermConfig::with_config(self.config.clone()));
+        let switcher = crate::frontend::WorkspaceSwitcher::new(&workspace_name);
+        mux.set_active_workspace(&workspace_name);
+
+        promise::spawn::spawn(async move {
+            if let Err(err) = crate::project_sessions::materialize_session(
+                workspace_name,
+                layout,
+                initial_cwd,
+                size,
+                None,
+                term_config,
+            )
+            .await
+            {
+                log::error!("failed to materialize ThinkTerm session: {err:#}");
+            }
+            switcher.do_switch();
+        })
+        .detach();
+
+        context.invalidate();
     }
 
     fn pane_nav_tab_context_menu_items(&self, pane_id: mux::pane::PaneId) -> Vec<ContextMenuItem> {
@@ -771,8 +1270,13 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Arrow));
 
         match event.kind {
-            WMEK::VertWheel(amount) | WMEK::HorzWheel(amount) => {
+            WMEK::HorzWheel(amount) => {
+                self.lock_pane_nav_tab_wheel_surface(pane_id);
                 self.scroll_pane_nav_tabs(pane_id, amount, context);
+                return;
+            }
+            WMEK::VertWheel(_) => {
+                self.lock_pane_nav_tab_wheel_surface(pane_id);
                 return;
             }
             _ => {}
@@ -793,21 +1297,19 @@ impl super::TermWindow {
         }
 
         let mux = Mux::get();
-        if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
-            tab.set_active_idx(pane_index);
-        }
 
         match action {
             PaneNavAction::Background => {
+                if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    tab.set_active_idx(pane_index);
+                }
                 if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
                     self.spawn_pane_nav_tab(pane_id, pane_index);
                 }
             }
             PaneNavAction::Activate(target_pane_id) => {
-                if target_pane_id != pane_id {
-                    if let Err(err) = mux.activate_pane_in_stack(target_pane_id) {
-                        log::error!("pane nav activate failed: {err:#}");
-                    }
+                if let Err(err) = mux.activate_pane_in_stack(target_pane_id) {
+                    log::error!("pane nav activate failed: {err:#}");
                 }
             }
             PaneNavAction::Close(target_pane_id) => {
@@ -815,8 +1317,16 @@ impl super::TermWindow {
                     self.close_pane(pane, true);
                 }
             }
-            PaneNavAction::NewTab => self.spawn_pane_nav_tab(pane_id, pane_index),
+            PaneNavAction::NewTab => {
+                if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    tab.set_active_idx(pane_index);
+                }
+                self.spawn_pane_nav_tab(pane_id, pane_index);
+            }
             PaneNavAction::SplitRight | PaneNavAction::SplitDown => {
+                if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    tab.set_active_idx(pane_index);
+                }
                 let pane = match mux.get_pane(pane_id) {
                     Some(pane) => pane,
                     None => return,
@@ -1178,9 +1688,10 @@ impl super::TermWindow {
                 | TabBarItem::Tab { .. }
                 | TabBarItem::NewTabButton { .. } => {}
             },
-            WMEK::VertWheel(amount) | WMEK::HorzWheel(amount) => {
+            WMEK::HorzWheel(amount) => {
                 self.scroll_window_tab_bar(amount, context);
             }
+            WMEK::VertWheel(_) => {}
             _ => {}
         }
         context.set_cursor(Some(MouseCursor::Arrow));
@@ -1343,14 +1854,9 @@ impl super::TermWindow {
                             is_click_to_focus_pane = true;
                         }
                         WMEK::Move => {
-                            if self.config.pane_focus_follows_mouse {
-                                let mux = Mux::get();
-                                mux.get_active_tab_for_window(self.mux_window_id)
-                                    .map(|tab| tab.set_active_idx(pos.index));
-
-                                pane = Arc::clone(&pos.pane);
-                                context.invalidate();
-                            }
+                            // ThinkTerm keeps pane focus explicit. The upstream
+                            // focus-follows-mouse behavior makes split panes
+                            // appear to switch while scrolling pane-local tabs.
                         }
                         WMEK::Release(_) | WMEK::HorzWheel(_) => {}
                         WMEK::VertWheel(_) => {

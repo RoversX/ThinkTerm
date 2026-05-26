@@ -196,6 +196,8 @@ pub struct Tab {
 
 #[derive(Clone)]
 pub struct PositionedPane {
+    /// Stable identifier for the pane stack that owns this pane.
+    pub pane_stack_id: PaneStackId,
     /// The topological pane index that can be used to reference this pane
     pub index: usize,
     /// true if this is the active pane at the time the position was computed
@@ -221,6 +223,7 @@ pub struct PositionedPane {
 impl std::fmt::Debug for PositionedPane {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         fmt.debug_struct("PositionedPane")
+            .field("pane_stack_id", &self.pane_stack_id)
             .field("index", &self.index)
             .field("is_active", &self.is_active)
             .field("left", &self.left)
@@ -771,6 +774,10 @@ impl Tab {
         self.inner.lock().pane_stack_tabs(pane_id)
     }
 
+    pub fn pane_stack_id(&self, pane_id: PaneId) -> Option<PaneStackId> {
+        self.inner.lock().pane_stack_id(pane_id)
+    }
+
     pub fn pane_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
         self.inner.lock().pane_index_for_pane(pane_id)
     }
@@ -896,6 +903,10 @@ impl Tab {
         self.inner.lock().set_active_pane(pane)
     }
 
+    pub fn set_active_pane_silent(&self, pane: &Arc<dyn Pane>) {
+        self.inner.lock().set_active_pane_silent(pane)
+    }
+
     pub fn set_active_idx(&self, pane_index: usize) {
         self.inner.lock().set_active_idx(pane_index)
     }
@@ -991,7 +1002,7 @@ impl TabInner {
             let mut index = 0;
             loop {
                 if let Some(stack) = cursor.leaf_mut() {
-                    if stack.set_active_pane(active.pane_id()) {
+                    if stack.contains_pane(active.pane_id()) {
                         // Found it
                         self.active = index;
                         self.recency.tag(index);
@@ -1190,6 +1201,30 @@ impl TabInner {
         tabs
     }
 
+    fn pane_stack_id(&mut self, pane_id: PaneId) -> Option<PaneStackId> {
+        let mut pane_stack_id = None;
+        let mut cursor = self.pane.take().unwrap().cursor();
+
+        loop {
+            if cursor.is_leaf() {
+                let stack = cursor.leaf_mut().unwrap();
+                if stack.contains_pane(pane_id) {
+                    pane_stack_id = Some(stack.id());
+                }
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) if pane_stack_id.is_none() => cursor = c,
+                Ok(c) | Err(c) => {
+                    self.pane.replace(c.tree());
+                    break;
+                }
+            }
+        }
+
+        pane_stack_id
+    }
+
     fn pane_index_for_pane(&mut self, pane_id: PaneId) -> Option<usize> {
         let mut cursor = self.pane.take().unwrap().cursor();
         let mut pane_index = 0;
@@ -1304,6 +1339,7 @@ impl TabInner {
             if let Some(zoomed) = self.zoomed.as_ref() {
                 let size = self.size;
                 panes.push(PositionedPane {
+                    pane_stack_id: zoomed.pane_id(),
                     index: 0,
                     is_active: true,
                     is_zoomed: true,
@@ -1348,8 +1384,10 @@ impl TabInner {
 
                 if let Some(pane) = cursor.leaf_mut().unwrap().active_pane() {
                     let dims = parent_size.unwrap_or_else(|| root_size);
+                    let pane_stack_id = cursor.leaf_mut().unwrap().id();
 
                     panes.push(PositionedPane {
+                        pane_stack_id,
                         index,
                         is_active: index == active_idx,
                         is_zoomed: zoomed_id == Some(pane.pane_id()),
@@ -2076,6 +2114,14 @@ impl TabInner {
     }
 
     fn set_active_pane(&mut self, pane: &Arc<dyn Pane>) {
+        self.set_active_pane_impl(pane, true);
+    }
+
+    fn set_active_pane_silent(&mut self, pane: &Arc<dyn Pane>) {
+        self.set_active_pane_impl(pane, false);
+    }
+
+    fn set_active_pane_impl(&mut self, pane: &Arc<dyn Pane>, notify_focus: bool) {
         let prior = self.get_active_pane();
 
         if is_pane(pane, &prior.as_ref()) {
@@ -2092,7 +2138,7 @@ impl TabInner {
         if let Some(pane_index) = self.activate_pane_in_stack_impl(pane.pane_id()) {
             self.active = pane_index;
             self.recency.tag(pane_index);
-            self.advise_focus_change(prior);
+            self.advise_focus_change_impl(prior, notify_focus);
         }
     }
 
@@ -2139,17 +2185,25 @@ impl TabInner {
     }
 
     fn advise_focus_change(&mut self, prior: Option<Arc<dyn Pane>>) {
+        self.advise_focus_change_impl(prior, true);
+    }
+
+    fn advise_focus_change_impl(&mut self, prior: Option<Arc<dyn Pane>>, notify_focus: bool) {
         let mux = Mux::get();
         let current = self.get_active_pane();
         match (prior, current) {
             (Some(prior), Some(current)) if prior.pane_id() != current.pane_id() => {
                 prior.focus_changed(false);
                 current.focus_changed(true);
-                mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                if notify_focus {
+                    mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                }
             }
             (None, Some(current)) => {
                 current.focus_changed(true);
-                mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                if notify_focus {
+                    mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                }
             }
             (Some(prior), None) => {
                 prior.focus_changed(false);
@@ -3105,6 +3159,30 @@ mod test {
         assert!(!panes[1].is_active);
 
         let tabs = tab.pane_stack_tabs(200);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].pane_id, 200);
+        assert!(!tabs[0].is_active);
+        assert_eq!(tabs[1].pane_id, 201);
+        assert!(tabs[1].is_active);
+    }
+
+    #[test]
+    fn sync_with_pane_tree_does_not_overwrite_stack_active_tab() {
+        let size = test_size();
+        let tab = Tab::new(&size);
+        let root = PaneNode::Stack(PaneStackEntry {
+            active: 1,
+            panes: vec![pane_entry(200, size, true), pane_entry(201, size, false)],
+        });
+
+        tab.sync_with_pane_tree(size, root, |entry| FakePane::new(entry.pane_id, entry.size));
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane.pane_id(), 201);
+        assert!(panes[0].is_active);
+
+        let tabs = tab.pane_stack_tabs(201);
         assert_eq!(tabs.len(), 2);
         assert_eq!(tabs[0].pane_id, 200);
         assert!(!tabs[0].is_active);
