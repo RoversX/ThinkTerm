@@ -15,6 +15,9 @@ pub enum SvgIcon {
     Globe,
     Info,
     Keyboard,
+    Loader,
+    LoaderCircle,
+    MemoryStick,
     Minus,
     Palette,
     PanelLeft,
@@ -29,6 +32,9 @@ pub enum SvgIcon {
     Search,
     Settings,
     SlidersHorizontal,
+    SlidersVertical,
+    CircleAlert,
+    CircleCheck,
     SquareTerminal,
     SplitHorizontal,
     SplitVertical,
@@ -61,6 +67,13 @@ impl SvgIcon {
             Self::Globe => include_bytes!("../../../../third_party/lucide/icons/globe.svg"),
             Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
             Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),
+            Self::Loader => include_bytes!("../../../../third_party/lucide/icons/loader.svg"),
+            Self::LoaderCircle => {
+                include_bytes!("../../../../third_party/lucide/icons/loader-circle.svg")
+            }
+            Self::MemoryStick => {
+                include_bytes!("../../../../third_party/lucide/icons/memory-stick.svg")
+            }
             Self::Minus => include_bytes!("../../../../third_party/lucide/icons/minus.svg"),
             Self::Palette => include_bytes!("../../../../third_party/lucide/icons/palette.svg"),
             Self::PanelLeft => {
@@ -89,6 +102,15 @@ impl SvgIcon {
             Self::SlidersHorizontal => {
                 include_bytes!("../../../../third_party/lucide/icons/sliders-horizontal.svg")
             }
+            Self::SlidersVertical => {
+                include_bytes!("../../../../third_party/lucide/icons/sliders-vertical.svg")
+            }
+            Self::CircleAlert => {
+                include_bytes!("../../../../third_party/lucide/icons/circle-alert.svg")
+            }
+            Self::CircleCheck => {
+                include_bytes!("../../../../third_party/lucide/icons/circle-check.svg")
+            }
             Self::SquareTerminal => {
                 include_bytes!("../../../../third_party/lucide/icons/square-terminal.svg")
             }
@@ -105,6 +127,10 @@ impl SvgIcon {
     }
 
     pub fn rasterize(self, size: usize) -> Result<Image> {
+        self.rasterize_with_rotation(size, 0.0)
+    }
+
+    pub fn rasterize_with_rotation(self, size: usize, degrees: f32) -> Result<Image> {
         let size = size.max(1);
         let svg = std::str::from_utf8(self.bytes()).context("SVG asset is not UTF-8")?;
         let svg = svg.replace("currentColor", "#ffffff");
@@ -114,8 +140,11 @@ impl SvgIcon {
         let scale = (size as f32 / svg_size.width()).min(size as f32 / svg_size.height());
         let translate_x = (size as f32 - svg_size.width() * scale) / 2.0;
         let translate_y = (size as f32 - svg_size.height() * scale) / 2.0;
-        let transform = resvg::tiny_skia::Transform::from_translate(translate_x, translate_y)
+        let mut transform = resvg::tiny_skia::Transform::from_translate(translate_x, translate_y)
             .pre_scale(scale, scale);
+        if degrees != 0.0 {
+            transform = transform.pre_rotate_at(degrees, size as f32 / 2.0, size as f32 / 2.0);
+        }
 
         let mut pixmap = resvg::tiny_skia::Pixmap::new(size as u32, size as u32)
             .with_context(|| format!("allocating {size}px SVG icon pixmap"))?;
@@ -143,6 +172,8 @@ mod tests {
             SvgIcon::Globe,
             SvgIcon::Info,
             SvgIcon::Keyboard,
+            SvgIcon::Loader,
+            SvgIcon::LoaderCircle,
             SvgIcon::Minus,
             SvgIcon::Palette,
             SvgIcon::PanelLeft,
@@ -157,6 +188,9 @@ mod tests {
             SvgIcon::Search,
             SvgIcon::Settings,
             SvgIcon::SlidersHorizontal,
+            SvgIcon::SlidersVertical,
+            SvgIcon::CircleAlert,
+            SvgIcon::CircleCheck,
             SvgIcon::SquareTerminal,
             SvgIcon::SplitHorizontal,
             SvgIcon::SplitVertical,

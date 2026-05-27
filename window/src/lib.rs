@@ -63,6 +63,9 @@ pub enum ContextMenuItem {
         label: String,
         icon: Option<String>,
         action: config::keyassignment::KeyAssignment,
+        checked: bool,
+        enabled: bool,
+        submenu: Vec<ContextMenuItem>,
     },
     Separator,
 }
@@ -73,6 +76,9 @@ impl ContextMenuItem {
             label: label.into(),
             icon: None,
             action,
+            checked: false,
+            enabled: true,
+            submenu: vec![],
         }
     }
 
@@ -85,6 +91,34 @@ impl ContextMenuItem {
             label: label.into(),
             icon: Some(icon.into()),
             action,
+            checked: false,
+            enabled: true,
+            submenu: vec![],
+        }
+    }
+
+    pub fn disabled(mut self) -> Self {
+        if let Self::Item { enabled, .. } = &mut self {
+            *enabled = false;
+        }
+        self
+    }
+
+    pub fn checked(mut self, checked_value: bool) -> Self {
+        if let Self::Item { checked, .. } = &mut self {
+            *checked = checked_value;
+        }
+        self
+    }
+
+    pub fn submenu(label: impl Into<String>, items: Vec<ContextMenuItem>) -> Self {
+        Self::Item {
+            label: label.into(),
+            icon: None,
+            action: config::keyassignment::KeyAssignment::Nop,
+            checked: false,
+            enabled: true,
+            submenu: items,
         }
     }
 }
@@ -402,6 +436,7 @@ pub struct RequestedWindowGeometry {
     pub height: Dimension,
     pub x: Option<Dimension>,
     pub y: Option<Dimension>,
+    pub macos_frame_autosave_name: Option<String>,
     /// Specifies basis for evaluating x/y coords.
     /// Also applies to width/height when computing % based dimensions
     pub origin: GeometryOrigin,

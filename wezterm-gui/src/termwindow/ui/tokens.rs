@@ -1,5 +1,5 @@
 pub const SIDEBAR_WIDTH_CELLS: usize = 26;
-pub const SIDEBAR_MIN_WIDTH: usize = 224;
+pub const SIDEBAR_MIN_WIDTH: usize = 254;
 pub const SIDEBAR_MAX_WIDTH: usize = 520;
 pub const SIDEBAR_INSET: usize = 10;
 pub const SIDEBAR_ICON_GAP: usize = 10;

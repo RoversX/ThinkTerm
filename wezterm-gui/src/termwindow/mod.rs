@@ -219,6 +219,7 @@ pub enum UIItemType {
     WorkspaceSidebarBackground,
     WorkspaceSidebarResize,
     WorkspaceSidebarSettings,
+    WorkspaceSidebarViewOptions,
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
@@ -1093,6 +1094,15 @@ impl TermWindow {
             height: Dimension::Pixels(dimensions.pixel_height as f32),
             x,
             y,
+            macos_frame_autosave_name: if cfg!(target_os = "macos")
+                && crate::native_settings::load()
+                    .window
+                    .restore_main_window_frame
+            {
+                Some("ThinkTerm.MainWindow".to_string())
+            } else {
+                None
+            },
             origin,
         };
         log::trace!("{:?}", geometry);

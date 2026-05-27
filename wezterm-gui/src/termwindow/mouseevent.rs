@@ -576,6 +576,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
+            | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -601,6 +602,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
+            | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -749,9 +751,17 @@ impl super::TermWindow {
                     // Completed a window drag
                     return;
                 }
-                if press == &MousePress::Left && self.dragging.take().is_some() {
-                    // Completed a drag
-                    return;
+                if press == &MousePress::Left {
+                    let completed_drag = self.dragging.take();
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::WorkspaceSidebarResize
+                    }) {
+                        self.persist_workspace_sidebar_width();
+                    }
+                    if completed_drag.is_some() {
+                        // Completed a drag
+                        return;
+                    }
                 }
             }
 
@@ -1107,6 +1117,9 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarSettings => {
                 self.mouse_event_workspace_sidebar_settings(event, context);
             }
+            UIItemType::WorkspaceSidebarViewOptions => {
+                self.mouse_event_workspace_sidebar_view_options(item, event, context);
+            }
         }
     }
 
@@ -1150,6 +1163,22 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
             crate::settings_window::show();
+        }
+    }
+
+    pub fn mouse_event_workspace_sidebar_view_options(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            let coords = window::Point::new(
+                item.x.saturating_add(item.width) as isize,
+                item.y.saturating_add(item.height / 2) as isize,
+            );
+            context.show_context_menu(coords, self.workspace_sidebar_view_options_menu_items());
         }
     }
 
@@ -1344,6 +1373,52 @@ impl super::TermWindow {
                 "folder.badge.minus",
                 KeyAssignment::RemoveProject(project_id),
             ),
+        ]
+    }
+
+    fn workspace_sidebar_view_options_menu_items(&self) -> Vec<ContextMenuItem> {
+        use config::keyassignment::KeyAssignment;
+
+        vec![
+            ContextMenuItem::item("Group by", KeyAssignment::Nop).disabled(),
+            ContextMenuItem::item_with_icon("Workspace", "folder", KeyAssignment::Nop)
+                .checked(true)
+                .disabled(),
+            ContextMenuItem::Separator,
+            ContextMenuItem::item("Show", KeyAssignment::Nop).disabled(),
+            ContextMenuItem::submenu(
+                "Status",
+                vec![
+                    ContextMenuItem::item_with_icon(
+                        "Running",
+                        "arrow.triangle.2.circlepath",
+                        KeyAssignment::Nop,
+                    )
+                    .checked(true)
+                    .disabled(),
+                    ContextMenuItem::item_with_icon(
+                        "Needs Attention",
+                        "exclamationmark.circle",
+                        KeyAssignment::Nop,
+                    )
+                    .checked(true)
+                    .disabled(),
+                    ContextMenuItem::item_with_icon("Done", "checkmark.circle", KeyAssignment::Nop)
+                        .checked(true)
+                        .disabled(),
+                ],
+            ),
+            ContextMenuItem::item_with_icon("Unread", "envelope.badge", KeyAssignment::Nop)
+                .checked(true)
+                .disabled(),
+            ContextMenuItem::item_with_icon("Archived", "archivebox", KeyAssignment::Nop)
+                .disabled(),
+            ContextMenuItem::item_with_icon("Pinned", "pin", KeyAssignment::Nop)
+                .checked(true)
+                .disabled(),
+            ContextMenuItem::Separator,
+            ContextMenuItem::item("Collapse All", KeyAssignment::Nop).disabled(),
+            ContextMenuItem::item("Mark All Read", KeyAssignment::Nop).disabled(),
         ]
     }
 

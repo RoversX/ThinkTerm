@@ -562,6 +562,7 @@ impl Window {
         };
 
         let conn = Connection::get().expect("new_window called on gui thread");
+        let macos_frame_autosave_name = geometry.macos_frame_autosave_name.clone();
         let ResolvedGeometry {
             width,
             height,
@@ -638,7 +639,15 @@ impl Window {
 
             // Prevent Cocoa native tabs from being used
             let _: () = msg_send![*window, setTabbingMode:2 /* NSWindowTabbingModeDisallowed */];
-            let _: () = msg_send![*window, setRestorable: NO];
+            let restored_from_frame_autosave =
+                if let Some(name) = macos_frame_autosave_name.as_deref() {
+                    let restored: BOOL = msg_send![*window, setFrameAutosaveName: *nsstring(name)];
+                    let _: () = msg_send![*window, setRestorable: YES];
+                    restored == YES
+                } else {
+                    let _: () = msg_send![*window, setRestorable: NO];
+                    false
+                };
 
             window.setReleasedWhenClosed_(NO);
             window.setBackgroundColor_(cocoa::appkit::NSColor::clearColor(nil));
@@ -677,6 +686,9 @@ impl Window {
             }
 
             LAST_POSITION.with(|last_pos| {
+                if restored_from_frame_autosave {
+                    return;
+                }
                 if let Some(pos) = initial_pos {
                     // Put it where they asked it to be, without influencing
                     // future positioning info
@@ -1432,33 +1444,59 @@ impl WindowInner {
             return;
         }
 
-        let menu = Menu::new_with_title("");
-        let mut has_items = false;
-
-        for item in items {
-            match item {
-                ContextMenuItem::Item {
-                    label,
-                    icon,
-                    action,
-                } => {
-                    let menu_item =
-                        MenuItem::new_with(&label, Some(sel!(weztermPerformKeyAssignment:)), "");
-                    if let Some(icon) = icon {
-                        menu_item.set_system_symbol_image(&icon);
+        fn add_context_menu_items(menu: &Menu, view: id, items: Vec<ContextMenuItem>) -> bool {
+            let mut has_items = false;
+            for item in items {
+                match item {
+                    ContextMenuItem::Item {
+                        label,
+                        icon,
+                        action,
+                        checked,
+                        enabled,
+                        submenu,
+                    } => {
+                        let has_submenu = !submenu.is_empty();
+                        let menu_item = MenuItem::new_with(
+                            &label,
+                            if has_submenu {
+                                None
+                            } else {
+                                Some(sel!(weztermPerformKeyAssignment:))
+                            },
+                            "",
+                        );
+                        if let Some(icon) = icon {
+                            menu_item.set_system_symbol_image(&icon);
+                        }
+                        menu_item.set_checked(checked);
+                        menu_item.set_enabled(enabled);
+                        if has_submenu {
+                            let child_menu = Menu::new_with_title(&label);
+                            if add_context_menu_items(&child_menu, view, submenu) {
+                                menu_item.set_sub_menu(&child_menu);
+                                menu.add_item(&menu_item);
+                                has_items = true;
+                            }
+                        } else {
+                            menu_item.set_target(view);
+                            menu_item.set_represented_item(RepresentedItem::KeyAssignment(action));
+                            menu.add_item(&menu_item);
+                            has_items = true;
+                        }
                     }
-                    menu_item.set_target(*self.view);
-                    menu_item.set_represented_item(RepresentedItem::KeyAssignment(action));
-                    menu.add_item(&menu_item);
-                    has_items = true;
-                }
-                ContextMenuItem::Separator => {
-                    if has_items {
-                        menu.add_item(&MenuItem::new_separator());
+                    ContextMenuItem::Separator => {
+                        if has_items {
+                            menu.add_item(&MenuItem::new_separator());
+                        }
                     }
                 }
             }
+            has_items
         }
+
+        let menu = Menu::new_with_title("");
+        let has_items = add_context_menu_items(&menu, *self.view, items);
 
         if !has_items {
             return;

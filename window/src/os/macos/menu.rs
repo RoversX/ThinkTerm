@@ -306,6 +306,20 @@ impl MenuItem {
         }
     }
 
+    pub fn set_enabled(&self, enabled: bool) {
+        unsafe {
+            let enabled: BOOL = if enabled { YES } else { NO };
+            let () = msg_send![*self.item, setEnabled: enabled];
+        }
+    }
+
+    pub fn set_checked(&self, checked: bool) {
+        unsafe {
+            let state: NSInteger = if checked { 1 } else { 0 };
+            let () = msg_send![*self.item, setState: state];
+        }
+    }
+
     pub fn set_sub_menu(&self, menu: &Menu) {
         unsafe {
             self.item.setSubmenu_(*menu.menu);

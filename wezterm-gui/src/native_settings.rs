@@ -69,8 +69,29 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) settings_font_size: Option<f64>,
     pub(crate) settings_font_weight: Option<u16>,
     pub(crate) sidebar_font_size: Option<f64>,
+    pub(crate) workspace_sidebar_width: Option<usize>,
     pub(crate) tab_font_size: Option<f64>,
     pub(crate) pane_header_font_size: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeDeveloperSettings {
+    pub(crate) developer_mode: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeWindowSettings {
+    pub(crate) restore_main_window_frame: bool,
+}
+
+impl Default for NativeWindowSettings {
+    fn default() -> Self {
+        Self {
+            restore_main_window_frame: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -80,6 +101,8 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) appearance: NativeAppearanceSettings,
     pub(crate) terminal: NativeTerminalSettings,
     pub(crate) chrome: NativeChromeSettings,
+    pub(crate) developer: NativeDeveloperSettings,
+    pub(crate) window: NativeWindowSettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -89,6 +112,8 @@ impl Default for ThinkTermNativeSettings {
             appearance: NativeAppearanceSettings::default(),
             terminal: NativeTerminalSettings::default(),
             chrome: NativeChromeSettings::default(),
+            developer: NativeDeveloperSettings::default(),
+            window: NativeWindowSettings::default(),
         }
     }
 }
@@ -178,6 +203,16 @@ pub(crate) fn sidebar_font_size() -> f64 {
         .sidebar_font_size
         .unwrap_or(DEFAULT_SIDEBAR_FONT_SIZE)
         .clamp(10.0, 28.0)
+}
+
+pub(crate) fn workspace_sidebar_width() -> Option<usize> {
+    load().chrome.workspace_sidebar_width
+}
+
+pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.chrome.workspace_sidebar_width = Some(width);
+    save(&settings)
 }
 
 pub(crate) fn tab_font_size() -> f64 {

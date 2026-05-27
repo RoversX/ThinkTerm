@@ -1,5 +1,6 @@
 pub mod icons;
 pub mod sidebar;
+pub mod status_icon;
 pub mod tokens;
 
 use crate::utilsprites::RenderMetrics;

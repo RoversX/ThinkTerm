@@ -466,7 +466,15 @@ impl crate::TermWindow {
             )?;
         }
 
-        let text_x = icon_x + icon_size + WINDOW_TAB_ICON_GAP;
+        let mut text_x = icon_x + icon_size + WINDOW_TAB_ICON_GAP;
+        if let Some(status) = item.status {
+            let status_x = text_x;
+            if status_x >= viewport_left && status_x.saturating_add(icon_size) <= viewport_right {
+                self.paint_status_icon(layers, 2, status, status_x, icon_y, icon_size, foreground)
+                    .context("window tab status icon")?;
+            }
+            text_x = status_x + icon_size + WINDOW_TAB_ICON_GAP;
+        }
         let text_right = if close_slot_reserved {
             close_x.saturating_sub(WINDOW_TAB_ICON_GAP)
         } else {
@@ -499,6 +507,7 @@ impl crate::TermWindow {
                 layers,
                 font,
                 &item.title,
+                item.status.is_some(),
                 text_x,
                 text_y,
                 text_width,
@@ -570,6 +579,7 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
         font: &Rc<LoadedFont>,
         title: &Line,
+        strip_leading_progress: bool,
         x: usize,
         y: usize,
         width: usize,
@@ -583,8 +593,19 @@ impl crate::TermWindow {
         }
 
         let mut text = String::new();
+        let mut trimming_legacy_progress = strip_leading_progress;
         for cell in title.visible_cells() {
-            text.push_str(cell.str());
+            let value = cell.str();
+            if trimming_legacy_progress {
+                if is_legacy_progress_marker(value) {
+                    continue;
+                }
+                if text.is_empty() && value.trim().is_empty() {
+                    continue;
+                }
+                trimming_legacy_progress = false;
+            }
+            text.push_str(value);
         }
         self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
     }
@@ -738,4 +759,19 @@ fn fancy_tab_icon_size(metrics: &RenderMetrics, tab_bar_height: f32) -> f32 {
     let from_bar = (tab_bar_height - 14.0).max(1.0);
     let from_font = metrics.cell_size.height as f32 * 0.95;
     from_bar.min(from_font).clamp(18.0, 24.0).floor()
+}
+
+fn is_legacy_progress_marker(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+
+    matches!(
+        ch as u32,
+        0x2800..=0x28ff | 0xf0130 | 0xf0a9e..=0xf0aa5 | 0xee00..=0xee0b
+    )
 }

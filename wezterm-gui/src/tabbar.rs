@@ -1,3 +1,4 @@
+use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::terminal_title_for_display;
 use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors};
@@ -35,6 +36,7 @@ pub enum TabBarItem {
 pub struct TabEntry {
     pub item: TabBarItem,
     pub title: Line,
+    pub status: Option<UiStatusKind>,
     x: usize,
     width: usize,
 }
@@ -133,6 +135,32 @@ fn pct_to_glyph(pct: u8) -> char {
     }
 }
 
+fn leading_legacy_progress_marker(line: &Line) -> bool {
+    for cell in line.visible_cells() {
+        let value = cell.str();
+        if value.trim().is_empty() {
+            continue;
+        }
+        return is_legacy_progress_marker(value);
+    }
+    false
+}
+
+fn is_legacy_progress_marker(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+
+    matches!(
+        ch as u32,
+        0x2800..=0x28ff | 0xf0130 | 0xf0a9e..=0xf0aa5 | 0xee00..=0xee0b
+    )
+}
+
 fn compute_tab_title(
     tab: &TabInformation,
     tab_info: &[TabInformation],
@@ -177,22 +205,24 @@ fn compute_tab_title(
                     title = format!("{}{classic_spacing}", title);
                 }
 
-                match pane.progress {
-                    Progress::None => {}
-                    Progress::Percentage(pct) | Progress::Error(pct) => {
-                        let graphic = format!("{} ", pct_to_glyph(pct));
-                        len += unicode_column_width(&graphic, None);
-                        let color = if matches!(pane.progress, Progress::Percentage(_)) {
-                            FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Green))
-                        } else {
-                            FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Red))
-                        };
-                        items.push(color);
-                        items.push(FormatItem::Text(graphic));
-                        items.push(FormatItem::Foreground(FormatColor::Default));
-                    }
-                    Progress::Indeterminate => {
-                        // TODO: Decide what to do here to indicate this
+                if !config.use_fancy_tab_bar {
+                    match pane.progress {
+                        Progress::None => {}
+                        Progress::Percentage(pct) | Progress::Error(pct) => {
+                            let graphic = format!("{} ", pct_to_glyph(pct));
+                            len += unicode_column_width(&graphic, None);
+                            let color = if matches!(pane.progress, Progress::Percentage(_)) {
+                                FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Green))
+                            } else {
+                                FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Red))
+                            };
+                            items.push(color);
+                            items.push(FormatItem::Text(graphic));
+                            items.push(FormatItem::Foreground(FormatColor::Default));
+                        }
+                        Progress::Indeterminate => {
+                            // Classic tab titles keep the historical textual behavior.
+                        }
                     }
                 }
 
@@ -281,6 +311,7 @@ impl TabBarState {
             items: vec![TabEntry {
                 item: TabBarItem::None,
                 title: Line::from_text(" ", &CellAttributes::blank(), 1, None),
+                status: None,
                 x: 1,
                 width: 1,
             }],
@@ -374,6 +405,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::WindowButton(*button),
                 title: title.to_owned(),
+                status: None,
                 x: *x,
                 width,
             });
@@ -511,6 +543,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::LeftStatus,
                 title: left_status_line.clone(),
+                status: None,
                 x,
                 width: left_status_line.len(),
             });
@@ -559,6 +592,17 @@ impl TabBarState {
             );
 
             let title = tab_line.clone();
+            let status = if config.use_fancy_tab_bar {
+                tab_info[tab_idx]
+                    .active_pane
+                    .as_ref()
+                    .and_then(|pane| UiStatusKind::from_progress(&pane.progress))
+                    .or_else(|| {
+                        leading_legacy_progress_marker(&tab_line).then_some(UiStatusKind::Running)
+                    })
+            } else {
+                None
+            };
             if tab_line.len() > tab_width_max {
                 tab_line.resize(tab_width_max, SEQ_ZERO);
             }
@@ -568,6 +612,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::Tab { tab_idx, active },
                 title,
+                status,
                 x: tab_start_idx,
                 width,
             });
@@ -590,6 +635,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::NewTabButton,
                 title: new_tab_button.clone(),
+                status: None,
                 x: button_start,
                 width,
             });
@@ -652,6 +698,7 @@ impl TabBarState {
         items.push(TabEntry {
             item: TabBarItem::RightStatus,
             title: right_status_line.clone(),
+            status: None,
             x,
             width: status_space_available,
         });

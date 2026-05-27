@@ -532,7 +532,10 @@ impl SessionStore {
                     project,
                     Some(active_project_id),
                     live_workspaces,
-                ),
+                )
+                .into_iter()
+                .filter(|session| !session.is_pinned)
+                .collect(),
             })
             .collect();
         ProjectSessionView {

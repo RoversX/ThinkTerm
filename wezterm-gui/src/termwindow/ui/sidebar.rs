@@ -28,6 +28,21 @@ use window::{MouseEventKind as WMEK, RectF, WindowOps, WindowState};
 const SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
 const SIDEBAR_SETTINGS_FOOTER_HEIGHT: usize = 72;
 const SIDEBAR_SETTINGS_FADE_HEIGHT: usize = 52;
+const SIDEBAR_LIST_BOTTOM_PADDING: usize = 65;
+const SIDEBAR_SETTINGS_ROW_TOP_PADDING: usize = 4;
+const SIDEBAR_SETTINGS_ROW_BOTTOM_PADDING: usize = 12;
+const SIDEBAR_SETTINGS_ROW_SIDE_PADDING: usize = 16;
+const SIDEBAR_SETTINGS_ICON_EXTRA_INSET: usize = 18;
+const SIDEBAR_SETTINGS_ROW_LIFT: usize = 18;
+const SIDEBAR_TOP_FADE_HEIGHT: usize = 32;
+const WORKSPACE_GROUP_EXTRA_GAP: usize = 8;
+const WORKSPACE_SECTION_LABEL_GAP: usize = 12;
+const SESSION_ROW_MIN_HEIGHT: usize = 62;
+const SESSION_ROW_SIDE_PADDING: usize = 8;
+const SESSION_ACTION_MIN_SIZE: usize = 48;
+const SESSION_ACTION_MAX_SIZE: usize = 52;
+const SESSION_ACTION_ICON_INSET: usize = 12;
+const SESSION_STATUS_DOT_SIZE: usize = 10;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceSidebarRect {
@@ -49,7 +64,11 @@ pub struct WorkspaceSidebarScrollGeometry {
 }
 
 pub fn workspace_sidebar_width_for_metrics(render_metrics: &RenderMetrics) -> usize {
-    (render_metrics.cell_size.width as usize * SIDEBAR_WIDTH_CELLS).max(SIDEBAR_MIN_WIDTH)
+    let default_width =
+        (render_metrics.cell_size.width as usize * SIDEBAR_WIDTH_CELLS).max(SIDEBAR_MIN_WIDTH);
+    crate::native_settings::workspace_sidebar_width()
+        .unwrap_or(default_width)
+        .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
 }
 
 impl crate::TermWindow {
@@ -69,6 +88,15 @@ impl crate::TermWindow {
     pub fn set_workspace_sidebar_width(&mut self, width: usize) {
         self.workspace_sidebar_width =
             width.clamp(SIDEBAR_MIN_WIDTH, self.workspace_sidebar_max_width());
+    }
+
+    pub fn persist_workspace_sidebar_width(&self) {
+        let width = self
+            .workspace_sidebar_width
+            .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        if let Err(err) = crate::native_settings::save_workspace_sidebar_width(width) {
+            log::warn!("failed to save workspace sidebar width: {err:#}");
+        }
     }
 
     pub fn toggle_workspace_sidebar(&mut self) {
@@ -138,6 +166,12 @@ impl crate::TermWindow {
                     .saturating_mul(row_height + row_gap),
             );
         }
+        if !view.projects.is_empty() {
+            if !view.pinned_sessions.is_empty() {
+                height = height.saturating_add(WORKSPACE_SECTION_LABEL_GAP);
+            }
+            height = height.saturating_add(row_height + row_gap);
+        }
         for project in &view.projects {
             height = height.saturating_add(row_height + row_gap);
             if !project.sessions_collapsed {
@@ -145,7 +179,27 @@ impl crate::TermWindow {
                     .saturating_add(project.sessions.len().saturating_mul(row_height + row_gap));
             }
         }
+        height = height.saturating_add(
+            view.projects
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(WORKSPACE_GROUP_EXTRA_GAP),
+        );
         height.saturating_sub(row_gap)
+    }
+
+    fn workspace_sidebar_scroll_height(
+        view: &project_sessions::ProjectSessionView,
+        row_height: usize,
+        row_gap: usize,
+        viewport_height: usize,
+    ) -> usize {
+        let height = Self::workspace_sidebar_list_height(view, row_height, row_gap);
+        if height > viewport_height {
+            height.saturating_add(SIDEBAR_LIST_BOTTOM_PADDING)
+        } else {
+            height
+        }
     }
 
     fn workspace_sidebar_content_top(&self, panel_y: usize) -> usize {
@@ -184,7 +238,14 @@ impl crate::TermWindow {
             .saturating_sub(SIDEBAR_SETTINGS_FOOTER_HEIGHT);
         let content_bottom = (panel_y + panel_height.saturating_sub(SIDEBAR_INSET))
             .min(settings_footer_top.max(panel_y));
-        let list_top = self.workspace_sidebar_content_top(panel_y) + ui_cell_height + SIDEBAR_INSET;
+        let mut list_top = self.workspace_sidebar_content_top(panel_y);
+        if self.window_state.contains(WindowState::FULL_SCREEN) {
+            list_top += WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE + SIDEBAR_INSET;
+        }
+        let row_height =
+            (ui_cell_height.max(icon_size) + SIDEBAR_INSET).max(SESSION_ROW_MIN_HEIGHT);
+        let top_action_height = row_height.min(48).max(ui_cell_height + SIDEBAR_INSET);
+        list_top += top_action_height + SIDEBAR_INSET;
         let viewport_height = content_bottom.saturating_sub(list_top);
         if viewport_height == 0 {
             return 0.0;
@@ -194,9 +255,9 @@ impl crate::TermWindow {
         let active_workspace = mux.active_workspace();
         let workspaces = mux.iter_workspaces();
         let view = project_sessions::view_for_current_project(&active_workspace, &workspaces);
-        let row_height = (ui_cell_height.max(icon_size) + SIDEBAR_INSET).max(52);
         let row_gap = SIDEBAR_ROW_GAP;
-        let total_height = Self::workspace_sidebar_list_height(&view, row_height, row_gap);
+        let total_height =
+            Self::workspace_sidebar_scroll_height(&view, row_height, row_gap, viewport_height);
         total_height.saturating_sub(viewport_height) as f32
     }
 
@@ -226,7 +287,14 @@ impl crate::TermWindow {
             .saturating_sub(SIDEBAR_SETTINGS_FOOTER_HEIGHT);
         let content_bottom = (panel_y + panel_height.saturating_sub(SIDEBAR_INSET))
             .min(settings_footer_top.max(panel_y));
-        let list_top = self.workspace_sidebar_content_top(panel_y) + ui_cell_height + SIDEBAR_INSET;
+        let mut list_top = self.workspace_sidebar_content_top(panel_y);
+        if self.window_state.contains(WindowState::FULL_SCREEN) {
+            list_top += WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE + SIDEBAR_INSET;
+        }
+        let row_height =
+            (ui_cell_height.max(icon_size) + SIDEBAR_INSET).max(SESSION_ROW_MIN_HEIGHT);
+        let top_action_height = row_height.min(48).max(ui_cell_height + SIDEBAR_INSET);
+        list_top += top_action_height + SIDEBAR_INSET;
         let viewport_height = content_bottom.saturating_sub(list_top);
         if viewport_height == 0 {
             return None;
@@ -236,9 +304,9 @@ impl crate::TermWindow {
         let active_workspace = mux.active_workspace();
         let workspaces = mux.iter_workspaces();
         let view = project_sessions::view_for_current_project(&active_workspace, &workspaces);
-        let row_height = (ui_cell_height.max(icon_size) + SIDEBAR_INSET).max(52);
         let row_gap = SIDEBAR_ROW_GAP;
-        let total_height = Self::workspace_sidebar_list_height(&view, row_height, row_gap);
+        let total_height =
+            Self::workspace_sidebar_scroll_height(&view, row_height, row_gap, viewport_height);
         let max_scroll = total_height.saturating_sub(viewport_height) as f32;
         if max_scroll <= 0.0 || total_height == 0 {
             return None;
@@ -326,7 +394,8 @@ impl crate::TermWindow {
             item_type: UIItemType::WorkspaceSidebarBackground,
         });
 
-        let session_row_height = (ui_cell_height.max(icon_size) + SIDEBAR_INSET).max(52);
+        let session_row_height =
+            (ui_cell_height.max(icon_size) + SIDEBAR_INSET).max(SESSION_ROW_MIN_HEIGHT);
         let item_x = panel_x + SIDEBAR_INSET;
         let item_width = panel_width.saturating_sub(SIDEBAR_INSET * 2 + 1);
         self.ui_items.push(UIItem {
@@ -403,56 +472,89 @@ impl crate::TermWindow {
             .saturating_add(panel_height)
             .saturating_sub(settings_footer_height);
         content_bottom = content_bottom.min(settings_footer_y.max(panel_y));
-        let section_button_x = item_x
-            .saturating_add(item_width)
-            .saturating_sub(section_button_size + SIDEBAR_INSET);
-        let section_button_y = y.saturating_sub(6);
-        self.paint_sidebar_text(
-            layers,
-            &ui_font,
-            ui_metrics,
-            "Workspaces",
-            item_x + SIDEBAR_INSET,
-            y,
-            section_button_x.saturating_sub(item_x + SIDEBAR_INSET * 2),
-            muted_fg,
-        )?;
+        let active_project_id = view
+            .projects
+            .iter()
+            .find(|project| project.is_active)
+            .map(|project| project.id.clone());
+        let top_action_x = item_x + SIDEBAR_SETTINGS_ROW_SIDE_PADDING;
+        let top_action_y = y;
+        let top_action_width = item_width.saturating_sub(SIDEBAR_SETTINGS_ROW_SIDE_PADDING * 2);
+        let top_action_height = session_row_height
+            .min(48)
+            .max(ui_cell_height + SIDEBAR_INSET);
+        let top_action_hovered = active_project_id.is_some()
+            && self.is_pointer_over_ui_rect(
+                top_action_x,
+                top_action_y,
+                top_action_width,
+                top_action_height,
+            );
         self.fill_rounded_rectangle(
             layers,
             1,
             euclid::rect(
-                section_button_x as f32,
-                section_button_y as f32,
-                section_button_size as f32,
-                section_button_size as f32,
+                top_action_x as f32,
+                top_action_y as f32,
+                top_action_width as f32,
+                top_action_height as f32,
             ),
-            foreground.mul_alpha(0.08),
-            SIDEBAR_ROW_RADIUS,
+            foreground.mul_alpha(if top_action_hovered { 0.14 } else { 0.08 }),
+            SIDEBAR_ROW_RADIUS + 4.0,
         )
-        .context("sidebar new project button")?;
-        self.ui_items.push(UIItem {
-            x: section_button_x,
-            y: section_button_y,
-            width: section_button_size,
-            height: section_button_size,
-            item_type: UIItemType::ProjectNew,
-        });
-        let section_icon_size = header_icon_size.min(section_button_size.saturating_sub(10));
+        .context("sidebar add session button")?;
+        if let Some(project_id) = active_project_id.clone() {
+            self.ui_items.push(UIItem {
+                x: top_action_x,
+                y: top_action_y,
+                width: top_action_width,
+                height: top_action_height,
+                item_type: UIItemType::ProjectSessionNew(project_id),
+            });
+        }
+        let top_action_icon_size = header_icon_size.min(top_action_height.saturating_sub(14));
+        let top_action_icon_x = top_action_x + SIDEBAR_SETTINGS_ICON_EXTRA_INSET;
+        let top_action_icon_y =
+            top_action_y + ((top_action_height.saturating_sub(top_action_icon_size)) / 2);
+        let top_action_text_x = top_action_icon_x + top_action_icon_size + SIDEBAR_ICON_GAP + 8;
+        let top_action_text_y =
+            top_action_y + ((top_action_height.saturating_sub(ui_cell_height)) / 2);
+        let top_action_fg = if active_project_id.is_some() {
+            foreground
+        } else {
+            muted_fg
+        };
         self.paint_sidebar_icon(
             layers,
-            SvgIcon::FolderPlus,
-            section_button_x + ((section_button_size.saturating_sub(section_icon_size)) / 2),
-            section_button_y + ((section_button_size.saturating_sub(section_icon_size)) / 2),
-            section_icon_size,
-            foreground,
+            SvgIcon::Plus,
+            top_action_icon_x,
+            top_action_icon_y,
+            top_action_icon_size,
+            top_action_fg,
         )?;
-        y += ui_cell_height + SIDEBAR_INSET;
+        self.paint_sidebar_text(
+            layers,
+            &ui_font,
+            ui_metrics,
+            "Add New Session",
+            top_action_text_x,
+            top_action_text_y,
+            top_action_x
+                .saturating_add(top_action_width)
+                .saturating_sub(top_action_text_x + SIDEBAR_INSET),
+            top_action_fg,
+        )?;
+        y += top_action_height + SIDEBAR_INSET;
         let list_top = y;
         let row_gap = SIDEBAR_ROW_GAP;
         let max_scroll = {
             let viewport_height = content_bottom.saturating_sub(list_top);
-            let total_height =
-                Self::workspace_sidebar_list_height(&view, session_row_height, row_gap);
+            let total_height = Self::workspace_sidebar_scroll_height(
+                &view,
+                session_row_height,
+                row_gap,
+                viewport_height,
+            );
             total_height.saturating_sub(viewport_height) as f32
         };
         self.workspace_sidebar_scroll_offset =
@@ -561,9 +663,9 @@ impl crate::TermWindow {
                     }
 
                     let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
-                    let action_size = section_button_size
-                        .min(session_row_height.saturating_sub(12))
-                        .max(24);
+                    let action_size = session_row_height
+                        .saturating_sub(8)
+                        .clamp(SESSION_ACTION_MIN_SIZE, SESSION_ACTION_MAX_SIZE);
                     let delete_x = pinned_x
                         .saturating_add(pinned_width)
                         .saturating_sub(SIDEBAR_INSET + action_size);
@@ -593,7 +695,7 @@ impl crate::TermWindow {
                     )?;
 
                     if is_hovered && !is_renaming_session {
-                        for (x, item_type, icon, context_name) in [
+                        for (x, item_type, icon, _context_name) in [
                             (
                                 pin_x,
                                 UIItemType::ProjectSessionPin(session.id.clone()),
@@ -609,19 +711,6 @@ impl crate::TermWindow {
                         ] {
                             let hovered =
                                 self.is_pointer_over_ui_rect(x, action_y, action_size, action_size);
-                            self.fill_rounded_rectangle(
-                                layers,
-                                1,
-                                euclid::rect(
-                                    x as f32,
-                                    action_y as f32,
-                                    action_size as f32,
-                                    action_size as f32,
-                                ),
-                                foreground.mul_alpha(if hovered { 0.14 } else { 0.08 }),
-                                SIDEBAR_ROW_RADIUS,
-                            )
-                            .context(context_name)?;
                             self.ui_items.push(UIItem {
                                 x,
                                 y: action_y,
@@ -629,15 +718,20 @@ impl crate::TermWindow {
                                 height: action_size,
                                 item_type,
                             });
-                            let action_icon_size =
-                                header_icon_size.min(action_size.saturating_sub(10));
+                            let action_icon_size = action_size
+                                .saturating_sub(SESSION_ACTION_ICON_INSET)
+                                .max(header_icon_size);
                             self.paint_sidebar_icon(
                                 layers,
                                 icon,
                                 x + ((action_size.saturating_sub(action_icon_size)) / 2),
                                 action_y + ((action_size.saturating_sub(action_icon_size)) / 2),
                                 action_icon_size,
-                                if hovered { foreground } else { muted_fg },
+                                if hovered {
+                                    foreground
+                                } else {
+                                    muted_fg.mul_alpha(0.88)
+                                },
                             )?;
                         }
                     }
@@ -647,7 +741,72 @@ impl crate::TermWindow {
             }
         }
 
-        for project in &view.projects {
+        if !view.projects.is_empty() {
+            if !view.pinned_sessions.is_empty() {
+                virtual_y += WORKSPACE_SECTION_LABEL_GAP;
+            }
+            let label_top = list_top_f + virtual_y as f32 - scroll_offset;
+            let label_bottom = label_top + session_row_height as f32;
+            let label_is_visible = label_bottom > list_top_f && label_top < content_bottom_f;
+            if label_is_visible {
+                let label_y = label_top.floor().max(0.0) as usize;
+                let button_y =
+                    label_y + ((session_row_height.saturating_sub(section_button_size)) / 2);
+                let button_x = item_x
+                    .saturating_add(item_width)
+                    .saturating_sub(section_button_size + SIDEBAR_INSET);
+                let button_hovered = !suppress_hover
+                    && self.is_pointer_over_ui_rect(
+                        button_x,
+                        button_y,
+                        section_button_size,
+                        section_button_size,
+                    );
+                self.paint_sidebar_text(
+                    layers,
+                    &ui_font,
+                    ui_metrics,
+                    "Workspaces",
+                    item_x + SIDEBAR_INSET,
+                    label_y + ((session_row_height.saturating_sub(ui_cell_height)) / 2),
+                    button_x.saturating_sub(item_x + SIDEBAR_INSET * 2),
+                    muted_fg,
+                )?;
+                self.fill_rounded_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(
+                        button_x as f32,
+                        button_y as f32,
+                        section_button_size as f32,
+                        section_button_size as f32,
+                    ),
+                    foreground.mul_alpha(if button_hovered { 0.14 } else { 0.08 }),
+                    SIDEBAR_ROW_RADIUS,
+                )
+                .context("sidebar new project button")?;
+                self.ui_items.push(UIItem {
+                    x: button_x,
+                    y: button_y,
+                    width: section_button_size,
+                    height: section_button_size,
+                    item_type: UIItemType::ProjectNew,
+                });
+                let section_icon_size =
+                    header_icon_size.min(section_button_size.saturating_sub(10));
+                self.paint_sidebar_icon(
+                    layers,
+                    SvgIcon::FolderPlus,
+                    button_x + ((section_button_size.saturating_sub(section_icon_size)) / 2),
+                    button_y + ((section_button_size.saturating_sub(section_icon_size)) / 2),
+                    section_icon_size,
+                    if button_hovered { foreground } else { muted_fg },
+                )?;
+            }
+            virtual_y += session_row_height + row_gap;
+        }
+
+        for (project_idx, project) in view.projects.iter().enumerate() {
             let row_top = list_top_f + virtual_y as f32 - scroll_offset;
             let row_bottom = row_top + session_row_height as f32;
             let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
@@ -767,15 +926,11 @@ impl crate::TermWindow {
             virtual_y += session_row_height + row_gap;
 
             if !project.sessions_collapsed {
-                let session_x = item_x + SIDEBAR_INSET * 3;
-                let session_width = item_width.saturating_sub(SIDEBAR_INSET * 3);
-                let session_icon_x = project_icon_x + SIDEBAR_INSET;
-                let session_text_x = session_icon_x + icon_size + SIDEBAR_ICON_GAP;
-                let guide_x = disclosure_x + disclosure_size / 2;
-                let guide_top =
-                    (list_top_f + virtual_y as f32 - scroll_offset).max(list_top_f) as usize;
-                let session_start_virtual_y = virtual_y;
-                let mut guide_bottom = guide_top;
+                let session_x = item_x + SIDEBAR_INSET * 3 + SESSION_ROW_SIDE_PADDING;
+                let session_width =
+                    item_width.saturating_sub(SIDEBAR_INSET * 3 + SESSION_ROW_SIDE_PADDING * 2);
+                let session_dot_x = session_x + SIDEBAR_INSET + 2;
+                let session_text_x = session_dot_x + SESSION_STATUS_DOT_SIZE + SIDEBAR_ICON_GAP + 8;
 
                 for session in &project.sessions {
                     let row_top = list_top_f + virtual_y as f32 - scroll_offset;
@@ -786,7 +941,6 @@ impl crate::TermWindow {
                     let hit_bottom =
                         row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
                     let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
-                    guide_bottom = y.saturating_add(session_row_height);
 
                     if row_is_visible && session.is_active {
                         self.fill_rounded_rectangle_with_border(
@@ -806,13 +960,9 @@ impl crate::TermWindow {
                         .context("sidebar selected session")?;
                     }
 
-                    let icon_y = y + ((session_row_height.saturating_sub(icon_size)) / 2);
                     let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
-                    let status_size = 8usize;
-                    let status_x = session_x
-                        .saturating_add(session_width)
-                        .saturating_sub(SIDEBAR_INSET + status_size);
-                    let status_y = y + ((session_row_height.saturating_sub(status_size)) / 2);
+                    let dot_y =
+                        y + ((session_row_height.saturating_sub(SESSION_STATUS_DOT_SIZE)) / 2);
                     if row_is_visible {
                         self.ui_items.push(UIItem {
                             x: session_x,
@@ -829,9 +979,9 @@ impl crate::TermWindow {
                                 session_row_height,
                             );
                         let is_renaming_session = self.is_renaming_sidebar_session(&session.id);
-                        let action_size = section_button_size
-                            .min(session_row_height.saturating_sub(12))
-                            .max(24);
+                        let action_size = session_row_height
+                            .saturating_sub(8)
+                            .clamp(SESSION_ACTION_MIN_SIZE, SESSION_ACTION_MAX_SIZE);
                         let delete_x = session_x
                             .saturating_add(session_width)
                             .saturating_sub(SIDEBAR_INSET + action_size);
@@ -840,7 +990,9 @@ impl crate::TermWindow {
                         let text_right = if is_hovered && !is_renaming_session {
                             pin_x
                         } else {
-                            status_x
+                            session_x
+                                .saturating_add(session_width)
+                                .saturating_sub(SIDEBAR_INSET)
                         };
                         let text_width = text_right.saturating_sub(session_text_x + SIDEBAR_INSET);
                         if is_hovered && !session.is_active && !is_renaming_session {
@@ -858,18 +1010,29 @@ impl crate::TermWindow {
                             )
                             .context("sidebar hovered session")?;
                         }
-                        self.paint_sidebar_icon(
+                        self.fill_rounded_rectangle(
                             layers,
-                            SvgIcon::SquareTerminal,
-                            session_icon_x,
-                            icon_y,
-                            icon_size,
+                            1,
+                            euclid::rect(
+                                session_dot_x as f32,
+                                dot_y as f32,
+                                SESSION_STATUS_DOT_SIZE as f32,
+                                SESSION_STATUS_DOT_SIZE as f32,
+                            ),
                             if session.is_active {
-                                active_fg
+                                LinearRgba::with_components(0.20, 0.78, 0.36, 1.0)
+                            } else if session.is_unread {
+                                chrome.selected_bg
+                            } else if session.is_pinned {
+                                foreground.mul_alpha(0.68)
+                            } else if session.is_materialized {
+                                foreground.mul_alpha(0.45)
                             } else {
-                                muted_fg
+                                foreground.mul_alpha(0.16)
                             },
-                        )?;
+                            SESSION_STATUS_DOT_SIZE as f32 / 2.0,
+                        )
+                        .context("sidebar session status dot")?;
                         let session_title = self.sidebar_session_title(&session.id, &session.name);
                         self.paint_sidebar_text(
                             layers,
@@ -891,7 +1054,7 @@ impl crate::TermWindow {
                             } else {
                                 SvgIcon::Pin
                             };
-                            for (x, item_type, icon, context_name) in [
+                            for (x, item_type, icon, _context_name) in [
                                 (
                                     pin_x,
                                     UIItemType::ProjectSessionPin(session.id.clone()),
@@ -911,19 +1074,6 @@ impl crate::TermWindow {
                                     action_size,
                                     action_size,
                                 );
-                                self.fill_rounded_rectangle(
-                                    layers,
-                                    1,
-                                    euclid::rect(
-                                        x as f32,
-                                        action_y as f32,
-                                        action_size as f32,
-                                        action_size as f32,
-                                    ),
-                                    foreground.mul_alpha(if hovered { 0.14 } else { 0.08 }),
-                                    SIDEBAR_ROW_RADIUS,
-                                )
-                                .context(context_name)?;
                                 self.ui_items.push(UIItem {
                                     x,
                                     y: action_y,
@@ -931,64 +1081,31 @@ impl crate::TermWindow {
                                     height: action_size,
                                     item_type,
                                 });
-                                let action_icon_size =
-                                    header_icon_size.min(action_size.saturating_sub(10));
+                                let action_icon_size = action_size
+                                    .saturating_sub(SESSION_ACTION_ICON_INSET)
+                                    .max(header_icon_size);
                                 self.paint_sidebar_icon(
                                     layers,
                                     icon,
                                     x + ((action_size.saturating_sub(action_icon_size)) / 2),
                                     action_y + ((action_size.saturating_sub(action_icon_size)) / 2),
                                     action_icon_size,
-                                    if hovered { foreground } else { muted_fg },
+                                    if hovered {
+                                        foreground
+                                    } else {
+                                        muted_fg.mul_alpha(0.88)
+                                    },
                                 )?;
                             }
-                        } else {
-                            self.fill_rounded_rectangle(
-                                layers,
-                                1,
-                                euclid::rect(
-                                    status_x as f32,
-                                    status_y as f32,
-                                    status_size as f32,
-                                    status_size as f32,
-                                ),
-                                if session.is_active {
-                                    LinearRgba::with_components(0.20, 0.78, 0.36, 1.0)
-                                } else if session.is_unread {
-                                    chrome.selected_bg
-                                } else if session.is_pinned {
-                                    foreground.mul_alpha(0.68)
-                                } else if session.is_materialized {
-                                    foreground.mul_alpha(0.45)
-                                } else {
-                                    foreground.mul_alpha(0.16)
-                                },
-                                status_size as f32 / 2.0,
-                            )
-                            .context("sidebar session status")?;
                         }
                     }
 
                     virtual_y += session_row_height + row_gap;
                 }
+            }
 
-                if virtual_y > session_start_virtual_y && guide_bottom > guide_top {
-                    self.filled_rectangle(
-                        layers,
-                        0,
-                        euclid::rect(
-                            guide_x as f32,
-                            guide_top as f32,
-                            1.0,
-                            guide_bottom
-                                .min(content_bottom)
-                                .saturating_sub(guide_top + row_gap)
-                                as f32,
-                        ),
-                        foreground.mul_alpha(0.16),
-                    )
-                    .context("sidebar session guide")?;
-                }
+            if project_idx + 1 < view.projects.len() {
+                virtual_y += WORKSPACE_GROUP_EXTRA_GAP;
             }
         }
 
@@ -1006,16 +1123,6 @@ impl crate::TermWindow {
                 sidebar_bg,
             )
             .context("sidebar header scroll mask")?;
-            self.paint_sidebar_text(
-                layers,
-                &ui_font,
-                ui_metrics,
-                "Workspaces",
-                item_x + SIDEBAR_INSET,
-                y.saturating_sub(ui_cell_height + SIDEBAR_INSET),
-                section_button_x.saturating_sub(item_x + SIDEBAR_INSET * 2),
-                muted_fg,
-            )?;
             if show_sidebar_toolbar {
                 let toggle_hovered = self.is_pointer_over_ui_rect(
                     sidebar_toggle_x,
@@ -1047,27 +1154,71 @@ impl crate::TermWindow {
                     if toggle_hovered { foreground } else { muted_fg },
                 )?;
             }
+            let top_action_hovered = active_project_id.is_some()
+                && self.is_pointer_over_ui_rect(
+                    top_action_x,
+                    top_action_y,
+                    top_action_width,
+                    top_action_height,
+                );
             self.fill_rounded_rectangle(
                 layers,
                 2,
                 euclid::rect(
-                    section_button_x as f32,
-                    section_button_y as f32,
-                    section_button_size as f32,
-                    section_button_size as f32,
+                    top_action_x as f32,
+                    top_action_y as f32,
+                    top_action_width as f32,
+                    top_action_height as f32,
                 ),
-                foreground.mul_alpha(0.08),
-                SIDEBAR_ROW_RADIUS,
+                foreground.mul_alpha(if top_action_hovered { 0.14 } else { 0.08 }),
+                SIDEBAR_ROW_RADIUS + 4.0,
             )
-            .context("sidebar new project button repaint")?;
+            .context("sidebar add session button repaint")?;
+            let top_action_fg = if active_project_id.is_some() {
+                foreground
+            } else {
+                muted_fg
+            };
             self.paint_sidebar_icon(
                 layers,
-                SvgIcon::FolderPlus,
-                section_button_x + ((section_button_size.saturating_sub(section_icon_size)) / 2),
-                section_button_y + ((section_button_size.saturating_sub(section_icon_size)) / 2),
-                section_icon_size,
-                foreground,
+                SvgIcon::Plus,
+                top_action_icon_x,
+                top_action_icon_y,
+                top_action_icon_size,
+                top_action_fg,
             )?;
+            self.paint_sidebar_text(
+                layers,
+                &ui_font,
+                ui_metrics,
+                "Add New Session",
+                top_action_text_x,
+                top_action_text_y,
+                top_action_x
+                    .saturating_add(top_action_width)
+                    .saturating_sub(top_action_text_x + SIDEBAR_INSET),
+                top_action_fg,
+            )?;
+        }
+
+        if max_scroll > 0.0 && scroll_offset > 0.0 {
+            let fade_height = SIDEBAR_TOP_FADE_HEIGHT.min(content_bottom.saturating_sub(list_top));
+            for step in 0..fade_height {
+                let progress = step as f32 / fade_height as f32;
+                let alpha = 1.0 - progress * progress * (3.0 - 2.0 * progress);
+                self.filled_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        panel_x as f32,
+                        (list_top + step) as f32,
+                        panel_width as f32,
+                        1.0,
+                    ),
+                    sidebar_bg.mul_alpha(alpha),
+                )
+                .context("sidebar top scroll fade")?;
+            }
         }
 
         let bottom_mask_height = panel_y
@@ -1123,17 +1274,35 @@ impl crate::TermWindow {
             )
             .context("sidebar settings footer background")?;
 
-            let settings_row_x = item_x + SIDEBAR_INSET;
-            let settings_row_y = settings_footer_y + 8;
-            let settings_row_width = item_width.saturating_sub(SIDEBAR_INSET * 2);
-            let settings_row_height = 48usize
-                .min(settings_footer_height.saturating_sub(SIDEBAR_INSET))
+            let settings_row_x = item_x + SIDEBAR_SETTINGS_ROW_SIDE_PADDING;
+            let settings_row_y = (settings_footer_y + SIDEBAR_SETTINGS_ROW_TOP_PADDING)
+                .saturating_sub(SIDEBAR_SETTINGS_ROW_LIFT);
+            let settings_row_width =
+                item_width.saturating_sub(SIDEBAR_SETTINGS_ROW_SIDE_PADDING * 2);
+            let settings_row_height = settings_footer_height
+                .saturating_sub(
+                    SIDEBAR_SETTINGS_ROW_TOP_PADDING + SIDEBAR_SETTINGS_ROW_BOTTOM_PADDING,
+                )
                 .max(1);
+            let settings_action_size = settings_row_height.max(1);
+            let settings_action_x = settings_row_x
+                .saturating_add(settings_row_width)
+                .saturating_sub(settings_action_size);
+            let settings_action_y = settings_row_y;
+            let settings_body_width = settings_action_x
+                .saturating_sub(settings_row_x)
+                .saturating_sub(SIDEBAR_INSET / 2);
             let settings_hovered = self.is_pointer_over_ui_rect(
                 settings_row_x,
                 settings_row_y,
-                settings_row_width,
+                settings_body_width,
                 settings_row_height,
+            );
+            let settings_options_hovered = self.is_pointer_over_ui_rect(
+                settings_action_x,
+                settings_action_y,
+                settings_action_size,
+                settings_action_size,
             );
             if settings_hovered {
                 self.fill_rounded_rectangle(
@@ -1142,7 +1311,7 @@ impl crate::TermWindow {
                     euclid::rect(
                         settings_row_x as f32,
                         settings_row_y as f32,
-                        settings_row_width as f32,
+                        settings_body_width as f32,
                         settings_row_height as f32,
                     ),
                     foreground.mul_alpha(0.10),
@@ -1153,15 +1322,37 @@ impl crate::TermWindow {
             self.ui_items.push(UIItem {
                 x: settings_row_x,
                 y: settings_row_y,
-                width: settings_row_width,
+                width: settings_body_width,
                 height: settings_row_height,
                 item_type: UIItemType::WorkspaceSidebarSettings,
             });
+            if settings_options_hovered {
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        settings_action_x as f32,
+                        settings_action_y as f32,
+                        settings_action_size as f32,
+                        settings_action_size as f32,
+                    ),
+                    foreground.mul_alpha(0.12),
+                    SIDEBAR_ROW_RADIUS + 4.0,
+                )
+                .context("sidebar settings view options hover")?;
+            }
+            self.ui_items.push(UIItem {
+                x: settings_action_x,
+                y: settings_action_y,
+                width: settings_action_size,
+                height: settings_action_size,
+                item_type: UIItemType::WorkspaceSidebarViewOptions,
+            });
             let settings_icon_size = icon_size.min(settings_row_height.saturating_sub(8));
-            let settings_icon_x = settings_row_x + SIDEBAR_INSET + 2;
+            let settings_icon_x = settings_row_x + SIDEBAR_SETTINGS_ICON_EXTRA_INSET;
             let settings_icon_y =
                 settings_row_y + ((settings_row_height.saturating_sub(settings_icon_size)) / 2);
-            let settings_text_x = settings_icon_x + settings_icon_size + SIDEBAR_ICON_GAP + 4;
+            let settings_text_x = settings_icon_x + settings_icon_size + SIDEBAR_ICON_GAP + 8;
             let settings_text_y =
                 settings_row_y + ((settings_row_height.saturating_sub(ui_cell_height)) / 2);
             self.paint_sidebar_icon(
@@ -1179,10 +1370,23 @@ impl crate::TermWindow {
                 "Settings",
                 settings_text_x,
                 settings_text_y,
-                settings_row_x
-                    .saturating_add(settings_row_width)
-                    .saturating_sub(settings_text_x + SIDEBAR_INSET),
+                settings_action_x.saturating_sub(settings_text_x + SIDEBAR_INSET),
                 foreground,
+            )?;
+            let settings_action_icon_size = settings_icon_size;
+            self.paint_sidebar_icon(
+                layers,
+                SvgIcon::SlidersVertical,
+                settings_action_x
+                    + ((settings_action_size.saturating_sub(settings_action_icon_size)) / 2),
+                settings_action_y
+                    + ((settings_action_size.saturating_sub(settings_action_icon_size)) / 2),
+                settings_action_icon_size,
+                if settings_options_hovered {
+                    foreground
+                } else {
+                    muted_fg
+                },
             )?;
         }
 

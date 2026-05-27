@@ -78,6 +78,13 @@ pub struct SizedSvgIconKey {
     pub size: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SizedRotatedSvgIconKey {
+    pub icon: SvgIcon,
+    pub size: u16,
+    pub frame: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
     pub font_idx: usize,
@@ -575,6 +582,7 @@ pub struct GlyphCache {
     pub svg_icons: HashMap<SizedSvgIconKey, Sprite>,
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
+    pub rotated_svg_icons: HashMap<SizedRotatedSvgIconKey, Sprite>,
     min_frame_duration: Duration,
 }
 
@@ -597,6 +605,7 @@ impl GlyphCache {
             line_glyphs: HashMap::new(),
             block_glyphs: HashMap::new(),
             svg_icons: HashMap::new(),
+            rotated_svg_icons: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
@@ -627,6 +636,7 @@ impl GlyphCache {
             line_glyphs: HashMap::new(),
             block_glyphs: HashMap::new(),
             svg_icons: HashMap::new(),
+            rotated_svg_icons: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
@@ -1158,6 +1168,33 @@ impl GlyphCache {
         let image = icon.rasterize(size)?;
         let sprite = self.atlas.allocate(&image)?;
         self.svg_icons.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    pub fn cached_rotated_svg_icon(
+        &mut self,
+        icon: SvgIcon,
+        size: usize,
+        frame: u8,
+        frame_count: u8,
+    ) -> anyhow::Result<Sprite> {
+        let size = size.max(1).min(u16::MAX as usize);
+        let frame_count = frame_count.max(1);
+        let frame = frame % frame_count;
+        let key = SizedRotatedSvgIconKey {
+            icon,
+            size: size as u16,
+            frame,
+        };
+
+        if let Some(sprite) = self.rotated_svg_icons.get(&key) {
+            return Ok(sprite.clone());
+        }
+
+        let degrees = 360.0 * frame as f32 / frame_count as f32;
+        let image = icon.rasterize_with_rotation(size, degrees)?;
+        let sprite = self.atlas.allocate(&image)?;
+        self.rotated_svg_icons.insert(key, sprite.clone());
         Ok(sprite)
     }
 

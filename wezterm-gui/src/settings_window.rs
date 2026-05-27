@@ -18,7 +18,7 @@ use config::{configuration, Dimension, GeometryOrigin};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wezterm_bidi::Direction;
 use wezterm_font::{FontConfiguration, LoadedFont};
 use window::bitmaps::atlas::OutOfTextureSpace;
@@ -64,10 +64,12 @@ enum SettingsSection {
     Keymap,
     Compatibility,
     Developer,
+    UiKit,
+    Memory,
     About,
 }
 
-const SECTIONS: &[SettingsSection] = &[
+const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::General,
     SettingsSection::Appearance,
     SettingsSection::Terminal,
@@ -77,6 +79,8 @@ const SECTIONS: &[SettingsSection] = &[
     SettingsSection::Developer,
     SettingsSection::About,
 ];
+
+const DEVELOPER_SECTIONS: &[SettingsSection] = &[SettingsSection::UiKit, SettingsSection::Memory];
 
 impl SettingsSection {
     fn label(self) -> &'static str {
@@ -88,6 +92,8 @@ impl SettingsSection {
             Self::Keymap => "Keymap",
             Self::Compatibility => "Compatibility",
             Self::Developer => "Developer",
+            Self::UiKit => "UI Kit",
+            Self::Memory => "Memory",
             Self::About => "About",
         }
     }
@@ -101,6 +107,8 @@ impl SettingsSection {
             Self::Keymap => SettingsIcon::Keymap,
             Self::Compatibility => SettingsIcon::Sync,
             Self::Developer => SettingsIcon::Developer,
+            Self::UiKit => SettingsIcon::UiKit,
+            Self::Memory => SettingsIcon::Memory,
             Self::About => SettingsIcon::About,
         }
     }
@@ -112,6 +120,9 @@ impl SettingsSection {
                 "ThinkTerm Native Settings",
                 "Theme Mode",
                 "Native Settings",
+                "Restore Main Window Frame",
+                "Window Size",
+                "Window Position",
                 "Configuration",
             ],
             Self::Appearance => &[
@@ -146,6 +157,13 @@ impl SettingsSection {
                 "Import",
             ],
             Self::Developer => &[
+                "Developer Mode",
+                "Diagnostics",
+                "Debug Pages",
+                "Memory Diagnostics",
+                "UI Kit",
+            ],
+            Self::UiKit => &[
                 "Search Field",
                 "Sidebar Rows",
                 "Buttons and Controls",
@@ -155,6 +173,19 @@ impl SettingsSection {
                 "Typography",
                 "Component Preview",
                 "Component Styles",
+            ],
+            Self::Memory => &[
+                "Memory",
+                "Diagnostics",
+                "Manual Sampling",
+                "Copy",
+                "Refresh",
+                "Physical Footprint",
+                "RSS",
+                "vmmap",
+                "IOAccelerator",
+                "IOSurface",
+                "Graphics",
             ],
             Self::About => &["About", "Version", "ThinkTerm"],
         }
@@ -166,6 +197,11 @@ enum SettingsAction {
     Select(SettingsSection),
     OpenConfigFile,
     ShowCompatibilityStatus,
+    ToggleMainWindowFrameRestore,
+    ToggleDeveloperMode,
+    ToggleMemoryMonitoring,
+    RefreshMemorySnapshot,
+    CopyMemorySnapshot,
     ToggleThemeModeMenu,
     SetThemeMode(NativeThemeMode),
     SearchInput,
@@ -193,6 +229,67 @@ enum SettingsDrag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsDropdown {
     ThemeMode,
+}
+
+#[derive(Debug, Clone)]
+struct MemorySnapshot {
+    captured_at: Instant,
+    pid: u32,
+    resident_size: Option<u64>,
+    physical_footprint: Option<u64>,
+    peak_physical_footprint: Option<u64>,
+    error: Option<String>,
+}
+
+impl MemorySnapshot {
+    fn log_line(&self) -> String {
+        format!(
+            "pid={} rss={} physical_footprint={} peak_physical_footprint={}{}",
+            self.pid,
+            self.resident_size
+                .map(format_bytes)
+                .unwrap_or_else(|| "unavailable".to_string()),
+            self.physical_footprint
+                .map(format_bytes)
+                .unwrap_or_else(|| "unavailable".to_string()),
+            self.peak_physical_footprint
+                .map(format_bytes)
+                .unwrap_or_else(|| "unavailable".to_string()),
+            self.error
+                .as_ref()
+                .map(|error| format!(" error={error}"))
+                .unwrap_or_default()
+        )
+    }
+
+    fn summary_for_clipboard(&self) -> String {
+        let mut lines = vec![
+            "ThinkTerm Memory Snapshot".to_string(),
+            format!("pid: {}", self.pid),
+            format!(
+                "rss: {}",
+                self.resident_size
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "unavailable".to_string())
+            ),
+            format!(
+                "physical_footprint: {}",
+                self.physical_footprint
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "unavailable".to_string())
+            ),
+            format!(
+                "peak_physical_footprint: {}",
+                self.peak_physical_footprint
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "unavailable".to_string())
+            ),
+        ];
+        if let Some(error) = &self.error {
+            lines.push(format!("error: {error}"));
+        }
+        lines.join("\n")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +341,10 @@ struct SettingsUiState {
     interaction: InteractionState<SettingsAction>,
     drag: Option<SettingsDrag>,
     open_dropdown: Option<SettingsDropdown>,
+    memory_monitoring: bool,
+    memory_monitor_generation: u64,
+    memory_snapshot: Option<MemorySnapshot>,
+    memory_snapshot_copied_until: Option<Instant>,
     sidebar_scrollbar_visible_until: Option<Instant>,
     content_scrollbar_visible_until: Option<Instant>,
 }
@@ -266,10 +367,131 @@ impl SettingsUiState {
             interaction: InteractionState::default(),
             drag: None,
             open_dropdown: None,
+            memory_monitoring: false,
+            memory_monitor_generation: 0,
+            memory_snapshot: None,
+            memory_snapshot_copied_until: None,
             sidebar_scrollbar_visible_until: None,
             content_scrollbar_visible_until: None,
         }
     }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let mib = bytes as f64 / 1024.0 / 1024.0;
+    if mib >= 1024.0 {
+        format!("{:.2} GB", mib / 1024.0)
+    } else {
+        format!("{mib:.1} MB")
+    }
+}
+
+fn capture_memory_snapshot() -> MemorySnapshot {
+    let pid = std::process::id();
+    let mut snapshot = MemorySnapshot {
+        captured_at: Instant::now(),
+        pid,
+        resident_size: None,
+        physical_footprint: None,
+        peak_physical_footprint: None,
+        error: None,
+    };
+
+    match capture_process_memory_info(pid) {
+        Ok(info) => {
+            snapshot.resident_size = Some(info.resident_size);
+            snapshot.physical_footprint = Some(info.physical_footprint);
+            snapshot.peak_physical_footprint = Some(info.peak_physical_footprint);
+        }
+        Err(err) => {
+            snapshot.error = Some(err);
+        }
+    }
+
+    snapshot
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessMemoryInfo {
+    resident_size: u64,
+    physical_footprint: u64,
+    peak_physical_footprint: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn capture_process_memory_info(pid: u32) -> Result<ProcessMemoryInfo, String> {
+    const RUSAGE_INFO_V4: libc::c_int = 4;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RUsageInfoV4 {
+        ri_uuid: [u8; 16],
+        ri_user_time: u64,
+        ri_system_time: u64,
+        ri_pkg_idle_wkups: u64,
+        ri_interrupt_wkups: u64,
+        ri_pageins: u64,
+        ri_wired_size: u64,
+        ri_resident_size: u64,
+        ri_phys_footprint: u64,
+        ri_proc_start_abstime: u64,
+        ri_proc_exit_abstime: u64,
+        ri_child_user_time: u64,
+        ri_child_system_time: u64,
+        ri_child_pkg_idle_wkups: u64,
+        ri_child_interrupt_wkups: u64,
+        ri_child_pageins: u64,
+        ri_child_elapsed_abstime: u64,
+        ri_diskio_bytesread: u64,
+        ri_diskio_byteswritten: u64,
+        ri_cpu_time_qos_default: u64,
+        ri_cpu_time_qos_maintenance: u64,
+        ri_cpu_time_qos_background: u64,
+        ri_cpu_time_qos_utility: u64,
+        ri_cpu_time_qos_legacy: u64,
+        ri_cpu_time_qos_user_initiated: u64,
+        ri_cpu_time_qos_user_interactive: u64,
+        ri_billed_system_time: u64,
+        ri_serviced_system_time: u64,
+        ri_logical_writes: u64,
+        ri_lifetime_max_phys_footprint: u64,
+        ri_instructions: u64,
+        ri_cycles: u64,
+        ri_billed_energy: u64,
+        ri_serviced_energy: u64,
+    }
+
+    unsafe extern "C" {
+        fn proc_pid_rusage(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            buffer: *mut libc::c_void,
+        ) -> libc::c_int;
+    }
+
+    let mut info = std::mem::MaybeUninit::<RUsageInfoV4>::zeroed();
+    let result = unsafe {
+        proc_pid_rusage(
+            pid as libc::c_int,
+            RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let info = unsafe { info.assume_init() };
+    Ok(ProcessMemoryInfo {
+        resident_size: info.ri_resident_size,
+        physical_footprint: info.ri_phys_footprint,
+        peak_physical_footprint: info.ri_lifetime_max_phys_footprint,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_process_memory_info(_pid: u32) -> Result<ProcessMemoryInfo, String> {
+    Err("memory diagnostics are only wired on macOS for now".to_string())
 }
 
 struct StyleToken<'a> {
@@ -403,6 +625,7 @@ impl SettingsWindow {
             height: Dimension::Pixels(DEFAULT_HEIGHT as f32),
             x: None,
             y: None,
+            macos_frame_autosave_name: None,
             origin: GeometryOrigin::default(),
         };
 
@@ -559,7 +782,7 @@ impl SettingsWindow {
                 self.ui.drag = None;
                 self.ui.interaction.hovered = action;
                 if pressed.is_some() && pressed == action {
-                    self.perform_action(action.unwrap());
+                    self.perform_action(action.unwrap(), window);
                 }
                 window.invalidate();
             }
@@ -621,6 +844,52 @@ impl SettingsWindow {
         promise::spawn::spawn_into_main_thread(async move {
             smol::Timer::after(std::time::Duration::from_millis(930)).await;
             window.invalidate();
+        })
+        .detach();
+    }
+
+    fn schedule_memory_monitor_tick(&self, window: &Window, generation: u64) {
+        let window = window.clone();
+        promise::spawn::spawn_into_main_thread(async move {
+            smol::Timer::after(Duration::from_millis(1500)).await;
+            SETTINGS_WINDOW.with(|slot| {
+                let Some(settings) = slot.borrow().as_ref().cloned() else {
+                    return;
+                };
+                let mut settings = settings.borrow_mut();
+                if !settings.ui.memory_monitoring
+                    || settings.ui.memory_monitor_generation != generation
+                {
+                    return;
+                }
+                let snapshot = capture_memory_snapshot();
+                log::info!("settings memory diagnostics: {}", snapshot.log_line());
+                settings.ui.memory_snapshot = Some(snapshot);
+                window.invalidate();
+                settings.schedule_memory_monitor_tick(&window, generation);
+            });
+        })
+        .detach();
+    }
+
+    fn schedule_copied_state_clear(&self, window: &Window) {
+        let window = window.clone();
+        promise::spawn::spawn_into_main_thread(async move {
+            smol::Timer::after(Duration::from_millis(1450)).await;
+            SETTINGS_WINDOW.with(|slot| {
+                let Some(settings) = slot.borrow().as_ref().cloned() else {
+                    return;
+                };
+                let mut settings = settings.borrow_mut();
+                if settings
+                    .ui
+                    .memory_snapshot_copied_until
+                    .is_some_and(|until| Instant::now() >= until)
+                {
+                    settings.ui.memory_snapshot_copied_until = None;
+                    window.invalidate();
+                }
+            });
         })
         .detach();
     }
@@ -1041,6 +1310,25 @@ impl SettingsWindow {
         (bottom_y + 65.0).max(self.content_bottom())
     }
 
+    fn developer_mode_enabled(&self) -> bool {
+        self.native_settings.developer.developer_mode
+    }
+
+    fn visible_sections(&self) -> Vec<SettingsSection> {
+        let mut sections = Vec::with_capacity(BASE_SECTIONS.len() + DEVELOPER_SECTIONS.len());
+        for section in BASE_SECTIONS {
+            if *section == SettingsSection::About && self.developer_mode_enabled() {
+                sections.extend_from_slice(DEVELOPER_SECTIONS);
+            }
+            sections.push(*section);
+        }
+        sections
+    }
+
+    fn section_is_visible(&self, section: SettingsSection) -> bool {
+        self.visible_sections().contains(&section)
+    }
+
     fn clamp_sidebar_to_window(&mut self) {
         let dynamic_max = (self.dimensions.pixel_width as f32 * 0.38)
             .max(self.ui.sidebar.min_width)
@@ -1050,7 +1338,7 @@ impl SettingsWindow {
         }
     }
 
-    fn perform_action(&mut self, action: SettingsAction) {
+    fn perform_action(&mut self, action: SettingsAction, window: &Window) {
         match action {
             SettingsAction::Select(section) => {
                 self.selected = section;
@@ -1077,6 +1365,80 @@ impl SettingsWindow {
                         "No config file is loaded; ThinkTerm is using built-in defaults".to_string()
                     }
                 };
+            }
+            SettingsAction::ToggleMainWindowFrameRestore => {
+                self.ui.open_dropdown = None;
+                self.native_settings.window.restore_main_window_frame =
+                    !self.native_settings.window.restore_main_window_frame;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = if self.native_settings.window.restore_main_window_frame {
+                            "Main window frame restore enabled for new macOS windows.".to_string()
+                        } else {
+                            "Main window frame restore disabled for new macOS windows.".to_string()
+                        };
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to save window restore setting: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::ToggleDeveloperMode => {
+                self.ui.open_dropdown = None;
+                self.native_settings.developer.developer_mode =
+                    !self.native_settings.developer.developer_mode;
+                if !self.developer_mode_enabled() && !self.section_is_visible(self.selected) {
+                    self.selected = SettingsSection::Developer;
+                    self.ui.content_scroll.reset();
+                }
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = if self.developer_mode_enabled() {
+                            "Developer mode enabled. Extra diagnostics tabs are now visible."
+                                .to_string()
+                        } else {
+                            "Developer mode disabled. Diagnostics tabs are hidden.".to_string()
+                        };
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to save developer mode: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::ToggleMemoryMonitoring => {
+                self.ui.open_dropdown = None;
+                self.ui.memory_monitoring = !self.ui.memory_monitoring;
+                self.ui.memory_monitor_generation =
+                    self.ui.memory_monitor_generation.wrapping_add(1);
+                if self.ui.memory_monitoring {
+                    let snapshot = capture_memory_snapshot();
+                    log::info!("settings memory diagnostics: {}", snapshot.log_line());
+                    self.ui.memory_snapshot = Some(snapshot);
+                    self.status = "Memory diagnostics are running manually.".to_string();
+                    self.schedule_memory_monitor_tick(window, self.ui.memory_monitor_generation);
+                } else {
+                    self.status = "Memory diagnostics stopped.".to_string();
+                }
+            }
+            SettingsAction::RefreshMemorySnapshot => {
+                self.ui.open_dropdown = None;
+                let snapshot = capture_memory_snapshot();
+                log::info!("settings memory diagnostics: {}", snapshot.log_line());
+                self.ui.memory_snapshot = Some(snapshot);
+                self.status = "Memory snapshot refreshed.".to_string();
+            }
+            SettingsAction::CopyMemorySnapshot => {
+                self.ui.open_dropdown = None;
+                if self.ui.memory_snapshot.is_none() {
+                    self.ui.memory_snapshot = Some(capture_memory_snapshot());
+                }
+                if let Some(snapshot) = &self.ui.memory_snapshot {
+                    window.set_clipboard(Clipboard::Clipboard, snapshot.summary_for_clipboard());
+                    self.ui.memory_snapshot_copied_until =
+                        Some(Instant::now() + Duration::from_millis(1400));
+                    self.status = "Memory snapshot copied.".to_string();
+                    self.schedule_copied_state_clear(window);
+                }
             }
             SettingsAction::ToggleThemeModeMenu => {
                 self.ui.open_dropdown =
@@ -1544,6 +1906,8 @@ impl SettingsWindow {
                 max_width,
             )?,
             SettingsSection::Developer => self.paint_developer(layers, x, max_width)?,
+            SettingsSection::UiKit => self.paint_ui_kit(layers, x, max_width)?,
+            SettingsSection::Memory => self.paint_memory_diagnostics(layers, x, max_width)?,
             SettingsSection::About => self.paint_placeholder(
                 layers,
                 &ui_font,
@@ -1574,8 +1938,8 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 3);
-        let card_height = self.settings_card_height(3);
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 4);
+        let card_height = self.settings_card_height(4);
         self.ui.content_scroll.set_extents(
             self.content_bottom(),
             self.settings_content_extent(card_y + scroll + card_height),
@@ -1633,6 +1997,17 @@ impl SettingsWindow {
             first_row_y + row_step * 2.0,
             row_width,
             "Small ThinkTerm-native state; compatible terminal config stays in wezterm.lua.",
+            true,
+        )?;
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 3.0,
+            row_width,
+            "Restore Main Window Frame",
+            "macOS restores the last main terminal window size and position.",
+            self.native_settings.window.restore_main_window_frame,
+            SettingsAction::ToggleMainWindowFrameRestore,
             true,
         )?;
         Ok(())
@@ -1856,6 +2231,90 @@ impl SettingsWindow {
     }
 
     fn paint_developer(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let scroll = self.ui.content_scroll.offset;
+        let row_step = self.settings_row_step();
+        let section_y = CONTENT_SECTION_Y - scroll;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 2);
+        let card_height = self.settings_card_height(2);
+        let button_y = card_y + card_height + self.settings_section_card_gap();
+        self.ui.content_scroll.set_extents(
+            self.content_bottom(),
+            self.settings_content_extent(button_y + scroll + CONTROL_HEIGHT),
+        );
+
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            section_y,
+            "Keep normal Settings clean. Enable developer mode to reveal internal pages. Memory sampling still has to be started manually.",
+            palette.secondary_text,
+            max_width,
+        )?;
+
+        let card_padding = 36.0;
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y,
+            row_width,
+            "Developer Mode",
+            "Shows internal Settings pages for UI tuning and memory diagnostics.",
+            if self.developer_mode_enabled() {
+                "On"
+            } else {
+                "Off"
+            },
+            false,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step,
+            row_width,
+            "Visible Developer Tabs",
+            "UI Kit and Memory tabs are shown here; diagnostics do not run automatically.",
+            if self.developer_mode_enabled() {
+                "UI Kit, Memory"
+            } else {
+                "Hidden"
+            },
+            true,
+        )?;
+        self.draw_button(
+            layers,
+            x,
+            button_y,
+            self.button_width_for_label(
+                if self.developer_mode_enabled() {
+                    "Disable Developer Mode"
+                } else {
+                    "Enable Developer Mode"
+                },
+                300.0,
+            ),
+            if self.developer_mode_enabled() {
+                "Disable Developer Mode"
+            } else {
+                "Enable Developer Mode"
+            },
+            SettingsAction::ToggleDeveloperMode,
+        )?;
+
+        Ok(())
+    }
+
+    fn paint_ui_kit(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         x: f32,
@@ -2092,6 +2551,156 @@ impl SettingsWindow {
             notes_width,
             "Layout",
             &layout_tokens,
+        )?;
+
+        Ok(())
+    }
+
+    fn paint_memory_diagnostics(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let scroll = self.ui.content_scroll.offset;
+        let row_step = self.settings_row_step();
+        let section_y = CONTENT_SECTION_Y - scroll;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 5);
+        let card_height = self.settings_card_height(5);
+        let button_y = card_y + card_height + self.settings_section_card_gap();
+        self.ui.content_scroll.set_extents(
+            self.content_bottom(),
+            self.settings_content_extent(button_y + scroll + CONTROL_HEIGHT),
+        );
+
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            section_y,
+            "Memory diagnostics are manual. Developer mode only reveals this page; sampling starts when you enable it here.",
+            palette.secondary_text,
+            max_width,
+        )?;
+
+        let snapshot = self
+            .ui
+            .memory_snapshot
+            .clone()
+            .unwrap_or_else(capture_memory_snapshot);
+        if self.ui.memory_snapshot.is_none() {
+            self.ui.memory_snapshot = Some(snapshot.clone());
+        }
+        let age_label = format!("{:.1}s ago", snapshot.captured_at.elapsed().as_secs_f32());
+        let footprint = snapshot
+            .physical_footprint
+            .map(format_bytes)
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let rss = snapshot
+            .resident_size
+            .map(format_bytes)
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let peak = snapshot
+            .peak_physical_footprint
+            .map(format_bytes)
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let monitor_state = if self.ui.memory_monitoring {
+            "Running"
+        } else {
+            "Off"
+        };
+
+        let card_padding = 36.0;
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y,
+            row_width,
+            "Manual Sampling",
+            "Keeps refreshing this page until you turn it off.",
+            monitor_state,
+            false,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step,
+            row_width,
+            "Physical Footprint",
+            "Matches the macOS memory pressure number more closely than RSS.",
+            &footprint,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 2.0,
+            row_width,
+            "Resident Size",
+            "Current resident process memory from proc_pid_rusage.",
+            &rss,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 3.0,
+            row_width,
+            "Peak Physical Footprint",
+            "Highest physical footprint reported for this process lifetime.",
+            &peak,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 4.0,
+            row_width,
+            "Last Snapshot",
+            "Manual refresh and copy use this latest captured value.",
+            &age_label,
+            true,
+        )?;
+        let primary_label = if self.ui.memory_monitoring {
+            "Stop Memory Sampling"
+        } else {
+            "Start Memory Sampling"
+        };
+        self.draw_button(
+            layers,
+            x,
+            button_y,
+            self.button_width_for_label(primary_label, 300.0),
+            primary_label,
+            SettingsAction::ToggleMemoryMonitoring,
+        )?;
+        let refresh_x = x + self.button_width_for_label(primary_label, 300.0) + 16.0;
+        self.draw_button(
+            layers,
+            refresh_x,
+            button_y,
+            self.button_width_for_label("Refresh Now", 210.0),
+            "Refresh Now",
+            SettingsAction::RefreshMemorySnapshot,
+        )?;
+        let copied = self
+            .ui
+            .memory_snapshot_copied_until
+            .is_some_and(|until| Instant::now() < until);
+        let copy_label = if copied { "Copied" } else { "Copy" };
+        let copy_x = refresh_x + self.button_width_for_label("Refresh Now", 210.0) + 16.0;
+        self.draw_button(
+            layers,
+            copy_x,
+            button_y,
+            self.button_width_for_label(copy_label, 150.0),
+            copy_label,
+            SettingsAction::CopyMemorySnapshot,
         )?;
 
         Ok(())
@@ -2505,6 +3114,83 @@ impl SettingsWindow {
             control_x + 14.0,
             self.control_text_y(control_y, CONTROL_HEIGHT),
             value,
+            palette.text,
+            control_width - 26.0,
+        )?;
+        Ok(())
+    }
+
+    fn paint_toggle_setting_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        description: &str,
+        enabled: bool,
+        action: SettingsAction,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - 28.0, width)?;
+        }
+        let control_width = if width >= 680.0 {
+            280.0_f32.min(width * 0.36)
+        } else {
+            220.0_f32.min(width * 0.44)
+        };
+        let control_x = x + width - control_width;
+        let control_y = y + 4.0;
+        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed {
+            palette.control_pressed_bg
+        } else if hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y),
+            description,
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            control_x,
+            control_y,
+            control_width,
+            CONTROL_HEIGHT,
+            bg,
+            border,
+            CONTROL_RADIUS,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            control_x + 14.0,
+            self.control_text_y(control_y, CONTROL_HEIGHT),
+            if enabled { "On" } else { "Off" },
             palette.text,
             control_width - 26.0,
         )?;
@@ -3028,12 +3714,12 @@ impl SettingsWindow {
 
     fn filtered_sections(&self) -> Vec<SettingsSection> {
         let query = self.ui.search.text.trim().to_lowercase();
+        let sections = self.visible_sections();
         if query.is_empty() {
-            return SECTIONS.to_vec();
+            return sections;
         }
-        SECTIONS
-            .iter()
-            .copied()
+        sections
+            .into_iter()
             .filter(|section| {
                 section.label().to_lowercase().contains(&query)
                     || section
