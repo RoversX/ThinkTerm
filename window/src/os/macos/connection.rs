@@ -1,8 +1,8 @@
 // let () = msg_send! is a common pattern for objc
 #![allow(clippy::let_unit_value)]
 
-use super::nsstring_to_str;
 use super::window::WindowInner;
+use super::{nsstring, nsstring_to_str};
 use crate::connection::ConnectionOps;
 use crate::os::macos::app::create_app_delegate;
 use crate::screen::{ScreenInfo, Screens};
@@ -149,6 +149,23 @@ impl ConnectionOps for Connection {
                 log::warn!("Unknown NSAppearanceName {name}, assume Light");
                 Appearance::Light
             }
+        }
+    }
+
+    fn set_preferred_appearance(&self, appearance: Option<Appearance>) {
+        unsafe {
+            let ns_appearance: id = match appearance {
+                Some(Appearance::Light | Appearance::LightHighContrast) => {
+                    let name = nsstring("NSAppearanceNameAqua");
+                    msg_send![class!(NSAppearance), appearanceNamed: *name]
+                }
+                Some(Appearance::Dark | Appearance::DarkHighContrast) => {
+                    let name = nsstring("NSAppearanceNameDarkAqua");
+                    msg_send![class!(NSAppearance), appearanceNamed: *name]
+                }
+                None => nil,
+            };
+            let () = msg_send![self.ns_app, setAppearance: ns_appearance];
         }
     }
 

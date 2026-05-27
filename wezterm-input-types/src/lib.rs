@@ -1269,7 +1269,23 @@ pub enum MouseEventKind {
     HorzWheel(i16),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct PreciseScrollDelta {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ScrollPhase {
+    Began,
+    Stationary,
+    Changed,
+    Ended,
+    Cancelled,
+    MayBegin,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct MouseEvent {
     pub kind: MouseEventKind,
     /// Coordinates of the mouse relative to the top left of the window
@@ -1278,6 +1294,15 @@ pub struct MouseEvent {
     pub screen_coords: crate::ScreenPoint,
     pub mouse_buttons: MouseButtons,
     pub modifiers: Modifiers,
+    /// Pixel-precise wheel delta from native scroll devices when available.
+    ///
+    /// Traditional `VertWheel`/`HorzWheel` values are line/discrete oriented;
+    /// this preserves high-resolution trackpad scrolling for UI chrome.
+    pub precise_scroll_delta: Option<PreciseScrollDelta>,
+    /// Native scroll gesture phase when available.
+    pub scroll_phase: Option<ScrollPhase>,
+    /// Native momentum scroll phase when available.
+    pub momentum_phase: Option<ScrollPhase>,
 }
 
 #[derive(Debug, Clone)]

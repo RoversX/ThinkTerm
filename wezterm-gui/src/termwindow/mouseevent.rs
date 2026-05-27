@@ -2,8 +2,11 @@ use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::termwindow::ui::tokens::{
+    MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH, MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS,
     PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_ROW_START_PADDING,
-    TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
+    TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X,
+    WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
 use crate::termwindow::{
     GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TabWheelSurface,
@@ -65,12 +68,70 @@ impl super::TermWindow {
             .ceil()
     }
 
+    pub(super) fn window_tab_leading_action_slot_count(&self) -> usize {
+        if !self.config.use_fancy_tab_bar || self.workspace_sidebar_width() > 0 {
+            return 0;
+        }
+
+        if self.window_state.contains(WindowState::FULL_SCREEN) {
+            return 1;
+        }
+
+        if cfg!(target_os = "macos") {
+            return MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS;
+        }
+
+        0
+    }
+
+    pub(super) fn window_tab_shows_sidebar_toggle_action(&self) -> bool {
+        self.config.use_fancy_tab_bar
+            && self.workspace_sidebar_width() == 0
+            && self.window_state.contains(WindowState::FULL_SCREEN)
+    }
+
+    pub(super) fn window_tab_leading_action_start_pixels(&self) -> f32 {
+        if self.window_tab_leading_action_slot_count() == 0 {
+            0.0
+        } else if self.window_state.contains(WindowState::FULL_SCREEN) {
+            WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X as f32
+        } else if cfg!(target_os = "macos") {
+            MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH as f32
+        } else {
+            0.0
+        }
+    }
+
+    pub(super) fn window_tab_leading_action_area_width_pixels(&self) -> f32 {
+        let count = self.window_tab_leading_action_slot_count();
+        if count == 0 {
+            0.0
+        } else {
+            let button_size = if self.window_tab_shows_sidebar_toggle_action() {
+                WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
+            } else {
+                WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
+            };
+            (count * (button_size + WINDOW_TAB_LEADING_ACTION_GAP)) as f32
+        }
+    }
+
     pub(super) fn window_tab_left_padding_pixels(&self) -> f32 {
         if self.workspace_sidebar_width() > 0 {
             return 0.0;
         }
 
         let cell_width = self.render_metrics.cell_size.width.max(1) as f32;
+        let leading_action_slot_count = self.window_tab_leading_action_slot_count();
+        let leading_action_padding = if leading_action_slot_count > 0 {
+            self.window_tab_leading_action_start_pixels()
+                + self.window_tab_leading_action_area_width_pixels()
+        } else {
+            0.0
+        };
+        if cfg!(target_os = "macos") && !self.window_state.contains(WindowState::FULL_SCREEN) {
+            return leading_action_padding.max(MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH as f32);
+        }
         if self
             .config
             .window_decorations
@@ -84,15 +145,15 @@ impl super::TermWindow {
                 == window::IntegratedTitleButtonStyle::MacOsNative
             {
                 if self.window_state.contains(WindowState::FULL_SCREEN) {
-                    cell_width * 0.5
+                    leading_action_padding + cell_width * 0.5
                 } else {
                     70.0
                 }
             } else {
-                0.0
+                leading_action_padding
             }
         } else {
-            cell_width * 0.5
+            leading_action_padding + cell_width * 0.5
         }
     }
 
@@ -506,12 +567,15 @@ impl super::TermWindow {
             | UIItemType::ProjectToggleSessions(_)
             | UIItemType::Project(_)
             | UIItemType::ProjectSession(_)
-            | UIItemType::ProjectSessionArchive(_)
+            | UIItemType::ProjectSessionPin(_)
+            | UIItemType::ProjectSessionDelete(_)
             | UIItemType::ProjectSessionNew(_)
+            | UIItemType::WorkspaceSidebarToggle
             | UIItemType::WorkspaceSidebarScrollTrack
             | UIItemType::WorkspaceSidebarScrollThumb
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
+            | UIItemType::WorkspaceSidebarSettings
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -528,12 +592,15 @@ impl super::TermWindow {
             | UIItemType::ProjectToggleSessions(_)
             | UIItemType::Project(_)
             | UIItemType::ProjectSession(_)
-            | UIItemType::ProjectSessionArchive(_)
+            | UIItemType::ProjectSessionPin(_)
+            | UIItemType::ProjectSessionDelete(_)
             | UIItemType::ProjectSessionNew(_)
+            | UIItemType::WorkspaceSidebarToggle
             | UIItemType::WorkspaceSidebarScrollTrack
             | UIItemType::WorkspaceSidebarScrollThumb
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
+            | UIItemType::WorkspaceSidebarSettings
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -1013,11 +1080,17 @@ impl super::TermWindow {
             UIItemType::ProjectSession(session_id) => {
                 self.mouse_event_project_session(session_id, event, context);
             }
-            UIItemType::ProjectSessionArchive(session_id) => {
-                self.mouse_event_project_session_archive(session_id, event, context);
+            UIItemType::ProjectSessionPin(session_id) => {
+                self.mouse_event_project_session_pin(session_id, event, context);
+            }
+            UIItemType::ProjectSessionDelete(session_id) => {
+                self.mouse_event_project_session_delete(session_id, event, context);
             }
             UIItemType::ProjectSessionNew(project_id) => {
                 self.mouse_event_project_session_new(project_id, event, context);
+            }
+            UIItemType::WorkspaceSidebarToggle => {
+                self.mouse_event_workspace_sidebar_toggle(event, context);
             }
             UIItemType::WorkspaceSidebarBackground => {
                 context.set_cursor(Some(MouseCursor::Arrow));
@@ -1030,6 +1103,9 @@ impl super::TermWindow {
             }
             UIItemType::WorkspaceSidebarResize => {
                 self.mouse_event_workspace_sidebar_resize(item, event, context);
+            }
+            UIItemType::WorkspaceSidebarSettings => {
+                self.mouse_event_workspace_sidebar_settings(event, context);
             }
         }
     }
@@ -1051,6 +1127,29 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::SizeLeftRight));
         if event.kind == WMEK::Press(MousePress::Left) {
             self.dragging.replace((item, event));
+        }
+    }
+
+    pub fn mouse_event_workspace_sidebar_toggle(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.toggle_workspace_sidebar();
+            self.reflow_workspace_sidebar(context);
+        }
+    }
+
+    pub fn mouse_event_workspace_sidebar_settings(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            crate::settings_window::show();
         }
     }
 
@@ -1111,14 +1210,16 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        if let WMEK::Press(MousePress::Left) = event.kind {
-            if let Some(session_id) =
-                crate::project_sessions::active_session_for_project(&project_id)
-            {
-                self.activate_project_session(session_id, context);
-            } else {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                crate::project_sessions::toggle_project_sessions_collapsed(&project_id);
                 context.invalidate();
             }
+            WMEK::Press(MousePress::Right) => {
+                context
+                    .show_context_menu(event.coords, self.project_context_menu_items(&project_id));
+            }
+            _ => {}
         }
         context.set_cursor(Some(MouseCursor::Arrow));
     }
@@ -1129,9 +1230,16 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        if let WMEK::Press(MousePress::Left) = event.kind {
-            crate::project_sessions::toggle_project_sessions_collapsed(&project_id);
-            context.invalidate();
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                crate::project_sessions::toggle_project_sessions_collapsed(&project_id);
+                context.invalidate();
+            }
+            WMEK::Press(MousePress::Right) => {
+                context
+                    .show_context_menu(event.coords, self.project_context_menu_items(&project_id));
+            }
+            _ => {}
         }
         context.set_cursor(Some(MouseCursor::Arrow));
     }
@@ -1157,25 +1265,99 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Arrow));
     }
 
-    pub fn mouse_event_project_session_archive(
+    pub fn mouse_event_project_session_pin(
         &mut self,
         session_id: String,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        if let WMEK::Press(MousePress::Left) = event.kind {
-            if crate::project_sessions::archive_session(&session_id) {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                crate::project_sessions::toggle_session_pinned(&session_id);
                 context.invalidate();
             }
+            WMEK::Press(MousePress::Right) => {
+                context.show_context_menu(
+                    event.coords,
+                    self.project_session_context_menu_items(&session_id),
+                );
+            }
+            _ => {}
         }
         context.set_cursor(Some(MouseCursor::Arrow));
     }
 
+    pub fn mouse_event_project_session_delete(
+        &mut self,
+        session_id: String,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                if let Some(deleted) = crate::project_sessions::delete_session(&session_id) {
+                    if deleted.was_active {
+                        if let Some(next_session_id) = deleted.next_session_id {
+                            self.activate_project_session(next_session_id, context);
+                        }
+                    } else if let Some(workspace) = deleted.materialized_workspace_name {
+                        let mux = Mux::get();
+                        for window_id in mux.iter_windows_in_workspace(&workspace) {
+                            mux.kill_window(window_id);
+                        }
+                    }
+                    context.invalidate();
+                }
+            }
+            WMEK::Press(MousePress::Right) => {
+                context.show_context_menu(
+                    event.coords,
+                    self.project_session_context_menu_items(&session_id),
+                );
+            }
+            _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn project_context_menu_items(&self, project_id: &str) -> Vec<ContextMenuItem> {
+        let project_id = project_id.to_string();
+        vec![
+            ContextMenuItem::item_with_icon(
+                "Rename Workspace...",
+                "pencil",
+                KeyAssignment::PromptRenameProject(project_id.clone()),
+            ),
+            ContextMenuItem::item_with_icon(
+                "New Session",
+                "plus.square",
+                KeyAssignment::CreateProjectSession(project_id.clone()),
+            ),
+            ContextMenuItem::item_with_icon(
+                "Collapse / Expand Sessions",
+                "chevron.right",
+                KeyAssignment::ToggleProjectSessionsCollapsed(project_id.clone()),
+            ),
+            ContextMenuItem::Separator,
+            ContextMenuItem::item_with_icon(
+                "Remove Workspace",
+                "folder.badge.minus",
+                KeyAssignment::RemoveProject(project_id),
+            ),
+        ]
+    }
+
     fn project_session_context_menu_items(&self, session_id: &str) -> Vec<ContextMenuItem> {
         let session_id = session_id.to_string();
+        let is_pinned = crate::project_sessions::session_is_pinned(&session_id);
         vec![
-            ContextMenuItem::item(
-                "Pin Session",
+            ContextMenuItem::item_with_icon(
+                if is_pinned {
+                    "Unpin Session"
+                } else {
+                    "Pin Session"
+                },
+                if is_pinned { "pin.slash" } else { "pin" },
                 KeyAssignment::ToggleProjectSessionPinned(session_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
@@ -1183,23 +1365,26 @@ impl super::TermWindow {
                 "pencil",
                 KeyAssignment::PromptRenameProjectSession(session_id.clone()),
             ),
-            ContextMenuItem::item(
+            ContextMenuItem::item_with_icon(
                 "Archive Session",
+                "archivebox",
                 KeyAssignment::ArchiveProjectSession(session_id.clone()),
             ),
-            ContextMenuItem::item(
+            ContextMenuItem::item_with_icon(
                 "Delete Session",
+                "trash",
                 KeyAssignment::DeleteProjectSession(session_id.clone()),
             ),
-            ContextMenuItem::item(
+            ContextMenuItem::item_with_icon(
                 "Mark as Unread",
+                "envelope.badge",
                 KeyAssignment::MarkProjectSessionUnread(session_id),
             ),
         ]
     }
 
     pub(crate) fn activate_project_session(&mut self, session_id: String, context: &dyn WindowOps) {
-        crate::project_sessions::snapshot_active_session_layout(self.mux_window_id);
+        self.snapshot_active_project_session_layout();
 
         let mux = Mux::get();
         let live_workspaces = mux.iter_workspaces();

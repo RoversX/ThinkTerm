@@ -1757,6 +1757,9 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
         screen_coords: client_to_screen(hwnd, coords),
         mouse_buttons,
         modifiers,
+        precise_scroll_delta: None,
+        scroll_phase: None,
+        momentum_phase: None,
     };
     inner
         .borrow_mut()
@@ -1807,6 +1810,9 @@ unsafe fn nc_mouse_button(
         screen_coords: client_to_screen(hwnd, coords),
         mouse_buttons,
         modifiers,
+        precise_scroll_delta: None,
+        scroll_phase: None,
+        momentum_phase: None,
     };
     inner
         .borrow_mut()
@@ -1840,6 +1846,9 @@ unsafe fn mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         screen_coords: client_to_screen(hwnd, coords),
         mouse_buttons,
         modifiers,
+        precise_scroll_delta: None,
+        scroll_phase: None,
+        momentum_phase: None,
     };
 
     inner.events.dispatch(WindowEvent::MouseEvent(event));
@@ -1876,6 +1885,9 @@ unsafe fn nc_mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
         screen_coords: client_to_screen(hwnd, coords),
         mouse_buttons,
         modifiers,
+        precise_scroll_delta: None,
+        scroll_phase: None,
+        momentum_phase: None,
     };
 
     inner.events.dispatch(WindowEvent::MouseEvent(event));
@@ -1968,6 +1980,9 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         screen_coords,
         mouse_buttons,
         modifiers,
+        precise_scroll_delta: None,
+        scroll_phase: None,
+        momentum_phase: None,
     };
     inner
         .borrow_mut()

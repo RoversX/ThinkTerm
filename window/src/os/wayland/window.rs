@@ -719,6 +719,9 @@ impl WaylandWindowInner {
                 ),
                 mouse_buttons: self.mouse_buttons,
                 modifiers: self.modifiers,
+                precise_scroll_delta: None,
+                scroll_phase: None,
+                momentum_phase: None,
             };
             self.events.dispatch(WindowEvent::MouseEvent(event));
             self.refresh_frame();
@@ -750,6 +753,9 @@ impl WaylandWindowInner {
                 ),
                 mouse_buttons: self.mouse_buttons,
                 modifiers: self.modifiers,
+                precise_scroll_delta: None,
+                scroll_phase: None,
+                momentum_phase: None,
             };
             self.events.dispatch(WindowEvent::MouseEvent(event));
         }
@@ -774,6 +780,9 @@ impl WaylandWindowInner {
                     ),
                     mouse_buttons: self.mouse_buttons,
                     modifiers: self.modifiers,
+                    precise_scroll_delta: None,
+                    scroll_phase: None,
+                    momentum_phase: None,
                 };
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }
@@ -794,6 +803,9 @@ impl WaylandWindowInner {
                     ),
                     mouse_buttons: self.mouse_buttons,
                     modifiers: self.modifiers,
+                    precise_scroll_delta: None,
+                    scroll_phase: None,
+                    momentum_phase: None,
                 };
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }

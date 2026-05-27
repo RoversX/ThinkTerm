@@ -65,6 +65,8 @@ pub struct SessionLayoutSnapshot {
 pub struct TerminalSpecEntry {
     pub pane_id: PaneId,
     pub spec: TerminalSpawnSpec,
+    #[serde(default)]
+    pub font_scale: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -76,6 +78,7 @@ pub struct TerminalSpawnSpec {
 
 #[derive(Debug, Clone)]
 pub struct ProjectSessionView {
+    pub pinned_sessions: Vec<SessionView>,
     pub projects: Vec<ProjectView>,
 }
 
@@ -111,6 +114,13 @@ pub struct DeletedSession {
     pub was_active: bool,
     pub next_session_id: Option<SessionId>,
     pub materialized_workspace_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedProject {
+    pub was_active: bool,
+    pub next_session_id: Option<SessionId>,
+    pub materialized_workspace_names: Vec<String>,
 }
 
 lazy_static::lazy_static! {
@@ -247,15 +257,6 @@ pub fn create_project_from_path(path: &str) -> Result<SessionId> {
     Ok(session_id)
 }
 
-pub fn active_session_for_project(project_id: &str) -> Option<SessionId> {
-    let mut store = SESSION_STORE.lock();
-    let session_id = store.active_session_for_project(project_id);
-    if session_id.is_some() {
-        persist_locked(&store);
-    }
-    session_id
-}
-
 pub fn activate_session_record(
     session_id: &str,
     live_workspaces: &[String],
@@ -266,8 +267,14 @@ pub fn activate_session_record(
     plan
 }
 
-pub fn snapshot_workspace_layout(workspace: &str, window_id: MuxWindowId) {
-    let Some(snapshot) = snapshot_window_layout(window_id) else {
+pub fn snapshot_workspace_layout_with_font_scales<F>(
+    workspace: &str,
+    window_id: MuxWindowId,
+    pane_font_scale: F,
+) where
+    F: Fn(PaneId) -> Option<f64>,
+{
+    let Some(snapshot) = snapshot_window_layout(window_id, &pane_font_scale) else {
         return;
     };
 
@@ -276,9 +283,14 @@ pub fn snapshot_workspace_layout(workspace: &str, window_id: MuxWindowId) {
     persist_locked(&store);
 }
 
-pub fn snapshot_active_session_layout(window_id: MuxWindowId) {
+pub fn snapshot_active_session_layout_with_font_scales<F>(
+    window_id: MuxWindowId,
+    pane_font_scale: F,
+) where
+    F: Fn(PaneId) -> Option<f64>,
+{
     let workspace = Mux::get().active_workspace();
-    snapshot_workspace_layout(&workspace, window_id);
+    snapshot_workspace_layout_with_font_scales(&workspace, window_id, pane_font_scale);
 }
 
 pub async fn materialize_session(
@@ -341,6 +353,51 @@ pub fn session_name(session_id: &str) -> Option<String> {
         .flat_map(|project| project.sessions.iter())
         .find(|session| session.id == session_id)
         .map(|session| session.name.clone())
+}
+
+pub fn session_is_pinned(session_id: &str) -> bool {
+    let store = SESSION_STORE.lock();
+    store
+        .projects
+        .iter()
+        .flat_map(|project| project.sessions.iter())
+        .find(|session| session.id == session_id)
+        .is_some_and(|session| session.is_pinned)
+}
+
+pub fn project_name(project_id: &str) -> Option<String> {
+    let store = SESSION_STORE.lock();
+    store
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| project.name.clone())
+}
+
+pub fn workspace_pane_font_scales(
+    workspace: &str,
+    window_id: MuxWindowId,
+) -> Option<HashMap<PaneId, Option<f64>>> {
+    let store = SESSION_STORE.lock();
+    store.workspace_pane_font_scales(workspace, window_id)
+}
+
+pub fn rename_project(project_id: &str, name: String) -> bool {
+    let mut store = SESSION_STORE.lock();
+    let changed = store.rename_project(project_id, name);
+    if changed {
+        persist_locked(&store);
+    }
+    changed
+}
+
+pub fn remove_project(project_id: &str) -> Option<RemovedProject> {
+    let mut store = SESSION_STORE.lock();
+    let removed = store.remove_project(project_id);
+    if removed.is_some() {
+        persist_locked(&store);
+    }
+    removed
 }
 
 pub fn rename_session(session_id: &str, name: String) -> bool {
@@ -454,6 +511,15 @@ impl SessionStore {
 
     fn view_for_project(&self, project_id: &str, live_workspaces: &[String]) -> ProjectSessionView {
         let active_project_id = self.active_project_id.as_deref().unwrap_or(project_id);
+        let pinned_sessions = self
+            .projects
+            .iter()
+            .flat_map(|project| {
+                session_views_for_project(project, Some(active_project_id), live_workspaces)
+                    .into_iter()
+                    .filter(|session| session.is_pinned)
+            })
+            .collect();
         let projects = self
             .projects
             .iter()
@@ -469,7 +535,10 @@ impl SessionStore {
                 ),
             })
             .collect();
-        ProjectSessionView { projects }
+        ProjectSessionView {
+            pinned_sessions,
+            projects,
+        }
     }
 
     fn sync_active_workspace(&mut self, project_id: &str, active_workspace: &str) -> bool {
@@ -526,10 +595,15 @@ impl SessionStore {
 
     fn create_project_from_path(&mut self, path: PathBuf) -> SessionId {
         let project_id = project_id_for_path(&path);
-        if self.projects.iter().any(|project| project.path == path) {
-            return self
-                .active_session_for_project(&project_id)
-                .expect("existing project should have an active session");
+        if let Some(existing_project_id) = self
+            .projects
+            .iter()
+            .find(|project| project.path == path)
+            .map(|project| project.id.clone())
+        {
+            if let Some(session_id) = self.active_session_for_project(&existing_project_id) {
+                return session_id;
+            }
         }
 
         let name = path
@@ -645,6 +719,39 @@ impl SessionStore {
         }
     }
 
+    fn workspace_pane_font_scales(
+        &self,
+        workspace: &str,
+        window_id: MuxWindowId,
+    ) -> Option<HashMap<PaneId, Option<f64>>> {
+        self.projects
+            .iter()
+            .flat_map(|project| project.sessions.iter())
+            .find(|session| session.materialized_workspace_name.as_deref() == Some(workspace))
+            .and_then(|session| session.layout.as_ref())
+            .and_then(|layout| pane_font_scales_for_window(layout, window_id))
+    }
+
+    fn rename_project(&mut self, project_id: &str, name: String) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+
+        let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        else {
+            return false;
+        };
+        if project.name == name {
+            return false;
+        }
+        project.name = name.to_string();
+        true
+    }
+
     fn rename_session(&mut self, session_id: &str, name: String) -> bool {
         let name = name.trim();
         if name.is_empty() {
@@ -754,6 +861,56 @@ impl SessionStore {
         None
     }
 
+    fn remove_project(&mut self, project_id: &str) -> Option<RemovedProject> {
+        if self.projects.len() <= 1 {
+            return None;
+        }
+
+        let index = self
+            .projects
+            .iter()
+            .position(|project| project.id == project_id)?;
+        let removed = self.projects.remove(index);
+        let was_active = self.active_project_id.as_deref() == Some(project_id);
+        let materialized_workspace_names = removed
+            .sessions
+            .iter()
+            .filter_map(|session| session.materialized_workspace_name.clone())
+            .collect::<Vec<_>>();
+
+        let next_session_id = if was_active {
+            let next_index = index.saturating_sub(1).min(self.projects.len() - 1);
+            let project = &mut self.projects[next_index];
+            self.active_project_id = Some(project.id.clone());
+            let session_id = project
+                .active_session_id
+                .clone()
+                .or_else(|| {
+                    project
+                        .sessions
+                        .iter()
+                        .find(|session| !session.archived)
+                        .map(|session| session.id.clone())
+                })
+                .unwrap_or_else(|| {
+                    let session = Session::new(project.id.clone(), "main".to_string(), None);
+                    let session_id = session.id.clone();
+                    project.sessions.push(session);
+                    session_id
+                });
+            project.active_session_id = Some(session_id.clone());
+            Some(session_id)
+        } else {
+            None
+        };
+
+        Some(RemovedProject {
+            was_active,
+            next_session_id,
+            materialized_workspace_names,
+        })
+    }
+
     fn toggle_project_sessions_collapsed(&mut self, project_id: &str) -> bool {
         let Some(project) = self
             .projects
@@ -783,13 +940,23 @@ impl Session {
     }
 }
 
+fn valid_font_scale(font_scale: Option<f64>) -> Option<f64> {
+    font_scale.filter(|scale| scale.is_finite() && *scale > 0.0)
+}
+
 fn persist_locked(store: &SessionStore) {
     if let Err(err) = save_session_store(store) {
         log::warn!("failed to save ThinkTerm session store: {err:#}");
     }
 }
 
-fn snapshot_window_layout(window_id: MuxWindowId) -> Option<SessionLayoutSnapshot> {
+fn snapshot_window_layout<F>(
+    window_id: MuxWindowId,
+    pane_font_scale: &F,
+) -> Option<SessionLayoutSnapshot>
+where
+    F: Fn(PaneId) -> Option<f64>,
+{
     let mux = Mux::get();
     let window = mux.get_window(window_id)?;
     let active_tab = window.get_active_idx();
@@ -798,7 +965,7 @@ fn snapshot_window_layout(window_id: MuxWindowId) -> Option<SessionLayoutSnapsho
         .iter()
         .filter_map(|tab| {
             let tree = tab.codec_pane_tree();
-            collect_terminal_specs(&mux, &tree, &mut terminal_specs);
+            collect_terminal_specs(&mux, &tree, &mut terminal_specs, pane_font_scale);
             serde_json::to_value(tree).ok()
         })
         .collect::<Vec<_>>();
@@ -807,6 +974,108 @@ fn snapshot_window_layout(window_id: MuxWindowId) -> Option<SessionLayoutSnapsho
         tabs,
         terminal_specs,
     })
+}
+
+fn pane_font_scales_for_window(
+    layout: &SessionLayoutSnapshot,
+    window_id: MuxWindowId,
+) -> Option<HashMap<PaneId, Option<f64>>> {
+    let mux = Mux::get();
+    let window = mux.get_window(window_id)?;
+    let spec_scales = layout
+        .terminal_specs
+        .iter()
+        .map(|entry| (entry.pane_id, valid_font_scale(entry.font_scale)))
+        .collect::<HashMap<_, _>>();
+    let mut font_scales = HashMap::new();
+    let mut decoded_tabs = 0usize;
+
+    for (stored_tab, live_tab) in layout.tabs.iter().zip(window.iter()) {
+        let Ok(stored_node) = serde_json::from_value::<PaneNode>(stored_tab.clone()) else {
+            continue;
+        };
+        decoded_tabs += 1;
+        let live_node = live_tab.codec_pane_tree();
+        collect_matching_font_scales(&stored_node, &live_node, &spec_scales, &mut font_scales);
+    }
+
+    if decoded_tabs == 0 && !layout.tabs.is_empty() {
+        return None;
+    }
+
+    for tab in window.iter() {
+        for pos in tab.iter_panes_ignoring_zoom() {
+            let pane_id = pos.pane.pane_id();
+            if let Some(font_scale) = spec_scales.get(&pane_id) {
+                font_scales.insert(pane_id, *font_scale);
+            }
+        }
+    }
+
+    Some(font_scales)
+}
+
+fn collect_matching_font_scales(
+    stored_node: &PaneNode,
+    live_node: &PaneNode,
+    spec_scales: &HashMap<PaneId, Option<f64>>,
+    font_scales: &mut HashMap<PaneId, Option<f64>>,
+) {
+    match (stored_node, live_node) {
+        (PaneNode::Leaf(stored), PaneNode::Leaf(live)) => {
+            font_scales.insert(
+                live.pane_id,
+                spec_scales.get(&stored.pane_id).copied().unwrap_or(None),
+            );
+        }
+        (PaneNode::Stack(stored), PaneNode::Stack(live)) => {
+            for (stored, live) in stored.panes.iter().zip(&live.panes) {
+                font_scales.insert(
+                    live.pane_id,
+                    spec_scales.get(&stored.pane_id).copied().unwrap_or(None),
+                );
+            }
+        }
+        (
+            PaneNode::Split {
+                left: stored_left,
+                right: stored_right,
+                ..
+            },
+            PaneNode::Split {
+                left: live_left,
+                right: live_right,
+                ..
+            },
+        ) => {
+            collect_matching_font_scales(stored_left, live_left, spec_scales, font_scales);
+            collect_matching_font_scales(stored_right, live_right, spec_scales, font_scales);
+        }
+        _ => {
+            let mut stored_panes = vec![];
+            let mut live_panes = vec![];
+            collect_pane_entries(stored_node, &mut stored_panes);
+            collect_pane_entries(live_node, &mut live_panes);
+            for (stored, live) in stored_panes.into_iter().zip(live_panes) {
+                font_scales.insert(
+                    live.pane_id,
+                    spec_scales.get(&stored.pane_id).copied().unwrap_or(None),
+                );
+            }
+        }
+    }
+}
+
+fn collect_pane_entries<'a>(node: &'a PaneNode, entries: &mut Vec<&'a PaneEntry>) {
+    match node {
+        PaneNode::Empty => {}
+        PaneNode::Leaf(entry) => entries.push(entry),
+        PaneNode::Stack(stack) => entries.extend(stack.panes.iter()),
+        PaneNode::Split { left, right, .. } => {
+            collect_pane_entries(left, entries);
+            collect_pane_entries(right, entries);
+        }
+    }
 }
 
 async fn materialize_layout(
@@ -984,27 +1253,37 @@ fn working_dir_from_entry(entry: &PaneEntry) -> Option<String> {
         .and_then(|path| path.to_str().map(|path| path.to_string()))
 }
 
-fn collect_terminal_specs(mux: &Mux, node: &PaneNode, terminal_specs: &mut Vec<TerminalSpecEntry>) {
+fn collect_terminal_specs<F>(
+    mux: &Mux,
+    node: &PaneNode,
+    terminal_specs: &mut Vec<TerminalSpecEntry>,
+    pane_font_scale: &F,
+) where
+    F: Fn(PaneId) -> Option<f64>,
+{
     match node {
         PaneNode::Empty => {}
-        PaneNode::Leaf(entry) => collect_terminal_spec(mux, entry, terminal_specs),
+        PaneNode::Leaf(entry) => collect_terminal_spec(mux, entry, terminal_specs, pane_font_scale),
         PaneNode::Stack(stack) => {
             for entry in &stack.panes {
-                collect_terminal_spec(mux, entry, terminal_specs);
+                collect_terminal_spec(mux, entry, terminal_specs, pane_font_scale);
             }
         }
         PaneNode::Split { left, right, .. } => {
-            collect_terminal_specs(mux, left, terminal_specs);
-            collect_terminal_specs(mux, right, terminal_specs);
+            collect_terminal_specs(mux, left, terminal_specs, pane_font_scale);
+            collect_terminal_specs(mux, right, terminal_specs, pane_font_scale);
         }
     }
 }
 
-fn collect_terminal_spec(
+fn collect_terminal_spec<F>(
     mux: &Mux,
     entry: &PaneEntry,
     terminal_specs: &mut Vec<TerminalSpecEntry>,
-) {
+    pane_font_scale: &F,
+) where
+    F: Fn(PaneId) -> Option<f64>,
+{
     let domain = mux
         .get_pane(entry.pane_id)
         .and_then(|pane| mux.get_domain(pane.domain_id()))
@@ -1016,6 +1295,7 @@ fn collect_terminal_spec(
             domain,
             title: entry.title.clone(),
         },
+        font_scale: valid_font_scale(pane_font_scale(entry.pane_id)),
     });
 }
 
@@ -1187,6 +1467,49 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_project_path_reuses_existing_session() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::default();
+
+        let first_session_id = store.create_project_from_path(dir.path().to_path_buf());
+        let second_session_id = store.create_project_from_path(dir.path().to_path_buf());
+
+        assert_eq!(second_session_id, first_session_id);
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].sessions.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_project_path_reuses_stored_project_id() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::default();
+
+        let project = Project {
+            id: "stored-project-id".to_string(),
+            name: "existing".to_string(),
+            path: dir.path().to_path_buf(),
+            sessions: vec![Session::new(
+                "stored-project-id".to_string(),
+                "main".to_string(),
+                None,
+            )],
+            active_session_id: None,
+            sessions_collapsed: false,
+        };
+        let session_id = project.sessions[0].id.clone();
+        store.projects.push(project);
+
+        let reused_session_id = store.create_project_from_path(dir.path().to_path_buf());
+
+        assert_eq!(reused_session_id, session_id);
+        assert_eq!(
+            store.active_project_id.as_deref(),
+            Some("stored-project-id")
+        );
+        assert_eq!(store.projects.len(), 1);
+    }
+
+    #[test]
     fn snapshot_layout_attaches_to_materialized_session() {
         let mut store = SessionStore::default();
         let mut session = Session::new(
@@ -1246,6 +1569,45 @@ mod tests {
         assert!(!view.projects[0].sessions[0].is_active);
         assert!(view.projects[1].is_active);
         assert!(view.projects[1].sessions[0].is_active);
+    }
+
+    #[test]
+    fn project_menu_metadata_actions_update_store() {
+        let mut store = SessionStore::default();
+        let first = Session::new("project-1".to_string(), "main".to_string(), None);
+        let second = Session::new("project-2".to_string(), "current".to_string(), None);
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        store.projects.push(Project {
+            id: "project-1".to_string(),
+            name: "thinkterm".to_string(),
+            path: PathBuf::from("/tmp/thinkterm"),
+            sessions: vec![first],
+            active_session_id: Some(first_id),
+            sessions_collapsed: false,
+        });
+        store.projects.push(Project {
+            id: "project-2".to_string(),
+            name: "agent_dock".to_string(),
+            path: PathBuf::from("/tmp/agent_dock"),
+            sessions: vec![second],
+            active_session_id: Some(second_id.clone()),
+            sessions_collapsed: false,
+        });
+        store.active_project_id = Some("project-2".to_string());
+
+        assert!(store.rename_project("project-2", "Agents".to_string()));
+        assert_eq!(store.projects[1].name, "Agents");
+
+        let removed = store.remove_project("project-2").unwrap();
+        assert!(removed.was_active);
+        assert_eq!(
+            removed.next_session_id,
+            Some(store.projects[0].sessions[0].id.clone())
+        );
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.active_project_id.as_deref(), Some("project-1"));
+        assert!(store.remove_project("project-1").is_none());
     }
 
     #[test]

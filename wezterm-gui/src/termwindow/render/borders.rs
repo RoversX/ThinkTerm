@@ -1,4 +1,5 @@
 use crate::quad::TripleLayerQuadAllocator;
+use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use ::window::ULength;
 use config::{ConfigHandle, DimensionContext};
@@ -17,60 +18,75 @@ impl crate::TermWindow {
         {
             let height = self.dimensions.pixel_height as f32;
             let width = self.dimensions.pixel_width as f32;
+            let chrome_border_color = self.config.use_fancy_tab_bar.then(|| {
+                UiPalette::for_appearance(crate::native_settings::effective_appearance()).sidebar_bg
+            });
 
             let border_top = border_dimensions.top.get() as f32;
             if border_top > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(0.0, 0.0, width, border_top),
+                let top_color = chrome_border_color.unwrap_or_else(|| {
                     self.config
                         .window_frame
                         .border_top_color
                         .map(|c| c.to_linear())
-                        .unwrap_or(border_dimensions.color),
+                        .unwrap_or(border_dimensions.color)
+                });
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(0.0, 0.0, width, border_top),
+                    top_color,
                 )?;
             }
 
             let border_left = border_dimensions.left.get() as f32;
             if border_left > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(0.0, 0.0, border_left, height),
+                let left_color = chrome_border_color.unwrap_or_else(|| {
                     self.config
                         .window_frame
                         .border_left_color
                         .map(|c| c.to_linear())
-                        .unwrap_or(border_dimensions.color),
+                        .unwrap_or(border_dimensions.color)
+                });
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(0.0, 0.0, border_left, height),
+                    left_color,
                 )?;
             }
 
             let border_bottom = border_dimensions.bottom.get() as f32;
             if border_bottom > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(0.0, height - border_bottom, width, height),
+                let bottom_color = chrome_border_color.unwrap_or_else(|| {
                     self.config
                         .window_frame
                         .border_bottom_color
                         .map(|c| c.to_linear())
-                        .unwrap_or(border_dimensions.color),
+                        .unwrap_or(border_dimensions.color)
+                });
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(0.0, height - border_bottom, width, height),
+                    bottom_color,
                 )?;
             }
 
             let border_right = border_dimensions.right.get() as f32;
             if border_right > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(width - border_right, 0.0, border_right, height),
+                let right_color = chrome_border_color.unwrap_or_else(|| {
                     self.config
                         .window_frame
                         .border_right_color
                         .map(|c| c.to_linear())
-                        .unwrap_or(border_dimensions.color),
+                        .unwrap_or(border_dimensions.color)
+                });
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(width - border_right, 0.0, border_right, height),
+                    right_color,
                 )?;
             }
         }

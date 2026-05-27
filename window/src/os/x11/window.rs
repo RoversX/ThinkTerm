@@ -474,6 +474,9 @@ impl XWindowInner {
             screen_coords: ScreenPoint::new(root_x.try_into().unwrap(), root_y.try_into().unwrap()),
             modifiers: xkeysyms::modifiers_from_state(state.bits()),
             mouse_buttons: MouseButtons::default(),
+            precise_scroll_delta: None,
+            scroll_phase: None,
+            momentum_phase: None,
         };
         self.do_mouse_event(event)
     }
@@ -731,6 +734,9 @@ impl XWindowInner {
                     ),
                     modifiers: xkeysyms::modifiers_from_state(motion.state().bits()),
                     mouse_buttons: MouseButtons::default(),
+                    precise_scroll_delta: None,
+                    scroll_phase: None,
+                    momentum_phase: None,
                 };
                 self.do_mouse_event(event)?;
             }

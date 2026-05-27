@@ -467,8 +467,13 @@ pub fn configuration_warnings_and_errors() -> Vec<String> {
     CONFIG.get_warnings_and_errors()
 }
 
+pub fn configuration_file() -> Option<PathBuf> {
+    CONFIG.config_file()
+}
+
 struct ConfigInner {
     config: Arc<Config>,
+    config_file: Option<PathBuf>,
     error: Option<String>,
     warnings: Vec<String>,
     generation: usize,
@@ -480,6 +485,7 @@ impl ConfigInner {
     fn new() -> Self {
         Self {
             config: Arc::new(Config::default_config()),
+            config_file: None,
             error: None,
             warnings: vec![],
             generation: 0,
@@ -588,6 +594,7 @@ impl ConfigInner {
         // Before we process the success/failure, extract and update
         // any paths that we should be watching
         let mut watch_paths = vec![];
+        let loaded_file_name = file_name.clone();
         if let Some(path) = file_name {
             // Let's also watch the parent directory for folks that do
             // things with symlinks:
@@ -609,6 +616,7 @@ impl ConfigInner {
         match config {
             Ok(config) => {
                 self.config = Arc::new(config);
+                self.config_file = loaded_file_name;
                 self.error.take();
                 self.generation += 1;
 
@@ -645,12 +653,14 @@ impl ConfigInner {
     /// configuration
     fn use_defaults(&mut self) {
         self.config = Arc::new(Config::default_config());
+        self.config_file = None;
         self.error.take();
         self.generation += 1;
     }
 
     fn use_this_config(&mut self, cfg: Config) {
         self.config = Arc::new(cfg);
+        self.config_file = None;
         self.error.take();
         self.generation += 1;
     }
@@ -753,6 +763,11 @@ impl Configuration {
     pub fn get_error(&self) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         inner.error.as_ref().cloned()
+    }
+
+    pub fn config_file(&self) -> Option<PathBuf> {
+        let inner = self.inner.lock().unwrap();
+        inner.config_file.clone()
     }
 
     pub fn get_warnings_and_errors(&self) -> Vec<String> {

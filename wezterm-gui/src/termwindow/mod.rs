@@ -210,12 +210,15 @@ pub enum UIItemType {
     ProjectToggleSessions(String),
     Project(String),
     ProjectSession(String),
-    ProjectSessionArchive(String),
+    ProjectSessionPin(String),
+    ProjectSessionDelete(String),
     ProjectSessionNew(String),
+    WorkspaceSidebarToggle,
     WorkspaceSidebarScrollTrack,
     WorkspaceSidebarScrollThumb,
     WorkspaceSidebarBackground,
     WorkspaceSidebarResize,
+    WorkspaceSidebarSettings,
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
@@ -242,6 +245,8 @@ pub(crate) enum TabWheelSurface {
 enum InlineTabRenameTarget {
     WindowTab(TabId),
     PaneTab(PaneId),
+    Project(String),
+    ProjectSession(String),
 }
 
 #[derive(Clone, Debug)]
@@ -1159,6 +1164,8 @@ impl TermWindow {
                 myself.webgpu.replace(Rc::clone(&webgpu));
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
+            myself.apply_native_terminal_settings();
+            myself.apply_workspace_session_font_scales();
             myself.load_os_parameters();
             window.show();
             myself.subscribe_to_pane_updates();
@@ -1629,6 +1636,7 @@ impl TermWindow {
 
                 self.clear_all_overlays();
                 self.current_highlight.take();
+                self.apply_workspace_session_font_scales();
                 self.invalidate_fancy_tab_bar();
                 self.invalidate_modal();
 
@@ -2144,6 +2152,7 @@ impl TermWindow {
             self.load_os_parameters();
             self.apply_scale_change(&dimensions, self.fonts.get_font_scale());
             self.apply_dimensions(&dimensions, None, &window);
+            self.apply_workspace_session_font_scales();
             window.config_did_change(&config);
             window.invalidate();
         }
@@ -2712,31 +2721,22 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    fn prompt_rename_project(&mut self, project_id: String) {
+        let initial_title = crate::project_sessions::project_name(&project_id).unwrap_or_default();
+        self.inline_tab_rename = Some(InlineTabRename::new(
+            InlineTabRenameTarget::Project(project_id),
+            initial_title,
+        ));
+        self.update_title_impl();
+    }
+
     fn prompt_rename_project_session(&mut self, session_id: String) {
-        let mux = Mux::get();
-        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
-            Some(tab) => tab,
-            None => return,
-        };
-
         let initial_title = crate::project_sessions::session_name(&session_id).unwrap_or_default();
-        let description = "Rename Session".to_string();
-        let prompt = "Name: ".to_string();
-
-        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
-            let line = crate::overlay::prompt::read_line_prompt_overlay(
-                term,
-                &description,
-                &prompt,
-                Some(&initial_title),
-            )?;
-            if let Some(line) = line {
-                crate::project_sessions::rename_session(&session_id, line);
-            }
-            Ok(())
-        });
-        self.assign_overlay(tab.tab_id(), overlay);
-        promise::spawn::spawn(future).detach();
+        self.inline_tab_rename = Some(InlineTabRename::new(
+            InlineTabRenameTarget::ProjectSession(session_id),
+            initial_title,
+        ));
+        self.update_title_impl();
     }
 
     pub(crate) fn prompt_create_project(&mut self, context: &dyn WindowOps) {
@@ -2771,6 +2771,12 @@ impl TermWindow {
                         self.pane_tab_title_overrides.insert(pane_id, title);
                     }
                 }
+                InlineTabRenameTarget::Project(project_id) => {
+                    crate::project_sessions::rename_project(&project_id, title);
+                }
+                InlineTabRenameTarget::ProjectSession(session_id) => {
+                    crate::project_sessions::rename_session(&session_id, title);
+                }
             }
         }
 
@@ -2789,7 +2795,9 @@ impl TermWindow {
             .as_ref()
             .and_then(|rename| match rename.target {
                 InlineTabRenameTarget::WindowTab(tab_id) => Some(tab_id),
-                InlineTabRenameTarget::PaneTab(_) => None,
+                InlineTabRenameTarget::PaneTab(_)
+                | InlineTabRenameTarget::Project(_)
+                | InlineTabRenameTarget::ProjectSession(_) => None,
             })
     }
 
@@ -2812,6 +2820,28 @@ impl TermWindow {
     pub fn is_renaming_pane_nav_tab(&self, pane_id: PaneId) -> bool {
         self.inline_tab_rename.as_ref().is_some_and(
             |rename| matches!(rename.target, InlineTabRenameTarget::PaneTab(id) if id == pane_id),
+        )
+    }
+
+    pub fn sidebar_project_title(&self, project_id: &str, name: &str) -> String {
+        self.inline_tab_rename
+            .as_ref()
+            .filter(|rename| matches!(&rename.target, InlineTabRenameTarget::Project(id) if id == project_id))
+            .map(|rename| rename.display_text())
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    pub fn sidebar_session_title(&self, session_id: &str, name: &str) -> String {
+        self.inline_tab_rename
+            .as_ref()
+            .filter(|rename| matches!(&rename.target, InlineTabRenameTarget::ProjectSession(id) if id == session_id))
+            .map(|rename| rename.display_text())
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    pub fn is_renaming_sidebar_session(&self, session_id: &str) -> bool {
+        self.inline_tab_rename.as_ref().is_some_and(
+            |rename| matches!(&rename.target, InlineTabRenameTarget::ProjectSession(id) if id == session_id),
         )
     }
 
@@ -3272,8 +3302,41 @@ impl TermWindow {
             ShowTabNavigator => self.show_tab_navigator(),
             PromptRenameTab => self.prompt_rename_current_tab(),
             PromptRenamePaneTab(pane_id) => self.prompt_rename_pane_tab(*pane_id),
+            PromptRenameProject(project_id) => self.prompt_rename_project(project_id.clone()),
             PromptRenameProjectSession(session_id) => {
                 self.prompt_rename_project_session(session_id.clone())
+            }
+            CreateProjectSession(project_id) => {
+                let session_id = crate::project_sessions::create_session(project_id, None);
+                if let Some(window) = window.as_ref() {
+                    self.activate_project_session(session_id, window);
+                }
+            }
+            ToggleProjectSessionsCollapsed(project_id) => {
+                crate::project_sessions::toggle_project_sessions_collapsed(project_id);
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            RemoveProject(project_id) => {
+                if let Some(removed) = crate::project_sessions::remove_project(project_id) {
+                    if removed.was_active {
+                        if let (Some(next_session_id), Some(window)) =
+                            (removed.next_session_id, window.as_ref())
+                        {
+                            self.activate_project_session(next_session_id, window);
+                        }
+                    }
+                    let mux = Mux::get();
+                    for workspace in removed.materialized_workspace_names {
+                        for window_id in mux.iter_windows_in_workspace(&workspace) {
+                            mux.kill_window(window_id);
+                        }
+                    }
+                    if let Some(window) = window.as_ref() {
+                        window.invalidate();
+                    }
+                }
             }
             ToggleProjectSessionPinned(session_id) => {
                 crate::project_sessions::toggle_session_pinned(session_id);

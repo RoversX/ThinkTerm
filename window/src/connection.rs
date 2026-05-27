@@ -68,6 +68,9 @@ pub trait ConnectionOps {
         Appearance::Light
     }
 
+    /// Override the application appearance. Passing `None` follows the system.
+    fn set_preferred_appearance(&self, _appearance: Option<Appearance>) {}
+
     /// Hide the application.
     /// This actions hides all of the windows of the application and switches
     /// focus away from it.

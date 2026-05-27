@@ -28,6 +28,7 @@ opt-level = 3
 # debug = 2
 
 [profile.dev]
+debug = 1
 # https://jakedeichert.com/blog/reducing-rust-incremental-compilation-times-on-macos-by-70-percent/
 # Disabled because it breaks builds on Windows
 #split-debuginfo = "unpacked"

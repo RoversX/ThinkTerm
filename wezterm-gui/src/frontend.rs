@@ -36,6 +36,7 @@ impl GuiFrontEnd {
     pub fn try_new() -> anyhow::Result<Rc<GuiFrontEnd>> {
         let connection = Connection::init()?;
         connection.set_event_handler(Self::app_event_handler);
+        crate::native_settings::apply_to_app(&crate::native_settings::load());
 
         let mux = Mux::get();
         let client_id = mux.active_identity().expect("to have set my own id");
@@ -471,6 +472,12 @@ impl GuiFrontEnd {
         self.known_windows.borrow_mut().remove(window);
         if !self.is_switching_workspace() {
             self.reconcile_workspace();
+        }
+    }
+
+    pub fn invalidate_all_windows(&self) {
+        for window in self.known_windows.borrow().keys() {
+            window.invalidate();
         }
     }
 

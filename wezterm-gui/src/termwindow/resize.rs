@@ -3,8 +3,10 @@ use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
+use mux::pane::PaneId;
 use mux::tab::PositionedPane;
 use mux::Mux;
+use std::collections::HashMap;
 use std::rc::Rc;
 use wezterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
@@ -22,6 +24,236 @@ pub enum ScaleChange {
 }
 
 impl super::TermWindow {
+    fn normalized_font_scale_value(&self, font_scale: Option<f64>) -> Option<f64> {
+        let global_scale = self.fonts.get_font_scale();
+        font_scale
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .filter(|scale| scale.to_bits() != global_scale.to_bits())
+    }
+
+    fn persisted_font_scale_for_pane(&self, pane_id: PaneId) -> Option<f64> {
+        let font_scale = self
+            .pane_state
+            .borrow()
+            .get(&pane_id)
+            .and_then(|state| state.font_scale);
+        self.normalized_font_scale_value(font_scale)
+    }
+
+    pub(crate) fn snapshot_active_project_session_layout(&self) {
+        crate::project_sessions::snapshot_active_session_layout_with_font_scales(
+            self.mux_window_id,
+            |pane_id| self.persisted_font_scale_for_pane(pane_id),
+        );
+    }
+
+    fn persist_workspace_pane_font_scales(&self) {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        crate::project_sessions::snapshot_workspace_layout_with_font_scales(
+            window.get_workspace(),
+            self.mux_window_id,
+            |pane_id| self.persisted_font_scale_for_pane(pane_id),
+        );
+    }
+
+    fn apply_font_scales_to_mux_window_panes(&mut self, font_scales: HashMap<PaneId, Option<f64>>) {
+        let mux = Mux::get();
+        let Some(mux_window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+
+        for tab in mux_window.iter() {
+            for pos in tab.iter_panes_ignoring_zoom() {
+                let pane_id = pos.pane.pane_id();
+                let font_scale = self.normalized_font_scale_value(
+                    font_scales.get(&pane_id).copied().unwrap_or(None),
+                );
+                let mut state = self.pane_state(pos.pane.pane_id());
+                if state.font_scale != font_scale {
+                    state.font_scale = font_scale;
+                }
+            }
+        }
+
+        self.sync_pane_font_sizes();
+        self.quad_generation += 1;
+        self.shape_generation += 1;
+        self.pane_font_cache.borrow_mut().clear();
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    pub(crate) fn apply_workspace_session_font_scales(&mut self) {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        let Some(font_scales) = crate::project_sessions::workspace_pane_font_scales(
+            window.get_workspace(),
+            self.mux_window_id,
+        ) else {
+            return;
+        };
+        self.apply_font_scales_to_mux_window_panes(font_scales);
+    }
+
+    pub(crate) fn apply_native_terminal_settings(&mut self) {
+        let settings = crate::native_settings::load();
+        let Some(font_size) = settings.terminal.font_size else {
+            return;
+        };
+        if !font_size.is_finite() || font_size <= 0.0 || self.config.font_size <= 0.0 {
+            return;
+        }
+        let font_scale = (font_size / self.config.font_size).clamp(0.25, 4.0);
+        if let Some(window) = self.window.as_ref().cloned() {
+            self.adjust_font_scale(font_scale, &window);
+        }
+    }
+
+    pub(crate) fn resize_layout_for_dimensions(
+        &self,
+        dimensions: &Dimensions,
+        scale_changed_cells: Option<RowsAndCols>,
+    ) -> (TerminalSize, Dimensions, ResizeIncrementCalculator) {
+        let config = &self.config;
+
+        let tab_bar_height = if self.show_tab_bar {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.
+        };
+
+        let border = self.get_os_border();
+
+        if let Some(cell_dims) = scale_changed_cells {
+            // Scaling preserves existing terminal dimensions, yielding a new
+            // overall set of window dimensions
+            let size = TerminalSize {
+                rows: cell_dims.rows,
+                cols: cell_dims.cols,
+                pixel_height: cell_dims.rows * self.render_metrics.cell_size.height as usize,
+                pixel_width: cell_dims.cols * self.render_metrics.cell_size.width as usize,
+                dpi: dimensions.dpi as u32,
+            };
+
+            let rows = size.rows;
+            let cols = size.cols;
+
+            let h_context = DimensionContext {
+                dpi: dimensions.dpi as f32,
+                pixel_max: size.pixel_width as f32,
+                pixel_cell: self.render_metrics.cell_size.width as f32,
+            };
+            let v_context = DimensionContext {
+                dpi: dimensions.dpi as f32,
+                pixel_max: size.pixel_height as f32,
+                pixel_cell: self.render_metrics.cell_size.height as f32,
+            };
+            let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize
+                + self.workspace_sidebar_width();
+            let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
+            let padding_bottom =
+                config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
+            let padding_right = effective_right_padding(&config, h_context);
+
+            let pixel_height = (rows * self.render_metrics.cell_size.height as usize)
+                + (padding_top + padding_bottom)
+                + (border.top + border.bottom).get() as usize
+                + tab_bar_height as usize;
+
+            let pixel_width = (cols * self.render_metrics.cell_size.width as usize)
+                + (padding_left + padding_right)
+                + (border.left + border.right).get() as usize;
+
+            let dims = Dimensions {
+                pixel_width: pixel_width as usize,
+                pixel_height: pixel_height as usize,
+                dpi: dimensions.dpi,
+            };
+
+            let ri_calc = ResizeIncrementCalculator {
+                x: self.render_metrics.cell_size.width as u16,
+                y: self.render_metrics.cell_size.height as u16,
+                padding_left: padding_left,
+                padding_top: padding_top,
+                padding_right: padding_right,
+                padding_bottom: padding_bottom,
+                border: border,
+                tab_bar_height: tab_bar_height as usize,
+            };
+
+            (size, dims, ri_calc)
+        } else {
+            // Resize of the window dimensions may result in changed terminal dimensions
+
+            let h_context = DimensionContext {
+                dpi: dimensions.dpi as f32,
+                pixel_max: self.terminal_size.pixel_width as f32,
+                pixel_cell: self.render_metrics.cell_size.width as f32,
+            };
+            let v_context = DimensionContext {
+                dpi: dimensions.dpi as f32,
+                pixel_max: self.terminal_size.pixel_height as f32,
+                pixel_cell: self.render_metrics.cell_size.height as f32,
+            };
+            let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize
+                + self.workspace_sidebar_width();
+            let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
+            let padding_bottom =
+                config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
+            let padding_right = effective_right_padding(&config, h_context);
+
+            let avail_width = dimensions.pixel_width.saturating_sub(
+                (padding_left + padding_right) as usize
+                    + (border.left + border.right).get() as usize,
+            );
+            let avail_height = dimensions
+                .pixel_height
+                .saturating_sub(
+                    (padding_top + padding_bottom) as usize
+                        + (border.top + border.bottom).get() as usize,
+                )
+                .saturating_sub(tab_bar_height as usize);
+
+            let rows = avail_height / self.render_metrics.cell_size.height as usize;
+            let cols = avail_width / self.render_metrics.cell_size.width as usize;
+
+            let size = TerminalSize {
+                rows,
+                cols,
+                // Take care to use the exact pixel dimensions of the cells, rather
+                // than the available space, so that apps that are sensitive to
+                // the pixels-per-cell have consistent values at a given font size.
+                // https://github.com/wezterm/wezterm/issues/535
+                pixel_height: rows * self.render_metrics.cell_size.height as usize,
+                pixel_width: cols * self.render_metrics.cell_size.width as usize,
+                dpi: dimensions.dpi as u32,
+            };
+
+            let ri_calc = ResizeIncrementCalculator {
+                x: self.render_metrics.cell_size.width as u16,
+                y: self.render_metrics.cell_size.height as u16,
+                padding_left: padding_left,
+                padding_top: padding_top,
+                padding_right: padding_right,
+                padding_bottom: padding_bottom,
+                border: border,
+                tab_bar_height: tab_bar_height as usize,
+            };
+
+            (size, *dimensions, ri_calc)
+        }
+    }
+
     pub(crate) fn terminal_size_for_positioned_pane(
         &self,
         pos: &PositionedPane,
@@ -224,146 +456,25 @@ impl super::TermWindow {
         // final size, which in that case should result in a NOP
         // change to the tab size.
 
-        let config = &self.config;
-
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
-        };
-
-        let border = self.get_os_border();
-
-        let (size, dims, ri_calc) = if let Some(cell_dims) = scale_changed_cells {
-            // Scaling preserves existing terminal dimensions, yielding a new
-            // overall set of window dimensions
-            let size = TerminalSize {
-                rows: cell_dims.rows,
-                cols: cell_dims.cols,
-                pixel_height: cell_dims.rows * self.render_metrics.cell_size.height as usize,
-                pixel_width: cell_dims.cols * self.render_metrics.cell_size.width as usize,
-                dpi: dimensions.dpi as u32,
-            };
-
-            let rows = size.rows;
-            let cols = size.cols;
-
-            let h_context = DimensionContext {
-                dpi: dimensions.dpi as f32,
-                pixel_max: size.pixel_width as f32,
-                pixel_cell: self.render_metrics.cell_size.width as f32,
-            };
-            let v_context = DimensionContext {
-                dpi: dimensions.dpi as f32,
-                pixel_max: size.pixel_height as f32,
-                pixel_cell: self.render_metrics.cell_size.height as f32,
-            };
-            let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize
-                + self.workspace_sidebar_width();
-            let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
-            let padding_bottom =
-                config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
-            let padding_right = effective_right_padding(&config, h_context);
-
-            let pixel_height = (rows * self.render_metrics.cell_size.height as usize)
-                + (padding_top + padding_bottom)
-                + (border.top + border.bottom).get() as usize
-                + tab_bar_height as usize;
-
-            let pixel_width = (cols * self.render_metrics.cell_size.width as usize)
-                + (padding_left + padding_right)
-                + (border.left + border.right).get() as usize;
-
-            let dims = Dimensions {
-                pixel_width: pixel_width as usize,
-                pixel_height: pixel_height as usize,
-                dpi: dimensions.dpi,
-            };
-
-            let ri_calc = ResizeIncrementCalculator {
-                x: self.render_metrics.cell_size.width as u16,
-                y: self.render_metrics.cell_size.height as u16,
-                padding_left: padding_left,
-                padding_top: padding_top,
-                padding_right: padding_right,
-                padding_bottom: padding_bottom,
-                border: border,
-                tab_bar_height: tab_bar_height as usize,
-            };
-
-            (size, dims, ri_calc)
-        } else {
-            // Resize of the window dimensions may result in changed terminal dimensions
-
-            let h_context = DimensionContext {
-                dpi: dimensions.dpi as f32,
-                pixel_max: self.terminal_size.pixel_width as f32,
-                pixel_cell: self.render_metrics.cell_size.width as f32,
-            };
-            let v_context = DimensionContext {
-                dpi: dimensions.dpi as f32,
-                pixel_max: self.terminal_size.pixel_height as f32,
-                pixel_cell: self.render_metrics.cell_size.height as f32,
-            };
-            let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize
-                + self.workspace_sidebar_width();
-            let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
-            let padding_bottom =
-                config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
-            let padding_right = effective_right_padding(&config, h_context);
-
-            let avail_width = dimensions.pixel_width.saturating_sub(
-                (padding_left + padding_right) as usize
-                    + (border.left + border.right).get() as usize,
-            );
-            let avail_height = dimensions
-                .pixel_height
-                .saturating_sub(
-                    (padding_top + padding_bottom) as usize
-                        + (border.top + border.bottom).get() as usize,
-                )
-                .saturating_sub(tab_bar_height as usize);
-
-            let rows = avail_height / self.render_metrics.cell_size.height as usize;
-            let cols = avail_width / self.render_metrics.cell_size.width as usize;
-
-            let size = TerminalSize {
-                rows,
-                cols,
-                // Take care to use the exact pixel dimensions of the cells, rather
-                // than the available space, so that apps that are sensitive to
-                // the pixels-per-cell have consistent values at a given font size.
-                // https://github.com/wezterm/wezterm/issues/535
-                pixel_height: rows * self.render_metrics.cell_size.height as usize,
-                pixel_width: cols * self.render_metrics.cell_size.width as usize,
-                dpi: dimensions.dpi as u32,
-            };
-
-            let ri_calc = ResizeIncrementCalculator {
-                x: self.render_metrics.cell_size.width as u16,
-                y: self.render_metrics.cell_size.height as u16,
-                padding_left: padding_left,
-                padding_top: padding_top,
-                padding_right: padding_right,
-                padding_bottom: padding_bottom,
-                border: border,
-                tab_bar_height: tab_bar_height as usize,
-            };
-
-            (size, *dimensions, ri_calc)
-        };
+        let (size, dims, ri_calc) =
+            self.resize_layout_for_dimensions(dimensions, scale_changed_cells);
 
         log::trace!("apply_dimensions computed size {:?}, dims {:?}", size, dims);
 
+        let terminal_size_changed = self.terminal_size != size;
         self.terminal_size = size;
-
-        let mux = Mux::get();
-        if let Some(window) = mux.get_window(self.mux_window_id) {
-            for tab in window.iter() {
-                tab.resize(size);
+        if terminal_size_changed {
+            let mux = Mux::get();
+            if let Some(window) = mux.get_window(self.mux_window_id) {
+                for tab in window.iter() {
+                    tab.resize(size);
+                }
             }
-        };
-        self.sync_pane_font_sizes();
+            self.sync_pane_font_sizes();
+        } else {
+            log::trace!("terminal size unchanged; skipping mux tab resize");
+        }
+
         self.resize_overlays();
         self.invalidate_fancy_tab_bar();
         self.update_title();
@@ -554,6 +665,7 @@ impl super::TermWindow {
                 Some(font_scale)
             };
         }
+        self.persist_workspace_pane_font_scales();
 
         self.sync_pane_font_sizes();
         self.quad_generation += 1;

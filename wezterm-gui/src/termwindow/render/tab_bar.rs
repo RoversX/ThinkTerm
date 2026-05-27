@@ -2,6 +2,7 @@ use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::theme_aligned_tab_bar_colors_from_palette;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
+use crate::termwindow::ui::tokens::WINDOW_TAB_TOP_SPACER;
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use mux::renderable::RenderableDimensions;
@@ -129,7 +130,7 @@ impl crate::TermWindow {
         render_metrics: &RenderMetrics,
     ) -> anyhow::Result<f32> {
         if config.use_fancy_tab_bar {
-            Ok(pane_nav_bar_height_for_metrics(*render_metrics) as f32)
+            Ok((pane_nav_bar_height_for_metrics(*render_metrics) + WINDOW_TAB_TOP_SPACER) as f32)
         } else {
             Ok(render_metrics.cell_size.height as f32)
         }

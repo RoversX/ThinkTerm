@@ -7,13 +7,28 @@ pub enum SvgIcon {
     Archive,
     ChevronDown,
     ChevronRight,
+    Cloud,
     ExternalLink,
+    Folder,
     FolderOpen,
     FolderPlus,
     Globe,
+    Info,
+    Keyboard,
+    Minus,
+    Palette,
+    PanelLeft,
+    PanelLeftClose,
+    PanelLeftOpen,
     PanelRightClose,
     PanelRightOpen,
+    Pin,
+    PinOff,
     Plus,
+    RotateCcw,
+    Search,
+    Settings,
+    SlidersHorizontal,
     SquareTerminal,
     SplitHorizontal,
     SplitVertical,
@@ -32,9 +47,11 @@ impl SvgIcon {
             Self::ChevronRight => {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-right.svg")
             }
+            Self::Cloud => include_bytes!("../../../../third_party/lucide/icons/cloud.svg"),
             Self::ExternalLink => {
                 include_bytes!("../../../../third_party/lucide/icons/external-link.svg")
             }
+            Self::Folder => include_bytes!("../../../../third_party/lucide/icons/folder.svg"),
             Self::FolderOpen => {
                 include_bytes!("../../../../third_party/lucide/icons/folder-open.svg")
             }
@@ -42,13 +59,36 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/folder-plus.svg")
             }
             Self::Globe => include_bytes!("../../../../third_party/lucide/icons/globe.svg"),
+            Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
+            Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),
+            Self::Minus => include_bytes!("../../../../third_party/lucide/icons/minus.svg"),
+            Self::Palette => include_bytes!("../../../../third_party/lucide/icons/palette.svg"),
+            Self::PanelLeft => {
+                include_bytes!("../../../../third_party/lucide/icons/panel-left.svg")
+            }
+            Self::PanelLeftClose => {
+                include_bytes!("../../../../third_party/lucide/icons/panel-left-close.svg")
+            }
+            Self::PanelLeftOpen => {
+                include_bytes!("../../../../third_party/lucide/icons/panel-left-open.svg")
+            }
             Self::PanelRightClose => {
                 include_bytes!("../../../../third_party/lucide/icons/panel-right-close.svg")
             }
             Self::PanelRightOpen => {
                 include_bytes!("../../../../third_party/lucide/icons/panel-right-open.svg")
             }
+            Self::Pin => include_bytes!("../../../../third_party/lucide/icons/pin.svg"),
+            Self::PinOff => include_bytes!("../../../../third_party/lucide/icons/pin-off.svg"),
             Self::Plus => include_bytes!("../../../../third_party/lucide/icons/plus.svg"),
+            Self::RotateCcw => {
+                include_bytes!("../../../../third_party/lucide/icons/rotate-ccw.svg")
+            }
+            Self::Search => include_bytes!("../../../../third_party/lucide/icons/search.svg"),
+            Self::Settings => include_bytes!("../../../../third_party/lucide/icons/settings.svg"),
+            Self::SlidersHorizontal => {
+                include_bytes!("../../../../third_party/lucide/icons/sliders-horizontal.svg")
+            }
             Self::SquareTerminal => {
                 include_bytes!("../../../../third_party/lucide/icons/square-terminal.svg")
             }
@@ -96,12 +136,27 @@ mod tests {
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,
             SvgIcon::ChevronRight,
+            SvgIcon::Cloud,
+            SvgIcon::Folder,
             SvgIcon::FolderOpen,
             SvgIcon::FolderPlus,
             SvgIcon::Globe,
+            SvgIcon::Info,
+            SvgIcon::Keyboard,
+            SvgIcon::Minus,
+            SvgIcon::Palette,
+            SvgIcon::PanelLeft,
+            SvgIcon::PanelLeftClose,
+            SvgIcon::PanelLeftOpen,
             SvgIcon::PanelRightClose,
             SvgIcon::PanelRightOpen,
+            SvgIcon::Pin,
+            SvgIcon::PinOff,
             SvgIcon::Plus,
+            SvgIcon::RotateCcw,
+            SvgIcon::Search,
+            SvgIcon::Settings,
+            SvgIcon::SlidersHorizontal,
             SvgIcon::SquareTerminal,
             SvgIcon::SplitHorizontal,
             SvgIcon::SplitVertical,

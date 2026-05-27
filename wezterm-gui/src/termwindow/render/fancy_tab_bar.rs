@@ -3,11 +3,15 @@ use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorT
 use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::tokens::{
-    active_capsule_bg, capsule_border, CAPSULE_BORDER_WIDTH, TAB_CLOSE_HOVER_INSET,
-    TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
-    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP, WINDOW_TAB_RADIUS,
+    CAPSULE_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
+    TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
+    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
+    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS,
+    WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType};
+use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -15,7 +19,6 @@ use std::rc::Rc;
 use termwiz::cell::grapheme_column_width;
 use wezterm_bidi::Direction;
 use wezterm_font::LoadedFont;
-use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::Line;
 use window::color::LinearRgba;
 use window::WindowOps;
@@ -33,26 +36,21 @@ impl crate::TermWindow {
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<Vec<UIItem>> {
-        let palette = self.palette().clone();
+        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
         if row_height == 0 {
             return Ok(vec![]);
         }
 
-        let font = self.fonts.title_font()?;
+        let font = self
+            .fonts
+            .title_font_with_size(crate::native_settings::tab_font_size())?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
-        let icon_size = fancy_tab_icon_size(&metrics, row_height as f32) as usize;
-        let button_size = row_height
-            .saturating_sub(TAB_VERTICAL_PADDING * 2)
-            .max(icon_size);
         let tab_width = self.window_tab_width_pixels().ceil() as usize;
 
-        let background = palette
-            .resolve_bg(ColorAttribute::Default)
-            .to_linear()
-            .mul_alpha(self.config.window_background_opacity);
-        let foreground = palette.foreground.to_linear();
-        let muted_fg = foreground.mul_alpha(0.66);
+        let background = chrome.sidebar_bg;
+        let foreground = chrome.text;
+        let muted_fg = chrome.secondary_text;
 
         let border = self.get_os_border();
         let row_x = self.tab_bar_left_edge();
@@ -63,6 +61,17 @@ impl crate::TermWindow {
         } else {
             border.top.get() as usize
         };
+        let content_top_spacer = if self.config.tab_bar_at_bottom {
+            0
+        } else {
+            WINDOW_TAB_TOP_SPACER.min(row_height)
+        };
+        let content_row_y = row_y + content_top_spacer;
+        let content_row_height = row_height.saturating_sub(content_top_spacer);
+        let icon_size = fancy_tab_icon_size(&metrics, content_row_height as f32) as usize;
+        let button_size = content_row_height
+            .saturating_sub(TAB_VERTICAL_PADDING * 2)
+            .max(icon_size);
         let row_width = self
             .dimensions
             .pixel_width
@@ -86,6 +95,7 @@ impl crate::TermWindow {
             background,
         )
         .context("fancy tab bar background")?;
+
         let mut ui_items = vec![UIItem {
             x: row_x,
             y: row_y,
@@ -93,6 +103,34 @@ impl crate::TermWindow {
             height: row_height,
             item_type: UIItemType::TabBar(TabBarItem::None),
         }];
+
+        self.paint_window_tab_leading_actions(
+            layers,
+            &mut ui_items,
+            row_x,
+            content_row_y,
+            content_row_height,
+            foreground,
+            muted_fg,
+        )?;
+
+        let show_pane_layer_divider = mux::Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .is_some_and(|tab| tab.iter_panes_ignoring_zoom().len() > 1);
+        if show_pane_layer_divider {
+            let divider_y = if self.config.tab_bar_at_bottom {
+                row_y
+            } else {
+                row_y + row_height
+            };
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(row_x as f32, divider_y as f32, row_width as f32, 1.0),
+                foreground.mul_alpha(0.14),
+            )
+            .context("fancy tab bar pane layer divider")?;
+        }
 
         if viewport_width == 0 || tab_width == 0 {
             return Ok(ui_items);
@@ -141,14 +179,14 @@ impl crate::TermWindow {
                 visible_width,
                 viewport_left,
                 viewport_right,
-                row_y,
-                row_height,
+                content_row_y,
+                content_row_height,
                 tab_width,
                 button_size,
                 icon_size,
                 &font,
                 metrics,
-                &palette,
+                chrome,
                 background,
                 if active { foreground } else { muted_fg },
             )?;
@@ -158,8 +196,8 @@ impl crate::TermWindow {
             layers,
             &mut ui_items,
             row_right,
-            row_y,
-            row_height,
+            content_row_y,
+            content_row_height,
             button_size,
             icon_size,
             foreground,
@@ -167,6 +205,121 @@ impl crate::TermWindow {
         )?;
 
         Ok(ui_items)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_window_tab_leading_actions(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        row_x: usize,
+        row_y: usize,
+        row_height: usize,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let action_slot_count = self.window_tab_leading_action_slot_count();
+        if action_slot_count == 0 {
+            return Ok(());
+        }
+
+        let mut button_x = row_x + self.window_tab_leading_action_start_pixels().ceil() as usize;
+        for action_idx in 0..action_slot_count {
+            let is_sidebar_toggle =
+                action_idx == 0 && self.window_tab_shows_sidebar_toggle_action();
+            let action_button_size = if is_sidebar_toggle {
+                WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
+            } else {
+                WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
+            };
+            let action_icon_size = if is_sidebar_toggle {
+                WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE
+            } else {
+                WINDOW_TAB_LEADING_ACTION_ICON_SIZE
+            };
+            let button_size = action_button_size.min(row_height.saturating_sub(4)).max(1);
+            let icon_size = action_icon_size.min(button_size.saturating_sub(2));
+
+            if is_sidebar_toggle {
+                let button_y = if self.config.tab_bar_at_bottom {
+                    row_y + (row_height.saturating_sub(button_size) / 2)
+                } else {
+                    row_y.saturating_sub(WINDOW_TAB_TOP_SPACER) + SIDEBAR_INSET
+                };
+                self.paint_window_sidebar_toggle_button(
+                    layers,
+                    ui_items,
+                    button_x,
+                    button_y,
+                    button_size,
+                    icon_size,
+                    foreground,
+                    muted_fg,
+                )?;
+            }
+            button_x += action_button_size + WINDOW_TAB_LEADING_ACTION_GAP;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_window_sidebar_toggle_button(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        button_x: usize,
+        button_y: usize,
+        button_size: usize,
+        icon_size: usize,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
+        if hovered {
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    button_x as f32,
+                    button_y as f32,
+                    button_size as f32,
+                    button_size as f32,
+                ),
+                foreground.mul_alpha(
+                    if self.is_pointer_pressing_ui_rect(
+                        button_x,
+                        button_y,
+                        button_size,
+                        button_size,
+                    ) {
+                        0.20
+                    } else {
+                        0.12
+                    },
+                ),
+                6.0,
+            )
+            .context("window sidebar toggle hover")?;
+        }
+
+        ui_items.push(UIItem {
+            x: button_x,
+            y: button_y,
+            width: button_size,
+            height: button_size,
+            item_type: UIItemType::WorkspaceSidebarToggle,
+        });
+
+        let icon_size = icon_size.min(button_size.saturating_sub(2)).max(1);
+        self.paint_fancy_tab_icon(
+            layers,
+            self.workspace_sidebar_toggle_icon(),
+            button_x + (button_size.saturating_sub(icon_size) / 2),
+            button_y + (button_size.saturating_sub(icon_size) / 2),
+            icon_size,
+            if hovered { foreground } else { muted_fg },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -190,7 +343,7 @@ impl crate::TermWindow {
         icon_size: usize,
         font: &Rc<LoadedFont>,
         metrics: RenderMetrics,
-        palette: &ColorPalette,
+        chrome: UiPalette,
         background: LinearRgba,
         foreground: LinearRgba,
     ) -> anyhow::Result<()> {
@@ -205,13 +358,12 @@ impl crate::TermWindow {
         let hover_x = visible_left.max(0.0) as usize;
         let hover_width = visible_width.max(0.0) as usize;
         let is_hovered = self.is_pointer_over_ui_rect(hover_x, row_y, hover_width, row_height);
-        let surface_foreground = palette.foreground.to_linear();
         let tab_surface_color = if active {
-            active_capsule_bg(background.3)
+            chrome.control_bg
         } else if is_hovered && !is_renaming {
-            surface_foreground.mul_alpha(0.055)
+            chrome.control_hover_bg
         } else {
-            surface_foreground.mul_alpha(0.025)
+            background
         };
         let tab_surface_y = row_y + (row_height.saturating_sub(button_size) / 2);
         self.fill_rounded_rectangle_with_border(
@@ -225,7 +377,7 @@ impl crate::TermWindow {
             ),
             tab_surface_color,
             if active {
-                capsule_border(surface_foreground, true)
+                chrome.control_border
             } else {
                 LinearRgba::TRANSPARENT
             },
@@ -336,10 +488,10 @@ impl crate::TermWindow {
                         text_width.saturating_add(6) as f32,
                         metrics.cell_size.height as f32,
                     ),
-                    palette.selection_bg.to_linear(),
+                    chrome.selected_bg,
                 )
                 .context("window tab rename selection")?;
-                palette.selection_fg.to_linear()
+                chrome.selected_text
             } else {
                 foreground
             };

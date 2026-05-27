@@ -1819,7 +1819,7 @@ fn default_anim_fps() -> u8 {
 }
 
 fn default_max_fps() -> u64 {
-    60
+    120
 }
 
 fn default_tiling_desktop_environments() -> Vec<String> {

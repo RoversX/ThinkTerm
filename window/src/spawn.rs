@@ -4,6 +4,7 @@ use crate::os::windows::event::EventHandle;
 use core_foundation::runloop::*;
 use promise::spawn::{Runnable, SpawnFunc};
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -95,6 +96,18 @@ impl SpawnQueue {
         !self.spawned_funcs.lock().unwrap().is_empty()
             || !self.spawned_funcs_low_pri.lock().unwrap().is_empty()
     }
+
+    fn run_func(func: SpawnFunc) {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(func)) {
+            if let Some(message) = payload.downcast_ref::<&str>() {
+                log::error!("spawn queue callback panicked: {message}");
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                log::error!("spawn queue callback panicked: {message}");
+            } else {
+                log::error!("spawn queue callback panicked");
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -118,7 +131,7 @@ impl SpawnQueue {
     fn run_impl(&self) -> bool {
         self.event_handle.reset_event();
         while let Some(func) = self.pop_func() {
-            func();
+            Self::run_func(func);
         }
         self.has_any_queued()
     }
@@ -166,7 +179,7 @@ impl SpawnQueue {
         // we can return to the main loop and process messages
         // from the X server
         if let Some(func) = self.pop_func() {
-            func();
+            Self::run_func(func);
         }
 
         // try to drain the pipe.
@@ -237,7 +250,7 @@ impl SpawnQueue {
 
     fn run_impl(&self) -> bool {
         if let Some(func) = self.pop_func() {
-            func();
+            Self::run_func(func);
         }
         self.has_any_queued()
     }

@@ -11,8 +11,9 @@ use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
     Clipboard, Connection, ContextMenuItem, DeadKeyStatus, Dimensions, Handled, Image, KeyCode,
     KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point,
-    RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint,
-    Size, ULength, WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
+    PreciseScrollDelta, RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement,
+    ResolvedGeometry, ScreenPoint, ScrollPhase, Size, ULength, WindowDecorations, WindowEvent,
+    WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -20,9 +21,9 @@ use block2::RcBlock;
 use cocoa::appkit::{
     self, CGFloat, NSApplication, NSApplicationActivateIgnoringOtherApps,
     NSApplicationPresentationOptions, NSBackingStoreBuffered, NSEvent, NSEventModifierFlags,
-    NSImage, NSImageNameApplicationIcon, NSOpenGLContext, NSOpenGLPixelFormat, NSPasteboard,
-    NSRunningApplication, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable, NSWindow,
-    NSWindowStyleMask,
+    NSEventPhase, NSImage, NSImageNameApplicationIcon, NSOpenGLContext, NSOpenGLPixelFormat,
+    NSPasteboard, NSRunningApplication, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable,
+    NSWindow, NSWindowStyleMask,
 };
 use cocoa::base::*;
 use cocoa::foundation::{
@@ -53,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::{is_ascii_control, IntegratedTitleButtonStyle, KeyboardLedStatus};
@@ -63,10 +64,95 @@ const NSViewLayerContentsPlacementTopLeft: NSInteger = 11;
 #[allow(non_upper_case_globals)]
 const NSViewLayerContentsRedrawDuringViewResize: NSInteger = 2;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FALLBACK_X: f64 = 96.0;
-const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FULLSCREEN_X: f64 = 22.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_GAP: f64 = 8.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE: f64 = 30.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG: NSInteger = 0x7474_7362;
+
+static THINKTERM_PERF_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn thinkterm_perf_enabled() -> bool {
+    *THINKTERM_PERF_ENABLED.get_or_init(|| {
+        std::env::var_os("THINKTERM_PERF")
+            .map(|value| value != "0" && !value.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn macos_current_screen_max_fps() -> Option<usize> {
+    unsafe {
+        let screen = NSScreen::mainScreen(nil);
+        if screen.is_null() {
+            return None;
+        }
+        let has_max_fps: BOOL = msg_send!(screen, respondsToSelector: sel!(maximumFramesPerSecond));
+        if has_max_fps == YES {
+            let max_fps: NSInteger = msg_send!(screen, maximumFramesPerSecond);
+            Some(max_fps.max(1) as usize)
+        } else {
+            None
+        }
+    }
+}
+
+fn target_frame_fps(configured_max_fps: u64) -> f64 {
+    let configured = configured_max_fps.max(1) as f64;
+    let screen = macos_current_screen_max_fps().unwrap_or(60).max(1) as f64;
+    configured.min(screen).max(1.0)
+}
+
+fn ns_event_phase_to_scroll_phase(phase: NSEventPhase) -> Option<ScrollPhase> {
+    if phase.contains(NSEventPhase::NSEventPhaseBegan) {
+        Some(ScrollPhase::Began)
+    } else if phase.contains(NSEventPhase::NSEventPhaseStationary) {
+        Some(ScrollPhase::Stationary)
+    } else if phase.contains(NSEventPhase::NSEventPhaseChanged) {
+        Some(ScrollPhase::Changed)
+    } else if phase.contains(NSEventPhase::NSEventPhaseEnded) {
+        Some(ScrollPhase::Ended)
+    } else if phase.contains(NSEventPhase::NSEventPhaseCancelled) {
+        Some(ScrollPhase::Cancelled)
+    } else if phase.contains(NSEventPhase::NSEventPhaseMayBegin) {
+        Some(ScrollPhase::MayBegin)
+    } else {
+        None
+    }
+}
+
+unsafe fn set_view_background_color(view: id, color: RgbaColor) {
+    if view.is_null() {
+        return;
+    }
+
+    let layer: id = msg_send![view, layer];
+    if !layer.is_null() {
+        let srgb_cgcolor = objc2_core_graphics::CGColor::new_srgb(
+            color.0.into(),
+            color.1.into(),
+            color.2.into(),
+            color.3.into(),
+        );
+        let _: () = msg_send![layer, setBackgroundColor: srgb_cgcolor];
+    }
+}
+
+unsafe fn set_standard_window_buttons_visible(window: &StrongPtr, visible: bool) {
+    let hidden = if visible { NO } else { YES };
+    let alpha = if visible { 1.0 } else { 0.0 };
+    let enabled = if visible { YES } else { NO };
+
+    for titlebar_button in &[
+        appkit::NSWindowButton::NSWindowMiniaturizeButton,
+        appkit::NSWindowButton::NSWindowCloseButton,
+        appkit::NSWindowButton::NSWindowZoomButton,
+    ] {
+        let button = window.standardWindowButton_(*titlebar_button);
+        if !button.is_null() {
+            let _: () = msg_send![button, setHidden: hidden];
+            let _: () = msg_send![button, setAlphaValue: alpha];
+            let _: () = msg_send![button, setEnabled: enabled];
+        }
+    }
+}
 
 pub fn set_application_icon_from_file(path: &Path) -> anyhow::Result<()> {
     let path_string = path.to_string_lossy();
@@ -514,6 +600,7 @@ impl Window {
                 view_id: None,
                 window_id,
                 window: None,
+                titlebar_sidebar_button_visible: false,
                 screen_changed: false,
                 paint_throttled: false,
                 invalidated: true,
@@ -523,6 +610,7 @@ impl Window {
                 hscroll_remainder: 0.,
                 vscroll_remainder: 0.,
                 last_wheel: Instant::now(),
+                last_repaint_time: None,
                 key_is_down: None,
                 dead_pending: None,
                 fullscreen: None,
@@ -1109,11 +1197,17 @@ impl WindowInner {
 
     fn set_titlebar_sidebar_button_visible(&mut self, visible: bool) {
         self.titlebar_sidebar_button_visible = visible;
+        if let Some(window_view) = WindowView::get_this(unsafe { &**self.view }) {
+            window_view
+                .inner
+                .borrow_mut()
+                .titlebar_sidebar_button_visible = visible;
+        }
         self.update_titlebar_sidebar_button();
     }
 
     fn update_titlebar_sidebar_button(&mut self) {
-        if self.titlebar_sidebar_button_visible {
+        if self.titlebar_sidebar_button_visible && !self.is_fullscreen() {
             install_thinkterm_titlebar_sidebar_button(&self.window, *self.view);
         } else {
             remove_thinkterm_titlebar_sidebar_button(&self.window);
@@ -1238,39 +1332,14 @@ impl WindowInner {
     }
 
     fn update_titlebar_background(&self) {
-        if !self
-            .config
-            .window_decorations
-            .contains(WindowDecorations::MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR)
-        {
-            return;
-        }
-
-        // Set the titlebar background to the theme color falling back to black if there is no
-        // specified color scheme
-        let color = self
-            .config
-            .resolved_palette
-            .background
-            .unwrap_or(RgbaColor::from(SrgbaTuple(0., 0., 0., 255.)));
-
         unsafe {
             if let Some(titlebar_view_container) = get_titlebar_view_container(&self.window) {
-                let layer: id = msg_send![*titlebar_view_container.load(), layer];
-
-                if layer.is_null() {
-                    return;
-                }
-
-                // We need to make sure to convert the config color into an sRGB CGColor or the color will be slightly off
-                let srgb_cgcolor = objc2_core_graphics::CGColor::new_srgb(
-                    color.0.into(),
-                    color.1.into(),
-                    color.2.into(),
-                    color.3.into(),
+                let titlebar_view_container_id = titlebar_view_container.load();
+                set_view_background_color(
+                    *titlebar_view_container_id,
+                    RgbaColor::from(SrgbaTuple(0.0, 0.0, 0.0, 0.0)),
                 );
-
-                let _: () = msg_send![layer, setBackgroundColor: srgb_cgcolor];
+                set_standard_window_buttons_visible(&self.window, true);
             } else {
                 log::trace!("failed to get titlebar view container from window");
             }
@@ -1310,7 +1379,8 @@ impl WindowInner {
             self.update_titlebar_background();
             self.update_titlebar_sidebar_button();
 
-            self.window.makeKeyAndOrderFront_(nil)
+            self.window.makeKeyAndOrderFront_(nil);
+            self.update_titlebar_background();
         }
     }
 
@@ -1549,36 +1619,14 @@ fn apply_decorations_to_window(
     integrated_title_button_style: IntegratedTitleButtonStyle,
 ) {
     let mask = decoration_to_mask(decorations, integrated_title_button_style);
-    let decorations = effective_decorations(decorations, integrated_title_button_style);
     unsafe {
         window.setStyleMask_(mask);
 
-        let hidden = if decorations.contains(WindowDecorations::TITLE)
-            || decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
-        {
-            NO
-        } else {
-            YES
-        };
-
-        for titlebar_button in &[
-            appkit::NSWindowButton::NSWindowMiniaturizeButton,
-            appkit::NSWindowButton::NSWindowCloseButton,
-            appkit::NSWindowButton::NSWindowZoomButton,
-        ] {
-            let button = window.standardWindowButton_(*titlebar_button);
-            let _: () = msg_send![button, setHidden: hidden];
-        }
+        set_standard_window_buttons_visible(window, true);
 
         window.setTitleVisibility_(appkit::NSWindowTitleVisibility::NSWindowTitleHidden);
 
-        if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
-            || decorations.contains(WindowDecorations::MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR)
-        {
-            window.setTitlebarAppearsTransparent_(YES);
-        } else {
-            window.setTitlebarAppearsTransparent_(hidden);
-        }
+        window.setTitlebarAppearsTransparent_(YES);
     }
 }
 
@@ -1645,8 +1693,6 @@ fn position_thinkterm_titlebar_sidebar_button(
     unsafe {
         let titlebar_frame = NSView::frame(titlebar_view_container_id);
         let zoom_button = window.standardWindowButton_(appkit::NSWindowButton::NSWindowZoomButton);
-        let is_fullscreen =
-            NSWindow::styleMask(**window).contains(NSWindowStyleMask::NSFullScreenWindowMask);
         let zoom_button_hidden = if zoom_button.is_null() {
             false
         } else {
@@ -1654,15 +1700,11 @@ fn position_thinkterm_titlebar_sidebar_button(
             hidden == YES
         };
         let x = if zoom_button.is_null() {
-            if is_fullscreen {
-                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FULLSCREEN_X
-            } else {
-                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FALLBACK_X
-            }
+            THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FALLBACK_X
         } else {
             let zoom_frame = NSView::frame(zoom_button);
             if zoom_button_hidden && zoom_frame.size.width <= 0.0 {
-                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FULLSCREEN_X
+                THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FALLBACK_X
             } else {
                 zoom_frame.origin.x + zoom_frame.size.width + THINKTERM_TITLEBAR_SIDEBAR_BUTTON_GAP
             }
@@ -1678,22 +1720,6 @@ fn position_thinkterm_titlebar_sidebar_button(
         );
         let () = msg_send![button, setFrame: frame];
     }
-}
-
-fn reposition_thinkterm_titlebar_sidebar_button_if_present(window: &StrongPtr) {
-    let Some(titlebar_view_container) = get_titlebar_view_container(window) else {
-        return;
-    };
-    let titlebar_view_container = titlebar_view_container.load();
-    if titlebar_view_container.is_null() {
-        return;
-    }
-
-    let Some(button) = thinkterm_titlebar_sidebar_button(&titlebar_view_container) else {
-        return;
-    };
-
-    position_thinkterm_titlebar_sidebar_button(window, *titlebar_view_container, button);
 }
 
 fn remove_thinkterm_titlebar_sidebar_button(window: &StrongPtr) {
@@ -1756,10 +1782,12 @@ fn decoration_to_mask(
             | NSWindowStyleMask::NSClosableWindowMask
             | NSWindowStyleMask::NSMiniaturizableWindowMask
             | NSWindowStyleMask::NSResizableWindowMask
+            | NSWindowStyleMask::NSFullSizeContentViewWindowMask
     } else if decorations
         == WindowDecorations::MACOS_FORCE_SQUARE_CORNERS | WindowDecorations::RESIZE
     {
-        NSWindowStyleMask::NSClosableWindowMask
+        NSWindowStyleMask::NSTitledWindowMask
+            | NSWindowStyleMask::NSClosableWindowMask
             | NSWindowStyleMask::NSMiniaturizableWindowMask
             | NSWindowStyleMask::NSResizableWindowMask
             | NSWindowStyleMask::NSFullSizeContentViewWindowMask
@@ -1782,7 +1810,8 @@ fn decoration_to_mask(
             | NSWindowStyleMask::NSClosableWindowMask
             | NSWindowStyleMask::NSMiniaturizableWindowMask
     } else if decorations == WindowDecorations::MACOS_FORCE_SQUARE_CORNERS {
-        NSWindowStyleMask::NSClosableWindowMask
+        NSWindowStyleMask::NSTitledWindowMask
+            | NSWindowStyleMask::NSClosableWindowMask
             | NSWindowStyleMask::NSMiniaturizableWindowMask
             | NSWindowStyleMask::NSFullSizeContentViewWindowMask
     } else {
@@ -1871,6 +1900,7 @@ struct Inner {
     events: WindowEventSender,
     view_id: Option<WeakPtr>,
     window: Option<WeakPtr>,
+    titlebar_sidebar_button_visible: bool,
     screen_changed: bool,
     paint_throttled: bool,
     window_id: usize,
@@ -1881,6 +1911,7 @@ struct Inner {
     hscroll_remainder: f64,
     vscroll_remainder: f64,
     last_wheel: Instant,
+    last_repaint_time: Option<Instant>,
     /// We use this to avoid double-emitting events when
     /// procesing key-up events.
     key_is_down: Option<bool>,
@@ -2485,11 +2516,19 @@ impl WindowView {
 
     extern "C" fn view_did_change_effective_appearance(this: &mut Object, _sel: Sel) {
         if let Some(this) = Self::get_this(this) {
-            let appearance = Connection::get().unwrap().get_appearance();
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::AppearanceChanged(appearance));
+            let Some(connection) = Connection::get() else {
+                return;
+            };
+            let appearance = connection.get_appearance();
+            if let Ok(mut inner) = this.inner.try_borrow_mut() {
+                inner
+                    .events
+                    .dispatch(WindowEvent::AppearanceChanged(appearance));
+            } else {
+                log::trace!(
+                    "deferring appearance change because the macOS window is dispatching another event"
+                );
+            }
         }
     }
 
@@ -2660,7 +2699,14 @@ impl WindowView {
         }
     }
 
-    fn mouse_common(this: &mut Object, nsevent: id, kind: MouseEventKind) {
+    fn mouse_common(
+        this: &mut Object,
+        nsevent: id,
+        kind: MouseEventKind,
+        precise_scroll_delta: Option<PreciseScrollDelta>,
+        scroll_phase: Option<ScrollPhase>,
+        momentum_phase: Option<ScrollPhase>,
+    ) {
         let view = this as id;
         let coords;
         let mouse_buttons;
@@ -2686,6 +2732,9 @@ impl WindowView {
             screen_coords: cartesian_to_screen_point(screen_coords),
             mouse_buttons,
             modifiers,
+            precise_scroll_delta,
+            scroll_phase,
+            momentum_phase,
         };
 
         if let Some(myself) = Self::get_this(this) {
@@ -2695,14 +2744,35 @@ impl WindowView {
     }
 
     extern "C" fn mouse_up(this: &mut Object, _sel: Sel, nsevent: id) {
-        Self::mouse_common(this, nsevent, MouseEventKind::Release(MousePress::Left));
+        Self::mouse_common(
+            this,
+            nsevent,
+            MouseEventKind::Release(MousePress::Left),
+            None,
+            None,
+            None,
+        );
     }
 
     extern "C" fn mouse_down(this: &mut Object, _sel: Sel, nsevent: id) {
-        Self::mouse_common(this, nsevent, MouseEventKind::Press(MousePress::Left));
+        Self::mouse_common(
+            this,
+            nsevent,
+            MouseEventKind::Press(MousePress::Left),
+            None,
+            None,
+            None,
+        );
     }
     extern "C" fn right_mouse_up(this: &mut Object, _sel: Sel, nsevent: id) {
-        Self::mouse_common(this, nsevent, MouseEventKind::Release(MousePress::Right));
+        Self::mouse_common(
+            this,
+            nsevent,
+            MouseEventKind::Release(MousePress::Right),
+            None,
+            None,
+            None,
+        );
     }
 
     extern "C" fn other_mouse_up(this: &mut Object, _sel: Sel, nsevent: id) {
@@ -2712,13 +2782,34 @@ impl WindowView {
             // Button 2 is the middle mouse button (scroll wheel)
             // but is the dedicated middle mouse button on 4 button mouses
             if button_number == 2 {
-                Self::mouse_common(this, nsevent, MouseEventKind::Release(MousePress::Middle));
+                Self::mouse_common(
+                    this,
+                    nsevent,
+                    MouseEventKind::Release(MousePress::Middle),
+                    None,
+                    None,
+                    None,
+                );
             }
         }
     }
 
     extern "C" fn scroll_wheel(this: &mut Object, _sel: Sel, nsevent: id) {
         let precise = unsafe { nsevent.hasPreciseScrollingDeltas() } == YES;
+        let raw_vert_delta = unsafe { nsevent.scrollingDeltaY() };
+        let raw_horz_delta = unsafe { nsevent.scrollingDeltaX() };
+        let scroll_phase = unsafe { ns_event_phase_to_scroll_phase(nsevent.phase()) };
+        let momentum_phase = unsafe { ns_event_phase_to_scroll_phase(nsevent.momentumPhase()) };
+        let precise_scroll_delta = if precise
+            && (raw_vert_delta.abs() > f64::EPSILON || raw_horz_delta.abs() > f64::EPSILON)
+        {
+            Some(PreciseScrollDelta {
+                x: raw_horz_delta as f32,
+                y: raw_vert_delta as f32,
+            })
+        } else {
+            None
+        };
         let scale = if precise {
             // Devices with precise deltas report number of pixels scrolled.
             // At this layer we don't know how many pixels comprise a cell
@@ -2732,8 +2823,8 @@ impl WindowView {
             // so we want to report those lines here wholesale.
             1.0
         };
-        let mut vert_delta = unsafe { nsevent.scrollingDeltaY() } / scale;
-        let mut horz_delta = unsafe { nsevent.scrollingDeltaX() } / scale;
+        let mut vert_delta = raw_vert_delta / scale;
+        let mut horz_delta = raw_horz_delta / scale;
 
         if let Some(myself) = Self::get_this(this) {
             let mut inner = myself.inner.borrow_mut();
@@ -2780,16 +2871,36 @@ impl WindowView {
             return;
         }
 
-        let kind = if vert_delta.abs() > horz_delta.abs() {
+        let vertical_is_dominant = vert_delta.abs() > horz_delta.abs();
+        let kind = if vertical_is_dominant {
             MouseEventKind::VertWheel(round_away_from_zero(vert_delta))
         } else {
             MouseEventKind::HorzWheel(round_away_from_zero(horz_delta))
         };
-        Self::mouse_common(this, nsevent, kind);
+        if thinkterm_perf_enabled() {
+            log::info!(
+                "thinkterm_perf scroll precise={precise} raw=({raw_horz_delta:.2},{raw_vert_delta:.2}) phase={scroll_phase:?} momentum={momentum_phase:?}"
+            );
+        }
+        Self::mouse_common(
+            this,
+            nsevent,
+            kind,
+            precise_scroll_delta,
+            scroll_phase,
+            momentum_phase,
+        );
     }
 
     extern "C" fn right_mouse_down(this: &mut Object, _sel: Sel, nsevent: id) {
-        Self::mouse_common(this, nsevent, MouseEventKind::Press(MousePress::Right));
+        Self::mouse_common(
+            this,
+            nsevent,
+            MouseEventKind::Press(MousePress::Right),
+            None,
+            None,
+            None,
+        );
     }
 
     extern "C" fn other_mouse_down(this: &mut Object, _sel: Sel, nsevent: id) {
@@ -2798,13 +2909,20 @@ impl WindowView {
             let button_number = NSEvent::buttonNumber(nsevent);
             // See `other_mouse_up`
             if button_number == 2 {
-                Self::mouse_common(this, nsevent, MouseEventKind::Press(MousePress::Middle));
+                Self::mouse_common(
+                    this,
+                    nsevent,
+                    MouseEventKind::Press(MousePress::Middle),
+                    None,
+                    None,
+                    None,
+                );
             }
         }
     }
 
     extern "C" fn mouse_moved_or_dragged(this: &mut Object, _sel: Sel, nsevent: id) {
-        Self::mouse_common(this, nsevent, MouseEventKind::Move);
+        Self::mouse_common(this, nsevent, MouseEventKind::Move, None, None, None);
     }
 
     extern "C" fn mouse_exited(this: &mut Object, _sel: Sel, _nsevent: id) {
@@ -3317,7 +3435,15 @@ impl WindowView {
                 _ => WindowState::default(),
             };
             if let Some(window) = inner.window.as_ref() {
-                reposition_thinkterm_titlebar_sidebar_button_if_present(&window.load());
+                let window = window.load();
+                if let (true, Some(view)) = (
+                    inner.titlebar_sidebar_button_visible && !is_full_screen,
+                    inner.view_id.as_ref().map(|view| view.load()),
+                ) {
+                    install_thinkterm_titlebar_sidebar_button(&window, *view);
+                } else {
+                    remove_thinkterm_titlebar_sidebar_button(&window);
+                }
             }
 
             let dpi = inner
@@ -3417,15 +3543,26 @@ impl WindowView {
             if inner.paint_throttled {
                 inner.invalidated = true;
             } else {
+                let now = Instant::now();
+                if let Some(last) = inner.last_repaint_time.replace(now) {
+                    if thinkterm_perf_enabled() {
+                        log::info!(
+                            "thinkterm_perf macos_frame_interval_ms={:.2}",
+                            now.saturating_duration_since(last).as_secs_f64() * 1000.0
+                        );
+                    }
+                }
                 inner.events.dispatch(WindowEvent::NeedRepaint);
                 inner.invalidated = false;
                 inner.paint_throttled = true;
 
                 let window_id = inner.window_id;
-                let max_fps = inner.config.max_fps;
+                let max_fps = target_frame_fps(inner.config.max_fps);
+                if thinkterm_perf_enabled() {
+                    log::info!("thinkterm_perf macos_target_fps={max_fps:.0}");
+                }
                 promise::spawn::spawn(async move {
-                    async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64))
-                        .await;
+                    async_io::Timer::after(std::time::Duration::from_secs_f64(1.0 / max_fps)).await;
                     Connection::with_window_inner(window_id, move |inner| {
                         if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
                             if let Ok(mut state) = window_view.inner.try_borrow_mut() {
@@ -3558,7 +3695,6 @@ impl WindowView {
                 sel!(thinktermToggleWorkspaceSidebar:),
                 Self::thinkterm_toggle_workspace_sidebar as extern "C" fn(&mut Object, Sel, id),
             );
-
             cls.add_method(
                 sel!(windowWillClose:),
                 Self::window_will_close as extern "C" fn(&mut Object, Sel, id),

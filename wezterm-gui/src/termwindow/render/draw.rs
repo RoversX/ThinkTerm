@@ -1,5 +1,6 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::webgpu::ShaderUniform;
+use crate::renderstate::RenderState;
+use crate::termwindow::webgpu::{ShaderUniform, WebGpuState, WebGpuTexture};
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
 use ::window::glium;
@@ -7,7 +8,138 @@ use ::window::glium::uniforms::{
     MagnifySamplerFilter, MinifySamplerFilter, Sampler, SamplerWrapFunction,
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
+use ::window::Dimensions;
 use config::FreeTypeLoadTarget;
+
+pub(crate) fn draw_webgpu_layers(
+    webgpu: &WebGpuState,
+    render_state: &RenderState,
+    dimensions: Dimensions,
+    foreground_text_hsb: [f32; 3],
+    milliseconds: u32,
+    clear_color: wgpu::Color,
+) -> anyhow::Result<()> {
+    let acquire_start = crate::perf::now();
+    let output = webgpu.surface.get_current_texture()?;
+    crate::perf::log_duration("webgpu_surface_acquire", acquire_start);
+    let view = output
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = webgpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Render Encoder"),
+        });
+    let tex = render_state.glyph_cache.borrow().atlas.texture();
+    let tex = tex.downcast_ref::<WebGpuTexture>().unwrap();
+    let texture_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let texture_linear_bind_group = webgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &webgpu.texture_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&webgpu.texture_linear_sampler),
+            },
+        ],
+        label: Some("linear bind group"),
+    });
+
+    let texture_nearest_bind_group = webgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &webgpu.texture_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&webgpu.texture_nearest_sampler),
+            },
+        ],
+        label: Some("nearest bind group"),
+    });
+
+    let projection = euclid::Transform3D::<f32, f32, f32>::ortho(
+        -(dimensions.pixel_width as f32) / 2.0,
+        dimensions.pixel_width as f32 / 2.0,
+        dimensions.pixel_height as f32 / 2.0,
+        -(dimensions.pixel_height as f32) / 2.0,
+        -1.0,
+        1.0,
+    )
+    .to_arrays_transposed();
+
+    let mut cleared = false;
+    let mut draw_calls = 0usize;
+    let mut vertices_total = 0usize;
+    let draw_start = crate::perf::now();
+    for layer in render_state.layers.borrow().iter() {
+        for idx in 0..3 {
+            let vb = &layer.vb.borrow()[idx];
+            let (vertex_count, index_count) = vb.vertex_index_count();
+            let vertex_buffer;
+            let uniforms;
+            if vertex_count > 0 {
+                let mut vertices = vb.current_vb_mut();
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if cleared {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(clear_color)
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                cleared = true;
+
+                uniforms = webgpu.create_uniform(ShaderUniform {
+                    foreground_text_hsb,
+                    milliseconds,
+                    projection,
+                });
+
+                render_pass.set_pipeline(&webgpu.render_pipeline);
+                render_pass.set_bind_group(0, &uniforms, &[]);
+                render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
+                render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
+                vertex_buffer = vertices.webgpu_mut().recreate();
+                vertex_buffer.unmap();
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(vb.indices.webgpu().slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..index_count as _, 0, 0..1);
+                draw_calls += 1;
+                vertices_total += vertex_count;
+            }
+
+            vb.next_index();
+        }
+    }
+
+    crate::perf::log_duration("webgpu_encode", draw_start);
+    crate::perf::log_counter("webgpu_draw_calls", draw_calls);
+    crate::perf::log_counter("webgpu_vertices", vertices_total);
+    let submit_start = crate::perf::now();
+    webgpu.queue.submit(std::iter::once(encoder.finish()));
+    output.present();
+    crate::perf::log_duration("webgpu_submit_present", submit_start);
+
+    Ok(())
+}
 
 impl crate::TermWindow {
     pub fn call_draw(&mut self, frame: &mut RenderFrame) -> anyhow::Result<()> {
@@ -18,57 +150,8 @@ impl crate::TermWindow {
     }
 
     fn call_draw_webgpu(&mut self) -> anyhow::Result<()> {
-        use crate::termwindow::webgpu::WebGpuTexture;
-
         let webgpu = self.webgpu.as_mut().unwrap();
         let render_state = self.render_state.as_ref().unwrap();
-
-        let output = webgpu.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = webgpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-        let tex = render_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex.downcast_ref::<WebGpuTexture>().unwrap();
-        let texture_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let texture_linear_bind_group =
-            webgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &webgpu.texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&webgpu.texture_linear_sampler),
-                    },
-                ],
-                label: Some("linear bind group"),
-            });
-
-        let texture_nearest_bind_group =
-            webgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &webgpu.texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&webgpu.texture_nearest_sampler),
-                    },
-                ],
-                label: Some("nearest bind group"),
-            });
-
-        let mut cleared = false;
         let foreground_text_hsb = self.config.foreground_text_hsb;
         let foreground_text_hsb = [
             foreground_text_hsb.hue,
@@ -77,76 +160,19 @@ impl crate::TermWindow {
         ];
 
         let milliseconds = self.created.elapsed().as_millis() as u32;
-        let projection = euclid::Transform3D::<f32, f32, f32>::ortho(
-            -(self.dimensions.pixel_width as f32) / 2.0,
-            self.dimensions.pixel_width as f32 / 2.0,
-            self.dimensions.pixel_height as f32 / 2.0,
-            -(self.dimensions.pixel_height as f32) / 2.0,
-            -1.0,
-            1.0,
+        draw_webgpu_layers(
+            webgpu,
+            render_state,
+            self.dimensions,
+            foreground_text_hsb,
+            milliseconds,
+            wgpu::Color {
+                r: 0.,
+                g: 0.,
+                b: 0.,
+                a: 0.,
+            },
         )
-        .to_arrays_transposed();
-
-        for layer in render_state.layers.borrow().iter() {
-            for idx in 0..3 {
-                let vb = &layer.vb.borrow()[idx];
-                let (vertex_count, index_count) = vb.vertex_index_count();
-                let vertex_buffer;
-                let uniforms;
-                if vertex_count > 0 {
-                    let mut vertices = vb.current_vb_mut();
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Render Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: if cleared {
-                                    wgpu::LoadOp::Load
-                                } else {
-                                    wgpu::LoadOp::Clear(wgpu::Color {
-                                        r: 0.,
-                                        g: 0.,
-                                        b: 0.,
-                                        a: 0.,
-                                    })
-                                },
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        occlusion_query_set: None,
-                        timestamp_writes: None,
-                    });
-                    cleared = true;
-
-                    uniforms = webgpu.create_uniform(ShaderUniform {
-                        foreground_text_hsb,
-                        milliseconds,
-                        projection,
-                    });
-
-                    render_pass.set_pipeline(&webgpu.render_pipeline);
-                    render_pass.set_bind_group(0, &uniforms, &[]);
-                    render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
-                    render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
-                    vertex_buffer = vertices.webgpu_mut().recreate();
-                    vertex_buffer.unmap();
-                    render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                    render_pass
-                        .set_index_buffer(vb.indices.webgpu().slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..index_count as _, 0, 0..1);
-                }
-
-                vb.next_index();
-            }
-        }
-
-        // submit will accept anything that implements IntoIter
-        webgpu.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
     }
 
     fn call_draw_glium(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {

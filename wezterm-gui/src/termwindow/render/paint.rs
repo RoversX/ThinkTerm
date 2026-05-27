@@ -1,4 +1,5 @@
 use crate::termwindow::{RenderFrame, TermWindowNotif};
+use crate::ui::UiPalette;
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::WindowOps;
 use anyhow::Context;
@@ -261,15 +262,28 @@ impl crate::TermWindow {
 
         if paint_terminal_background {
             // Regular window background color
-            let background = if panes.len() == 1 {
+            let background = if matches!(
+                crate::native_settings::effective_appearance(),
+                window::Appearance::Dark | window::Appearance::DarkHighContrast
+            ) {
+                UiPalette::for_appearance(crate::native_settings::effective_appearance())
+                    .sidebar_bg
+                    .mul_alpha(self.config.window_background_opacity)
+            } else if panes.len() == 1 {
                 // If we're the only pane, use the pane's palette
                 // to draw the padding background
-                panes[0].pane.palette().background
+                panes[0]
+                    .pane
+                    .palette()
+                    .background
+                    .to_linear()
+                    .mul_alpha(self.config.window_background_opacity)
             } else {
-                self.palette().background
-            }
-            .to_linear()
-            .mul_alpha(self.config.window_background_opacity);
+                self.palette()
+                    .background
+                    .to_linear()
+                    .mul_alpha(self.config.window_background_opacity)
+            };
 
             self.filled_rectangle(
                 &mut layers,
@@ -283,6 +297,19 @@ impl crate::TermWindow {
                 background,
             )
             .context("filled_rectangle for window background")?;
+        }
+
+        let border = self.get_os_border();
+        let header_height = border.top.get() as f32;
+        if header_height > 0.0 {
+            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            self.filled_rectangle(
+                &mut layers,
+                0,
+                euclid::rect(0.0, 0.0, self.dimensions.pixel_width as f32, header_height),
+                chrome.sidebar_bg,
+            )
+            .context("filled_rectangle for chrome header background")?;
         }
 
         for pos in panes {

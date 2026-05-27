@@ -10,11 +10,12 @@ use crate::termwindow::render::{
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::termwindow::ui::tokens::{
-    active_capsule_bg, capsule_border, CAPSULE_BORDER_WIDTH, PANE_NAV_BUTTON_GAP,
-    PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS,
-    TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_VERTICAL_PADDING,
+    CAPSULE_BORDER_WIDTH, PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP,
+    PANE_NAV_TAB_RADIUS, PANE_NAV_TAB_TOP_OFFSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
+    TAB_CLOSE_RIGHT_GAP, TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, UIItem, UIItemType};
+use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::TextureRect;
 use ::window::DeadKeyStatus;
@@ -70,7 +71,7 @@ impl crate::TermWindow {
         &mut self,
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
-        palette: &ColorPalette,
+        _palette: &ColorPalette,
     ) -> anyhow::Result<usize> {
         let nav_height = self.pane_nav_bar_height(pos);
         if nav_height == 0 {
@@ -90,13 +91,19 @@ impl crate::TermWindow {
         };
         let pane_width = (content_pane_right - pane_x).max(1.0);
 
-        let background = palette
-            .resolve_bg(ColorAttribute::Default)
-            .to_linear()
-            .mul_alpha(self.config.window_background_opacity);
-        let foreground = palette.foreground.to_linear();
-        let muted_fg = foreground.mul_alpha(0.66);
+        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let background = chrome.sidebar_bg;
+        let foreground = chrome.text;
+        let muted_fg = chrome.secondary_text;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
+
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(pane_x, pane_y, pane_width, nav_height as f32),
+            background,
+        )
+        .context("pane nav background")?;
 
         self.ui_items.push(UIItem {
             x: pane_x.max(0.0) as usize,
@@ -114,7 +121,9 @@ impl crate::TermWindow {
         let button_size = nav_height
             .saturating_sub(TAB_VERTICAL_PADDING * 2)
             .max(icon_size);
-        let button_y = pane_y as usize + (nav_height.saturating_sub(button_size) / 2);
+        let button_y = pane_y as usize
+            + (nav_height.saturating_sub(button_size) / 2 + PANE_NAV_TAB_TOP_OFFSET)
+                .min(nav_height.saturating_sub(button_size));
         let mut button_x = (pane_x + pane_width) as usize;
         for (icon, action) in [
             (SvgIcon::SplitVertical, PaneNavAction::SplitDown),
@@ -187,14 +196,14 @@ impl crate::TermWindow {
             let is_hovered = !suppress_hover
                 && self.is_pointer_over_ui_rect(hover_x, tab_y, hover_width, tab_height);
             let tab_surface_color = if selected_tab {
-                active_capsule_bg(background.3)
+                chrome.control_bg
             } else if is_hovered && !is_renaming_tab {
-                foreground.mul_alpha(0.055)
+                chrome.control_hover_bg
             } else {
                 foreground.mul_alpha(0.025)
             };
             let tab_border_color = if selected_tab {
-                capsule_border(foreground, true)
+                chrome.control_border
             } else {
                 LinearRgba::TRANSPARENT
             };
@@ -293,7 +302,10 @@ impl crate::TermWindow {
                 }
             }
 
-            let ui_font = self.fonts.title_font().context("pane nav title font")?;
+            let ui_font = self
+                .fonts
+                .title_font_with_size(crate::native_settings::pane_header_font_size())
+                .context("pane nav title font")?;
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
             let text_x = title_icon_x + icon_size + PANE_NAV_ICON_GAP;
             let text_right = if close_slot_reserved {
@@ -318,11 +330,11 @@ impl crate::TermWindow {
                             text_width.saturating_add(6) as f32,
                             ui_metrics.cell_size.height as f32,
                         ),
-                        palette.selection_bg.to_linear(),
+                        chrome.selected_bg,
                         4.0,
                     )
                     .context("pane nav rename selection")?;
-                    palette.selection_fg.to_linear()
+                    chrome.selected_text
                 } else {
                     this_tab_fg
                 };
@@ -529,9 +541,15 @@ impl crate::TermWindow {
         let window_is_transparent =
             !self.window_background.is_empty() || config.window_background_opacity != 1.0;
 
-        let default_bg = palette
-            .resolve_bg(ColorAttribute::Default)
-            .to_linear()
+        let dark_chrome_background = matches!(
+            crate::native_settings::effective_appearance(),
+            window::Appearance::Dark | window::Appearance::DarkHighContrast
+        )
+        .then(|| {
+            UiPalette::for_appearance(crate::native_settings::effective_appearance()).sidebar_bg
+        });
+        let default_bg = dark_chrome_background
+            .unwrap_or_else(|| palette.resolve_bg(ColorAttribute::Default).to_linear())
             .mul_alpha(if window_is_transparent {
                 0.
             } else {
@@ -592,9 +610,8 @@ impl crate::TermWindow {
                     layers,
                     0,
                     background_rect,
-                    palette
-                        .background
-                        .to_linear()
+                    dark_chrome_background
+                        .unwrap_or_else(|| palette.background.to_linear())
                         .mul_alpha(config.window_background_opacity),
                 )
                 .context("filled_rectangle")?;

@@ -1,40 +1,35 @@
-# Wez's Terminal
+# ThinkTerm
 
-<img height="128" alt="WezTerm Icon" src="https://raw.githubusercontent.com/wezterm/wezterm/main/assets/icon/wezterm-icon.svg" align="left"> *A GPU-accelerated cross-platform terminal emulator and multiplexer written by <a href="https://github.com/wez">@wez</a> and implemented in <a href="https://www.rust-lang.org/">Rust</a>*
+ThinkTerm is a macOS-focused terminal app based on WezTerm, with workspace and session management built into the main window. It is built for heavy AI workflows while maintaining high performance and low RAM usage.
 
-User facing docs and guide at: https://wezterm.org/
+## Build
 
-![Screenshot](docs/screenshots/two.png)
+```bash
+make build BUILD_OPTS=--release
+TAG_NAME=v0.1.0 bash ci/deploy.sh
+```
 
-*Screenshot of wezterm on macOS, running vim*
+This creates:
 
-## Installation
+```text
+ThinkTerm-macos-v0.1.0/ThinkTerm.app
+ThinkTerm-macos-v0.1.0.zip
+```
 
-https://wezterm.org/installation
+Upload the `.zip` file to GitHub Releases. The `.app` bundle is inside the zip.
 
-## Getting help
+## macOS Security Note
 
-This is a spare time project, so please bear with me.  There are a couple of channels for support:
+If macOS blocks the app, run this in Terminal:
 
-* You can use the [GitHub issue tracker](https://github.com/wezterm/wezterm/issues) to see if someone else has a similar issue, or to file a new one.
-* Start or join a thread in our [GitHub Discussions](https://github.com/wezterm/wezterm/discussions); if you have general
-  questions or want to chat with other wezterm users, you're welcome here!
-* There is a [Matrix room via Element.io](https://app.element.io/#/room/#wezterm:matrix.org)
-  for (potentially!) real time discussions.
+```bash
+sudo xattr -r -d com.apple.quarantine /Applications/ThinkTerm.app
+```
 
-The GitHub Discussions and Element/Gitter rooms are better suited for questions
-than bug reports, but don't be afraid to use whichever you are most comfortable
-using and we'll work it out.
+Why: I can't afford Apple's developer certificate ($99/year), so macOS may block the unsigned app. This command removes the quarantine flag and lets it run. Only use this command on apps you trust.
 
-## Supporting the Project
+## Notes
 
-If you use and like WezTerm, please consider sponsoring it: your support helps
-to cover the fees required to maintain the project and to validate the time
-spent working on it!
-
-[Read more about sponsoring](https://wezterm.org/sponsor.html).
-
-* [![Sponsor WezTerm](https://img.shields.io/github/sponsors/wez?label=Sponsor%20WezTerm&logo=github&style=for-the-badge)](https://github.com/sponsors/wez)
-* [Patreon](https://patreon.com/WezFurlong)
-* [Ko-Fi](https://ko-fi.com/wezfurlong)
-* [Liberapay](https://liberapay.com/wez)
+- The package script uses the binaries from `target/release/`.
+- The macOS app template lives in `assets/macos/ThinkTerm.app`.
+- Change `TAG_NAME` for each release version.
