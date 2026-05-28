@@ -936,6 +936,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "smol",
+ "tempfile",
  "termwiz",
  "toml 0.8.23",
  "umask",

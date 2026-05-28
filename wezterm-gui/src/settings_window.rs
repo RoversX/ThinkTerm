@@ -16,11 +16,13 @@ use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
 use config::{configuration, Dimension, GeometryOrigin};
 use std::cell::RefCell;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wezterm_bidi::Direction;
+use wezterm_dynamic::{ToDynamic, Value};
 use wezterm_font::{FontConfiguration, LoadedFont};
 use window::bitmaps::atlas::OutOfTextureSpace;
 use window::color::LinearRgba;
@@ -157,12 +159,17 @@ impl SettingsSection {
             Self::Workspaces => &["Workspace", "Sidebar", "Session", "Layout"],
             Self::Keymap => &["Keymap", "Keyboard", "Shortcut", "Command Palette"],
             Self::Compatibility => &[
-                "Active Source",
-                "GUI Editing",
-                "Open Config File",
-                "Compatibility Status",
+                "ThinkTerm Config",
+                "WezTerm Source",
+                "Copy WezTerm Config",
+                "Open ThinkTerm Config",
+                "Full Config File",
+                "Appearance",
+                "Terminal",
+                "Keymap",
                 "WezTerm",
                 "Import",
+                "Sync",
             ],
             Self::Developer => &[
                 "Developer Mode",
@@ -203,8 +210,13 @@ impl SettingsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsAction {
     Select(SettingsSection),
-    OpenConfigFile,
-    ShowCompatibilityStatus,
+    OpenThinkTermConfigFile,
+    OpenWezTermConfigFile,
+    LoadWezTermSource,
+    ImportSelectedFields,
+    SelectAllImportFields,
+    ClearImportFields,
+    ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
     ToggleDeveloperMode,
     ToggleMemoryMonitoring,
@@ -244,6 +256,203 @@ enum SettingsDropdown {
     ThemeMode,
     AppIcon,
     MainRenderer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportFieldId {
+    ColorScheme,
+    WindowBackgroundOpacity,
+    MacosWindowBackgroundBlur,
+    InactivePaneHsb,
+    FontSize,
+    Font,
+    LineHeight,
+    CellWidth,
+    DefaultProg,
+    DefaultCwd,
+    FrontEnd,
+    WindowDecorations,
+    DisableDefaultKeyBindings,
+    Keys,
+    KeyTables,
+}
+
+impl ImportFieldId {
+    fn all() -> &'static [Self] {
+        &[
+            Self::ColorScheme,
+            Self::WindowBackgroundOpacity,
+            Self::MacosWindowBackgroundBlur,
+            Self::InactivePaneHsb,
+            Self::FontSize,
+            Self::Font,
+            Self::LineHeight,
+            Self::CellWidth,
+            Self::DefaultProg,
+            Self::DefaultCwd,
+            Self::FrontEnd,
+            Self::WindowDecorations,
+            Self::DisableDefaultKeyBindings,
+            Self::Keys,
+            Self::KeyTables,
+        ]
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ColorScheme => "color_scheme",
+            Self::WindowBackgroundOpacity => "window_background_opacity",
+            Self::MacosWindowBackgroundBlur => "macos_window_background_blur",
+            Self::InactivePaneHsb => "inactive_pane_hsb",
+            Self::FontSize => "font_size",
+            Self::Font => "font",
+            Self::LineHeight => "line_height",
+            Self::CellWidth => "cell_width",
+            Self::DefaultProg => "default_prog",
+            Self::DefaultCwd => "default_cwd",
+            Self::FrontEnd => "front_end",
+            Self::WindowDecorations => "window_decorations",
+            Self::DisableDefaultKeyBindings => "disable_default_key_bindings",
+            Self::Keys => "keys",
+            Self::KeyTables => "key_tables",
+        }
+    }
+
+    fn category(self) -> &'static str {
+        match self {
+            Self::ColorScheme
+            | Self::WindowBackgroundOpacity
+            | Self::MacosWindowBackgroundBlur
+            | Self::InactivePaneHsb => "Appearance",
+            Self::FontSize
+            | Self::Font
+            | Self::LineHeight
+            | Self::CellWidth
+            | Self::DefaultProg
+            | Self::DefaultCwd => "Terminal",
+            Self::FrontEnd | Self::WindowDecorations => "Window",
+            Self::DisableDefaultKeyBindings | Self::Keys | Self::KeyTables => "Keymap",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ColorScheme => "Color Scheme",
+            Self::WindowBackgroundOpacity => "Window Background Opacity",
+            Self::MacosWindowBackgroundBlur => "macOS Background Blur",
+            Self::InactivePaneHsb => "Inactive Pane HSB",
+            Self::FontSize => "Font Size",
+            Self::Font => "Font",
+            Self::LineHeight => "Line Height",
+            Self::CellWidth => "Cell Width",
+            Self::DefaultProg => "Default Program",
+            Self::DefaultCwd => "Default CWD",
+            Self::FrontEnd => "Renderer Backend",
+            Self::WindowDecorations => "Window Decorations",
+            Self::DisableDefaultKeyBindings => "Disable Default Key Bindings",
+            Self::Keys => "Key Bindings",
+            Self::KeyTables => "Key Tables",
+        }
+    }
+
+    fn description(self, config: &config::Config) -> String {
+        match self {
+            Self::ColorScheme => "Theme name from the source config.".to_string(),
+            Self::WindowBackgroundOpacity => "Terminal window opacity.".to_string(),
+            Self::MacosWindowBackgroundBlur => {
+                "macOS blur amount behind transparent windows.".to_string()
+            }
+            Self::InactivePaneHsb => "Color transform for inactive split panes.".to_string(),
+            Self::FontSize => "Terminal cell font size.".to_string(),
+            Self::Font => "Terminal font stack.".to_string(),
+            Self::LineHeight => "Terminal line-height multiplier.".to_string(),
+            Self::CellWidth => "Terminal cell-width multiplier.".to_string(),
+            Self::DefaultProg => "Default shell or command launched in new panes.".to_string(),
+            Self::DefaultCwd => "Default working directory for new panes.".to_string(),
+            Self::FrontEnd => "OpenGL/WebGpu renderer choice.".to_string(),
+            Self::WindowDecorations => "Native/custom window decoration flags.".to_string(),
+            Self::DisableDefaultKeyBindings => {
+                "Whether built-in key bindings are disabled.".to_string()
+            }
+            Self::Keys => format!("{} custom key binding entries.", config.keys.len()),
+            Self::KeyTables => format!("{} custom key tables.", config.key_tables.len()),
+        }
+    }
+
+    fn preview(self, config: &config::Config, value: &Value) -> String {
+        match self {
+            Self::ColorScheme => config
+                .color_scheme
+                .clone()
+                .unwrap_or_else(|| "Custom colors".to_string()),
+            Self::WindowBackgroundOpacity => format!("{:.2}", config.window_background_opacity),
+            Self::MacosWindowBackgroundBlur => config.macos_window_background_blur.to_string(),
+            Self::InactivePaneHsb => format!(
+                "h {:.2}, s {:.2}, b {:.2}",
+                config.inactive_pane_hsb.hue,
+                config.inactive_pane_hsb.saturation,
+                config.inactive_pane_hsb.brightness
+            ),
+            Self::FontSize => format!("{:.1}", config.font_size),
+            Self::Font => config
+                .font
+                .font
+                .first()
+                .map(|font| font.family.clone())
+                .unwrap_or_else(|| "Font table".to_string()),
+            Self::LineHeight => format!("{:.2}", config.line_height),
+            Self::CellWidth => format!("{:.2}", config.cell_width),
+            Self::DefaultProg => config
+                .default_prog
+                .as_ref()
+                .map(|prog| prog.join(" "))
+                .unwrap_or_else(|| Self::value_preview(value)),
+            Self::DefaultCwd => config
+                .default_cwd
+                .as_ref()
+                .map(|cwd| cwd.display().to_string())
+                .unwrap_or_else(|| Self::value_preview(value)),
+            Self::FrontEnd => format!("{:?}", config.front_end),
+            Self::WindowDecorations => {
+                let value: String = (&config.window_decorations).into();
+                value
+            }
+            Self::DisableDefaultKeyBindings => config.disable_default_key_bindings.to_string(),
+            Self::Keys => format!("{} bindings", config.keys.len()),
+            Self::KeyTables => format!("{} tables", config.key_tables.len()),
+        }
+    }
+
+    fn value_preview(value: &Value) -> String {
+        match value {
+            Value::Null => "nil".to_string(),
+            Value::Bool(value) => value.to_string(),
+            Value::String(value) => value.clone(),
+            Value::U64(value) => value.to_string(),
+            Value::I64(value) => value.to_string(),
+            Value::F64(value) => value.to_string(),
+            Value::Array(value) => format!("{} items", value.len()),
+            Value::Object(value) => format!("{} fields", value.len()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImportableField {
+    id: ImportFieldId,
+    category: &'static str,
+    label: &'static str,
+    description: String,
+    preview: String,
+    lua_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CompatibilityImportState {
+    loaded_source: Option<PathBuf>,
+    fields: Vec<ImportableField>,
+    warnings: Vec<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -809,6 +1018,7 @@ struct SettingsWindow {
     active_main_renderer: NativeRendererBackend,
     ui: SettingsUiState,
     ui_context: UiContext<SettingsAction>,
+    compatibility_import: CompatibilityImportState,
     status: String,
 }
 
@@ -866,6 +1076,7 @@ impl SettingsWindow {
             active_main_renderer,
             ui,
             ui_context: UiContext::default(),
+            compatibility_import: CompatibilityImportState::default(),
             status: Self::initial_status(),
         }));
 
@@ -1708,26 +1919,70 @@ impl SettingsWindow {
                 self.ui.content_scroll.reset();
                 self.ui.open_dropdown = None;
             }
-            SettingsAction::OpenConfigFile => {
+            SettingsAction::OpenThinkTermConfigFile => {
                 self.ui.open_dropdown = None;
-                if let Some(path) = config::configuration_file() {
-                    self.status = format!("Opening active config {}", path.display());
+                let path = Self::thinkterm_compatible_config_path();
+                if path.exists() {
+                    self.status = format!("Opening ThinkTerm config {}", path.display());
                     Self::open_path(path);
                 } else {
-                    self.status = "Using built-in defaults; no config file to open".to_string();
+                    self.status = format!(
+                        "No ThinkTerm config yet. Copy or create {} first.",
+                        path.display()
+                    );
                 }
             }
-            SettingsAction::ShowCompatibilityStatus => {
+            SettingsAction::OpenWezTermConfigFile => {
                 self.ui.open_dropdown = None;
-                self.status = match config::configuration_file() {
-                    Some(path) => format!(
-                        "Compatibility view is using {}. GUI import is intentionally pending.",
-                        path.display()
-                    ),
-                    None => {
-                        "No config file is loaded; ThinkTerm is using built-in defaults".to_string()
+                if let Some(path) = Self::first_wezterm_config_path() {
+                    self.status = format!("Opening WezTerm source config {}", path.display());
+                    Self::open_path(path);
+                } else {
+                    self.status = "No existing WezTerm config was found to open.".to_string();
+                }
+            }
+            SettingsAction::LoadWezTermSource => {
+                self.ui.open_dropdown = None;
+                match self.load_compatibility_source() {
+                    Ok(()) => window.invalidate(),
+                    Err(err) => {
+                        self.compatibility_import.error = Some(err.to_string());
+                        self.status = format!("Unable to load WezTerm source: {err:#}");
                     }
-                };
+                }
+            }
+            SettingsAction::ImportSelectedFields => {
+                self.ui.open_dropdown = None;
+                match self.import_selected_compatibility_fields() {
+                    Ok((count, entry_created)) => {
+                        self.status = format!(
+                            "Imported {count} selected field{} into ThinkTerm's managed config layer{}.",
+                            if count == 1 { "" } else { "s" },
+                            if entry_created {
+                                " and created the ThinkTerm config entry"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to import selected fields: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::SelectAllImportFields => {
+                self.ui.open_dropdown = None;
+                self.select_all_import_fields();
+                window.invalidate();
+            }
+            SettingsAction::ClearImportFields => {
+                self.ui.open_dropdown = None;
+                self.clear_import_fields();
+                window.invalidate();
+            }
+            SettingsAction::ToggleImportField(field_id) => {
+                self.ui.open_dropdown = None;
+                self.toggle_import_field(field_id);
             }
             SettingsAction::ToggleMainWindowFrameRestore => {
                 self.ui.open_dropdown = None;
@@ -2430,7 +2685,7 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 2.0,
             row_width,
-            "Small ThinkTerm-native state; compatible terminal config stays in wezterm.lua.",
+            "Small ThinkTerm-native state; terminal config stays in ThinkTerm's own wezterm.lua.",
             true,
         )?;
         self.paint_main_renderer_row(layers, row_x, first_row_y + row_step * 3.0, row_width, true)?;
@@ -3533,21 +3788,51 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 2);
-        let card_height = self.settings_card_height(2);
+        let field_count = self.compatibility_import.fields.len();
+        let row_count = 4 + field_count.max(1);
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
+        let card_height = self.settings_card_height(row_count);
         let buttons_y = card_y + card_height + self.settings_section_card_gap();
         self.ui.content_scroll.set_extents(
             self.content_bottom(),
-            self.settings_content_extent(buttons_y + scroll + CONTROL_HEIGHT),
+            self.settings_content_extent(buttons_y + scroll + CONTROL_HEIGHT * 2.0 + 14.0),
         );
-        let source = Self::config_source_summary();
+        let thinkterm_path = Self::thinkterm_compatible_config_path();
+        let thinkterm_source = if thinkterm_path.exists() {
+            thinkterm_path.display().to_string()
+        } else {
+            format!("Not created yet; target is {}", thinkterm_path.display())
+        };
+        let wezterm_source = Self::first_wezterm_config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "No existing WezTerm config found".to_string());
+        let loaded_source = self
+            .compatibility_import
+            .loaded_source
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Not loaded yet".to_string());
+        let loaded_source_description = if self.compatibility_import.warnings.is_empty() {
+            loaded_source
+        } else {
+            format!(
+                "{} ({} warning{})",
+                loaded_source,
+                self.compatibility_import.warnings.len(),
+                if self.compatibility_import.warnings.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        };
 
         self.draw_text(
             layers,
             &ui_font,
             x,
             section_y,
-            "ThinkTerm keeps the WezTerm-compatible config path as the main terminal configuration.",
+            "ThinkTerm uses its own WezTerm-compatible config. Existing WezTerm files are optional import sources, not shared live state.",
             palette.secondary_text,
             max_width,
         )?;
@@ -3560,10 +3845,10 @@ impl SettingsWindow {
             row_x,
             first_row_y,
             row_width,
-            "Active Source",
-            &source,
-            if config::configuration_file().is_some() {
-                "File"
+            "ThinkTerm Config",
+            &thinkterm_source,
+            if thinkterm_path.exists() {
+                "Independent"
             } else {
                 "Defaults"
             },
@@ -3574,26 +3859,133 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step,
             row_width,
-            "GUI Editing",
-            "Future visual editor will generate a managed compatible config layer.",
-            "Pending",
+            "WezTerm Source",
+            &wezterm_source,
+            if Self::first_wezterm_config_path().is_some() {
+                "Found"
+            } else {
+                "Missing"
+            },
             true,
         )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 2.0,
+            row_width,
+            "Loaded Source",
+            &loaded_source_description,
+            if self.compatibility_import.error.is_some() {
+                "Error"
+            } else if field_count > 0 {
+                "Parsed"
+            } else {
+                "Idle"
+            },
+            true,
+        )?;
+
+        let mut row_y = first_row_y + row_step * 3.0;
+        let selected_count = self
+            .compatibility_import
+            .fields
+            .iter()
+            .filter(|field| field.lua_value.is_some() && self.import_field_selected(field.id))
+            .count();
+        let detected_label = if field_count == 0 {
+            "No fields loaded".to_string()
+        } else {
+            format!("{selected_count} of {field_count} selected")
+        };
+        self.paint_setting_row(
+            layers,
+            row_x,
+            row_y,
+            row_width,
+            "Importable Fields",
+            "Choose exactly which source config values ThinkTerm should copy.",
+            &detected_label,
+            true,
+        )?;
+        row_y += row_step;
+
+        if self.compatibility_import.fields.is_empty() {
+            self.paint_setting_row(
+                layers,
+                row_x,
+                row_y,
+                row_width,
+                "Detected Fields",
+                self.compatibility_import
+                    .error
+                    .as_deref()
+                    .unwrap_or("Load a WezTerm source config to inspect importable fields."),
+                if self.compatibility_import.error.is_some() {
+                    "Error"
+                } else {
+                    "Empty"
+                },
+                true,
+            )?;
+        } else {
+            let fields = self.compatibility_import.fields.clone();
+            for field in fields {
+                self.paint_import_field_row(layers, row_x, row_y, row_width, &field, true)?;
+                row_y += row_step;
+            }
+        }
         self.draw_button(
             layers,
             x,
             buttons_y,
-            self.button_width_for_label("Open Config File", 260.0),
-            "Open Config File",
-            SettingsAction::OpenConfigFile,
+            self.button_width_for_label("Load WezTerm Source", 290.0),
+            "Load WezTerm Source",
+            SettingsAction::LoadWezTermSource,
         )?;
+        let second_x = x + self.button_width_for_label("Load WezTerm Source", 290.0) + 16.0;
         self.draw_button(
             layers,
-            x + 326.0,
+            second_x,
             buttons_y,
-            self.button_width_for_label("Compatibility Status", 260.0),
-            "Compatibility Status",
-            SettingsAction::ShowCompatibilityStatus,
+            self.button_width_for_label("Select All", 180.0),
+            "Select All",
+            SettingsAction::SelectAllImportFields,
+        )?;
+        let third_x = second_x + self.button_width_for_label("Select All", 180.0) + 16.0;
+        self.draw_button(
+            layers,
+            third_x,
+            buttons_y,
+            self.button_width_for_label("Clear", 150.0),
+            "Clear",
+            SettingsAction::ClearImportFields,
+        )?;
+        let fourth_x = third_x + self.button_width_for_label("Clear", 150.0) + 16.0;
+        self.draw_button(
+            layers,
+            fourth_x,
+            buttons_y,
+            self.button_width_for_label("Import Selected", 260.0),
+            "Import Selected",
+            SettingsAction::ImportSelectedFields,
+        )?;
+        let open_buttons_y = buttons_y + CONTROL_HEIGHT + 14.0;
+        self.draw_button(
+            layers,
+            x,
+            open_buttons_y,
+            self.button_width_for_label("Open WezTerm Source", 300.0),
+            "Open WezTerm Source",
+            SettingsAction::OpenWezTermConfigFile,
+        )?;
+        let fifth_x = x + self.button_width_for_label("Open WezTerm Source", 300.0) + 16.0;
+        self.draw_button(
+            layers,
+            fifth_x,
+            open_buttons_y,
+            self.button_width_for_label("Open ThinkTerm Config", 300.0),
+            "Open ThinkTerm Config",
+            SettingsAction::OpenThinkTermConfigFile,
         )?;
 
         Ok(())
@@ -3763,6 +4155,152 @@ impl SettingsWindow {
             if enabled { "On" } else { "Off" },
             palette.text,
             control_width - 26.0,
+        )?;
+        Ok(())
+    }
+
+    fn paint_import_field_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        field: &ImportableField,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let action = SettingsAction::ToggleImportField(field.id);
+        let enabled = field.lua_value.is_some();
+        let selected = enabled && self.import_field_selected(field.id);
+        let hovered = enabled && self.ui.interaction.hovered == Some(action);
+        let pressed = enabled && self.ui.interaction.pressed == Some(action);
+
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - 28.0, width)?;
+        }
+
+        let row_rect = rect(
+            x - 14.0,
+            y - 18.0,
+            width + 28.0,
+            self.settings_row_visual_height() + 18.0,
+        );
+        if enabled {
+            self.ui_context.push(row_rect, WidgetKind::Button, action);
+        }
+        if selected || hovered || pressed {
+            let bg = if pressed {
+                palette.control_pressed_bg
+            } else if selected {
+                rgba(10, 132, 255, 0.14)
+            } else {
+                palette.control_hover_bg
+            };
+            self.draw_rounded_rect(
+                layers,
+                0,
+                row_rect.origin.x,
+                row_rect.origin.y,
+                row_rect.size.width,
+                row_rect.size.height,
+                bg,
+                16.0,
+            )?;
+        }
+
+        let checkbox_size = 30.0;
+        let checkbox_x = x;
+        let checkbox_y = y + 6.0;
+        let checkbox_fill = if selected {
+            palette.nav_selected_bg
+        } else if hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let checkbox_border = if selected || hovered {
+            palette.nav_selected_bg
+        } else {
+            palette.control_border
+        };
+        self.draw_rounded_frame(
+            layers,
+            0,
+            checkbox_x,
+            checkbox_y,
+            checkbox_size,
+            checkbox_size,
+            checkbox_fill,
+            checkbox_border,
+            8.0,
+        )?;
+        if selected {
+            self.draw_rounded_rect(
+                layers,
+                1,
+                checkbox_x + 8.0,
+                checkbox_y + 8.0,
+                checkbox_size - 16.0,
+                checkbox_size - 16.0,
+                palette.selected_text,
+                4.0,
+            )?;
+        }
+
+        let label_x = x + checkbox_size + 18.0;
+        let value_width = if width >= 760.0 {
+            280.0_f32.min(width * 0.30)
+        } else {
+            210.0_f32.min(width * 0.34)
+        };
+        let value_x = x + width - value_width;
+        let text_width = (value_x - label_x - 28.0).max(width * 0.42);
+        let title = format!("{} / {}", field.category, field.label);
+        self.draw_text(
+            layers,
+            &ui_font,
+            label_x,
+            y,
+            &title,
+            if enabled {
+                palette.text
+            } else {
+                palette.muted_text
+            },
+            text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            label_x,
+            self.settings_row_description_y(y),
+            &field.description,
+            palette.secondary_text,
+            text_width,
+        )?;
+
+        let preview_y = y + 4.0;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            value_x,
+            preview_y,
+            value_width,
+            CONTROL_HEIGHT,
+            palette.control_bg,
+            palette.control_border,
+            CONTROL_RADIUS,
+        )?;
+        let preview = self.text_with_ellipsis(&ui_font, &field.preview, value_width - 28.0);
+        self.draw_text(
+            layers,
+            &ui_font,
+            value_x + 14.0,
+            self.control_text_y(preview_y, CONTROL_HEIGHT),
+            &preview,
+            palette.text,
+            value_width - 28.0,
         )?;
         Ok(())
     }
@@ -5196,6 +5734,329 @@ impl SettingsWindow {
         } else {
             "No config file loaded; using built-in defaults".to_string()
         }
+    }
+
+    fn thinkterm_compatible_config_path() -> PathBuf {
+        config::HOME_DIR
+            .join(".config")
+            .join("thinkterm")
+            .join("wezterm.lua")
+    }
+
+    fn wezterm_config_candidates() -> Vec<PathBuf> {
+        let mut paths = vec![config::HOME_DIR.join(".wezterm.lua")];
+        for dir in config::CONFIG_DIRS.iter() {
+            paths.push(dir.join("wezterm.lua"));
+        }
+        paths
+    }
+
+    fn first_wezterm_config_path() -> Option<PathBuf> {
+        Self::wezterm_config_candidates()
+            .into_iter()
+            .find(|path| path.exists())
+    }
+
+    fn thinkterm_imported_config_path() -> PathBuf {
+        config::HOME_DIR
+            .join(".config")
+            .join("thinkterm")
+            .join("imported_from_wezterm.lua")
+    }
+
+    fn selected_wezterm_source_path(&self) -> Option<PathBuf> {
+        self.native_settings
+            .compatibility
+            .source_path
+            .as_ref()
+            .filter(|path| path.exists())
+            .cloned()
+            .or_else(Self::first_wezterm_config_path)
+    }
+
+    fn load_compatibility_source(&mut self) -> anyhow::Result<()> {
+        let source = self
+            .selected_wezterm_source_path()
+            .ok_or_else(|| anyhow::anyhow!("no existing WezTerm config was found"))?;
+        let loaded = config::load_config_file_for_import(&source)
+            .with_context(|| format!("load {}", source.display()))?;
+        let fields = Self::build_importable_fields(&loaded.config, &loaded.raw_keys);
+        if self
+            .native_settings
+            .compatibility
+            .selected_fields
+            .is_empty()
+        {
+            self.native_settings.compatibility.selected_fields = fields
+                .iter()
+                .filter(|field| field.lua_value.is_some())
+                .map(|field| field.id.as_str().to_string())
+                .collect();
+        }
+        self.native_settings.compatibility.source_path = Some(loaded.file_name.clone());
+        let _ = crate::native_settings::save(&self.native_settings);
+        let field_count = fields.len();
+        self.compatibility_import = CompatibilityImportState {
+            loaded_source: Some(loaded.file_name.clone()),
+            fields,
+            warnings: loaded.warnings,
+            error: None,
+        };
+        self.status = format!(
+            "Loaded {} and found {field_count} supported field{}.",
+            loaded.file_name.display(),
+            if field_count == 1 { "" } else { "s" }
+        );
+        Ok(())
+    }
+
+    fn build_importable_fields(
+        config: &config::Config,
+        raw_keys: &std::collections::BTreeSet<String>,
+    ) -> Vec<ImportableField> {
+        ImportFieldId::all()
+            .iter()
+            .filter_map(|field_id| {
+                if !raw_keys.contains(field_id.as_str()) {
+                    return None;
+                }
+                let value = Self::import_field_value(config, *field_id)?;
+                let lua_value = Self::lua_literal(&value);
+                Some(ImportableField {
+                    id: *field_id,
+                    category: field_id.category(),
+                    label: field_id.label(),
+                    description: field_id.description(config),
+                    preview: field_id.preview(config, &value),
+                    lua_value,
+                })
+            })
+            .collect()
+    }
+
+    fn import_field_value(config: &config::Config, field_id: ImportFieldId) -> Option<Value> {
+        match field_id {
+            ImportFieldId::ColorScheme => Some(config.color_scheme.to_dynamic()),
+            ImportFieldId::WindowBackgroundOpacity => {
+                Some(config.window_background_opacity.to_dynamic())
+            }
+            ImportFieldId::MacosWindowBackgroundBlur => {
+                Some(config.macos_window_background_blur.to_dynamic())
+            }
+            ImportFieldId::InactivePaneHsb => Some(config.inactive_pane_hsb.to_dynamic()),
+            ImportFieldId::FontSize => Some(config.font_size.to_dynamic()),
+            ImportFieldId::Font => Some(config.font.to_dynamic()),
+            ImportFieldId::LineHeight => Some(config.line_height.to_dynamic()),
+            ImportFieldId::CellWidth => Some(config.cell_width.to_dynamic()),
+            ImportFieldId::DefaultProg => Some(config.default_prog.to_dynamic()),
+            ImportFieldId::DefaultCwd => Some(config.default_cwd.to_dynamic()),
+            ImportFieldId::FrontEnd => Some(config.front_end.to_dynamic()),
+            ImportFieldId::WindowDecorations => Some(config.window_decorations.to_dynamic()),
+            ImportFieldId::DisableDefaultKeyBindings => {
+                Some(config.disable_default_key_bindings.to_dynamic())
+            }
+            ImportFieldId::Keys => Some(config.keys.to_dynamic()),
+            ImportFieldId::KeyTables => Some(config.key_tables.to_dynamic()),
+        }
+    }
+
+    fn import_field_selected(&self, field_id: ImportFieldId) -> bool {
+        self.native_settings
+            .compatibility
+            .selected_fields
+            .iter()
+            .any(|field| field == field_id.as_str())
+    }
+
+    fn toggle_import_field(&mut self, field_id: ImportFieldId) {
+        let key = field_id.as_str();
+        if let Some(pos) = self
+            .native_settings
+            .compatibility
+            .selected_fields
+            .iter()
+            .position(|field| field == key)
+        {
+            self.native_settings
+                .compatibility
+                .selected_fields
+                .remove(pos);
+            self.status = format!("{} disabled for import.", field_id.label());
+        } else {
+            self.native_settings
+                .compatibility
+                .selected_fields
+                .push(key.to_string());
+            self.status = format!("{} enabled for import.", field_id.label());
+        }
+
+        if let Err(err) = crate::native_settings::save(&self.native_settings) {
+            self.status = format!("Unable to save import field selection: {err:#}");
+        }
+    }
+
+    fn select_all_import_fields(&mut self) {
+        let selected = self
+            .compatibility_import
+            .fields
+            .iter()
+            .filter(|field| field.lua_value.is_some())
+            .map(|field| field.id.as_str().to_string())
+            .collect::<Vec<_>>();
+        let count = selected.len();
+        self.native_settings.compatibility.selected_fields = selected;
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                self.status = format!(
+                    "{count} importable field{} selected.",
+                    if count == 1 { "" } else { "s" }
+                );
+            }
+            Err(err) => {
+                self.status = format!("Unable to save import field selection: {err:#}");
+            }
+        }
+    }
+
+    fn clear_import_fields(&mut self) {
+        self.native_settings.compatibility.selected_fields.clear();
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                self.status = "All import fields cleared.".to_string();
+            }
+            Err(err) => {
+                self.status = format!("Unable to save import field selection: {err:#}");
+            }
+        }
+    }
+
+    fn import_selected_compatibility_fields(&mut self) -> anyhow::Result<(usize, bool)> {
+        if self.compatibility_import.fields.is_empty() {
+            self.load_compatibility_source()?;
+        }
+
+        let selected = self
+            .compatibility_import
+            .fields
+            .iter()
+            .filter(|field| self.import_field_selected(field.id))
+            .filter_map(|field| field.lua_value.as_ref().map(|value| (field, value)))
+            .collect::<Vec<_>>();
+
+        if selected.is_empty() {
+            anyhow::bail!("no importable fields are selected");
+        }
+
+        let target = Self::thinkterm_imported_config_path();
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+
+        let mut body = String::new();
+        body.push_str("-- Generated by ThinkTerm Settings. Do not edit by hand.\n");
+        body.push_str("-- Re-run Compatibility import to refresh these values.\n\n");
+        body.push_str("return {\n");
+        for (field, value) in &selected {
+            body.push_str("  ");
+            body.push_str(field.id.as_str());
+            body.push_str(" = ");
+            body.push_str(value);
+            body.push_str(",\n");
+        }
+        body.push_str("}\n");
+
+        fs::write(&target, body).with_context(|| format!("write {}", target.display()))?;
+        let entry_created = Self::ensure_thinkterm_config_entry()?;
+        self.native_settings.compatibility.last_imported_at =
+            Some(Self::current_unix_timestamp_string());
+        crate::native_settings::save(&self.native_settings)
+            .context("save ThinkTerm compatibility settings")?;
+        Ok((selected.len(), entry_created))
+    }
+
+    fn ensure_thinkterm_config_entry() -> anyhow::Result<bool> {
+        let entry = Self::thinkterm_compatible_config_path();
+        if entry.exists() {
+            return Ok(false);
+        }
+        if let Some(parent) = entry.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+
+        let body = r#"local wezterm = require "wezterm"
+local config = wezterm.config_builder and wezterm.config_builder() or {}
+
+local imported = require "imported_from_wezterm"
+for key, value in pairs(imported) do
+  config[key] = value
+end
+
+return config
+"#;
+        fs::write(&entry, body).with_context(|| format!("write {}", entry.display()))?;
+        Ok(true)
+    }
+
+    fn current_unix_timestamp_string() -> String {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string())
+    }
+
+    fn lua_literal(value: &Value) -> Option<String> {
+        Some(match value {
+            Value::Null => return None,
+            Value::Bool(value) => value.to_string(),
+            Value::String(value) => Self::lua_string(value),
+            Value::U64(value) => value.to_string(),
+            Value::I64(value) => value.to_string(),
+            Value::F64(value) => value.to_string(),
+            Value::Array(array) => {
+                let mut parts = Vec::with_capacity(array.len());
+                for value in array.iter() {
+                    parts.push(Self::lua_literal(value)?);
+                }
+                format!("{{ {} }}", parts.join(", "))
+            }
+            Value::Object(object) => {
+                let mut parts = Vec::with_capacity(object.len());
+                for (key, value) in object.iter() {
+                    let key = match key {
+                        Value::String(key)
+                            if key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                                && key
+                                    .chars()
+                                    .next()
+                                    .map(|c| c == '_' || c.is_ascii_alphabetic())
+                                    .unwrap_or(false) =>
+                        {
+                            key.to_string()
+                        }
+                        _ => format!("[{}]", Self::lua_literal(key)?),
+                    };
+                    parts.push(format!("{key} = {}", Self::lua_literal(value)?));
+                }
+                format!("{{ {} }}", parts.join(", "))
+            }
+        })
+    }
+
+    fn lua_string(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+        out
     }
 
     fn effective_color_scheme_label(config: &config::ConfigHandle) -> &str {

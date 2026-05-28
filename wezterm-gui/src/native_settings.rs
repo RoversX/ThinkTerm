@@ -133,6 +133,14 @@ pub(crate) struct NativeDeveloperSettings {
     pub(crate) developer_mode: bool,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeCompatibilitySettings {
+    pub(crate) source_path: Option<PathBuf>,
+    pub(crate) selected_fields: Vec<String>,
+    pub(crate) last_imported_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeWindowSettings {
@@ -157,6 +165,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) terminal: NativeTerminalSettings,
     pub(crate) chrome: NativeChromeSettings,
     pub(crate) developer: NativeDeveloperSettings,
+    pub(crate) compatibility: NativeCompatibilitySettings,
     pub(crate) window: NativeWindowSettings,
 }
 
@@ -168,6 +177,7 @@ impl Default for ThinkTermNativeSettings {
             terminal: NativeTerminalSettings::default(),
             chrome: NativeChromeSettings::default(),
             developer: NativeDeveloperSettings::default(),
+            compatibility: NativeCompatibilitySettings::default(),
             window: NativeWindowSettings::default(),
         }
     }

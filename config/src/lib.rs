@@ -471,6 +471,10 @@ pub fn configuration_file() -> Option<PathBuf> {
     CONFIG.config_file()
 }
 
+pub fn load_config_file_for_import(path: &Path) -> anyhow::Result<ConfigImportResult> {
+    Config::load_file_for_import(path)
+}
+
 struct ConfigInner {
     config: Arc<Config>,
     config_file: Option<PathBuf>,

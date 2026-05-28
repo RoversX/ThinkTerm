@@ -31,7 +31,7 @@ use anyhow::Context;
 use luahelper::impl_lua_conversion_dynamic;
 use mlua::FromLua;
 use portable_pty::CommandBuilder;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -895,6 +895,18 @@ pub struct Config {
     #[dynamic(default = "default_ulimit_nproc")]
     pub ulimit_nproc: u64,
 }
+
+pub struct ConfigImportResult {
+    pub config: Config,
+    pub file_name: PathBuf,
+    pub raw_keys: BTreeSet<String>,
+    pub warnings: Vec<String>,
+}
+
+struct LoadedConfigWithKeys {
+    loaded: LoadedConfig,
+    raw_keys: BTreeSet<String>,
+}
 impl_lua_conversion_dynamic!(Config);
 
 fn default_one() -> usize {
@@ -1014,10 +1026,15 @@ impl Config {
         // multiple.  In addition, it spawns a lot of subprocesses,
         // so we do this bit "by-hand"
 
-        let mut paths = vec![PathPossibility::optional(HOME_DIR.join(".wezterm.lua"))];
-        for dir in CONFIG_DIRS.iter() {
-            paths.push(PathPossibility::optional(dir.join("wezterm.lua")))
-        }
+        let mut paths = vec![
+            PathPossibility::optional(
+                HOME_DIR
+                    .join(".config")
+                    .join("thinkterm")
+                    .join("wezterm.lua"),
+            ),
+            PathPossibility::optional(HOME_DIR.join(".thinkterm.lua")),
+        ];
 
         if cfg!(windows) {
             // On Windows, a common use case is to maintain a thumb drive
@@ -1094,10 +1111,57 @@ impl Config {
         })
     }
 
+    pub fn load_file_for_import(path: &Path) -> anyhow::Result<ConfigImportResult> {
+        struct EnvRestore {
+            config_file: Option<std::ffi::OsString>,
+            config_dir: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match self.config_file.take() {
+                    Some(value) => std::env::set_var("WEZTERM_CONFIG_FILE", value),
+                    None => std::env::remove_var("WEZTERM_CONFIG_FILE"),
+                }
+                match self.config_dir.take() {
+                    Some(value) => std::env::set_var("WEZTERM_CONFIG_DIR", value),
+                    None => std::env::remove_var("WEZTERM_CONFIG_DIR"),
+                }
+            }
+        }
+
+        let _env_restore = EnvRestore {
+            config_file: std::env::var_os("WEZTERM_CONFIG_FILE"),
+            config_dir: std::env::var_os("WEZTERM_CONFIG_DIR"),
+        };
+
+        let path_item = PathPossibility::required(path.to_path_buf());
+        let loaded = Self::try_load_with_key_capture(&path_item, &wezterm_dynamic::Value::Null)?
+            .ok_or_else(|| anyhow::anyhow!("No config file loaded from {}", path.display()))?;
+        let config = loaded.loaded.config?;
+
+        Ok(ConfigImportResult {
+            config,
+            file_name: loaded
+                .loaded
+                .file_name
+                .unwrap_or_else(|| path.to_path_buf()),
+            raw_keys: loaded.raw_keys,
+            warnings: loaded.loaded.warnings,
+        })
+    }
+
     fn try_load(
         path_item: &PathPossibility,
         overrides: &wezterm_dynamic::Value,
     ) -> anyhow::Result<Option<LoadedConfig>> {
+        Ok(Self::try_load_with_key_capture(path_item, overrides)?.map(|loaded| loaded.loaded))
+    }
+
+    fn try_load_with_key_capture(
+        path_item: &PathPossibility,
+        overrides: &wezterm_dynamic::Value,
+    ) -> anyhow::Result<Option<LoadedConfigWithKeys>> {
         let p = path_item.path.as_path();
         log::trace!("consider config: {}", p.display());
         let mut file = match std::fs::File::open(p) {
@@ -1112,8 +1176,8 @@ impl Config {
         file.read_to_string(&mut s)?;
         let lua = make_lua_context(p)?;
 
-        let (config, warnings) =
-            wezterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
+        let (config, warnings) = wezterm_dynamic::Error::capture_warnings(
+            || -> anyhow::Result<(Config, BTreeSet<String>)> {
                 let cfg: Config;
 
                 let config: mlua::Value = smol::block_on(
@@ -1124,6 +1188,7 @@ impl Config {
                         .set_name(p.to_string_lossy())
                         .eval_async(),
                 )?;
+                let raw_keys = Self::collect_lua_table_keys(&config)?;
                 let config = Config::apply_overrides_to(&lua, config)?;
                 let config = Config::apply_overrides_obj_to(&lua, config, overrides)?;
                 cfg = Config::from_lua(config, &lua).with_context(|| {
@@ -1142,16 +1207,38 @@ impl Config {
                 if let Some(dir) = p.parent() {
                     std::env::set_var("WEZTERM_CONFIG_DIR", dir);
                 }
-                Ok(cfg)
-            });
-        let cfg = config?;
+                Ok((cfg, raw_keys))
+            },
+        );
+        let (cfg, raw_keys) = config?;
 
-        Ok(Some(LoadedConfig {
-            config: Ok(cfg.compute_extra_defaults(Some(p))),
-            file_name: Some(p.to_path_buf()),
-            lua: Some(lua),
-            warnings,
+        Ok(Some(LoadedConfigWithKeys {
+            loaded: LoadedConfig {
+                config: Ok(cfg.compute_extra_defaults(Some(p))),
+                file_name: Some(p.to_path_buf()),
+                lua: Some(lua),
+                warnings,
+            },
+            raw_keys,
         }))
+    }
+
+    fn collect_lua_table_keys(value: &mlua::Value) -> anyhow::Result<BTreeSet<String>> {
+        let mut raw_keys = BTreeSet::new();
+        let mlua::Value::Table(table) = value else {
+            return Ok(raw_keys);
+        };
+
+        for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+            let (key, _) = pair?;
+            if let mlua::Value::String(key) = key {
+                if let Ok(key) = key.to_str() {
+                    raw_keys.insert(key.to_string());
+                }
+            }
+        }
+
+        Ok(raw_keys)
     }
 
     pub(crate) fn apply_overrides_obj_to<'l>(
@@ -2208,4 +2295,70 @@ fn default_macos_forward_mods() -> Modifiers {
 
 fn default_colr_rasterizer() -> FontRasterizerSelection {
     FontRasterizerSelection::Harfbuzz
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    struct EnvGuard {
+        config_file: Option<std::ffi::OsString>,
+        config_dir: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self {
+                config_file: std::env::var_os("WEZTERM_CONFIG_FILE"),
+                config_dir: std::env::var_os("WEZTERM_CONFIG_DIR"),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.config_file.take() {
+                Some(value) => std::env::set_var("WEZTERM_CONFIG_FILE", value),
+                None => std::env::remove_var("WEZTERM_CONFIG_FILE"),
+            }
+            match self.config_dir.take() {
+                Some(value) => std::env::set_var("WEZTERM_CONFIG_DIR", value),
+                None => std::env::remove_var("WEZTERM_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn import_loader_restores_env_and_collects_raw_keys() {
+        let _guard = EnvGuard::new();
+        std::env::set_var("WEZTERM_CONFIG_FILE", "/tmp/original-wezterm.lua");
+        std::env::set_var("WEZTERM_CONFIG_DIR", "/tmp/original-wezterm-dir");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wezterm.lua");
+        std::fs::write(
+            &path,
+            r#"
+local wezterm = require "wezterm"
+local config = wezterm.config_builder and wezterm.config_builder() or {}
+config.font_size = 17.5
+config.color_scheme = "Apple System Colors"
+return config
+"#,
+        )
+        .unwrap();
+
+        let imported = Config::load_file_for_import(&path).unwrap();
+        assert_eq!(imported.config.font_size, 17.5);
+        assert!(imported.raw_keys.contains("font_size"));
+        assert!(imported.raw_keys.contains("color_scheme"));
+        assert_eq!(
+            std::env::var_os("WEZTERM_CONFIG_FILE").as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/original-wezterm.lua"))
+        );
+        assert_eq!(
+            std::env::var_os("WEZTERM_CONFIG_DIR").as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/original-wezterm-dir"))
+        );
+    }
 }
