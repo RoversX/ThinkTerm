@@ -49,8 +49,8 @@ const SESSION_STATUS_DOT_SIZE: usize = 10;
 const SESSION_STATUS_ICON_SIZE: usize = 20;
 const SESSION_STATUS_ACTIVE_ICON_SIZE: usize = 26;
 const SESSION_STATUS_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
-const SIDEBAR_SECTION_ACTION_SIZE: usize = 40;
-const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 8;
+const SIDEBAR_SECTION_ACTION_SIZE: usize = 48;
+const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 6;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceSidebarRect {
@@ -669,10 +669,9 @@ impl crate::TermWindow {
         } else {
             0
         };
-        let top_action_x = item_x + SIDEBAR_SETTINGS_ROW_SIDE_PADDING;
+        let top_action_x = item_x + SIDEBAR_INSET;
         let top_action_y = y + top_action_y_offset;
-        let top_action_total_width =
-            item_width.saturating_sub(SIDEBAR_SETTINGS_ROW_SIDE_PADDING * 2);
+        let top_action_total_width = item_width.saturating_sub(SIDEBAR_INSET * 2);
         let top_action_gap = SIDEBAR_ICON_GAP + 4;
         let top_action_height = session_row_height
             .min(48)
@@ -1068,7 +1067,7 @@ impl crate::TermWindow {
                     height: section_button_size,
                     item_type: UIItemType::ProjectNew,
                 });
-                let section_icon_size = header_icon_size
+                let section_icon_size = (header_icon_size + 4)
                     .min(section_button_size.saturating_sub(SIDEBAR_SECTION_ACTION_ICON_INSET));
                 self.paint_sidebar_icon(
                     layers,
@@ -1199,7 +1198,7 @@ impl crate::TermWindow {
                     height: project_action_size,
                     item_type: UIItemType::ProjectSessionNew(project.id.clone()),
                 });
-                let action_icon_size = header_icon_size
+                let action_icon_size = (header_icon_size + 4)
                     .min(project_action_size.saturating_sub(SIDEBAR_SECTION_ACTION_ICON_INSET));
                 self.paint_sidebar_icon(
                     layers,
