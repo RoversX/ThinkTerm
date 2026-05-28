@@ -36,9 +36,8 @@ use config::keyassignment::{
 };
 use config::window::WindowLevel;
 use config::{
-    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection,
-    GeometryOrigin, GuiPosition, RgbaColor, TabBarColor, TabBarColors, TermConfig,
-    WindowCloseConfirmation,
+    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, GeometryOrigin,
+    GuiPosition, RgbaColor, TabBarColor, TabBarColors, TermConfig, WindowCloseConfirmation,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -919,6 +918,9 @@ impl TermWindow {
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
         let config = configuration();
+        let native_settings = crate::native_settings::load();
+        let main_renderer =
+            crate::native_settings::main_window_renderer(&native_settings, config.front_end);
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
 
@@ -1166,9 +1168,7 @@ impl TermWindow {
             x,
             y,
             macos_frame_autosave_name: if cfg!(target_os = "macos")
-                && crate::native_settings::load()
-                    .window
-                    .restore_main_window_frame
+                && native_settings.window.restore_main_window_frame
             {
                 Some("ThinkTerm.MainWindow".to_string())
             } else {
@@ -1207,9 +1207,9 @@ impl TermWindow {
             }
         });
 
-        let gl = match config.front_end {
-            FrontEndSelection::WebGpu => None,
-            _ => {
+        let gl = match main_renderer {
+            crate::native_settings::NativeRendererBackend::WebGpu => None,
+            crate::native_settings::NativeRendererBackend::OpenGL => {
                 gpu_debug(format!(
                     "enable OpenGL main_window size={}x{} dpi={}",
                     dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
@@ -1220,8 +1220,8 @@ impl TermWindow {
 
         {
             let mut myself = tw.borrow_mut();
-            let webgpu = match config.front_end {
-                FrontEndSelection::WebGpu => {
+            let webgpu = match main_renderer {
+                crate::native_settings::NativeRendererBackend::WebGpu => {
                     gpu_debug(format!(
                         "create WebGpu main_window size={}x{} dpi={}",
                         dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
@@ -1230,7 +1230,7 @@ impl TermWindow {
                         WebGpuState::new(&window, dimensions, &config).await?,
                     ))
                 }
-                _ => None,
+                crate::native_settings::NativeRendererBackend::OpenGL => None,
             };
             myself.config_subscription.replace(config_subscription);
             if config.use_resize_increments {

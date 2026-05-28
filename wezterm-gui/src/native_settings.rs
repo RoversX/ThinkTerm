@@ -79,6 +79,29 @@ impl NativeAppIcon {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NativeRendererBackend {
+    OpenGL,
+    WebGpu,
+}
+
+impl NativeRendererBackend {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OpenGL => "OpenGL",
+            Self::WebGpu => "WebGpu",
+        }
+    }
+
+    pub(crate) fn from_front_end(front_end: config::FrontEndSelection) -> Self {
+        match front_end {
+            config::FrontEndSelection::WebGpu => Self::WebGpu,
+            config::FrontEndSelection::OpenGL | config::FrontEndSelection::Software => Self::OpenGL,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAppearanceSettings {
@@ -114,12 +137,14 @@ pub(crate) struct NativeDeveloperSettings {
 #[serde(default)]
 pub(crate) struct NativeWindowSettings {
     pub(crate) restore_main_window_frame: bool,
+    pub(crate) main_renderer: Option<NativeRendererBackend>,
 }
 
 impl Default for NativeWindowSettings {
     fn default() -> Self {
         Self {
             restore_main_window_frame: true,
+            main_renderer: None,
         }
     }
 }
@@ -300,4 +325,14 @@ pub(crate) fn pane_header_font_size() -> f64 {
         .pane_header_font_size
         .unwrap_or(DEFAULT_PANE_HEADER_FONT_SIZE)
         .clamp(10.0, 28.0)
+}
+
+pub(crate) fn main_window_renderer(
+    settings: &ThinkTermNativeSettings,
+    config_front_end: config::FrontEndSelection,
+) -> NativeRendererBackend {
+    settings
+        .window
+        .main_renderer
+        .unwrap_or_else(|| NativeRendererBackend::from_front_end(config_front_end))
 }

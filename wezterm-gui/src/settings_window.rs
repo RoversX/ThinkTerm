@@ -31,8 +31,9 @@ use window::{
 };
 
 use crate::native_settings::{
-    NativeAppIcon, NativeThemeMode, ThinkTermNativeSettings, DEFAULT_PANE_HEADER_FONT_SIZE,
-    DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE, DEFAULT_TAB_FONT_SIZE,
+    NativeAppIcon, NativeRendererBackend, NativeThemeMode, ThinkTermNativeSettings,
+    DEFAULT_PANE_HEADER_FONT_SIZE, DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE,
+    DEFAULT_TAB_FONT_SIZE,
 };
 
 const DEFAULT_WIDTH: usize = 1840;
@@ -122,6 +123,11 @@ impl SettingsSection {
                 "Theme Mode",
                 "Native Settings",
                 "Restore Main Window Frame",
+                "Main Window Renderer",
+                "Renderer Backend",
+                "OpenGL",
+                "WebGpu",
+                "Restart",
                 "Window Size",
                 "Window Position",
                 "Configuration",
@@ -208,6 +214,9 @@ enum SettingsAction {
     SetThemeMode(NativeThemeMode),
     ToggleAppIconMenu,
     SetAppIcon(NativeAppIcon),
+    ToggleMainRendererMenu,
+    SetMainRenderer(NativeRendererBackend),
+    RestartApplication,
     SearchInput,
     DecreaseFontSize,
     IncreaseFontSize,
@@ -234,6 +243,7 @@ enum SettingsDrag {
 enum SettingsDropdown {
     ThemeMode,
     AppIcon,
+    MainRenderer,
 }
 
 #[derive(Debug, Clone)]
@@ -796,6 +806,7 @@ struct SettingsWindow {
     appearance: Appearance,
     selected: SettingsSection,
     native_settings: ThinkTermNativeSettings,
+    active_main_renderer: NativeRendererBackend,
     ui: SettingsUiState,
     ui_context: UiContext<SettingsAction>,
     status: String,
@@ -807,6 +818,8 @@ impl SettingsWindow {
         let dpi = window::default_dpi() as usize;
         let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
         let native_settings = Self::load_native_settings();
+        let active_main_renderer =
+            crate::native_settings::main_window_renderer(&native_settings, config.front_end);
         let settings_font_size = crate::native_settings::settings_font_size(&native_settings);
         let settings_font_weight = crate::native_settings::settings_font_weight(&native_settings);
         let title_font = fonts
@@ -850,6 +863,7 @@ impl SettingsWindow {
             appearance,
             selected: SettingsSection::Appearance,
             native_settings,
+            active_main_renderer,
             ui,
             ui_context: UiContext::default(),
             status: Self::initial_status(),
@@ -1009,7 +1023,9 @@ impl SettingsWindow {
                         SettingsAction::ToggleThemeModeMenu
                         | SettingsAction::SetThemeMode(_)
                         | SettingsAction::ToggleAppIconMenu
-                        | SettingsAction::SetAppIcon(_),
+                        | SettingsAction::SetAppIcon(_)
+                        | SettingsAction::ToggleMainRendererMenu
+                        | SettingsAction::SetMainRenderer(_),
                     ) => {
                         self.ui.interaction.focused = None;
                     }
@@ -1463,6 +1479,17 @@ impl SettingsWindow {
         self.save_native_chrome_settings(ChromeFontArea::Settings);
     }
 
+    fn current_main_renderer(&self) -> NativeRendererBackend {
+        crate::native_settings::main_window_renderer(
+            &self.native_settings,
+            configuration().front_end,
+        )
+    }
+
+    fn main_renderer_restart_required(&self) -> bool {
+        self.current_main_renderer() != self.active_main_renderer
+    }
+
     fn save_native_chrome_settings(&mut self, area: ChromeFontArea) {
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
@@ -1716,6 +1743,40 @@ impl SettingsWindow {
                     }
                     Err(err) => {
                         self.status = format!("Unable to save window restore setting: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::ToggleMainRendererMenu => {
+                self.ui.open_dropdown =
+                    if self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer) {
+                        None
+                    } else {
+                        Some(SettingsDropdown::MainRenderer)
+                    };
+            }
+            SettingsAction::SetMainRenderer(renderer) => {
+                self.native_settings.window.main_renderer = Some(renderer);
+                self.ui.open_dropdown = None;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Main window renderer set to {}; restart ThinkTerm to apply it.",
+                            renderer.label()
+                        );
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to save renderer setting: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::RestartApplication => {
+                self.ui.open_dropdown = None;
+                match Self::restart_application() {
+                    Ok(()) => {
+                        self.status = "Restarting ThinkTerm...".to_string();
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to restart ThinkTerm: {err:#}");
                     }
                 }
             }
@@ -2306,8 +2367,9 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 4);
-        let card_height = self.settings_card_height(4);
+        let row_count = 6;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
+        let card_height = self.settings_card_height(row_count);
         self.ui.content_scroll.set_extents(
             self.content_bottom(),
             self.settings_content_extent(card_y + scroll + card_height),
@@ -2367,10 +2429,11 @@ impl SettingsWindow {
             "Small ThinkTerm-native state; compatible terminal config stays in wezterm.lua.",
             true,
         )?;
+        self.paint_main_renderer_row(layers, row_x, first_row_y + row_step * 3.0, row_width, true)?;
         self.paint_toggle_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 3.0,
+            first_row_y + row_step * 4.0,
             row_width,
             "Restore Main Window Frame",
             "macOS restores the last main terminal window size and position.",
@@ -2378,6 +2441,7 @@ impl SettingsWindow {
             SettingsAction::ToggleMainWindowFrameRestore,
             true,
         )?;
+        self.paint_restart_row(layers, row_x, first_row_y + row_step * 5.0, row_width, true)?;
         Ok(())
     }
 
@@ -4149,6 +4213,141 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn paint_main_renderer_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - 28.0, width)?;
+        }
+
+        let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
+        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let action = SettingsAction::ToggleMainRendererMenu;
+        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        let open = self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            "Main Window Renderer",
+            palette.text,
+            text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y),
+            "Applies to the main terminal window after restart.",
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            control_rect.origin.x,
+            control_rect.origin.y,
+            control_rect.size.width,
+            control_rect.size.height,
+            bg,
+            border,
+            CONTROL_RADIUS,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            control_x + 16.0,
+            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.current_main_renderer().label(),
+            palette.text,
+            control_width - 60.0,
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronDown,
+            control_x + control_width - 38.0,
+            control_y + (CONTROL_HEIGHT - 22.0) / 2.0,
+            22.0,
+            palette.secondary_text,
+        )?;
+
+        Ok(())
+    }
+
+    fn paint_restart_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - 28.0, width)?;
+        }
+
+        let button_label = if self.main_renderer_restart_required() {
+            "Restart ThinkTerm"
+        } else {
+            "Restart"
+        };
+        let button_width = self.button_width_for_label(button_label, 0.0).max(220.0);
+        let button_x = x + width - button_width;
+        let text_width = (button_x - x - 24.0).max(width * 0.45);
+        let value = if self.main_renderer_restart_required() {
+            "Required"
+        } else {
+            "Not required"
+        };
+        self.draw_text(layers, &ui_font, x, y, "Restart", palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y),
+            &format!("Renderer change status: {value}."),
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_button(
+            layers,
+            button_x,
+            y + 4.0,
+            button_width,
+            button_label,
+            SettingsAction::RestartApplication,
+        )?;
+
+        Ok(())
+    }
+
     fn theme_mode_control_geometry(&self, x: f32, y: f32, width: f32) -> (f32, f32, f32) {
         self.dropdown_control_geometry(x, y, width)
     }
@@ -4175,20 +4374,29 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let card_padding = 36.0;
         let section_y = CONTENT_SECTION_Y - scroll;
-        let (_, first_row_y) = self.settings_card_geometry(section_y, 4);
+        let row_count = match self.selected {
+            SettingsSection::General => 6,
+            SettingsSection::Appearance => 4,
+            _ => 4,
+        };
+        let (_, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let (row_x, row_y, row_width) = match self.selected {
             SettingsSection::Appearance => {
                 let row_y = match dropdown {
                     SettingsDropdown::ThemeMode => first_row_y,
                     SettingsDropdown::AppIcon => first_row_y + self.settings_row_step(),
+                    SettingsDropdown::MainRenderer => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
-            SettingsSection::General if dropdown == SettingsDropdown::ThemeMode => (
-                x + card_padding,
-                first_row_y + self.settings_row_step() * 2.0,
-                max_width - card_padding * 2.0,
-            ),
+            SettingsSection::General => {
+                let row_y = match dropdown {
+                    SettingsDropdown::ThemeMode => first_row_y + self.settings_row_step() * 2.0,
+                    SettingsDropdown::MainRenderer => first_row_y + self.settings_row_step() * 3.0,
+                    SettingsDropdown::AppIcon => return Ok(()),
+                };
+                (x + card_padding, row_y, max_width - card_padding * 2.0)
+            }
             _ => return Ok(()),
         };
         let (control_x, control_y, control_width) =
@@ -4201,6 +4409,12 @@ impl SettingsWindow {
                 control_width,
             ),
             SettingsDropdown::AppIcon => self.paint_app_icon_menu(
+                layers,
+                control_x,
+                control_y + CONTROL_HEIGHT + 8.0,
+                control_width,
+            ),
+            SettingsDropdown::MainRenderer => self.paint_main_renderer_menu(
                 layers,
                 control_x,
                 control_y + CONTROL_HEIGHT + 8.0,
@@ -4253,6 +4467,29 @@ impl SettingsWindow {
                 NativeAppIcon::Simple.label(),
                 SettingsAction::SetAppIcon(NativeAppIcon::Simple),
                 self.native_settings.appearance.app_icon == NativeAppIcon::Simple,
+            ),
+        ];
+        self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
+    fn paint_main_renderer_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<()> {
+        let current = self.current_main_renderer();
+        let options = [
+            (
+                NativeRendererBackend::OpenGL.label(),
+                SettingsAction::SetMainRenderer(NativeRendererBackend::OpenGL),
+                current == NativeRendererBackend::OpenGL,
+            ),
+            (
+                NativeRendererBackend::WebGpu.label(),
+                SettingsAction::SetMainRenderer(NativeRendererBackend::WebGpu),
+                current == NativeRendererBackend::WebGpu,
             ),
         ];
         self.paint_dropdown_menu(layers, x, y, width, &options)
@@ -4985,6 +5222,21 @@ impl SettingsWindow {
             Ok(url) => wezterm_open_url::open_url(url.as_str()),
             Err(_) => log::error!("Unable to convert {} into a file URL", path.display()),
         }
+    }
+
+    fn restart_application() -> anyhow::Result<()> {
+        let exe = std::env::current_exe().context("resolve current executable")?;
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        let mut command = Command::new(exe);
+        command.args(args);
+        if let Ok(cwd) = std::env::current_dir() {
+            command.current_dir(cwd);
+        }
+        command.spawn().context("spawn replacement ThinkTerm")?;
+        if let Some(conn) = Connection::get() {
+            conn.terminate_message_loop();
+        }
+        Ok(())
     }
 }
 
