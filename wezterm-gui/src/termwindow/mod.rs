@@ -47,8 +47,8 @@ use mux::pane::{
 };
 use mux::renderable::RenderableDimensions;
 use mux::tab::{
-    PaneStackId, PositionedPane, PositionedSplit, SplitDirection, SplitRequest,
-    SplitSize as MuxSplitSize, Tab, TabId,
+    CollapsedPaneLayout, PaneStackId, PositionedPane, PositionedSplit, SplitDirection,
+    SplitRequest, SplitSize as MuxSplitSize, Tab, TabId,
 };
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
@@ -70,6 +70,16 @@ use wezterm_font::FontConfiguration;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
+
+fn gpu_debug_enabled() -> bool {
+    std::env::var_os("THINKTERM_GPU_DEBUG").is_some()
+}
+
+fn gpu_debug(message: impl AsRef<str>) {
+    if gpu_debug_enabled() {
+        log::info!("[gpu-resource] {}", message.as_ref());
+    }
+}
 
 pub mod background;
 pub mod box_model;
@@ -220,6 +230,7 @@ pub enum UIItemType {
     WorkspaceSidebarResize,
     WorkspaceSidebarSettings,
     WorkspaceSidebarViewOptions,
+    WorkspaceSidebarNotifications,
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
@@ -232,6 +243,8 @@ pub enum PaneNavAction {
     Activate(PaneId),
     Close(PaneId),
     NewTab,
+    ToggleZoom,
+    ToggleCollapse,
     SplitRight,
     SplitDown,
 }
@@ -647,6 +660,7 @@ pub struct TermWindow {
     tab_bar_scroll_target: f32,
     pane_nav_tab_scroll_offsets: HashMap<PaneId, f32>,
     pane_nav_tab_scroll_targets: HashMap<PaneId, f32>,
+    collapsed_pane_layouts: HashMap<PaneStackId, CollapsedPaneLayout>,
     tab_wheel_surface_lock: Option<(TabWheelSurface, Instant)>,
     tab_wheel_direction_lock: Option<(TabWheelSurface, i16, Instant)>,
     inline_tab_rename: Option<InlineTabRename>,
@@ -731,6 +745,62 @@ pub struct TermWindow {
 }
 
 impl TermWindow {
+    pub(crate) fn memory_resource_lines(&self, label: &str) -> Vec<String> {
+        let backend = if self.webgpu.is_some() {
+            "WebGpu"
+        } else if self.gl.is_some() {
+            "OpenGL"
+        } else {
+            "none"
+        };
+        let tab_count = Mux::get()
+            .get_window(self.mux_window_id)
+            .map(|window| window.len())
+            .unwrap_or(0);
+        let mut lines = vec![format!(
+            "{label}: backend={backend} size={}x{} dpi={} panes={} tabs={}",
+            self.dimensions.pixel_width,
+            self.dimensions.pixel_height,
+            self.dimensions.dpi,
+            self.get_panes_to_render().len(),
+            tab_count
+        )];
+
+        if let Some(render_state) = self.render_state.as_ref() {
+            let stats = render_state.stats();
+            lines.push(format!(
+                "{label}: render_backend={} atlas={} glyphs={} svg_icons={} rotated_icons={} images={} frames={} blocks={} colors={} cursor_glyphs={}",
+                stats.backend,
+                stats.atlas_size,
+                stats.glyphs,
+                stats.svg_icons,
+                stats.rotated_svg_icons,
+                stats.decoded_images,
+                stats.image_frames,
+                stats.block_glyphs,
+                stats.color_sprites,
+                stats.cursor_glyphs,
+            ));
+            lines.push(format!(
+                "{label}: layers={} vertex_buffers={} quad_capacity={} line_glyphs={}",
+                stats.layers, stats.vertex_buffers, stats.layer_quads, stats.line_glyphs
+            ));
+        } else {
+            lines.push(format!("{label}: render_state=none"));
+        }
+
+        lines.push(format!(
+            "{label}: caches shape={} line_state={} line_quad={} line_to_element_shape={} pane_font={} semantic_zones={}",
+            self.shape_cache.borrow().len(),
+            self.line_state_cache.borrow().len(),
+            self.line_quad_cache.borrow().len(),
+            self.line_to_ele_shape_cache.borrow().len(),
+            self.pane_font_cache.borrow().len(),
+            self.semantic_zones.len(),
+        ));
+        lines
+    }
+
     fn load_os_parameters(&mut self) {
         if let Some(ref window) = self.window {
             self.os_parameters = match window.get_os_parameters(&self.config, self.window_state) {
@@ -985,6 +1055,7 @@ impl TermWindow {
             tab_bar_scroll_target: 0.0,
             pane_nav_tab_scroll_offsets: HashMap::new(),
             pane_nav_tab_scroll_targets: HashMap::new(),
+            collapsed_pane_layouts: HashMap::new(),
             tab_wheel_surface_lock: None,
             tab_wheel_direction_lock: None,
             inline_tab_rename: None,
@@ -1138,15 +1209,27 @@ impl TermWindow {
 
         let gl = match config.front_end {
             FrontEndSelection::WebGpu => None,
-            _ => Some(window.enable_opengl().await?),
+            _ => {
+                gpu_debug(format!(
+                    "enable OpenGL main_window size={}x{} dpi={}",
+                    dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
+                ));
+                Some(window.enable_opengl().await?)
+            }
         };
 
         {
             let mut myself = tw.borrow_mut();
             let webgpu = match config.front_end {
-                FrontEndSelection::WebGpu => Some(Rc::new(
-                    WebGpuState::new(&window, dimensions, &config).await?,
-                )),
+                FrontEndSelection::WebGpu => {
+                    gpu_debug(format!(
+                        "create WebGpu main_window size={}x{} dpi={}",
+                        dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
+                    ));
+                    Some(Rc::new(
+                        WebGpuState::new(&window, dimensions, &config).await?,
+                    ))
+                }
                 _ => None,
             };
             myself.config_subscription.replace(config_subscription);
@@ -1704,7 +1787,9 @@ impl TermWindow {
 
     fn apply_icon(window: &Window) -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
-        if let Some(path) = Self::macos_application_icon_path() {
+        if let Some(path) = crate::native_settings::app_icon_path(
+            crate::native_settings::load().appearance.app_icon,
+        ) {
             match ::window::set_application_icon_from_file(&path) {
                 Ok(()) => return Ok(()),
                 Err(err) => log::warn!(
@@ -1723,23 +1808,6 @@ impl TermWindow {
             image.as_raw(),
         ));
         Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn macos_application_icon_path() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        let exe_dir = exe.parent()?;
-        let mut candidates = vec![exe_dir.join("ThinkTerm.icns")];
-
-        if let Some(contents_dir) = exe_dir.parent() {
-            candidates.push(contents_dir.join("Resources").join("ThinkTerm.icns"));
-        }
-
-        if let Some(repo_dir) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent() {
-            candidates.push(repo_dir.join("assets").join("icon").join("ThinkTerm.icns"));
-        }
-
-        candidates.into_iter().find(|path| path.exists())
     }
 
     fn schedule_status_update(&self) {
@@ -3185,6 +3253,7 @@ impl TermWindow {
             }
             SplitHorizontal(spawn) => {
                 log::trace!("SplitHorizontal {:?}", spawn);
+                self.restore_collapsed_panes_for_active_tab();
                 self.spawn_command(
                     spawn,
                     SpawnWhere::SplitPane(SplitRequest {
@@ -3197,6 +3266,7 @@ impl TermWindow {
             }
             SplitVertical(spawn) => {
                 log::trace!("SplitVertical {:?}", spawn);
+                self.restore_collapsed_panes_for_active_tab();
                 self.spawn_command(
                     spawn,
                     SpawnWhere::SplitPane(SplitRequest {
@@ -3719,6 +3789,7 @@ impl TermWindow {
             }
             SplitPane(split) => {
                 log::trace!("SplitPane {:?}", split);
+                self.restore_collapsed_panes_for_active_tab();
                 self.spawn_command(
                     &split.command,
                     SpawnWhere::SplitPane(SplitRequest {
@@ -3776,6 +3847,62 @@ impl TermWindow {
             Confirmation(args) => self.show_confirmation(args),
         };
         Ok(PerformAssignmentResult::Handled)
+    }
+
+    fn restore_collapsed_panes_for_active_tab(&mut self) {
+        if self.collapsed_pane_layouts.is_empty() {
+            return;
+        }
+
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            self.collapsed_pane_layouts.clear();
+            return;
+        };
+
+        let layouts: Vec<_> = self
+            .collapsed_pane_layouts
+            .drain()
+            .map(|(_, layout)| layout)
+            .collect();
+        for layout in layouts {
+            if !tab.restore_collapsed_pane(layout) {
+                self.collapsed_pane_layouts
+                    .insert(layout.pane_stack_id, layout);
+            }
+        }
+    }
+
+    pub(crate) fn reapply_collapsed_panes_for_window(&mut self) {
+        if self.collapsed_pane_layouts.is_empty() {
+            return;
+        }
+
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            self.collapsed_pane_layouts.clear();
+            return;
+        };
+
+        let min_cells = self.collapsed_pane_min_cells();
+        let layouts: Vec<_> = self.collapsed_pane_layouts.values().copied().collect();
+        for layout in layouts {
+            let mut found_stack = false;
+            for tab in window.iter() {
+                let contains_stack = tab
+                    .iter_panes_ignoring_zoom()
+                    .into_iter()
+                    .any(|pane| pane.pane_stack_id == layout.pane_stack_id);
+                if contains_stack {
+                    found_stack = true;
+                    tab.reapply_collapsed_pane(layout, min_cells);
+                    break;
+                }
+            }
+
+            if !found_stack {
+                self.collapsed_pane_layouts.remove(&layout.pane_stack_id);
+            }
+        }
     }
 
     fn do_open_link_at_mouse_cursor(&self, pane: &Arc<dyn Pane>) {
@@ -4282,6 +4409,19 @@ impl TermWindow {
 
 impl Drop for TermWindow {
     fn drop(&mut self) {
+        gpu_debug(format!(
+            "drop main_window backend={} size={}x{} dpi={}",
+            if self.webgpu.is_some() {
+                "WebGpu"
+            } else if self.gl.is_some() {
+                "OpenGL"
+            } else {
+                "none"
+            },
+            self.dimensions.pixel_width,
+            self.dimensions.pixel_height,
+            self.dimensions.dpi
+        ));
         self.clear_all_overlays();
         if let Some(window) = self.window.take() {
             if let Some(fe) = try_front_end() {

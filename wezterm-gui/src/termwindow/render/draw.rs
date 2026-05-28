@@ -1,5 +1,5 @@
 use crate::colorease::ColorEaseUniform;
-use crate::renderstate::RenderState;
+use crate::renderstate::{LoggedSrgbTexture2d, RenderState};
 use crate::termwindow::webgpu::{ShaderUniform, WebGpuState, WebGpuTexture};
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
@@ -180,7 +180,13 @@ impl crate::TermWindow {
 
         let gl_state = self.render_state.as_ref().unwrap();
         let tex = gl_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex.downcast_ref::<SrgbTexture2d>().unwrap();
+        let tex = if let Some(tex) = tex.downcast_ref::<SrgbTexture2d>() {
+            tex
+        } else {
+            tex.downcast_ref::<LoggedSrgbTexture2d>()
+                .expect("OpenGL texture atlas")
+                .inner()
+        };
 
         frame.clear_color(0., 0., 0., 0.);
 

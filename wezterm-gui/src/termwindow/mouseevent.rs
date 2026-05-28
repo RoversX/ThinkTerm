@@ -40,6 +40,13 @@ const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
 
 impl super::TermWindow {
+    pub(crate) fn collapsed_pane_min_cells(&self) -> usize {
+        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics);
+        let cell_height = self.render_metrics.cell_size.height.max(1) as usize;
+
+        nav_height.div_ceil(cell_height).max(2)
+    }
+
     fn tab_scroll_pixels(amount: i16) -> f32 {
         let steps = amount.unsigned_abs().max(1) as f32;
         let delta = (steps * 56.0).min(280.0);
@@ -577,6 +584,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
             | UIItemType::WorkspaceSidebarViewOptions
+            | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -603,6 +611,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
             | UIItemType::WorkspaceSidebarViewOptions
+            | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -1120,6 +1129,9 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarViewOptions => {
                 self.mouse_event_workspace_sidebar_view_options(item, event, context);
             }
+            UIItemType::WorkspaceSidebarNotifications => {
+                context.set_cursor(Some(MouseCursor::Hand));
+            }
         }
     }
 
@@ -1561,6 +1573,13 @@ impl super::TermWindow {
         match action {
             PaneNavAction::Background => {
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    if tab
+                        .pane_stack_id(pane_id)
+                        .is_some_and(|stack_id| self.collapsed_pane_layouts.contains_key(&stack_id))
+                    {
+                        context.invalidate();
+                        return;
+                    }
                     tab.set_active_idx(pane_index);
                 }
                 if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
@@ -1568,11 +1587,29 @@ impl super::TermWindow {
                 }
             }
             PaneNavAction::Activate(target_pane_id) => {
+                if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    if let Some(stack_id) = tab.pane_stack_id(target_pane_id) {
+                        if let Some(layout) = self.collapsed_pane_layouts.remove(&stack_id) {
+                            if !tab.restore_collapsed_pane(layout) {
+                                self.collapsed_pane_layouts.insert(stack_id, layout);
+                                context.invalidate();
+                                return;
+                            }
+                        }
+                    }
+                }
                 if let Err(err) = mux.activate_pane_in_stack(target_pane_id) {
                     log::error!("pane nav activate failed: {err:#}");
                 }
             }
             PaneNavAction::Close(target_pane_id) => {
+                if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    if tab.pane_stack_tabs(target_pane_id).len() <= 1 {
+                        if let Some(stack_id) = tab.pane_stack_id(target_pane_id) {
+                            self.collapsed_pane_layouts.remove(&stack_id);
+                        }
+                    }
+                }
                 if let Some(pane) = mux.get_pane(target_pane_id) {
                     self.close_pane(pane, true);
                 }
@@ -1583,8 +1620,70 @@ impl super::TermWindow {
                 }
                 self.spawn_pane_nav_tab(pane_id, pane_index);
             }
+            PaneNavAction::ToggleZoom => {
+                if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    tab.set_active_idx(pane_index);
+                    tab.toggle_zoom();
+                }
+            }
+            PaneNavAction::ToggleCollapse => {
+                if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    let Some(stack_id) = tab.pane_stack_id(pane_id) else {
+                        context.invalidate();
+                        return;
+                    };
+                    if let Some(layout) = self.collapsed_pane_layouts.remove(&stack_id) {
+                        if !tab.restore_collapsed_pane(layout) {
+                            self.collapsed_pane_layouts.insert(stack_id, layout);
+                            context.invalidate();
+                            return;
+                        }
+                        tab.set_active_idx(pane_index);
+                    } else {
+                        tab.set_active_idx(pane_index);
+                        let can_collapse_direction = tab.pane_split_direction_by_index(pane_index)
+                            == Some(SplitDirection::Vertical);
+                        if can_collapse_direction {
+                            let panes = tab.iter_panes_ignoring_zoom();
+                            let has_collapsed_stack = panes.iter().any(|pane| {
+                                self.collapsed_pane_layouts
+                                    .contains_key(&pane.pane_stack_id)
+                            });
+                            let has_another_visible_stack =
+                                panes.into_iter().any(|pane| pane.pane_stack_id != stack_id);
+                            if !has_collapsed_stack && has_another_visible_stack {
+                                if let Some(layout) = tab.collapse_pane_by_index(
+                                    pane_index,
+                                    self.collapsed_pane_min_cells(),
+                                ) {
+                                    let collapsed_stack_id = layout.pane_stack_id;
+                                    self.collapsed_pane_layouts
+                                        .insert(collapsed_stack_id, layout);
+                                    if let Some(visible_pane) =
+                                        tab.iter_panes_ignoring_zoom().into_iter().find(|pane| {
+                                            pane.pane_stack_id != collapsed_stack_id
+                                                && !self
+                                                    .collapsed_pane_layouts
+                                                    .contains_key(&pane.pane_stack_id)
+                                        })
+                                    {
+                                        tab.set_active_idx(visible_pane.index);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             PaneNavAction::SplitRight | PaneNavAction::SplitDown => {
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    if tab
+                        .pane_stack_id(pane_id)
+                        .is_some_and(|stack_id| self.collapsed_pane_layouts.contains_key(&stack_id))
+                    {
+                        context.invalidate();
+                        return;
+                    }
                     tab.set_active_idx(pane_index);
                 }
                 let pane = match mux.get_pane(pane_id) {
@@ -1617,6 +1716,12 @@ impl super::TermWindow {
             Some(tab) => tab,
             None => return,
         };
+        if tab
+            .pane_stack_id(pane_id)
+            .is_some_and(|stack_id| self.collapsed_pane_layouts.contains_key(&stack_id))
+        {
+            return;
+        }
         let panes = tab.iter_panes_ignoring_zoom();
         let pos = panes
             .iter()
@@ -2153,6 +2258,11 @@ impl super::TermWindow {
         } else {
             false
         };
+
+        if matches!(event.kind, WMEK::Press(_)) && self.acknowledge_active_workspace_session_work()
+        {
+            context.invalidate();
+        }
 
         if self.focused.is_some() && !is_focused {
             if matches!(&event.kind, WMEK::Press(_))

@@ -5,9 +5,11 @@ use window::Image;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SvgIcon {
     Archive,
+    Bell,
     ChevronDown,
     ChevronRight,
     Cloud,
+    Expand,
     ExternalLink,
     Folder,
     FolderOpen,
@@ -17,7 +19,9 @@ pub enum SvgIcon {
     Keyboard,
     Loader,
     LoaderCircle,
+    Maximize2,
     MemoryStick,
+    Minimize2,
     Minus,
     Palette,
     PanelLeft,
@@ -33,8 +37,10 @@ pub enum SvgIcon {
     Settings,
     SlidersHorizontal,
     SlidersVertical,
+    Shrink,
     CircleAlert,
     CircleCheck,
+    CirclePlus,
     SquareTerminal,
     SplitHorizontal,
     SplitVertical,
@@ -47,6 +53,7 @@ impl SvgIcon {
     pub fn bytes(self) -> &'static [u8] {
         match self {
             Self::Archive => include_bytes!("../../../../third_party/lucide/icons/archive.svg"),
+            Self::Bell => include_bytes!("../../../../third_party/lucide/icons/bell.svg"),
             Self::ChevronDown => {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-down.svg")
             }
@@ -54,6 +61,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-right.svg")
             }
             Self::Cloud => include_bytes!("../../../../third_party/lucide/icons/cloud.svg"),
+            Self::Expand => include_bytes!("../../../../third_party/lucide/icons/expand.svg"),
             Self::ExternalLink => {
                 include_bytes!("../../../../third_party/lucide/icons/external-link.svg")
             }
@@ -71,8 +79,14 @@ impl SvgIcon {
             Self::LoaderCircle => {
                 include_bytes!("../../../../third_party/lucide/icons/loader-circle.svg")
             }
+            Self::Maximize2 => {
+                include_bytes!("../../../../third_party/lucide/icons/maximize-2.svg")
+            }
             Self::MemoryStick => {
                 include_bytes!("../../../../third_party/lucide/icons/memory-stick.svg")
+            }
+            Self::Minimize2 => {
+                include_bytes!("../../../../third_party/lucide/icons/minimize-2.svg")
             }
             Self::Minus => include_bytes!("../../../../third_party/lucide/icons/minus.svg"),
             Self::Palette => include_bytes!("../../../../third_party/lucide/icons/palette.svg"),
@@ -105,11 +119,15 @@ impl SvgIcon {
             Self::SlidersVertical => {
                 include_bytes!("../../../../third_party/lucide/icons/sliders-vertical.svg")
             }
+            Self::Shrink => include_bytes!("../../../../third_party/lucide/icons/shrink.svg"),
             Self::CircleAlert => {
                 include_bytes!("../../../../third_party/lucide/icons/circle-alert.svg")
             }
             Self::CircleCheck => {
                 include_bytes!("../../../../third_party/lucide/icons/circle-check.svg")
+            }
+            Self::CirclePlus => {
+                include_bytes!("../../../../third_party/lucide/icons/circle-plus.svg")
             }
             Self::SquareTerminal => {
                 include_bytes!("../../../../third_party/lucide/icons/square-terminal.svg")
@@ -143,7 +161,7 @@ impl SvgIcon {
         let mut transform = resvg::tiny_skia::Transform::from_translate(translate_x, translate_y)
             .pre_scale(scale, scale);
         if degrees != 0.0 {
-            transform = transform.pre_rotate_at(degrees, size as f32 / 2.0, size as f32 / 2.0);
+            transform = transform.post_rotate_at(degrees, size as f32 / 2.0, size as f32 / 2.0);
         }
 
         let mut pixmap = resvg::tiny_skia::Pixmap::new(size as u32, size as u32)
@@ -162,10 +180,12 @@ mod tests {
     fn svg_icons_rasterize() {
         for icon in [
             SvgIcon::Archive,
+            SvgIcon::Bell,
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,
             SvgIcon::ChevronRight,
             SvgIcon::Cloud,
+            SvgIcon::Expand,
             SvgIcon::Folder,
             SvgIcon::FolderOpen,
             SvgIcon::FolderPlus,
@@ -174,7 +194,9 @@ mod tests {
             SvgIcon::Keyboard,
             SvgIcon::Loader,
             SvgIcon::LoaderCircle,
+            SvgIcon::Maximize2,
             SvgIcon::Minus,
+            SvgIcon::Minimize2,
             SvgIcon::Palette,
             SvgIcon::PanelLeft,
             SvgIcon::PanelLeftClose,
@@ -189,8 +211,10 @@ mod tests {
             SvgIcon::Settings,
             SvgIcon::SlidersHorizontal,
             SvgIcon::SlidersVertical,
+            SvgIcon::Shrink,
             SvgIcon::CircleAlert,
             SvgIcon::CircleCheck,
+            SvgIcon::CirclePlus,
             SvgIcon::SquareTerminal,
             SvgIcon::SplitHorizontal,
             SvgIcon::SplitVertical,

@@ -50,10 +50,40 @@ impl NativeThemeMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NativeAppIcon {
+    Default,
+    Simple,
+}
+
+impl Default for NativeAppIcon {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl NativeAppIcon {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Simple => "Simple",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Default => "ThinkTerm.icns",
+            Self::Simple => "ThinkTerm_simple.icns",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAppearanceSettings {
     pub(crate) theme_mode: NativeThemeMode,
+    pub(crate) app_icon: NativeAppIcon,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -179,6 +209,47 @@ pub(crate) fn apply_to_app(settings: &ThinkTermNativeSettings) {
     if let Some(conn) = Connection::get() {
         conn.set_preferred_appearance(settings.appearance.theme_mode.preferred_app_appearance());
     }
+
+    #[cfg(target_os = "macos")]
+    if let Some(path) = app_icon_path(settings.appearance.app_icon) {
+        if let Err(err) = window::set_application_icon_from_file(&path) {
+            log::warn!(
+                "Unable to apply ThinkTerm app icon {} from {}: {err:#}",
+                settings.appearance.app_icon.label(),
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn app_icon_path(icon: NativeAppIcon) -> Option<PathBuf> {
+    let file_name = icon.file_name();
+    let mut candidates = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join(file_name));
+            if let Some(contents_dir) = exe_dir.parent() {
+                candidates.push(contents_dir.join("Resources").join(file_name));
+            }
+        }
+    }
+
+    if let Some(repo_dir) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent() {
+        candidates.push(repo_dir.join("assets").join("icon").join(file_name));
+        candidates.push(
+            repo_dir
+                .join("assets")
+                .join("macos")
+                .join("ThinkTerm.app")
+                .join("Contents")
+                .join("Resources")
+                .join(file_name),
+        );
+    }
+
+    candidates.into_iter().find(|path| path.exists())
 }
 
 pub(crate) fn settings_font_size(settings: &ThinkTermNativeSettings) -> f64 {

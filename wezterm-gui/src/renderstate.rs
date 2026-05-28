@@ -6,6 +6,7 @@ use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::bitmaps::Texture2d;
 use ::window::glium::backend::Context as GliumContext;
 use ::window::glium::buffer::{BufferMutSlice, Mapping};
+use ::window::glium::texture::SrgbTexture2d;
 use ::window::glium::{
     CapabilitiesSource, IndexBuffer as GliumIndexBuffer, VertexBuffer as GliumVertexBuffer,
 };
@@ -18,6 +19,61 @@ use wezterm_font::FontConfiguration;
 use wgpu::util::DeviceExt;
 
 const INDICES_PER_CELL: usize = 6;
+
+fn gpu_debug_enabled() -> bool {
+    std::env::var_os("THINKTERM_GPU_DEBUG").is_some()
+}
+
+fn gpu_debug(message: impl AsRef<str>) {
+    if gpu_debug_enabled() {
+        log::info!("[gpu-resource] {}", message.as_ref());
+    }
+}
+
+pub(crate) struct LoggedSrgbTexture2d {
+    inner: SrgbTexture2d,
+    label: &'static str,
+}
+
+impl LoggedSrgbTexture2d {
+    pub(crate) fn new(inner: SrgbTexture2d, label: &'static str) -> Self {
+        Self { inner, label }
+    }
+
+    pub(crate) fn inner(&self) -> &SrgbTexture2d {
+        &self.inner
+    }
+}
+
+impl Texture2d for LoggedSrgbTexture2d {
+    fn write(&self, rect: Rect, im: &dyn BitmapImage) {
+        <SrgbTexture2d as Texture2d>::write(&self.inner, rect, im);
+    }
+
+    fn read(&self, rect: Rect, im: &mut dyn BitmapImage) {
+        <SrgbTexture2d as Texture2d>::read(&self.inner, rect, im);
+    }
+
+    fn width(&self) -> usize {
+        <SrgbTexture2d as Texture2d>::width(&self.inner)
+    }
+
+    fn height(&self) -> usize {
+        <SrgbTexture2d as Texture2d>::height(&self.inner)
+    }
+}
+
+impl Drop for LoggedSrgbTexture2d {
+    fn drop(&mut self) {
+        gpu_debug(format!(
+            "drop OpenGL texture label={} size={}x{} bytes={}",
+            self.label,
+            self.width(),
+            self.height(),
+            self.width() * self.height() * 4
+        ));
+    }
+}
 
 #[derive(Clone)]
 pub enum RenderContext {
@@ -56,21 +112,36 @@ impl RenderContext {
         num_quads: usize,
         initializer: &[Vertex],
     ) -> anyhow::Result<VertexBuffer> {
+        let bytes = num_quads * VERTICES_PER_CELL * std::mem::size_of::<Vertex>();
         match self {
-            Self::Glium(context) => Ok(VertexBuffer::Glium(GliumVertexBuffer::dynamic(
-                context,
-                initializer,
-            )?)),
-            Self::WebGpu(state) => Ok(VertexBuffer::WebGpu(WebGpuVertexBuffer::new(
-                num_quads * VERTICES_PER_CELL,
-                state,
-            ))),
+            Self::Glium(context) => {
+                gpu_debug(format!(
+                    "create OpenGL vertex_buffer quads={num_quads} bytes={bytes}"
+                ));
+                Ok(VertexBuffer::Glium(GliumVertexBuffer::dynamic(
+                    context,
+                    initializer,
+                )?))
+            }
+            Self::WebGpu(state) => {
+                gpu_debug(format!(
+                    "create WebGpu vertex_buffer quads={num_quads} bytes={bytes}"
+                ));
+                Ok(VertexBuffer::WebGpu(WebGpuVertexBuffer::new(
+                    num_quads * VERTICES_PER_CELL,
+                    state,
+                )))
+            }
         }
     }
 
     pub fn allocate_texture_atlas(&self, size: usize) -> anyhow::Result<Rc<dyn Texture2d>> {
+        let bytes = size * size * 4;
         match self {
             Self::Glium(context) => {
+                gpu_debug(format!(
+                    "create OpenGL texture_atlas size={size}x{size} bytes={bytes}"
+                ));
                 let caps = context.get_capabilities();
                 // You'd hope that allocating a texture would automatically
                 // include this check, but it doesn't, and instead, the texture
@@ -88,17 +159,21 @@ impl RenderContext {
                         caps.max_texture_size
                     );
                 }
-                use crate::glium::texture::SrgbTexture2d;
-                let surface: Rc<dyn Texture2d> = Rc::new(SrgbTexture2d::empty_with_format(
+                let surface = SrgbTexture2d::empty_with_format(
                     context,
                     glium::texture::SrgbFormat::U8U8U8U8,
                     glium::texture::MipmapsOption::NoMipmap,
                     size as u32,
                     size as u32,
-                )?);
+                )?;
+                let surface: Rc<dyn Texture2d> =
+                    Rc::new(LoggedSrgbTexture2d::new(surface, "Texture Atlas"));
                 Ok(surface)
             }
             Self::WebGpu(state) => {
+                gpu_debug(format!(
+                    "create WebGpu texture_atlas size={size}x{size} bytes={bytes}"
+                ));
                 let texture: Rc<dyn Texture2d> =
                     Rc::new(WebGpuTexture::new(size as u32, size as u32, state)?);
                 Ok(texture)
@@ -144,6 +219,22 @@ impl IndexBuffer {
 pub enum VertexBuffer {
     Glium(GliumVertexBuffer<Vertex>),
     WebGpu(WebGpuVertexBuffer),
+}
+
+impl Drop for VertexBuffer {
+    fn drop(&mut self) {
+        if !gpu_debug_enabled() {
+            return;
+        }
+        match self {
+            Self::Glium(_) => gpu_debug("drop OpenGL vertex_buffer"),
+            Self::WebGpu(vb) => gpu_debug(format!(
+                "drop WebGpu vertex_buffer vertices={} bytes={}",
+                vb.num_vertices,
+                vb.num_vertices * std::mem::size_of::<Vertex>()
+            )),
+        }
+    }
 }
 
 impl VertexBuffer {
@@ -500,9 +591,18 @@ impl RenderLayer {
     }
 
     pub fn reallocate_quads(&self, idx: usize, num_quads: usize) -> anyhow::Result<()> {
+        let old_capacity = self.vb.borrow()[idx].capacity;
+        gpu_debug(format!(
+            "reallocate layer zindex={} vb_idx={idx} old_quads={old_capacity} new_quads={num_quads}",
+            self.zindex
+        ));
         let vb = Self::compute_vertices(&self.context, num_quads)?;
         self.vb.borrow_mut()[idx] = vb;
         Ok(())
+    }
+
+    fn total_quad_capacity(&self) -> usize {
+        self.vb.borrow().iter().map(|vb| vb.capacity).sum()
     }
 
     /// Compute a vertex buffer to hold the quads that comprise the visible
@@ -576,6 +676,24 @@ pub struct RenderState {
     pub util_sprites: UtilSprites,
     pub glyph_prog: Option<glium::Program>,
     pub layers: RefCell<Vec<Rc<RenderLayer>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderStateStats {
+    pub backend: &'static str,
+    pub atlas_size: usize,
+    pub glyphs: usize,
+    pub decoded_images: usize,
+    pub image_frames: usize,
+    pub line_glyphs: usize,
+    pub block_glyphs: usize,
+    pub svg_icons: usize,
+    pub rotated_svg_icons: usize,
+    pub cursor_glyphs: usize,
+    pub color_sprites: usize,
+    pub layers: usize,
+    pub layer_quads: usize,
+    pub vertex_buffers: usize,
 }
 
 impl RenderState {
@@ -716,6 +834,34 @@ impl RenderState {
         self.glyph_cache.borrow_mut().config_changed();
     }
 
+    pub fn stats(&self) -> RenderStateStats {
+        let glyph = self.glyph_cache.borrow().stats();
+        let layers = self.layers.borrow();
+        let layer_quads = layers
+            .iter()
+            .map(|layer| layer.total_quad_capacity())
+            .sum::<usize>();
+        RenderStateStats {
+            backend: match &self.context {
+                RenderContext::Glium(_) => "OpenGL",
+                RenderContext::WebGpu(_) => "WebGpu",
+            },
+            atlas_size: glyph.atlas_size,
+            glyphs: glyph.glyphs,
+            decoded_images: glyph.decoded_images,
+            image_frames: glyph.image_frames,
+            line_glyphs: glyph.line_glyphs,
+            block_glyphs: glyph.block_glyphs,
+            svg_icons: glyph.svg_icons,
+            rotated_svg_icons: glyph.rotated_svg_icons,
+            cursor_glyphs: glyph.cursor_glyphs,
+            color_sprites: glyph.color_sprites,
+            layers: layers.len(),
+            layer_quads,
+            vertex_buffers: layers.len() * 3,
+        }
+    }
+
     pub fn recreate_texture_atlas(
         &mut self,
         fonts: &Rc<FontConfiguration>,
@@ -761,6 +907,7 @@ impl RenderState {
         size: Option<usize>,
     ) -> anyhow::Result<()> {
         let size = size.unwrap_or_else(|| self.glyph_cache.borrow().atlas.size());
+        gpu_debug(format!("recreate texture_atlas requested_size={size}"));
         let mut new_glyph_cache = GlyphCache::new_gl(&self.context, fonts, size)?;
         self.util_sprites = UtilSprites::new(&mut new_glyph_cache, metrics)?;
 

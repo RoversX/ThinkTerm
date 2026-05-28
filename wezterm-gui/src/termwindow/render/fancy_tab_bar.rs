@@ -6,9 +6,9 @@ use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
     TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
     WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
-    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS,
-    WINDOW_TAB_TOP_SPACER,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
+    WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
+    WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType};
 use crate::ui::UiPalette;
@@ -237,14 +237,20 @@ impl crate::TermWindow {
             } else {
                 WINDOW_TAB_LEADING_ACTION_ICON_SIZE
             };
-            let button_size = action_button_size.min(row_height.saturating_sub(4)).max(1);
+            let button_size = if is_sidebar_toggle {
+                action_button_size
+            } else {
+                action_button_size.min(row_height.saturating_sub(4)).max(1)
+            };
             let icon_size = action_icon_size.min(button_size.saturating_sub(2));
 
             if is_sidebar_toggle {
                 let button_y = if self.config.tab_bar_at_bottom {
                     row_y + (row_height.saturating_sub(button_size) / 2)
                 } else {
-                    row_y.saturating_sub(WINDOW_TAB_TOP_SPACER) + SIDEBAR_INSET
+                    row_y.saturating_sub(WINDOW_TAB_TOP_SPACER)
+                        + SIDEBAR_INSET
+                        + WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET
                 };
                 self.paint_window_sidebar_toggle_button(
                     layers,
@@ -298,7 +304,7 @@ impl crate::TermWindow {
                         0.12
                     },
                 ),
-                6.0,
+                SIDEBAR_INSET as f32,
             )
             .context("window sidebar toggle hover")?;
         }

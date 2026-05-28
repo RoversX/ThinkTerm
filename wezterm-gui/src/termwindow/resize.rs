@@ -341,6 +341,23 @@ impl super::TermWindow {
             log::trace!("dimensions didn't change NOP!");
             return;
         }
+        super::gpu_debug(format!(
+            "main_window resize live={} {}x{} -> {}x{} dpi {} -> {} backend={}",
+            live_resizing,
+            self.dimensions.pixel_width,
+            self.dimensions.pixel_height,
+            dimensions.pixel_width,
+            dimensions.pixel_height,
+            self.dimensions.dpi,
+            dimensions.dpi,
+            if self.webgpu.is_some() {
+                "WebGpu"
+            } else if self.gl.is_some() {
+                "OpenGL"
+            } else {
+                "none"
+            }
+        ));
         let last_state = self.window_state;
         self.window_state = window_state;
         self.quad_generation += 1;
@@ -470,6 +487,7 @@ impl super::TermWindow {
                     tab.resize(size);
                 }
             }
+            self.reapply_collapsed_panes_for_window();
             self.sync_pane_font_sizes();
         } else {
             log::trace!("terminal size unchanged; skipping mux tab resize");

@@ -165,7 +165,12 @@ extern "C" fn thinkterm_order_front_standard_about_panel(
         let app_name = nsstring("ThinkTerm");
         let empty_app_version = nsstring("");
         let empty_build_version = nsstring("");
-        let loaded_icon = thinkterm_icon_path().and_then(|path| load_thinkterm_icon(&path));
+        let current_icon: id = msg_send![app, applicationIconImage];
+        let loaded_icon = if current_icon == nil {
+            thinkterm_icon_path().and_then(|path| load_thinkterm_icon(&path))
+        } else {
+            None
+        };
 
         let mut keys = vec![
             NSAboutPanelOptionApplicationName,
@@ -174,13 +179,17 @@ extern "C" fn thinkterm_order_front_standard_about_panel(
         ];
         let mut objects = vec![*app_name, *empty_app_version, *empty_build_version];
 
-        let app_icon = if let Some(icon) = loaded_icon.as_ref() {
+        let app_icon = if current_icon != nil {
+            current_icon
+        } else if let Some(icon) = loaded_icon.as_ref() {
             **icon
         } else {
-            msg_send![app, applicationIconImage]
+            nil
         };
         if app_icon != nil {
-            let () = msg_send![app, setApplicationIconImage: app_icon];
+            if current_icon == nil {
+                let () = msg_send![app, setApplicationIconImage: app_icon];
+            }
             keys.push(NSAboutPanelOptionApplicationIcon);
             objects.push(app_icon);
         }

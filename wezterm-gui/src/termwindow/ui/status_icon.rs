@@ -39,6 +39,25 @@ impl UiStatusKind {
     }
 }
 
+pub fn split_leading_legacy_progress_marker(title: &str) -> Option<&str> {
+    let trimmed = title.trim_start();
+    let mut chars = trimmed.char_indices();
+    let (_, ch) = chars.next()?;
+    if !is_legacy_progress_marker_char(ch) {
+        return None;
+    }
+
+    let marker_end = chars.next().map(|(idx, _)| idx).unwrap_or(trimmed.len());
+    Some(trimmed[marker_end..].trim_start())
+}
+
+fn is_legacy_progress_marker_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2800..=0x28ff | 0xf0130 | 0xf0a9e..=0xf0aa5 | 0xee00..=0xee0b
+    )
+}
+
 impl TermWindow {
     pub(crate) fn paint_ui_icon(
         &self,

@@ -586,7 +586,36 @@ pub struct GlyphCache {
     min_frame_duration: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct GlyphCacheStats {
+    pub atlas_size: usize,
+    pub glyphs: usize,
+    pub decoded_images: usize,
+    pub image_frames: usize,
+    pub line_glyphs: usize,
+    pub block_glyphs: usize,
+    pub svg_icons: usize,
+    pub rotated_svg_icons: usize,
+    pub cursor_glyphs: usize,
+    pub color_sprites: usize,
+}
+
 impl GlyphCache {
+    pub fn stats(&self) -> GlyphCacheStats {
+        GlyphCacheStats {
+            atlas_size: self.atlas.size(),
+            glyphs: self.glyph_cache.len(),
+            decoded_images: self.image_cache.len(),
+            image_frames: self.frame_cache.len(),
+            line_glyphs: self.line_glyphs.len(),
+            block_glyphs: self.block_glyphs.len(),
+            svg_icons: self.svg_icons.len(),
+            rotated_svg_icons: self.rotated_svg_icons.len(),
+            cursor_glyphs: self.cursor_glyphs.len(),
+            color_sprites: self.color.len(),
+        }
+    }
+
     pub fn new_in_memory(fonts: &Rc<FontConfiguration>, size: usize) -> anyhow::Result<Self> {
         let surface: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(size, size));
         let atlas = Atlas::new(&surface).expect("failed to create new texture atlas");

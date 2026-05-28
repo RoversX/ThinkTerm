@@ -11,6 +11,16 @@ use window::raw_window_handle::{
 };
 use window::{BitmapImage, Dimensions, Rect, Window};
 
+fn gpu_debug_enabled() -> bool {
+    std::env::var_os("THINKTERM_GPU_DEBUG").is_some()
+}
+
+fn gpu_debug(message: impl AsRef<str>) {
+    if gpu_debug_enabled() {
+        log::info!("[gpu-resource] {}", message.as_ref());
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShaderUniform {
@@ -145,6 +155,12 @@ impl WebGpuTexture {
         } else {
             vec![]
         };
+        gpu_debug(format!(
+            "create WebGpu texture label=Texture Atlas size={}x{} bytes={}",
+            width,
+            height,
+            width as usize * height as usize * 4
+        ));
         let texture = state.device.create_texture(&wgpu::TextureDescriptor {
             size: wgpu::Extent3d {
                 width,
@@ -165,6 +181,17 @@ impl WebGpuTexture {
             height,
             queue: Arc::clone(&state.queue),
         })
+    }
+}
+
+impl Drop for WebGpuTexture {
+    fn drop(&mut self) {
+        gpu_debug(format!(
+            "drop WebGpu texture label=Texture Atlas size={}x{} bytes={}",
+            self.width,
+            self.height,
+            self.width as usize * self.height as usize * 4
+        ));
     }
 }
 
@@ -381,6 +408,10 @@ impl WebGpuState {
             view_formats,
             desired_maximum_frame_latency: 2,
         };
+        gpu_debug(format!(
+            "configure WebGpu surface initial size={}x{} format={:?} frame_latency={}",
+            config.width, config.height, config.format, config.desired_maximum_frame_latency
+        ));
         surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
@@ -547,15 +578,30 @@ impl WebGpuState {
         if dims == *self.dimensions.borrow() {
             return;
         }
+        let old = *self.dimensions.borrow();
         *self.dimensions.borrow_mut() = dims;
         let mut config = self.config.borrow_mut();
         config.width = dims.pixel_width as u32;
         config.height = dims.pixel_height as u32;
         if config.width > 0 && config.height > 0 {
+            gpu_debug(format!(
+                "resize WebGpu surface {}x{} -> {}x{}",
+                old.pixel_width, old.pixel_height, config.width, config.height
+            ));
             // Avoid reconfiguring with a 0 sized surface, as webgpu will
             // panic in that case
             // <https://github.com/wezterm/wezterm/issues/2881>
             self.surface.configure(&self.device, &config);
         }
+    }
+}
+
+impl Drop for WebGpuState {
+    fn drop(&mut self) {
+        let dims = *self.dimensions.borrow();
+        gpu_debug(format!(
+            "drop WebGpu state surface size={}x{}",
+            dims.pixel_width, dims.pixel_height
+        ));
     }
 }

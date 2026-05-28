@@ -796,6 +796,16 @@ impl super::TermWindow {
         }
 
         let modifiers = window_key.modifiers;
+        let key = self.win_key_code_to_termwiz_key_code(&window_key.key);
+        let should_acknowledge_session_work = window_key.key_is_down
+            && match &key {
+                Key::Code(key) => !key.is_modifier(),
+                Key::Composed(_) => true,
+                Key::None => false,
+            };
+        if should_acknowledge_session_work && self.acknowledge_active_workspace_session_work() {
+            context.invalidate();
+        }
 
         if self.process_key(
             &pane,
@@ -817,8 +827,6 @@ impl super::TermWindow {
         if window_key.key_is_down {
             self.key_table_state.pop_until_unknown();
         }
-
-        let key = self.win_key_code_to_termwiz_key_code(&window_key.key);
 
         match key {
             Key::Code(key) => {

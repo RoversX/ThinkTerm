@@ -9,6 +9,7 @@ use crate::termwindow::render::{
 };
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
+use crate::termwindow::ui::status_icon::{split_leading_legacy_progress_marker, UiStatusKind};
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP,
     PANE_NAV_TAB_RADIUS, PANE_NAV_TAB_TOP_OFFSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
@@ -18,12 +19,12 @@ use crate::termwindow::{PaneNavAction, ScrollHit, UIItem, UIItemType};
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::TextureRect;
-use ::window::DeadKeyStatus;
+use ::window::{DeadKeyStatus, RectF};
 use anyhow::Context;
 use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::PositionedPane;
+use mux::tab::{CollapsedPaneLayout, PositionedPane, SplitDirection};
 use mux::Mux;
 use ordered_float::NotNan;
 use std::rc::Rc;
@@ -67,12 +68,423 @@ impl crate::TermWindow {
         ))
     }
 
+    fn pane_frame_rect(&self, pos: &PositionedPane) -> anyhow::Result<RectF> {
+        let (content_pane_x, pane_y) = self.pane_content_origin(pos)?;
+        let content_pane_width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
+        let content_pane_right = content_pane_x + content_pane_width;
+        let pane_x = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
+            self.tab_bar_left_edge() as f32
+        } else {
+            content_pane_x
+        };
+        let mut height = (pos.height as f32 * self.render_metrics.cell_size.height as f32).max(1.0);
+        if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) && pos.top > 0 {
+            height = height.max(pane_nav_bar_height_for_metrics(self.render_metrics) as f32);
+        }
+
+        Ok(euclid::rect(
+            pane_x,
+            pane_y,
+            (content_pane_right - pane_x).max(1.0),
+            height,
+        ))
+    }
+
+    fn paint_collapsed_pane_nav_bar(
+        &mut self,
+        pos: &PositionedPane,
+        layers: &mut TripleLayerQuadAllocator,
+        layout: CollapsedPaneLayout,
+    ) -> anyhow::Result<usize> {
+        let pane_rect = self.pane_frame_rect(pos)?;
+        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let foreground = chrome.text;
+        let muted_fg = chrome.secondary_text;
+
+        self.filled_rectangle(layers, 0, pane_rect, chrome.sidebar_bg)
+            .context("collapsed pane background")?;
+
+        self.ui_items.push(UIItem {
+            x: pane_rect.origin.x.max(0.0) as usize,
+            y: pane_rect.origin.y.max(0.0) as usize,
+            width: pane_rect.size.width.max(0.0) as usize,
+            height: pane_rect.size.height.max(0.0) as usize,
+            item_type: UIItemType::PaneNav {
+                pane_id: pos.pane.pane_id(),
+                pane_index: pos.index,
+                action: PaneNavAction::Background,
+            },
+        });
+
+        const COLLAPSED_EDGE_PADDING: usize = 8;
+        const COLLAPSED_BUTTON_GAP: usize = 6;
+        const COLLAPSED_SECTION_GAP: usize = 10;
+
+        let tabs = Mux::get().pane_stack_tabs(pos.pane.pane_id());
+        let active_tab = tabs.iter().find(|tab| tab.is_active);
+
+        let is_vertical_strip = layout.split_direction == SplitDirection::Horizontal;
+        if is_vertical_strip {
+            let strip_left = pane_rect.origin.x.max(0.0) as usize;
+            let strip_top = pane_rect.origin.y.max(0.0) as usize;
+            let strip_width = pane_rect.size.width.max(0.0) as usize;
+            let strip_bottom = pane_rect.max_y().max(0.0) as usize;
+            let button_size = (pane_rect.size.width as usize)
+                .saturating_sub(COLLAPSED_EDGE_PADDING * 2)
+                .clamp(24, 30);
+            let icon_size = button_size.saturating_sub(8).clamp(16, 22);
+            let x = strip_left + (strip_width.saturating_sub(button_size) / 2);
+            let mut y = strip_top + COLLAPSED_EDGE_PADDING;
+
+            if let Some(tab) = &active_tab {
+                if y.saturating_add(button_size) <= strip_bottom {
+                    self.fill_rounded_rectangle_with_border(
+                        layers,
+                        1,
+                        euclid::rect(x as f32, y as f32, button_size as f32, button_size as f32),
+                        chrome.control_bg,
+                        chrome.control_border,
+                        PANE_NAV_TAB_RADIUS,
+                        CAPSULE_BORDER_WIDTH,
+                    )
+                    .context("collapsed vertical pane tab chip")?;
+                    self.ui_items.push(UIItem {
+                        x,
+                        y,
+                        width: button_size,
+                        height: button_size,
+                        item_type: UIItemType::PaneNav {
+                            pane_id: pos.pane.pane_id(),
+                            pane_index: pos.index,
+                            action: PaneNavAction::Activate(tab.pane_id),
+                        },
+                    });
+                    self.paint_pane_nav_icon(
+                        layers,
+                        SvgIcon::SquareTerminal,
+                        x + ((button_size.saturating_sub(icon_size)) / 2),
+                        y + ((button_size.saturating_sub(icon_size)) / 2),
+                        icon_size,
+                        foreground,
+                    )?;
+                    y = y.saturating_add(button_size + COLLAPSED_SECTION_GAP);
+                }
+            }
+
+            for (icon, action) in [(SvgIcon::Expand, PaneNavAction::ToggleCollapse)] {
+                if y.saturating_add(button_size) > strip_bottom {
+                    break;
+                }
+                self.paint_pane_nav_icon_button(
+                    layers,
+                    icon,
+                    x,
+                    y,
+                    button_size,
+                    icon_size,
+                    muted_fg,
+                    foreground,
+                    pos,
+                    action,
+                )?;
+                y = y.saturating_add(button_size + COLLAPSED_BUTTON_GAP);
+            }
+            return Ok(pane_rect.size.height.max(0.0) as usize);
+        }
+
+        let strip_left = pane_rect.origin.x.max(0.0) as usize;
+        let strip_right = pane_rect.max_x().max(0.0) as usize;
+        let strip_height = pane_rect.size.height.max(1.0) as usize;
+        let chrome_height = pane_nav_bar_height_for_metrics(self.render_metrics).min(strip_height);
+        let icon_size = chrome_height
+            .saturating_sub(PANE_NAV_INSET * 2)
+            .clamp(20, 24);
+        let action_icon_size = icon_size.saturating_add(2).clamp(icon_size, 26);
+        let button_size = chrome_height
+            .saturating_sub(TAB_VERTICAL_PADDING * 2)
+            .max(action_icon_size);
+        let button_y =
+            pane_rect.origin.y.max(0.0) as usize + (chrome_height.saturating_sub(button_size) / 2);
+        let mut button_x = strip_right.saturating_sub(COLLAPSED_EDGE_PADDING);
+        let actions = [(SvgIcon::Expand, PaneNavAction::ToggleCollapse)];
+        let action_count = actions.len();
+        for (idx, (icon, action)) in actions.iter().copied().enumerate() {
+            button_x = button_x.saturating_sub(button_size);
+            self.paint_pane_nav_icon_button(
+                layers,
+                icon,
+                button_x,
+                button_y,
+                button_size,
+                action_icon_size,
+                muted_fg,
+                foreground,
+                pos,
+                action,
+            )?;
+            if idx + 1 < action_count {
+                button_x = button_x.saturating_sub(COLLAPSED_BUTTON_GAP);
+            }
+        }
+
+        let tab_start = strip_left + COLLAPSED_EDGE_PADDING;
+        let tab_width = self.window_tab_width_pixels().ceil() as usize;
+        let tab_step = tab_width + PANE_NAV_TAB_GAP;
+        let total_tab_width = tabs.len().saturating_mul(tab_width).saturating_add(
+            tabs.len()
+                .saturating_sub(1)
+                .saturating_mul(PANE_NAV_TAB_GAP),
+        );
+        let max_tab_right = button_x.saturating_sub(COLLAPSED_SECTION_GAP);
+        let viewport_width = max_tab_right.saturating_sub(tab_start);
+        let max_scroll = total_tab_width.saturating_sub(viewport_width) as f32;
+        let scroll_offset = self
+            .pane_nav_tab_scroll_offsets
+            .get(&pos.pane_stack_id)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, max_scroll.max(0.0));
+        let suppress_hover = self
+            .current_mouse_event
+            .as_ref()
+            .is_some_and(|event| matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)))
+            || self.tab_wheel_scroll_active();
+        let tab_height = button_size;
+        let tab_y = button_y;
+        let tab_fg = if pos.is_active { foreground } else { muted_fg };
+        for (idx, tab) in tabs.into_iter().enumerate() {
+            if tab_width <= icon_size + PANE_NAV_ICON_GAP + button_size || viewport_width == 0 {
+                break;
+            }
+
+            let virtual_x = idx.saturating_mul(tab_step) as f32;
+            let tab_left = tab_start as f32 + virtual_x - scroll_offset;
+            let tab_right = tab_left + tab_width as f32;
+            if tab_right <= tab_start as f32 || tab_left >= max_tab_right as f32 {
+                continue;
+            }
+
+            let visible_left = tab_left.max(tab_start as f32);
+            let visible_right = tab_right.min(max_tab_right as f32);
+            let visible_width = (visible_right - visible_left).max(0.0);
+            if visible_width <= 1.0 {
+                continue;
+            }
+
+            let selected_tab = tab.is_active;
+            let is_renaming_tab = self.is_renaming_pane_nav_tab(tab.pane_id);
+            let this_tab_fg = if selected_tab { tab_fg } else { muted_fg };
+            let hover_x = visible_left.max(0.0) as usize;
+            let hover_width = visible_width.max(0.0) as usize;
+            let is_hovered = !suppress_hover
+                && self.is_pointer_over_ui_rect(hover_x, tab_y, hover_width, tab_height);
+            let tab_surface_color = if selected_tab {
+                chrome.control_bg
+            } else if is_hovered && !is_renaming_tab {
+                chrome.control_hover_bg
+            } else {
+                foreground.mul_alpha(0.025)
+            };
+            let tab_border_color = if selected_tab {
+                chrome.control_border
+            } else {
+                LinearRgba::TRANSPARENT
+            };
+            self.fill_rounded_rectangle_with_border(
+                layers,
+                1,
+                euclid::rect(visible_left, tab_y as f32, visible_width, tab_height as f32),
+                tab_surface_color,
+                tab_border_color,
+                PANE_NAV_TAB_RADIUS,
+                CAPSULE_BORDER_WIDTH,
+            )
+            .context("collapsed pane nav tab surface")?;
+
+            self.ui_items.push(UIItem {
+                x: visible_left.max(0.0) as usize,
+                y: tab_y,
+                width: visible_width.max(0.0) as usize,
+                height: tab_height,
+                item_type: UIItemType::PaneNav {
+                    pane_id: pos.pane.pane_id(),
+                    pane_index: pos.index,
+                    action: PaneNavAction::Activate(tab.pane_id),
+                },
+            });
+
+            let draw_tab_x = tab_left.max(0.0) as usize;
+            let title_icon_x = draw_tab_x + PANE_NAV_INSET;
+            let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
+            let raw_title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
+            let (title, status) =
+                if let Some(title) = split_leading_legacy_progress_marker(&raw_title) {
+                    (
+                        if title.is_empty() { "Terminal" } else { title },
+                        Some(UiStatusKind::Running),
+                    )
+                } else {
+                    (raw_title.as_str(), None)
+                };
+            if title_icon_x >= tab_start && title_icon_x.saturating_add(icon_size) <= max_tab_right
+            {
+                if let Some(status) = status {
+                    self.paint_status_icon(
+                        layers,
+                        2,
+                        status,
+                        title_icon_x,
+                        title_icon_y,
+                        icon_size,
+                        this_tab_fg,
+                    )?;
+                } else {
+                    self.paint_pane_nav_icon(
+                        layers,
+                        SvgIcon::SquareTerminal,
+                        title_icon_x,
+                        title_icon_y,
+                        icon_size,
+                        this_tab_fg,
+                    )?;
+                }
+            }
+
+            let close_x = draw_tab_x
+                .saturating_add(tab_width)
+                .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
+            let close_slot_reserved = !is_renaming_tab;
+            let show_close = close_slot_reserved && (selected_tab || is_hovered);
+            if show_close
+                && close_x >= tab_start
+                && close_x.saturating_add(button_size) <= max_tab_right
+            {
+                let close_hovered =
+                    self.is_pointer_over_ui_rect(close_x, tab_y, button_size, button_size);
+                if close_hovered {
+                    let hover_alpha = if self.is_pointer_pressing_ui_rect(
+                        close_x,
+                        tab_y,
+                        button_size,
+                        button_size,
+                    ) {
+                        0.20
+                    } else {
+                        0.12
+                    };
+                    let hover_inset = TAB_CLOSE_HOVER_INSET.min(button_size / 2);
+                    let hover_size = button_size.saturating_sub(hover_inset * 2);
+                    self.fill_rounded_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            (close_x + hover_inset) as f32,
+                            (tab_y + hover_inset) as f32,
+                            hover_size as f32,
+                            hover_size as f32,
+                        ),
+                        foreground.mul_alpha(hover_alpha),
+                        TAB_CLOSE_HOVER_RADIUS,
+                    )
+                    .context("collapsed pane nav close hover")?;
+                }
+                self.ui_items.push(UIItem {
+                    x: close_x,
+                    y: tab_y,
+                    width: button_size,
+                    height: button_size,
+                    item_type: UIItemType::PaneNav {
+                        pane_id: pos.pane.pane_id(),
+                        pane_index: pos.index,
+                        action: PaneNavAction::Close(tab.pane_id),
+                    },
+                });
+                self.paint_pane_nav_icon(
+                    layers,
+                    SvgIcon::X,
+                    close_x + ((button_size.saturating_sub(icon_size)) / 2),
+                    title_icon_y,
+                    icon_size,
+                    if close_hovered { foreground } else { muted_fg },
+                )?;
+            }
+
+            let ui_font = self
+                .fonts
+                .title_font_with_size(crate::native_settings::pane_header_font_size())
+                .context("collapsed pane nav title font")?;
+            let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
+            let text_x = title_icon_x + icon_size + PANE_NAV_ICON_GAP;
+            let text_right = if close_slot_reserved {
+                close_x
+            } else {
+                draw_tab_x + tab_width - PANE_NAV_INSET
+            };
+            let text_width = text_right
+                .min(max_tab_right)
+                .saturating_sub(text_x + PANE_NAV_ICON_GAP);
+            let text_y =
+                tab_y + ((tab_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2);
+            if text_x >= tab_start && text_x < max_tab_right && text_width > 0 {
+                let text_fg = if is_renaming_tab {
+                    self.fill_rounded_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            text_x.saturating_sub(3) as f32,
+                            text_y as f32,
+                            text_width.saturating_add(6) as f32,
+                            ui_metrics.cell_size.height as f32,
+                        ),
+                        chrome.selected_bg,
+                        4.0,
+                    )
+                    .context("collapsed pane nav rename selection")?;
+                    chrome.selected_text
+                } else {
+                    this_tab_fg
+                };
+                self.paint_pane_nav_text(
+                    layers, &ui_font, ui_metrics, title, text_x, text_y, text_width, text_fg,
+                )?;
+            }
+        }
+
+        Ok(strip_height)
+    }
+
+    fn can_collapse_pane_stack(&self, pos: &PositionedPane) -> bool {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return false;
+        };
+
+        if tab.pane_split_direction_by_index(pos.index) != Some(SplitDirection::Vertical) {
+            return false;
+        }
+
+        let panes = tab.iter_panes_ignoring_zoom();
+        if panes.iter().any(|pane| {
+            self.collapsed_pane_layouts
+                .contains_key(&pane.pane_stack_id)
+        }) {
+            return false;
+        }
+
+        panes
+            .into_iter()
+            .any(|pane| pane.pane_stack_id != pos.pane_stack_id)
+    }
+
     fn paint_pane_nav_bar(
         &mut self,
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
         _palette: &ColorPalette,
     ) -> anyhow::Result<usize> {
+        if let Some(layout) = self.collapsed_pane_layouts.get(&pos.pane_stack_id).copied() {
+            return self.paint_collapsed_pane_nav_bar(pos, layers, layout);
+        }
+
         let nav_height = self.pane_nav_bar_height(pos);
         if nav_height == 0 {
             return Ok(0);
@@ -118,17 +530,30 @@ impl crate::TermWindow {
         });
 
         let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
+        let action_icon_size = icon_size.saturating_add(2).clamp(icon_size, 26);
         let button_size = nav_height
             .saturating_sub(TAB_VERTICAL_PADDING * 2)
-            .max(icon_size);
+            .max(action_icon_size);
         let button_y = pane_y as usize
             + (nav_height.saturating_sub(button_size) / 2 + PANE_NAV_TAB_TOP_OFFSET)
                 .min(nav_height.saturating_sub(button_size));
         let mut button_x = (pane_x + pane_width) as usize;
-        for (icon, action) in [
+        let mut actions = vec![
             (SvgIcon::SplitVertical, PaneNavAction::SplitDown),
             (SvgIcon::SplitHorizontal, PaneNavAction::SplitRight),
-        ] {
+        ];
+        if self.can_collapse_pane_stack(pos) {
+            actions.push((SvgIcon::Shrink, PaneNavAction::ToggleCollapse));
+        }
+        actions.push((
+            if pos.is_zoomed {
+                SvgIcon::Minimize2
+            } else {
+                SvgIcon::Maximize2
+            },
+            PaneNavAction::ToggleZoom,
+        ));
+        for (icon, action) in actions {
             button_x = button_x.saturating_sub(button_size + PANE_NAV_BUTTON_GAP);
             self.paint_pane_nav_icon_button(
                 layers,
@@ -136,7 +561,7 @@ impl crate::TermWindow {
                 button_x,
                 button_y,
                 button_size,
-                icon_size,
+                action_icon_size,
                 muted_fg,
                 foreground,
                 pos,
@@ -232,16 +657,38 @@ impl crate::TermWindow {
             let draw_tab_x = tab_left.max(0.0) as usize;
             let title_icon_x = draw_tab_x + PANE_NAV_INSET;
             let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
+            let raw_title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
+            let (title, status) =
+                if let Some(title) = split_leading_legacy_progress_marker(&raw_title) {
+                    (
+                        if title.is_empty() { "Terminal" } else { title },
+                        Some(UiStatusKind::Running),
+                    )
+                } else {
+                    (raw_title.as_str(), None)
+                };
             if title_icon_x >= tab_start && title_icon_x.saturating_add(icon_size) <= max_tab_right
             {
-                self.paint_pane_nav_icon(
-                    layers,
-                    SvgIcon::SquareTerminal,
-                    title_icon_x,
-                    title_icon_y,
-                    icon_size,
-                    this_tab_fg,
-                )?;
+                if let Some(status) = status {
+                    self.paint_status_icon(
+                        layers,
+                        2,
+                        status,
+                        title_icon_x,
+                        title_icon_y,
+                        icon_size,
+                        this_tab_fg,
+                    )?;
+                } else {
+                    self.paint_pane_nav_icon(
+                        layers,
+                        SvgIcon::SquareTerminal,
+                        title_icon_x,
+                        title_icon_y,
+                        icon_size,
+                        this_tab_fg,
+                    )?;
+                }
             }
 
             let close_x = draw_tab_x
@@ -318,7 +765,6 @@ impl crate::TermWindow {
                 .saturating_sub(text_x + PANE_NAV_ICON_GAP);
             let text_y =
                 tab_y + ((tab_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2);
-            let title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
             if text_x >= tab_start && text_x < max_tab_right && text_width > 0 {
                 let text_fg = if is_renaming_tab {
                     self.fill_rounded_rectangle(
@@ -339,7 +785,7 @@ impl crate::TermWindow {
                     this_tab_fg
                 };
                 self.paint_pane_nav_text(
-                    layers, &ui_font, ui_metrics, &title, text_x, text_y, text_width, text_fg,
+                    layers, &ui_font, ui_metrics, title, text_x, text_y, text_width, text_fg,
                 )?;
             }
         }
@@ -674,6 +1120,9 @@ impl crate::TermWindow {
         let pane_nav_height = self
             .paint_pane_nav_bar(pos, layers, &palette)
             .context("paint_pane_nav_bar")?;
+        if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
+            return Ok(());
+        }
 
         // TODO: we only have a single scrollbar in a single position.
         // We only update it for the active pane, but we should probably

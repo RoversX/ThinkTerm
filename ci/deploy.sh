@@ -33,6 +33,7 @@ case $OSTYPE in
     rm $zipdir/ThinkTerm.app/*.dylib
     mkdir -p $zipdir/ThinkTerm.app/Contents/MacOS
     mkdir -p $zipdir/ThinkTerm.app/Contents/Resources
+    cp assets/icon/ThinkTerm_simple.icns $zipdir/ThinkTerm.app/Contents/Resources/ThinkTerm_simple.icns
     cp -r assets/shell-integration/* $zipdir/ThinkTerm.app/Contents/Resources
     cp -r assets/shell-completion $zipdir/ThinkTerm.app/Contents/Resources
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo

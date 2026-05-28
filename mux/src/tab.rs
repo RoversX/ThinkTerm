@@ -220,6 +220,14 @@ pub struct PositionedPane {
     pub pane: Arc<dyn Pane>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollapsedPaneLayout {
+    pub pane_stack_id: PaneStackId,
+    pub split_direction: SplitDirection,
+    pub active_is_second: bool,
+    pub active_cells_before: usize,
+}
+
 impl std::fmt::Debug for PositionedPane {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         fmt.debug_struct("PositionedPane")
@@ -778,6 +786,10 @@ impl Tab {
         self.inner.lock().pane_stack_id(pane_id)
     }
 
+    pub fn pane_split_direction_by_index(&self, pane_index: usize) -> Option<SplitDirection> {
+        self.inner.lock().pane_split_direction_by_index(pane_index)
+    }
+
     pub fn pane_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
         self.inner.lock().pane_index_for_pane(pane_id)
     }
@@ -839,6 +851,24 @@ impl Tab {
     /// their panes are resized accordingly.
     pub fn resize_split_by(&self, split_index: usize, delta: isize) {
         self.inner.lock().resize_split_by(split_index, delta)
+    }
+
+    pub fn collapse_pane_by_index(
+        &self,
+        pane_index: usize,
+        min_cells: usize,
+    ) -> Option<CollapsedPaneLayout> {
+        self.inner
+            .lock()
+            .collapse_pane_by_index(pane_index, min_cells)
+    }
+
+    pub fn restore_collapsed_pane(&self, layout: CollapsedPaneLayout) -> bool {
+        self.inner.lock().restore_collapsed_pane(layout)
+    }
+
+    pub fn reapply_collapsed_pane(&self, layout: CollapsedPaneLayout, min_cells: usize) -> bool {
+        self.inner.lock().reapply_collapsed_pane(layout, min_cells)
     }
 
     /// Adjusts the size of the active pane in the specified direction
@@ -1223,6 +1253,40 @@ impl TabInner {
         }
 
         pane_stack_id
+    }
+
+    fn pane_split_direction_by_index(&mut self, pane_index: usize) -> Option<SplitDirection> {
+        if self.zoomed.is_some() {
+            return None;
+        }
+
+        let mut cursor = self.pane.take()?.cursor();
+        let mut index = 0;
+
+        loop {
+            if cursor.is_leaf() {
+                if index == pane_index {
+                    break;
+                }
+                index += 1;
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(c) => {
+                    self.pane.replace(c.tree());
+                    return None;
+                }
+            }
+        }
+
+        let direction = {
+            let mut path = cursor.path_to_root();
+            path.next()
+                .and_then(|(_, parent)| parent.map(|node| node.direction))
+        };
+        self.pane.replace(cursor.tree());
+        direction
     }
 
     fn pane_index_for_pane(&mut self, pane_id: PaneId) -> Option<usize> {
@@ -1670,6 +1734,245 @@ impl TabInner {
                         .rows
                         .saturating_mul(cell_dimensions.pixel_height);
                 }
+            }
+        }
+    }
+
+    fn split_branch_cells(node: &SplitDirectionAndSize, active_is_second: bool) -> usize {
+        match (node.direction, active_is_second) {
+            (SplitDirection::Horizontal, false) => node.first.cols,
+            (SplitDirection::Horizontal, true) => node.second.cols,
+            (SplitDirection::Vertical, false) => node.first.rows,
+            (SplitDirection::Vertical, true) => node.second.rows,
+        }
+    }
+
+    fn set_split_branch_cells(
+        node: &mut SplitDirectionAndSize,
+        active_is_second: bool,
+        active_cells: usize,
+        cell_dimensions: TerminalSize,
+    ) {
+        let total = match node.direction {
+            SplitDirection::Horizontal => node.width(),
+            SplitDirection::Vertical => node.height(),
+        };
+        if total < 3 {
+            return;
+        }
+
+        let active_cells = active_cells.max(1).min(total.saturating_sub(2));
+        let other_cells = total.saturating_sub(active_cells.saturating_add(1)).max(1);
+
+        match (node.direction, active_is_second) {
+            (SplitDirection::Horizontal, false) => {
+                node.first.cols = active_cells;
+                node.second.cols = other_cells;
+                node.first.pixel_width = active_cells.saturating_mul(cell_dimensions.pixel_width);
+                node.second.pixel_width = other_cells.saturating_mul(cell_dimensions.pixel_width);
+            }
+            (SplitDirection::Horizontal, true) => {
+                node.first.cols = other_cells;
+                node.second.cols = active_cells;
+                node.first.pixel_width = other_cells.saturating_mul(cell_dimensions.pixel_width);
+                node.second.pixel_width = active_cells.saturating_mul(cell_dimensions.pixel_width);
+            }
+            (SplitDirection::Vertical, false) => {
+                node.first.rows = active_cells;
+                node.second.rows = other_cells;
+                node.first.pixel_height = active_cells.saturating_mul(cell_dimensions.pixel_height);
+                node.second.pixel_height = other_cells.saturating_mul(cell_dimensions.pixel_height);
+            }
+            (SplitDirection::Vertical, true) => {
+                node.first.rows = other_cells;
+                node.second.rows = active_cells;
+                node.first.pixel_height = other_cells.saturating_mul(cell_dimensions.pixel_height);
+                node.second.pixel_height =
+                    active_cells.saturating_mul(cell_dimensions.pixel_height);
+            }
+        }
+    }
+
+    fn collapse_pane_by_index(
+        &mut self,
+        pane_index: usize,
+        min_cells: usize,
+    ) -> Option<CollapsedPaneLayout> {
+        if self.zoomed.is_some() {
+            return None;
+        }
+
+        let mut cursor = self.pane.take()?.cursor();
+        let mut index = 0;
+        loop {
+            if cursor.is_leaf() {
+                if index == pane_index {
+                    break;
+                }
+                index += 1;
+            }
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(c) => {
+                    self.pane.replace(c.tree());
+                    return None;
+                }
+            }
+        }
+
+        let pane_stack_id = match cursor.leaf_mut().map(|stack| stack.id()) {
+            Some(pane_stack_id) => pane_stack_id,
+            None => {
+                self.pane.replace(cursor.tree());
+                return None;
+            }
+        };
+        let (branch, parent_node) = match cursor.path_to_root().next() {
+            Some((branch, Some(parent_node))) => (branch, *parent_node),
+            _ => {
+                self.pane.replace(cursor.tree());
+                return None;
+            }
+        };
+        let active_is_second = branch == PathBranch::IsRight;
+        let active_cells_before = Self::split_branch_cells(&parent_node, active_is_second);
+
+        match cursor.go_up() {
+            Ok(mut parent_cursor) => {
+                let cell_dimensions = self.cell_dimensions();
+                if let Ok(Some(node)) = parent_cursor.node_mut() {
+                    let layout = CollapsedPaneLayout {
+                        pane_stack_id,
+                        split_direction: node.direction,
+                        active_is_second,
+                        active_cells_before,
+                    };
+                    Self::set_split_branch_cells(
+                        node,
+                        active_is_second,
+                        min_cells,
+                        cell_dimensions,
+                    );
+                    self.cascade_size_from_cursor(parent_cursor);
+                    Some(layout)
+                } else {
+                    self.pane.replace(parent_cursor.tree());
+                    None
+                }
+            }
+            Err(c) => {
+                self.pane.replace(c.tree());
+                None
+            }
+        }
+    }
+
+    fn restore_collapsed_pane(&mut self, layout: CollapsedPaneLayout) -> bool {
+        if self.zoomed.is_some() {
+            return false;
+        }
+
+        let mut cursor = match self.pane.take() {
+            Some(tree) => tree.cursor(),
+            None => return false,
+        };
+        loop {
+            if cursor.is_leaf() {
+                let contains_pane = cursor
+                    .leaf_mut()
+                    .is_some_and(|stack| stack.id() == layout.pane_stack_id);
+                if contains_pane {
+                    break;
+                }
+            }
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(c) => {
+                    self.pane.replace(c.tree());
+                    return false;
+                }
+            }
+        }
+
+        match cursor.go_up() {
+            Ok(mut parent_cursor) => {
+                let cell_dimensions = self.cell_dimensions();
+                if let Ok(Some(node)) = parent_cursor.node_mut() {
+                    if node.direction != layout.split_direction {
+                        self.pane.replace(parent_cursor.tree());
+                        return false;
+                    }
+                    Self::set_split_branch_cells(
+                        node,
+                        layout.active_is_second,
+                        layout.active_cells_before,
+                        cell_dimensions,
+                    );
+                    self.cascade_size_from_cursor(parent_cursor);
+                    true
+                } else {
+                    self.pane.replace(parent_cursor.tree());
+                    false
+                }
+            }
+            Err(c) => {
+                self.pane.replace(c.tree());
+                false
+            }
+        }
+    }
+
+    fn reapply_collapsed_pane(&mut self, layout: CollapsedPaneLayout, min_cells: usize) -> bool {
+        if self.zoomed.is_some() {
+            return false;
+        }
+
+        let mut cursor = match self.pane.take() {
+            Some(tree) => tree.cursor(),
+            None => return false,
+        };
+        loop {
+            if cursor.is_leaf() {
+                let contains_pane = cursor
+                    .leaf_mut()
+                    .is_some_and(|stack| stack.id() == layout.pane_stack_id);
+                if contains_pane {
+                    break;
+                }
+            }
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(c) => {
+                    self.pane.replace(c.tree());
+                    return false;
+                }
+            }
+        }
+
+        match cursor.go_up() {
+            Ok(mut parent_cursor) => {
+                let cell_dimensions = self.cell_dimensions();
+                if let Ok(Some(node)) = parent_cursor.node_mut() {
+                    if node.direction != layout.split_direction {
+                        self.pane.replace(parent_cursor.tree());
+                        return false;
+                    }
+                    Self::set_split_branch_cells(
+                        node,
+                        layout.active_is_second,
+                        min_cells,
+                        cell_dimensions,
+                    );
+                    self.cascade_size_from_cursor(parent_cursor);
+                    true
+                } else {
+                    self.pane.replace(parent_cursor.tree());
+                    false
+                }
+            }
+            Err(c) => {
+                self.pane.replace(c.tree());
+                false
             }
         }
     }

@@ -174,8 +174,14 @@ END
         let dest_plist = build_target_dir.join("Info.plist");
         let src_icon = repo_dir.join("assets").join("icon").join("ThinkTerm.icns");
         let dest_icon = build_target_dir.join("ThinkTerm.icns");
+        let src_simple_icon = repo_dir
+            .join("assets")
+            .join("icon")
+            .join("ThinkTerm_simple.icns");
+        let dest_simple_icon = build_target_dir.join("ThinkTerm_simple.icns");
         println!("cargo:rerun-if-changed=assets/macos/ThinkTerm.app/Contents/Info.plist");
         println!("cargo:rerun-if-changed=assets/icon/ThinkTerm.icns");
+        println!("cargo:rerun-if-changed=assets/icon/ThinkTerm_simple.icns");
 
         std::fs::copy(&src_plist, &dest_plist)
             .context(format!(
@@ -190,6 +196,14 @@ END
                 "copy {} -> {}",
                 src_icon.display(),
                 dest_icon.display()
+            ))
+            .unwrap();
+
+        std::fs::copy(&src_simple_icon, &dest_simple_icon)
+            .context(format!(
+                "copy {} -> {}",
+                src_simple_icon.display(),
+                dest_simple_icon.display()
             ))
             .unwrap();
     }

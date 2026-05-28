@@ -17,6 +17,7 @@ use anyhow::Context;
 use config::{configuration, Dimension, GeometryOrigin};
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::process::Command;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use wezterm_bidi::Direction;
@@ -30,7 +31,7 @@ use window::{
 };
 
 use crate::native_settings::{
-    NativeThemeMode, ThinkTermNativeSettings, DEFAULT_PANE_HEADER_FONT_SIZE,
+    NativeAppIcon, NativeThemeMode, ThinkTermNativeSettings, DEFAULT_PANE_HEADER_FONT_SIZE,
     DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE, DEFAULT_TAB_FONT_SIZE,
 };
 
@@ -129,6 +130,7 @@ impl SettingsSection {
                 "Theme Mode",
                 "Effective Color Scheme",
                 "Config Source",
+                "App Icon",
                 "Settings UI Font Size",
                 "Workspace Sidebar Font Size",
                 "Tab Bar Font Size",
@@ -204,6 +206,8 @@ enum SettingsAction {
     CopyMemorySnapshot,
     ToggleThemeModeMenu,
     SetThemeMode(NativeThemeMode),
+    ToggleAppIconMenu,
+    SetAppIcon(NativeAppIcon),
     SearchInput,
     DecreaseFontSize,
     IncreaseFontSize,
@@ -229,6 +233,7 @@ enum SettingsDrag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsDropdown {
     ThemeMode,
+    AppIcon,
 }
 
 #[derive(Debug, Clone)]
@@ -238,13 +243,27 @@ struct MemorySnapshot {
     resident_size: Option<u64>,
     physical_footprint: Option<u64>,
     peak_physical_footprint: Option<u64>,
+    vmmap_total_resident: Option<u64>,
+    vmmap_graphics_resident: Option<u64>,
+    vmmap_malloc_resident: Option<u64>,
+    vmmap_text_resident: Option<u64>,
+    vmmap_iosurface_resident: Option<u64>,
+    vmmap_error: Option<String>,
     error: Option<String>,
 }
 
 impl MemorySnapshot {
+    fn has_vmmap_breakdown(&self) -> bool {
+        self.vmmap_total_resident.is_some()
+            || self.vmmap_graphics_resident.is_some()
+            || self.vmmap_malloc_resident.is_some()
+            || self.vmmap_text_resident.is_some()
+            || self.vmmap_iosurface_resident.is_some()
+    }
+
     fn log_line(&self) -> String {
         format!(
-            "pid={} rss={} physical_footprint={} peak_physical_footprint={}{}",
+            "pid={} rss={} physical_footprint={} peak_physical_footprint={} vmmap_total_resident={} graphics_resident={} malloc_resident={}{}{}",
             self.pid,
             self.resident_size
                 .map(format_bytes)
@@ -255,6 +274,19 @@ impl MemorySnapshot {
             self.peak_physical_footprint
                 .map(format_bytes)
                 .unwrap_or_else(|| "unavailable".to_string()),
+            self.vmmap_total_resident
+                .map(format_bytes)
+                .unwrap_or_else(|| "unavailable".to_string()),
+            self.vmmap_graphics_resident
+                .map(format_bytes)
+                .unwrap_or_else(|| "unavailable".to_string()),
+            self.vmmap_malloc_resident
+                .map(format_bytes)
+                .unwrap_or_else(|| "unavailable".to_string()),
+            self.vmmap_error
+                .as_ref()
+                .map(|error| format!(" vmmap_error={error}"))
+                .unwrap_or_default(),
             self.error
                 .as_ref()
                 .map(|error| format!(" error={error}"))
@@ -284,7 +316,40 @@ impl MemorySnapshot {
                     .map(format_bytes)
                     .unwrap_or_else(|| "unavailable".to_string())
             ),
+            format!(
+                "vmmap_total_resident: {}",
+                self.vmmap_total_resident
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "not captured".to_string())
+            ),
+            format!(
+                "graphics_resident: {}",
+                self.vmmap_graphics_resident
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "not captured".to_string())
+            ),
+            format!(
+                "iosurface_resident: {}",
+                self.vmmap_iosurface_resident
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "not captured".to_string())
+            ),
+            format!(
+                "malloc_resident: {}",
+                self.vmmap_malloc_resident
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "not captured".to_string())
+            ),
+            format!(
+                "text_segments_resident: {}",
+                self.vmmap_text_resident
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "not captured".to_string())
+            ),
         ];
+        if let Some(error) = &self.vmmap_error {
+            lines.push(format!("vmmap_error: {error}"));
+        }
         if let Some(error) = &self.error {
             lines.push(format!("error: {error}"));
         }
@@ -344,6 +409,7 @@ struct SettingsUiState {
     memory_monitoring: bool,
     memory_monitor_generation: u64,
     memory_snapshot: Option<MemorySnapshot>,
+    main_window_resource_lines: Vec<String>,
     memory_snapshot_copied_until: Option<Instant>,
     sidebar_scrollbar_visible_until: Option<Instant>,
     content_scrollbar_visible_until: Option<Instant>,
@@ -370,6 +436,7 @@ impl SettingsUiState {
             memory_monitoring: false,
             memory_monitor_generation: 0,
             memory_snapshot: None,
+            main_window_resource_lines: Vec::new(),
             memory_snapshot_copied_until: None,
             sidebar_scrollbar_visible_until: None,
             content_scrollbar_visible_until: None,
@@ -386,7 +453,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn capture_memory_snapshot() -> MemorySnapshot {
+fn capture_memory_snapshot(detailed: bool) -> MemorySnapshot {
     let pid = std::process::id();
     let mut snapshot = MemorySnapshot {
         captured_at: Instant::now(),
@@ -394,6 +461,12 @@ fn capture_memory_snapshot() -> MemorySnapshot {
         resident_size: None,
         physical_footprint: None,
         peak_physical_footprint: None,
+        vmmap_total_resident: None,
+        vmmap_graphics_resident: None,
+        vmmap_malloc_resident: None,
+        vmmap_text_resident: None,
+        vmmap_iosurface_resident: None,
+        vmmap_error: None,
         error: None,
     };
 
@@ -408,7 +481,170 @@ fn capture_memory_snapshot() -> MemorySnapshot {
         }
     }
 
+    if detailed {
+        match capture_vmmap_breakdown(pid) {
+            Ok(breakdown) => {
+                snapshot.vmmap_total_resident = breakdown.total_resident;
+                snapshot.vmmap_graphics_resident = breakdown.graphics_resident;
+                snapshot.vmmap_malloc_resident = breakdown.malloc_resident;
+                snapshot.vmmap_text_resident = breakdown.text_resident;
+                snapshot.vmmap_iosurface_resident = breakdown.iosurface_resident;
+            }
+            Err(err) => {
+                snapshot.vmmap_error = Some(err);
+            }
+        }
+    }
+
     snapshot
+}
+
+#[derive(Debug, Clone, Default)]
+struct VmmapBreakdown {
+    total_resident: Option<u64>,
+    graphics_resident: Option<u64>,
+    malloc_resident: Option<u64>,
+    text_resident: Option<u64>,
+    iosurface_resident: Option<u64>,
+}
+
+fn capture_vmmap_breakdown(pid: u32) -> Result<VmmapBreakdown, String> {
+    let output = Command::new("/usr/bin/vmmap")
+        .arg("-summary")
+        .arg(pid.to_string())
+        .output()
+        .map_err(|err| format!("failed to run vmmap: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(stderr.trim().to_string());
+    }
+
+    parse_vmmap_summary(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_vmmap_summary(summary: &str) -> Result<VmmapBreakdown, String> {
+    let mut result = VmmapBreakdown::default();
+    let mut graphics_resident = 0;
+    let mut has_graphics = false;
+    let mut malloc_resident = 0;
+    let mut has_malloc = false;
+    let mut in_region_table = false;
+
+    for line in summary.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("REGION TYPE") {
+            in_region_table = true;
+            continue;
+        }
+        if !in_region_table || trimmed.is_empty() || trimmed.starts_with("==========") {
+            continue;
+        }
+
+        let Some((name, values)) = parse_vmmap_region_line(line) else {
+            continue;
+        };
+        if values.len() < 2 {
+            continue;
+        }
+        let resident = values[1];
+        let name = name.trim();
+
+        if name == "TOTAL" {
+            result.total_resident = Some(resident);
+            break;
+        } else if name == "__TEXT" {
+            result.text_resident = Some(resident);
+        } else if name == "IOSurface" {
+            result.iosurface_resident = Some(resident);
+            graphics_resident += resident;
+            has_graphics = true;
+        } else if name == "IOAccelerator (graphics)" || name == "owned unmapped (graphics)" {
+            graphics_resident += resident;
+            has_graphics = true;
+        } else if name.starts_with("MALLOC") {
+            malloc_resident += resident;
+            has_malloc = true;
+        }
+    }
+
+    if has_graphics {
+        result.graphics_resident = Some(graphics_resident);
+    }
+    if has_malloc {
+        result.malloc_resident = Some(malloc_resident);
+    }
+    Ok(result)
+}
+
+fn parse_vmmap_region_line(line: &str) -> Option<(String, Vec<u64>)> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let first_size = tokens
+        .iter()
+        .position(|token| parse_vmmap_size(token).is_some())?;
+    if first_size == 0 {
+        return None;
+    }
+    let name = tokens[..first_size].join(" ");
+    let values = tokens[first_size..]
+        .iter()
+        .filter_map(|token| parse_vmmap_size(token))
+        .collect::<Vec<_>>();
+    Some((name, values))
+}
+
+fn parse_vmmap_size(token: &str) -> Option<u64> {
+    let token = token.trim_end_matches(',');
+    let (number, multiplier) = if let Some(number) = token.strip_suffix('K') {
+        (number, 1024.0)
+    } else if let Some(number) = token.strip_suffix('M') {
+        (number, 1024.0 * 1024.0)
+    } else if let Some(number) = token.strip_suffix('G') {
+        (number, 1024.0 * 1024.0 * 1024.0)
+    } else {
+        return None;
+    };
+    number
+        .parse::<f64>()
+        .ok()
+        .map(|value| (value * multiplier).round() as u64)
+}
+
+#[cfg(test)]
+mod memory_parser_tests {
+    use super::*;
+
+    #[test]
+    fn vmmap_summary_uses_region_type_table_total() {
+        let summary = r#"
+ReadOnly portion of Libraries: Total=579.0M resident=421.4M(73%) swapped_out_or_unallocated=157.6M(27%)
+Writable regions: Total=81.0M written=19.4M(24%) resident=19.4M(24%) swapped_out=0K(0%) unallocated=61.6M(76%)
+
+                                VIRTUAL RESIDENT    DIRTY  SWAPPED VOLATILE   NONVOL    EMPTY   REGION
+REGION TYPE                        SIZE     SIZE     SIZE     SIZE     SIZE     SIZE     SIZE    COUNT (non-coalesced)
+===========                     ======= ========    =====  ======= ========   ======    =====  =======
+MALLOC metadata                    752K     192K     192K       0K       0K       0K       0K        4
+IOSurface                         96.0M    82.6M      64K       0K       0K       0K       0K        2
+IOAccelerator (graphics)          64.0M    36.2M      16K       0K       0K       0K       0K        1
+__TEXT                           430.0M   421.4M       0K       0K       0K       0K       0K       46
+===========                     ======= ========    =====  ======= ========   ======    =====  =======
+TOTAL                            802.4M   563.7M    19.8M       0K       0K       0K       0K      261
+
+MALLOC ZONE                         SIZE       SIZE       SIZE       SIZE      COUNT  ALLOCATED  FRAG SIZE  % FRAG   COUNT
+===========                      =======  =========  =========  =========  =========  =========  =========  ======  ======
+TOTAL                              94.4M      19.3M      19.3M         0K        184        11K       245K     96%       5
+"#;
+
+        let parsed = parse_vmmap_summary(summary).unwrap();
+        assert_eq!(parsed.total_resident, parse_vmmap_size("563.7M"));
+        assert_eq!(parsed.iosurface_resident, parse_vmmap_size("82.6M"));
+        assert_eq!(
+            parsed.graphics_resident,
+            Some(parse_vmmap_size("82.6M").unwrap() + parse_vmmap_size("36.2M").unwrap())
+        );
+        assert_eq!(parsed.malloc_resident, Some(192 * 1024));
+        assert_eq!(parsed.text_resident, parse_vmmap_size("421.4M"));
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -673,6 +909,12 @@ impl SettingsWindow {
                 Ok(true)
             }
             WindowEvent::Destroyed => {
+                self.ui.memory_monitoring = false;
+                self.ui.memory_monitor_generation =
+                    self.ui.memory_monitor_generation.wrapping_add(1);
+                self.render_state.take();
+                self.webgpu.take();
+                self.window.take();
                 SETTINGS_WINDOW.with(|slot| {
                     slot.borrow_mut().take();
                 });
@@ -763,7 +1005,12 @@ impl SettingsWindow {
                         });
                         self.ui.open_dropdown = None;
                     }
-                    Some(SettingsAction::ToggleThemeModeMenu | SettingsAction::SetThemeMode(_)) => {
+                    Some(
+                        SettingsAction::ToggleThemeModeMenu
+                        | SettingsAction::SetThemeMode(_)
+                        | SettingsAction::ToggleAppIconMenu
+                        | SettingsAction::SetAppIcon(_),
+                    ) => {
                         self.ui.interaction.focused = None;
                     }
                     Some(_) => {
@@ -862,7 +1109,7 @@ impl SettingsWindow {
                 {
                     return;
                 }
-                let snapshot = capture_memory_snapshot();
+                let snapshot = capture_memory_snapshot(false);
                 log::info!("settings memory diagnostics: {}", snapshot.log_line());
                 settings.ui.memory_snapshot = Some(snapshot);
                 window.invalidate();
@@ -870,6 +1117,95 @@ impl SettingsWindow {
             });
         })
         .detach();
+    }
+
+    fn settings_resource_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "Settings window: backend={} size={}x{} dpi={}",
+            if self.webgpu.is_some() {
+                "WebGpu"
+            } else {
+                "none"
+            },
+            self.dimensions.pixel_width,
+            self.dimensions.pixel_height,
+            self.dimensions.dpi
+        )];
+
+        if let Some(render_state) = self.render_state.as_ref() {
+            let stats = render_state.stats();
+            lines.push(format!(
+                "Settings window: render_backend={} atlas={} glyphs={} svg_icons={} rotated_icons={} images={} frames={} blocks={} colors={} cursor_glyphs={}",
+                stats.backend,
+                stats.atlas_size,
+                stats.glyphs,
+                stats.svg_icons,
+                stats.rotated_svg_icons,
+                stats.decoded_images,
+                stats.image_frames,
+                stats.block_glyphs,
+                stats.color_sprites,
+                stats.cursor_glyphs,
+            ));
+            lines.push(format!(
+                "Settings window: layers={} vertex_buffers={} quad_capacity={} line_glyphs={}",
+                stats.layers, stats.vertex_buffers, stats.layer_quads, stats.line_glyphs
+            ));
+        } else {
+            lines.push("Settings window: render_state=none".to_string());
+        }
+
+        lines
+    }
+
+    fn memory_resource_lines(&self) -> Vec<String> {
+        let mut lines = self.settings_resource_lines();
+        if self.ui.main_window_resource_lines.is_empty() {
+            lines.push("Main windows: not captured yet; use Refresh Now".to_string());
+        } else {
+            lines.extend(self.ui.main_window_resource_lines.clone());
+        }
+        lines
+    }
+
+    fn request_main_window_resource_stats(&mut self) {
+        let Some(front_end) = crate::frontend::try_front_end() else {
+            self.ui.main_window_resource_lines =
+                vec!["Main windows: frontend unavailable".to_string()];
+            return;
+        };
+        let windows = front_end.gui_windows();
+        if windows.is_empty() {
+            self.ui.main_window_resource_lines = vec!["Main windows: none".to_string()];
+            return;
+        }
+
+        self.ui.main_window_resource_lines =
+            vec![format!("Main windows: {} pending", windows.len())];
+        for (idx, gui_window) in windows.into_iter().enumerate() {
+            let label = format!("Main window {}", idx + 1);
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |term_window| {
+                        let lines = term_window.memory_resource_lines(&label);
+                        SETTINGS_WINDOW.with(|slot| {
+                            let Some(settings) = slot.borrow().as_ref().cloned() else {
+                                return;
+                            };
+                            let mut settings = settings.borrow_mut();
+                            settings
+                                .ui
+                                .main_window_resource_lines
+                                .retain(|line| !line.contains(" pending"));
+                            settings.ui.main_window_resource_lines.extend(lines);
+                            if let Some(window) = settings.window.as_ref() {
+                                window.invalidate();
+                            }
+                        });
+                    },
+                )));
+        }
     }
 
     fn schedule_copied_state_clear(&self, window: &Window) {
@@ -1411,9 +1747,10 @@ impl SettingsWindow {
                 self.ui.memory_monitor_generation =
                     self.ui.memory_monitor_generation.wrapping_add(1);
                 if self.ui.memory_monitoring {
-                    let snapshot = capture_memory_snapshot();
+                    let snapshot = capture_memory_snapshot(false);
                     log::info!("settings memory diagnostics: {}", snapshot.log_line());
                     self.ui.memory_snapshot = Some(snapshot);
+                    self.request_main_window_resource_stats();
                     self.status = "Memory diagnostics are running manually.".to_string();
                     self.schedule_memory_monitor_tick(window, self.ui.memory_monitor_generation);
                 } else {
@@ -1422,18 +1759,28 @@ impl SettingsWindow {
             }
             SettingsAction::RefreshMemorySnapshot => {
                 self.ui.open_dropdown = None;
-                let snapshot = capture_memory_snapshot();
+                let snapshot = capture_memory_snapshot(true);
                 log::info!("settings memory diagnostics: {}", snapshot.log_line());
                 self.ui.memory_snapshot = Some(snapshot);
+                self.request_main_window_resource_stats();
                 self.status = "Memory snapshot refreshed.".to_string();
             }
             SettingsAction::CopyMemorySnapshot => {
                 self.ui.open_dropdown = None;
-                if self.ui.memory_snapshot.is_none() {
-                    self.ui.memory_snapshot = Some(capture_memory_snapshot());
+                if self
+                    .ui
+                    .memory_snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| !snapshot.has_vmmap_breakdown())
+                {
+                    self.ui.memory_snapshot = Some(capture_memory_snapshot(true));
                 }
                 if let Some(snapshot) = &self.ui.memory_snapshot {
-                    window.set_clipboard(Clipboard::Clipboard, snapshot.summary_for_clipboard());
+                    let mut summary = snapshot.summary_for_clipboard();
+                    summary.push_str("\n\nThinkTerm Resource Stats\n");
+                    summary.push_str(&self.memory_resource_lines().join("\n"));
+                    window.set_clipboard(Clipboard::Clipboard, summary);
+                    self.request_main_window_resource_stats();
                     self.ui.memory_snapshot_copied_until =
                         Some(Instant::now() + Duration::from_millis(1400));
                     self.status = "Memory snapshot copied.".to_string();
@@ -1461,6 +1808,27 @@ impl SettingsWindow {
                     }
                     Err(err) => {
                         self.status = format!("Unable to save theme mode: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::ToggleAppIconMenu => {
+                self.ui.open_dropdown = if self.ui.open_dropdown == Some(SettingsDropdown::AppIcon)
+                {
+                    None
+                } else {
+                    Some(SettingsDropdown::AppIcon)
+                };
+            }
+            SettingsAction::SetAppIcon(icon) => {
+                self.native_settings.appearance.app_icon = icon;
+                self.ui.open_dropdown = None;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        crate::native_settings::apply_to_app(&self.native_settings);
+                        self.status = format!("App icon is now {}.", icon.label());
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to save app icon: {err:#}");
                     }
                 }
             }
@@ -2025,7 +2393,7 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let theme_row_count = 3;
+        let theme_row_count = 4;
         let typography_row_count = 5;
         let (theme_card_y, mut y) = self.settings_card_geometry(section_y, theme_row_count);
         let theme_card_height = self.settings_card_height(theme_row_count);
@@ -2060,6 +2428,15 @@ impl SettingsWindow {
             row_width,
             "ThinkTerm-native window appearance preference.",
             false,
+        )?;
+        y += row_step;
+        self.paint_app_icon_row(
+            layers,
+            row_x,
+            y,
+            row_width,
+            "Switch the running macOS Dock and app switcher icon.",
+            true,
         )?;
         y += row_step;
         self.paint_setting_row(
@@ -2567,13 +2944,10 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 5);
-        let card_height = self.settings_card_height(5);
+        let row_count = 11;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
+        let card_height = self.settings_card_height(row_count);
         let button_y = card_y + card_height + self.settings_section_card_gap();
-        self.ui.content_scroll.set_extents(
-            self.content_bottom(),
-            self.settings_content_extent(button_y + scroll + CONTROL_HEIGHT),
-        );
 
         self.draw_text(
             layers,
@@ -2589,7 +2963,7 @@ impl SettingsWindow {
             .ui
             .memory_snapshot
             .clone()
-            .unwrap_or_else(capture_memory_snapshot);
+            .unwrap_or_else(|| capture_memory_snapshot(false));
         if self.ui.memory_snapshot.is_none() {
             self.ui.memory_snapshot = Some(snapshot.clone());
         }
@@ -2606,11 +2980,46 @@ impl SettingsWindow {
             .peak_physical_footprint
             .map(format_bytes)
             .unwrap_or_else(|| "Unavailable".to_string());
+        let total_resident = snapshot
+            .vmmap_total_resident
+            .map(format_bytes)
+            .unwrap_or_else(|| "Run Refresh Now".to_string());
+        let graphics = snapshot
+            .vmmap_graphics_resident
+            .map(format_bytes)
+            .unwrap_or_else(|| "Run Refresh Now".to_string());
+        let iosurface = snapshot
+            .vmmap_iosurface_resident
+            .map(format_bytes)
+            .unwrap_or_else(|| "Run Refresh Now".to_string());
+        let malloc = snapshot
+            .vmmap_malloc_resident
+            .map(format_bytes)
+            .unwrap_or_else(|| "Run Refresh Now".to_string());
+        let text = snapshot
+            .vmmap_text_resident
+            .map(format_bytes)
+            .unwrap_or_else(|| "Run Refresh Now".to_string());
+        let breakdown_status = if snapshot.has_vmmap_breakdown() {
+            "Captured"
+        } else if snapshot.vmmap_error.is_some() {
+            "Unavailable"
+        } else {
+            "Refresh for vmmap"
+        };
         let monitor_state = if self.ui.memory_monitoring {
             "Running"
         } else {
             "Off"
         };
+        let resource_lines = self.memory_resource_lines();
+        let resource_card_y = button_y + CONTROL_HEIGHT + self.settings_section_card_gap();
+        let resource_line_height = 30.0;
+        let resource_card_height = 88.0 + resource_line_height * resource_lines.len() as f32;
+        self.ui.content_scroll.set_extents(
+            self.content_bottom(),
+            self.settings_content_extent(resource_card_y + scroll + resource_card_height),
+        );
 
         let card_padding = 36.0;
         let row_x = x + card_padding;
@@ -2666,6 +3075,77 @@ impl SettingsWindow {
             &age_label,
             true,
         )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 5.0,
+            row_width,
+            "vmmap Breakdown",
+            "Refresh Now captures the slower macOS breakdown; sampling keeps this lightweight.",
+            breakdown_status,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 6.0,
+            row_width,
+            "Activity Monitor Resident",
+            "vmmap TOTAL resident; this is the scary-looking number Activity Monitor can resemble.",
+            &total_resident,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 7.0,
+            row_width,
+            "Graphics Surfaces",
+            "IOSurface + IOAccelerator graphics + owned unmapped graphics.",
+            &graphics,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 8.0,
+            row_width,
+            "IOSurface",
+            "macOS window backing surfaces and swapchain-style drawable storage.",
+            &iosurface,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 9.0,
+            row_width,
+            "Allocator Heap",
+            "MALLOC resident from vmmap; Rust allocations mostly land here.",
+            &malloc,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 10.0,
+            row_width,
+            "Text Segments",
+            "__TEXT resident pages from the app, dependencies, and system libraries.",
+            &text,
+            true,
+        )?;
+        if let Some(error) = &snapshot.vmmap_error {
+            self.draw_text(
+                layers,
+                &ui_font,
+                row_x,
+                first_row_y + row_step * 11.0,
+                error,
+                palette.muted_text,
+                row_width,
+            )?;
+        }
         let primary_label = if self.ui.memory_monitoring {
             "Stop Memory Sampling"
         } else {
@@ -2702,6 +3182,28 @@ impl SettingsWindow {
             copy_label,
             SettingsAction::CopyMemorySnapshot,
         )?;
+
+        self.paint_group_card(layers, x, resource_card_y, max_width, resource_card_height)?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            row_x,
+            resource_card_y + 28.0,
+            "Renderer Resources",
+            palette.title,
+            row_width,
+        )?;
+        for (idx, line) in resource_lines.iter().enumerate() {
+            self.draw_text(
+                layers,
+                &ui_font,
+                row_x,
+                resource_card_y + 66.0 + resource_line_height * idx as f32,
+                line,
+                palette.secondary_text,
+                row_width,
+            )?;
+        }
 
         Ok(())
     }
@@ -3568,7 +4070,90 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn paint_app_icon_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        description: &str,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - 28.0, width)?;
+        }
+
+        let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
+        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let action = SettingsAction::ToggleAppIconMenu;
+        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        let open = self.ui.open_dropdown == Some(SettingsDropdown::AppIcon);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        self.draw_text(layers, &ui_font, x, y, "App Icon", palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y),
+            description,
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            control_rect.origin.x,
+            control_rect.origin.y,
+            control_rect.size.width,
+            control_rect.size.height,
+            bg,
+            border,
+            CONTROL_RADIUS,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            control_x + 16.0,
+            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.native_settings.appearance.app_icon.label(),
+            palette.text,
+            control_width - 60.0,
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronDown,
+            control_x + control_width - 38.0,
+            control_y + (CONTROL_HEIGHT - 22.0) / 2.0,
+            22.0,
+            palette.secondary_text,
+        )?;
+
+        Ok(())
+    }
+
     fn theme_mode_control_geometry(&self, x: f32, y: f32, width: f32) -> (f32, f32, f32) {
+        self.dropdown_control_geometry(x, y, width)
+    }
+
+    fn dropdown_control_geometry(&self, x: f32, y: f32, width: f32) -> (f32, f32, f32) {
         let control_width = if width >= 680.0 {
             280.0_f32.min(width * 0.36)
         } else {
@@ -3583,21 +4168,23 @@ impl SettingsWindow {
         x: f32,
         max_width: f32,
     ) -> anyhow::Result<()> {
-        if self.ui.open_dropdown != Some(SettingsDropdown::ThemeMode) {
+        let Some(dropdown) = self.ui.open_dropdown else {
             return Ok(());
-        }
+        };
 
         let scroll = self.ui.content_scroll.offset;
         let card_padding = 36.0;
         let section_y = CONTENT_SECTION_Y - scroll;
-        let (_, first_row_y) = self.settings_card_geometry(section_y, 3);
+        let (_, first_row_y) = self.settings_card_geometry(section_y, 4);
         let (row_x, row_y, row_width) = match self.selected {
-            SettingsSection::Appearance => (
-                x + card_padding,
-                first_row_y,
-                max_width - card_padding * 2.0,
-            ),
-            SettingsSection::General => (
+            SettingsSection::Appearance => {
+                let row_y = match dropdown {
+                    SettingsDropdown::ThemeMode => first_row_y,
+                    SettingsDropdown::AppIcon => first_row_y + self.settings_row_step(),
+                };
+                (x + card_padding, row_y, max_width - card_padding * 2.0)
+            }
+            SettingsSection::General if dropdown == SettingsDropdown::ThemeMode => (
                 x + card_padding,
                 first_row_y + self.settings_row_step() * 2.0,
                 max_width - card_padding * 2.0,
@@ -3605,13 +4192,21 @@ impl SettingsWindow {
             _ => return Ok(()),
         };
         let (control_x, control_y, control_width) =
-            self.theme_mode_control_geometry(row_x, row_y, row_width);
-        self.paint_theme_mode_menu(
-            layers,
-            control_x,
-            control_y + CONTROL_HEIGHT + 8.0,
-            control_width,
-        )
+            self.dropdown_control_geometry(row_x, row_y, row_width);
+        match dropdown {
+            SettingsDropdown::ThemeMode => self.paint_theme_mode_menu(
+                layers,
+                control_x,
+                control_y + CONTROL_HEIGHT + 8.0,
+                control_width,
+            ),
+            SettingsDropdown::AppIcon => self.paint_app_icon_menu(
+                layers,
+                control_x,
+                control_y + CONTROL_HEIGHT + 8.0,
+                control_width,
+            ),
+        }
     }
 
     fn paint_theme_mode_menu(
@@ -3621,15 +4216,64 @@ impl SettingsWindow {
         y: f32,
         width: f32,
     ) -> anyhow::Result<()> {
+        let options = [
+            (
+                NativeThemeMode::System.label(),
+                SettingsAction::SetThemeMode(NativeThemeMode::System),
+                self.native_settings.appearance.theme_mode == NativeThemeMode::System,
+            ),
+            (
+                NativeThemeMode::Light.label(),
+                SettingsAction::SetThemeMode(NativeThemeMode::Light),
+                self.native_settings.appearance.theme_mode == NativeThemeMode::Light,
+            ),
+            (
+                NativeThemeMode::Dark.label(),
+                SettingsAction::SetThemeMode(NativeThemeMode::Dark),
+                self.native_settings.appearance.theme_mode == NativeThemeMode::Dark,
+            ),
+        ];
+        self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
+    fn paint_app_icon_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<()> {
+        let options = [
+            (
+                NativeAppIcon::Default.label(),
+                SettingsAction::SetAppIcon(NativeAppIcon::Default),
+                self.native_settings.appearance.app_icon == NativeAppIcon::Default,
+            ),
+            (
+                NativeAppIcon::Simple.label(),
+                SettingsAction::SetAppIcon(NativeAppIcon::Simple),
+                self.native_settings.appearance.app_icon == NativeAppIcon::Simple,
+            ),
+        ];
+        self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
+    fn paint_dropdown_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        options: &[(&'static str, SettingsAction, bool)],
+    ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
-        let options = [
-            NativeThemeMode::System,
-            NativeThemeMode::Light,
-            NativeThemeMode::Dark,
-        ];
         let row_height = 46.0;
-        let menu_height = row_height * options.len() as f32 + 12.0;
+        let row_gap = 6.0;
+        let menu_padding = 8.0;
+        let menu_height = menu_padding * 2.0
+            + row_height * options.len() as f32
+            + row_gap * options.len().saturating_sub(1) as f32;
         let menu_bg = match self.effective_appearance() {
             Appearance::Light | Appearance::LightHighContrast => rgba(248, 248, 250, 1.0),
             Appearance::Dark | Appearance::DarkHighContrast => rgba(34, 34, 36, 1.0),
@@ -3647,12 +4291,10 @@ impl SettingsWindow {
             CONTROL_RADIUS,
         )?;
 
-        let mut row_y = y + 6.0;
-        for mode in options {
-            let action = SettingsAction::SetThemeMode(mode);
-            let row_rect = rect(x + 6.0, row_y, width - 12.0, row_height);
+        let mut row_y = y + menu_padding;
+        for (label, action, selected) in options.iter().copied() {
+            let row_rect = rect(x + 8.0, row_y, width - 16.0, row_height);
             self.ui_context.push(row_rect, WidgetKind::Button, action);
-            let selected = self.native_settings.appearance.theme_mode == mode;
             let hovered = self.ui.interaction.hovered == Some(action);
             let pressed = self.ui.interaction.pressed == Some(action);
             let row_bg = if selected {
@@ -3681,7 +4323,7 @@ impl SettingsWindow {
                 &ui_font,
                 row_rect.origin.x + 14.0,
                 self.control_text_y(row_rect.origin.y, row_height),
-                mode.label(),
+                label,
                 if selected {
                     palette.selected_text
                 } else {
@@ -3689,7 +4331,7 @@ impl SettingsWindow {
                 },
                 row_rect.size.width - 28.0,
             )?;
-            row_y += row_height;
+            row_y += row_height + row_gap;
         }
 
         Ok(())
