@@ -1584,9 +1584,9 @@ impl SettingsWindow {
                 separator: ui.separator,
                 search_bg: ui.control_bg,
                 search_border: ui.control_border,
-                nav_hover_bg: ui.control_hover_bg,
+                nav_hover_bg: ui.sidebar_row_hover_bg,
                 nav_pressed_bg: ui.control_pressed_bg,
-                nav_selected_bg: ui.control_bg,
+                nav_selected_bg: ui.sidebar_row_active_bg,
                 control_bg: ui.control_bg,
                 control_hover_bg: ui.control_hover_bg,
                 control_pressed_bg: ui.control_pressed_bg,
@@ -1605,9 +1605,9 @@ impl SettingsWindow {
                 separator: ui.separator,
                 search_bg: ui.control_bg,
                 search_border: ui.control_border,
-                nav_hover_bg: ui.control_hover_bg,
+                nav_hover_bg: ui.sidebar_row_hover_bg,
                 nav_pressed_bg: ui.control_pressed_bg,
-                nav_selected_bg: ui.control_bg,
+                nav_selected_bg: ui.sidebar_row_active_bg,
                 control_bg: ui.control_bg,
                 control_hover_bg: ui.control_hover_bg,
                 control_pressed_bg: ui.control_pressed_bg,
@@ -1921,6 +1921,10 @@ impl SettingsWindow {
     }
 
     fn do_paint(&mut self, window: &Window) -> bool {
+        if self.webgpu.is_none() || self.render_state.is_none() {
+            return false;
+        }
+
         let paint_start = crate::perf::now();
         let animating = self.advance_scroll_animations(Instant::now());
         match self.do_paint_webgpu() {

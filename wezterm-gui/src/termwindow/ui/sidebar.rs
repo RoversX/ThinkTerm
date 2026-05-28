@@ -525,8 +525,8 @@ impl crate::TermWindow {
         let foreground = chrome.text;
         let sidebar_bg = chrome.workspace_sidebar_bg;
         let sidebar_separator = chrome.separator;
-        let selected_bg = chrome.control_bg;
-        let selected_border = chrome.control_border;
+        let selected_bg = chrome.sidebar_row_active_bg;
+        let selected_border = chrome.sidebar_row_active_border;
         let active_fg = chrome.text;
         let muted_fg = chrome.secondary_text;
         let ui_font = self
@@ -622,7 +622,7 @@ impl crate::TermWindow {
                         sidebar_toggle_size as f32,
                         sidebar_toggle_size as f32,
                     ),
-                    foreground.mul_alpha(0.14),
+                    chrome.sidebar_button_hover_bg,
                     SIDEBAR_ROW_RADIUS,
                 )
                 .context("sidebar toolbar toggle button")?;
@@ -707,7 +707,11 @@ impl crate::TermWindow {
                 top_action_width as f32,
                 top_action_height as f32,
             ),
-            foreground.mul_alpha(if top_action_hovered { 0.14 } else { 0.08 }),
+            if top_action_hovered {
+                chrome.sidebar_button_hover_bg
+            } else {
+                chrome.sidebar_button_bg
+            },
             SIDEBAR_ROW_RADIUS + 4.0,
         )
         .context("sidebar add session button")?;
@@ -720,11 +724,11 @@ impl crate::TermWindow {
                 notification_action_size as f32,
                 notification_action_size as f32,
             ),
-            foreground.mul_alpha(if notification_action_hovered {
-                0.14
+            if notification_action_hovered {
+                chrome.sidebar_button_hover_bg
             } else {
-                0.08
-            }),
+                chrome.sidebar_button_bg
+            },
             SIDEBAR_ROW_RADIUS + 4.0,
         )
         .context("sidebar notifications button")?;
@@ -915,7 +919,7 @@ impl crate::TermWindow {
                                 pinned_width as f32,
                                 session_row_height as f32,
                             ),
-                            foreground.mul_alpha(0.06),
+                            chrome.sidebar_row_hover_bg,
                             SIDEBAR_ROW_RADIUS + 2.0,
                         )
                         .context("sidebar hovered pinned session")?;
@@ -1049,7 +1053,11 @@ impl crate::TermWindow {
                         section_button_size as f32,
                         section_button_size as f32,
                     ),
-                    foreground.mul_alpha(if button_hovered { 0.14 } else { 0.08 }),
+                    if button_hovered {
+                        chrome.sidebar_button_hover_bg
+                    } else {
+                        chrome.sidebar_button_bg
+                    },
                     SIDEBAR_ROW_RADIUS,
                 )
                 .context("sidebar new project button")?;
@@ -1176,7 +1184,11 @@ impl crate::TermWindow {
                         project_action_size as f32,
                         project_action_size as f32,
                     ),
-                    foreground.mul_alpha(if project_action_hovered { 0.14 } else { 0.08 }),
+                    if project_action_hovered {
+                        chrome.sidebar_button_hover_bg
+                    } else {
+                        chrome.sidebar_button_bg
+                    },
                     SIDEBAR_ROW_RADIUS,
                 )
                 .context("sidebar new session button")?;
@@ -1284,7 +1296,7 @@ impl crate::TermWindow {
                                     session_width as f32,
                                     session_row_height as f32,
                                 ),
-                                foreground.mul_alpha(0.06),
+                                chrome.sidebar_row_hover_bg,
                                 SIDEBAR_ROW_RADIUS + 2.0,
                             )
                             .context("sidebar hovered session")?;
@@ -1405,7 +1417,7 @@ impl crate::TermWindow {
                             sidebar_toggle_size as f32,
                             sidebar_toggle_size as f32,
                         ),
-                        foreground.mul_alpha(0.14),
+                        chrome.sidebar_button_hover_bg,
                         SIDEBAR_ROW_RADIUS,
                     )
                     .context("sidebar toolbar toggle button repaint")?;
@@ -1437,7 +1449,11 @@ impl crate::TermWindow {
                     top_action_width as f32,
                     top_action_height as f32,
                 ),
-                foreground.mul_alpha(if top_action_hovered { 0.14 } else { 0.08 }),
+                if top_action_hovered {
+                    chrome.sidebar_button_hover_bg
+                } else {
+                    chrome.sidebar_button_bg
+                },
                 SIDEBAR_ROW_RADIUS + 4.0,
             )
             .context("sidebar add session button repaint")?;
@@ -1456,11 +1472,11 @@ impl crate::TermWindow {
                     notification_action_size as f32,
                     notification_action_size as f32,
                 ),
-                foreground.mul_alpha(if notification_action_hovered {
-                    0.14
+                if notification_action_hovered {
+                    chrome.sidebar_button_hover_bg
                 } else {
-                    0.08
-                }),
+                    chrome.sidebar_button_bg
+                },
                 SIDEBAR_ROW_RADIUS + 4.0,
             )
             .context("sidebar notifications button repaint")?;
@@ -1616,7 +1632,7 @@ impl crate::TermWindow {
                         settings_body_width as f32,
                         settings_row_height as f32,
                     ),
-                    foreground.mul_alpha(0.10),
+                    chrome.sidebar_row_hover_bg,
                     SIDEBAR_ROW_RADIUS + 4.0,
                 )
                 .context("sidebar settings button hover")?;
@@ -1638,7 +1654,7 @@ impl crate::TermWindow {
                         settings_action_size as f32,
                         settings_action_size as f32,
                     ),
-                    foreground.mul_alpha(0.12),
+                    chrome.sidebar_button_hover_bg,
                     SIDEBAR_ROW_RADIUS + 4.0,
                 )
                 .context("sidebar settings view options hover")?;
@@ -1711,7 +1727,7 @@ impl crate::TermWindow {
                     scroll.track_width as f32,
                     scroll.track_height as f32,
                 ),
-                foreground.mul_alpha(0.06),
+                chrome.separator,
                 track_radius,
             )
             .context("sidebar scroll track")?;
@@ -1725,7 +1741,7 @@ impl crate::TermWindow {
                     scroll.track_width as f32,
                     scroll.thumb_height,
                 ),
-                foreground.mul_alpha(0.34),
+                chrome.scrollbar_thumb,
                 track_radius,
             )
             .context("sidebar scroll thumb")?;
