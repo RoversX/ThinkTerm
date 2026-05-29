@@ -8,9 +8,10 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X,
     WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
+use crate::termwindow::ssh_hosts_modal::SshHostsModal;
 use crate::termwindow::{
-    GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TabWheelSurface,
-    TermWindowNotif, UIItem, UIItemType, TMB,
+    GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, SshHostsAction,
+    TabWheelSurface, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     ContextMenuItem, MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK,
@@ -22,6 +23,7 @@ use config::keyassignment::{
 };
 use config::{MouseEventAltScreen, TermConfig};
 use mux::pane::{Pane, WithPaneLines};
+use mux::ssh::RemoteSshDomain;
 use mux::tab::{PositionedPane, SplitDirection};
 use mux::Mux;
 use mux_lua::MuxPane;
@@ -588,7 +590,8 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
-            | UIItemType::Split(_) => {}
+            | UIItemType::Split(_)
+            | UIItemType::SshHosts(_) => {}
         }
     }
 
@@ -615,7 +618,8 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
-            | UIItemType::Split(_) => {}
+            | UIItemType::Split(_)
+            | UIItemType::SshHosts(_) => {}
         }
     }
 
@@ -1132,6 +1136,74 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarNotifications => {
                 context.set_cursor(Some(MouseCursor::Hand));
             }
+            UIItemType::SshHosts(action) => {
+                self.mouse_event_ssh_hosts(action, event, context);
+            }
+        }
+    }
+
+    /// Run `f` against the active SSH hosts modal, if it is the active modal.
+    fn with_ssh_hosts_modal<R>(&self, f: impl FnOnce(&SshHostsModal) -> R) -> Option<R> {
+        let modal = self.get_modal()?;
+        let modal = modal.downcast_ref::<SshHostsModal>()?;
+        Some(f(modal))
+    }
+
+    fn mouse_event_ssh_hosts(
+        &mut self,
+        action: SshHostsAction,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+        match action {
+            SshHostsAction::Connect(id) => {
+                self.cancel_modal();
+                self.connect_ssh_host(id, None);
+            }
+            SshHostsAction::Edit(id) => {
+                self.with_ssh_hosts_modal(|m| m.enter_edit_form(&id));
+                self.invalidate_modal();
+            }
+            SshHostsAction::Delete(id) => {
+                crate::project_sessions::remove_host(&id);
+                self.invalidate_modal();
+            }
+            SshHostsAction::New => {
+                self.with_ssh_hosts_modal(|m| m.enter_new_form());
+                self.invalidate_modal();
+            }
+            SshHostsAction::FocusField(idx) => {
+                self.with_ssh_hosts_modal(|m| m.focus_field(idx));
+                self.invalidate_modal();
+            }
+            SshHostsAction::ToggleDetect => {
+                self.with_ssh_hosts_modal(|m| m.toggle_detect());
+                self.invalidate_modal();
+            }
+            SshHostsAction::Save => {
+                self.with_ssh_hosts_modal(|m| m.persist_form());
+                self.invalidate_modal();
+            }
+            SshHostsAction::SaveAndConnect => {
+                let id = self.with_ssh_hosts_modal(|m| m.persist_form()).flatten();
+                if let Some(id) = id {
+                    self.cancel_modal();
+                    self.connect_ssh_host(id, None);
+                } else {
+                    self.invalidate_modal();
+                }
+            }
+            SshHostsAction::Cancel => {
+                self.with_ssh_hosts_modal(|m| m.cancel_to_grid());
+                self.invalidate_modal();
+            }
+            SshHostsAction::Background => {
+                self.cancel_modal();
+            }
         }
     }
 
@@ -1511,6 +1583,7 @@ impl super::TermWindow {
                 size,
                 None,
                 term_config,
+                config::keyassignment::SpawnTabDomain::DefaultDomain,
             )
             .await
             {
@@ -1521,6 +1594,96 @@ impl super::TermWindow {
         .detach();
 
         context.invalidate();
+    }
+
+    /// Connect to a stored SSH host: ensure its mux domain is registered, then
+    /// create/restore a session in the target workspace (default `ssh:<host>`)
+    /// whose panes spawn into that SSH domain. Mirrors
+    /// [`Self::activate_project_session`] but targets the SSH domain.
+    pub(crate) fn connect_ssh_host(&mut self, project_id: String, target_workspace: Option<String>) {
+        let window = self.window.clone();
+        let invalidate = |window: &_| {
+            if let Some(win) = window {
+                WindowOps::invalidate(win);
+            }
+        };
+
+        let Some(spec) = crate::project_sessions::host_spec(&project_id) else {
+            invalidate(&window);
+            return;
+        };
+        let domain_name = match crate::ssh_hosts::ensure_ssh_domain_registered(&spec) {
+            Ok(name) => name,
+            Err(err) => {
+                log::error!("failed to register SSH domain for {:?}: {err:#}", spec.label);
+                return;
+            }
+        };
+        let workspace_name = target_workspace
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| crate::ssh_hosts::default_workspace_name(&spec));
+
+        let mux = Mux::get();
+        // Already live? Just switch to it rather than spawning a duplicate.
+        if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
+            if mux.active_workspace() != workspace_name {
+                front_end().switch_workspace(&workspace_name);
+            }
+            invalidate(&window);
+            return;
+        }
+
+        self.snapshot_active_project_session_layout();
+        let _ = crate::project_sessions::create_host_session(&project_id, &workspace_name);
+
+        let size = self.config.initial_size(
+            self.dimensions.dpi as u32,
+            crate::cell_pixel_dims(&self.config, self.dimensions.dpi as f64).ok(),
+        );
+        let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
+            Arc::new(TermConfig::with_config(self.config.clone()));
+        let switcher = crate::frontend::WorkspaceSwitcher::new(&workspace_name);
+        mux.set_active_workspace(&workspace_name);
+
+        let ws = workspace_name.clone();
+        let detect_os = spec.detect_os;
+        let detect_domain = domain_name.clone();
+        let detect_project = project_id.clone();
+        let detect_window = window.clone();
+        promise::spawn::spawn(async move {
+            if let Err(err) = crate::project_sessions::materialize_session(
+                ws,
+                None,
+                None,
+                size,
+                None,
+                term_config,
+                config::keyassignment::SpawnTabDomain::DomainName(domain_name),
+            )
+            .await
+            {
+                log::error!("failed to connect SSH session: {err:#}");
+            }
+            switcher.do_switch();
+
+            // Optional, user-controlled OS detection over the live session.
+            if detect_os {
+                if let Some(domain) = Mux::get().get_domain_by_name(&detect_domain) {
+                    if let Some(ssh) = domain.as_ref().downcast_ref::<RemoteSshDomain>() {
+                        if let Some(distro) = ssh.detect_os_release().await {
+                            if crate::project_sessions::set_host_distro(&detect_project, &distro) {
+                                if let Some(win) = detect_window.as_ref() {
+                                    win.invalidate();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+
+        invalidate(&window);
     }
 
     fn pane_nav_tab_context_menu_items(&self, pane_id: mux::pane::PaneId) -> Vec<ContextMenuItem> {

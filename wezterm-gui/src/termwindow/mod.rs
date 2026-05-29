@@ -94,6 +94,7 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+pub mod ssh_hosts_modal;
 pub mod ui;
 pub mod webgpu;
 
@@ -234,6 +235,33 @@ pub enum UIItemType {
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+    SshHosts(SshHostsAction),
+}
+
+/// Clickable targets inside the SSH host manager modal
+/// (see `termwindow/ssh_hosts_modal.rs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshHostsAction {
+    /// Connect to the host with this remote-project id.
+    Connect(String),
+    /// Open the edit form for this host.
+    Edit(String),
+    /// Delete this host.
+    Delete(String),
+    /// Open the empty "new host" form.
+    New,
+    /// Focus the form field at this index.
+    FocusField(usize),
+    /// Toggle the "detect OS on connect" switch in the form.
+    ToggleDetect,
+    /// Save the form (create/update) and return to the grid.
+    Save,
+    /// Save the form and immediately connect.
+    SaveAndConnect,
+    /// Discard the form and return to the grid.
+    Cancel,
+    /// Click on the dimmed backdrop: dismiss the modal.
+    Background,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3837,6 +3865,10 @@ impl TermWindow {
             }
             OpenSettings => {
                 crate::settings_window::show();
+            }
+            OpenSshHosts => {
+                let modal = crate::termwindow::ssh_hosts_modal::SshHostsModal::new();
+                self.set_modal(Rc::new(modal));
             }
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);

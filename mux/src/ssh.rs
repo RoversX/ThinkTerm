@@ -229,6 +229,19 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
     Ok(ssh_config)
 }
 
+/// Parse the `ID=` value out of `/etc/os-release` contents (e.g. "ubuntu").
+fn parse_os_release_id(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("ID=") {
+            let value = rest.trim().trim_matches('"').to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 impl RemoteSshDomain {
     pub fn with_ssh_domain(dom: &SshDomain) -> anyhow::Result<Self> {
         let id = alloc_domain_id();
@@ -238,6 +251,26 @@ impl RemoteSshDomain {
             session: Mutex::new(None),
             dom: dom.clone(),
         })
+    }
+
+    /// Run a one-shot, read-only `cat /etc/os-release` over the already
+    /// established session and return the parsed distro `ID` (e.g. "ubuntu").
+    /// Returns `None` on any error (no session, command failure, etc).
+    pub async fn detect_os_release(&self) -> Option<String> {
+        let session = self.session.lock().unwrap().as_ref().cloned()?;
+        let exec = session
+            .exec("cat /etc/os-release 2>/dev/null", None)
+            .await
+            .ok()?;
+        let mut stdout = exec.stdout;
+        // Read on a blocking thread so we don't stall the async executor.
+        let text = smol::unblock(move || {
+            let mut buf = String::new();
+            let _ = stdout.read_to_string(&mut buf);
+            buf
+        })
+        .await;
+        parse_os_release_id(&text)
     }
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {

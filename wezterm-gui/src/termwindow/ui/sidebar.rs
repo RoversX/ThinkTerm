@@ -5,7 +5,7 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::ui::icons::SvgIcon;
+use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, SvgIcon};
 use crate::termwindow::ui::status_icon::{split_leading_legacy_progress_marker, UiStatusKind};
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, MACOS_TITLEBAR_CONTENT_TOP_INSET, SIDEBAR_ICON_GAP, SIDEBAR_INSET,
@@ -1139,18 +1139,39 @@ impl crate::TermWindow {
                     disclosure_size,
                     muted_fg,
                 )?;
-                self.paint_sidebar_icon(
-                    layers,
-                    if project.sessions_collapsed {
+                let remote_brand = if project.is_remote {
+                    project.distro.as_deref().and_then(distro_to_icon)
+                } else {
+                    None
+                };
+                if let Some(brand) = remote_brand {
+                    // Detected remote OS: show its brand logo in full color.
+                    self.paint_sidebar_brand_icon(
+                        layers,
+                        brand,
+                        project_icon_x,
+                        icon_y,
+                        icon_size,
+                    )?;
+                } else {
+                    let project_icon = if project.is_remote {
+                        // Remote host without a detected OS: a globe marks it as
+                        // distinct from local folder projects in the mixed list.
+                        SvgIcon::Globe
+                    } else if project.sessions_collapsed {
                         SvgIcon::Folder
                     } else {
                         SvgIcon::FolderOpen
-                    },
-                    project_icon_x,
-                    icon_y,
-                    icon_size,
-                    muted_fg,
-                )?;
+                    };
+                    self.paint_sidebar_icon(
+                        layers,
+                        project_icon,
+                        project_icon_x,
+                        icon_y,
+                        icon_size,
+                        muted_fg,
+                    )?;
+                }
                 let project_title = self.sidebar_project_title(&project.id, &project.name);
                 self.paint_sidebar_text(
                     layers,
@@ -2035,6 +2056,40 @@ impl crate::TermWindow {
         quad.set_alt_color_and_mix_value(color, 0.0);
         quad.set_hsv(None);
         quad.set_grayscale();
+
+        Ok(())
+    }
+
+    /// Paint a full-color brand/OS logo (the brand color is baked into the
+    /// sprite, so unlike [`Self::paint_sidebar_icon`] it is not tinted).
+    fn paint_sidebar_brand_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        icon: BrandIcon,
+        x: usize,
+        y: usize,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        let gl_state = self.render_state.as_ref().unwrap();
+        let sprite = gl_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_brand_icon(icon, size)?
+            .texture_coords();
+
+        let mut quad = layers.allocate(2)?;
+        quad.set_position(
+            x as f32 - left_offset,
+            y as f32 - top_offset,
+            x as f32 + size as f32 - left_offset,
+            y as f32 + size as f32 - top_offset,
+        );
+        quad.set_texture(sprite);
+        quad.set_hsv(None);
+        quad.set_has_color(true);
+        quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
 
         Ok(())
     }

@@ -54,6 +54,7 @@ mod selection;
 mod settings_window;
 mod shapecache;
 mod spawn;
+mod ssh_hosts;
 mod stats;
 mod tabbar;
 mod termwindow;
@@ -700,6 +701,9 @@ fn setup_mux(
     mux.set_active_workspace(&default_workspace_name);
     crate::update::load_last_release_info_and_set_banner();
     update_mux_domains(config)?;
+    // Register ThinkTerm's saved SSH hosts as runtime mux domains so that
+    // reconnecting / restoring remote sessions can resolve them by name.
+    crate::ssh_hosts::register_saved_hosts();
 
     let default_name =
         default_domain_name.unwrap_or(config.default_domain.as_deref().unwrap_or("local"));

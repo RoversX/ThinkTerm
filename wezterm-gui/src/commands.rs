@@ -750,6 +750,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["ThinkTerm"],
             icon: Some("cod_settings_gear"),
         },
+        OpenSshHosts => CommandDef {
+            brief: "SSH Hosts...".into(),
+            doc: "Opens the ThinkTerm SSH host manager".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("md_server_network"),
+        },
         SpawnWindow => CommandDef {
             brief: "New Window".into(),
             doc: "Launches the default program into a new window".into(),
@@ -2125,6 +2133,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         #[cfg(target_os = "macos")]
         QuitApplication,
         // ----------------- Shell
+        OpenSshHosts,
         SpawnTab(SpawnTabDomain::CurrentPaneDomain),
         SpawnWindow,
         SplitVertical(SpawnCommand {

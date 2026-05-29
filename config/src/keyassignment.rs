@@ -652,6 +652,7 @@ pub enum KeyAssignment {
     ResetTerminal,
     OpenUri(String),
     OpenSettings,
+    OpenSshHosts,
     ActivateCommandPalette,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
