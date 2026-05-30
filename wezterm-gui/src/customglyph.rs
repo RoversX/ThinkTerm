@@ -5018,6 +5018,13 @@ impl GlyphCache {
         blend_mode: BlendMode,
     ) {
         let (width, height) = buffer.image_dimensions();
+        // A degenerate (zero-area) buffer can occur when a rounded-rect corner
+        // is requested at sub-pixel size (e.g. a tab dragged very small).
+        // `PixmapMut::from_bytes` returns None for 0 dimensions; skip rather
+        // than panic.
+        if width == 0 || height == 0 {
+            return;
+        }
         let mut pixmap =
             PixmapMut::from_bytes(buffer.pixel_data_slice_mut(), width as u32, height as u32)
                 .expect("make pixmap from existing bitmap");

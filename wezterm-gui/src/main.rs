@@ -50,6 +50,7 @@ mod renderstate;
 mod resize_increment_calculator;
 mod scripting;
 mod scrollbar;
+mod secret;
 mod selection;
 mod settings_window;
 mod shapecache;

@@ -1,5 +1,6 @@
+use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::{RenderFrame, TermWindowNotif};
-use crate::ui::UiPalette;
+use crate::ui::{DrawContext, UiPalette};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::WindowOps;
 use anyhow::Context;
@@ -182,6 +183,74 @@ impl crate::TermWindow {
         }
     }
 
+    /// Paint the active content view into the content area (right of the
+    /// sidebar, below the tab bar).
+    pub fn paint_content_view(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+    ) -> anyhow::Result<()> {
+        let settings = crate::native_settings::load();
+        let font_size = crate::native_settings::settings_font_size(&settings);
+        let font_weight = crate::native_settings::settings_font_weight(&settings);
+        let ui_font = self
+            .fonts
+            .command_palette_font_with_size_and_weight(font_size, font_weight)?;
+        let render_metrics =
+            crate::utilsprites::RenderMetrics::with_font_metrics(&ui_font.metrics());
+        let dimensions = self.dimensions;
+        let palette = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+
+        // Occupy exactly the terminal content area: right of the (possibly
+        // collapsed) sidebar and below the tab bar. padding_left_top().0 already
+        // includes the effective sidebar width.
+        let (padding_left, padding_top) = self.padding_left_top();
+        let border = self.get_os_border();
+        let top_tab_h = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let bottom_tab_h = if self.show_tab_bar && self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let left = padding_left + border.left.get() as f32;
+        let top = border.top.get() as f32 + top_tab_h + padding_top;
+        let width = (dimensions.pixel_width as f32 - left - border.right.get() as f32).max(0.0);
+        let height =
+            (dimensions.pixel_height as f32 - top - border.bottom.get() as f32 - bottom_tab_h)
+                .max(0.0);
+        let area = euclid::rect(left, top, width, height);
+
+        // Cursor blink: only animate when the view wants it (focused input).
+        let wants_blink = self
+            .content_view
+            .as_ref()
+            .map(|v| v.wants_cursor_blink())
+            .unwrap_or(false);
+        let blink_ms = (self.config.cursor_blink_rate as u64).max(100);
+        let cursor_on = if wants_blink {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            (ms / blink_ms as u128) % 2 == 0
+        } else {
+            true
+        };
+        if wants_blink {
+            self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(blink_ms)));
+        }
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
+        if let Some(view) = self.content_view.as_mut() {
+            view.paint(&ctx, layers, area, palette, &ui_font, cursor_on)?;
+        }
+        Ok(())
+    }
+
     pub fn paint_modal(&mut self) -> anyhow::Result<()> {
         if let Some(modal) = self.get_modal() {
             for computed in modal.computed_element(self)?.iter() {
@@ -312,23 +381,34 @@ impl crate::TermWindow {
             .context("filled_rectangle for chrome header background")?;
         }
 
-        for pos in panes {
-            if pos.is_active {
-                self.update_text_cursor(&pos);
-                if focused {
-                    pos.pane.advise_focus();
-                    mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
+        // When a content view is the foreground it takes over the content area,
+        // so skip painting the terminal panes / splits.
+        let content_view_active = self.content_view_foreground();
+
+        if !content_view_active {
+            for pos in panes {
+                if pos.is_active {
+                    self.update_text_cursor(&pos);
+                    if focused {
+                        pos.pane.advise_focus();
+                        mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
+                    }
+                }
+                self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+            }
+
+            if let Some(pane) = self.get_active_pane_or_overlay() {
+                let splits = self.get_splits();
+                for split in &splits {
+                    self.paint_split(&mut layers, split, &pane)
+                        .context("paint_split")?;
                 }
             }
-            self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
 
-        if let Some(pane) = self.get_active_pane_or_overlay() {
-            let splits = self.get_splits();
-            for split in &splits {
-                self.paint_split(&mut layers, split, &pane)
-                    .context("paint_split")?;
-            }
+        if content_view_active {
+            self.paint_content_view(&mut layers)
+                .context("paint_content_view")?;
         }
 
         self.paint_workspace_sidebar(&mut layers)

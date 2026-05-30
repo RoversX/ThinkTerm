@@ -27,9 +27,14 @@ pub enum TabBarItem {
     None,
     LeftStatus,
     RightStatus,
-    Tab { tab_idx: usize, active: bool },
+    Tab {
+        tab_idx: usize,
+        active: bool,
+    },
     NewTabButton,
     WindowButton(IntegratedTitleButton),
+    /// Synthetic tab for a ThinkTerm content view (e.g. SSH hosts).
+    ContentView,
 }
 
 #[derive(Clone, Debug, PartialEq)]

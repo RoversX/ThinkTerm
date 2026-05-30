@@ -15,6 +15,7 @@ k9.workspace = true
 gl_generator.workspace = true
 
 [features]
+cargo-clippy = []
 wayland = ["wayland-client", "smithay-client-toolkit", "wayland-egl", "wayland-protocols", "wayland-backend", "wayland-protocols-plasma"]
 
 [dependencies]

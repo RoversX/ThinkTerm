@@ -1,20 +1,298 @@
-//! Runtime SSH host -> mux domain plumbing for the ThinkTerm host manager.
+//! ThinkTerm SSH host address book and runtime host -> mux domain plumbing.
 //!
-//! ThinkTerm stores SSH hosts as "remote projects" (see
-//! [`crate::project_sessions::SshHostSpec`]). Unlike WezTerm's Lua
-//! `ssh_domains`, these are registered with the mux **at runtime** via
-//! [`mux::Mux::add_domain`]. No engine changes are required: building a domain
-//! from a struct (`RemoteSshDomain::with_ssh_domain`) and adding it is exactly
-//! what `wezterm ssh` already does in `main.rs`.
+//! `sessions.json` owns workspace/session layout only. User-created SSH hosts
+//! live in `ssh_hosts.json`; system `~/.ssh/config` hosts are exposed as
+//! read-only entries. Runtime domains are still registered lazily with the mux
+//! via [`mux::Mux::add_domain`].
 
-use crate::project_sessions::{self, SshHostSpec};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::{SshDomain, SshMultiplexing};
 use mux::domain::Domain;
 use mux::ssh::RemoteSshDomain;
 use mux::Mux;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+pub type SshHostId = String;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshHostSpec {
+    /// Display name shown on the host card / sidebar row.
+    pub label: String,
+    /// Hostname or IP address of the remote server.
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Path to an SSH identity (private key) file, if any.
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    /// Optional stored password used to auto-answer the password prompt on
+    /// connect. New values are stored encrypted (`enc:v1:...`); legacy
+    /// plaintext values are still accepted by the connection layer.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Extra `ssh_config` option overrides (key -> value).
+    #[serde(default)]
+    pub ssh_options: HashMap<String, String>,
+    /// Use WezTerm's multiplexed SSH (persistent, reconnecting) when true.
+    /// That requires `wezterm` installed on the remote; default to direct
+    /// `ssh` (like `wezterm ssh`) so password auth + the shell work anywhere.
+    #[serde(default)]
+    pub multiplexing: bool,
+    /// Override the default `ssh:<host>` workspace name.
+    #[serde(default)]
+    pub default_workspace: Option<String>,
+    /// When true, run a one-shot `cat /etc/os-release` after connecting to
+    /// detect the distro and pick its icon. User-controlled (opt-in).
+    #[serde(default = "default_true")]
+    pub detect_os: bool,
+    /// `/etc/os-release` `ID` detected after connecting; drives the OS icon.
+    #[serde(default)]
+    pub detected_distro: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshHostSource {
+    ThinkTerm,
+    System,
+}
+
+#[derive(Debug, Clone)]
+pub struct SshHostEntry {
+    pub id: SshHostId,
+    pub source: SshHostSource,
+    pub spec: SshHostSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SshHostRecord {
+    id: SshHostId,
+    spec: SshHostSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SshHostStore {
+    #[serde(default = "store_version")]
+    version: u32,
+    #[serde(default)]
+    hosts: Vec<SshHostRecord>,
+}
+
+impl Default for SshHostStore {
+    fn default() -> Self {
+        Self {
+            version: store_version(),
+            hosts: vec![],
+        }
+    }
+}
+
+fn store_version() -> u32 {
+    1
+}
+
+lazy_static::lazy_static! {
+    static ref SSH_HOST_STORE: Mutex<SshHostStore> =
+        Mutex::new(load_ssh_host_store().unwrap_or_else(|err| {
+            log::warn!("failed to load ThinkTerm SSH host store: {err:#}");
+            SshHostStore::default()
+        }));
+}
+
+pub fn ssh_hosts_store_path() -> PathBuf {
+    config::DATA_DIR.join("thinkterm").join("ssh_hosts.json")
+}
+
+fn load_ssh_host_store() -> Result<SshHostStore> {
+    load_ssh_host_store_from_path(&ssh_hosts_store_path())
+}
+
+fn load_ssh_host_store_from_path(path: &Path) -> Result<SshHostStore> {
+    if !path.exists() {
+        return Ok(SshHostStore::default());
+    }
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))
+}
+
+fn save_ssh_host_store(store: &SshHostStore) -> Result<()> {
+    save_ssh_host_store_to_path(&ssh_hosts_store_path(), store)
+}
+
+fn save_ssh_host_store_to_path(path: &Path, store: &SshHostStore) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("create temporary SSH host store in {}", parent.display()))?;
+        serde_json::to_writer_pretty(&mut file, store)
+            .with_context(|| format!("write {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", path.display()))?;
+        file.as_file()
+            .sync_all()
+            .with_context(|| format!("sync {}", path.display()))?;
+        file.persist(path)
+            .with_context(|| format!("replace {}", path.display()))?;
+        return Ok(());
+    }
+
+    let mut file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, store)
+        .with_context(|| format!("write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", path.display()))
+}
+
+pub fn list_hosts() -> Vec<(SshHostId, SshHostSpec)> {
+    let store = SSH_HOST_STORE.lock();
+    store
+        .hosts
+        .iter()
+        .map(|record| (record.id.clone(), record.spec.clone()))
+        .collect()
+}
+
+pub fn list_all_hosts() -> Vec<SshHostEntry> {
+    let mut entries: Vec<_> = list_hosts()
+        .into_iter()
+        .map(|(id, spec)| SshHostEntry {
+            id,
+            source: SshHostSource::ThinkTerm,
+            spec,
+        })
+        .collect();
+    entries.extend(list_system_hosts());
+    entries
+}
+
+pub fn host_spec(host_id: &str) -> Option<SshHostSpec> {
+    {
+        let store = SSH_HOST_STORE.lock();
+        if let Some(record) = store.hosts.iter().find(|record| record.id == host_id) {
+            return Some(record.spec.clone());
+        }
+    }
+    list_system_hosts()
+        .into_iter()
+        .find(|entry| entry.id == host_id)
+        .map(|entry| entry.spec)
+}
+
+pub fn try_create_host(spec: SshHostSpec) -> Result<SshHostId> {
+    let (host_id, spec) = upsert_host(spec)?;
+    register_ssh_domain(&spec)?;
+    Ok(host_id)
+}
+
+pub fn try_import_legacy_host(spec: SshHostSpec) -> Result<SshHostId> {
+    let mut store = SSH_HOST_STORE.lock();
+    let host_id = host_id_for_host(&spec);
+    if store.hosts.iter().any(|record| record.id == host_id) {
+        return Ok(host_id);
+    }
+    store.hosts.push(SshHostRecord {
+        id: host_id.clone(),
+        spec,
+    });
+    save_ssh_host_store(&store)?;
+    Ok(host_id)
+}
+
+fn upsert_host(spec: SshHostSpec) -> Result<(SshHostId, SshHostSpec)> {
+    let mut store = SSH_HOST_STORE.lock();
+    let host_id = host_id_for_host(&spec);
+    if let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) {
+        record.spec = spec;
+    } else {
+        store.hosts.push(SshHostRecord {
+            id: host_id.clone(),
+            spec,
+        });
+    }
+    save_ssh_host_store(&store)?;
+    let saved_spec = store
+        .hosts
+        .iter()
+        .find(|record| record.id == host_id)
+        .map(|record| record.spec.clone())
+        .expect("host was just inserted");
+    Ok((host_id, saved_spec))
+}
+
+pub fn try_update_host(host_id: &str, spec: SshHostSpec) -> Result<bool> {
+    if is_system_host_id(host_id) {
+        return Ok(false);
+    }
+    let mut store = SSH_HOST_STORE.lock();
+    let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) else {
+        return Ok(false);
+    };
+    record.spec = spec;
+    save_ssh_host_store(&store)?;
+    let spec = store
+        .hosts
+        .iter()
+        .find(|record| record.id == host_id)
+        .map(|record| record.spec.clone());
+    drop(store);
+    if let Some(spec) = spec {
+        register_ssh_domain(&spec)?;
+    }
+    Ok(true)
+}
+
+pub fn try_remove_host(host_id: &str) -> Result<bool> {
+    if is_system_host_id(host_id) {
+        return Ok(false);
+    }
+    let mut store = SSH_HOST_STORE.lock();
+    let before = store.hosts.len();
+    store.hosts.retain(|record| record.id != host_id);
+    if store.hosts.len() == before {
+        return Ok(false);
+    }
+    save_ssh_host_store(&store)?;
+    Ok(true)
+}
+
+pub fn set_host_distro(host_id: &str, distro_id: &str) -> bool {
+    if is_system_host_id(host_id) {
+        return false;
+    }
+    let mut store = SSH_HOST_STORE.lock();
+    let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) else {
+        return false;
+    };
+    let new_value = {
+        let trimmed = distro_id.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    if record.spec.detected_distro == new_value {
+        return false;
+    }
+    record.spec.detected_distro = new_value;
+    if let Err(err) = save_ssh_host_store(&store) {
+        log::warn!("failed to persist SSH host distro for {host_id}: {err:#}");
+    }
+    true
+}
+
+pub fn is_system_host_id(host_id: &str) -> bool {
+    host_id.starts_with("system-ssh-")
+}
 
 /// `user@host` (or `host`, with `:port` when non-default) used for the
 /// human-readable domain / workspace identifiers.
@@ -27,6 +305,10 @@ fn endpoint(spec: &SshHostSpec) -> String {
         Some(user) if !user.is_empty() => format!("{user}@{host}"),
         _ => host,
     }
+}
+
+pub fn host_project_path(spec: &SshHostSpec) -> PathBuf {
+    PathBuf::from(format!("ssh://{}", endpoint(spec)))
 }
 
 /// Deterministic mux domain name for a host. Stable across restarts so that a
@@ -76,6 +358,20 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
     }
 }
 
+fn register_ssh_domain(spec: &SshHostSpec) -> Result<()> {
+    let dom = build_ssh_domain(spec);
+    let password = spec
+        .password
+        .as_deref()
+        .map(crate::secret::reveal)
+        .filter(|p| !p.is_empty());
+    let domain: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain_and_password(
+        &dom, password,
+    )?);
+    Mux::get().add_domain(&domain);
+    Ok(())
+}
+
 /// Ensure the host's SSH domain is registered with the mux, building and adding
 /// it on first use. Returns the domain name to spawn into. The actual SSH
 /// connection is established lazily by the domain's `spawn_pane`, so this is
@@ -84,9 +380,7 @@ pub fn ensure_ssh_domain_registered(spec: &SshHostSpec) -> Result<String> {
     let name = ssh_domain_name(spec);
     let mux = Mux::get();
     if mux.get_domain_by_name(&name).is_none() {
-        let dom = build_ssh_domain(spec);
-        let domain: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain(&dom)?);
-        mux.add_domain(&domain);
+        register_ssh_domain(spec)?;
     }
     Ok(name)
 }
@@ -95,12 +389,198 @@ pub fn ensure_ssh_domain_registered(spec: &SshHostSpec) -> Result<String> {
 /// that re-activating a previously-connected remote session (whose saved layout
 /// references the domain by name) works without re-opening the host manager.
 pub fn register_saved_hosts() {
-    for (_project_id, spec) in project_sessions::list_hosts() {
-        if let Err(err) = ensure_ssh_domain_registered(&spec) {
+    for entry in list_all_hosts() {
+        if let Err(err) = ensure_ssh_domain_registered(&entry.spec) {
             log::warn!(
                 "failed to register saved SSH host {:?}: {err:#}",
-                spec.label
+                entry.spec.label
             );
         }
+    }
+}
+
+pub fn list_system_hosts() -> Vec<SshHostEntry> {
+    let path = config::HOME_DIR.join(".ssh").join("config");
+    match parse_system_ssh_config(&path) {
+        Ok(hosts) => hosts,
+        Err(err) => {
+            log::debug!(
+                "failed to read system SSH config {}: {err:#}",
+                path.display()
+            );
+            vec![]
+        }
+    }
+}
+
+fn parse_system_ssh_config(path: &Path) -> Result<Vec<SshHostEntry>> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(parse_system_ssh_config_str(&content))
+}
+
+#[derive(Default)]
+struct SystemHostBlock {
+    aliases: Vec<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    identity_file: Option<String>,
+}
+
+fn parse_system_ssh_config_str(content: &str) -> Vec<SshHostEntry> {
+    fn flush(block: &mut Option<SystemHostBlock>, out: &mut Vec<SshHostEntry>) {
+        let Some(block) = block.take() else {
+            return;
+        };
+        for alias in block.aliases {
+            if !is_concrete_host_alias(&alias) {
+                continue;
+            }
+            let spec = SshHostSpec {
+                label: alias.clone(),
+                // Preserve the alias as the remote address so ssh_config
+                // alias-scoped options such as ProxyJump still apply.
+                host: alias.clone(),
+                port: block.port,
+                username: block.user.clone(),
+                identity_file: block.identity_file.clone(),
+                password: None,
+                ssh_options: HashMap::new(),
+                multiplexing: false,
+                default_workspace: None,
+                detect_os: true,
+                detected_distro: None,
+            };
+            out.push(SshHostEntry {
+                id: system_host_id(&alias),
+                source: SshHostSource::System,
+                spec,
+            });
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut current: Option<SystemHostBlock> = None;
+
+    for raw_line in content.lines() {
+        let Some(line) = strip_ssh_config_comment(raw_line) else {
+            continue;
+        };
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let key = key.to_ascii_lowercase();
+        match key.as_str() {
+            "host" => {
+                flush(&mut current, &mut entries);
+                let aliases = parts.map(|part| part.to_string()).collect::<Vec<_>>();
+                current = Some(SystemHostBlock {
+                    aliases,
+                    ..Default::default()
+                });
+            }
+            "user" => {
+                if let Some(block) = current.as_mut() {
+                    block.user = parts.next().map(|value| value.to_string());
+                }
+            }
+            "port" => {
+                if let Some(block) = current.as_mut() {
+                    block.port = parts.next().and_then(|value| value.parse::<u16>().ok());
+                }
+            }
+            "identityfile" => {
+                if let Some(block) = current.as_mut() {
+                    block.identity_file = parts.next().map(expand_system_ssh_value);
+                }
+            }
+            _ => {}
+        }
+    }
+    flush(&mut current, &mut entries);
+    entries.sort_by(|a, b| {
+        a.spec
+            .label
+            .to_ascii_lowercase()
+            .cmp(&b.spec.label.to_ascii_lowercase())
+    });
+    entries.dedup_by(|a, b| a.id == b.id);
+    entries
+}
+
+fn strip_ssh_config_comment(line: &str) -> Option<&str> {
+    let line = line.split_once('#').map(|(head, _)| head).unwrap_or(line);
+    let line = line.trim();
+    (!line.is_empty()).then_some(line)
+}
+
+fn is_concrete_host_alias(alias: &str) -> bool {
+    !alias.starts_with('!') && !alias.contains('*') && !alias.contains('?')
+}
+
+fn expand_system_ssh_value(value: &str) -> String {
+    if value == "~" {
+        config::HOME_DIR.to_string_lossy().to_string()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        config::HOME_DIR.join(rest).to_string_lossy().to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn fnv1a(input: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in input.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn host_id_for_host(spec: &SshHostSpec) -> SshHostId {
+    let key = format!(
+        "ssh:{}@{}:{}",
+        spec.username.as_deref().unwrap_or(""),
+        spec.host,
+        spec.port.unwrap_or(22)
+    );
+    format!("ssh-{:x}", fnv1a(&key))
+}
+
+fn system_host_id(alias: &str) -> SshHostId {
+    format!("system-ssh-{:x}", fnv1a(&format!("system:{alias}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_hosts_preserve_ssh_config_alias_as_remote_address() {
+        let entries = parse_system_ssh_config_str(
+            r#"
+Host prod *.internal
+  HostName 10.0.0.1
+  User deploy
+  Port 2202
+  IdentityFile ~/.ssh/prod
+  ProxyJump bastion
+"#,
+        );
+
+        assert_eq!(entries.len(), 1);
+        let spec = &entries[0].spec;
+        assert_eq!(spec.label, "prod");
+        assert_eq!(spec.host, "prod");
+        assert_eq!(spec.username.as_deref(), Some("deploy"));
+        assert_eq!(spec.port, Some(2202));
+        assert!(spec
+            .identity_file
+            .as_deref()
+            .unwrap()
+            .ends_with("/.ssh/prod"));
     }
 }

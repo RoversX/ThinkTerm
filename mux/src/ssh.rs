@@ -182,6 +182,8 @@ pub struct RemoteSshDomain {
     dom: SshDomain,
     id: DomainId,
     name: String,
+    /// Optional stored password used to auto-answer the first password prompt.
+    password: Option<String>,
 }
 
 pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
@@ -244,12 +246,23 @@ fn parse_os_release_id(text: &str) -> Option<String> {
 
 impl RemoteSshDomain {
     pub fn with_ssh_domain(dom: &SshDomain) -> anyhow::Result<Self> {
+        Self::with_ssh_domain_and_password(dom, None)
+    }
+
+    /// Like [`Self::with_ssh_domain`] but stores a password used to
+    /// auto-answer the first interactive password prompt (ThinkTerm host
+    /// manager). The password is held in memory only on this domain.
+    pub fn with_ssh_domain_and_password(
+        dom: &SshDomain,
+        password: Option<String>,
+    ) -> anyhow::Result<Self> {
         let id = alloc_domain_id();
         Ok(Self {
             id,
             name: dom.name.clone(),
             session: Mutex::new(None),
             dom: dom.clone(),
+            password,
         })
     }
 
@@ -362,6 +375,7 @@ impl RemoteSshDomain {
         command_line: Option<String>,
         env: HashMap<String, String>,
         size: TerminalSize,
+        password: Option<String>,
     ) -> anyhow::Result<StartNewSessionResult> {
         let (session, events) = Session::connect(self.ssh_config().context("obtain ssh config")?)
             .context("connect to ssh server")?;
@@ -433,6 +447,7 @@ impl RemoteSshDomain {
                 size,
                 command_line,
                 env,
+                password,
             ) {
                 let _ = write!(stdout_write, "{:#}", err);
                 log::error!("Failed to connect ssh: {:#}", err);
@@ -463,6 +478,7 @@ fn connect_ssh_session(
     size: Arc<Mutex<TerminalSize>>,
     command_line: Option<String>,
     env: HashMap<String, String>,
+    mut password: Option<String>,
 ) -> anyhow::Result<()> {
     struct StdoutShim<'a> {
         size: Arc<Mutex<TerminalSize>>,
@@ -660,6 +676,17 @@ fn connect_ssh_session(
                     for line in &prompt_lines {
                         shim.output_line(line)?;
                     }
+                    // Auto-answer the first password (non-echo) prompt with a
+                    // stored password, if any. Only once: a wrong stored
+                    // password then falls back to interactive entry so the user
+                    // can correct it instead of looping.
+                    if !prompt.echo {
+                        if let Some(stored) = password.take() {
+                            shim.output_line(editor_prompt)?;
+                            answers.push(stored);
+                            continue;
+                        }
+                    }
                     let mut editor = LineEditor::new(&mut shim);
                     let mut host = PasswordPromptHost::default();
                     editor.set_prompt(editor_prompt);
@@ -775,7 +802,8 @@ impl Domain for RemoteSshDomain {
                     {
                         // Session died (perhaps they closed the initial tab?)
                         // So we'll try making a new one
-                        self.start_new_session(command_line, env, size).await?
+                        self.start_new_session(command_line, env, size, self.password.clone())
+                            .await?
                     } else {
                         log::error!("{err:#?}");
                         return Err(err);
@@ -783,7 +811,8 @@ impl Domain for RemoteSshDomain {
                 }
             }
         } else {
-            self.start_new_session(command_line, env, size).await?
+            self.start_new_session(command_line, env, size, self.password.clone())
+                .await?
         };
 
         // Wrap up the pty etc. in a LocalPane.  That allows for

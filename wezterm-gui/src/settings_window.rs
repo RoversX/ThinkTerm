@@ -1474,6 +1474,7 @@ impl SettingsWindow {
             return match event.key {
                 KeyCode::Char('a') | KeyCode::Char('A') => self.select_all_focused_input(focused),
                 KeyCode::Char('c') | KeyCode::Char('C') => self.copy_focused_input(focused, window),
+                KeyCode::Char('x') | KeyCode::Char('X') => self.cut_focused_input(focused, window),
                 KeyCode::Char('v') | KeyCode::Char('V') => {
                     self.paste_focused_input_from_clipboard(focused, window)
                 }
@@ -1535,6 +1536,29 @@ impl SettingsWindow {
             return false;
         };
         window.set_clipboard(Clipboard::Clipboard, text.to_string());
+        true
+    }
+
+    fn cut_focused_input(&mut self, focused: SettingsAction, window: &Window) -> bool {
+        let text = match focused {
+            SettingsAction::SearchInput => {
+                let Some(text) = self.ui.search.take_selected_text() else {
+                    return false;
+                };
+                self.ui.sidebar_scroll.reset();
+                self.sync_selected_section_with_search();
+                text
+            }
+            SettingsAction::FontFamilyInput => {
+                let Some(text) = self.ui.font_family_input.take_selected_text() else {
+                    return false;
+                };
+                self.sync_native_terminal_inputs();
+                text
+            }
+            _ => return false,
+        };
+        window.set_clipboard(Clipboard::Clipboard, text);
         true
     }
 
@@ -4549,14 +4573,17 @@ impl SettingsWindow {
             _ => false,
         };
         if focused && selected_all && !value.is_empty() {
+            let selection_width = self
+                .measure_text_width(&ui_font, value)
+                .min((control_width - 32.0).max(0.0));
             self.draw_rounded_rect(
                 layers,
                 1,
-                control_x + 10.0,
-                control_y + 8.0,
-                control_width - 20.0,
-                CONTROL_HEIGHT - 16.0,
-                palette.nav_selected_bg.mul_alpha(0.32),
+                control_x + 12.0,
+                control_y + 6.0,
+                selection_width + 8.0,
+                CONTROL_HEIGHT - 12.0,
+                palette.nav_selected_bg.mul_alpha(0.56),
                 CONTROL_RADIUS - 4.0,
             )?;
         }
@@ -4579,10 +4606,10 @@ impl SettingsWindow {
             self.draw_rect(
                 layers,
                 1,
-                caret_x,
-                control_y + 12.0,
-                1.5,
-                CONTROL_HEIGHT - 24.0,
+                caret_x - 1.0,
+                control_y + 8.0,
+                3.0,
+                CONTROL_HEIGHT - 16.0,
                 palette.nav_selected_bg,
             )?;
         }
@@ -5201,14 +5228,17 @@ impl SettingsWindow {
             palette.text
         };
         if spec.focused && spec.selected_all && !spec.text.is_empty() {
+            let selection_width = self
+                .measure_text_width(&Rc::clone(&self.ui_font), spec.text)
+                .min((spec.rect.size.width - 116.0).max(0.0));
             self.draw_rounded_rect(
                 layers,
                 1,
-                spec.rect.origin.x + 50.0,
-                spec.rect.origin.y + 8.0,
-                spec.rect.size.width - 96.0,
-                spec.rect.size.height - 16.0,
-                palette.nav_selected_bg.mul_alpha(0.32),
+                spec.rect.origin.x + 54.0,
+                spec.rect.origin.y + 6.0,
+                selection_width + 8.0,
+                spec.rect.size.height - 12.0,
+                palette.nav_selected_bg.mul_alpha(0.56),
                 self.ui.tokens.control_radius - 4.0,
             )?;
         }
@@ -5230,10 +5260,10 @@ impl SettingsWindow {
             self.draw_rect(
                 layers,
                 1,
-                caret_x,
-                spec.rect.origin.y + 10.0,
-                1.5,
-                spec.rect.size.height - 20.0,
+                caret_x - 1.0,
+                spec.rect.origin.y + 8.0,
+                3.0,
+                spec.rect.size.height - 16.0,
                 palette.nav_selected_bg,
             )?;
         }

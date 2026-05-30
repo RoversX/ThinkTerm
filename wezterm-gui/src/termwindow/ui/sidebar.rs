@@ -40,8 +40,8 @@ const SIDEBAR_SETTINGS_ROW_LIFT: usize = 18;
 const SIDEBAR_TOP_FADE_HEIGHT: usize = 32;
 const WORKSPACE_GROUP_EXTRA_GAP: usize = 8;
 const WORKSPACE_SECTION_LABEL_GAP: usize = 12;
-const SESSION_ROW_MIN_HEIGHT: usize = 62;
-const SESSION_ROW_SIDE_PADDING: usize = 8;
+const SESSION_ROW_MIN_HEIGHT: usize = 66;
+const SESSION_ROW_SIDE_PADDING: usize = 10;
 const SESSION_ACTION_MIN_SIZE: usize = 48;
 const SESSION_ACTION_MAX_SIZE: usize = 52;
 const SESSION_ACTION_ICON_INSET: usize = 12;
@@ -1627,7 +1627,17 @@ impl crate::TermWindow {
                 .saturating_add(settings_row_width)
                 .saturating_sub(settings_action_size);
             let settings_action_y = settings_row_y;
-            let settings_body_width = settings_action_x
+            // SSH hosts (link-2) button sits just left of the view-options button.
+            let ssh_action_x =
+                settings_action_x.saturating_sub(settings_action_size + SIDEBAR_INSET / 2);
+            let ssh_action_y = settings_row_y;
+            let ssh_action_hovered = self.is_pointer_over_ui_rect(
+                ssh_action_x,
+                ssh_action_y,
+                settings_action_size,
+                settings_action_size,
+            );
+            let settings_body_width = ssh_action_x
                 .saturating_sub(settings_row_x)
                 .saturating_sub(SIDEBAR_INSET / 2);
             let settings_hovered = self.is_pointer_over_ui_rect(
@@ -1686,6 +1696,43 @@ impl crate::TermWindow {
                 height: settings_action_size,
                 item_type: UIItemType::WorkspaceSidebarViewOptions,
             });
+            if ssh_action_hovered {
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        ssh_action_x as f32,
+                        ssh_action_y as f32,
+                        settings_action_size as f32,
+                        settings_action_size as f32,
+                    ),
+                    chrome.sidebar_button_hover_bg,
+                    SIDEBAR_ROW_RADIUS + 4.0,
+                )
+                .context("sidebar ssh hosts hover")?;
+            }
+            self.ui_items.push(UIItem {
+                x: ssh_action_x,
+                y: ssh_action_y,
+                width: settings_action_size,
+                height: settings_action_size,
+                item_type: UIItemType::WorkspaceSidebarSshHosts,
+            });
+            {
+                let ssh_icon_size = icon_size.min(settings_row_height.saturating_sub(8));
+                self.paint_sidebar_icon(
+                    layers,
+                    SvgIcon::Link2,
+                    ssh_action_x + ((settings_action_size.saturating_sub(ssh_icon_size)) / 2),
+                    ssh_action_y + ((settings_action_size.saturating_sub(ssh_icon_size)) / 2),
+                    ssh_icon_size,
+                    if ssh_action_hovered {
+                        foreground
+                    } else {
+                        muted_fg
+                    },
+                )?;
+            }
             let settings_icon_size = icon_size.min(settings_row_height.saturating_sub(8));
             let settings_icon_x = settings_row_x + SIDEBAR_SETTINGS_ICON_EXTRA_INSET;
             let settings_icon_y =
@@ -1828,7 +1875,9 @@ impl crate::TermWindow {
         radius: f32,
     ) -> anyhow::Result<()> {
         let radius = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
-        if radius <= 0.0 {
+        // Sub-pixel radii round down to a 0px corner sprite (which panics when
+        // building its pixmap), so fall back to a plain rectangle below ~1px.
+        if !(radius >= 1.0) {
             self.filled_rectangle(layers, layer_num, rect, color)?;
             return Ok(());
         }

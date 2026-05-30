@@ -35,48 +35,6 @@ pub struct Project {
     pub active_session_id: Option<SessionId>,
     #[serde(default)]
     pub sessions_collapsed: bool,
-    /// When set, this "project" is a remote SSH host rather than a local
-    /// folder. Local projects leave this `None`.
-    #[serde(default)]
-    pub remote: Option<SshHostSpec>,
-}
-
-/// Stored SSH host definition. A remote [`Project`] carries one of these; the
-/// connection layer (`ssh_hosts.rs`) turns it into a live `config::SshDomain`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SshHostSpec {
-    /// Display name shown on the host card / sidebar row.
-    pub label: String,
-    /// Hostname or IP address of the remote server.
-    pub host: String,
-    #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub username: Option<String>,
-    /// Path to an SSH identity (private key) file, if any.
-    #[serde(default)]
-    pub identity_file: Option<String>,
-    /// Extra `ssh_config` option overrides (key -> value).
-    #[serde(default)]
-    pub ssh_options: HashMap<String, String>,
-    /// Use WezTerm's multiplexed SSH (persistent, reconnecting) when true,
-    /// otherwise connect directly like `ssh`.
-    #[serde(default = "default_true")]
-    pub multiplexing: bool,
-    /// Override the default `ssh:<host>` workspace name.
-    #[serde(default)]
-    pub default_workspace: Option<String>,
-    /// When true, run a one-shot `cat /etc/os-release` after connecting to
-    /// detect the distro and pick its icon. User-controlled (opt-in).
-    #[serde(default = "default_true")]
-    pub detect_os: bool,
-    /// `/etc/os-release` `ID` detected after connecting; drives the OS icon.
-    #[serde(default)]
-    pub detected_distro: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -162,6 +120,7 @@ pub enum SessionWorkStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationPlan {
+    pub project_id: ProjectId,
     pub session_id: SessionId,
     pub workspace_name: String,
     pub project_path: PathBuf,
@@ -225,7 +184,68 @@ pub fn load_session_store_from_path(path: &Path) -> Result<SessionStore> {
         return Ok(SessionStore::default());
     }
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))
+    let value: serde_json::Value =
+        serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))?;
+    migrate_legacy_remote_hosts(&value);
+    serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))
+}
+
+fn migrate_legacy_remote_hosts(value: &serde_json::Value) {
+    let Some(projects) = value
+        .get("projects")
+        .and_then(|projects| projects.as_array())
+    else {
+        return;
+    };
+
+    for project in projects {
+        let Some(remote) = project.get("remote") else {
+            continue;
+        };
+        let project_label = project
+            .get("name")
+            .and_then(|name| name.as_str())
+            .unwrap_or("SSH Host");
+        let project_id = project
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("<unknown>");
+
+        let mut spec = match serde_json::from_value::<crate::ssh_hosts::SshHostSpec>(remote.clone())
+        {
+            Ok(spec) => spec,
+            Err(err) => {
+                log::warn!(
+                    "failed to migrate legacy SSH host from session project {project_id}: {err:#}"
+                );
+                continue;
+            }
+        };
+
+        if spec.label.trim().is_empty() {
+            spec.label = project_label.to_string();
+        }
+
+        if let Some(password) = spec.password.clone() {
+            if !password.is_empty() && !crate::secret::is_encrypted(&password) {
+                match crate::secret::encrypt(&password) {
+                    Ok(encrypted) => spec.password = Some(encrypted),
+                    Err(err) => {
+                        log::warn!(
+                            "failed to encrypt legacy SSH password for session project {project_id}: {err:#}"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if let Err(err) = crate::ssh_hosts::try_import_legacy_host(spec) {
+            log::warn!(
+                "failed to migrate legacy SSH host from session project {project_id}: {err:#}"
+            );
+        }
+    }
 }
 
 pub fn save_session_store(store: &SessionStore) -> Result<()> {
@@ -274,7 +294,6 @@ pub fn current_project_from_cwd() -> Project {
         sessions: vec![],
         active_session_id: None,
         sessions_collapsed: false,
-        remote: None,
     }
 }
 
@@ -317,110 +336,35 @@ pub fn create_project_from_path(path: &str) -> Result<SessionId> {
     Ok(session_id)
 }
 
-/// Return every stored SSH host (remote project) as `(project_id, spec)`.
-pub fn list_hosts() -> Vec<(ProjectId, SshHostSpec)> {
-    let store = SESSION_STORE.lock();
-    store
-        .projects
-        .iter()
-        .filter_map(|project| {
-            project
-                .remote
-                .clone()
-                .map(|spec| (project.id.clone(), spec))
-        })
-        .collect()
-}
-
-/// Fetch the SSH host spec for a remote project, if it is one.
-pub fn host_spec(project_id: &str) -> Option<SshHostSpec> {
-    let store = SESSION_STORE.lock();
-    store
-        .projects
-        .iter()
-        .find(|project| project.id == project_id)
-        .and_then(|project| project.remote.clone())
-}
-
-/// Create (or update, when host+user+port already exist) an SSH host. Returns
-/// the remote project id. The host starts with no sessions; connecting creates
-/// them.
-pub fn create_host(spec: SshHostSpec) -> ProjectId {
+/// Create a new session under a remote (SSH) project bound to `workspace_name`,
+/// mark it active, and return its id. Remote host connection details live in
+/// `ssh_hosts.json`; the project record here is layout/sidebar state only.
+pub fn create_remote_host_session(
+    project_id: &str,
+    label: &str,
+    path: PathBuf,
+    workspace_name: &str,
+) -> SessionId {
     let mut store = SESSION_STORE.lock();
-    let project_id = project_id_for_host(&spec);
     if let Some(project) = store.projects.iter_mut().find(|p| p.id == project_id) {
-        project.name = spec.label.clone();
-        project.remote = Some(spec);
+        project.name = label.to_string();
+        project.path = path.clone();
     } else {
-        let path = PathBuf::from(format!("ssh://{}", host_display(&spec)));
         store.projects.push(Project {
-            id: project_id.clone(),
-            name: spec.label.clone(),
+            id: project_id.to_string(),
+            name: label.to_string(),
             path,
             sessions: vec![],
             active_session_id: None,
             sessions_collapsed: false,
-            remote: Some(spec),
         });
     }
-    persist_locked(&store);
-    project_id
-}
 
-/// Update the spec of an existing remote project in place. Returns false when
-/// the project does not exist or is not a remote host.
-pub fn update_host(project_id: &str, spec: SshHostSpec) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let Some(project) = store
-        .projects
-        .iter_mut()
-        .find(|p| p.id == project_id && p.remote.is_some())
-    else {
-        return false;
-    };
-    project.name = spec.label.clone();
-    project.remote = Some(spec);
-    persist_locked(&store);
-    true
-}
-
-/// Remove an SSH host (and any sessions under it). Delegates to the shared
-/// project-removal path so workspace cleanup is handled identically.
-pub fn remove_host(project_id: &str) -> Option<RemovedProject> {
-    remove_project(project_id)
-}
-
-/// Record the detected `/etc/os-release` `ID` for a host so the UI can show the
-/// matching OS icon. Returns true when the value changed.
-pub fn set_host_distro(project_id: &str, distro_id: &str) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let Some(project) = store.projects.iter_mut().find(|p| p.id == project_id) else {
-        return false;
-    };
-    let Some(remote) = project.remote.as_mut() else {
-        return false;
-    };
-    let new_value = {
-        let trimmed = distro_id.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    };
-    if remote.detected_distro == new_value {
-        return false;
-    }
-    remote.detected_distro = new_value;
-    persist_locked(&store);
-    true
-}
-
-/// Create a new session under a remote (SSH) project bound to `workspace_name`,
-/// mark it active, and return its id. Returns `None` if the project is missing
-/// or not a remote host.
-pub fn create_host_session(project_id: &str, workspace_name: &str) -> Option<SessionId> {
-    let mut store = SESSION_STORE.lock();
     let project = store
         .projects
         .iter_mut()
-        .find(|p| p.id == project_id && p.remote.is_some())?;
+        .find(|p| p.id == project_id)
+        .expect("remote project was just inserted");
     let name = format!("Session {}", project.sessions.len() + 1);
     let session = Session::new(
         project_id.to_string(),
@@ -432,7 +376,7 @@ pub fn create_host_session(project_id: &str, workspace_name: &str) -> Option<Ses
     project.sessions.push(session);
     store.active_project_id = Some(project_id.to_string());
     persist_locked(&store);
-    Some(session_id)
+    session_id
 }
 
 pub fn activate_session_record(
@@ -722,24 +666,29 @@ impl SessionStore {
         let projects = self
             .projects
             .iter()
-            .map(|project| ProjectView {
-                id: project.id.clone(),
-                name: project.name.clone(),
-                is_active: project.id == active_project_id,
-                sessions_collapsed: project.sessions_collapsed,
-                sessions: session_views_for_project(
-                    project,
-                    Some(active_project_id),
-                    live_workspaces,
-                )
-                .into_iter()
-                .filter(|session| !session.is_pinned)
-                .collect(),
-                is_remote: project.remote.is_some(),
-                distro: project
-                    .remote
-                    .as_ref()
-                    .and_then(|spec| spec.detected_distro.clone()),
+            .map(|project| {
+                let is_remote = is_remote_project(project);
+                ProjectView {
+                    id: project.id.clone(),
+                    name: project.name.clone(),
+                    is_active: project.id == active_project_id,
+                    sessions_collapsed: project.sessions_collapsed,
+                    sessions: session_views_for_project(
+                        project,
+                        Some(active_project_id),
+                        live_workspaces,
+                    )
+                    .into_iter()
+                    .filter(|session| !session.is_pinned)
+                    .collect(),
+                    is_remote,
+                    distro: if is_remote {
+                        crate::ssh_hosts::host_spec(&project.id)
+                            .and_then(|spec| spec.detected_distro.clone())
+                    } else {
+                        None
+                    },
+                }
             })
             .collect();
         ProjectSessionView {
@@ -826,7 +775,6 @@ impl SessionStore {
             sessions: vec![],
             active_session_id: None,
             sessions_collapsed: false,
-            remote: None,
         };
         let session = Session::new(project_id.clone(), "main".to_string(), None);
         let session_id = session.id.clone();
@@ -909,6 +857,7 @@ impl SessionStore {
         project.active_session_id = Some(session.id.clone());
         self.active_project_id = Some(project.id.clone());
         Some(ActivationPlan {
+            project_id,
             session_id: session.id.clone(),
             workspace_name,
             project_path: project.path.clone(),
@@ -1611,33 +1560,10 @@ fn project_id_for_path(path: &Path) -> ProjectId {
     format!("project-{hash:x}")
 }
 
-fn fnv1a(input: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in input.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-/// `user@host` (or just `host`) for display / synthetic paths.
-fn host_display(spec: &SshHostSpec) -> String {
-    match &spec.username {
-        Some(user) if !user.is_empty() => format!("{user}@{}", spec.host),
-        _ => spec.host.clone(),
-    }
-}
-
-/// Stable id for a remote project, derived from user@host:port so re-adding the
-/// same host maps back to the same project.
-fn project_id_for_host(spec: &SshHostSpec) -> ProjectId {
-    let key = format!(
-        "ssh:{}@{}:{}",
-        spec.username.as_deref().unwrap_or(""),
-        spec.host,
-        spec.port.unwrap_or(22)
-    );
-    format!("ssh-{:x}", fnv1a(&key))
+fn is_remote_project(project: &Project) -> bool {
+    project.id.starts_with("ssh-")
+        || project.id.starts_with("system-ssh-")
+        || project.path.to_string_lossy().starts_with("ssh://")
 }
 
 fn normalize_project_path(path: &str) -> Result<PathBuf> {
@@ -1706,7 +1632,6 @@ mod tests {
             )],
             active_session_id: None,
             sessions_collapsed: false,
-            remote: None,
         };
         store.active_project_id = Some(project.id.clone());
         store.projects.push(project);
@@ -1730,7 +1655,6 @@ mod tests {
             sessions: vec![session],
             active_session_id: None,
             sessions_collapsed: false,
-            remote: None,
         });
 
         save_session_store_to_path(&path, &store).unwrap();
@@ -1763,7 +1687,6 @@ mod tests {
             )],
             active_session_id: None,
             sessions_collapsed: false,
-            remote: None,
         };
         let session_id = project.sessions[0].id.clone();
         store.projects.push(project);
@@ -1825,7 +1748,6 @@ mod tests {
             )],
             active_session_id: None,
             sessions_collapsed: false,
-            remote: None,
         };
         let session_id = project.sessions[0].id.clone();
         store.projects.push(project);
@@ -1856,7 +1778,6 @@ mod tests {
             sessions: vec![session.clone()],
             active_session_id: Some(session_id),
             sessions_collapsed: false,
-            remote: None,
         };
         store.projects.push(project);
         store.snapshot_workspace_layout(
@@ -1885,7 +1806,6 @@ mod tests {
             sessions: vec![first],
             active_session_id: Some(first_id),
             sessions_collapsed: false,
-            remote: None,
         });
         store.projects.push(Project {
             id: "project-2".to_string(),
@@ -1894,7 +1814,6 @@ mod tests {
             sessions: vec![second],
             active_session_id: Some(second_id),
             sessions_collapsed: false,
-            remote: None,
         });
         store.active_project_id = Some("project-2".to_string());
 
@@ -1919,7 +1838,6 @@ mod tests {
             sessions: vec![first],
             active_session_id: Some(first_id),
             sessions_collapsed: false,
-            remote: None,
         });
         store.projects.push(Project {
             id: "project-2".to_string(),
@@ -1928,7 +1846,6 @@ mod tests {
             sessions: vec![second],
             active_session_id: Some(second_id.clone()),
             sessions_collapsed: false,
-            remote: None,
         });
         store.active_project_id = Some("project-2".to_string());
 
@@ -1963,7 +1880,6 @@ mod tests {
             sessions: vec![first, second, third],
             active_session_id: Some(first_id.clone()),
             sessions_collapsed: false,
-            remote: None,
         });
 
         assert!(store.rename_session(&second_id, "Review".to_string()));

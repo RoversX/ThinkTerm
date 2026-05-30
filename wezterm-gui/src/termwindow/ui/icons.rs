@@ -17,6 +17,7 @@ pub enum SvgIcon {
     Globe,
     Info,
     Keyboard,
+    Link2,
     Loader,
     LoaderCircle,
     Maximize2,
@@ -76,6 +77,7 @@ impl SvgIcon {
             Self::Globe => include_bytes!("../../../../third_party/lucide/icons/globe.svg"),
             Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
             Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),
+            Self::Link2 => include_bytes!("../../../../third_party/lucide/icons/link-2.svg"),
             Self::Loader => include_bytes!("../../../../third_party/lucide/icons/loader.svg"),
             Self::LoaderCircle => {
                 include_bytes!("../../../../third_party/lucide/icons/loader-circle.svg")
@@ -395,7 +397,11 @@ mod tests {
             let data: Vec<u8> = icon.rasterize(24).unwrap().into();
             assert_eq!(data.len(), 24 * 24 * 4);
             // The brand color must actually paint some non-transparent pixels.
-            assert!(data.iter().any(|value| *value != 0), "{:?} rendered empty", icon);
+            assert!(
+                data.iter().any(|value| *value != 0),
+                "{:?} rendered empty",
+                icon
+            );
         }
     }
 

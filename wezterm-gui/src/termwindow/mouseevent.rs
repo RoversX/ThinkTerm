@@ -8,10 +8,9 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X,
     WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
-use crate::termwindow::ssh_hosts_modal::SshHostsModal;
 use crate::termwindow::{
-    GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, SshHostsAction,
-    TabWheelSurface, TermWindowNotif, UIItem, UIItemType, TMB,
+    GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TabWheelSurface,
+    TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     ContextMenuItem, MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK,
@@ -586,12 +585,13 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
             | UIItemType::WorkspaceSidebarViewOptions
+            | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::Split(_)
-            | UIItemType::SshHosts(_) => {}
+            | UIItemType::ContentViewClose => {}
         }
     }
 
@@ -614,12 +614,13 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
             | UIItemType::WorkspaceSidebarViewOptions
+            | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::Split(_)
-            | UIItemType::SshHosts(_) => {}
+            | UIItemType::ContentViewClose => {}
         }
     }
 
@@ -866,6 +867,18 @@ impl super::TermWindow {
                 self.current_mouse_capture = Some(MouseCapture::UI);
             }
             self.mouse_event_ui_item(item, pane, y, event, context);
+        } else if self.content_view_foreground() {
+            // The content view owns the content area; route by pixel coords.
+            context.set_cursor(Some(MouseCursor::Arrow));
+            let px = event.coords.x as f32;
+            let py = event.coords.y as f32;
+            let resp = self
+                .content_view
+                .as_mut()
+                .map(|v| v.on_mouse(px, py, event.kind));
+            if let Some(resp) = resp {
+                self.handle_content_response(resp);
+            }
         } else if matches!(
             self.current_mouse_capture,
             None | Some(MouseCapture::TerminalPane(_))
@@ -1130,79 +1143,23 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarSettings => {
                 self.mouse_event_workspace_sidebar_settings(event, context);
             }
+            UIItemType::WorkspaceSidebarSshHosts => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_ssh_hosts_view();
+                }
+            }
+            UIItemType::ContentViewClose => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.close_content_view();
+                }
+            }
             UIItemType::WorkspaceSidebarViewOptions => {
                 self.mouse_event_workspace_sidebar_view_options(item, event, context);
             }
             UIItemType::WorkspaceSidebarNotifications => {
                 context.set_cursor(Some(MouseCursor::Hand));
-            }
-            UIItemType::SshHosts(action) => {
-                self.mouse_event_ssh_hosts(action, event, context);
-            }
-        }
-    }
-
-    /// Run `f` against the active SSH hosts modal, if it is the active modal.
-    fn with_ssh_hosts_modal<R>(&self, f: impl FnOnce(&SshHostsModal) -> R) -> Option<R> {
-        let modal = self.get_modal()?;
-        let modal = modal.downcast_ref::<SshHostsModal>()?;
-        Some(f(modal))
-    }
-
-    fn mouse_event_ssh_hosts(
-        &mut self,
-        action: SshHostsAction,
-        event: MouseEvent,
-        context: &dyn WindowOps,
-    ) {
-        context.set_cursor(Some(MouseCursor::Hand));
-        if event.kind != WMEK::Press(MousePress::Left) {
-            return;
-        }
-        match action {
-            SshHostsAction::Connect(id) => {
-                self.cancel_modal();
-                self.connect_ssh_host(id, None);
-            }
-            SshHostsAction::Edit(id) => {
-                self.with_ssh_hosts_modal(|m| m.enter_edit_form(&id));
-                self.invalidate_modal();
-            }
-            SshHostsAction::Delete(id) => {
-                crate::project_sessions::remove_host(&id);
-                self.invalidate_modal();
-            }
-            SshHostsAction::New => {
-                self.with_ssh_hosts_modal(|m| m.enter_new_form());
-                self.invalidate_modal();
-            }
-            SshHostsAction::FocusField(idx) => {
-                self.with_ssh_hosts_modal(|m| m.focus_field(idx));
-                self.invalidate_modal();
-            }
-            SshHostsAction::ToggleDetect => {
-                self.with_ssh_hosts_modal(|m| m.toggle_detect());
-                self.invalidate_modal();
-            }
-            SshHostsAction::Save => {
-                self.with_ssh_hosts_modal(|m| m.persist_form());
-                self.invalidate_modal();
-            }
-            SshHostsAction::SaveAndConnect => {
-                let id = self.with_ssh_hosts_modal(|m| m.persist_form()).flatten();
-                if let Some(id) = id {
-                    self.cancel_modal();
-                    self.connect_ssh_host(id, None);
-                } else {
-                    self.invalidate_modal();
-                }
-            }
-            SshHostsAction::Cancel => {
-                self.with_ssh_hosts_modal(|m| m.cancel_to_grid());
-                self.invalidate_modal();
-            }
-            SshHostsAction::Background => {
-                self.cancel_modal();
             }
         }
     }
@@ -1563,7 +1520,28 @@ impl super::TermWindow {
         }
 
         let workspace_name = plan.workspace_name.clone();
-        let initial_cwd = plan.project_path.to_str().map(|path| path.to_string());
+        let remote_spec = crate::ssh_hosts::host_spec(&plan.project_id);
+        let (initial_cwd, default_domain) = if let Some(spec) = remote_spec.as_ref() {
+            match crate::ssh_hosts::ensure_ssh_domain_registered(spec) {
+                Ok(domain_name) => (
+                    None,
+                    config::keyassignment::SpawnTabDomain::DomainName(domain_name),
+                ),
+                Err(err) => {
+                    log::error!(
+                        "failed to register SSH domain for session {:?}: {err:#}",
+                        spec.label
+                    );
+                    context.invalidate();
+                    return;
+                }
+            }
+        } else {
+            (
+                plan.project_path.to_str().map(|path| path.to_string()),
+                config::keyassignment::SpawnTabDomain::DefaultDomain,
+            )
+        };
         let layout = crate::project_sessions::session_layout(&plan.session_id);
         let dpi = self.dimensions.dpi as u32;
         let size = self.config.initial_size(
@@ -1583,7 +1561,7 @@ impl super::TermWindow {
                 size,
                 None,
                 term_config,
-                config::keyassignment::SpawnTabDomain::DefaultDomain,
+                default_domain,
             )
             .await
             {
@@ -1600,7 +1578,11 @@ impl super::TermWindow {
     /// create/restore a session in the target workspace (default `ssh:<host>`)
     /// whose panes spawn into that SSH domain. Mirrors
     /// [`Self::activate_project_session`] but targets the SSH domain.
-    pub(crate) fn connect_ssh_host(&mut self, project_id: String, target_workspace: Option<String>) {
+    pub(crate) fn connect_ssh_host(
+        &mut self,
+        project_id: String,
+        target_workspace: Option<String>,
+    ) {
         let window = self.window.clone();
         let invalidate = |window: &_| {
             if let Some(win) = window {
@@ -1608,14 +1590,17 @@ impl super::TermWindow {
             }
         };
 
-        let Some(spec) = crate::project_sessions::host_spec(&project_id) else {
+        let Some(spec) = crate::ssh_hosts::host_spec(&project_id) else {
             invalidate(&window);
             return;
         };
         let domain_name = match crate::ssh_hosts::ensure_ssh_domain_registered(&spec) {
             Ok(name) => name,
             Err(err) => {
-                log::error!("failed to register SSH domain for {:?}: {err:#}", spec.label);
+                log::error!(
+                    "failed to register SSH domain for {:?}: {err:#}",
+                    spec.label
+                );
                 return;
             }
         };
@@ -1634,7 +1619,12 @@ impl super::TermWindow {
         }
 
         self.snapshot_active_project_session_layout();
-        let _ = crate::project_sessions::create_host_session(&project_id, &workspace_name);
+        let _ = crate::project_sessions::create_remote_host_session(
+            &project_id,
+            &spec.label,
+            crate::ssh_hosts::host_project_path(&spec),
+            &workspace_name,
+        );
 
         let size = self.config.initial_size(
             self.dimensions.dpi as u32,
@@ -1671,7 +1661,7 @@ impl super::TermWindow {
                 if let Some(domain) = Mux::get().get_domain_by_name(&detect_domain) {
                     if let Some(ssh) = domain.as_ref().downcast_ref::<RemoteSshDomain>() {
                         if let Some(distro) = ssh.detect_os_release().await {
-                            if crate::project_sessions::set_host_distro(&detect_project, &distro) {
+                            if crate::ssh_hosts::set_host_distro(&detect_project, &distro) {
                                 if let Some(win) = detect_window.as_ref() {
                                     win.invalidate();
                                 }
@@ -1986,17 +1976,6 @@ impl super::TermWindow {
         .detach();
     }
 
-    fn spawn_window_tab_from_active_pane(&mut self) {
-        let pane = match self.get_active_pane_or_overlay() {
-            Some(pane) => pane,
-            None => return,
-        };
-        let assignment = KeyAssignment::SpawnTab(SpawnTabDomain::CurrentPaneDomain);
-        if let Err(err) = self.perform_key_assignment(&pane, &assignment) {
-            log::error!("tab bar double-click new tab failed: {err:#}");
-        }
-    }
-
     fn tab_context_action(tab_idx: usize, action: KeyAssignment) -> KeyAssignment {
         KeyAssignment::Multiple(vec![KeyAssignment::ActivateTab(tab_idx as isize), action])
     }
@@ -2119,19 +2098,16 @@ impl super::TermWindow {
         match event.kind {
             WMEK::Press(MousePress::Left) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
+                    self.set_content_view_active(false);
                     self.activate_tab(tab_idx as isize).ok();
+                }
+                TabBarItem::ContentView => {
+                    self.set_content_view_active(true);
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
-                    if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
-                        self.window_drag_position.take();
-                        self.spawn_window_tab_from_active_pane();
-                        context.invalidate();
-                        return;
-                    }
-
                     let maximized = self
                         .window_state
                         .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
@@ -2150,9 +2126,15 @@ impl super::TermWindow {
                     }
                     // Potentially starting a drag by the tab bar
                     if !maximized {
+                        #[cfg(target_os = "macos")]
+                        {
+                            context.request_drag_move();
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         self.window_drag_position.replace(event.clone());
+                        #[cfg(not(target_os = "macos"))]
+                        context.request_drag_move();
                     }
-                    context.request_drag_move();
                 }
                 TabBarItem::WindowButton(button) => {
                     use window::IntegratedTitleButton as Button;
@@ -2184,6 +2166,7 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
+                | TabBarItem::ContentView
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match item {
@@ -2196,6 +2179,7 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
+                | TabBarItem::ContentView
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match item {
@@ -2214,6 +2198,7 @@ impl super::TermWindow {
                 }
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
+                | TabBarItem::ContentView
                 | TabBarItem::NewTabButton { .. } => {}
             },
             WMEK::HorzWheel(amount) => {

@@ -3,12 +3,13 @@ use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorT
 use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::tokens::{
-    CAPSULE_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
-    TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
-    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
-    WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
-    WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
+    CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
+    TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
+    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_ADD_BUTTON_RADIUS,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
+    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS,
+    WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType};
 use crate::ui::UiPalette;
@@ -17,6 +18,7 @@ use anyhow::Context;
 use finl_unicode::grapheme_clusters::Graphemes;
 use std::rc::Rc;
 use termwiz::cell::grapheme_column_width;
+use termwiz::cell::CellAttributes;
 use wezterm_bidi::Direction;
 use wezterm_font::LoadedFont;
 use wezterm_term::Line;
@@ -144,12 +146,17 @@ impl crate::TermWindow {
                 .and_then(|window| window.idx_by_id(tab_id))
         });
 
+        // When a content view is the foreground, no mux tab is "active".
+        let cv_present = self.content_view.is_some();
+        let cv_active = self.content_view_active;
+
         let tab_step = tab_width + WINDOW_TAB_GAP;
         let mut tab_sequence_idx = 0usize;
         for item in self.tab_bar.items() {
             let TabBarItem::Tab { tab_idx, active } = item.item else {
                 continue;
             };
+            let active = active && !cv_active;
 
             let virtual_left = tab_sequence_idx as f32 * tab_step as f32 - scroll_offset;
             tab_sequence_idx += 1;
@@ -190,6 +197,46 @@ impl crate::TermWindow {
                 background,
                 if active { foreground } else { muted_fg },
             )?;
+        }
+
+        // Synthetic content-view tab (e.g. SSH Hosts), placed after the mux tabs.
+        if cv_present {
+            let virtual_left = tab_sequence_idx as f32 * tab_step as f32 - scroll_offset;
+            let tab_left = viewport_left as f32 + virtual_left;
+            let tab_right = tab_left + tab_width as f32;
+            if tab_right > viewport_left as f32 && tab_left < viewport_right as f32 {
+                let visible_left = tab_left.max(viewport_left as f32);
+                let visible_right = tab_right.min(viewport_right as f32);
+                let visible_width = (visible_right - visible_left).max(0.0);
+                if visible_width > 1.0 {
+                    let title = self
+                        .content_view
+                        .as_ref()
+                        .map(|v| v.title())
+                        .unwrap_or_default();
+                    self.paint_content_view_tab(
+                        layers,
+                        &mut ui_items,
+                        &title,
+                        cv_active,
+                        tab_left,
+                        visible_left,
+                        visible_width,
+                        viewport_left,
+                        viewport_right,
+                        content_row_y,
+                        content_row_height,
+                        tab_width,
+                        button_size,
+                        icon_size,
+                        &font,
+                        metrics,
+                        chrome,
+                        background,
+                        if cv_active { foreground } else { muted_fg },
+                    )?;
+                }
+            }
         }
 
         self.paint_window_tab_new_button(
@@ -524,6 +571,135 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn paint_content_view_tab(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        title: &str,
+        active: bool,
+        tab_left: f32,
+        visible_left: f32,
+        visible_width: f32,
+        viewport_left: usize,
+        viewport_right: usize,
+        row_y: usize,
+        row_height: usize,
+        tab_width: usize,
+        button_size: usize,
+        icon_size: usize,
+        font: &Rc<LoadedFont>,
+        metrics: RenderMetrics,
+        chrome: UiPalette,
+        background: LinearRgba,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let is_hovered = self.is_pointer_over_ui_rect(
+            visible_left.max(0.0) as usize,
+            row_y,
+            visible_width.max(0.0) as usize,
+            row_height,
+        );
+        let surface = if active {
+            chrome.control_bg
+        } else if is_hovered {
+            chrome.control_hover_bg
+        } else {
+            background
+        };
+        let tab_surface_y = row_y + (row_height.saturating_sub(button_size) / 2);
+        self.fill_rounded_rectangle_with_border(
+            layers,
+            1,
+            euclid::rect(
+                visible_left,
+                tab_surface_y as f32,
+                visible_width,
+                button_size as f32,
+            ),
+            surface,
+            if active {
+                chrome.control_border
+            } else {
+                LinearRgba::TRANSPARENT
+            },
+            WINDOW_TAB_RADIUS,
+            CAPSULE_BORDER_WIDTH,
+        )
+        .context("content view tab surface")?;
+
+        ui_items.push(UIItem {
+            x: visible_left.max(0.0) as usize,
+            y: row_y,
+            width: visible_width.max(0.0) as usize,
+            height: row_height,
+            item_type: UIItemType::TabBar(TabBarItem::ContentView),
+        });
+
+        let tab_left = tab_left.max(0.0) as usize;
+        let icon_x = tab_left + WINDOW_TAB_INSET;
+        let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
+        if icon_x >= viewport_left && icon_x.saturating_add(icon_size) <= viewport_right {
+            self.paint_fancy_tab_icon(
+                layers,
+                SvgIcon::Link2,
+                icon_x,
+                icon_y,
+                icon_size,
+                foreground,
+            )?;
+        }
+
+        let close_x = tab_left
+            .saturating_add(tab_width)
+            .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
+        let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
+        let show_close =
+            close_x >= viewport_left && close_x.saturating_add(button_size) <= viewport_right;
+        if show_close {
+            let close_hovered =
+                self.is_pointer_over_ui_rect(close_x, close_y, button_size, button_size);
+            ui_items.push(UIItem {
+                x: close_x,
+                y: close_y,
+                width: button_size,
+                height: button_size,
+                item_type: UIItemType::ContentViewClose,
+            });
+            self.paint_fancy_tab_icon(
+                layers,
+                SvgIcon::X,
+                close_x + (button_size.saturating_sub(icon_size) / 2),
+                icon_y,
+                icon_size,
+                if close_hovered {
+                    foreground
+                } else {
+                    foreground.mul_alpha(0.82)
+                },
+            )?;
+        }
+
+        let text_x = icon_x + icon_size + WINDOW_TAB_ICON_GAP;
+        let text_right = if show_close {
+            close_x.saturating_sub(WINDOW_TAB_ICON_GAP)
+        } else {
+            tab_left
+                .saturating_add(tab_width)
+                .saturating_sub(WINDOW_TAB_INSET)
+        }
+        .min(viewport_right);
+        let text_width = text_right.saturating_sub(text_x);
+        let text_y = row_y + (row_height.saturating_sub(metrics.cell_size.height as usize) / 2);
+        if text_x >= viewport_left && text_x < viewport_right {
+            let line = Line::from_text(title, &CellAttributes::blank(), 0, None);
+            self.paint_fancy_tab_text(
+                layers, font, &line, false, text_x, text_y, text_width, foreground,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn paint_window_tab_new_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -536,27 +712,34 @@ impl crate::TermWindow {
         foreground: LinearRgba,
         muted_fg: LinearRgba,
     ) -> anyhow::Result<()> {
-        let button_x = row_right.saturating_sub(WINDOW_TAB_INSET + button_size);
+        let button_x = row_right.saturating_sub(WINDOW_TAB_INSET + button_size + 2);
         let button_y = row_y + (row_height.saturating_sub(button_size) / 2);
         let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
+        let pressed = hovered
+            && self.is_pointer_pressing_ui_rect(button_x, button_y, button_size, button_size);
+        let press_inset = if pressed { 1 } else { 0 };
+        let visual_size = button_size.saturating_sub(press_inset * 2);
         if hovered {
-            let hover_alpha =
-                if self.is_pointer_pressing_ui_rect(button_x, button_y, button_size, button_size) {
-                    0.20
-                } else {
-                    0.12
-                };
-            self.fill_rounded_rectangle(
+            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let fill = if pressed {
+                chrome.control_pressed_bg
+            } else {
+                chrome.control_hover_bg
+            };
+            let border_alpha = if pressed { 0.52 } else { 0.38 };
+            self.fill_rounded_rectangle_with_border(
                 layers,
                 1,
                 euclid::rect(
-                    button_x as f32,
-                    button_y as f32,
-                    button_size as f32,
-                    button_size as f32,
+                    (button_x + press_inset) as f32,
+                    (button_y + press_inset) as f32,
+                    visual_size as f32,
+                    visual_size as f32,
                 ),
-                foreground.mul_alpha(hover_alpha),
-                5.0,
+                fill,
+                foreground.mul_alpha(border_alpha),
+                WINDOW_TAB_ADD_BUTTON_RADIUS,
+                ICON_BUTTON_BORDER_WIDTH,
             )
             .context("window tab new button hover")?;
         }
@@ -569,11 +752,16 @@ impl crate::TermWindow {
             item_type: UIItemType::TabBar(TabBarItem::NewTabButton),
         });
 
+        let icon_size = if pressed {
+            icon_size.saturating_sub(1).max(1)
+        } else {
+            icon_size
+        };
         self.paint_fancy_tab_icon(
             layers,
             SvgIcon::Plus,
-            button_x + (button_size.saturating_sub(icon_size) / 2),
-            button_y + (button_size.saturating_sub(icon_size) / 2),
+            button_x + press_inset + (visual_size.saturating_sub(icon_size) / 2),
+            button_y + press_inset + (visual_size.saturating_sub(icon_size) / 2),
             icon_size,
             if hovered { foreground } else { muted_fg },
         )

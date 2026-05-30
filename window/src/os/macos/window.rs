@@ -1025,6 +1025,13 @@ impl WindowOps for Window {
         });
     }
 
+    fn request_drag_move(&self) {
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.request_drag_move();
+            Ok(())
+        });
+    }
+
     fn set_text_cursor_position(&self, cursor: Rect) {
         Connection::with_window_inner(self.id, move |inner| {
             inner.set_text_cursor_position(cursor);
@@ -1557,6 +1564,16 @@ impl WindowInner {
 
     fn set_window_position(&self, coords: ScreenPoint) {
         set_window_position(*self.window, coords);
+    }
+
+    fn request_drag_move(&self) {
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let event: id = msg_send![app, currentEvent];
+            if event != nil {
+                let () = msg_send![*self.window, performWindowDragWithEvent: event];
+            }
+        }
     }
 
     fn set_text_cursor_position(&mut self, cursor: Rect) {

@@ -11,9 +11,10 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::termwindow::ui::status_icon::{split_leading_legacy_progress_marker, UiStatusKind};
 use crate::termwindow::ui::tokens::{
-    CAPSULE_BORDER_WIDTH, PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP,
-    PANE_NAV_TAB_RADIUS, PANE_NAV_TAB_TOP_OFFSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
-    TAB_CLOSE_RIGHT_GAP, TAB_VERTICAL_PADDING,
+    CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, PANE_NAV_ACTION_BUTTON_RADIUS,
+    PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS,
+    PANE_NAV_TAB_TOP_OFFSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP,
+    TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, UIItem, UIItemType};
 use crate::ui::UiPalette;
@@ -539,6 +540,7 @@ impl crate::TermWindow {
                 .min(nav_height.saturating_sub(button_size));
         let mut button_x = (pane_x + pane_width) as usize;
         let mut actions = vec![
+            (SvgIcon::Plus, PaneNavAction::NewTab),
             (SvgIcon::SplitVertical, PaneNavAction::SplitDown),
             (SvgIcon::SplitHorizontal, PaneNavAction::SplitRight),
         ];
@@ -555,6 +557,11 @@ impl crate::TermWindow {
         ));
         for (icon, action) in actions {
             button_x = button_x.saturating_sub(button_size + PANE_NAV_BUTTON_GAP);
+            // Stop once a button would spill past the pane's left edge (happens
+            // when the pane is too narrow to hold all the action buttons).
+            if (button_x as f32) < pane_x {
+                break;
+            }
             self.paint_pane_nav_icon_button(
                 layers,
                 icon,
@@ -819,27 +826,44 @@ impl crate::TermWindow {
         });
 
         let hovered = self.is_pointer_over_ui_rect(x, y, button_size, button_size);
+        let pressed = hovered && self.is_pointer_pressing_ui_rect(x, y, button_size, button_size);
+        let press_inset = if pressed { 1 } else { 0 };
+        let visual_size = button_size.saturating_sub(press_inset * 2);
         if hovered {
-            let hover_alpha = if self.is_pointer_pressing_ui_rect(x, y, button_size, button_size) {
-                0.20
+            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let fill = if pressed {
+                chrome.control_pressed_bg
             } else {
-                0.12
+                chrome.control_hover_bg
             };
-            self.fill_rounded_rectangle(
+            let border_alpha = if pressed { 0.52 } else { 0.38 };
+            self.fill_rounded_rectangle_with_border(
                 layers,
                 1,
-                euclid::rect(x as f32, y as f32, button_size as f32, button_size as f32),
-                color.mul_alpha(hover_alpha),
-                5.0,
+                euclid::rect(
+                    (x + press_inset) as f32,
+                    (y + press_inset) as f32,
+                    visual_size as f32,
+                    visual_size as f32,
+                ),
+                fill,
+                color.mul_alpha(border_alpha),
+                PANE_NAV_ACTION_BUTTON_RADIUS,
+                ICON_BUTTON_BORDER_WIDTH,
             )
             .context("pane nav button hover")?;
         }
 
+        let icon_size = if pressed {
+            icon_size.saturating_sub(1).max(1)
+        } else {
+            icon_size
+        };
         self.paint_pane_nav_icon(
             layers,
             icon,
-            x + ((button_size.saturating_sub(icon_size)) / 2),
-            y + ((button_size.saturating_sub(icon_size)) / 2),
+            x + press_inset + ((visual_size.saturating_sub(icon_size)) / 2),
+            y + press_inset + ((visual_size.saturating_sub(icon_size)) / 2),
             icon_size,
             if hovered { hover_color } else { color },
         )

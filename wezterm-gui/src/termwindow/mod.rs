@@ -31,8 +31,8 @@ use ::window::color::LinearRgba;
 use ::window::*;
 use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
-    Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern, PromptInputLine,
-    QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
+    ClipboardPasteSource, Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern,
+    PromptInputLine, QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
@@ -84,6 +84,7 @@ pub mod background;
 pub mod box_model;
 pub mod charselect;
 pub mod clipboard;
+pub mod content_view;
 pub mod keyevent;
 pub mod modal;
 mod mouseevent;
@@ -94,7 +95,7 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
-pub mod ssh_hosts_modal;
+pub mod ssh_hosts_view;
 pub mod ui;
 pub mod webgpu;
 
@@ -230,38 +231,14 @@ pub enum UIItemType {
     WorkspaceSidebarResize,
     WorkspaceSidebarSettings,
     WorkspaceSidebarViewOptions,
+    WorkspaceSidebarSshHosts,
     WorkspaceSidebarNotifications,
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
-    SshHosts(SshHostsAction),
-}
-
-/// Clickable targets inside the SSH host manager modal
-/// (see `termwindow/ssh_hosts_modal.rs`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SshHostsAction {
-    /// Connect to the host with this remote-project id.
-    Connect(String),
-    /// Open the edit form for this host.
-    Edit(String),
-    /// Delete this host.
-    Delete(String),
-    /// Open the empty "new host" form.
-    New,
-    /// Focus the form field at this index.
-    FocusField(usize),
-    /// Toggle the "detect OS on connect" switch in the form.
-    ToggleDetect,
-    /// Save the form (create/update) and return to the grid.
-    Save,
-    /// Save the form and immediately connect.
-    SaveAndConnect,
-    /// Discard the form and return to the grid.
-    Cancel,
-    /// Click on the dimmed backdrop: dismiss the modal.
-    Background,
+    /// Close button on the synthetic content-view tab.
+    ContentViewClose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -742,6 +719,11 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     dragging: Option<(UIItem, MouseEvent)>,
+    /// When `Some`, a content view (e.g. SSH hosts) is available as a synthetic
+    /// tab. `content_view_active` is whether it is the foreground content (vs a
+    /// terminal tab being shown).
+    content_view: Option<Box<dyn crate::termwindow::content_view::ContentView>>,
+    content_view_active: bool,
     workspace_sidebar_width: usize,
     workspace_sidebar_collapsed: bool,
     workspace_sidebar_scroll_offset: f32,
@@ -1162,6 +1144,8 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             dragging: None,
+            content_view: None,
+            content_view_active: false,
             workspace_sidebar_width,
             workspace_sidebar_collapsed: false,
             workspace_sidebar_scroll_offset: 0.0,
@@ -2276,6 +2260,124 @@ impl TermWindow {
         self.emit_window_event("window-config-reloaded", None);
     }
 
+    /// True when a content view is the foreground content (occupying the
+    /// content area instead of terminal panes).
+    pub(crate) fn content_view_foreground(&self) -> bool {
+        self.content_view.is_some() && self.content_view_active
+    }
+
+    pub(crate) fn open_content_view(
+        &mut self,
+        view: Box<dyn crate::termwindow::content_view::ContentView>,
+    ) {
+        self.content_view = Some(view);
+        self.content_view_active = true;
+        self.invalidate_window();
+    }
+
+    pub(crate) fn close_content_view(&mut self) {
+        self.content_view = None;
+        self.content_view_active = false;
+        self.invalidate_window();
+    }
+
+    pub(crate) fn set_content_view_active(&mut self, active: bool) {
+        if self.content_view.is_some() {
+            self.content_view_active = active;
+            self.invalidate_window();
+        }
+    }
+
+    /// Toggle the SSH hosts content view (sidebar button / OpenSshHosts).
+    pub(crate) fn toggle_ssh_hosts_view(&mut self) {
+        if self.content_view.is_some() {
+            self.close_content_view();
+        } else {
+            self.open_content_view(Box::new(
+                crate::termwindow::ssh_hosts_view::SshHostsView::new(),
+            ));
+        }
+    }
+
+    fn invalidate_window(&self) {
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// Copy the active content view's focused text to the clipboard (⌘C).
+    pub(crate) fn content_view_copy(&mut self) {
+        if let Some(text) = self.content_view.as_ref().and_then(|v| v.copy_text()) {
+            if !text.is_empty() {
+                self.copy_to_clipboard(
+                    config::keyassignment::ClipboardCopyDestination::Clipboard,
+                    text,
+                );
+            }
+        }
+    }
+
+    /// Cut the active content view's selected text to the clipboard (⌘X).
+    pub(crate) fn content_view_cut(&mut self) {
+        if let Some(text) = self.content_view.as_mut().and_then(|v| v.cut_text()) {
+            if !text.is_empty() {
+                self.copy_to_clipboard(
+                    config::keyassignment::ClipboardCopyDestination::Clipboard,
+                    text,
+                );
+                self.invalidate_window();
+            }
+        }
+    }
+
+    fn content_view_paste_from(&mut self, clipboard: ClipboardPasteSource) {
+        let Some(window) = self.window.as_ref().map(|w| w.clone()) else {
+            return;
+        };
+        let clipboard = match clipboard {
+            ClipboardPasteSource::Clipboard => ::window::Clipboard::Clipboard,
+            ClipboardPasteSource::PrimarySelection => ::window::Clipboard::PrimarySelection,
+        };
+        let future = window.get_clipboard(clipboard);
+        promise::spawn::spawn(async move {
+            if let Ok(clip) = future.await {
+                window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                    let resp = myself.content_view.as_mut().map(|v| v.on_paste(&clip));
+                    if let Some(resp) = resp {
+                        myself.handle_content_response(resp);
+                    }
+                })));
+            }
+        })
+        .detach();
+    }
+
+    /// Read the clipboard asynchronously and feed it to the active content view
+    /// (used for ⌘V inside content-view text fields).
+    pub(crate) fn content_view_paste(&mut self) {
+        self.content_view_paste_from(ClipboardPasteSource::Clipboard);
+    }
+
+    /// Apply the result of an input event handled by the active content view.
+    pub(crate) fn handle_content_response(
+        &mut self,
+        response: crate::termwindow::content_view::ContentViewResponse,
+    ) {
+        use crate::termwindow::content_view::ContentViewResponse;
+        match response {
+            ContentViewResponse::Ignored => return,
+            ContentViewResponse::Redraw => {}
+            ContentViewResponse::Close => {
+                self.content_view = None;
+                self.content_view_active = false;
+            }
+            ContentViewResponse::Run(func) => {
+                func(self);
+            }
+        }
+        self.invalidate_window();
+    }
+
     fn invalidate_modal(&mut self) {
         if let Some(modal) = self.get_modal() {
             modal.reconfigure(self);
@@ -3220,6 +3322,24 @@ impl TermWindow {
             }
         }
 
+        if self.content_view_foreground() {
+            match assignment {
+                CopyTo(destination) => {
+                    if let Some(text) = self.content_view.as_ref().and_then(|v| v.copy_text()) {
+                        if !text.is_empty() {
+                            self.copy_to_clipboard(*destination, text);
+                        }
+                    }
+                    return Ok(PerformAssignmentResult::Handled);
+                }
+                PasteFrom(source) => {
+                    self.content_view_paste_from(*source);
+                    return Ok(PerformAssignmentResult::Handled);
+                }
+                _ => {}
+            }
+        }
+
         match pane.perform_assignment(assignment) {
             PerformAssignmentResult::Unhandled => {}
             result => return Ok(result),
@@ -3867,8 +3987,7 @@ impl TermWindow {
                 crate::settings_window::show();
             }
             OpenSshHosts => {
-                let modal = crate::termwindow::ssh_hosts_modal::SshHostsModal::new();
-                self.set_modal(Rc::new(modal));
+                self.toggle_ssh_hosts_view();
             }
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);

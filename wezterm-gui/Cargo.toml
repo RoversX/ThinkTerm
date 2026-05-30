@@ -10,6 +10,7 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+cargo-clippy = []
 default = ["vendored-fonts", "wayland"]
 wayland = ["window/wayland"]
 distro-defaults = ["config/distro-defaults"]
@@ -35,6 +36,7 @@ embed-resource.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
 chrono.workspace = true
@@ -66,6 +68,7 @@ mlua = {workspace=true, features=["send", "serialize"]}
 mux-lua.workspace = true
 mux.workspace = true
 nucleo-matcher.workspace = true
+openssl.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}

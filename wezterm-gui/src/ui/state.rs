@@ -103,6 +103,15 @@ impl TextInputState {
         self.selected_all = false;
     }
 
+    pub(crate) fn take_selected_text(&mut self) -> Option<String> {
+        if self.selected_all && !self.text.is_empty() {
+            self.selected_all = false;
+            Some(std::mem::take(&mut self.text))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.text.is_empty()
     }

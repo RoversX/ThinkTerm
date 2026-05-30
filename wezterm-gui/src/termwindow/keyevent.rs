@@ -450,6 +450,52 @@ impl super::TermWindow {
                 }
             }
 
+            if only_key_bindings == OnlyKeyBindings::No && self.content_view_foreground() {
+                use ::termwiz::input::{KeyCode as TKC, Modifiers as TMods};
+                match self.win_key_code_to_termwiz_key_code(keycode) {
+                    Key::Code(term_key) => {
+                        let mods = raw_modifiers.remove_positional_mods();
+                        // ⌘C / ⌘X / ⌘V operate on the focused content-view field.
+                        if mods.contains(TMods::SUPER)
+                            && matches!(term_key, TKC::Char('v') | TKC::Char('V'))
+                        {
+                            self.content_view_paste();
+                            return true;
+                        }
+                        if mods.contains(TMods::SUPER)
+                            && matches!(term_key, TKC::Char('x') | TKC::Char('X'))
+                        {
+                            self.content_view_cut();
+                            return true;
+                        }
+                        if mods.contains(TMods::SUPER)
+                            && matches!(term_key, TKC::Char('c') | TKC::Char('C'))
+                        {
+                            self.content_view_copy();
+                            return true;
+                        }
+                        let resp = self.content_view.as_mut().map(|v| v.on_key(term_key, mods));
+                        match resp {
+                            Some(crate::termwindow::content_view::ContentViewResponse::Ignored)
+                            | None => {}
+                            Some(resp) => {
+                                self.handle_content_response(resp);
+                                return true;
+                            }
+                        }
+                    }
+                    // IME / composed text (e.g. CJK input) arrives here.
+                    Key::Composed(text) => {
+                        let resp = self.content_view.as_mut().map(|v| v.on_paste(&text));
+                        if let Some(resp) = resp {
+                            self.handle_content_response(resp);
+                        }
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+
             if let Some((entry, table_name)) = self.lookup_key(
                 pane,
                 &keycode,

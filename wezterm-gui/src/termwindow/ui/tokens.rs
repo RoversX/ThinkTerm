@@ -24,6 +24,7 @@ pub const WINDOW_TAB_LEADING_ACTION_GAP: usize = 8;
 pub const WINDOW_TAB_LEADING_ACTION_ICON_SIZE: usize = 26;
 pub const WINDOW_TAB_GAP: usize = 18;
 pub const WINDOW_TAB_RADIUS: f32 = 12.0;
+pub const WINDOW_TAB_ADD_BUTTON_RADIUS: f32 = 999.0;
 pub const TAB_CLOSE_HOVER_INSET: usize = 5;
 pub const TAB_CLOSE_HOVER_RADIUS: f32 = 999.0;
 pub const TAB_CLOSE_RIGHT_GAP: usize = 6;
@@ -38,5 +39,7 @@ pub const PANE_NAV_EXTRA_HEIGHT: usize = 32;
 pub const PANE_NAV_MIN_HEIGHT: usize = 62;
 pub const PANE_NAV_MAX_HEIGHT: usize = 72;
 pub const PANE_NAV_TAB_RADIUS: f32 = 12.0;
+pub const PANE_NAV_ACTION_BUTTON_RADIUS: f32 = 999.0;
 
 pub const CAPSULE_BORDER_WIDTH: f32 = 1.0;
+pub const ICON_BUTTON_BORDER_WIDTH: f32 = 1.0;
