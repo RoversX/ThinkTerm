@@ -176,6 +176,7 @@ impl SettingsSection {
                 "Diagnostics",
                 "Debug Pages",
                 "Memory Diagnostics",
+                "Input Diagnostics",
                 "UI Kit",
             ],
             Self::UiKit => &[
@@ -201,6 +202,10 @@ impl SettingsSection {
                 "IOAccelerator",
                 "IOSurface",
                 "Graphics",
+                "Input",
+                "Latency",
+                "Key Events",
+                "P95",
             ],
             Self::About => &["About", "Version", "ThinkTerm"],
         }
@@ -222,6 +227,9 @@ enum SettingsAction {
     ToggleMemoryMonitoring,
     RefreshMemorySnapshot,
     CopyMemorySnapshot,
+    ToggleInputDiagnostics,
+    ResetInputDiagnostics,
+    CopyInputDiagnostics,
     ToggleThemeModeMenu,
     SetThemeMode(NativeThemeMode),
     ToggleAppIconMenu,
@@ -630,6 +638,7 @@ struct SettingsUiState {
     memory_snapshot: Option<MemorySnapshot>,
     main_window_resource_lines: Vec<String>,
     memory_snapshot_copied_until: Option<Instant>,
+    input_diagnostics_copied_until: Option<Instant>,
     sidebar_scrollbar_visible_until: Option<Instant>,
     content_scrollbar_visible_until: Option<Instant>,
 }
@@ -657,6 +666,7 @@ impl SettingsUiState {
             memory_snapshot: None,
             main_window_resource_lines: Vec::new(),
             memory_snapshot_copied_until: None,
+            input_diagnostics_copied_until: None,
             sidebar_scrollbar_visible_until: None,
             content_scrollbar_visible_until: None,
         }
@@ -1452,6 +1462,14 @@ impl SettingsWindow {
                     settings.ui.memory_snapshot_copied_until = None;
                     window.invalidate();
                 }
+                if settings
+                    .ui
+                    .input_diagnostics_copied_until
+                    .is_some_and(|until| Instant::now() >= until)
+                {
+                    settings.ui.input_diagnostics_copied_until = None;
+                    window.invalidate();
+                }
             });
         })
         .detach();
@@ -2119,6 +2137,12 @@ impl SettingsWindow {
                     let mut summary = snapshot.summary_for_clipboard();
                     summary.push_str("\n\nThinkTerm Resource Stats\n");
                     summary.push_str(&self.memory_resource_lines().join("\n"));
+                    summary.push_str("\n\n");
+                    summary.push_str(
+                        &crate::input_diagnostics::snapshot()
+                            .summary_lines()
+                            .join("\n"),
+                    );
                     window.set_clipboard(Clipboard::Clipboard, summary);
                     self.request_main_window_resource_stats();
                     self.ui.memory_snapshot_copied_until =
@@ -2126,6 +2150,35 @@ impl SettingsWindow {
                     self.status = "Memory snapshot copied.".to_string();
                     self.schedule_copied_state_clear(window);
                 }
+            }
+            SettingsAction::ToggleInputDiagnostics => {
+                self.ui.open_dropdown = None;
+                let enabled = !crate::input_diagnostics::enabled();
+                crate::input_diagnostics::set_enabled(enabled);
+                self.status = if enabled {
+                    "Input diagnostics started. Leave this running while you reproduce typing lag."
+                        .to_string()
+                } else {
+                    "Input diagnostics stopped.".to_string()
+                };
+            }
+            SettingsAction::ResetInputDiagnostics => {
+                self.ui.open_dropdown = None;
+                crate::input_diagnostics::reset();
+                self.status = "Input diagnostics reset.".to_string();
+            }
+            SettingsAction::CopyInputDiagnostics => {
+                self.ui.open_dropdown = None;
+                window.set_clipboard(
+                    Clipboard::Clipboard,
+                    crate::input_diagnostics::snapshot()
+                        .summary_lines()
+                        .join("\n"),
+                );
+                self.ui.input_diagnostics_copied_until =
+                    Some(Instant::now() + Duration::from_millis(1400));
+                self.status = "Input diagnostics copied.".to_string();
+                self.schedule_copied_state_clear(window);
             }
             SettingsAction::ToggleThemeModeMenu => {
                 self.ui.open_dropdown =
@@ -3007,9 +3060,9 @@ impl SettingsWindow {
             first_row_y + row_step,
             row_width,
             "Visible Developer Tabs",
-            "UI Kit and Memory tabs are shown here; diagnostics do not run automatically.",
+            "UI Kit and Memory/Input tabs are shown here; diagnostics do not run automatically.",
             if self.developer_mode_enabled() {
-                "UI Kit, Memory"
+                "UI Kit, Memory/Input"
             } else {
                 "Hidden"
             },
@@ -3291,7 +3344,7 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let row_count = 11;
+        let row_count = 15;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         let button_y = card_y + card_height + self.settings_section_card_gap();
@@ -3301,7 +3354,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             section_y,
-            "Memory diagnostics are manual. Developer mode only reveals this page; sampling starts when you enable it here.",
+            "Memory and input diagnostics are manual. Developer mode only reveals this page; sampling starts when you enable it here.",
             palette.secondary_text,
             max_width,
         )?;
@@ -3359,8 +3412,25 @@ impl SettingsWindow {
         } else {
             "Off"
         };
+        let input = crate::input_diagnostics::snapshot();
+        let input_state = if input.enabled { "Running" } else { "Off" };
+        let input_events = format!("{} events", input.key_events);
+        let input_p95 = crate::input_diagnostics::format_duration(input.recent_p95);
+        let input_avg = crate::input_diagnostics::format_duration(input.average_duration());
+        let input_slowest = input
+            .slowest_stage
+            .as_ref()
+            .map(|stage| {
+                format!(
+                    "{} {}",
+                    stage.name,
+                    crate::input_diagnostics::format_duration(stage.max_duration)
+                )
+            })
+            .unwrap_or_else(|| "No stage samples".to_string());
         let resource_lines = self.memory_resource_lines();
-        let resource_card_y = button_y + CONTROL_HEIGHT + self.settings_section_card_gap();
+        let input_button_y = button_y + CONTROL_HEIGHT + 16.0;
+        let resource_card_y = input_button_y + CONTROL_HEIGHT + self.settings_section_card_gap();
         let resource_line_height = 30.0;
         let resource_card_height = 88.0 + resource_line_height * resource_lines.len() as f32;
         self.ui.content_scroll.set_extents(
@@ -3482,12 +3552,52 @@ impl SettingsWindow {
             &text,
             true,
         )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 11.0,
+            row_width,
+            "Input Diagnostics",
+            "Manual tracing for long-running typing latency. No key text is stored.",
+            input_state,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 12.0,
+            row_width,
+            "Key Event Samples",
+            "Counts events seen since diagnostics started or reset.",
+            &input_events,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 13.0,
+            row_width,
+            "Input Event Avg / P95",
+            "Wall time spent in the key event path.",
+            &format!("{input_avg} / {input_p95}"),
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 14.0,
+            row_width,
+            "Slowest Stage",
+            "The slowest recorded sub-stage so far.",
+            &input_slowest,
+            true,
+        )?;
         if let Some(error) = &snapshot.vmmap_error {
             self.draw_text(
                 layers,
                 &ui_font,
                 row_x,
-                first_row_y + row_step * 11.0,
+                first_row_y + row_step * 15.0,
                 error,
                 palette.muted_text,
                 row_width,
@@ -3528,6 +3638,42 @@ impl SettingsWindow {
             self.button_width_for_label(copy_label, 150.0),
             copy_label,
             SettingsAction::CopyMemorySnapshot,
+        )?;
+        let input_primary_label = if input.enabled {
+            "Stop Input Trace"
+        } else {
+            "Start Input Trace"
+        };
+        self.draw_button(
+            layers,
+            x,
+            input_button_y,
+            self.button_width_for_label(input_primary_label, 250.0),
+            input_primary_label,
+            SettingsAction::ToggleInputDiagnostics,
+        )?;
+        let reset_input_x = x + self.button_width_for_label(input_primary_label, 250.0) + 16.0;
+        self.draw_button(
+            layers,
+            reset_input_x,
+            input_button_y,
+            self.button_width_for_label("Reset Input", 190.0),
+            "Reset Input",
+            SettingsAction::ResetInputDiagnostics,
+        )?;
+        let input_copied = self
+            .ui
+            .input_diagnostics_copied_until
+            .is_some_and(|until| Instant::now() < until);
+        let input_copy_label = if input_copied { "Copied" } else { "Copy Input" };
+        let copy_input_x = reset_input_x + self.button_width_for_label("Reset Input", 190.0) + 16.0;
+        self.draw_button(
+            layers,
+            copy_input_x,
+            input_button_y,
+            self.button_width_for_label(input_copy_label, 180.0),
+            input_copy_label,
+            SettingsAction::CopyInputDiagnostics,
         )?;
 
         self.paint_group_card(layers, x, resource_card_y, max_width, resource_card_height)?;

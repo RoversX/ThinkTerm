@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use wezterm_term::TerminalConfiguration;
 use wezterm_term::TerminalSize;
 
@@ -118,6 +120,13 @@ pub enum SessionWorkStatus {
     FinishedUnseen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionWorkChange {
+    status: SessionWorkStatus,
+    changed: bool,
+    should_persist: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationPlan {
     pub project_id: ProjectId,
@@ -148,6 +157,9 @@ lazy_static::lazy_static! {
             SessionStore::default()
         }));
 }
+
+static SESSION_STORE_PERSIST_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static SESSION_STORE_PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
 
 pub fn session_store_path() -> PathBuf {
     config::DATA_DIR.join("thinkterm").join("sessions.json")
@@ -391,20 +403,29 @@ pub fn activate_session_record(
 
 pub fn observe_session_work(session_id: &str, is_working: bool) -> Option<SessionWorkStatus> {
     let mut store = SESSION_STORE.lock();
-    let (status, changed) = store.observe_session_work(session_id, is_working)?;
-    if changed {
+    let change = store.observe_session_work(session_id, is_working)?;
+    if change.should_persist {
         persist_locked(&store);
     }
-    Some(status)
+    Some(change.status)
 }
 
 pub fn acknowledge_session_work_for_workspace(workspace: &str) -> bool {
     let mut store = SESSION_STORE.lock();
-    let changed = store.acknowledge_session_work_for_workspace(workspace);
-    if changed {
+    let change = store.acknowledge_session_work_for_workspace(workspace);
+    if change.should_persist {
         persist_locked(&store);
     }
-    changed
+    change.changed
+}
+
+pub fn acknowledge_session_work_for_workspace_deferred(workspace: &str) -> bool {
+    let mut store = SESSION_STORE.lock();
+    let change = store.acknowledge_session_work_for_workspace(workspace);
+    if change.should_persist {
+        schedule_session_store_persist();
+    }
+    change.changed
 }
 
 pub fn snapshot_workspace_layout_with_font_scales<F>(
@@ -969,7 +990,7 @@ impl SessionStore {
         &mut self,
         session_id: &str,
         is_working: bool,
-    ) -> Option<(SessionWorkStatus, bool)> {
+    ) -> Option<SessionWorkChange> {
         for project in &mut self.projects {
             if let Some(session) = project
                 .sessions
@@ -977,14 +998,21 @@ impl SessionStore {
                 .find(|session| session.id == session_id)
             {
                 if is_working {
+                    let should_persist = session.work_finished_unseen;
                     let changed = !session.work_is_running || session.work_finished_unseen;
                     session.work_is_running = true;
                     session.work_finished_unseen = false;
-                    return Some((SessionWorkStatus::Running, changed));
+                    return Some(SessionWorkChange {
+                        status: SessionWorkStatus::Running,
+                        changed,
+                        should_persist,
+                    });
                 }
 
+                let mut should_persist = false;
                 let changed = if session.work_is_running {
                     session.work_is_running = false;
+                    should_persist = !session.work_finished_unseen;
                     session.work_finished_unseen = true;
                     true
                 } else {
@@ -995,13 +1023,17 @@ impl SessionStore {
                 } else {
                     SessionWorkStatus::Idle
                 };
-                return Some((status, changed));
+                return Some(SessionWorkChange {
+                    status,
+                    changed,
+                    should_persist,
+                });
             }
         }
         None
     }
 
-    fn acknowledge_session_work_for_workspace(&mut self, workspace: &str) -> bool {
+    fn acknowledge_session_work_for_workspace(&mut self, workspace: &str) -> SessionWorkChange {
         for project in &mut self.projects {
             let project_id = project.id.clone();
             for session in &mut project.sessions {
@@ -1010,14 +1042,23 @@ impl SessionStore {
                     .clone()
                     .unwrap_or_else(|| workspace_name_for_session(&project_id, &session.id));
                 if session_workspace == workspace {
+                    let should_persist = session.work_finished_unseen;
                     let changed = session.work_is_running || session.work_finished_unseen;
                     session.work_is_running = false;
                     session.work_finished_unseen = false;
-                    return changed;
+                    return SessionWorkChange {
+                        status: SessionWorkStatus::Idle,
+                        changed,
+                        should_persist,
+                    };
                 }
             }
         }
-        false
+        SessionWorkChange {
+            status: SessionWorkStatus::Idle,
+            changed: false,
+            should_persist: false,
+        }
     }
 
     fn archive_session(&mut self, session_id: &str) -> bool {
@@ -1163,6 +1204,32 @@ fn persist_locked(store: &SessionStore) {
     if let Err(err) = save_session_store(store) {
         log::warn!("failed to save ThinkTerm session store: {err:#}");
     }
+}
+
+fn schedule_session_store_persist() {
+    SESSION_STORE_PERSIST_DIRTY.store(true, Ordering::Release);
+    if SESSION_STORE_PERSIST_SCHEDULED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_millis(50));
+
+        if SESSION_STORE_PERSIST_DIRTY.swap(false, Ordering::AcqRel) {
+            let store = SESSION_STORE.lock().clone();
+            persist_locked(&store);
+            continue;
+        }
+
+        SESSION_STORE_PERSIST_SCHEDULED.store(false, Ordering::Release);
+        if SESSION_STORE_PERSIST_DIRTY.load(Ordering::Acquire)
+            && !SESSION_STORE_PERSIST_SCHEDULED.swap(true, Ordering::AcqRel)
+        {
+            continue;
+        }
+
+        break;
+    });
 }
 
 fn snapshot_window_layout<F>(
@@ -1671,6 +1738,36 @@ mod tests {
         let loaded = load_session_store_from_path(&path).unwrap();
         assert!(!loaded.projects[0].sessions[0].work_is_running);
         assert!(!loaded.projects[0].sessions[0].work_finished_unseen);
+    }
+
+    #[test]
+    fn acknowledged_finished_work_persists_but_runtime_running_state_does_not() {
+        let mut store = SessionStore::default();
+        let mut session = Session::new(
+            "project-1".to_string(),
+            "main".to_string(),
+            Some("workspace-1".to_string()),
+        );
+        session.work_finished_unseen = true;
+        store.projects.push(Project {
+            id: "project-1".to_string(),
+            name: "thinkterm".to_string(),
+            path: PathBuf::from("/tmp/thinkterm"),
+            sessions: vec![session],
+            active_session_id: None,
+            sessions_collapsed: false,
+        });
+
+        let change = store.acknowledge_session_work_for_workspace("workspace-1");
+        assert!(change.changed);
+        assert!(change.should_persist);
+        assert!(!store.projects[0].sessions[0].work_finished_unseen);
+
+        store.projects[0].sessions[0].work_is_running = true;
+        let change = store.acknowledge_session_work_for_workspace("workspace-1");
+        assert!(change.changed);
+        assert!(!change.should_persist);
+        assert!(!store.projects[0].sessions[0].work_is_running);
     }
 
     #[test]

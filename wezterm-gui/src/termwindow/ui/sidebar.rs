@@ -96,6 +96,14 @@ impl crate::TermWindow {
         project_sessions::acknowledge_session_work_for_workspace(window.get_workspace())
     }
 
+    pub(crate) fn acknowledge_active_workspace_session_work_deferred(&self) -> bool {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return false;
+        };
+        project_sessions::acknowledge_session_work_for_workspace_deferred(window.get_workspace())
+    }
+
     pub fn workspace_sidebar_width(&self) -> usize {
         if self.workspace_sidebar_collapsed {
             0

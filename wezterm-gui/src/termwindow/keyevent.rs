@@ -516,14 +516,19 @@ impl super::TermWindow {
                 }
 
                 self.key_table_state.did_process_key();
-                let handled = match self.perform_key_assignment(&pane, &entry.action) {
+                let stage = crate::input_diagnostics::StageTimer::begin("key_assignment");
+                let assignment_result = self.perform_key_assignment(&pane, &entry.action);
+                stage.finish(assignment_result.is_ok());
+                let handled = match assignment_result {
                     Ok(PerformAssignmentResult::Handled) => true,
                     Err(_) => true,
                     Ok(_) => false,
                 };
 
                 if handled {
+                    let stage = crate::input_diagnostics::StageTimer::begin("key_invalidate");
                     context.invalidate();
+                    stage.finish(true);
 
                     if leader_active {
                         // A successful leader key-lookup cancels the leader
@@ -577,19 +582,29 @@ impl super::TermWindow {
                             if self.config.debug_key_events {
                                 log::info!("win32: Encoded input as {:?}", encoded);
                             }
-                            pane.writer()
+                            let stage = crate::input_diagnostics::StageTimer::begin(
+                                "process_encoded_writer_write",
+                            );
+                            let res = pane
+                                .writer()
                                 .write_all(encoded.as_bytes())
-                                .context("sending win32-input-mode encoded data")
-                                .ok();
+                                .context("sending win32-input-mode encoded data");
+                            stage.finish(res.is_ok());
+                            res.ok();
                             did_encode = true;
                         } else if let Some(encoded) = self.encode_kitty_input(&pane, &key_event) {
                             if self.config.debug_key_events {
                                 log::info!("kitty: Encoded input as {:?}", encoded);
                             }
-                            pane.writer()
+                            let stage = crate::input_diagnostics::StageTimer::begin(
+                                "process_encoded_writer_write",
+                            );
+                            let res = pane
+                                .writer()
                                 .write_all(encoded.as_bytes())
-                                .context("sending kitty encoded data")
-                                .ok();
+                                .context("sending kitty encoded data");
+                            stage.finish(res.is_ok());
+                            res.ok();
                             did_encode = true;
                         }
                     };
@@ -604,12 +619,14 @@ impl super::TermWindow {
                             );
                         }
 
-                        did_encode = if is_down {
+                        let stage = crate::input_diagnostics::StageTimer::begin("process_pane_key");
+                        let res = if is_down {
                             pane.key_down(term_key, tw_raw_modifiers)
                         } else {
                             pane.key_up(term_key, tw_raw_modifiers)
-                        }
-                        .is_ok();
+                        };
+                        stage.finish(res.is_ok());
+                        did_encode = res.is_ok();
                     };
 
                     if did_encode {
@@ -617,16 +634,26 @@ impl super::TermWindow {
                             && !keycode.is_modifier()
                             && self.pane_state(pane.pane_id()).overlay.is_none()
                         {
+                            let stage = crate::input_diagnostics::StageTimer::begin(
+                                "scroll_to_bottom_for_input",
+                            );
                             self.maybe_scroll_to_bottom_for_input(&pane);
+                            stage.finish(true);
                         }
                         if is_down
                             && self.config.hide_mouse_cursor_when_typing
                             && !keycode.is_modifier()
                         {
+                            let stage =
+                                crate::input_diagnostics::StageTimer::begin("set_cursor_none");
                             context.set_cursor(None);
+                            stage.finish(true);
                         }
                         if !keycode.is_modifier() {
+                            let stage =
+                                crate::input_diagnostics::StageTimer::begin("key_invalidate");
                             context.invalidate();
+                            stage.finish(true);
                         }
 
                         return true;
@@ -639,6 +666,8 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
+        let mut input_trace =
+            crate::input_diagnostics::KeyEventTrace::begin(key.key_is_down, key.key.is_modifier());
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
         // after which it auto-deactivates.
@@ -669,7 +698,10 @@ impl super::TermWindow {
             self.schedule_next_status_update();
         }
 
-        let pane = match self.get_active_pane_or_overlay() {
+        let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
+        let pane = self.get_active_pane_or_overlay();
+        stage.finish(pane.is_some());
+        let pane = match pane {
             Some(pane) => pane,
             None => return,
         };
@@ -681,7 +713,8 @@ impl super::TermWindow {
         };
 
         if let Some(phys_key) = &phys_key {
-            if self.process_key(
+            let stage = crate::input_diagnostics::StageTimer::begin("raw_process_key");
+            let handled = self.process_key(
                 &pane,
                 context,
                 &phys_key,
@@ -691,7 +724,10 @@ impl super::TermWindow {
                 OnlyKeyBindings::Yes,
                 key.key_is_down,
                 None,
-            ) {
+            );
+            stage.finish(handled);
+            if handled {
+                input_trace.handled();
                 key.set_handled();
                 return;
             }
@@ -702,7 +738,8 @@ impl super::TermWindow {
             raw @ KeyCode::RawCode(_) => raw.clone(),
             _ => KeyCode::RawCode(key.raw_code),
         };
-        if self.process_key(
+        let stage = crate::input_diagnostics::StageTimer::begin("raw_process_key");
+        let handled = self.process_key(
             &pane,
             context,
             &raw_key,
@@ -712,7 +749,10 @@ impl super::TermWindow {
             OnlyKeyBindings::Yes,
             key.key_is_down,
             None,
-        ) {
+        );
+        stage.finish(handled);
+        if handled {
+            input_trace.handled();
             key.set_handled();
             return;
         }
@@ -723,7 +763,8 @@ impl super::TermWindow {
             return;
         }
 
-        if self.process_key(
+        let stage = crate::input_diagnostics::StageTimer::begin("raw_process_key");
+        let handled = self.process_key(
             &pane,
             context,
             &key.key,
@@ -733,7 +774,10 @@ impl super::TermWindow {
             OnlyKeyBindings::Yes,
             key.key_is_down,
             None,
-        ) {
+        );
+        stage.finish(handled);
+        if handled {
+            input_trace.handled();
             key.set_handled();
         }
     }
@@ -811,8 +855,15 @@ impl super::TermWindow {
         if self.handle_inline_tab_rename_key(&window_key, context) {
             return;
         }
+        let mut input_trace = crate::input_diagnostics::KeyEventTrace::begin(
+            window_key.key_is_down,
+            window_key.key.is_modifier(),
+        );
 
-        let pane = match self.get_active_pane_or_overlay() {
+        let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
+        let pane = self.get_active_pane_or_overlay();
+        stage.finish(pane.is_some());
+        let pane = match pane {
             Some(pane) => pane,
             None => return,
         };
@@ -842,18 +893,28 @@ impl super::TermWindow {
         }
 
         let modifiers = window_key.modifiers;
+        let stage = crate::input_diagnostics::StageTimer::begin("translate_key_code");
         let key = self.win_key_code_to_termwiz_key_code(&window_key.key);
+        stage.finish(true);
         let should_acknowledge_session_work = window_key.key_is_down
             && match &key {
                 Key::Code(key) => !key.is_modifier(),
                 Key::Composed(_) => true,
                 Key::None => false,
             };
-        if should_acknowledge_session_work && self.acknowledge_active_workspace_session_work() {
-            context.invalidate();
+        if should_acknowledge_session_work {
+            let stage = crate::input_diagnostics::StageTimer::begin("ack_session_work");
+            let should_invalidate = self.acknowledge_active_workspace_session_work_deferred();
+            stage.finish(should_invalidate);
+            if should_invalidate {
+                let stage = crate::input_diagnostics::StageTimer::begin("key_invalidate");
+                context.invalidate();
+                stage.finish(true);
+            }
         }
 
-        if self.process_key(
+        let stage = crate::input_diagnostics::StageTimer::begin("process_key");
+        let handled = self.process_key(
             &pane,
             context,
             &window_key.key,
@@ -863,7 +924,10 @@ impl super::TermWindow {
             OnlyKeyBindings::No,
             window_key.key_is_down,
             Some(&window_key),
-        ) {
+        );
+        stage.finish(handled);
+        if handled {
+            input_trace.handled();
             return;
         }
 
@@ -871,7 +935,9 @@ impl super::TermWindow {
         // any key table rules. Therefore, we should pop all `until_unknown`
         // entries from the stack.
         if window_key.key_is_down {
+            let stage = crate::input_diagnostics::StageTimer::begin("key_table_pop_unknown");
             self.key_table_state.pop_until_unknown();
+            stage.finish(true);
         }
 
         match key {
@@ -882,6 +948,7 @@ impl super::TermWindow {
                         // a registered key binding; swallow this event and cancel
                         // the leader modifier.
                         self.leader_done();
+                        input_trace.handled();
                         return;
                     }
                     self.key_table_state.did_process_key();
@@ -891,6 +958,7 @@ impl super::TermWindow {
                     if window_key.key_is_down {
                         modal.key_down(key, modifiers, self).ok();
                     }
+                    input_trace.handled();
                     return;
                 }
 
@@ -898,16 +966,24 @@ impl super::TermWindow {
                     if self.config.debug_key_events {
                         log::info!("win32: Encoded input as {:?}", encoded);
                     }
-                    pane.writer()
+                    let stage = crate::input_diagnostics::StageTimer::begin("encoded_writer_write");
+                    let res = pane
+                        .writer()
                         .write_all(encoded.as_bytes())
-                        .context("sending win32-input-mode encoded data")
+                        .context("sending win32-input-mode encoded data");
+                    stage.finish(res.is_ok());
+                    res
                 } else if let Some(encoded) = self.encode_kitty_input(&pane, &window_key) {
                     if self.config.debug_key_events {
                         log::info!("kitty: Encoded input as {:?}", encoded);
                     }
-                    pane.writer()
+                    let stage = crate::input_diagnostics::StageTimer::begin("encoded_writer_write");
+                    let res = pane
+                        .writer()
                         .write_all(encoded.as_bytes())
-                        .context("sending kitty encoded data")
+                        .context("sending kitty encoded data");
+                    stage.finish(res.is_ok());
+                    res
                 } else {
                     if self.config.debug_key_events {
                         log::info!(
@@ -918,28 +994,40 @@ impl super::TermWindow {
                         );
                     }
 
-                    if window_key.key_is_down {
+                    let stage = crate::input_diagnostics::StageTimer::begin("pane_key");
+                    let res = if window_key.key_is_down {
                         pane.key_down(key, modifiers)
                     } else {
                         pane.key_up(key, modifiers)
-                    }
+                    };
+                    stage.finish(res.is_ok());
+                    res
                 };
 
                 if res.is_ok() {
+                    input_trace.handled();
                     if window_key.key_is_down
                         && !key.is_modifier()
                         && self.pane_state(pane.pane_id()).overlay.is_none()
                     {
+                        let stage = crate::input_diagnostics::StageTimer::begin(
+                            "scroll_to_bottom_for_input",
+                        );
                         self.maybe_scroll_to_bottom_for_input(&pane);
+                        stage.finish(true);
                     }
                     if window_key.key_is_down
                         && self.config.hide_mouse_cursor_when_typing
                         && !key.is_modifier()
                     {
+                        let stage = crate::input_diagnostics::StageTimer::begin("set_cursor_none");
                         context.set_cursor(None);
+                        stage.finish(true);
                     }
                     if !key.is_modifier() {
+                        let stage = crate::input_diagnostics::StageTimer::begin("key_invalidate");
                         context.invalidate();
+                        stage.finish(true);
                     }
                 }
             }
@@ -952,15 +1040,25 @@ impl super::TermWindow {
                     // a registered key binding; swallow this event and cancel
                     // the leader modifier.
                     self.leader_done();
+                    input_trace.handled();
                     return;
                 }
                 self.key_table_state.did_process_key();
                 if self.config.debug_key_events {
                     log::info!("send to pane string={:?}", s);
                 }
-                pane.writer().write_all(s.as_bytes()).ok();
+                let stage = crate::input_diagnostics::StageTimer::begin("composed_writer_write");
+                let res = pane.writer().write_all(s.as_bytes());
+                stage.finish(res.is_ok());
+                res.ok();
+                input_trace.handled();
+                let stage =
+                    crate::input_diagnostics::StageTimer::begin("scroll_to_bottom_for_input");
                 self.maybe_scroll_to_bottom_for_input(&pane);
+                stage.finish(true);
+                let stage = crate::input_diagnostics::StageTimer::begin("key_invalidate");
                 context.invalidate();
+                stage.finish(true);
             }
             Key::None => {}
         }
