@@ -856,25 +856,25 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_edit"),
         },
-        PromptRenameProjectSession(_) => CommandDef {
-            brief: "Rename Session".into(),
-            doc: "Prompts for a new name for the ThinkTerm session".into(),
+        PromptRenameWorkspaceThread(_) => CommandDef {
+            brief: "Rename Thread".into(),
+            doc: "Prompts for a new name for the ThinkTerm thread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],
             icon: Some("md_edit"),
         },
-        CreateProjectSession(_) => CommandDef {
-            brief: "New Session".into(),
-            doc: "Creates a new ThinkTerm session for the workspace".into(),
+        CreateWorkspaceThread(_) => CommandDef {
+            brief: "New Thread".into(),
+            doc: "Creates a new ThinkTerm thread for the workspace".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],
             icon: Some("md_add"),
         },
-        ToggleProjectSessionsCollapsed(_) => CommandDef {
-            brief: "Collapse or Expand Sessions".into(),
-            doc: "Toggles the ThinkTerm workspace session list".into(),
+        ToggleWorkspaceThreadsCollapsed(_) => CommandDef {
+            brief: "Collapse or Expand Threads".into(),
+            doc: "Toggles the ThinkTerm workspace thread list".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],
@@ -888,33 +888,33 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_delete"),
         },
-        ToggleProjectSessionPinned(_) => CommandDef {
-            brief: "Pin Session".into(),
-            doc: "Toggles the pinned state for the ThinkTerm session".into(),
+        ToggleWorkspaceThreadPinned(_) => CommandDef {
+            brief: "Pin Thread".into(),
+            doc: "Toggles the pinned state for the ThinkTerm thread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],
             icon: None,
         },
-        ArchiveProjectSession(_) => CommandDef {
-            brief: "Archive Session".into(),
-            doc: "Archives the ThinkTerm session".into(),
+        ArchiveWorkspaceThread(_) => CommandDef {
+            brief: "Archive Thread".into(),
+            doc: "Archives the ThinkTerm thread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],
             icon: None,
         },
-        DeleteProjectSession(_) => CommandDef {
-            brief: "Delete Session".into(),
-            doc: "Deletes the ThinkTerm session from the session store".into(),
+        DeleteWorkspaceThread(_) => CommandDef {
+            brief: "Delete Thread".into(),
+            doc: "Deletes the ThinkTerm thread from the thread store".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],
             icon: None,
         },
-        MarkProjectSessionUnread(_) => CommandDef {
-            brief: "Mark Session as Unread".into(),
-            doc: "Marks the ThinkTerm session as unread".into(),
+        MarkWorkspaceThreadUnread(_) => CommandDef {
+            brief: "Mark Thread as Unread".into(),
+            doc: "Marks the ThinkTerm thread as unread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],

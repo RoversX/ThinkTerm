@@ -42,10 +42,10 @@ mod frontend;
 mod glyphcache;
 mod input_diagnostics;
 mod inputmap;
+mod native_paths;
 mod native_settings;
 mod overlay;
 mod perf;
-mod project_sessions;
 mod quad;
 mod renderstate;
 mod resize_increment_calculator;
@@ -65,6 +65,7 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
+mod workspace_threads;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]

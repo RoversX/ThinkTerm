@@ -1,6 +1,6 @@
 //! ThinkTerm SSH host address book and runtime host -> mux domain plumbing.
 //!
-//! `sessions.json` owns workspace/session layout only. User-created SSH hosts
+//! `workspace_threads.json` owns workspace/thread layout only. User-created SSH hosts
 //! live in `ssh_hosts.json`; system `~/.ssh/config` hosts are exposed as
 //! read-only entries. Runtime domains are still registered lazily with the mux
 //! via [`mux::Mux::add_domain`].
@@ -111,7 +111,7 @@ lazy_static::lazy_static! {
 }
 
 pub fn ssh_hosts_store_path() -> PathBuf {
-    config::DATA_DIR.join("thinkterm").join("ssh_hosts.json")
+    crate::native_paths::data_file("ssh_hosts.json")
 }
 
 fn load_ssh_host_store() -> Result<SshHostStore> {

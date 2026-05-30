@@ -40,8 +40,8 @@ impl super::TermWindow {
         self.normalized_font_scale_value(font_scale)
     }
 
-    pub(crate) fn snapshot_active_project_session_layout(&self) {
-        crate::project_sessions::snapshot_active_session_layout_with_font_scales(
+    pub(crate) fn snapshot_active_workspace_thread_layout(&self) {
+        crate::workspace_threads::snapshot_active_thread_layout_with_font_scales(
             self.mux_window_id,
             |pane_id| self.persisted_font_scale_for_pane(pane_id),
         );
@@ -52,7 +52,7 @@ impl super::TermWindow {
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return;
         };
-        crate::project_sessions::snapshot_workspace_layout_with_font_scales(
+        crate::workspace_threads::snapshot_workspace_layout_with_font_scales(
             window.get_workspace(),
             self.mux_window_id,
             |pane_id| self.persisted_font_scale_for_pane(pane_id),
@@ -91,12 +91,12 @@ impl super::TermWindow {
         }
     }
 
-    pub(crate) fn apply_workspace_session_font_scales(&mut self) {
+    pub(crate) fn apply_workspace_thread_font_scales(&mut self) {
         let mux = Mux::get();
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return;
         };
-        let Some(font_scales) = crate::project_sessions::workspace_pane_font_scales(
+        let Some(font_scales) = crate::workspace_threads::workspace_pane_font_scales(
             window.get_workspace(),
             self.mux_window_id,
         ) else {

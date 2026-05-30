@@ -904,7 +904,7 @@ impl super::TermWindow {
             };
         if should_acknowledge_session_work {
             let stage = crate::input_diagnostics::StageTimer::begin("ack_session_work");
-            let should_invalidate = self.acknowledge_active_workspace_session_work_deferred();
+            let should_invalidate = self.acknowledge_active_workspace_thread_work_deferred();
             stage.finish(should_invalidate);
             if should_invalidate {
                 let stage = crate::input_diagnostics::StageTimer::begin("key_invalidate");

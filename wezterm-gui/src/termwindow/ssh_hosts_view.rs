@@ -4,7 +4,6 @@
 //! infrastructure. The view owns its state + hit-testing and exposes a tiny
 //! [`SshViewOutcome`] so `TermWindow` integration stays minimal.
 
-use crate::project_sessions;
 use crate::quad::TripleLayerQuadAllocator;
 use crate::ssh_hosts::{self, SshHostEntry, SshHostSource, SshHostSpec};
 use crate::termwindow::content_view::{ContentView, ContentViewResponse};
@@ -15,6 +14,7 @@ use crate::ui::{
     wheel_delta_pixels, ButtonSpec, ControlState, DrawContext, InteractionState, ScrollState,
     TextInputSpec, UiContext, UiPalette, UiTokens, WidgetKind,
 };
+use crate::workspace_threads;
 use std::rc::Rc;
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
@@ -387,7 +387,7 @@ impl SshHostsView {
                         if let Err(err) = ssh_hosts::try_remove_host(&id) {
                             log::error!("failed to delete SSH host {id}: {err:#}");
                         } else {
-                            let _ = project_sessions::remove_project(&id);
+                            let _ = workspace_threads::remove_project(&id);
                         }
                         self.refresh();
                     }

@@ -1,8 +1,8 @@
 //! At-rest encryption for stored secrets (currently SSH passwords).
 //!
 //! Secrets are encrypted with AES-256-GCM using a per-machine random key kept
-//! in `DATA_DIR/thinkterm/secret.key` (mode 0600). The encrypted value is
-//! stored in `sessions.json` as `enc:v1:<base64(nonce|tag|ciphertext)>` so the
+//! in ThinkTerm's native data directory as `secret.key` (mode 0600). The encrypted value is
+//! stored in `ssh_hosts.json` as `enc:v1:<base64(nonce|tag|ciphertext)>` so the
 //! JSON never contains plaintext. This protects against casual disclosure
 //! (sync/backups/prying eyes); anyone with both the key file and the ciphertext
 //! can still decrypt, which is the documented trade-off for a key-on-disk
@@ -21,7 +21,7 @@ const IV_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
 fn key_path() -> PathBuf {
-    config::DATA_DIR.join("thinkterm").join("secret.key")
+    crate::native_paths::data_file("secret.key")
 }
 
 /// Load the 32-byte key, generating and persisting one (0600) if absent.

@@ -21,10 +21,10 @@ use wezterm_term::TerminalConfiguration;
 use wezterm_term::TerminalSize;
 
 pub type ProjectId = String;
-pub type SessionId = String;
+pub type WorkspaceThreadId = String;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct SessionStore {
+pub struct WorkspaceThreadStore {
     pub active_project_id: Option<ProjectId>,
     pub projects: Vec<Project>,
 }
@@ -34,18 +34,19 @@ pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub path: PathBuf,
-    pub sessions: Vec<Session>,
-    pub active_session_id: Option<SessionId>,
     #[serde(default)]
-    pub sessions_collapsed: bool,
+    pub threads: Vec<WorkspaceThread>,
+    pub active_thread_id: Option<WorkspaceThreadId>,
+    #[serde(default)]
+    pub threads_collapsed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Session {
-    pub id: SessionId,
+pub struct WorkspaceThread {
+    pub id: WorkspaceThreadId,
     pub name: String,
     pub project_id: ProjectId,
-    pub layout: Option<SessionLayoutSnapshot>,
+    pub layout: Option<WorkspaceThreadLayoutSnapshot>,
     pub materialized_workspace_name: Option<String>,
     pub last_active_at: i64,
     #[serde(default)]
@@ -63,7 +64,7 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SessionLayoutSnapshot {
+pub struct WorkspaceThreadLayoutSnapshot {
     pub active_tab: usize,
     pub tabs: Vec<serde_json::Value>,
     #[serde(default)]
@@ -86,8 +87,8 @@ pub struct TerminalSpawnSpec {
 }
 
 #[derive(Debug, Clone)]
-pub struct ProjectSessionView {
-    pub pinned_sessions: Vec<SessionView>,
+pub struct WorkspaceThreadsView {
+    pub pinned_threads: Vec<WorkspaceThreadView>,
     pub projects: Vec<ProjectView>,
 }
 
@@ -96,8 +97,8 @@ pub struct ProjectView {
     pub id: ProjectId,
     pub name: String,
     pub is_active: bool,
-    pub sessions_collapsed: bool,
-    pub sessions: Vec<SessionView>,
+    pub threads_collapsed: bool,
+    pub threads: Vec<WorkspaceThreadView>,
     /// True when this project is a remote SSH host rather than a local folder.
     pub is_remote: bool,
     /// Detected `/etc/os-release` `ID` for remote hosts, used to pick an OS icon.
@@ -105,18 +106,18 @@ pub struct ProjectView {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionView {
-    pub id: SessionId,
+pub struct WorkspaceThreadView {
+    pub id: WorkspaceThreadId,
     pub name: String,
     pub is_active: bool,
     pub is_materialized: bool,
     pub is_pinned: bool,
     pub is_unread: bool,
-    pub work_status: SessionWorkStatus,
+    pub work_status: WorkspaceThreadWorkStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionWorkStatus {
+pub enum WorkspaceThreadWorkStatus {
     Idle,
     Running,
     NeedsAttention,
@@ -124,7 +125,7 @@ pub enum SessionWorkStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SessionWorkChange {
+struct WorkspaceThreadWorkChange {
     changed: bool,
     should_persist: bool,
 }
@@ -132,70 +133,48 @@ struct SessionWorkChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationPlan {
     pub project_id: ProjectId,
-    pub session_id: SessionId,
+    pub thread_id: WorkspaceThreadId,
     pub workspace_name: String,
     pub project_path: PathBuf,
     pub needs_materialize: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeletedSession {
+pub struct DeletedWorkspaceThread {
     pub was_active: bool,
-    pub next_session_id: Option<SessionId>,
+    pub next_thread_id: Option<WorkspaceThreadId>,
     pub materialized_workspace_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedProject {
     pub was_active: bool,
-    pub next_session_id: Option<SessionId>,
+    pub next_thread_id: Option<WorkspaceThreadId>,
     pub materialized_workspace_names: Vec<String>,
 }
 
 lazy_static::lazy_static! {
-    static ref SESSION_STORE: Mutex<SessionStore> =
-        Mutex::new(load_session_store().unwrap_or_else(|err| {
-            log::warn!("failed to load ThinkTerm session store: {err:#}");
-            SessionStore::default()
+    static ref THREAD_STORE: Mutex<WorkspaceThreadStore> =
+        Mutex::new(load_workspace_thread_store().unwrap_or_else(|err| {
+            log::warn!("failed to load ThinkTerm workspace thread store: {err:#}");
+            WorkspaceThreadStore::default()
         }));
 }
 
-static SESSION_STORE_PERSIST_SCHEDULED: AtomicBool = AtomicBool::new(false);
-static SESSION_STORE_PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
+static THREAD_STORE_PERSIST_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static THREAD_STORE_PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
 
-pub fn session_store_path() -> PathBuf {
-    config::DATA_DIR.join("thinkterm").join("sessions.json")
+pub fn workspace_thread_store_path() -> PathBuf {
+    crate::native_paths::data_file("workspace_threads.json")
 }
 
-fn legacy_session_store_path() -> PathBuf {
-    config::CACHE_DIR.join("thinkterm").join("sessions.json")
+pub fn load_workspace_thread_store() -> Result<WorkspaceThreadStore> {
+    load_workspace_thread_store_from_path(&workspace_thread_store_path())
 }
 
-pub fn load_session_store() -> Result<SessionStore> {
-    let path = session_store_path();
-    if path.exists() {
-        return load_session_store_from_path(&path);
-    }
-
-    let legacy_path = legacy_session_store_path();
-    if legacy_path.exists() {
-        let store = load_session_store_from_path(&legacy_path)?;
-        if let Err(err) = save_session_store_to_path(&path, &store) {
-            log::warn!(
-                "failed to migrate ThinkTerm session store from {} to {}: {err:#}",
-                legacy_path.display(),
-                path.display()
-            );
-        }
-        return Ok(store);
-    }
-
-    Ok(SessionStore::default())
-}
-
-pub fn load_session_store_from_path(path: &Path) -> Result<SessionStore> {
+pub fn load_workspace_thread_store_from_path(path: &Path) -> Result<WorkspaceThreadStore> {
     if !path.exists() {
-        return Ok(SessionStore::default());
+        return Ok(WorkspaceThreadStore::default());
     }
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let value: serde_json::Value =
@@ -230,7 +209,7 @@ fn migrate_legacy_remote_hosts(value: &serde_json::Value) {
             Ok(spec) => spec,
             Err(err) => {
                 log::warn!(
-                    "failed to migrate legacy SSH host from session project {project_id}: {err:#}"
+                    "failed to migrate legacy SSH host from workspace project {project_id}: {err:#}"
                 );
                 continue;
             }
@@ -246,7 +225,7 @@ fn migrate_legacy_remote_hosts(value: &serde_json::Value) {
                     Ok(encrypted) => spec.password = Some(encrypted),
                     Err(err) => {
                         log::warn!(
-                            "failed to encrypt legacy SSH password for session project {project_id}: {err:#}"
+                            "failed to encrypt legacy SSH password for workspace project {project_id}: {err:#}"
                         );
                         continue;
                     }
@@ -256,21 +235,24 @@ fn migrate_legacy_remote_hosts(value: &serde_json::Value) {
 
         if let Err(err) = crate::ssh_hosts::try_import_legacy_host(spec) {
             log::warn!(
-                "failed to migrate legacy SSH host from session project {project_id}: {err:#}"
+                "failed to migrate legacy SSH host from workspace project {project_id}: {err:#}"
             );
         }
     }
 }
 
-pub fn save_session_store(store: &SessionStore) -> Result<()> {
-    save_session_store_to_path(&session_store_path(), store)
+pub fn save_workspace_thread_store(store: &WorkspaceThreadStore) -> Result<()> {
+    save_workspace_thread_store_to_path(&workspace_thread_store_path(), store)
 }
 
-pub fn save_session_store_to_path(path: &Path, store: &SessionStore) -> Result<()> {
+pub fn save_workspace_thread_store_to_path(
+    path: &Path,
+    store: &WorkspaceThreadStore,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         let mut file = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("create temporary session store in {}", parent.display()))?;
+            .with_context(|| format!("create temporary thread store in {}", parent.display()))?;
         serde_json::to_writer_pretty(&mut file, store)
             .with_context(|| format!("write {}", path.display()))?;
         file.flush()
@@ -305,29 +287,29 @@ pub fn current_project_from_cwd() -> Project {
         id,
         name,
         path,
-        sessions: vec![],
-        active_session_id: None,
-        sessions_collapsed: false,
+        threads: vec![],
+        active_thread_id: None,
+        threads_collapsed: false,
     }
 }
 
 fn current_project_for_workspace(active_workspace: &str) -> Project {
     let mut project = current_project_from_cwd();
-    let session = Session::new_initial(
+    let session = WorkspaceThread::new_initial(
         project.id.clone(),
         "main".to_string(),
         Some(active_workspace.to_string()),
     );
-    project.active_session_id = Some(session.id.clone());
-    project.sessions.push(session);
+    project.active_thread_id = Some(session.id.clone());
+    project.threads.push(session);
     project
 }
 
 pub fn view_for_current_project(
     active_workspace: &str,
     live_workspaces: &[String],
-) -> ProjectSessionView {
-    let store = SESSION_STORE.lock();
+) -> WorkspaceThreadsView {
+    let store = THREAD_STORE.lock();
     if let Some(project_id) = store
         .project_id_for_workspace(active_workspace)
         .or_else(|| store.active_project_id.clone())
@@ -345,7 +327,7 @@ pub fn view_for_current_project(
 }
 
 pub fn sync_current_project(active_workspace: &str) -> bool {
-    let mut store = SESSION_STORE.lock();
+    let mut store = THREAD_STORE.lock();
     let (project_id, mut changed) =
         if let Some(project_id) = store.project_id_for_workspace(active_workspace) {
             if store.active_project_id.as_deref() != Some(&project_id) {
@@ -364,31 +346,31 @@ pub fn sync_current_project(active_workspace: &str) -> bool {
     changed
 }
 
-pub fn create_session(project_id: &str, name: Option<String>) -> SessionId {
-    let mut store = SESSION_STORE.lock();
-    let session_id = store.create_session(project_id, name);
+pub fn create_thread(project_id: &str, name: Option<String>) -> WorkspaceThreadId {
+    let mut store = THREAD_STORE.lock();
+    let thread_id = store.create_thread(project_id, name);
     persist_locked(&store);
-    session_id
+    thread_id
 }
 
-pub fn create_project_from_path(path: &str) -> Result<SessionId> {
+pub fn create_project_from_path(path: &str) -> Result<WorkspaceThreadId> {
     let path = normalize_project_path(path)?;
-    let mut store = SESSION_STORE.lock();
-    let session_id = store.create_project_from_path(path);
+    let mut store = THREAD_STORE.lock();
+    let thread_id = store.create_project_from_path(path);
     persist_locked(&store);
-    Ok(session_id)
+    Ok(thread_id)
 }
 
-/// Create a new session under a remote (SSH) project bound to `workspace_name`,
+/// Create a new thread under a remote (SSH) project bound to `workspace_name`,
 /// mark it active, and return its id. Remote host connection details live in
 /// `ssh_hosts.json`; the project record here is layout/sidebar state only.
-pub fn create_remote_host_session(
+pub fn create_remote_host_thread(
     project_id: &str,
     label: &str,
     path: PathBuf,
     workspace_name: &str,
-) -> SessionId {
-    let mut store = SESSION_STORE.lock();
+) -> WorkspaceThreadId {
+    let mut store = THREAD_STORE.lock();
     if let Some(project) = store.projects.iter_mut().find(|p| p.id == project_id) {
         project.name = label.to_string();
         project.path = path.clone();
@@ -397,9 +379,9 @@ pub fn create_remote_host_session(
             id: project_id.to_string(),
             name: label.to_string(),
             path,
-            sessions: vec![],
-            active_session_id: None,
-            sessions_collapsed: false,
+            threads: vec![],
+            active_thread_id: None,
+            threads_collapsed: false,
         });
     }
 
@@ -408,31 +390,31 @@ pub fn create_remote_host_session(
         .iter_mut()
         .find(|p| p.id == project_id)
         .expect("remote project was just inserted");
-    let name = format!("Session {}", project.sessions.len() + 1);
-    let session = Session::new(
+    let name = format!("Thread {}", project.threads.len() + 1);
+    let session = WorkspaceThread::new(
         project_id.to_string(),
         name,
         Some(workspace_name.to_string()),
     );
-    let session_id = session.id.clone();
-    project.active_session_id = Some(session_id.clone());
-    project.sessions.push(session);
+    let thread_id = session.id.clone();
+    project.active_thread_id = Some(thread_id.clone());
+    project.threads.push(session);
     store.active_project_id = Some(project_id.to_string());
     persist_locked(&store);
-    session_id
+    thread_id
 }
 
-pub fn activate_session_record(
-    session_id: &str,
+pub fn activate_thread_record(
+    thread_id: &str,
     live_workspaces: &[String],
 ) -> Option<ActivationPlan> {
-    let mut store = SESSION_STORE.lock();
-    let plan = store.activate_session_record(session_id, live_workspaces);
+    let mut store = THREAD_STORE.lock();
+    let plan = store.activate_thread_record(thread_id, live_workspaces);
     persist_locked(&store);
     plan
 }
 
-pub fn refresh_session_work_for_pane(pane_id: PaneId) -> bool {
+pub fn refresh_thread_work_for_pane(pane_id: PaneId) -> bool {
     let mux = Mux::get();
     let Some((_domain_id, window_id, _tab_id)) = mux.resolve_pane_id(pane_id) else {
         return false;
@@ -442,47 +424,47 @@ pub fn refresh_session_work_for_pane(pane_id: PaneId) -> bool {
     };
     let workspace = window.get_workspace().to_string();
     drop(window);
-    refresh_session_work_for_workspace(&workspace)
+    refresh_thread_work_for_workspace(&workspace)
 }
 
-pub fn refresh_session_work_for_workspace(workspace: &str) -> bool {
+pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
     let observed = scan_workspace_work_status(workspace);
-    let mut store = SESSION_STORE.lock();
-    let Some(change) = store.observe_session_work_for_workspace(workspace, observed) else {
+    let mut store = THREAD_STORE.lock();
+    let Some(change) = store.observe_thread_work_for_workspace(workspace, observed) else {
         return false;
     };
     if change.should_persist {
-        schedule_session_store_persist();
+        schedule_workspace_thread_store_persist();
     }
     change.changed
 }
 
-pub fn refresh_all_session_work() -> bool {
+pub fn refresh_all_thread_work() -> bool {
     let workspaces = {
-        let store = SESSION_STORE.lock();
-        store.session_workspace_names()
+        let store = THREAD_STORE.lock();
+        store.thread_workspace_names()
     };
     let mut changed = false;
     for workspace in workspaces {
-        changed |= refresh_session_work_for_workspace(&workspace);
+        changed |= refresh_thread_work_for_workspace(&workspace);
     }
     changed
 }
 
-pub fn acknowledge_session_work_for_workspace(workspace: &str) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let change = store.acknowledge_session_work_for_workspace(workspace);
+pub fn acknowledge_thread_work_for_workspace(workspace: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let change = store.acknowledge_thread_work_for_workspace(workspace);
     if change.should_persist {
         persist_locked(&store);
     }
     change.changed
 }
 
-pub fn acknowledge_session_work_for_workspace_deferred(workspace: &str) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let change = store.acknowledge_session_work_for_workspace(workspace);
+pub fn acknowledge_thread_work_for_workspace_deferred(workspace: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let change = store.acknowledge_thread_work_for_workspace(workspace);
     if change.should_persist {
-        schedule_session_store_persist();
+        schedule_workspace_thread_store_persist();
     }
     change.changed
 }
@@ -498,24 +480,22 @@ pub fn snapshot_workspace_layout_with_font_scales<F>(
         return;
     };
 
-    let mut store = SESSION_STORE.lock();
+    let mut store = THREAD_STORE.lock();
     store.snapshot_workspace_layout(workspace, snapshot);
     persist_locked(&store);
 }
 
-pub fn snapshot_active_session_layout_with_font_scales<F>(
-    window_id: MuxWindowId,
-    pane_font_scale: F,
-) where
+pub fn snapshot_active_thread_layout_with_font_scales<F>(window_id: MuxWindowId, pane_font_scale: F)
+where
     F: Fn(PaneId) -> Option<f64>,
 {
     let workspace = Mux::get().active_workspace();
     snapshot_workspace_layout_with_font_scales(&workspace, window_id, pane_font_scale);
 }
 
-pub async fn materialize_session(
+pub async fn materialize_thread(
     workspace_name: String,
-    layout: Option<SessionLayoutSnapshot>,
+    layout: Option<WorkspaceThreadLayoutSnapshot>,
     initial_cwd: Option<String>,
     size: TerminalSize,
     src_window_id: Option<MuxWindowId>,
@@ -549,45 +529,45 @@ pub async fn materialize_session(
                 None,
             )
             .await
-            .context("spawn default session window")?;
+            .context("spawn default thread window")?;
         pane.set_config(term_config);
         let _ = src_window_id;
         Ok(())
     }
 }
 
-pub fn session_layout(session_id: &str) -> Option<SessionLayoutSnapshot> {
-    let store = SESSION_STORE.lock();
+pub fn thread_layout(thread_id: &str) -> Option<WorkspaceThreadLayoutSnapshot> {
+    let store = THREAD_STORE.lock();
     store
         .projects
         .iter()
-        .flat_map(|project| project.sessions.iter())
-        .find(|session| session.id == session_id)
+        .flat_map(|project| project.threads.iter())
+        .find(|session| session.id == thread_id)
         .and_then(|session| session.layout.clone())
 }
 
-pub fn session_name(session_id: &str) -> Option<String> {
-    let store = SESSION_STORE.lock();
+pub fn thread_name(thread_id: &str) -> Option<String> {
+    let store = THREAD_STORE.lock();
     store
         .projects
         .iter()
-        .flat_map(|project| project.sessions.iter())
-        .find(|session| session.id == session_id)
+        .flat_map(|project| project.threads.iter())
+        .find(|session| session.id == thread_id)
         .map(|session| session.name.clone())
 }
 
-pub fn session_is_pinned(session_id: &str) -> bool {
-    let store = SESSION_STORE.lock();
+pub fn thread_is_pinned(thread_id: &str) -> bool {
+    let store = THREAD_STORE.lock();
     store
         .projects
         .iter()
-        .flat_map(|project| project.sessions.iter())
-        .find(|session| session.id == session_id)
+        .flat_map(|project| project.threads.iter())
+        .find(|session| session.id == thread_id)
         .is_some_and(|session| session.is_pinned)
 }
 
 pub fn project_name(project_id: &str) -> Option<String> {
-    let store = SESSION_STORE.lock();
+    let store = THREAD_STORE.lock();
     store
         .projects
         .iter()
@@ -599,12 +579,12 @@ pub fn workspace_pane_font_scales(
     workspace: &str,
     window_id: MuxWindowId,
 ) -> Option<HashMap<PaneId, Option<f64>>> {
-    let store = SESSION_STORE.lock();
+    let store = THREAD_STORE.lock();
     store.workspace_pane_font_scales(workspace, window_id)
 }
 
 pub fn rename_project(project_id: &str, name: String) -> bool {
-    let mut store = SESSION_STORE.lock();
+    let mut store = THREAD_STORE.lock();
     let changed = store.rename_project(project_id, name);
     if changed {
         persist_locked(&store);
@@ -613,7 +593,7 @@ pub fn rename_project(project_id: &str, name: String) -> bool {
 }
 
 pub fn remove_project(project_id: &str) -> Option<RemovedProject> {
-    let mut store = SESSION_STORE.lock();
+    let mut store = THREAD_STORE.lock();
     let removed = store.remove_project(project_id);
     if removed.is_some() {
         persist_locked(&store);
@@ -621,81 +601,81 @@ pub fn remove_project(project_id: &str) -> Option<RemovedProject> {
     removed
 }
 
-pub fn rename_session(session_id: &str, name: String) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let changed = store.rename_session(session_id, name);
+pub fn rename_thread(thread_id: &str, name: String) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.rename_thread(thread_id, name);
     if changed {
         persist_locked(&store);
     }
     changed
 }
 
-pub fn toggle_session_pinned(session_id: &str) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let changed = store.toggle_session_pinned(session_id);
+pub fn toggle_thread_pinned(thread_id: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.toggle_thread_pinned(thread_id);
     if changed {
         persist_locked(&store);
     }
     changed
 }
 
-pub fn mark_session_unread(session_id: &str) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let changed = store.mark_session_unread(session_id);
+pub fn mark_thread_unread(thread_id: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.mark_thread_unread(thread_id);
     if changed {
         persist_locked(&store);
     }
     changed
 }
 
-pub fn archive_session(session_id: &str) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let changed = store.archive_session(session_id);
+pub fn archive_thread(thread_id: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.archive_thread(thread_id);
     if changed {
         persist_locked(&store);
     }
     changed
 }
 
-pub fn delete_session(session_id: &str) -> Option<DeletedSession> {
-    let mut store = SESSION_STORE.lock();
-    let deleted = store.delete_session(session_id);
+pub fn delete_thread(thread_id: &str) -> Option<DeletedWorkspaceThread> {
+    let mut store = THREAD_STORE.lock();
+    let deleted = store.delete_thread(thread_id);
     if deleted.is_some() {
         persist_locked(&store);
     }
     deleted
 }
 
-pub fn toggle_project_sessions_collapsed(project_id: &str) -> bool {
-    let mut store = SESSION_STORE.lock();
-    let changed = store.toggle_project_sessions_collapsed(project_id);
+pub fn toggle_project_threads_collapsed(project_id: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.toggle_project_threads_collapsed(project_id);
     if changed {
         persist_locked(&store);
     }
     changed
 }
 
-fn session_views_for_project(
+fn thread_views_for_project(
     project: &Project,
     active_project_id: Option<&str>,
     live_workspaces: &[String],
-) -> Vec<SessionView> {
+) -> Vec<WorkspaceThreadView> {
     let project_is_active = active_project_id == Some(project.id.as_str());
     project
-        .sessions
+        .threads
         .iter()
         .filter(|session| !session.archived)
         .map(|session| {
             let workspace_name = session
                 .materialized_workspace_name
                 .clone()
-                .unwrap_or_else(|| workspace_name_for_session(&project.id, &session.id));
+                .unwrap_or_else(|| workspace_name_for_thread(&project.id, &session.id));
             let is_materialized = live_workspaces.iter().any(|live| live == &workspace_name);
-            SessionView {
+            WorkspaceThreadView {
                 id: session.id.clone(),
                 name: session.name.clone(),
                 is_active: project_is_active
-                    && project.active_session_id.as_deref() == Some(&session.id),
+                    && project.active_thread_id.as_deref() == Some(&session.id),
                 is_materialized,
                 is_pinned: session.is_pinned,
                 is_unread: session.is_unread,
@@ -706,15 +686,15 @@ fn session_views_for_project(
 }
 
 impl Project {
-    fn view(&self, live_workspaces: &[String]) -> ProjectSessionView {
-        ProjectSessionView {
-            pinned_sessions: vec![],
+    fn view(&self, live_workspaces: &[String]) -> WorkspaceThreadsView {
+        WorkspaceThreadsView {
+            pinned_threads: vec![],
             projects: vec![ProjectView {
                 id: self.id.clone(),
                 name: self.name.clone(),
                 is_active: true,
-                sessions_collapsed: self.sessions_collapsed,
-                sessions: session_views_for_project(self, Some(&self.id), live_workspaces),
+                threads_collapsed: self.threads_collapsed,
+                threads: thread_views_for_project(self, Some(&self.id), live_workspaces),
                 is_remote: is_remote_project(self),
                 distro: None,
             }],
@@ -722,7 +702,7 @@ impl Project {
     }
 }
 
-impl SessionStore {
+impl WorkspaceThreadStore {
     fn ensure_current_project(&mut self, active_workspace: &str) -> (ProjectId, bool) {
         let current = current_project_from_cwd();
         let (project_id, mut changed) =
@@ -730,13 +710,13 @@ impl SessionStore {
                 (project.id.clone(), false)
             } else {
                 let mut project = current;
-                let session = Session::new_initial(
+                let session = WorkspaceThread::new_initial(
                     project.id.clone(),
                     "main".to_string(),
                     Some(active_workspace.to_string()),
                 );
-                project.active_session_id = Some(session.id.clone());
-                project.sessions.push(session);
+                project.active_thread_id = Some(session.id.clone());
+                project.threads.push(session);
                 let project_id = project.id.clone();
                 self.projects.push(project);
                 (project_id, true)
@@ -748,13 +728,17 @@ impl SessionStore {
         (project_id, changed)
     }
 
-    fn view_for_project(&self, project_id: &str, live_workspaces: &[String]) -> ProjectSessionView {
+    fn view_for_project(
+        &self,
+        project_id: &str,
+        live_workspaces: &[String],
+    ) -> WorkspaceThreadsView {
         let active_project_id = self.active_project_id.as_deref().unwrap_or(project_id);
-        let pinned_sessions = self
+        let pinned_threads = self
             .projects
             .iter()
             .flat_map(|project| {
-                session_views_for_project(project, Some(active_project_id), live_workspaces)
+                thread_views_for_project(project, Some(active_project_id), live_workspaces)
                     .into_iter()
                     .filter(|session| session.is_pinned)
             })
@@ -768,8 +752,8 @@ impl SessionStore {
                     id: project.id.clone(),
                     name: project.name.clone(),
                     is_active: project.id == active_project_id,
-                    sessions_collapsed: project.sessions_collapsed,
-                    sessions: session_views_for_project(
+                    threads_collapsed: project.threads_collapsed,
+                    threads: thread_views_for_project(
                         project,
                         Some(active_project_id),
                         live_workspaces,
@@ -787,8 +771,8 @@ impl SessionStore {
                 }
             })
             .collect();
-        ProjectSessionView {
-            pinned_sessions,
+        WorkspaceThreadsView {
+            pinned_threads,
             projects,
         }
     }
@@ -797,23 +781,23 @@ impl SessionStore {
         let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) else {
             return false;
         };
-        if let Some(session) = project.sessions.iter().find(|session| {
+        if let Some(session) = project.threads.iter().find(|session| {
             session.materialized_workspace_name.as_deref() == Some(active_workspace)
         }) {
-            if project.active_session_id.as_deref() != Some(&session.id) {
-                project.active_session_id = Some(session.id.clone());
+            if project.active_thread_id.as_deref() != Some(&session.id) {
+                project.active_thread_id = Some(session.id.clone());
                 return true;
             }
             return false;
         }
 
         let active_id = project
-            .active_session_id
+            .active_thread_id
             .clone()
-            .or_else(|| project.sessions.first().map(|session| session.id.clone()));
+            .or_else(|| project.threads.first().map(|session| session.id.clone()));
         if let Some(active_id) = active_id {
             if let Some(session) = project
-                .sessions
+                .threads
                 .iter_mut()
                 .find(|session| session.id == active_id)
             {
@@ -822,8 +806,8 @@ impl SessionStore {
                     session.materialized_workspace_name = Some(active_workspace.to_string());
                     changed = true;
                 }
-                if project.active_session_id.as_deref() != Some(&session.id) {
-                    project.active_session_id = Some(session.id.clone());
+                if project.active_thread_id.as_deref() != Some(&session.id) {
+                    project.active_thread_id = Some(session.id.clone());
                     changed = true;
                 }
                 return changed;
@@ -832,20 +816,20 @@ impl SessionStore {
         false
     }
 
-    fn create_session(&mut self, project_id: &str, name: Option<String>) -> SessionId {
+    fn create_thread(&mut self, project_id: &str, name: Option<String>) -> WorkspaceThreadId {
         let project = self
             .projects
             .iter_mut()
             .find(|project| project.id == project_id)
             .expect("project_id should exist before creating session");
-        let name = name.unwrap_or_else(|| format!("Session {}", project.sessions.len() + 1));
-        let session = Session::new(project.id.clone(), name, None);
+        let name = name.unwrap_or_else(|| format!("Thread {}", project.threads.len() + 1));
+        let session = WorkspaceThread::new(project.id.clone(), name, None);
         let id = session.id.clone();
-        project.sessions.push(session);
+        project.threads.push(session);
         id
     }
 
-    fn create_project_from_path(&mut self, path: PathBuf) -> SessionId {
+    fn create_project_from_path(&mut self, path: PathBuf) -> WorkspaceThreadId {
         let project_id = project_id_for_path(&path);
         if let Some(existing_project_id) = self
             .projects
@@ -853,8 +837,8 @@ impl SessionStore {
             .find(|project| project.path == path)
             .map(|project| project.id.clone())
         {
-            if let Some(session_id) = self.active_session_for_project(&existing_project_id) {
-                return session_id;
+            if let Some(thread_id) = self.active_thread_for_project(&existing_project_id) {
+                return thread_id;
             }
         }
 
@@ -868,102 +852,106 @@ impl SessionStore {
             id: project_id.clone(),
             name,
             path,
-            sessions: vec![],
-            active_session_id: None,
-            sessions_collapsed: false,
+            threads: vec![],
+            active_thread_id: None,
+            threads_collapsed: false,
         };
-        let session = Session::new(project_id.clone(), "main".to_string(), None);
-        let session_id = session.id.clone();
-        project.active_session_id = Some(session_id.clone());
-        project.sessions.push(session);
+        let session = WorkspaceThread::new(project_id.clone(), "main".to_string(), None);
+        let thread_id = session.id.clone();
+        project.active_thread_id = Some(thread_id.clone());
+        project.threads.push(session);
         self.active_project_id = Some(project_id);
         self.projects.push(project);
-        session_id
+        thread_id
     }
 
     fn project_id_for_workspace(&self, workspace: &str) -> Option<ProjectId> {
         self.projects.iter().find_map(|project| {
             project
-                .sessions
+                .threads
                 .iter()
                 .any(|session| {
                     session.materialized_workspace_name.as_deref() == Some(workspace)
-                        || workspace_name_for_session(&project.id, &session.id) == workspace
+                        || workspace_name_for_thread(&project.id, &session.id) == workspace
                 })
                 .then(|| project.id.clone())
         })
     }
 
-    fn active_session_for_project(&mut self, project_id: &str) -> Option<SessionId> {
+    fn active_thread_for_project(&mut self, project_id: &str) -> Option<WorkspaceThreadId> {
         let project = self
             .projects
             .iter_mut()
             .find(|project| project.id == project_id)?;
-        if project.active_session_id.as_ref().is_some_and(|active_id| {
+        if project.active_thread_id.as_ref().is_some_and(|active_id| {
             project
-                .sessions
+                .threads
                 .iter()
                 .any(|session| !session.archived && &session.id == active_id)
         }) {
             self.active_project_id = Some(project.id.clone());
-            return project.active_session_id.clone();
+            return project.active_thread_id.clone();
         }
 
-        let session_id = project
-            .sessions
+        let thread_id = project
+            .threads
             .iter()
             .find(|session| !session.archived)
             .map(|session| session.id.clone())
             .unwrap_or_else(|| {
-                let session = Session::new(project.id.clone(), "main".to_string(), None);
-                let session_id = session.id.clone();
-                project.sessions.push(session);
-                session_id
+                let session = WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
+                let thread_id = session.id.clone();
+                project.threads.push(session);
+                thread_id
             });
-        project.active_session_id = Some(session_id.clone());
+        project.active_thread_id = Some(thread_id.clone());
         self.active_project_id = Some(project.id.clone());
-        Some(session_id)
+        Some(thread_id)
     }
 
-    fn activate_session_record(
+    fn activate_thread_record(
         &mut self,
-        session_id: &str,
+        thread_id: &str,
         live_workspaces: &[String],
     ) -> Option<ActivationPlan> {
         let project = self.projects.iter_mut().find(|project| {
             project
-                .sessions
+                .threads
                 .iter()
-                .any(|session| session.id == session_id)
+                .any(|session| session.id == thread_id)
         })?;
         let project_id = project.id.clone();
         let session = project
-            .sessions
+            .threads
             .iter_mut()
-            .find(|session| session.id == session_id)?;
+            .find(|session| session.id == thread_id)?;
         let workspace_name = session
             .materialized_workspace_name
             .clone()
-            .unwrap_or_else(|| workspace_name_for_session(&project_id, &session.id));
+            .unwrap_or_else(|| workspace_name_for_thread(&project_id, &session.id));
         let needs_materialize = !live_workspaces.iter().any(|live| live == &workspace_name);
         session.materialized_workspace_name = Some(workspace_name.clone());
         session.last_active_at = now_ts();
         session.is_unread = false;
         session.work_finished_unseen = false;
-        project.active_session_id = Some(session.id.clone());
+        project.active_thread_id = Some(session.id.clone());
         self.active_project_id = Some(project.id.clone());
         Some(ActivationPlan {
             project_id,
-            session_id: session.id.clone(),
+            thread_id: session.id.clone(),
             workspace_name,
             project_path: project.path.clone(),
             needs_materialize,
         })
     }
 
-    fn snapshot_workspace_layout(&mut self, workspace: &str, snapshot: SessionLayoutSnapshot) {
+    fn snapshot_workspace_layout(
+        &mut self,
+        workspace: &str,
+        snapshot: WorkspaceThreadLayoutSnapshot,
+    ) {
         for project in &mut self.projects {
-            for session in &mut project.sessions {
+            for session in &mut project.threads {
                 if session.materialized_workspace_name.as_deref() == Some(workspace) {
                     session.layout = Some(snapshot);
                     session.last_active_at = now_ts();
@@ -980,7 +968,7 @@ impl SessionStore {
     ) -> Option<HashMap<PaneId, Option<f64>>> {
         self.projects
             .iter()
-            .flat_map(|project| project.sessions.iter())
+            .flat_map(|project| project.threads.iter())
             .find(|session| session.materialized_workspace_name.as_deref() == Some(workspace))
             .and_then(|session| session.layout.as_ref())
             .and_then(|layout| pane_font_scales_for_window(layout, window_id))
@@ -1006,7 +994,7 @@ impl SessionStore {
         true
     }
 
-    fn rename_session(&mut self, session_id: &str, name: String) -> bool {
+    fn rename_thread(&mut self, thread_id: &str, name: String) -> bool {
         let name = name.trim();
         if name.is_empty() {
             return false;
@@ -1014,9 +1002,9 @@ impl SessionStore {
 
         for project in &mut self.projects {
             if let Some(session) = project
-                .sessions
+                .threads
                 .iter_mut()
-                .find(|session| session.id == session_id)
+                .find(|session| session.id == thread_id)
             {
                 if session.name == name {
                     return false;
@@ -1029,12 +1017,12 @@ impl SessionStore {
         false
     }
 
-    fn toggle_session_pinned(&mut self, session_id: &str) -> bool {
+    fn toggle_thread_pinned(&mut self, thread_id: &str) -> bool {
         for project in &mut self.projects {
             if let Some(session) = project
-                .sessions
+                .threads
                 .iter_mut()
-                .find(|session| session.id == session_id)
+                .find(|session| session.id == thread_id)
             {
                 session.is_pinned = !session.is_pinned;
                 session.last_active_at = now_ts();
@@ -1044,12 +1032,12 @@ impl SessionStore {
         false
     }
 
-    fn mark_session_unread(&mut self, session_id: &str) -> bool {
+    fn mark_thread_unread(&mut self, thread_id: &str) -> bool {
         for project in &mut self.projects {
             if let Some(session) = project
-                .sessions
+                .threads
                 .iter_mut()
-                .find(|session| session.id == session_id)
+                .find(|session| session.id == thread_id)
             {
                 if session.is_unread {
                     return false;
@@ -1061,18 +1049,18 @@ impl SessionStore {
         false
     }
 
-    fn observe_session_work_for_workspace(
+    fn observe_thread_work_for_workspace(
         &mut self,
         workspace: &str,
-        observed: SessionWorkStatus,
-    ) -> Option<SessionWorkChange> {
+        observed: WorkspaceThreadWorkStatus,
+    ) -> Option<WorkspaceThreadWorkChange> {
         for project in &mut self.projects {
             let project_id = project.id.clone();
-            for session in &mut project.sessions {
+            for session in &mut project.threads {
                 let session_workspace = session
                     .materialized_workspace_name
                     .clone()
-                    .unwrap_or_else(|| workspace_name_for_session(&project_id, &session.id));
+                    .unwrap_or_else(|| workspace_name_for_thread(&project_id, &session.id));
                 if session_workspace == workspace {
                     return Some(session.observe_work_status(observed));
                 }
@@ -1081,14 +1069,17 @@ impl SessionStore {
         None
     }
 
-    fn acknowledge_session_work_for_workspace(&mut self, workspace: &str) -> SessionWorkChange {
+    fn acknowledge_thread_work_for_workspace(
+        &mut self,
+        workspace: &str,
+    ) -> WorkspaceThreadWorkChange {
         for project in &mut self.projects {
             let project_id = project.id.clone();
-            for session in &mut project.sessions {
+            for session in &mut project.threads {
                 let session_workspace = session
                     .materialized_workspace_name
                     .clone()
-                    .unwrap_or_else(|| workspace_name_for_session(&project_id, &session.id));
+                    .unwrap_or_else(|| workspace_name_for_thread(&project_id, &session.id));
                 if session_workspace == workspace {
                     let should_persist = session.work_finished_unseen;
                     let changed = session.work_is_running
@@ -1097,23 +1088,23 @@ impl SessionStore {
                     session.work_is_running = false;
                     session.work_needs_attention = false;
                     session.work_finished_unseen = false;
-                    return SessionWorkChange {
+                    return WorkspaceThreadWorkChange {
                         changed,
                         should_persist,
                     };
                 }
             }
         }
-        SessionWorkChange {
+        WorkspaceThreadWorkChange {
             changed: false,
             should_persist: false,
         }
     }
 
-    fn session_workspace_names(&self) -> Vec<String> {
+    fn thread_workspace_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         for project in &self.projects {
-            for session in &project.sessions {
+            for session in &project.threads {
                 if session.archived {
                     continue;
                 }
@@ -1121,22 +1112,22 @@ impl SessionStore {
                     session
                         .materialized_workspace_name
                         .clone()
-                        .unwrap_or_else(|| workspace_name_for_session(&project.id, &session.id)),
+                        .unwrap_or_else(|| workspace_name_for_thread(&project.id, &session.id)),
                 );
             }
         }
         names
     }
 
-    fn archive_session(&mut self, session_id: &str) -> bool {
+    fn archive_thread(&mut self, thread_id: &str) -> bool {
         for project in &mut self.projects {
-            if project.active_session_id.as_deref() == Some(session_id) {
+            if project.active_thread_id.as_deref() == Some(thread_id) {
                 return false;
             }
             if let Some(session) = project
-                .sessions
+                .threads
                 .iter_mut()
-                .find(|session| session.id == session_id)
+                .find(|session| session.id == thread_id)
             {
                 if session.archived {
                     return false;
@@ -1149,33 +1140,33 @@ impl SessionStore {
         false
     }
 
-    fn delete_session(&mut self, session_id: &str) -> Option<DeletedSession> {
+    fn delete_thread(&mut self, thread_id: &str) -> Option<DeletedWorkspaceThread> {
         for project in &mut self.projects {
             let Some(index) = project
-                .sessions
+                .threads
                 .iter()
-                .position(|session| session.id == session_id)
+                .position(|session| session.id == thread_id)
             else {
                 continue;
             };
-            if project.sessions.len() <= 1 {
+            if project.threads.len() <= 1 {
                 return None;
             }
 
-            let removed = project.sessions.remove(index);
-            let was_active = project.active_session_id.as_deref() == Some(session_id);
-            let next_session_id = if was_active {
-                let next_index = index.saturating_sub(1).min(project.sessions.len() - 1);
-                let next_id = project.sessions[next_index].id.clone();
-                project.active_session_id = Some(next_id.clone());
+            let removed = project.threads.remove(index);
+            let was_active = project.active_thread_id.as_deref() == Some(thread_id);
+            let next_thread_id = if was_active {
+                let next_index = index.saturating_sub(1).min(project.threads.len() - 1);
+                let next_id = project.threads[next_index].id.clone();
+                project.active_thread_id = Some(next_id.clone());
                 Some(next_id)
             } else {
                 None
             };
 
-            return Some(DeletedSession {
+            return Some(DeletedWorkspaceThread {
                 was_active,
-                next_session_id,
+                next_thread_id,
                 materialized_workspace_name: removed.materialized_workspace_name,
             });
         }
@@ -1194,45 +1185,46 @@ impl SessionStore {
         let removed = self.projects.remove(index);
         let was_active = self.active_project_id.as_deref() == Some(project_id);
         let materialized_workspace_names = removed
-            .sessions
+            .threads
             .iter()
             .filter_map(|session| session.materialized_workspace_name.clone())
             .collect::<Vec<_>>();
 
-        let next_session_id = if was_active {
+        let next_thread_id = if was_active {
             let next_index = index.saturating_sub(1).min(self.projects.len() - 1);
             let project = &mut self.projects[next_index];
             self.active_project_id = Some(project.id.clone());
-            let session_id = project
-                .active_session_id
+            let thread_id = project
+                .active_thread_id
                 .clone()
                 .or_else(|| {
                     project
-                        .sessions
+                        .threads
                         .iter()
                         .find(|session| !session.archived)
                         .map(|session| session.id.clone())
                 })
                 .unwrap_or_else(|| {
-                    let session = Session::new(project.id.clone(), "main".to_string(), None);
-                    let session_id = session.id.clone();
-                    project.sessions.push(session);
-                    session_id
+                    let session =
+                        WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
+                    let thread_id = session.id.clone();
+                    project.threads.push(session);
+                    thread_id
                 });
-            project.active_session_id = Some(session_id.clone());
-            Some(session_id)
+            project.active_thread_id = Some(thread_id.clone());
+            Some(thread_id)
         } else {
             None
         };
 
         Some(RemovedProject {
             was_active,
-            next_session_id,
+            next_thread_id,
             materialized_workspace_names,
         })
     }
 
-    fn toggle_project_sessions_collapsed(&mut self, project_id: &str) -> bool {
+    fn toggle_project_threads_collapsed(&mut self, project_id: &str) -> bool {
         let Some(project) = self
             .projects
             .iter_mut()
@@ -1240,15 +1232,15 @@ impl SessionStore {
         else {
             return false;
         };
-        project.sessions_collapsed = !project.sessions_collapsed;
+        project.threads_collapsed = !project.threads_collapsed;
         true
     }
 }
 
-impl Session {
+impl WorkspaceThread {
     fn new(project_id: ProjectId, name: String, workspace: Option<String>) -> Self {
         Self {
-            id: new_id("session"),
+            id: new_id("thread"),
             name,
             project_id,
             layout: None,
@@ -1266,8 +1258,8 @@ impl Session {
     fn new_initial(project_id: ProjectId, name: String, workspace: Option<String>) -> Self {
         let id = workspace
             .as_deref()
-            .map(|workspace| initial_session_id_for_workspace(&project_id, workspace))
-            .unwrap_or_else(|| new_id("session"));
+            .map(|workspace| initial_thread_id_for_workspace(&project_id, workspace))
+            .unwrap_or_else(|| new_id("thread"));
         Self {
             id,
             name,
@@ -1284,41 +1276,44 @@ impl Session {
         }
     }
 
-    fn work_status(&self) -> SessionWorkStatus {
+    fn work_status(&self) -> WorkspaceThreadWorkStatus {
         if self.work_needs_attention {
-            SessionWorkStatus::NeedsAttention
+            WorkspaceThreadWorkStatus::NeedsAttention
         } else if self.work_is_running {
-            SessionWorkStatus::Running
+            WorkspaceThreadWorkStatus::Running
         } else if self.work_finished_unseen {
-            SessionWorkStatus::FinishedUnseen
+            WorkspaceThreadWorkStatus::FinishedUnseen
         } else {
-            SessionWorkStatus::Idle
+            WorkspaceThreadWorkStatus::Idle
         }
     }
 
-    fn observe_work_status(&mut self, observed: SessionWorkStatus) -> SessionWorkChange {
+    fn observe_work_status(
+        &mut self,
+        observed: WorkspaceThreadWorkStatus,
+    ) -> WorkspaceThreadWorkChange {
         match observed {
-            SessionWorkStatus::Running => {
+            WorkspaceThreadWorkStatus::Running => {
                 let should_persist = self.work_finished_unseen;
                 let changed =
                     !self.work_is_running || self.work_needs_attention || self.work_finished_unseen;
                 self.work_is_running = true;
                 self.work_needs_attention = false;
                 self.work_finished_unseen = false;
-                SessionWorkChange {
+                WorkspaceThreadWorkChange {
                     changed,
                     should_persist,
                 }
             }
-            SessionWorkStatus::NeedsAttention => {
+            WorkspaceThreadWorkStatus::NeedsAttention => {
                 let changed = !self.work_needs_attention;
                 self.work_needs_attention = true;
-                SessionWorkChange {
+                WorkspaceThreadWorkChange {
                     changed,
                     should_persist: false,
                 }
             }
-            SessionWorkStatus::Idle | SessionWorkStatus::FinishedUnseen => {
+            WorkspaceThreadWorkStatus::Idle | WorkspaceThreadWorkStatus::FinishedUnseen => {
                 let was_running = self.work_is_running;
                 let had_attention = self.work_needs_attention;
                 let mut should_persist = false;
@@ -1328,7 +1323,7 @@ impl Session {
                 }
                 self.work_is_running = false;
                 self.work_needs_attention = false;
-                SessionWorkChange {
+                WorkspaceThreadWorkChange {
                     changed: was_running || had_attention,
                     should_persist,
                 }
@@ -1341,30 +1336,30 @@ fn valid_font_scale(font_scale: Option<f64>) -> Option<f64> {
     font_scale.filter(|scale| scale.is_finite() && *scale > 0.0)
 }
 
-fn persist_locked(store: &SessionStore) {
-    if let Err(err) = save_session_store(store) {
-        log::warn!("failed to save ThinkTerm session store: {err:#}");
+fn persist_locked(store: &WorkspaceThreadStore) {
+    if let Err(err) = save_workspace_thread_store(store) {
+        log::warn!("failed to save ThinkTerm thread store: {err:#}");
     }
 }
 
-fn schedule_session_store_persist() {
-    SESSION_STORE_PERSIST_DIRTY.store(true, Ordering::Release);
-    if SESSION_STORE_PERSIST_SCHEDULED.swap(true, Ordering::AcqRel) {
+fn schedule_workspace_thread_store_persist() {
+    THREAD_STORE_PERSIST_DIRTY.store(true, Ordering::Release);
+    if THREAD_STORE_PERSIST_SCHEDULED.swap(true, Ordering::AcqRel) {
         return;
     }
 
     std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_millis(50));
 
-        if SESSION_STORE_PERSIST_DIRTY.swap(false, Ordering::AcqRel) {
-            let store = SESSION_STORE.lock().clone();
+        if THREAD_STORE_PERSIST_DIRTY.swap(false, Ordering::AcqRel) {
+            let store = THREAD_STORE.lock().clone();
             persist_locked(&store);
             continue;
         }
 
-        SESSION_STORE_PERSIST_SCHEDULED.store(false, Ordering::Release);
-        if SESSION_STORE_PERSIST_DIRTY.load(Ordering::Acquire)
-            && !SESSION_STORE_PERSIST_SCHEDULED.swap(true, Ordering::AcqRel)
+        THREAD_STORE_PERSIST_SCHEDULED.store(false, Ordering::Release);
+        if THREAD_STORE_PERSIST_DIRTY.load(Ordering::Acquire)
+            && !THREAD_STORE_PERSIST_SCHEDULED.swap(true, Ordering::AcqRel)
         {
             continue;
         }
@@ -1376,7 +1371,7 @@ fn schedule_session_store_persist() {
 fn snapshot_window_layout<F>(
     window_id: MuxWindowId,
     pane_font_scale: &F,
-) -> Option<SessionLayoutSnapshot>
+) -> Option<WorkspaceThreadLayoutSnapshot>
 where
     F: Fn(PaneId) -> Option<f64>,
 {
@@ -1392,7 +1387,7 @@ where
             serde_json::to_value(tree).ok()
         })
         .collect::<Vec<_>>();
-    Some(SessionLayoutSnapshot {
+    Some(WorkspaceThreadLayoutSnapshot {
         active_tab,
         tabs,
         terminal_specs,
@@ -1400,7 +1395,7 @@ where
 }
 
 fn pane_font_scales_for_window(
-    layout: &SessionLayoutSnapshot,
+    layout: &WorkspaceThreadLayoutSnapshot,
     window_id: MuxWindowId,
 ) -> Option<HashMap<PaneId, Option<f64>>> {
     let mux = Mux::get();
@@ -1504,7 +1499,7 @@ fn collect_pane_entries<'a>(node: &'a PaneNode, entries: &mut Vec<&'a PaneEntry>
 async fn materialize_layout(
     mux: Arc<Mux>,
     workspace_name: String,
-    layout: SessionLayoutSnapshot,
+    layout: WorkspaceThreadLayoutSnapshot,
     initial_cwd: Option<String>,
     size: TerminalSize,
     term_config: Arc<dyn TerminalConfiguration>,
@@ -1518,7 +1513,7 @@ async fn materialize_layout(
     let mut spawned_tabs = 0usize;
     for tab_value in &layout.tabs {
         let node: PaneNode =
-            serde_json::from_value(tab_value.clone()).context("decode session tab layout")?;
+            serde_json::from_value(tab_value.clone()).context("decode thread tab layout")?;
         let first_entry = first_pane_entry(&node);
         let cwd = first_entry
             .and_then(|entry| working_dir_for_entry(entry, &terminal_specs))
@@ -1538,7 +1533,7 @@ async fn materialize_layout(
                 None,
             )
             .await
-            .context("spawn session tab")?;
+            .context("spawn thread tab")?;
         pane.set_config(Arc::clone(&term_config));
         window_id = Some(win_id);
         restore_node(
@@ -1768,7 +1763,7 @@ fn project_id_for_path(path: &Path) -> ProjectId {
     format!("project-{hash:x}")
 }
 
-fn initial_session_id_for_workspace(project_id: &str, workspace: &str) -> SessionId {
+fn initial_thread_id_for_workspace(project_id: &str, workspace: &str) -> WorkspaceThreadId {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in project_id
         .bytes()
@@ -1778,10 +1773,10 @@ fn initial_session_id_for_workspace(project_id: &str, workspace: &str) -> Sessio
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("session-{hash:x}")
+    format!("thread-{hash:x}")
 }
 
-fn scan_workspace_work_status(workspace: &str) -> SessionWorkStatus {
+fn scan_workspace_work_status(workspace: &str) -> WorkspaceThreadWorkStatus {
     let mux = Mux::get();
     let mut running = false;
     let mut needs_attention = false;
@@ -1813,11 +1808,11 @@ fn scan_workspace_work_status(workspace: &str) -> SessionWorkStatus {
     }
 
     if needs_attention {
-        SessionWorkStatus::NeedsAttention
+        WorkspaceThreadWorkStatus::NeedsAttention
     } else if running {
-        SessionWorkStatus::Running
+        WorkspaceThreadWorkStatus::Running
     } else {
-        SessionWorkStatus::Idle
+        WorkspaceThreadWorkStatus::Idle
     }
 }
 
@@ -1856,8 +1851,8 @@ fn normalize_project_path(path: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn workspace_name_for_session(project_id: &str, session_id: &str) -> String {
-    format!("thinkterm:{project_id}:{session_id}")
+fn workspace_name_for_thread(project_id: &str, thread_id: &str) -> String {
+    format!("thinkterm:{project_id}:{thread_id}")
 }
 
 fn new_id(prefix: &str) -> String {
@@ -1878,47 +1873,47 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn session_store_round_trip() {
+    fn workspace_thread_store_round_trip() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        let mut store = SessionStore::default();
+        let path = dir.path().join("workspace_threads.json");
+        let mut store = WorkspaceThreadStore::default();
         let project = Project {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![Session::new(
+            threads: vec![WorkspaceThread::new(
                 "project-1".to_string(),
                 "main".to_string(),
                 None,
             )],
-            active_session_id: None,
-            sessions_collapsed: false,
+            active_thread_id: None,
+            threads_collapsed: false,
         };
         store.active_project_id = Some(project.id.clone());
         store.projects.push(project);
-        save_session_store_to_path(&path, &store).unwrap();
-        let loaded = load_session_store_from_path(&path).unwrap();
+        save_workspace_thread_store_to_path(&path, &store).unwrap();
+        let loaded = load_workspace_thread_store_from_path(&path).unwrap();
         assert_eq!(loaded.projects[0].path, PathBuf::from("/tmp/thinkterm"));
-        assert_eq!(loaded.projects[0].sessions[0].name, "main");
+        assert_eq!(loaded.projects[0].threads[0].name, "main");
     }
 
     #[test]
     fn running_work_state_is_runtime_only() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        let mut store = SessionStore::default();
-        let mut session = Session::new("project-1".to_string(), "main".to_string(), None);
+        let path = dir.path().join("workspace_threads.json");
+        let mut store = WorkspaceThreadStore::default();
+        let mut session = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
         session.work_is_running = true;
         store.projects.push(Project {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![session],
-            active_session_id: None,
-            sessions_collapsed: false,
+            threads: vec![session],
+            active_thread_id: None,
+            threads_collapsed: false,
         });
 
-        save_session_store_to_path(&path, &store).unwrap();
+        save_workspace_thread_store_to_path(&path, &store).unwrap();
         let json = std::fs::read_to_string(&path).unwrap();
         assert!(!json.contains("work_is_running"));
 
@@ -1929,25 +1924,25 @@ mod tests {
         assert_ne!(legacy_json, json);
         std::fs::write(&path, legacy_json).unwrap();
 
-        let loaded = load_session_store_from_path(&path).unwrap();
-        assert!(!loaded.projects[0].sessions[0].work_is_running);
-        assert!(!loaded.projects[0].sessions[0].work_finished_unseen);
+        let loaded = load_workspace_thread_store_from_path(&path).unwrap();
+        assert!(!loaded.projects[0].threads[0].work_is_running);
+        assert!(!loaded.projects[0].threads[0].work_finished_unseen);
     }
 
     #[test]
     fn synthetic_current_project_matches_ensured_project_ids() {
         let workspace = "workspace-1";
         let synthetic = current_project_for_workspace(workspace);
-        let synthetic_session_id = synthetic.sessions[0].id.clone();
+        let synthetic_thread_id = synthetic.threads[0].id.clone();
 
-        let mut store = SessionStore::default();
+        let mut store = WorkspaceThreadStore::default();
         let (project_id, changed) = store.ensure_current_project(workspace);
 
         assert!(changed);
         assert_eq!(project_id, synthetic.id);
-        assert_eq!(store.projects[0].sessions[0].id, synthetic_session_id);
+        assert_eq!(store.projects[0].threads[0].id, synthetic_thread_id);
         assert_eq!(
-            store.projects[0].sessions[0]
+            store.projects[0].threads[0]
                 .materialized_workspace_name
                 .as_deref(),
             Some(workspace)
@@ -1956,8 +1951,8 @@ mod tests {
 
     #[test]
     fn workspace_work_observation_transitions_to_finished_unseen() {
-        let mut store = SessionStore::default();
-        let session = Session::new(
+        let mut store = WorkspaceThreadStore::default();
+        let session = WorkspaceThread::new(
             "project-1".to_string(),
             "main".to_string(),
             Some("workspace-1".to_string()),
@@ -1966,36 +1961,36 @@ mod tests {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![session],
-            active_session_id: None,
-            sessions_collapsed: false,
+            threads: vec![session],
+            active_thread_id: None,
+            threads_collapsed: false,
         });
 
         let change = store
-            .observe_session_work_for_workspace("workspace-1", SessionWorkStatus::Running)
+            .observe_thread_work_for_workspace("workspace-1", WorkspaceThreadWorkStatus::Running)
             .unwrap();
         assert!(change.changed);
         assert!(!change.should_persist);
         assert_eq!(
-            store.projects[0].sessions[0].work_status(),
-            SessionWorkStatus::Running
+            store.projects[0].threads[0].work_status(),
+            WorkspaceThreadWorkStatus::Running
         );
 
         let change = store
-            .observe_session_work_for_workspace("workspace-1", SessionWorkStatus::Idle)
+            .observe_thread_work_for_workspace("workspace-1", WorkspaceThreadWorkStatus::Idle)
             .unwrap();
         assert!(change.changed);
         assert!(change.should_persist);
         assert_eq!(
-            store.projects[0].sessions[0].work_status(),
-            SessionWorkStatus::FinishedUnseen
+            store.projects[0].threads[0].work_status(),
+            WorkspaceThreadWorkStatus::FinishedUnseen
         );
     }
 
     #[test]
     fn acknowledged_finished_work_persists_but_runtime_running_state_does_not() {
-        let mut store = SessionStore::default();
-        let mut session = Session::new(
+        let mut store = WorkspaceThreadStore::default();
+        let mut session = WorkspaceThread::new(
             "project-1".to_string(),
             "main".to_string(),
             Some("workspace-1".to_string()),
@@ -2005,45 +2000,45 @@ mod tests {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![session],
-            active_session_id: None,
-            sessions_collapsed: false,
+            threads: vec![session],
+            active_thread_id: None,
+            threads_collapsed: false,
         });
 
-        let change = store.acknowledge_session_work_for_workspace("workspace-1");
+        let change = store.acknowledge_thread_work_for_workspace("workspace-1");
         assert!(change.changed);
         assert!(change.should_persist);
-        assert!(!store.projects[0].sessions[0].work_finished_unseen);
+        assert!(!store.projects[0].threads[0].work_finished_unseen);
 
-        store.projects[0].sessions[0].work_is_running = true;
-        let change = store.acknowledge_session_work_for_workspace("workspace-1");
+        store.projects[0].threads[0].work_is_running = true;
+        let change = store.acknowledge_thread_work_for_workspace("workspace-1");
         assert!(change.changed);
         assert!(!change.should_persist);
-        assert!(!store.projects[0].sessions[0].work_is_running);
+        assert!(!store.projects[0].threads[0].work_is_running);
     }
 
     #[test]
-    fn inactive_session_activation_materializes_once() {
-        let mut store = SessionStore::default();
+    fn inactive_thread_activation_materializes_once() {
+        let mut store = WorkspaceThreadStore::default();
         let project = Project {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![Session::new(
+            threads: vec![WorkspaceThread::new(
                 "project-1".to_string(),
                 "main".to_string(),
                 None,
             )],
-            active_session_id: None,
-            sessions_collapsed: false,
+            active_thread_id: None,
+            threads_collapsed: false,
         };
-        let session_id = project.sessions[0].id.clone();
+        let thread_id = project.threads[0].id.clone();
         store.projects.push(project);
 
-        let plan = store.activate_session_record(&session_id, &[]).unwrap();
+        let plan = store.activate_thread_record(&thread_id, &[]).unwrap();
         assert!(plan.needs_materialize);
         let plan = store
-            .activate_session_record(&session_id, &[plan.workspace_name.clone()])
+            .activate_thread_record(&thread_id, &[plan.workspace_name.clone()])
             .unwrap();
         assert!(!plan.needs_materialize);
     }
@@ -2051,59 +2046,59 @@ mod tests {
     #[test]
     fn created_project_gets_own_workspace_and_cwd() {
         let dir = tempdir().unwrap();
-        let mut store = SessionStore::default();
+        let mut store = WorkspaceThreadStore::default();
 
-        let session_id = store.create_project_from_path(dir.path().to_path_buf());
+        let thread_id = store.create_project_from_path(dir.path().to_path_buf());
         let project_id = store.active_project_id.clone().unwrap();
-        let workspace_name = workspace_name_for_session(&project_id, &session_id);
+        let workspace_name = workspace_name_for_thread(&project_id, &thread_id);
 
         assert_eq!(
             store.project_id_for_workspace(&workspace_name),
             Some(project_id.clone())
         );
 
-        let plan = store.activate_session_record(&session_id, &[]).unwrap();
+        let plan = store.activate_thread_record(&thread_id, &[]).unwrap();
         assert!(plan.needs_materialize);
         assert_eq!(plan.project_path, dir.path());
         assert_eq!(plan.workspace_name, workspace_name);
     }
 
     #[test]
-    fn duplicate_project_path_reuses_existing_session() {
+    fn duplicate_project_path_reuses_existing_thread() {
         let dir = tempdir().unwrap();
-        let mut store = SessionStore::default();
+        let mut store = WorkspaceThreadStore::default();
 
-        let first_session_id = store.create_project_from_path(dir.path().to_path_buf());
-        let second_session_id = store.create_project_from_path(dir.path().to_path_buf());
+        let first_thread_id = store.create_project_from_path(dir.path().to_path_buf());
+        let second_thread_id = store.create_project_from_path(dir.path().to_path_buf());
 
-        assert_eq!(second_session_id, first_session_id);
+        assert_eq!(second_thread_id, first_thread_id);
         assert_eq!(store.projects.len(), 1);
-        assert_eq!(store.projects[0].sessions.len(), 1);
+        assert_eq!(store.projects[0].threads.len(), 1);
     }
 
     #[test]
     fn duplicate_project_path_reuses_stored_project_id() {
         let dir = tempdir().unwrap();
-        let mut store = SessionStore::default();
+        let mut store = WorkspaceThreadStore::default();
 
         let project = Project {
             id: "stored-project-id".to_string(),
             name: "existing".to_string(),
             path: dir.path().to_path_buf(),
-            sessions: vec![Session::new(
+            threads: vec![WorkspaceThread::new(
                 "stored-project-id".to_string(),
                 "main".to_string(),
                 None,
             )],
-            active_session_id: None,
-            sessions_collapsed: false,
+            active_thread_id: None,
+            threads_collapsed: false,
         };
-        let session_id = project.sessions[0].id.clone();
+        let thread_id = project.threads[0].id.clone();
         store.projects.push(project);
 
-        let reused_session_id = store.create_project_from_path(dir.path().to_path_buf());
+        let reused_thread_id = store.create_project_from_path(dir.path().to_path_buf());
 
-        assert_eq!(reused_session_id, session_id);
+        assert_eq!(reused_thread_id, thread_id);
         assert_eq!(
             store.active_project_id.as_deref(),
             Some("stored-project-id")
@@ -2112,89 +2107,89 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_layout_attaches_to_materialized_session() {
-        let mut store = SessionStore::default();
-        let mut session = Session::new(
+    fn snapshot_layout_attaches_to_materialized_thread() {
+        let mut store = WorkspaceThreadStore::default();
+        let mut session = WorkspaceThread::new(
             "project-1".to_string(),
             "main".to_string(),
             Some("ws".to_string()),
         );
-        let session_id = session.id.clone();
+        let thread_id = session.id.clone();
         let project = Project {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![session.clone()],
-            active_session_id: Some(session_id),
-            sessions_collapsed: false,
+            threads: vec![session.clone()],
+            active_thread_id: Some(thread_id),
+            threads_collapsed: false,
         };
         store.projects.push(project);
         store.snapshot_workspace_layout(
             "ws",
-            SessionLayoutSnapshot {
+            WorkspaceThreadLayoutSnapshot {
                 active_tab: 0,
                 tabs: vec![serde_json::json!({"kind": "test"})],
                 terminal_specs: vec![],
             },
         );
-        session = store.projects[0].sessions[0].clone();
+        session = store.projects[0].threads[0].clone();
         assert_eq!(session.layout.unwrap().tabs.len(), 1);
     }
 
     #[test]
-    fn view_marks_only_global_active_project_session_active() {
-        let mut store = SessionStore::default();
-        let first = Session::new("project-1".to_string(), "main".to_string(), None);
-        let second = Session::new("project-2".to_string(), "current".to_string(), None);
+    fn view_marks_only_global_active_workspace_thread_active() {
+        let mut store = WorkspaceThreadStore::default();
+        let first = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
+        let second = WorkspaceThread::new("project-2".to_string(), "current".to_string(), None);
         let first_id = first.id.clone();
         let second_id = second.id.clone();
         store.projects.push(Project {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![first],
-            active_session_id: Some(first_id),
-            sessions_collapsed: false,
+            threads: vec![first],
+            active_thread_id: Some(first_id),
+            threads_collapsed: false,
         });
         store.projects.push(Project {
             id: "project-2".to_string(),
             name: "agent_dock".to_string(),
             path: PathBuf::from("/tmp/agent_dock"),
-            sessions: vec![second],
-            active_session_id: Some(second_id),
-            sessions_collapsed: false,
+            threads: vec![second],
+            active_thread_id: Some(second_id),
+            threads_collapsed: false,
         });
         store.active_project_id = Some("project-2".to_string());
 
         let view = store.view_for_project("project-2", &[]);
         assert!(!view.projects[0].is_active);
-        assert!(!view.projects[0].sessions[0].is_active);
+        assert!(!view.projects[0].threads[0].is_active);
         assert!(view.projects[1].is_active);
-        assert!(view.projects[1].sessions[0].is_active);
+        assert!(view.projects[1].threads[0].is_active);
     }
 
     #[test]
     fn project_menu_metadata_actions_update_store() {
-        let mut store = SessionStore::default();
-        let first = Session::new("project-1".to_string(), "main".to_string(), None);
-        let second = Session::new("project-2".to_string(), "current".to_string(), None);
+        let mut store = WorkspaceThreadStore::default();
+        let first = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
+        let second = WorkspaceThread::new("project-2".to_string(), "current".to_string(), None);
         let first_id = first.id.clone();
         let second_id = second.id.clone();
         store.projects.push(Project {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![first],
-            active_session_id: Some(first_id),
-            sessions_collapsed: false,
+            threads: vec![first],
+            active_thread_id: Some(first_id),
+            threads_collapsed: false,
         });
         store.projects.push(Project {
             id: "project-2".to_string(),
             name: "agent_dock".to_string(),
             path: PathBuf::from("/tmp/agent_dock"),
-            sessions: vec![second],
-            active_session_id: Some(second_id.clone()),
-            sessions_collapsed: false,
+            threads: vec![second],
+            active_thread_id: Some(second_id.clone()),
+            threads_collapsed: false,
         });
         store.active_project_id = Some("project-2".to_string());
 
@@ -2204,8 +2199,8 @@ mod tests {
         let removed = store.remove_project("project-2").unwrap();
         assert!(removed.was_active);
         assert_eq!(
-            removed.next_session_id,
-            Some(store.projects[0].sessions[0].id.clone())
+            removed.next_thread_id,
+            Some(store.projects[0].threads[0].id.clone())
         );
         assert_eq!(store.projects.len(), 1);
         assert_eq!(store.active_project_id.as_deref(), Some("project-1"));
@@ -2213,11 +2208,11 @@ mod tests {
     }
 
     #[test]
-    fn session_menu_metadata_actions_update_store() {
-        let mut store = SessionStore::default();
-        let mut first = Session::new("project-1".to_string(), "main".to_string(), None);
-        let second = Session::new("project-1".to_string(), "Session 2".to_string(), None);
-        let third = Session::new("project-1".to_string(), "Session 3".to_string(), None);
+    fn thread_menu_metadata_actions_update_store() {
+        let mut store = WorkspaceThreadStore::default();
+        let mut first = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
+        let second = WorkspaceThread::new("project-1".to_string(), "Thread 2".to_string(), None);
+        let third = WorkspaceThread::new("project-1".to_string(), "Thread 3".to_string(), None);
         let first_id = first.id.clone();
         let second_id = second.id.clone();
         let third_id = third.id.clone();
@@ -2226,19 +2221,19 @@ mod tests {
             id: "project-1".to_string(),
             name: "thinkterm".to_string(),
             path: PathBuf::from("/tmp/thinkterm"),
-            sessions: vec![first, second, third],
-            active_session_id: Some(first_id.clone()),
-            sessions_collapsed: false,
+            threads: vec![first, second, third],
+            active_thread_id: Some(first_id.clone()),
+            threads_collapsed: false,
         });
 
-        assert!(store.rename_session(&second_id, "Review".to_string()));
-        assert!(store.toggle_session_pinned(&second_id));
-        assert!(store.mark_session_unread(&second_id));
-        assert!(store.archive_session(&second_id));
-        assert!(!store.archive_session(&first_id));
+        assert!(store.rename_thread(&second_id, "Review".to_string()));
+        assert!(store.toggle_thread_pinned(&second_id));
+        assert!(store.mark_thread_unread(&second_id));
+        assert!(store.archive_thread(&second_id));
+        assert!(!store.archive_thread(&first_id));
         assert_eq!(
             store
-                .delete_session(&third_id)
+                .delete_thread(&third_id)
                 .unwrap()
                 .materialized_workspace_name,
             None
@@ -2246,7 +2241,7 @@ mod tests {
 
         let project = &store.projects[0];
         let archived = project
-            .sessions
+            .threads
             .iter()
             .find(|session| session.id == second_id)
             .unwrap();
@@ -2256,7 +2251,7 @@ mod tests {
         assert!(archived.archived);
 
         let view = store.view_for_project("project-1", &[]);
-        assert_eq!(view.projects[0].sessions.len(), 1);
-        assert_eq!(view.projects[0].sessions[0].id, first_id);
+        assert_eq!(view.projects[0].threads.len(), 1);
+        assert_eq!(view.projects[0].threads[0].id, first_id);
     }
 }

@@ -218,12 +218,12 @@ pub enum UIItemType {
         action: PaneNavAction,
     },
     ProjectNew,
-    ProjectToggleSessions(String),
+    ProjectToggleThreads(String),
     Project(String),
-    ProjectSession(String),
-    ProjectSessionPin(String),
-    ProjectSessionDelete(String),
-    ProjectSessionNew(String),
+    WorkspaceThread(String),
+    WorkspaceThreadPin(String),
+    WorkspaceThreadDelete(String),
+    WorkspaceThreadNew(String),
     WorkspaceSidebarToggle,
     WorkspaceSidebarScrollTrack,
     WorkspaceSidebarScrollThumb,
@@ -264,7 +264,7 @@ enum InlineTabRenameTarget {
     WindowTab(TabId),
     PaneTab(PaneId),
     Project(String),
-    ProjectSession(String),
+    WorkspaceThread(String),
 }
 
 #[derive(Clone, Debug)]
@@ -1270,9 +1270,9 @@ impl TermWindow {
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
             myself.apply_native_terminal_settings();
-            myself.apply_workspace_session_font_scales();
+            myself.apply_workspace_thread_font_scales();
             myself.load_os_parameters();
-            myself.sync_current_project_session();
+            myself.sync_current_workspace_thread();
             window.show();
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
@@ -1596,7 +1596,7 @@ impl TermWindow {
                     alert: Alert::SetUserVar { name, value },
                     pane_id,
                 } => {
-                    self.refresh_session_work_for_pane(pane_id);
+                    self.refresh_thread_work_for_pane(pane_id);
                     self.emit_user_var_event(pane_id, name, value);
                 }
                 MuxNotification::WindowTitleChanged { .. }
@@ -1614,7 +1614,7 @@ impl TermWindow {
                         | Alert::Progress(_),
                     pane_id,
                 } => {
-                    self.refresh_session_work_for_pane(pane_id);
+                    self.refresh_thread_work_for_pane(pane_id);
                     self.update_title();
                 }
                 MuxNotification::Alert {
@@ -1702,7 +1702,7 @@ impl TermWindow {
                 }
                 MuxNotification::PaneFocused(pane_id) => {
                     // Also handled by clientpane
-                    self.refresh_session_work_for_pane(pane_id);
+                    self.refresh_thread_work_for_pane(pane_id);
                     self.update_title_post_status();
                 }
                 MuxNotification::TabResized(_) => {
@@ -1713,27 +1713,27 @@ impl TermWindow {
                     self.update_title_post_status();
                 }
                 MuxNotification::PaneAdded(pane_id) => {
-                    self.refresh_session_work_for_pane(pane_id);
+                    self.refresh_thread_work_for_pane(pane_id);
                 }
                 MuxNotification::PaneRemoved(_) => {
-                    self.refresh_all_session_work();
+                    self.refresh_all_thread_work();
                 }
                 MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::WindowCreated(_) => {
-                    self.sync_current_project_session();
+                    self.sync_current_workspace_thread();
                 }
                 MuxNotification::Empty => {}
             },
             TermWindowNotif::EmitStatusUpdate => {
                 self.emit_status_event();
-                self.refresh_all_session_work();
+                self.refresh_all_thread_work();
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
-                match crate::project_sessions::create_project_from_path(path.as_ref()) {
-                    Ok(session_id) => self.activate_project_session(session_id, window),
+                match crate::workspace_threads::create_project_from_path(path.as_ref()) {
+                    Ok(thread_id) => self.activate_workspace_thread(thread_id, window),
                     Err(err) => log::error!("failed to create ThinkTerm project: {err:#}"),
                 }
             }
@@ -1756,7 +1756,7 @@ impl TermWindow {
 
                 self.clear_all_overlays();
                 self.current_highlight.take();
-                self.apply_workspace_session_font_scales();
+                self.apply_workspace_thread_font_scales();
                 self.invalidate_fancy_tab_bar();
                 self.invalidate_modal();
 
@@ -1766,7 +1766,7 @@ impl TermWindow {
                         tab.resize(self.terminal_size);
                     }
                 };
-                self.sync_current_project_session();
+                self.sync_current_workspace_thread();
                 self.update_title();
                 window.invalidate();
             }
@@ -2011,21 +2011,21 @@ impl TermWindow {
             .map(|window| window.get_workspace().to_string())
     }
 
-    fn sync_current_project_session(&mut self) {
+    fn sync_current_workspace_thread(&mut self) {
         let Some(workspace) = self.current_mux_workspace() else {
             return;
         };
-        self.invalidate_window_if(crate::project_sessions::sync_current_project(&workspace));
+        self.invalidate_window_if(crate::workspace_threads::sync_current_project(&workspace));
     }
 
-    fn refresh_session_work_for_pane(&mut self, pane_id: PaneId) {
-        self.invalidate_window_if(crate::project_sessions::refresh_session_work_for_pane(
+    fn refresh_thread_work_for_pane(&mut self, pane_id: PaneId) {
+        self.invalidate_window_if(crate::workspace_threads::refresh_thread_work_for_pane(
             pane_id,
         ));
     }
 
-    fn refresh_all_session_work(&mut self) {
-        self.invalidate_window_if(crate::project_sessions::refresh_all_session_work());
+    fn refresh_all_thread_work(&mut self) {
+        self.invalidate_window_if(crate::workspace_threads::refresh_all_thread_work());
     }
 
     fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
@@ -2289,7 +2289,7 @@ impl TermWindow {
             self.load_os_parameters();
             self.apply_scale_change(&dimensions, self.fonts.get_font_scale());
             self.apply_dimensions(&dimensions, None, &window);
-            self.apply_workspace_session_font_scales();
+            self.apply_workspace_thread_font_scales();
             window.config_did_change(&config);
             window.invalidate();
         }
@@ -2977,7 +2977,7 @@ impl TermWindow {
     }
 
     fn prompt_rename_project(&mut self, project_id: String) {
-        let initial_title = crate::project_sessions::project_name(&project_id).unwrap_or_default();
+        let initial_title = crate::workspace_threads::project_name(&project_id).unwrap_or_default();
         self.inline_tab_rename = Some(InlineTabRename::new(
             InlineTabRenameTarget::Project(project_id),
             initial_title,
@@ -2985,10 +2985,10 @@ impl TermWindow {
         self.update_title_impl();
     }
 
-    fn prompt_rename_project_session(&mut self, session_id: String) {
-        let initial_title = crate::project_sessions::session_name(&session_id).unwrap_or_default();
+    fn prompt_rename_workspace_thread(&mut self, thread_id: String) {
+        let initial_title = crate::workspace_threads::thread_name(&thread_id).unwrap_or_default();
         self.inline_tab_rename = Some(InlineTabRename::new(
-            InlineTabRenameTarget::ProjectSession(session_id),
+            InlineTabRenameTarget::WorkspaceThread(thread_id),
             initial_title,
         ));
         self.update_title_impl();
@@ -3027,10 +3027,10 @@ impl TermWindow {
                     }
                 }
                 InlineTabRenameTarget::Project(project_id) => {
-                    crate::project_sessions::rename_project(&project_id, title);
+                    crate::workspace_threads::rename_project(&project_id, title);
                 }
-                InlineTabRenameTarget::ProjectSession(session_id) => {
-                    crate::project_sessions::rename_session(&session_id, title);
+                InlineTabRenameTarget::WorkspaceThread(thread_id) => {
+                    crate::workspace_threads::rename_thread(&thread_id, title);
                 }
             }
         }
@@ -3052,7 +3052,7 @@ impl TermWindow {
                 InlineTabRenameTarget::WindowTab(tab_id) => Some(tab_id),
                 InlineTabRenameTarget::PaneTab(_)
                 | InlineTabRenameTarget::Project(_)
-                | InlineTabRenameTarget::ProjectSession(_) => None,
+                | InlineTabRenameTarget::WorkspaceThread(_) => None,
             })
     }
 
@@ -3086,17 +3086,17 @@ impl TermWindow {
             .unwrap_or_else(|| name.to_string())
     }
 
-    pub fn sidebar_session_title(&self, session_id: &str, name: &str) -> String {
+    pub fn sidebar_thread_title(&self, thread_id: &str, name: &str) -> String {
         self.inline_tab_rename
             .as_ref()
-            .filter(|rename| matches!(&rename.target, InlineTabRenameTarget::ProjectSession(id) if id == session_id))
+            .filter(|rename| matches!(&rename.target, InlineTabRenameTarget::WorkspaceThread(id) if id == thread_id))
             .map(|rename| rename.display_text())
             .unwrap_or_else(|| name.to_string())
     }
 
-    pub fn is_renaming_sidebar_session(&self, session_id: &str) -> bool {
+    pub fn is_renaming_sidebar_thread(&self, thread_id: &str) -> bool {
         self.inline_tab_rename.as_ref().is_some_and(
-            |rename| matches!(&rename.target, InlineTabRenameTarget::ProjectSession(id) if id == session_id),
+            |rename| matches!(&rename.target, InlineTabRenameTarget::WorkspaceThread(id) if id == thread_id),
         )
     }
 
@@ -3578,28 +3578,28 @@ impl TermWindow {
             PromptRenameTab => self.prompt_rename_current_tab(),
             PromptRenamePaneTab(pane_id) => self.prompt_rename_pane_tab(*pane_id),
             PromptRenameProject(project_id) => self.prompt_rename_project(project_id.clone()),
-            PromptRenameProjectSession(session_id) => {
-                self.prompt_rename_project_session(session_id.clone())
+            PromptRenameWorkspaceThread(thread_id) => {
+                self.prompt_rename_workspace_thread(thread_id.clone())
             }
-            CreateProjectSession(project_id) => {
-                let session_id = crate::project_sessions::create_session(project_id, None);
+            CreateWorkspaceThread(project_id) => {
+                let thread_id = crate::workspace_threads::create_thread(project_id, None);
                 if let Some(window) = window.as_ref() {
-                    self.activate_project_session(session_id, window);
+                    self.activate_workspace_thread(thread_id, window);
                 }
             }
-            ToggleProjectSessionsCollapsed(project_id) => {
-                crate::project_sessions::toggle_project_sessions_collapsed(project_id);
+            ToggleWorkspaceThreadsCollapsed(project_id) => {
+                crate::workspace_threads::toggle_project_threads_collapsed(project_id);
                 if let Some(window) = window.as_ref() {
                     window.invalidate();
                 }
             }
             RemoveProject(project_id) => {
-                if let Some(removed) = crate::project_sessions::remove_project(project_id) {
+                if let Some(removed) = crate::workspace_threads::remove_project(project_id) {
                     if removed.was_active {
-                        if let (Some(next_session_id), Some(window)) =
-                            (removed.next_session_id, window.as_ref())
+                        if let (Some(next_thread_id), Some(window)) =
+                            (removed.next_thread_id, window.as_ref())
                         {
-                            self.activate_project_session(next_session_id, window);
+                            self.activate_workspace_thread(next_thread_id, window);
                         }
                     }
                     let mux = Mux::get();
@@ -3613,25 +3613,25 @@ impl TermWindow {
                     }
                 }
             }
-            ToggleProjectSessionPinned(session_id) => {
-                crate::project_sessions::toggle_session_pinned(session_id);
+            ToggleWorkspaceThreadPinned(thread_id) => {
+                crate::workspace_threads::toggle_thread_pinned(thread_id);
                 if let Some(window) = window.as_ref() {
                     window.invalidate();
                 }
             }
-            ArchiveProjectSession(session_id) => {
-                crate::project_sessions::archive_session(session_id);
+            ArchiveWorkspaceThread(thread_id) => {
+                crate::workspace_threads::archive_thread(thread_id);
                 if let Some(window) = window.as_ref() {
                     window.invalidate();
                 }
             }
-            DeleteProjectSession(session_id) => {
-                if let Some(deleted) = crate::project_sessions::delete_session(session_id) {
+            DeleteWorkspaceThread(thread_id) => {
+                if let Some(deleted) = crate::workspace_threads::delete_thread(thread_id) {
                     if deleted.was_active {
-                        if let (Some(next_session_id), Some(window)) =
-                            (deleted.next_session_id, window.as_ref())
+                        if let (Some(next_thread_id), Some(window)) =
+                            (deleted.next_thread_id, window.as_ref())
                         {
-                            self.activate_project_session(next_session_id, window);
+                            self.activate_workspace_thread(next_thread_id, window);
                         }
                     } else if let Some(workspace) = deleted.materialized_workspace_name {
                         let mux = Mux::get();
@@ -3644,8 +3644,8 @@ impl TermWindow {
                     }
                 }
             }
-            MarkProjectSessionUnread(session_id) => {
-                crate::project_sessions::mark_session_unread(session_id);
+            MarkWorkspaceThreadUnread(thread_id) => {
+                crate::workspace_threads::mark_thread_unread(thread_id);
                 if let Some(window) = window.as_ref() {
                     window.invalidate();
                 }

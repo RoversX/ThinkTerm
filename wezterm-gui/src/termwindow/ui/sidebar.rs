@@ -1,5 +1,4 @@
 use crate::customglyph::BlockKey;
-use crate::project_sessions;
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
@@ -18,6 +17,7 @@ use crate::termwindow::ui::tokens::{
 use crate::termwindow::{UIItem, UIItemType};
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
+use crate::workspace_threads;
 use anyhow::Context;
 use finl_unicode::grapheme_clusters::Graphemes;
 use mux::Mux;
@@ -88,20 +88,20 @@ fn centered_inner_start(origin: usize, outer: usize, inner: usize) -> usize {
 }
 
 impl crate::TermWindow {
-    pub(crate) fn acknowledge_active_workspace_session_work(&self) -> bool {
+    pub(crate) fn acknowledge_active_workspace_thread_work(&self) -> bool {
         let mux = Mux::get();
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return false;
         };
-        project_sessions::acknowledge_session_work_for_workspace(window.get_workspace())
+        workspace_threads::acknowledge_thread_work_for_workspace(window.get_workspace())
     }
 
-    pub(crate) fn acknowledge_active_workspace_session_work_deferred(&self) -> bool {
+    pub(crate) fn acknowledge_active_workspace_thread_work_deferred(&self) -> bool {
         let mux = Mux::get();
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return false;
         };
-        project_sessions::acknowledge_session_work_for_workspace_deferred(window.get_workspace())
+        workspace_threads::acknowledge_thread_work_for_workspace_deferred(window.get_workspace())
     }
 
     pub fn workspace_sidebar_width(&self) -> usize {
@@ -185,30 +185,30 @@ impl crate::TermWindow {
     }
 
     fn workspace_sidebar_list_height(
-        view: &project_sessions::ProjectSessionView,
+        view: &workspace_threads::WorkspaceThreadsView,
         row_height: usize,
         row_gap: usize,
     ) -> usize {
         let mut height = 0usize;
-        if !view.pinned_sessions.is_empty() {
+        if !view.pinned_threads.is_empty() {
             height = height.saturating_add(row_height + row_gap);
             height = height.saturating_add(
-                view.pinned_sessions
+                view.pinned_threads
                     .len()
                     .saturating_mul(row_height + row_gap),
             );
         }
         if !view.projects.is_empty() {
-            if !view.pinned_sessions.is_empty() {
+            if !view.pinned_threads.is_empty() {
                 height = height.saturating_add(WORKSPACE_SECTION_LABEL_GAP);
             }
             height = height.saturating_add(row_height + row_gap);
         }
         for project in &view.projects {
             height = height.saturating_add(row_height + row_gap);
-            if !project.sessions_collapsed {
+            if !project.threads_collapsed {
                 height = height
-                    .saturating_add(project.sessions.len().saturating_mul(row_height + row_gap));
+                    .saturating_add(project.threads.len().saturating_mul(row_height + row_gap));
             }
         }
         height = height.saturating_add(
@@ -221,7 +221,7 @@ impl crate::TermWindow {
     }
 
     fn workspace_sidebar_scroll_height(
-        view: &project_sessions::ProjectSessionView,
+        view: &workspace_threads::WorkspaceThreadsView,
         row_height: usize,
         row_gap: usize,
         viewport_height: usize,
@@ -234,23 +234,25 @@ impl crate::TermWindow {
         }
     }
 
-    fn sidebar_session_status_kind(
+    fn sidebar_thread_status_kind(
         &self,
-        session: &project_sessions::SessionView,
+        session: &workspace_threads::WorkspaceThreadView,
     ) -> Option<UiStatusKind> {
         match session.work_status {
-            project_sessions::SessionWorkStatus::Running => Some(UiStatusKind::Running),
-            project_sessions::SessionWorkStatus::NeedsAttention => {
+            workspace_threads::WorkspaceThreadWorkStatus::Running => Some(UiStatusKind::Running),
+            workspace_threads::WorkspaceThreadWorkStatus::NeedsAttention => {
                 Some(UiStatusKind::NeedsAttention)
             }
-            project_sessions::SessionWorkStatus::FinishedUnseen => Some(UiStatusKind::Done),
-            project_sessions::SessionWorkStatus::Idle => None,
+            workspace_threads::WorkspaceThreadWorkStatus::FinishedUnseen => {
+                Some(UiStatusKind::Done)
+            }
+            workspace_threads::WorkspaceThreadWorkStatus::Idle => None,
         }
     }
 
-    fn sidebar_session_dot_color(
+    fn sidebar_thread_dot_color(
         &self,
-        session: &project_sessions::SessionView,
+        session: &workspace_threads::WorkspaceThreadView,
         chrome: &UiPalette,
         foreground: LinearRgba,
     ) -> LinearRgba {
@@ -267,9 +269,9 @@ impl crate::TermWindow {
         }
     }
 
-    fn sidebar_session_status_color(
+    fn sidebar_thread_status_color(
         &self,
-        session: &project_sessions::SessionView,
+        session: &workspace_threads::WorkspaceThreadView,
         status: UiStatusKind,
         chrome: &UiPalette,
         foreground: LinearRgba,
@@ -279,14 +281,14 @@ impl crate::TermWindow {
         } else if session.is_active {
             foreground
         } else {
-            self.sidebar_session_dot_color(session, chrome, foreground)
+            self.sidebar_thread_dot_color(session, chrome, foreground)
         }
     }
 
-    fn paint_sidebar_session_status(
+    fn paint_sidebar_thread_status(
         &self,
         layers: &mut TripleLayerQuadAllocator,
-        session: &project_sessions::SessionView,
+        session: &workspace_threads::WorkspaceThreadView,
         x: usize,
         y: usize,
         row_height: usize,
@@ -294,7 +296,7 @@ impl crate::TermWindow {
         foreground: LinearRgba,
     ) -> anyhow::Result<()> {
         let icon_y = y + ((row_height.saturating_sub(SESSION_STATUS_ICON_SIZE)) / 2);
-        if let Some(status) = self.sidebar_session_status_kind(session) {
+        if let Some(status) = self.sidebar_thread_status_kind(session) {
             let status_size = if matches!(status, UiStatusKind::Running | UiStatusKind::Done) {
                 SESSION_STATUS_ACTIVE_ICON_SIZE
             } else {
@@ -307,7 +309,7 @@ impl crate::TermWindow {
                 centered_inner_start(x, SESSION_STATUS_ICON_SIZE, status_size),
                 centered_inner_start(y, row_height, status_size),
                 status_size,
-                self.sidebar_session_status_color(session, status, chrome, foreground),
+                self.sidebar_thread_status_color(session, status, chrome, foreground),
             );
         }
 
@@ -323,10 +325,10 @@ impl crate::TermWindow {
                 SESSION_STATUS_DOT_SIZE as f32,
                 SESSION_STATUS_DOT_SIZE as f32,
             ),
-            self.sidebar_session_dot_color(session, chrome, foreground),
+            self.sidebar_thread_dot_color(session, chrome, foreground),
             SESSION_STATUS_DOT_SIZE as f32 / 2.0,
         )
-        .context("sidebar session status dot")
+        .context("sidebar thread status dot")
     }
 
     fn workspace_sidebar_content_top(&self, panel_y: usize) -> usize {
@@ -391,7 +393,7 @@ impl crate::TermWindow {
         let mux = Mux::get();
         let active_workspace = mux.active_workspace();
         let workspaces = mux.iter_workspaces();
-        let view = project_sessions::view_for_current_project(&active_workspace, &workspaces);
+        let view = workspace_threads::view_for_current_project(&active_workspace, &workspaces);
         let row_gap = SIDEBAR_ROW_GAP;
         let total_height =
             Self::workspace_sidebar_scroll_height(&view, row_height, row_gap, viewport_height);
@@ -450,7 +452,7 @@ impl crate::TermWindow {
         let mux = Mux::get();
         let active_workspace = mux.active_workspace();
         let workspaces = mux.iter_workspaces();
-        let view = project_sessions::view_for_current_project(&active_workspace, &workspaces);
+        let view = workspace_threads::view_for_current_project(&active_workspace, &workspaces);
         let row_gap = SIDEBAR_ROW_GAP;
         let total_height =
             Self::workspace_sidebar_scroll_height(&view, row_height, row_gap, viewport_height);
@@ -563,7 +565,7 @@ impl crate::TermWindow {
         let mux = Mux::get();
         let active_workspace = mux.active_workspace();
         let workspaces = mux.iter_workspaces();
-        let view = project_sessions::view_for_current_project(&active_workspace, &workspaces);
+        let view = workspace_threads::view_for_current_project(&active_workspace, &workspaces);
 
         let header_icon_size = icon_size.min(32);
         let button_size = (header_icon_size + 8).clamp(32, 40);
@@ -682,7 +684,7 @@ impl crate::TermWindow {
             },
             SIDEBAR_ROW_RADIUS + 4.0,
         )
-        .context("sidebar add session button")?;
+        .context("sidebar add thread button")?;
         self.fill_rounded_rectangle(
             layers,
             1,
@@ -706,7 +708,7 @@ impl crate::TermWindow {
                 y: top_action_y,
                 width: top_action_width,
                 height: top_action_height,
-                item_type: UIItemType::ProjectSessionNew(project_id),
+                item_type: UIItemType::WorkspaceThreadNew(project_id),
             });
         }
         self.ui_items.push(UIItem {
@@ -720,7 +722,7 @@ impl crate::TermWindow {
         let top_action_text_max_width = top_action_width
             .saturating_sub(top_action_icon_size + top_action_gap + SIDEBAR_INSET * 2);
         let top_action_label =
-            self.ellipsize_sidebar_text(&ui_font, "New Session", top_action_text_max_width)?;
+            self.ellipsize_sidebar_text(&ui_font, "New Thread", top_action_text_max_width)?;
         let top_action_text_width = self
             .sidebar_text_width(&ui_font, top_action_label.as_ref())?
             .ceil()
@@ -798,7 +800,7 @@ impl crate::TermWindow {
             .is_some_and(|event| matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)));
         let mut virtual_y = 0usize;
 
-        if !view.pinned_sessions.is_empty() {
+        if !view.pinned_threads.is_empty() {
             let label_top = list_top_f + virtual_y as f32 - scroll_offset;
             let label_bottom = label_top + session_row_height as f32;
             let label_is_visible = label_bottom > list_top_f && label_top < content_bottom_f;
@@ -836,7 +838,7 @@ impl crate::TermWindow {
             let pinned_width = item_width.saturating_sub(SIDEBAR_INSET * 2);
             let pinned_status_x = pinned_x + SIDEBAR_INSET;
             let pinned_text_x = pinned_status_x + SESSION_STATUS_ICON_SIZE + SIDEBAR_ICON_GAP + 6;
-            for session in &view.pinned_sessions {
+            for session in &view.pinned_threads {
                 let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                 let row_bottom = row_top + session_row_height as f32;
                 let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
@@ -851,7 +853,7 @@ impl crate::TermWindow {
                         y: hit_y,
                         width: pinned_width,
                         height: hit_height,
-                        item_type: UIItemType::ProjectSession(session.id.clone()),
+                        item_type: UIItemType::WorkspaceThread(session.id.clone()),
                     });
                     let is_hovered = !suppress_hover
                         && self.is_pointer_over_ui_rect(
@@ -860,7 +862,7 @@ impl crate::TermWindow {
                             pinned_width,
                             session_row_height,
                         );
-                    let is_renaming_session = self.is_renaming_sidebar_session(&session.id);
+                    let is_renaming_session = self.is_renaming_sidebar_thread(&session.id);
                     if session.is_active {
                         self.fill_rounded_rectangle_with_border(
                             layers,
@@ -876,7 +878,7 @@ impl crate::TermWindow {
                             SIDEBAR_ROW_RADIUS + 2.0,
                             CAPSULE_BORDER_WIDTH,
                         )
-                        .context("sidebar selected pinned session")?;
+                        .context("sidebar selected pinned thread")?;
                     } else if is_hovered && !is_renaming_session {
                         self.fill_rounded_rectangle(
                             layers,
@@ -890,7 +892,7 @@ impl crate::TermWindow {
                             chrome.sidebar_row_hover_bg,
                             SIDEBAR_ROW_RADIUS + 2.0,
                         )
-                        .context("sidebar hovered pinned session")?;
+                        .context("sidebar hovered pinned thread")?;
                     }
 
                     let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
@@ -909,7 +911,7 @@ impl crate::TermWindow {
                             .saturating_add(pinned_width)
                             .saturating_sub(SIDEBAR_INSET)
                     };
-                    self.paint_sidebar_session_status(
+                    self.paint_sidebar_thread_status(
                         layers,
                         session,
                         pinned_status_x,
@@ -918,7 +920,7 @@ impl crate::TermWindow {
                         &chrome,
                         foreground,
                     )?;
-                    let title = self.sidebar_session_title(&session.id, &session.name);
+                    let title = self.sidebar_thread_title(&session.id, &session.name);
                     self.paint_sidebar_text(
                         layers,
                         &ui_font,
@@ -938,15 +940,15 @@ impl crate::TermWindow {
                         for (x, item_type, icon, _context_name) in [
                             (
                                 pin_x,
-                                UIItemType::ProjectSessionPin(session.id.clone()),
+                                UIItemType::WorkspaceThreadPin(session.id.clone()),
                                 SvgIcon::PinOff,
-                                "sidebar unpin pinned session button",
+                                "sidebar unpin pinned thread button",
                             ),
                             (
                                 delete_x,
-                                UIItemType::ProjectSessionDelete(session.id.clone()),
+                                UIItemType::WorkspaceThreadDelete(session.id.clone()),
                                 SvgIcon::Trash2,
-                                "sidebar delete pinned session button",
+                                "sidebar delete pinned thread button",
                             ),
                         ] {
                             let hovered =
@@ -982,7 +984,7 @@ impl crate::TermWindow {
         }
 
         if !view.projects.is_empty() {
-            if !view.pinned_sessions.is_empty() {
+            if !view.pinned_threads.is_empty() {
                 virtual_y += WORKSPACE_SECTION_LABEL_GAP;
             }
             let label_top = list_top_f + virtual_y as f32 - scroll_offset;
@@ -1094,11 +1096,11 @@ impl crate::TermWindow {
                     y: disclosure_y,
                     width: disclosure_size,
                     height: disclosure_size,
-                    item_type: UIItemType::ProjectToggleSessions(project.id.clone()),
+                    item_type: UIItemType::ProjectToggleThreads(project.id.clone()),
                 });
                 self.paint_sidebar_icon(
                     layers,
-                    if project.sessions_collapsed {
+                    if project.threads_collapsed {
                         SvgIcon::ChevronRight
                     } else {
                         SvgIcon::ChevronDown
@@ -1127,7 +1129,7 @@ impl crate::TermWindow {
                         // Remote host without a detected OS: a globe marks it as
                         // distinct from local folder projects in the mixed list.
                         SvgIcon::Globe
-                    } else if project.sessions_collapsed {
+                    } else if project.threads_collapsed {
                         SvgIcon::Folder
                     } else {
                         SvgIcon::FolderOpen
@@ -1180,13 +1182,13 @@ impl crate::TermWindow {
                     },
                     SIDEBAR_ROW_RADIUS,
                 )
-                .context("sidebar new session button")?;
+                .context("sidebar new thread button")?;
                 self.ui_items.push(UIItem {
                     x: project_action_x,
                     y: project_action_y,
                     width: project_action_size,
                     height: project_action_size,
-                    item_type: UIItemType::ProjectSessionNew(project.id.clone()),
+                    item_type: UIItemType::WorkspaceThreadNew(project.id.clone()),
                 });
                 let action_icon_size = (header_icon_size + 4)
                     .min(project_action_size.saturating_sub(SIDEBAR_SECTION_ACTION_ICON_INSET));
@@ -1206,7 +1208,7 @@ impl crate::TermWindow {
 
             virtual_y += session_row_height + row_gap;
 
-            if !project.sessions_collapsed {
+            if !project.threads_collapsed {
                 let session_x = item_x + SIDEBAR_INSET * 3 + SESSION_ROW_SIDE_PADDING;
                 let session_width =
                     item_width.saturating_sub(SIDEBAR_INSET * 3 + SESSION_ROW_SIDE_PADDING * 2);
@@ -1214,7 +1216,7 @@ impl crate::TermWindow {
                 let session_text_x =
                     session_status_x + SESSION_STATUS_ICON_SIZE + SIDEBAR_ICON_GAP + 6;
 
-                for session in &project.sessions {
+                for session in &project.threads {
                     let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                     let row_bottom = row_top + session_row_height as f32;
                     let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
@@ -1239,7 +1241,7 @@ impl crate::TermWindow {
                             SIDEBAR_ROW_RADIUS + 2.0,
                             CAPSULE_BORDER_WIDTH,
                         )
-                        .context("sidebar selected session")?;
+                        .context("sidebar selected thread")?;
                     }
 
                     let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
@@ -1249,7 +1251,7 @@ impl crate::TermWindow {
                             y: hit_y,
                             width: session_width,
                             height: hit_height,
-                            item_type: UIItemType::ProjectSession(session.id.clone()),
+                            item_type: UIItemType::WorkspaceThread(session.id.clone()),
                         });
                         let is_hovered = !suppress_hover
                             && self.is_pointer_over_ui_rect(
@@ -1258,7 +1260,7 @@ impl crate::TermWindow {
                                 session_width,
                                 session_row_height,
                             );
-                        let is_renaming_session = self.is_renaming_sidebar_session(&session.id);
+                        let is_renaming_session = self.is_renaming_sidebar_thread(&session.id);
                         let action_size = session_row_height
                             .saturating_sub(8)
                             .clamp(SESSION_ACTION_MIN_SIZE, SESSION_ACTION_MAX_SIZE);
@@ -1288,9 +1290,9 @@ impl crate::TermWindow {
                                 chrome.sidebar_row_hover_bg,
                                 SIDEBAR_ROW_RADIUS + 2.0,
                             )
-                            .context("sidebar hovered session")?;
+                            .context("sidebar hovered thread")?;
                         }
-                        self.paint_sidebar_session_status(
+                        self.paint_sidebar_thread_status(
                             layers,
                             session,
                             session_status_x,
@@ -1299,7 +1301,7 @@ impl crate::TermWindow {
                             &chrome,
                             foreground,
                         )?;
-                        let session_title = self.sidebar_session_title(&session.id, &session.name);
+                        let session_title = self.sidebar_thread_title(&session.id, &session.name);
                         self.paint_sidebar_text(
                             layers,
                             &ui_font,
@@ -1323,15 +1325,15 @@ impl crate::TermWindow {
                             for (x, item_type, icon, _context_name) in [
                                 (
                                     pin_x,
-                                    UIItemType::ProjectSessionPin(session.id.clone()),
+                                    UIItemType::WorkspaceThreadPin(session.id.clone()),
                                     pin_icon,
-                                    "sidebar pin session button",
+                                    "sidebar pin thread button",
                                 ),
                                 (
                                     delete_x,
-                                    UIItemType::ProjectSessionDelete(session.id.clone()),
+                                    UIItemType::WorkspaceThreadDelete(session.id.clone()),
                                     SvgIcon::Trash2,
-                                    "sidebar delete session button",
+                                    "sidebar delete thread button",
                                 ),
                             ] {
                                 let hovered = self.is_pointer_over_ui_rect(
@@ -1445,7 +1447,7 @@ impl crate::TermWindow {
                 },
                 SIDEBAR_ROW_RADIUS + 4.0,
             )
-            .context("sidebar add session button repaint")?;
+            .context("sidebar add thread button repaint")?;
             let notification_action_hovered = self.is_pointer_over_ui_rect(
                 notification_action_x,
                 notification_action_y,

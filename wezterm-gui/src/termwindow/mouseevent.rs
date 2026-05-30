@@ -573,12 +573,12 @@ impl super::TermWindow {
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
-            | UIItemType::ProjectToggleSessions(_)
+            | UIItemType::ProjectToggleThreads(_)
             | UIItemType::Project(_)
-            | UIItemType::ProjectSession(_)
-            | UIItemType::ProjectSessionPin(_)
-            | UIItemType::ProjectSessionDelete(_)
-            | UIItemType::ProjectSessionNew(_)
+            | UIItemType::WorkspaceThread(_)
+            | UIItemType::WorkspaceThreadPin(_)
+            | UIItemType::WorkspaceThreadDelete(_)
+            | UIItemType::WorkspaceThreadNew(_)
             | UIItemType::WorkspaceSidebarToggle
             | UIItemType::WorkspaceSidebarScrollTrack
             | UIItemType::WorkspaceSidebarScrollThumb
@@ -602,12 +602,12 @@ impl super::TermWindow {
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
-            | UIItemType::ProjectToggleSessions(_)
+            | UIItemType::ProjectToggleThreads(_)
             | UIItemType::Project(_)
-            | UIItemType::ProjectSession(_)
-            | UIItemType::ProjectSessionPin(_)
-            | UIItemType::ProjectSessionDelete(_)
-            | UIItemType::ProjectSessionNew(_)
+            | UIItemType::WorkspaceThread(_)
+            | UIItemType::WorkspaceThreadPin(_)
+            | UIItemType::WorkspaceThreadDelete(_)
+            | UIItemType::WorkspaceThreadNew(_)
             | UIItemType::WorkspaceSidebarToggle
             | UIItemType::WorkspaceSidebarScrollTrack
             | UIItemType::WorkspaceSidebarScrollThumb
@@ -1108,23 +1108,23 @@ impl super::TermWindow {
             UIItemType::ProjectNew => {
                 self.mouse_event_project_new(event, context);
             }
-            UIItemType::ProjectToggleSessions(project_id) => {
-                self.mouse_event_project_toggle_sessions(project_id, event, context);
+            UIItemType::ProjectToggleThreads(project_id) => {
+                self.mouse_event_project_toggle_threads(project_id, event, context);
             }
             UIItemType::Project(project_id) => {
                 self.mouse_event_project(project_id, event, context);
             }
-            UIItemType::ProjectSession(session_id) => {
-                self.mouse_event_project_session(session_id, event, context);
+            UIItemType::WorkspaceThread(thread_id) => {
+                self.mouse_event_workspace_thread(thread_id, event, context);
             }
-            UIItemType::ProjectSessionPin(session_id) => {
-                self.mouse_event_project_session_pin(session_id, event, context);
+            UIItemType::WorkspaceThreadPin(thread_id) => {
+                self.mouse_event_workspace_thread_pin(thread_id, event, context);
             }
-            UIItemType::ProjectSessionDelete(session_id) => {
-                self.mouse_event_project_session_delete(session_id, event, context);
+            UIItemType::WorkspaceThreadDelete(thread_id) => {
+                self.mouse_event_workspace_thread_delete(thread_id, event, context);
             }
-            UIItemType::ProjectSessionNew(project_id) => {
-                self.mouse_event_project_session_new(project_id, event, context);
+            UIItemType::WorkspaceThreadNew(project_id) => {
+                self.mouse_event_workspace_thread_new(project_id, event, context);
             }
             UIItemType::WorkspaceSidebarToggle => {
                 self.mouse_event_workspace_sidebar_toggle(event, context);
@@ -1255,15 +1255,15 @@ impl super::TermWindow {
         }
     }
 
-    pub fn mouse_event_project_session_new(
+    pub fn mouse_event_workspace_thread_new(
         &mut self,
         project_id: String,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
-            let session_id = crate::project_sessions::create_session(&project_id, None);
-            self.activate_project_session(session_id, context);
+            let thread_id = crate::workspace_threads::create_thread(&project_id, None);
+            self.activate_workspace_thread(thread_id, context);
         }
         context.set_cursor(Some(MouseCursor::Arrow));
     }
@@ -1283,7 +1283,7 @@ impl super::TermWindow {
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                crate::project_sessions::toggle_project_sessions_collapsed(&project_id);
+                crate::workspace_threads::toggle_project_threads_collapsed(&project_id);
                 context.invalidate();
             }
             WMEK::Press(MousePress::Right) => {
@@ -1295,7 +1295,7 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Arrow));
     }
 
-    pub fn mouse_event_project_toggle_sessions(
+    pub fn mouse_event_project_toggle_threads(
         &mut self,
         project_id: String,
         event: MouseEvent,
@@ -1303,7 +1303,7 @@ impl super::TermWindow {
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                crate::project_sessions::toggle_project_sessions_collapsed(&project_id);
+                crate::workspace_threads::toggle_project_threads_collapsed(&project_id);
                 context.invalidate();
             }
             WMEK::Press(MousePress::Right) => {
@@ -1315,20 +1315,20 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Arrow));
     }
 
-    pub fn mouse_event_project_session(
+    pub fn mouse_event_workspace_thread(
         &mut self,
-        session_id: String,
+        thread_id: String,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                self.activate_project_session(session_id, context);
+                self.activate_workspace_thread(thread_id, context);
             }
             WMEK::Press(MousePress::Right) => {
                 context.show_context_menu(
                     event.coords,
-                    self.project_session_context_menu_items(&session_id),
+                    self.workspace_thread_context_menu_items(&thread_id),
                 );
             }
             _ => {}
@@ -1336,21 +1336,21 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Arrow));
     }
 
-    pub fn mouse_event_project_session_pin(
+    pub fn mouse_event_workspace_thread_pin(
         &mut self,
-        session_id: String,
+        thread_id: String,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                crate::project_sessions::toggle_session_pinned(&session_id);
+                crate::workspace_threads::toggle_thread_pinned(&thread_id);
                 context.invalidate();
             }
             WMEK::Press(MousePress::Right) => {
                 context.show_context_menu(
                     event.coords,
-                    self.project_session_context_menu_items(&session_id),
+                    self.workspace_thread_context_menu_items(&thread_id),
                 );
             }
             _ => {}
@@ -1358,18 +1358,18 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Arrow));
     }
 
-    pub fn mouse_event_project_session_delete(
+    pub fn mouse_event_workspace_thread_delete(
         &mut self,
-        session_id: String,
+        thread_id: String,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                if let Some(deleted) = crate::project_sessions::delete_session(&session_id) {
+                if let Some(deleted) = crate::workspace_threads::delete_thread(&thread_id) {
                     if deleted.was_active {
-                        if let Some(next_session_id) = deleted.next_session_id {
-                            self.activate_project_session(next_session_id, context);
+                        if let Some(next_thread_id) = deleted.next_thread_id {
+                            self.activate_workspace_thread(next_thread_id, context);
                         }
                     } else if let Some(workspace) = deleted.materialized_workspace_name {
                         let mux = Mux::get();
@@ -1383,7 +1383,7 @@ impl super::TermWindow {
             WMEK::Press(MousePress::Right) => {
                 context.show_context_menu(
                     event.coords,
-                    self.project_session_context_menu_items(&session_id),
+                    self.workspace_thread_context_menu_items(&thread_id),
                 );
             }
             _ => {}
@@ -1400,14 +1400,14 @@ impl super::TermWindow {
                 KeyAssignment::PromptRenameProject(project_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "New Session",
+                "New Thread",
                 "plus.square",
-                KeyAssignment::CreateProjectSession(project_id.clone()),
+                KeyAssignment::CreateWorkspaceThread(project_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "Collapse / Expand Sessions",
+                "Collapse / Expand Threads",
                 "chevron.right",
-                KeyAssignment::ToggleProjectSessionsCollapsed(project_id.clone()),
+                KeyAssignment::ToggleWorkspaceThreadsCollapsed(project_id.clone()),
             ),
             ContextMenuItem::Separator,
             ContextMenuItem::item_with_icon(
@@ -1464,49 +1464,49 @@ impl super::TermWindow {
         ]
     }
 
-    fn project_session_context_menu_items(&self, session_id: &str) -> Vec<ContextMenuItem> {
-        let session_id = session_id.to_string();
-        let is_pinned = crate::project_sessions::session_is_pinned(&session_id);
+    fn workspace_thread_context_menu_items(&self, thread_id: &str) -> Vec<ContextMenuItem> {
+        let thread_id = thread_id.to_string();
+        let is_pinned = crate::workspace_threads::thread_is_pinned(&thread_id);
         vec![
             ContextMenuItem::item_with_icon(
                 if is_pinned {
-                    "Unpin Session"
+                    "Unpin Thread"
                 } else {
-                    "Pin Session"
+                    "Pin Thread"
                 },
                 if is_pinned { "pin.slash" } else { "pin" },
-                KeyAssignment::ToggleProjectSessionPinned(session_id.clone()),
+                KeyAssignment::ToggleWorkspaceThreadPinned(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "Rename Session...",
+                "Rename Thread...",
                 "pencil",
-                KeyAssignment::PromptRenameProjectSession(session_id.clone()),
+                KeyAssignment::PromptRenameWorkspaceThread(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "Archive Session",
+                "Archive Thread",
                 "archivebox",
-                KeyAssignment::ArchiveProjectSession(session_id.clone()),
+                KeyAssignment::ArchiveWorkspaceThread(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "Delete Session",
+                "Delete Thread",
                 "trash",
-                KeyAssignment::DeleteProjectSession(session_id.clone()),
+                KeyAssignment::DeleteWorkspaceThread(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
                 "Mark as Unread",
                 "envelope.badge",
-                KeyAssignment::MarkProjectSessionUnread(session_id),
+                KeyAssignment::MarkWorkspaceThreadUnread(thread_id),
             ),
         ]
     }
 
-    pub(crate) fn activate_project_session(&mut self, session_id: String, context: &dyn WindowOps) {
-        self.snapshot_active_project_session_layout();
+    pub(crate) fn activate_workspace_thread(&mut self, thread_id: String, context: &dyn WindowOps) {
+        self.snapshot_active_workspace_thread_layout();
 
         let mux = Mux::get();
         let live_workspaces = mux.iter_workspaces();
         let Some(plan) =
-            crate::project_sessions::activate_session_record(&session_id, &live_workspaces)
+            crate::workspace_threads::activate_thread_record(&thread_id, &live_workspaces)
         else {
             context.invalidate();
             return;
@@ -1543,7 +1543,7 @@ impl super::TermWindow {
                 config::keyassignment::SpawnTabDomain::DefaultDomain,
             )
         };
-        let layout = crate::project_sessions::session_layout(&plan.session_id);
+        let layout = crate::workspace_threads::thread_layout(&plan.thread_id);
         let dpi = self.dimensions.dpi as u32;
         let size = self.config.initial_size(
             dpi,
@@ -1555,7 +1555,7 @@ impl super::TermWindow {
         mux.set_active_workspace(&workspace_name);
 
         promise::spawn::spawn(async move {
-            if let Err(err) = crate::project_sessions::materialize_session(
+            if let Err(err) = crate::workspace_threads::materialize_thread(
                 workspace_name,
                 layout,
                 initial_cwd,
@@ -1566,7 +1566,7 @@ impl super::TermWindow {
             )
             .await
             {
-                log::error!("failed to materialize ThinkTerm session: {err:#}");
+                log::error!("failed to materialize ThinkTerm thread: {err:#}");
             }
             switcher.do_switch();
         })
@@ -1578,7 +1578,7 @@ impl super::TermWindow {
     /// Connect to a stored SSH host: ensure its mux domain is registered, then
     /// create/restore a session in the target workspace (default `ssh:<host>`)
     /// whose panes spawn into that SSH domain. Mirrors
-    /// [`Self::activate_project_session`] but targets the SSH domain.
+    /// [`Self::activate_workspace_thread`] but targets the SSH domain.
     pub(crate) fn connect_ssh_host(
         &mut self,
         project_id: String,
@@ -1619,8 +1619,8 @@ impl super::TermWindow {
             return;
         }
 
-        self.snapshot_active_project_session_layout();
-        let _ = crate::project_sessions::create_remote_host_session(
+        self.snapshot_active_workspace_thread_layout();
+        let _ = crate::workspace_threads::create_remote_host_thread(
             &project_id,
             &spec.label,
             crate::ssh_hosts::host_project_path(&spec),
@@ -1642,7 +1642,7 @@ impl super::TermWindow {
         let detect_project = project_id.clone();
         let detect_window = window.clone();
         promise::spawn::spawn(async move {
-            if let Err(err) = crate::project_sessions::materialize_session(
+            if let Err(err) = crate::workspace_threads::materialize_thread(
                 ws,
                 None,
                 None,
@@ -2409,8 +2409,7 @@ impl super::TermWindow {
             false
         };
 
-        if matches!(event.kind, WMEK::Press(_)) && self.acknowledge_active_workspace_session_work()
-        {
+        if matches!(event.kind, WMEK::Press(_)) && self.acknowledge_active_workspace_thread_work() {
             context.invalidate();
         }
 
