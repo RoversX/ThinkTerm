@@ -2447,7 +2447,7 @@ impl TabInner {
 
     fn activate_pane_in_stack(&mut self, pane_id: PaneId) -> anyhow::Result<usize> {
         if self.zoomed.is_some() {
-            anyhow::bail!("cannot switch pane tab while zoomed");
+            return self.activate_zoomed_pane_in_stack(pane_id);
         }
 
         let prior = self.get_active_pane();
@@ -2456,6 +2456,58 @@ impl TabInner {
             .ok_or_else(|| anyhow::anyhow!("pane {} not found in tab", pane_id))?;
         self.active = pane_index;
         self.recency.tag(pane_index);
+        self.advise_focus_change(prior);
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+
+        Ok(pane_index)
+    }
+
+    fn activate_zoomed_pane_in_stack(&mut self, pane_id: PaneId) -> anyhow::Result<usize> {
+        let prior = self.get_active_pane();
+        let Some(zoomed_pane_id) = prior.as_ref().map(|pane| pane.pane_id()) else {
+            anyhow::bail!("cannot switch pane tab while zoomed");
+        };
+        let mut cursor = self.pane.take().unwrap().cursor();
+        let mut pane_index = 0;
+        let mut target = None;
+
+        loop {
+            if cursor.is_leaf() {
+                let stack = cursor.leaf_mut().unwrap();
+                if stack.contains_pane(zoomed_pane_id) {
+                    if stack.set_active_pane(pane_id) {
+                        target = stack.active_pane().map(|pane| (pane_index, pane));
+                    }
+                }
+                pane_index += 1;
+            }
+
+            match cursor.preorder_next() {
+                Ok(c) if target.is_none() => cursor = c,
+                Ok(c) | Err(c) => {
+                    self.pane.replace(c.tree());
+                    break;
+                }
+            }
+        }
+
+        let Some((pane_index, target_pane)) = target else {
+            anyhow::bail!("cannot switch pane tab while zoomed");
+        };
+
+        self.active = pane_index;
+        self.recency.tag(pane_index);
+
+        if !is_pane(&target_pane, &prior.as_ref()) {
+            if let Some(prior) = prior.as_ref() {
+                prior.set_zoomed(false);
+            }
+            target_pane.set_zoomed(true);
+            if let Err(err) = target_pane.resize(self.size) {
+                log::error!("failed to resize zoomed pane: {err:#}");
+            }
+        }
+        self.zoomed.replace(target_pane);
         self.advise_focus_change(prior);
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
 
@@ -3399,11 +3451,23 @@ mod test {
         assert_eq!(tab.count_panes(), Some(1));
         assert_eq!(tab.get_active_pane().unwrap().pane_id(), 100);
 
+        let pane_3 = FakePane::new(103, size);
+        tab.add_pane_to_stack(100, Arc::clone(&pane_3)).unwrap();
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 103);
+
         tab.set_zoomed(true);
+        assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 103);
         assert!(tab
-            .add_pane_to_stack(100, FakePane::new(103, size))
+            .add_pane_to_stack(100, FakePane::new(104, size))
             .is_err());
-        assert!(tab.activate_pane_in_stack(100).is_err());
+        tab.activate_pane_in_stack(100).unwrap();
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 100);
+        assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 100);
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane.pane_id(), 100);
+        assert!(panes[0].is_zoomed);
     }
 
     fn pane_entry(pane_id: PaneId, size: TerminalSize, is_active_pane: bool) -> PaneEntry {
