@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use wezterm_term::Progress;
 use wezterm_term::TerminalConfiguration;
 use wezterm_term::TerminalSize;
 
@@ -53,6 +54,8 @@ pub struct Session {
     pub is_unread: bool,
     #[serde(skip)]
     pub work_is_running: bool,
+    #[serde(skip)]
+    pub work_needs_attention: bool,
     #[serde(default)]
     pub work_finished_unseen: bool,
     #[serde(default)]
@@ -105,24 +108,23 @@ pub struct ProjectView {
 pub struct SessionView {
     pub id: SessionId,
     pub name: String,
-    pub workspace_name: String,
     pub is_active: bool,
     pub is_materialized: bool,
     pub is_pinned: bool,
     pub is_unread: bool,
-    pub work_finished_unseen: bool,
+    pub work_status: SessionWorkStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionWorkStatus {
     Idle,
     Running,
+    NeedsAttention,
     FinishedUnseen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SessionWorkChange {
-    status: SessionWorkStatus,
     changed: bool,
     should_persist: bool,
 }
@@ -309,10 +311,40 @@ pub fn current_project_from_cwd() -> Project {
     }
 }
 
+fn current_project_for_workspace(active_workspace: &str) -> Project {
+    let mut project = current_project_from_cwd();
+    let session = Session::new_initial(
+        project.id.clone(),
+        "main".to_string(),
+        Some(active_workspace.to_string()),
+    );
+    project.active_session_id = Some(session.id.clone());
+    project.sessions.push(session);
+    project
+}
+
 pub fn view_for_current_project(
     active_workspace: &str,
     live_workspaces: &[String],
 ) -> ProjectSessionView {
+    let store = SESSION_STORE.lock();
+    if let Some(project_id) = store
+        .project_id_for_workspace(active_workspace)
+        .or_else(|| store.active_project_id.clone())
+        .filter(|project_id| {
+            store
+                .projects
+                .iter()
+                .any(|project| &project.id == project_id)
+        })
+    {
+        return store.view_for_project(&project_id, live_workspaces);
+    }
+
+    current_project_for_workspace(active_workspace).view(live_workspaces)
+}
+
+pub fn sync_current_project(active_workspace: &str) -> bool {
     let mut store = SESSION_STORE.lock();
     let (project_id, mut changed) =
         if let Some(project_id) = store.project_id_for_workspace(active_workspace) {
@@ -326,11 +358,10 @@ pub fn view_for_current_project(
             store.ensure_current_project(active_workspace)
         };
     changed |= store.sync_active_workspace(&project_id, active_workspace);
-    let view = store.view_for_project(&project_id, live_workspaces);
     if changed {
         persist_locked(&store);
     }
-    view
+    changed
 }
 
 pub fn create_session(project_id: &str, name: Option<String>) -> SessionId {
@@ -401,13 +432,41 @@ pub fn activate_session_record(
     plan
 }
 
-pub fn observe_session_work(session_id: &str, is_working: bool) -> Option<SessionWorkStatus> {
+pub fn refresh_session_work_for_pane(pane_id: PaneId) -> bool {
+    let mux = Mux::get();
+    let Some((_domain_id, window_id, _tab_id)) = mux.resolve_pane_id(pane_id) else {
+        return false;
+    };
+    let Some(window) = mux.get_window(window_id) else {
+        return false;
+    };
+    let workspace = window.get_workspace().to_string();
+    drop(window);
+    refresh_session_work_for_workspace(&workspace)
+}
+
+pub fn refresh_session_work_for_workspace(workspace: &str) -> bool {
+    let observed = scan_workspace_work_status(workspace);
     let mut store = SESSION_STORE.lock();
-    let change = store.observe_session_work(session_id, is_working)?;
+    let Some(change) = store.observe_session_work_for_workspace(workspace, observed) else {
+        return false;
+    };
     if change.should_persist {
-        persist_locked(&store);
+        schedule_session_store_persist();
     }
-    Some(change.status)
+    change.changed
+}
+
+pub fn refresh_all_session_work() -> bool {
+    let workspaces = {
+        let store = SESSION_STORE.lock();
+        store.session_workspace_names()
+    };
+    let mut changed = false;
+    for workspace in workspaces {
+        changed |= refresh_session_work_for_workspace(&workspace);
+    }
+    changed
 }
 
 pub fn acknowledge_session_work_for_workspace(workspace: &str) -> bool {
@@ -635,16 +694,32 @@ fn session_views_for_project(
             SessionView {
                 id: session.id.clone(),
                 name: session.name.clone(),
-                workspace_name,
                 is_active: project_is_active
                     && project.active_session_id.as_deref() == Some(&session.id),
                 is_materialized,
                 is_pinned: session.is_pinned,
                 is_unread: session.is_unread,
-                work_finished_unseen: session.work_finished_unseen,
+                work_status: session.work_status(),
             }
         })
         .collect()
+}
+
+impl Project {
+    fn view(&self, live_workspaces: &[String]) -> ProjectSessionView {
+        ProjectSessionView {
+            pinned_sessions: vec![],
+            projects: vec![ProjectView {
+                id: self.id.clone(),
+                name: self.name.clone(),
+                is_active: true,
+                sessions_collapsed: self.sessions_collapsed,
+                sessions: session_views_for_project(self, Some(&self.id), live_workspaces),
+                is_remote: is_remote_project(self),
+                distro: None,
+            }],
+        }
+    }
 }
 
 impl SessionStore {
@@ -655,7 +730,7 @@ impl SessionStore {
                 (project.id.clone(), false)
             } else {
                 let mut project = current;
-                let session = Session::new(
+                let session = Session::new_initial(
                     project.id.clone(),
                     "main".to_string(),
                     Some(active_workspace.to_string()),
@@ -986,48 +1061,21 @@ impl SessionStore {
         false
     }
 
-    fn observe_session_work(
+    fn observe_session_work_for_workspace(
         &mut self,
-        session_id: &str,
-        is_working: bool,
+        workspace: &str,
+        observed: SessionWorkStatus,
     ) -> Option<SessionWorkChange> {
         for project in &mut self.projects {
-            if let Some(session) = project
-                .sessions
-                .iter_mut()
-                .find(|session| session.id == session_id)
-            {
-                if is_working {
-                    let should_persist = session.work_finished_unseen;
-                    let changed = !session.work_is_running || session.work_finished_unseen;
-                    session.work_is_running = true;
-                    session.work_finished_unseen = false;
-                    return Some(SessionWorkChange {
-                        status: SessionWorkStatus::Running,
-                        changed,
-                        should_persist,
-                    });
+            let project_id = project.id.clone();
+            for session in &mut project.sessions {
+                let session_workspace = session
+                    .materialized_workspace_name
+                    .clone()
+                    .unwrap_or_else(|| workspace_name_for_session(&project_id, &session.id));
+                if session_workspace == workspace {
+                    return Some(session.observe_work_status(observed));
                 }
-
-                let mut should_persist = false;
-                let changed = if session.work_is_running {
-                    session.work_is_running = false;
-                    should_persist = !session.work_finished_unseen;
-                    session.work_finished_unseen = true;
-                    true
-                } else {
-                    false
-                };
-                let status = if session.work_finished_unseen {
-                    SessionWorkStatus::FinishedUnseen
-                } else {
-                    SessionWorkStatus::Idle
-                };
-                return Some(SessionWorkChange {
-                    status,
-                    changed,
-                    should_persist,
-                });
             }
         }
         None
@@ -1043,11 +1091,13 @@ impl SessionStore {
                     .unwrap_or_else(|| workspace_name_for_session(&project_id, &session.id));
                 if session_workspace == workspace {
                     let should_persist = session.work_finished_unseen;
-                    let changed = session.work_is_running || session.work_finished_unseen;
+                    let changed = session.work_is_running
+                        || session.work_needs_attention
+                        || session.work_finished_unseen;
                     session.work_is_running = false;
+                    session.work_needs_attention = false;
                     session.work_finished_unseen = false;
                     return SessionWorkChange {
-                        status: SessionWorkStatus::Idle,
                         changed,
                         should_persist,
                     };
@@ -1055,10 +1105,27 @@ impl SessionStore {
             }
         }
         SessionWorkChange {
-            status: SessionWorkStatus::Idle,
             changed: false,
             should_persist: false,
         }
+    }
+
+    fn session_workspace_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for project in &self.projects {
+            for session in &project.sessions {
+                if session.archived {
+                    continue;
+                }
+                names.push(
+                    session
+                        .materialized_workspace_name
+                        .clone()
+                        .unwrap_or_else(|| workspace_name_for_session(&project.id, &session.id)),
+                );
+            }
+        }
+        names
     }
 
     fn archive_session(&mut self, session_id: &str) -> bool {
@@ -1190,8 +1257,82 @@ impl Session {
             is_pinned: false,
             is_unread: false,
             work_is_running: false,
+            work_needs_attention: false,
             work_finished_unseen: false,
             archived: false,
+        }
+    }
+
+    fn new_initial(project_id: ProjectId, name: String, workspace: Option<String>) -> Self {
+        let id = workspace
+            .as_deref()
+            .map(|workspace| initial_session_id_for_workspace(&project_id, workspace))
+            .unwrap_or_else(|| new_id("session"));
+        Self {
+            id,
+            name,
+            project_id,
+            layout: None,
+            materialized_workspace_name: workspace,
+            last_active_at: now_ts(),
+            is_pinned: false,
+            is_unread: false,
+            work_is_running: false,
+            work_needs_attention: false,
+            work_finished_unseen: false,
+            archived: false,
+        }
+    }
+
+    fn work_status(&self) -> SessionWorkStatus {
+        if self.work_needs_attention {
+            SessionWorkStatus::NeedsAttention
+        } else if self.work_is_running {
+            SessionWorkStatus::Running
+        } else if self.work_finished_unseen {
+            SessionWorkStatus::FinishedUnseen
+        } else {
+            SessionWorkStatus::Idle
+        }
+    }
+
+    fn observe_work_status(&mut self, observed: SessionWorkStatus) -> SessionWorkChange {
+        match observed {
+            SessionWorkStatus::Running => {
+                let should_persist = self.work_finished_unseen;
+                let changed =
+                    !self.work_is_running || self.work_needs_attention || self.work_finished_unseen;
+                self.work_is_running = true;
+                self.work_needs_attention = false;
+                self.work_finished_unseen = false;
+                SessionWorkChange {
+                    changed,
+                    should_persist,
+                }
+            }
+            SessionWorkStatus::NeedsAttention => {
+                let changed = !self.work_needs_attention;
+                self.work_needs_attention = true;
+                SessionWorkChange {
+                    changed,
+                    should_persist: false,
+                }
+            }
+            SessionWorkStatus::Idle | SessionWorkStatus::FinishedUnseen => {
+                let was_running = self.work_is_running;
+                let had_attention = self.work_needs_attention;
+                let mut should_persist = false;
+                if was_running {
+                    should_persist = !self.work_finished_unseen;
+                    self.work_finished_unseen = true;
+                }
+                self.work_is_running = false;
+                self.work_needs_attention = false;
+                SessionWorkChange {
+                    changed: was_running || had_attention,
+                    should_persist,
+                }
+            }
         }
     }
 }
@@ -1627,6 +1768,59 @@ fn project_id_for_path(path: &Path) -> ProjectId {
     format!("project-{hash:x}")
 }
 
+fn initial_session_id_for_workspace(project_id: &str, workspace: &str) -> SessionId {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in project_id
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(workspace.bytes())
+    {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("session-{hash:x}")
+}
+
+fn scan_workspace_work_status(workspace: &str) -> SessionWorkStatus {
+    let mux = Mux::get();
+    let mut running = false;
+    let mut needs_attention = false;
+    for window_id in mux.iter_windows_in_workspace(workspace) {
+        let Some(window) = mux.get_window(window_id) else {
+            continue;
+        };
+        let tabs = (0..window.len())
+            .filter_map(|idx| window.get_by_idx(idx).cloned())
+            .collect::<Vec<_>>();
+        drop(window);
+
+        for tab in tabs {
+            for pane in tab.iter_all_panes() {
+                match pane.get_progress() {
+                    Progress::None => {}
+                    Progress::Percentage(_) | Progress::Indeterminate => running = true,
+                    Progress::Error(_) => needs_attention = true,
+                }
+                if crate::termwindow::ui::status_icon::split_leading_legacy_progress_marker(
+                    &pane.get_title(),
+                )
+                .is_some()
+                {
+                    running = true;
+                }
+            }
+        }
+    }
+
+    if needs_attention {
+        SessionWorkStatus::NeedsAttention
+    } else if running {
+        SessionWorkStatus::Running
+    } else {
+        SessionWorkStatus::Idle
+    }
+}
+
 fn is_remote_project(project: &Project) -> bool {
     project.id.starts_with("ssh-")
         || project.id.starts_with("system-ssh-")
@@ -1738,6 +1932,64 @@ mod tests {
         let loaded = load_session_store_from_path(&path).unwrap();
         assert!(!loaded.projects[0].sessions[0].work_is_running);
         assert!(!loaded.projects[0].sessions[0].work_finished_unseen);
+    }
+
+    #[test]
+    fn synthetic_current_project_matches_ensured_project_ids() {
+        let workspace = "workspace-1";
+        let synthetic = current_project_for_workspace(workspace);
+        let synthetic_session_id = synthetic.sessions[0].id.clone();
+
+        let mut store = SessionStore::default();
+        let (project_id, changed) = store.ensure_current_project(workspace);
+
+        assert!(changed);
+        assert_eq!(project_id, synthetic.id);
+        assert_eq!(store.projects[0].sessions[0].id, synthetic_session_id);
+        assert_eq!(
+            store.projects[0].sessions[0]
+                .materialized_workspace_name
+                .as_deref(),
+            Some(workspace)
+        );
+    }
+
+    #[test]
+    fn workspace_work_observation_transitions_to_finished_unseen() {
+        let mut store = SessionStore::default();
+        let session = Session::new(
+            "project-1".to_string(),
+            "main".to_string(),
+            Some("workspace-1".to_string()),
+        );
+        store.projects.push(Project {
+            id: "project-1".to_string(),
+            name: "thinkterm".to_string(),
+            path: PathBuf::from("/tmp/thinkterm"),
+            sessions: vec![session],
+            active_session_id: None,
+            sessions_collapsed: false,
+        });
+
+        let change = store
+            .observe_session_work_for_workspace("workspace-1", SessionWorkStatus::Running)
+            .unwrap();
+        assert!(change.changed);
+        assert!(!change.should_persist);
+        assert_eq!(
+            store.projects[0].sessions[0].work_status(),
+            SessionWorkStatus::Running
+        );
+
+        let change = store
+            .observe_session_work_for_workspace("workspace-1", SessionWorkStatus::Idle)
+            .unwrap();
+        assert!(change.changed);
+        assert!(change.should_persist);
+        assert_eq!(
+            store.projects[0].sessions[0].work_status(),
+            SessionWorkStatus::FinishedUnseen
+        );
     }
 
     #[test]

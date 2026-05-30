@@ -1272,6 +1272,7 @@ impl TermWindow {
             myself.apply_native_terminal_settings();
             myself.apply_workspace_session_font_scales();
             myself.load_os_parameters();
+            myself.sync_current_project_session();
             window.show();
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
@@ -1595,19 +1596,25 @@ impl TermWindow {
                     alert: Alert::SetUserVar { name, value },
                     pane_id,
                 } => {
+                    self.refresh_session_work_for_pane(pane_id);
                     self.emit_user_var_event(pane_id, name, value);
                 }
                 MuxNotification::WindowTitleChanged { .. }
                 | MuxNotification::Alert {
+                    alert: Alert::OutputSinceFocusLost | Alert::CurrentWorkingDirectoryChanged,
+                    ..
+                } => {
+                    self.update_title();
+                }
+                MuxNotification::Alert {
                     alert:
-                        Alert::OutputSinceFocusLost
-                        | Alert::CurrentWorkingDirectoryChanged
-                        | Alert::WindowTitleChanged(_)
+                        Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
                         | Alert::Progress(_),
-                    ..
+                    pane_id,
                 } => {
+                    self.refresh_session_work_for_pane(pane_id);
                     self.update_title();
                 }
                 MuxNotification::Alert {
@@ -1693,8 +1700,9 @@ impl TermWindow {
                 MuxNotification::SaveToDownloads { .. } => {
                     // Handled by frontend
                 }
-                MuxNotification::PaneFocused(_) => {
+                MuxNotification::PaneFocused(pane_id) => {
                     // Also handled by clientpane
+                    self.refresh_session_work_for_pane(pane_id);
                     self.update_title_post_status();
                 }
                 MuxNotification::TabResized(_) => {
@@ -1704,16 +1712,23 @@ impl TermWindow {
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
                 }
-                MuxNotification::PaneAdded(_)
-                | MuxNotification::WorkspaceRenamed { .. }
-                | MuxNotification::PaneRemoved(_)
+                MuxNotification::PaneAdded(pane_id) => {
+                    self.refresh_session_work_for_pane(pane_id);
+                }
+                MuxNotification::PaneRemoved(_) => {
+                    self.refresh_all_session_work();
+                }
+                MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
-                | MuxNotification::Empty
-                | MuxNotification::WindowCreated(_) => {}
+                | MuxNotification::WindowCreated(_) => {
+                    self.sync_current_project_session();
+                }
+                MuxNotification::Empty => {}
             },
             TermWindowNotif::EmitStatusUpdate => {
                 self.emit_status_event();
+                self.refresh_all_session_work();
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
@@ -1751,6 +1766,7 @@ impl TermWindow {
                         tab.resize(self.terminal_size);
                     }
                 };
+                self.sync_current_project_session();
                 self.update_title();
                 window.invalidate();
             }
@@ -1979,6 +1995,37 @@ impl TermWindow {
     fn emit_status_event(&mut self) {
         self.emit_window_event("update-right-status", None);
         self.emit_window_event("update-status", None);
+    }
+
+    fn invalidate_window_if(&self, should_invalidate: bool) {
+        if should_invalidate {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+    }
+
+    fn current_mux_workspace(&self) -> Option<String> {
+        Mux::get()
+            .get_window(self.mux_window_id)
+            .map(|window| window.get_workspace().to_string())
+    }
+
+    fn sync_current_project_session(&mut self) {
+        let Some(workspace) = self.current_mux_workspace() else {
+            return;
+        };
+        self.invalidate_window_if(crate::project_sessions::sync_current_project(&workspace));
+    }
+
+    fn refresh_session_work_for_pane(&mut self, pane_id: PaneId) {
+        self.invalidate_window_if(crate::project_sessions::refresh_session_work_for_pane(
+            pane_id,
+        ));
+    }
+
+    fn refresh_all_session_work(&mut self) {
+        self.invalidate_window_if(crate::project_sessions::refresh_all_session_work());
     }
 
     fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {

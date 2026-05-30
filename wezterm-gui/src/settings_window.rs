@@ -630,6 +630,7 @@ struct SettingsUiState {
     search: TextInputState,
     font_size_input: TextInputState,
     font_family_input: TextInputState,
+    font_family_input_dirty: bool,
     interaction: InteractionState<SettingsAction>,
     drag: Option<SettingsDrag>,
     open_dropdown: Option<SettingsDropdown>,
@@ -658,6 +659,7 @@ impl SettingsUiState {
             search: TextInputState::new(),
             font_size_input: TextInputState::new(),
             font_family_input: TextInputState::new(),
+            font_family_input_dirty: false,
             interaction: InteractionState::default(),
             drag: None,
             open_dropdown: None,
@@ -1140,10 +1142,12 @@ impl SettingsWindow {
     fn dispatch(&mut self, event: WindowEvent, window: &Window) -> anyhow::Result<bool> {
         match event {
             WindowEvent::CloseRequested => {
+                self.commit_focused_input();
                 window.close();
                 Ok(true)
             }
             WindowEvent::Destroyed => {
+                self.commit_focused_input();
                 self.ui.memory_monitoring = false;
                 self.ui.memory_monitor_generation =
                     self.ui.memory_monitor_generation.wrapping_add(1);
@@ -1230,10 +1234,11 @@ impl SettingsWindow {
                 self.ui.interaction.pressed = action;
                 match action {
                     Some(SettingsAction::SearchInput | SettingsAction::FontFamilyInput) => {
-                        self.ui.interaction.focused = action;
+                        self.set_focused_input(action);
                         self.ui.open_dropdown = None;
                     }
                     Some(SettingsAction::SidebarResize) => {
+                        self.set_focused_input(None);
                         self.ui.drag = Some(SettingsDrag::SidebarResize {
                             start_x: x,
                             start_width: self.ui.sidebar.width,
@@ -1248,14 +1253,14 @@ impl SettingsWindow {
                         | SettingsAction::ToggleMainRendererMenu
                         | SettingsAction::SetMainRenderer(_),
                     ) => {
-                        self.ui.interaction.focused = None;
+                        self.set_focused_input(None);
                     }
                     Some(_) => {
-                        self.ui.interaction.focused = None;
+                        self.set_focused_input(None);
                         self.ui.open_dropdown = None;
                     }
                     None => {
-                        self.ui.interaction.focused = None;
+                        self.set_focused_input(None);
                         self.ui.open_dropdown = None;
                     }
                 }
@@ -1512,7 +1517,7 @@ impl SettingsWindow {
                 self.backspace_focused_input(focused)
             }
             KeyCode::Char('\u{1b}') | KeyCode::Char('\r') => {
-                self.ui.interaction.focused = None;
+                self.set_focused_input(None);
                 true
             }
             KeyCode::Char(ch) => {
@@ -1571,7 +1576,7 @@ impl SettingsWindow {
                 let Some(text) = self.ui.font_family_input.take_selected_text() else {
                     return false;
                 };
-                self.sync_native_terminal_inputs();
+                self.ui.font_family_input_dirty = true;
                 text
             }
             _ => return false,
@@ -1619,7 +1624,7 @@ impl SettingsWindow {
             }
             SettingsAction::FontFamilyInput => {
                 self.ui.font_family_input.backspace();
-                self.sync_native_terminal_inputs();
+                self.ui.font_family_input_dirty = true;
                 true
             }
             _ => false,
@@ -1636,21 +1641,45 @@ impl SettingsWindow {
             }
             SettingsAction::FontFamilyInput => {
                 self.ui.font_family_input.push_text(text);
-                self.sync_native_terminal_inputs();
+                self.ui.font_family_input_dirty = true;
                 true
             }
             _ => false,
         }
     }
 
-    fn sync_native_terminal_inputs(&mut self) {
+    fn set_focused_input(&mut self, focused: Option<SettingsAction>) {
+        if self.ui.interaction.focused != focused {
+            self.commit_focused_input();
+        }
+        self.ui.interaction.focused = focused;
+    }
+
+    fn commit_focused_input(&mut self) {
+        if self.ui.interaction.focused == Some(SettingsAction::FontFamilyInput)
+            && self.commit_native_terminal_inputs_from_ui()
+        {
+            self.save_and_apply_native_terminal_settings();
+        }
+    }
+
+    fn commit_native_terminal_inputs_from_ui(&mut self) -> bool {
+        if !self.ui.font_family_input_dirty {
+            return false;
+        }
+        self.ui.font_family_input_dirty = false;
+
         let family = self.ui.font_family_input.text.trim();
-        self.native_settings.terminal.font_family = if family.is_empty() {
+        let next = if family.is_empty() {
             None
         } else {
             Some(family.to_string())
         };
-        self.save_and_apply_native_terminal_settings();
+        if self.native_settings.terminal.font_family == next {
+            return false;
+        }
+        self.native_settings.terminal.font_family = next;
+        true
     }
 
     fn sync_selected_section_with_search(&mut self) {
@@ -1957,6 +1986,7 @@ impl SettingsWindow {
     fn perform_action(&mut self, action: SettingsAction, window: &Window) {
         match action {
             SettingsAction::Select(section) => {
+                self.commit_focused_input();
                 self.selected = section;
                 self.ui.content_scroll.reset();
                 self.ui.open_dropdown = None;
@@ -2226,7 +2256,7 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::SearchInput => {
-                self.ui.interaction.focused = Some(SettingsAction::SearchInput);
+                self.set_focused_input(Some(SettingsAction::SearchInput));
             }
             SettingsAction::DecreaseFontSize => self.step_terminal_font_size(-1.0),
             SettingsAction::IncreaseFontSize => self.step_terminal_font_size(1.0),
@@ -2238,13 +2268,13 @@ impl SettingsWindow {
             SettingsAction::IncreaseSettingsFontWeight => self.step_settings_font_weight(100),
             SettingsAction::ResetSettingsFontWeight => self.reset_settings_font_weight(),
             SettingsAction::FontFamilyInput => {
-                self.ui.interaction.focused = Some(SettingsAction::FontFamilyInput);
+                self.set_focused_input(Some(SettingsAction::FontFamilyInput));
             }
             SettingsAction::ClearSearch => {
                 self.ui.search.clear();
                 self.ui.sidebar_scroll.reset();
                 self.sync_selected_section_with_search();
-                self.ui.interaction.focused = Some(SettingsAction::SearchInput);
+                self.set_focused_input(Some(SettingsAction::SearchInput));
             }
             SettingsAction::SidebarResize
             | SettingsAction::SidebarScrollArea
@@ -5899,7 +5929,7 @@ impl SettingsWindow {
     }
 
     fn load_native_settings() -> ThinkTermNativeSettings {
-        crate::native_settings::load()
+        crate::native_settings::reload_from_disk()
     }
 
     fn config_source_summary() -> String {

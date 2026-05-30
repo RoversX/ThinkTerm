@@ -6,7 +6,7 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER,
 };
 use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, SvgIcon};
-use crate::termwindow::ui::status_icon::{split_leading_legacy_progress_marker, UiStatusKind};
+use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, MACOS_TITLEBAR_CONTENT_TOP_INSET, SIDEBAR_ICON_GAP, SIDEBAR_INSET,
     SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP,
@@ -238,52 +238,13 @@ impl crate::TermWindow {
         &self,
         session: &project_sessions::SessionView,
     ) -> Option<UiStatusKind> {
-        let mux = Mux::get();
-        let mut is_working = false;
-        let mut needs_attention = false;
-        for window_id in mux.iter_windows_in_workspace(&session.workspace_name) {
-            let Some(window) = mux.get_window(window_id) else {
-                continue;
-            };
-            let tabs = (0..window.len())
-                .filter_map(|idx| window.get_by_idx(idx).cloned())
-                .collect::<Vec<_>>();
-            drop(window);
-
-            for tab in tabs {
-                for pane in tab.iter_all_panes() {
-                    match UiStatusKind::from_progress(&pane.get_progress()) {
-                        Some(UiStatusKind::Running) => is_working = true,
-                        Some(UiStatusKind::NeedsAttention) => needs_attention = true,
-                        Some(UiStatusKind::Done) | None => {}
-                    }
-                    if split_leading_legacy_progress_marker(&pane.get_title()).is_some() {
-                        is_working = true;
-                    }
-                }
+        match session.work_status {
+            project_sessions::SessionWorkStatus::Running => Some(UiStatusKind::Running),
+            project_sessions::SessionWorkStatus::NeedsAttention => {
+                Some(UiStatusKind::NeedsAttention)
             }
-        }
-
-        if is_working {
-            project_sessions::observe_session_work(&session.id, true);
-            return Some(UiStatusKind::Running);
-        }
-
-        if needs_attention {
-            return Some(UiStatusKind::NeedsAttention);
-        }
-
-        let status = project_sessions::observe_session_work(&session.id, false).unwrap_or({
-            if session.work_finished_unseen {
-                project_sessions::SessionWorkStatus::FinishedUnseen
-            } else {
-                project_sessions::SessionWorkStatus::Idle
-            }
-        });
-        match status {
             project_sessions::SessionWorkStatus::FinishedUnseen => Some(UiStatusKind::Done),
-            project_sessions::SessionWorkStatus::Idle
-            | project_sessions::SessionWorkStatus::Running => None,
+            project_sessions::SessionWorkStatus::Idle => None,
         }
     }
 

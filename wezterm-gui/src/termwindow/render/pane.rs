@@ -351,15 +351,19 @@ impl crate::TermWindow {
                 }
             }
 
-            let close_x = draw_tab_x
+            let raw_close_x = draw_tab_x
                 .saturating_add(tab_width)
                 .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
             let close_slot_reserved = !is_renaming_tab;
-            let show_close = close_slot_reserved && (selected_tab || is_hovered);
-            if show_close
-                && close_x >= tab_start
-                && close_x.saturating_add(button_size) <= max_tab_right
-            {
+            let close_view_left = draw_tab_x.max(tab_start);
+            let close_view_right = draw_tab_x.saturating_add(tab_width).min(max_tab_right);
+            let close_x = raw_close_x
+                .min(close_view_right.saturating_sub(button_size))
+                .max(close_view_left);
+            let show_close = close_slot_reserved
+                && (selected_tab || is_hovered)
+                && close_view_right.saturating_sub(close_view_left) >= button_size;
+            if show_close {
                 let close_hovered =
                     self.is_pointer_over_ui_rect(close_x, tab_y, button_size, button_size);
                 if close_hovered {
@@ -417,7 +421,11 @@ impl crate::TermWindow {
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
             let text_x = title_icon_x + icon_size + PANE_NAV_ICON_GAP;
             let text_right = if close_slot_reserved {
-                close_x
+                if show_close {
+                    close_x
+                } else {
+                    raw_close_x
+                }
             } else {
                 draw_tab_x + tab_width - PANE_NAV_INSET
             };
@@ -698,62 +706,67 @@ impl crate::TermWindow {
                 }
             }
 
-            let close_x = draw_tab_x
+            let raw_close_x = draw_tab_x
                 .saturating_add(tab_width)
                 .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
             let close_slot_reserved = !is_renaming_tab;
-            let show_close = close_slot_reserved && (selected_tab || is_hovered);
+            let close_view_left = draw_tab_x.max(tab_start);
+            let close_view_right = draw_tab_x.saturating_add(tab_width).min(max_tab_right);
+            let close_x = raw_close_x
+                .min(close_view_right.saturating_sub(button_size))
+                .max(close_view_left);
+            let show_close = close_slot_reserved
+                && (selected_tab || is_hovered)
+                && close_view_right.saturating_sub(close_view_left) >= button_size;
             if show_close {
-                if close_x >= tab_start && close_x.saturating_add(button_size) <= max_tab_right {
-                    let close_hovered =
-                        self.is_pointer_over_ui_rect(close_x, tab_y, button_size, button_size);
-                    if close_hovered {
-                        let hover_alpha = if self.is_pointer_pressing_ui_rect(
-                            close_x,
-                            tab_y,
-                            button_size,
-                            button_size,
-                        ) {
-                            0.20
-                        } else {
-                            0.12
-                        };
-                        let hover_inset = TAB_CLOSE_HOVER_INSET.min(button_size / 2);
-                        let hover_size = button_size.saturating_sub(hover_inset * 2);
-                        self.fill_rounded_rectangle(
-                            layers,
-                            1,
-                            euclid::rect(
-                                (close_x + hover_inset) as f32,
-                                (tab_y + hover_inset) as f32,
-                                hover_size as f32,
-                                hover_size as f32,
-                            ),
-                            foreground.mul_alpha(hover_alpha),
-                            TAB_CLOSE_HOVER_RADIUS,
-                        )
-                        .context("pane nav close hover")?;
-                    }
-                    self.ui_items.push(UIItem {
-                        x: close_x,
-                        y: tab_y,
-                        width: button_size,
-                        height: button_size,
-                        item_type: UIItemType::PaneNav {
-                            pane_id: pos.pane.pane_id(),
-                            pane_index: pos.index,
-                            action: PaneNavAction::Close(tab.pane_id),
-                        },
-                    });
-                    self.paint_pane_nav_icon(
+                let close_hovered =
+                    self.is_pointer_over_ui_rect(close_x, tab_y, button_size, button_size);
+                if close_hovered {
+                    let hover_alpha = if self.is_pointer_pressing_ui_rect(
+                        close_x,
+                        tab_y,
+                        button_size,
+                        button_size,
+                    ) {
+                        0.20
+                    } else {
+                        0.12
+                    };
+                    let hover_inset = TAB_CLOSE_HOVER_INSET.min(button_size / 2);
+                    let hover_size = button_size.saturating_sub(hover_inset * 2);
+                    self.fill_rounded_rectangle(
                         layers,
-                        SvgIcon::X,
-                        close_x + ((button_size.saturating_sub(icon_size)) / 2),
-                        title_icon_y,
-                        icon_size,
-                        if close_hovered { foreground } else { muted_fg },
-                    )?;
+                        1,
+                        euclid::rect(
+                            (close_x + hover_inset) as f32,
+                            (tab_y + hover_inset) as f32,
+                            hover_size as f32,
+                            hover_size as f32,
+                        ),
+                        foreground.mul_alpha(hover_alpha),
+                        TAB_CLOSE_HOVER_RADIUS,
+                    )
+                    .context("pane nav close hover")?;
                 }
+                self.ui_items.push(UIItem {
+                    x: close_x,
+                    y: tab_y,
+                    width: button_size,
+                    height: button_size,
+                    item_type: UIItemType::PaneNav {
+                        pane_id: pos.pane.pane_id(),
+                        pane_index: pos.index,
+                        action: PaneNavAction::Close(tab.pane_id),
+                    },
+                });
+                self.paint_pane_nav_icon(
+                    layers,
+                    SvgIcon::X,
+                    close_x + ((button_size.saturating_sub(icon_size)) / 2),
+                    title_icon_y,
+                    icon_size,
+                    if close_hovered { foreground } else { muted_fg },
+                )?;
             }
 
             let ui_font = self
@@ -763,7 +776,11 @@ impl crate::TermWindow {
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
             let text_x = title_icon_x + icon_size + PANE_NAV_ICON_GAP;
             let text_right = if close_slot_reserved {
-                close_x
+                if show_close {
+                    close_x
+                } else {
+                    raw_close_x
+                }
             } else {
                 draw_tab_x + tab_width - PANE_NAV_INSET
             };

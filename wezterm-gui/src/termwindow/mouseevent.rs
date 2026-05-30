@@ -406,6 +406,7 @@ impl super::TermWindow {
     fn wheel_amount(event: &MouseEvent) -> Option<i16> {
         match event.kind {
             WMEK::HorzWheel(amount) => Some(amount),
+            WMEK::VertWheel(amount) => Some(amount),
             _ => None,
         }
     }
@@ -1700,8 +1701,9 @@ impl super::TermWindow {
                 self.scroll_pane_nav_tabs(pane_id, amount, context);
                 return;
             }
-            WMEK::VertWheel(_) => {
+            WMEK::VertWheel(amount) => {
                 self.lock_pane_nav_tab_wheel_surface(pane_id);
+                self.scroll_pane_nav_tabs(pane_id, amount, context);
                 return;
             }
             _ => {}

@@ -1,7 +1,9 @@
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use window::{Appearance, Connection, ConnectionOps};
 
 pub(crate) const DEFAULT_SETTINGS_FONT_SIZE: f64 = 14.0;
@@ -190,7 +192,13 @@ pub(crate) fn settings_path() -> PathBuf {
         .join("settings.json")
 }
 
-pub(crate) fn load() -> ThinkTermNativeSettings {
+static SETTINGS_CACHE: OnceLock<Mutex<ThinkTermNativeSettings>> = OnceLock::new();
+
+fn settings_cache() -> &'static Mutex<ThinkTermNativeSettings> {
+    SETTINGS_CACHE.get_or_init(|| Mutex::new(load_from_disk()))
+}
+
+fn load_from_disk() -> ThinkTermNativeSettings {
     let path = settings_path();
     match fs::read_to_string(&path) {
         Ok(data) => match serde_json::from_str(&data) {
@@ -214,6 +222,16 @@ pub(crate) fn load() -> ThinkTermNativeSettings {
     }
 }
 
+pub(crate) fn load() -> ThinkTermNativeSettings {
+    settings_cache().lock().clone()
+}
+
+pub(crate) fn reload_from_disk() -> ThinkTermNativeSettings {
+    let settings = load_from_disk();
+    *settings_cache().lock() = settings.clone();
+    settings
+}
+
 pub(crate) fn save(settings: &ThinkTermNativeSettings) -> anyhow::Result<()> {
     let path = settings_path();
     if let Some(parent) = path.parent() {
@@ -223,6 +241,7 @@ pub(crate) fn save(settings: &ThinkTermNativeSettings) -> anyhow::Result<()> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, data)?;
     fs::rename(tmp, path)?;
+    *settings_cache().lock() = settings.clone();
     Ok(())
 }
 
