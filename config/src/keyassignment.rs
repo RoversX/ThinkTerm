@@ -581,7 +581,6 @@ pub enum KeyAssignment {
     ToggleWorkspaceThreadsCollapsed(String),
     RemoveProject(String),
     ToggleWorkspaceThreadPinned(String),
-    ArchiveWorkspaceThread(String),
     DeleteWorkspaceThread(String),
     MarkWorkspaceThreadUnread(String),
     ShowDebugOverlay,

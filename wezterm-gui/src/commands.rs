@@ -896,14 +896,6 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: None,
         },
-        ArchiveWorkspaceThread(_) => CommandDef {
-            brief: "Archive Thread".into(),
-            doc: "Archives the ThinkTerm thread".into(),
-            keys: vec![],
-            args: &[ArgType::ActiveWindow],
-            menubar: &[],
-            icon: None,
-        },
         DeleteWorkspaceThread(_) => CommandDef {
             brief: "Delete Thread".into(),
             doc: "Deletes the ThinkTerm thread from the thread store".into(),

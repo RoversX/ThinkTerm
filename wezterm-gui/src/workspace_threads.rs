@@ -59,8 +59,6 @@ pub struct WorkspaceThread {
     pub work_needs_attention: bool,
     #[serde(default)]
     pub work_finished_unseen: bool,
-    #[serde(default)]
-    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -177,10 +175,81 @@ pub fn load_workspace_thread_store_from_path(path: &Path) -> Result<WorkspaceThr
         return Ok(WorkspaceThreadStore::default());
     }
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let value: serde_json::Value =
+    let mut value: serde_json::Value =
         serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))?;
     migrate_legacy_remote_hosts(&value);
+    let removed = drop_legacy_archived_threads(&mut value);
+    if removed > 0 {
+        log::info!("dropped {removed} legacy archived ThinkTerm workspace threads");
+    }
     serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))
+}
+
+fn drop_legacy_archived_threads(value: &mut serde_json::Value) -> usize {
+    let Some(projects) = value
+        .get_mut("projects")
+        .and_then(|projects| projects.as_array_mut())
+    else {
+        return 0;
+    };
+
+    let mut removed = 0usize;
+    for project in projects {
+        let active_thread_id = project
+            .get("active_thread_id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string);
+
+        let active_thread_update = {
+            let Some(threads) = project
+                .get_mut("threads")
+                .and_then(|threads| threads.as_array_mut())
+            else {
+                continue;
+            };
+
+            let mut removed_active = false;
+            threads.retain(|thread| {
+                let archived = thread
+                    .get("archived")
+                    .and_then(|archived| archived.as_bool())
+                    .unwrap_or(false);
+                if archived {
+                    removed += 1;
+                    if active_thread_id.as_deref() == thread.get("id").and_then(|id| id.as_str()) {
+                        removed_active = true;
+                    }
+                }
+                !archived
+            });
+
+            if removed_active {
+                Some(first_legacy_thread_id(threads))
+            } else if active_thread_id.as_deref().is_some_and(|active_id| {
+                !threads
+                    .iter()
+                    .any(|thread| thread.get("id").and_then(|id| id.as_str()) == Some(active_id))
+            }) {
+                Some(first_legacy_thread_id(threads))
+            } else {
+                None
+            }
+        };
+
+        if let Some(active_thread_update) = active_thread_update {
+            project["active_thread_id"] = active_thread_update;
+        }
+    }
+
+    removed
+}
+
+fn first_legacy_thread_id(threads: &[serde_json::Value]) -> serde_json::Value {
+    threads
+        .iter()
+        .find_map(|thread| thread.get("id").and_then(|id| id.as_str()))
+        .map(|id| serde_json::Value::String(id.to_string()))
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn migrate_legacy_remote_hosts(value: &serde_json::Value) {
@@ -628,15 +697,6 @@ pub fn mark_thread_unread(thread_id: &str) -> bool {
     changed
 }
 
-pub fn archive_thread(thread_id: &str) -> bool {
-    let mut store = THREAD_STORE.lock();
-    let changed = store.archive_thread(thread_id);
-    if changed {
-        persist_locked(&store);
-    }
-    changed
-}
-
 pub fn delete_thread(thread_id: &str) -> Option<DeletedWorkspaceThread> {
     let mut store = THREAD_STORE.lock();
     let deleted = store.delete_thread(thread_id);
@@ -664,7 +724,6 @@ fn thread_views_for_project(
     project
         .threads
         .iter()
-        .filter(|session| !session.archived)
         .map(|session| {
             let workspace_name = session
                 .materialized_workspace_name
@@ -887,7 +946,7 @@ impl WorkspaceThreadStore {
             project
                 .threads
                 .iter()
-                .any(|session| !session.archived && &session.id == active_id)
+                .any(|session| &session.id == active_id)
         }) {
             self.active_project_id = Some(project.id.clone());
             return project.active_thread_id.clone();
@@ -896,8 +955,8 @@ impl WorkspaceThreadStore {
         let thread_id = project
             .threads
             .iter()
-            .find(|session| !session.archived)
             .map(|session| session.id.clone())
+            .next()
             .unwrap_or_else(|| {
                 let session = WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
                 let thread_id = session.id.clone();
@@ -1105,9 +1164,6 @@ impl WorkspaceThreadStore {
         let mut names = Vec::new();
         for project in &self.projects {
             for session in &project.threads {
-                if session.archived {
-                    continue;
-                }
                 names.push(
                     session
                         .materialized_workspace_name
@@ -1117,27 +1173,6 @@ impl WorkspaceThreadStore {
             }
         }
         names
-    }
-
-    fn archive_thread(&mut self, thread_id: &str) -> bool {
-        for project in &mut self.projects {
-            if project.active_thread_id.as_deref() == Some(thread_id) {
-                return false;
-            }
-            if let Some(session) = project
-                .threads
-                .iter_mut()
-                .find(|session| session.id == thread_id)
-            {
-                if session.archived {
-                    return false;
-                }
-                session.archived = true;
-                session.last_active_at = now_ts();
-                return true;
-            }
-        }
-        false
     }
 
     fn delete_thread(&mut self, thread_id: &str) -> Option<DeletedWorkspaceThread> {
@@ -1201,8 +1236,8 @@ impl WorkspaceThreadStore {
                     project
                         .threads
                         .iter()
-                        .find(|session| !session.archived)
                         .map(|session| session.id.clone())
+                        .next()
                 })
                 .unwrap_or_else(|| {
                     let session =
@@ -1251,7 +1286,6 @@ impl WorkspaceThread {
             work_is_running: false,
             work_needs_attention: false,
             work_finished_unseen: false,
-            archived: false,
         }
     }
 
@@ -1272,7 +1306,6 @@ impl WorkspaceThread {
             work_is_running: false,
             work_needs_attention: false,
             work_finished_unseen: false,
-            archived: false,
         }
     }
 
@@ -1898,6 +1931,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_archived_threads_are_dropped_on_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace_threads.json");
+        let legacy = serde_json::json!({
+            "active_project_id": "project-1",
+            "projects": [
+                {
+                    "id": "project-1",
+                    "name": "thinkterm",
+                    "path": "/tmp/thinkterm",
+                    "threads": [
+                        {
+                            "id": "thread-archived",
+                            "name": "Archived Thread",
+                            "project_id": "project-1",
+                            "layout": null,
+                            "materialized_workspace_name": null,
+                            "last_active_at": 1,
+                            "is_pinned": false,
+                            "is_unread": false,
+                            "work_finished_unseen": false,
+                            "archived": true
+                        },
+                        {
+                            "id": "thread-live",
+                            "name": "Live Thread",
+                            "project_id": "project-1",
+                            "layout": null,
+                            "materialized_workspace_name": null,
+                            "last_active_at": 2,
+                            "is_pinned": false,
+                            "is_unread": false,
+                            "work_finished_unseen": false,
+                            "archived": false
+                        }
+                    ],
+                    "active_thread_id": "thread-archived",
+                    "threads_collapsed": false
+                }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let loaded = load_workspace_thread_store_from_path(&path).unwrap();
+        assert_eq!(loaded.projects[0].threads.len(), 1);
+        assert_eq!(loaded.projects[0].threads[0].id, "thread-live");
+        assert_eq!(
+            loaded.projects[0].active_thread_id.as_deref(),
+            Some("thread-live")
+        );
+
+        save_workspace_thread_store_to_path(&path, &loaded).unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("archived"));
+    }
+
+    #[test]
     fn running_work_state_is_runtime_only() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("workspace_threads.json");
@@ -2229,8 +2319,6 @@ mod tests {
         assert!(store.rename_thread(&second_id, "Review".to_string()));
         assert!(store.toggle_thread_pinned(&second_id));
         assert!(store.mark_thread_unread(&second_id));
-        assert!(store.archive_thread(&second_id));
-        assert!(!store.archive_thread(&first_id));
         assert_eq!(
             store
                 .delete_thread(&third_id)
@@ -2240,17 +2328,18 @@ mod tests {
         );
 
         let project = &store.projects[0];
-        let archived = project
+        let updated = project
             .threads
             .iter()
             .find(|session| session.id == second_id)
             .unwrap();
-        assert_eq!(archived.name, "Review");
-        assert!(archived.is_pinned);
-        assert!(archived.is_unread);
-        assert!(archived.archived);
+        assert_eq!(updated.name, "Review");
+        assert!(updated.is_pinned);
+        assert!(updated.is_unread);
 
         let view = store.view_for_project("project-1", &[]);
+        assert_eq!(view.pinned_threads.len(), 1);
+        assert_eq!(view.pinned_threads[0].id, second_id);
         assert_eq!(view.projects[0].threads.len(), 1);
         assert_eq!(view.projects[0].threads[0].id, first_id);
     }

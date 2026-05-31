@@ -1461,8 +1461,6 @@ impl super::TermWindow {
             ContextMenuItem::item_with_icon("Unread", "envelope.badge", KeyAssignment::Nop)
                 .checked(true)
                 .disabled(),
-            ContextMenuItem::item_with_icon("Archived", "archivebox", KeyAssignment::Nop)
-                .disabled(),
             ContextMenuItem::item_with_icon("Pinned", "pin", KeyAssignment::Nop)
                 .checked(true)
                 .disabled(),
@@ -1489,11 +1487,6 @@ impl super::TermWindow {
                 "Rename Thread...",
                 "pencil",
                 KeyAssignment::PromptRenameWorkspaceThread(thread_id.clone()),
-            ),
-            ContextMenuItem::item_with_icon(
-                "Archive Thread",
-                "archivebox",
-                KeyAssignment::ArchiveWorkspaceThread(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
                 "Delete Thread",

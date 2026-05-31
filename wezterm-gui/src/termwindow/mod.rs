@@ -3619,12 +3619,6 @@ impl TermWindow {
                     window.invalidate();
                 }
             }
-            ArchiveWorkspaceThread(thread_id) => {
-                crate::workspace_threads::archive_thread(thread_id);
-                if let Some(window) = window.as_ref() {
-                    window.invalidate();
-                }
-            }
             DeleteWorkspaceThread(thread_id) => {
                 if let Some(deleted) = crate::workspace_threads::delete_thread(thread_id) {
                     if deleted.was_active {
