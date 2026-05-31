@@ -1069,13 +1069,7 @@ impl crate::TermWindow {
             let project_action_x = item_x
                 .saturating_add(item_width)
                 .saturating_sub(project_action_size + SIDEBAR_INSET);
-            let project_text_right = if project.is_active {
-                project_action_x
-            } else {
-                item_x
-                    .saturating_add(item_width)
-                    .saturating_sub(SIDEBAR_INSET)
-            };
+            let project_text_right = project_action_x;
 
             if row_is_visible {
                 self.ui_items.push(UIItem {
