@@ -904,9 +904,17 @@ impl super::TermWindow {
     }
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
+        let preserve_cursor = self.current_mouse_event.as_ref().is_some_and(|event| {
+            event.coords.x >= 0
+                && event.coords.y >= 0
+                && event.coords.x as usize <= self.dimensions.pixel_width
+                && event.coords.y as usize <= self.dimensions.pixel_height
+        });
         self.current_mouse_event = None;
         self.update_title();
-        context.set_cursor(Some(MouseCursor::Arrow));
+        if !preserve_cursor {
+            context.set_cursor(Some(MouseCursor::Arrow));
+        }
         context.invalidate();
     }
 

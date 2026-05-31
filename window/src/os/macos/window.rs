@@ -1427,17 +1427,30 @@ impl WindowInner {
     fn set_cursor(&mut self, cursor: Option<MouseCursor>) {
         unsafe {
             let ns_cursor_cls = class!(NSCursor);
+
+            // Remember the requested cursor on the view so that our
+            // `resetCursorRects` override can re-assert it. macOS aggressively
+            // resets the cursor to the default arrow as part of its own
+            // cursor-management cycle; this is especially visible while the
+            // main thread is busy painting heavy terminal output, because our
+            // `mouseMoved:`-driven `set` calls get coalesced/delayed and the
+            // arrow shows through, making the I-beam appear to flicker.
+            // Registering a cursor rect (see `reset_cursor_rects`) lets AppKit
+            // draw our cursor over the view instead of falling back to arrow.
+            //
+            // Avoid borrowing the view's `Inner` here: `set_cursor` can be
+            // reached synchronously from inside an event dispatch that already
+            // holds that borrow, so we stash the value in an ivar instead.
+            (**self.view).set_ivar::<i64>(CURSOR_IVAR, cursor_to_code(cursor));
+            // Ask AppKit to rebuild the cursor rects so the change above takes
+            // effect for its own cursor management on the next event.
+            let () = msg_send![*self.window, invalidateCursorRectsForView: *self.view];
+
             if let Some(cursor) = cursor {
                 // Unconditionally apply the requested cursor, as there are
                 // cases where macOS can decide to change the cursor to something
                 // that we don't know about.
-                let instance: id = match cursor {
-                    MouseCursor::Arrow => msg_send![ns_cursor_cls, arrowCursor],
-                    MouseCursor::Text => msg_send![ns_cursor_cls, IBeamCursor],
-                    MouseCursor::Hand => msg_send![ns_cursor_cls, pointingHandCursor],
-                    MouseCursor::SizeUpDown => msg_send![ns_cursor_cls, resizeUpDownCursor],
-                    MouseCursor::SizeLeftRight => msg_send![ns_cursor_cls, resizeLeftRightCursor],
-                };
+                let instance = ns_cursor_instance(cursor);
                 let () = msg_send![ns_cursor_cls, setHiddenUntilMouseMoves: NO];
                 let () = msg_send![instance, set];
             } else {
@@ -2242,6 +2255,49 @@ const VIEW_CLS_NAME: &str = "WezTermWindowView";
 const WINDOW_CLS_NAME: &str = "WezTermWindow";
 const TITLEBAR_VIEW_NAME: &str = "NSTitlebarContainerView";
 
+/// Name of the ivar on the view that stores the cursor we last asked for,
+/// encoded via [`cursor_to_code`]. macOS aggressively resets the cursor to
+/// its default (arrow) as part of its own cursor-management cycle; this lets
+/// our `cursorUpdate:` handler re-assert the cursor we actually want.
+const CURSOR_IVAR: &str = "thinktermCursorCode";
+
+/// Returns the shared `NSCursor` instance for the given logical cursor.
+unsafe fn ns_cursor_instance(cursor: MouseCursor) -> id {
+    let cls = class!(NSCursor);
+    match cursor {
+        MouseCursor::Arrow => msg_send![cls, arrowCursor],
+        MouseCursor::Text => msg_send![cls, IBeamCursor],
+        MouseCursor::Hand => msg_send![cls, pointingHandCursor],
+        MouseCursor::SizeUpDown => msg_send![cls, resizeUpDownCursor],
+        MouseCursor::SizeLeftRight => msg_send![cls, resizeLeftRightCursor],
+    }
+}
+
+/// Encode a cursor as a small integer suitable for storing in an ivar.
+/// `0` means "no managed cursor" (eg: hidden while typing).
+fn cursor_to_code(cursor: Option<MouseCursor>) -> i64 {
+    match cursor {
+        None => 0,
+        Some(MouseCursor::Arrow) => 1,
+        Some(MouseCursor::Text) => 2,
+        Some(MouseCursor::Hand) => 3,
+        Some(MouseCursor::SizeUpDown) => 4,
+        Some(MouseCursor::SizeLeftRight) => 5,
+    }
+}
+
+/// Inverse of [`cursor_to_code`].
+fn code_to_cursor(code: i64) -> Option<MouseCursor> {
+    match code {
+        1 => Some(MouseCursor::Arrow),
+        2 => Some(MouseCursor::Text),
+        3 => Some(MouseCursor::Hand),
+        4 => Some(MouseCursor::SizeUpDown),
+        5 => Some(MouseCursor::SizeLeftRight),
+        _ => None,
+    }
+}
+
 struct WindowView {
     inner: Rc<RefCell<Inner>>,
 }
@@ -2990,6 +3046,27 @@ impl WindowView {
         }
     }
 
+    /// AppKit calls this whenever it (re)builds the view's cursor rectangles,
+    /// which is also the moment it would otherwise reset the cursor to the
+    /// default arrow. By registering a cursor rect for the cursor we last
+    /// requested, we let AppKit's own cursor management paint our cursor over
+    /// the view instead of the arrow. This is what stops the I-beam from
+    /// flickering to an arrow while the main thread is busy painting heavy
+    /// terminal output (our `mouseMoved:`-driven `[NSCursor set]` calls get
+    /// coalesced/delayed, so relying on them alone is not enough).
+    extern "C" fn reset_cursor_rects(this: &mut Object, _sel: Sel) {
+        unsafe {
+            let code: i64 = *this.get_ivar::<i64>(CURSOR_IVAR);
+            if let Some(cursor) = code_to_cursor(code) {
+                let instance = ns_cursor_instance(cursor);
+                let bounds: NSRect = msg_send![this, bounds];
+                let () = msg_send![this, addCursorRect: bounds cursor: instance];
+            }
+            // code == 0 means we have no managed cursor (eg: hidden while
+            // typing); leave AppKit's default behaviour in that case.
+        }
+    }
+
     fn key_common(this: &mut Object, nsevent: id, key_is_down: bool) {
         let is_a_repeat = unsafe { nsevent.isARepeat() == YES };
         let chars = unsafe { nsstring_to_str(nsevent.characters()) };
@@ -3715,6 +3792,7 @@ impl WindowView {
 
         unsafe {
             (**view_id).set_ivar(VIEW_CLS_NAME, view as *mut c_void);
+            (**view_id).set_ivar::<i64>(CURSOR_IVAR, 0);
         }
 
         Ok(view_id)
@@ -3729,6 +3807,7 @@ impl WindowView {
             .expect("Unable to register WindowView class");
 
         cls.add_ivar::<*mut c_void>(VIEW_CLS_NAME);
+        cls.add_ivar::<i64>(CURSOR_IVAR);
         cls.add_protocol(
             Protocol::get("NSTextInputClient").expect("failed to get NSTextInputClient protocol"),
         );
@@ -3884,6 +3963,10 @@ impl WindowView {
             cls.add_method(
                 sel!(mouseExited:),
                 Self::mouse_exited as extern "C" fn(&mut Object, Sel, id),
+            );
+            cls.add_method(
+                sel!(resetCursorRects),
+                Self::reset_cursor_rects as extern "C" fn(&mut Object, Sel),
             );
 
             cls.add_method(
