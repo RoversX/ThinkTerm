@@ -9,6 +9,7 @@ pub enum SvgIcon {
     ChevronDown,
     ChevronRight,
     Cloud,
+    Ellipsis,
     Expand,
     ExternalLink,
     Folder,
@@ -17,6 +18,7 @@ pub enum SvgIcon {
     Globe,
     Info,
     Keyboard,
+    Layers,
     Link2,
     Loader,
     LoaderCircle,
@@ -63,6 +65,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-right.svg")
             }
             Self::Cloud => include_bytes!("../../../../third_party/lucide/icons/cloud.svg"),
+            Self::Ellipsis => include_bytes!("../../../../third_party/lucide/icons/ellipsis.svg"),
             Self::Expand => include_bytes!("../../../../third_party/lucide/icons/expand.svg"),
             Self::ExternalLink => {
                 include_bytes!("../../../../third_party/lucide/icons/external-link.svg")
@@ -77,6 +80,7 @@ impl SvgIcon {
             Self::Globe => include_bytes!("../../../../third_party/lucide/icons/globe.svg"),
             Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
             Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),
+            Self::Layers => include_bytes!("../../../../third_party/lucide/icons/layers.svg"),
             Self::Link2 => include_bytes!("../../../../third_party/lucide/icons/link-2.svg"),
             Self::Loader => include_bytes!("../../../../third_party/lucide/icons/loader.svg"),
             Self::LoaderCircle => {

@@ -291,7 +291,15 @@ impl GuiFrontEnd {
                         config.initial_size(dpi as u32, crate::cell_pixel_dims(&config, dpi).ok());
                     let term_config = Arc::new(config::TermConfig::with_config(config));
 
-                    crate::spawn::spawn_command_impl(spawn, spawn_where, size, None, term_config)
+                    crate::spawn::spawn_command_impl(
+                        spawn,
+                        spawn_where,
+                        size,
+                        None,
+                        term_config,
+                        None,
+                        None,
+                    )
                 }
 
                 match action {
@@ -443,7 +451,7 @@ impl GuiFrontEnd {
         future
     }
 
-    fn has_mux_window(&self, mux_window_id: MuxWindowId) -> bool {
+    pub fn has_mux_window(&self, mux_window_id: MuxWindowId) -> bool {
         for &mux_id in self.known_windows.borrow().values() {
             if mux_id == mux_window_id {
                 return true;

@@ -9,29 +9,52 @@ use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use wezterm_term::Progress;
 use wezterm_term::TerminalConfiguration;
 use wezterm_term::TerminalSize;
 
+pub type SpaceId = String;
 pub type ProjectId = String;
 pub type WorkspaceThreadId = String;
 
+const DEFAULT_SPACE_ID: &str = "space-default";
+const DEFAULT_SPACE_NAME: &str = "Default";
+const REMOTE_PROJECT_SPACE_SEPARATOR: &str = "::space::";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct WorkspaceThreadStore {
+    #[serde(default)]
+    pub spaces: Vec<Space>,
+    #[serde(default)]
+    pub last_active_space_id: Option<SpaceId>,
+    #[serde(default, skip_serializing)]
     pub active_project_id: Option<ProjectId>,
     pub projects: Vec<Project>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Space {
+    pub id: SpaceId,
+    pub name: String,
+    pub active_project_id: Option<ProjectId>,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Project {
     pub id: ProjectId,
+    #[serde(default)]
+    pub space_id: SpaceId,
     pub name: String,
     pub path: PathBuf,
     #[serde(default)]
@@ -151,16 +174,43 @@ pub struct RemovedProject {
     pub materialized_workspace_names: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedSpace {
+    pub materialized_workspace_names: Vec<String>,
+    pub fallback_space_id: SpaceId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteSpaceError {
+    NotFound,
+    DefaultSpace,
+    LastSpace,
+    Occupied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceView {
+    pub id: SpaceId,
+    pub name: String,
+    pub is_active: bool,
+    pub is_default: bool,
+    pub is_occupied_by_other_window: bool,
+}
+
 lazy_static::lazy_static! {
     static ref THREAD_STORE: Mutex<WorkspaceThreadStore> =
         Mutex::new(load_workspace_thread_store().unwrap_or_else(|err| {
             log::warn!("failed to load ThinkTerm workspace thread store: {err:#}");
             WorkspaceThreadStore::default()
         }));
+    static ref WINDOW_SPACES: Mutex<HashMap<u64, SpaceId>> = Mutex::new(HashMap::new());
+    static ref MATERIALIZING_LAYOUT_WORKSPACES: Mutex<HashMap<String, usize>> =
+        Mutex::new(HashMap::new());
 }
 
 static THREAD_STORE_PERSIST_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static THREAD_STORE_PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
+static NEXT_SPACE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn workspace_thread_store_path() -> PathBuf {
     crate::native_paths::data_file("workspace_threads.json")
@@ -182,7 +232,10 @@ pub fn load_workspace_thread_store_from_path(path: &Path) -> Result<WorkspaceThr
     if removed > 0 {
         log::info!("dropped {removed} legacy archived ThinkTerm workspace threads");
     }
-    serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))
+    let mut store: WorkspaceThreadStore =
+        serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))?;
+    store.normalize_after_load();
+    Ok(store)
 }
 
 fn drop_legacy_archived_threads(value: &mut serde_json::Value) -> usize {
@@ -343,7 +396,243 @@ pub fn save_workspace_thread_store_to_path(
         .with_context(|| format!("sync {}", path.display()))
 }
 
-pub fn current_project_from_cwd() -> Project {
+pub fn default_space_id() -> SpaceId {
+    DEFAULT_SPACE_ID.to_string()
+}
+
+pub fn next_space_owner_id() -> u64 {
+    NEXT_SPACE_OWNER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn space_for_window(owner_id: u64) -> SpaceId {
+    if let Some(space_id) = WINDOW_SPACES.lock().get(&owner_id).cloned() {
+        return space_id;
+    }
+    claim_initial_space_for_window(owner_id)
+}
+
+pub fn claim_initial_space_for_window(owner_id: u64) -> SpaceId {
+    let occupied = WINDOW_SPACES
+        .lock()
+        .iter()
+        .filter_map(|(owner, space)| (*owner != owner_id).then(|| space.clone()))
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut store = THREAD_STORE.lock();
+    let changed = store.normalize_after_load();
+    let space_id = store
+        .last_active_space_id
+        .clone()
+        .filter(|space_id| store.has_space(space_id) && !occupied.contains(space_id))
+        .or_else(|| {
+            store
+                .spaces
+                .iter()
+                .find(|space| !occupied.contains(&space.id))
+                .map(|space| space.id.clone())
+        })
+        .unwrap_or_else(|| {
+            let name = next_space_name(&store.spaces);
+            store.create_space_record(name)
+        });
+    if store.last_active_space_id.as_deref() != Some(&space_id) {
+        store.last_active_space_id = Some(space_id.clone());
+        persist_locked(&store);
+    } else if changed {
+        persist_locked(&store);
+    }
+    drop(store);
+
+    WINDOW_SPACES.lock().insert(owner_id, space_id.clone());
+    space_id
+}
+
+pub fn release_window_space(owner_id: u64) {
+    WINDOW_SPACES.lock().remove(&owner_id);
+}
+
+pub fn switch_window_space(owner_id: u64, space_id: &str) -> bool {
+    if WINDOW_SPACES
+        .lock()
+        .iter()
+        .any(|(owner, active_space)| *owner != owner_id && active_space == space_id)
+    {
+        return false;
+    }
+
+    let mut store = THREAD_STORE.lock();
+    if !store.has_space(space_id) {
+        return false;
+    }
+    store.last_active_space_id = Some(space_id.to_string());
+    persist_locked(&store);
+    drop(store);
+
+    WINDOW_SPACES.lock().insert(owner_id, space_id.to_string());
+    true
+}
+
+pub fn spaces_for_window(owner_id: u64) -> Vec<SpaceView> {
+    let active_space_id = space_for_window(owner_id);
+    let occupied = WINDOW_SPACES.lock().clone();
+    let mut store = THREAD_STORE.lock();
+    if store.normalize_after_load() {
+        persist_locked(&store);
+    }
+    store
+        .spaces
+        .iter()
+        .map(|space| SpaceView {
+            id: space.id.clone(),
+            name: space.name.clone(),
+            is_active: space.id == active_space_id,
+            is_default: space.is_default,
+            is_occupied_by_other_window: occupied
+                .iter()
+                .any(|(owner, active_space)| *owner != owner_id && active_space == &space.id),
+        })
+        .collect()
+}
+
+pub fn active_space_name(space_id: &str) -> Option<String> {
+    let mut store = THREAD_STORE.lock();
+    if store.normalize_after_load() {
+        persist_locked(&store);
+    }
+    store
+        .spaces
+        .iter()
+        .find(|space| space.id == space_id)
+        .map(|space| space.name.clone())
+}
+
+pub fn create_space(name: Option<String>) -> SpaceId {
+    let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    let name = name.unwrap_or_else(|| next_space_name(&store.spaces));
+    let id = store.create_space_record(name);
+    store.last_active_space_id = Some(id.clone());
+    persist_locked(&store);
+    id
+}
+
+pub fn rename_space(space_id: &str, name: String) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.rename_space(space_id, name);
+    if changed {
+        persist_locked(&store);
+    }
+    changed
+}
+
+pub fn delete_space_for_window(
+    owner_id: u64,
+    space_id: &str,
+) -> Result<DeletedSpace, DeleteSpaceError> {
+    let window_was_active = WINDOW_SPACES
+        .lock()
+        .get(&owner_id)
+        .is_some_and(|active_space| active_space == space_id);
+    let occupied_by_other = WINDOW_SPACES
+        .lock()
+        .iter()
+        .filter_map(|(owner, active_space)| (*owner != owner_id).then(|| active_space.clone()))
+        .collect::<std::collections::HashSet<_>>();
+    if occupied_by_other.contains(space_id) {
+        return Err(DeleteSpaceError::Occupied);
+    }
+
+    let mut store = THREAD_STORE.lock();
+    let mut deleted = store.delete_space(space_id)?;
+    if window_was_active {
+        let fallback_space_id = store
+            .spaces
+            .iter()
+            .find(|space| space.is_default && !occupied_by_other.contains(&space.id))
+            .or_else(|| {
+                store
+                    .spaces
+                    .iter()
+                    .find(|space| !occupied_by_other.contains(&space.id))
+            })
+            .map(|space| space.id.clone())
+            .unwrap_or_else(|| {
+                let name = next_space_name(&store.spaces);
+                store.create_space_record(name)
+            });
+        store.last_active_space_id = Some(fallback_space_id.clone());
+        deleted.fallback_space_id = fallback_space_id;
+    }
+    persist_locked(&store);
+    drop(store);
+
+    if window_was_active {
+        WINDOW_SPACES
+            .lock()
+            .insert(owner_id, deleted.fallback_space_id.clone());
+    }
+    Ok(deleted)
+}
+
+pub fn ensure_active_thread_for_space(space_id: &str) -> Option<WorkspaceThreadId> {
+    let mut store = THREAD_STORE.lock();
+    let mut changed = store.normalize_after_load();
+    if !store.has_space(space_id) {
+        return None;
+    }
+    let project_id = store
+        .active_project_id_for_space(space_id)
+        .filter(|project_id| {
+            store
+                .projects
+                .iter()
+                .any(|project| project.space_id == space_id && &project.id == project_id)
+        })
+        .or_else(|| {
+            store
+                .projects
+                .iter()
+                .find(|project| project.space_id == space_id)
+                .map(|project| project.id.clone())
+        })
+        .unwrap_or_else(|| {
+            let mut project = current_project_from_cwd(space_id);
+            let session = WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
+            let thread_id = session.id.clone();
+            project.active_thread_id = Some(thread_id);
+            let project_id = project.id.clone();
+            project.threads.push(session);
+            store.projects.push(project);
+            changed = true;
+            project_id
+        });
+    let thread_id = store.active_thread_for_project(&project_id);
+    if changed {
+        persist_locked(&store);
+    }
+    thread_id
+}
+
+pub fn thread_to_restore_for_space(space_id: &str) -> Option<WorkspaceThreadId> {
+    let mut store = THREAD_STORE.lock();
+    let mut changed = store.normalize_after_load();
+    let (thread_id, selected_changed) = store.thread_to_restore_for_space(space_id);
+    changed |= selected_changed;
+    if changed {
+        persist_locked(&store);
+    }
+    thread_id
+}
+
+pub fn workspace_has_thread_binding(workspace: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    if store.normalize_after_load() {
+        persist_locked(&store);
+    }
+    store.workspace_space_id(workspace).is_some()
+}
+
+pub fn current_project_from_cwd(space_id: &str) -> Project {
     let path = std::env::current_dir().unwrap_or_else(|_| config::HOME_DIR.to_path_buf());
     let name = path
         .file_name()
@@ -351,9 +640,10 @@ pub fn current_project_from_cwd() -> Project {
         .filter(|name| !name.is_empty())
         .unwrap_or("Home")
         .to_string();
-    let id = project_id_for_path(&path);
+    let id = project_id_for_path(space_id, &path);
     Project {
         id,
+        space_id: space_id.to_string(),
         name,
         path,
         threads: vec![],
@@ -362,8 +652,8 @@ pub fn current_project_from_cwd() -> Project {
     }
 }
 
-fn current_project_for_workspace(active_workspace: &str) -> Project {
-    let mut project = current_project_from_cwd();
+fn current_project_for_workspace(space_id: &str, active_workspace: &str) -> Project {
+    let mut project = current_project_from_cwd(space_id);
     let session = WorkspaceThread::new_initial(
         project.id.clone(),
         "main".to_string(),
@@ -375,40 +665,33 @@ fn current_project_for_workspace(active_workspace: &str) -> Project {
 }
 
 pub fn view_for_current_project(
+    space_id: &str,
     active_workspace: &str,
     live_workspaces: &[String],
 ) -> WorkspaceThreadsView {
-    let store = THREAD_STORE.lock();
+    let mut store = THREAD_STORE.lock();
+    if store.normalize_after_load() {
+        persist_locked(&store);
+    }
     if let Some(project_id) = store
-        .project_id_for_workspace(active_workspace)
-        .or_else(|| store.active_project_id.clone())
+        .project_id_for_workspace(space_id, active_workspace)
+        .or_else(|| store.active_project_id_for_space(space_id))
         .filter(|project_id| {
             store
                 .projects
                 .iter()
-                .any(|project| &project.id == project_id)
+                .any(|project| project.space_id == space_id && &project.id == project_id)
         })
     {
-        return store.view_for_project(&project_id, live_workspaces);
+        return store.view_for_project(space_id, &project_id, live_workspaces);
     }
 
-    current_project_for_workspace(active_workspace).view(live_workspaces)
+    current_project_for_workspace(space_id, active_workspace).view(live_workspaces)
 }
 
-pub fn sync_current_project(active_workspace: &str) -> bool {
+pub fn sync_current_project(space_id: &str, active_workspace: &str) -> bool {
     let mut store = THREAD_STORE.lock();
-    let (project_id, mut changed) =
-        if let Some(project_id) = store.project_id_for_workspace(active_workspace) {
-            if store.active_project_id.as_deref() != Some(&project_id) {
-                store.active_project_id = Some(project_id.clone());
-                (project_id, true)
-            } else {
-                (project_id, false)
-            }
-        } else {
-            store.ensure_current_project(active_workspace)
-        };
-    changed |= store.sync_active_workspace(&project_id, active_workspace);
+    let changed = store.sync_current_project(space_id, active_workspace);
     if changed {
         persist_locked(&store);
     }
@@ -422,10 +705,11 @@ pub fn create_thread(project_id: &str, name: Option<String>) -> WorkspaceThreadI
     thread_id
 }
 
-pub fn create_project_from_path(path: &str) -> Result<WorkspaceThreadId> {
+pub fn create_project_from_path(space_id: &str, path: &str) -> Result<WorkspaceThreadId> {
     let path = normalize_project_path(path)?;
     let mut store = THREAD_STORE.lock();
-    let thread_id = store.create_project_from_path(path);
+    store.normalize_after_load();
+    let thread_id = store.create_project_from_path(space_id, path);
     persist_locked(&store);
     Ok(thread_id)
 }
@@ -434,18 +718,31 @@ pub fn create_project_from_path(path: &str) -> Result<WorkspaceThreadId> {
 /// mark it active, and return its id. Remote host connection details live in
 /// `ssh_hosts.json`; the project record here is layout/sidebar state only.
 pub fn create_remote_host_thread(
-    project_id: &str,
+    space_id: &str,
+    host_id: &str,
     label: &str,
     path: PathBuf,
     workspace_name: &str,
 ) -> WorkspaceThreadId {
     let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    let project_id = if store
+        .projects
+        .iter()
+        .any(|project| project.id == host_id && project.space_id == space_id)
+    {
+        host_id.to_string()
+    } else {
+        remote_project_id_for_space(space_id, host_id)
+    };
     if let Some(project) = store.projects.iter_mut().find(|p| p.id == project_id) {
+        project.space_id = space_id.to_string();
         project.name = label.to_string();
         project.path = path.clone();
     } else {
         store.projects.push(Project {
-            id: project_id.to_string(),
+            id: project_id.clone(),
+            space_id: space_id.to_string(),
             name: label.to_string(),
             path,
             threads: vec![],
@@ -460,15 +757,11 @@ pub fn create_remote_host_thread(
         .find(|p| p.id == project_id)
         .expect("remote project was just inserted");
     let name = format!("Thread {}", project.threads.len() + 1);
-    let session = WorkspaceThread::new(
-        project_id.to_string(),
-        name,
-        Some(workspace_name.to_string()),
-    );
+    let session = WorkspaceThread::new(project_id.clone(), name, Some(workspace_name.to_string()));
     let thread_id = session.id.clone();
     project.active_thread_id = Some(thread_id.clone());
     project.threads.push(session);
-    store.active_project_id = Some(project_id.to_string());
+    store.set_active_project_for_space(space_id, project_id);
     persist_locked(&store);
     thread_id
 }
@@ -538,28 +831,64 @@ pub fn acknowledge_thread_work_for_workspace_deferred(workspace: &str) -> bool {
     change.changed
 }
 
-pub fn snapshot_workspace_layout_with_font_scales<F>(
+pub fn is_materializing_thread_layout(workspace: &str) -> bool {
+    MATERIALIZING_LAYOUT_WORKSPACES
+        .lock()
+        .get(workspace)
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
+struct MaterializeThreadLayoutGuard {
+    workspace: String,
+}
+
+impl MaterializeThreadLayoutGuard {
+    fn new(workspace: String) -> Self {
+        *MATERIALIZING_LAYOUT_WORKSPACES
+            .lock()
+            .entry(workspace.clone())
+            .or_insert(0) += 1;
+        Self { workspace }
+    }
+}
+
+impl Drop for MaterializeThreadLayoutGuard {
+    fn drop(&mut self) {
+        let mut workspaces = MATERIALIZING_LAYOUT_WORKSPACES.lock();
+        if let Some(depth) = workspaces.get_mut(&self.workspace) {
+            *depth = depth.saturating_sub(1);
+            if *depth == 0 {
+                workspaces.remove(&self.workspace);
+            }
+        }
+    }
+}
+
+pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
+    space_id: &str,
     workspace: &str,
     window_id: MuxWindowId,
     pane_font_scale: F,
 ) where
     F: Fn(PaneId) -> Option<f64>,
 {
+    if is_materializing_thread_layout(workspace) {
+        return;
+    }
+
     let Some(snapshot) = snapshot_window_layout(window_id, &pane_font_scale) else {
         return;
     };
+    if snapshot.tabs.is_empty() {
+        return;
+    }
 
     let mut store = THREAD_STORE.lock();
-    store.snapshot_workspace_layout(workspace, snapshot);
-    persist_locked(&store);
-}
-
-pub fn snapshot_active_thread_layout_with_font_scales<F>(window_id: MuxWindowId, pane_font_scale: F)
-where
-    F: Fn(PaneId) -> Option<f64>,
-{
-    let workspace = Mux::get().active_workspace();
-    snapshot_workspace_layout_with_font_scales(&workspace, window_id, pane_font_scale);
+    if store.snapshot_active_space_thread_layout(space_id, workspace, snapshot) {
+        persist_locked(&store);
+    }
 }
 
 pub async fn materialize_thread(
@@ -584,6 +913,7 @@ pub async fn materialize_thread(
         }
     });
     if let Some(layout) = layout {
+        let _guard = MaterializeThreadLayoutGuard::new(workspace_name.clone());
         materialize_layout(mux, workspace_name, layout, initial_cwd, size, term_config).await
     } else {
         let (_tab, pane, _window_id) = mux
@@ -762,42 +1092,224 @@ impl Project {
 }
 
 impl WorkspaceThreadStore {
-    fn ensure_current_project(&mut self, active_workspace: &str) -> (ProjectId, bool) {
-        let current = current_project_from_cwd();
-        let (project_id, mut changed) =
-            if let Some(project) = self.projects.iter().find(|p| p.path == current.path) {
-                (project.id.clone(), false)
-            } else {
-                let mut project = current;
-                let session = WorkspaceThread::new_initial(
-                    project.id.clone(),
-                    "main".to_string(),
-                    Some(active_workspace.to_string()),
-                );
-                project.active_thread_id = Some(session.id.clone());
-                project.threads.push(session);
-                let project_id = project.id.clone();
-                self.projects.push(project);
-                (project_id, true)
-            };
-        if self.active_project_id.as_deref() != Some(&project_id) {
-            self.active_project_id = Some(project_id.clone());
+    fn normalize_after_load(&mut self) -> bool {
+        let mut changed = false;
+        if self.spaces.is_empty() {
+            self.spaces.push(Space {
+                id: DEFAULT_SPACE_ID.to_string(),
+                name: DEFAULT_SPACE_NAME.to_string(),
+                active_project_id: self.active_project_id.clone(),
+                is_default: true,
+            });
             changed = true;
         }
+
+        let default_space_id = self
+            .spaces
+            .iter()
+            .find(|space| space.is_default)
+            .map(|space| space.id.clone())
+            .unwrap_or_else(|| {
+                self.spaces[0].is_default = true;
+                self.spaces[0].id.clone()
+            });
+
+        let known_spaces = self
+            .spaces
+            .iter()
+            .map(|space| space.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for project in &mut self.projects {
+            if project.space_id.is_empty() || !known_spaces.contains(&project.space_id) {
+                project.space_id = default_space_id.clone();
+                changed = true;
+            }
+        }
+
+        if let Some(active_project_id) = self.active_project_id.take() {
+            if let Some(default_space) = self
+                .spaces
+                .iter_mut()
+                .find(|space| space.id == default_space_id)
+            {
+                if default_space.active_project_id.is_none() {
+                    default_space.active_project_id = Some(active_project_id);
+                    changed = true;
+                }
+            }
+        }
+
+        for index in 0..self.spaces.len() {
+            let space_id = self.spaces[index].id.clone();
+            let active_project_id = self.spaces[index].active_project_id.clone();
+            let active_is_valid = active_project_id.as_ref().is_some_and(|project_id| {
+                self.projects
+                    .iter()
+                    .any(|project| project.space_id == space_id && &project.id == project_id)
+            });
+            if !active_is_valid {
+                let next_active_project_id = self
+                    .projects
+                    .iter()
+                    .find(|project| project.space_id == space_id)
+                    .map(|project| project.id.clone());
+                if self.spaces[index].active_project_id != next_active_project_id {
+                    self.spaces[index].active_project_id = next_active_project_id;
+                    changed = true;
+                }
+            }
+        }
+
+        if self
+            .last_active_space_id
+            .as_ref()
+            .is_none_or(|space_id| !self.has_space(space_id))
+        {
+            self.last_active_space_id = Some(default_space_id);
+            changed = true;
+        }
+        changed |= self.repair_cross_space_local_workspace_bindings();
+        changed
+    }
+
+    fn has_space(&self, space_id: &str) -> bool {
+        self.spaces.iter().any(|space| space.id == space_id)
+    }
+
+    fn create_space_record(&mut self, name: String) -> SpaceId {
+        let id = new_id("space");
+        self.spaces.push(Space {
+            id: id.clone(),
+            name,
+            active_project_id: None,
+            is_default: false,
+        });
+        id
+    }
+
+    fn rename_space(&mut self, space_id: &str, name: String) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) else {
+            return false;
+        };
+        // Space ids must be stable: project ids for new projects are derived from
+        // space_id, so renaming a Space may only change the display name.
+        if space.name == name {
+            return false;
+        }
+        space.name = name.to_string();
+        true
+    }
+
+    fn delete_space(&mut self, space_id: &str) -> Result<DeletedSpace, DeleteSpaceError> {
+        let index = self
+            .spaces
+            .iter()
+            .position(|space| space.id == space_id)
+            .ok_or(DeleteSpaceError::NotFound)?;
+        if self.spaces[index].is_default {
+            return Err(DeleteSpaceError::DefaultSpace);
+        }
+        if self.spaces.len() <= 1 {
+            return Err(DeleteSpaceError::LastSpace);
+        }
+
+        self.spaces.remove(index);
+        let materialized_workspace_names = self
+            .projects
+            .iter()
+            .filter(|project| project.space_id == space_id)
+            .flat_map(|project| {
+                project
+                    .threads
+                    .iter()
+                    .filter_map(|thread| thread.materialized_workspace_name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        self.projects.retain(|project| project.space_id != space_id);
+
+        let fallback_space_id = self
+            .spaces
+            .iter()
+            .find(|space| space.is_default)
+            .or_else(|| self.spaces.first())
+            .map(|space| space.id.clone())
+            .unwrap_or_else(default_space_id);
+        if self.last_active_space_id.as_deref() == Some(space_id) {
+            self.last_active_space_id = Some(fallback_space_id.clone());
+        }
+        Ok(DeletedSpace {
+            materialized_workspace_names,
+            fallback_space_id,
+        })
+    }
+
+    fn active_project_id_for_space(&self, space_id: &str) -> Option<ProjectId> {
+        self.spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .and_then(|space| space.active_project_id.clone())
+    }
+
+    fn set_active_project_for_space(&mut self, space_id: &str, project_id: ProjectId) -> bool {
+        let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) else {
+            return false;
+        };
+        if space.active_project_id.as_deref() == Some(&project_id) {
+            return false;
+        }
+        space.active_project_id = Some(project_id);
+        true
+    }
+
+    fn ensure_current_project(
+        &mut self,
+        space_id: &str,
+        active_workspace: &str,
+    ) -> (ProjectId, bool) {
+        let current = current_project_from_cwd(space_id);
+        let (project_id, mut changed) = if let Some(project) = self
+            .projects
+            .iter()
+            .find(|p| p.space_id == space_id && p.path == current.path)
+        {
+            (project.id.clone(), false)
+        } else {
+            let mut project = current;
+            let session = WorkspaceThread::new_initial(
+                project.id.clone(),
+                "main".to_string(),
+                Some(active_workspace.to_string()),
+            );
+            project.active_thread_id = Some(session.id.clone());
+            project.threads.push(session);
+            let project_id = project.id.clone();
+            self.projects.push(project);
+            (project_id, true)
+        };
+        changed |= self.set_active_project_for_space(space_id, project_id.clone());
         (project_id, changed)
     }
 
     fn view_for_project(
         &self,
+        space_id: &str,
         project_id: &str,
         live_workspaces: &[String],
     ) -> WorkspaceThreadsView {
-        let active_project_id = self.active_project_id.as_deref().unwrap_or(project_id);
+        let active_project_id = self
+            .active_project_id_for_space(space_id)
+            .unwrap_or_else(|| project_id.to_string());
         let pinned_threads = self
             .projects
             .iter()
+            .filter(|project| project.space_id == space_id)
             .flat_map(|project| {
-                thread_views_for_project(project, Some(active_project_id), live_workspaces)
+                thread_views_for_project(project, Some(&active_project_id), live_workspaces)
                     .into_iter()
                     .filter(|session| session.is_pinned)
             })
@@ -805,6 +1317,7 @@ impl WorkspaceThreadStore {
         let projects = self
             .projects
             .iter()
+            .filter(|project| project.space_id == space_id)
             .map(|project| {
                 let is_remote = is_remote_project(project);
                 ProjectView {
@@ -814,7 +1327,7 @@ impl WorkspaceThreadStore {
                     threads_collapsed: project.threads_collapsed,
                     threads: thread_views_for_project(
                         project,
-                        Some(active_project_id),
+                        Some(&active_project_id),
                         live_workspaces,
                     )
                     .into_iter()
@@ -822,7 +1335,7 @@ impl WorkspaceThreadStore {
                     .collect(),
                     is_remote,
                     distro: if is_remote {
-                        crate::ssh_hosts::host_spec(&project.id)
+                        crate::ssh_hosts::host_spec(remote_host_id_for_project_id(&project.id))
                             .and_then(|spec| spec.detected_distro.clone())
                     } else {
                         None
@@ -836,10 +1349,18 @@ impl WorkspaceThreadStore {
         }
     }
 
-    fn sync_active_workspace(&mut self, project_id: &str, active_workspace: &str) -> bool {
+    fn sync_active_workspace(
+        &mut self,
+        space_id: &str,
+        project_id: &str,
+        active_workspace: &str,
+    ) -> bool {
         let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) else {
             return false;
         };
+        if project.space_id != space_id {
+            return false;
+        }
         if let Some(session) = project.threads.iter().find(|session| {
             session.materialized_workspace_name.as_deref() == Some(active_workspace)
         }) {
@@ -875,6 +1396,71 @@ impl WorkspaceThreadStore {
         false
     }
 
+    fn sync_current_project(&mut self, space_id: &str, active_workspace: &str) -> bool {
+        let mut changed = self.normalize_after_load();
+        if self.workspace_belongs_to_other_space(space_id, active_workspace) {
+            return changed;
+        }
+        let (project_id, project_changed) =
+            if let Some(project_id) = self.project_id_for_workspace(space_id, active_workspace) {
+                if self.set_active_project_for_space(space_id, project_id.clone()) {
+                    (project_id, true)
+                } else {
+                    (project_id, false)
+                }
+            } else {
+                self.ensure_current_project(space_id, active_workspace)
+            };
+        changed |= project_changed;
+        changed |= self.sync_active_workspace(space_id, &project_id, active_workspace);
+        changed
+    }
+
+    fn workspace_space_id(&self, workspace: &str) -> Option<SpaceId> {
+        self.projects.iter().find_map(|project| {
+            project
+                .threads
+                .iter()
+                .any(|session| {
+                    session.materialized_workspace_name.as_deref() == Some(workspace)
+                        || workspace_name_for_thread(&project.id, &session.id) == workspace
+                })
+                .then(|| project.space_id.clone())
+        })
+    }
+
+    fn workspace_belongs_to_other_space(&self, space_id: &str, workspace: &str) -> bool {
+        self.workspace_space_id(workspace)
+            .is_some_and(|owner_space_id| owner_space_id != space_id)
+    }
+
+    fn repair_cross_space_local_workspace_bindings(&mut self) -> bool {
+        let mut changed = false;
+        for project in &mut self.projects {
+            if is_remote_project(project) {
+                continue;
+            }
+            for session in &mut project.threads {
+                let expected_workspace = workspace_name_for_thread(&project.id, &session.id);
+                let Some(materialized_workspace) = session.materialized_workspace_name.as_deref()
+                else {
+                    continue;
+                };
+
+                // Space ids are part of new local project ids. A local thread
+                // pointing at another `thinkterm:*` workspace would make two
+                // Spaces share one live terminal and corrupt layout snapshots.
+                if materialized_workspace.starts_with("thinkterm:")
+                    && materialized_workspace != expected_workspace
+                {
+                    session.materialized_workspace_name = Some(expected_workspace);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     fn create_thread(&mut self, project_id: &str, name: Option<String>) -> WorkspaceThreadId {
         let project = self
             .projects
@@ -888,12 +1474,14 @@ impl WorkspaceThreadStore {
         id
     }
 
-    fn create_project_from_path(&mut self, path: PathBuf) -> WorkspaceThreadId {
-        let project_id = project_id_for_path(&path);
+    fn create_project_from_path(&mut self, space_id: &str, path: PathBuf) -> WorkspaceThreadId {
+        // New project ids include the stable Space id, but migration must never
+        // recompute old project ids; existing Project.id values remain valid.
+        let project_id = project_id_for_path(space_id, &path);
         if let Some(existing_project_id) = self
             .projects
             .iter()
-            .find(|project| project.path == path)
+            .find(|project| project.space_id == space_id && project.path == path)
             .map(|project| project.id.clone())
         {
             if let Some(thread_id) = self.active_thread_for_project(&existing_project_id) {
@@ -909,6 +1497,7 @@ impl WorkspaceThreadStore {
             .to_string();
         let mut project = Project {
             id: project_id.clone(),
+            space_id: space_id.to_string(),
             name,
             path,
             threads: vec![],
@@ -919,13 +1508,16 @@ impl WorkspaceThreadStore {
         let thread_id = session.id.clone();
         project.active_thread_id = Some(thread_id.clone());
         project.threads.push(session);
-        self.active_project_id = Some(project_id);
+        self.set_active_project_for_space(space_id, project_id);
         self.projects.push(project);
         thread_id
     }
 
-    fn project_id_for_workspace(&self, workspace: &str) -> Option<ProjectId> {
+    fn project_id_for_workspace(&self, space_id: &str, workspace: &str) -> Option<ProjectId> {
         self.projects.iter().find_map(|project| {
+            if project.space_id != space_id {
+                return None;
+            }
             project
                 .threads
                 .iter()
@@ -938,18 +1530,23 @@ impl WorkspaceThreadStore {
     }
 
     fn active_thread_for_project(&mut self, project_id: &str) -> Option<WorkspaceThreadId> {
-        let project = self
+        let project_index = self
             .projects
-            .iter_mut()
-            .find(|project| project.id == project_id)?;
+            .iter()
+            .position(|project| project.id == project_id)?;
+        let project = &mut self.projects[project_index];
         if project.active_thread_id.as_ref().is_some_and(|active_id| {
             project
                 .threads
                 .iter()
                 .any(|session| &session.id == active_id)
         }) {
-            self.active_project_id = Some(project.id.clone());
-            return project.active_thread_id.clone();
+            let space_id = project.space_id.clone();
+            let project_id = project.id.clone();
+            let active_thread_id = project.active_thread_id.clone();
+            let _ = project;
+            self.set_active_project_for_space(&space_id, project_id);
+            return active_thread_id;
         }
 
         let thread_id = project
@@ -964,8 +1561,74 @@ impl WorkspaceThreadStore {
                 thread_id
             });
         project.active_thread_id = Some(thread_id.clone());
-        self.active_project_id = Some(project.id.clone());
+        let space_id = project.space_id.clone();
+        let project_id = project.id.clone();
+        let _ = project;
+        self.set_active_project_for_space(&space_id, project_id);
         Some(thread_id)
+    }
+
+    fn thread_to_restore_for_space(&mut self, space_id: &str) -> (Option<WorkspaceThreadId>, bool) {
+        if !self.has_space(space_id) {
+            return (None, false);
+        }
+
+        let project_indices = self
+            .active_project_id_for_space(space_id)
+            .and_then(|active_project_id| {
+                self.projects.iter().position(|project| {
+                    project.space_id == space_id && project.id == active_project_id
+                })
+            })
+            .into_iter()
+            .chain(
+                self.projects
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, project)| (project.space_id == space_id).then_some(index)),
+            )
+            .collect::<Vec<_>>();
+
+        for project_index in project_indices {
+            let Some(thread_id) = self.restorable_thread_id_for_project(project_index) else {
+                continue;
+            };
+            let project = &mut self.projects[project_index];
+            let mut changed = false;
+            if project.active_thread_id.as_deref() != Some(&thread_id) {
+                project.active_thread_id = Some(thread_id.clone());
+                changed = true;
+            }
+            let project_id = project.id.clone();
+            let _ = project;
+            changed |= self.set_active_project_for_space(space_id, project_id);
+            return (Some(thread_id), changed);
+        }
+
+        (None, false)
+    }
+
+    fn restorable_thread_id_for_project(&self, project_index: usize) -> Option<WorkspaceThreadId> {
+        let project = self.projects.get(project_index)?;
+        project
+            .active_thread_id
+            .as_ref()
+            .and_then(|active_thread_id| {
+                project
+                    .threads
+                    .iter()
+                    .find(|thread| {
+                        &thread.id == active_thread_id && thread_has_restorable_workspace(thread)
+                    })
+                    .map(|thread| thread.id.clone())
+            })
+            .or_else(|| {
+                project
+                    .threads
+                    .iter()
+                    .find(|thread| thread_has_restorable_workspace(thread))
+                    .map(|thread| thread.id.clone())
+            })
     }
 
     fn activate_thread_record(
@@ -993,31 +1656,66 @@ impl WorkspaceThreadStore {
         session.last_active_at = now_ts();
         session.is_unread = false;
         session.work_finished_unseen = false;
-        project.active_thread_id = Some(session.id.clone());
-        self.active_project_id = Some(project.id.clone());
+        let thread_id = session.id.clone();
+        project.active_thread_id = Some(thread_id.clone());
+        let space_id = project.space_id.clone();
+        let active_project_id = project.id.clone();
+        let project_path = project.path.clone();
+        let _ = project;
+        self.set_active_project_for_space(&space_id, active_project_id);
         Some(ActivationPlan {
             project_id,
-            thread_id: session.id.clone(),
+            thread_id,
             workspace_name,
-            project_path: project.path.clone(),
+            project_path,
             needs_materialize,
         })
     }
 
-    fn snapshot_workspace_layout(
+    fn snapshot_active_space_thread_layout(
         &mut self,
+        space_id: &str,
         workspace: &str,
         snapshot: WorkspaceThreadLayoutSnapshot,
-    ) {
-        for project in &mut self.projects {
-            for session in &mut project.threads {
-                if session.materialized_workspace_name.as_deref() == Some(workspace) {
-                    session.layout = Some(snapshot);
-                    session.last_active_at = now_ts();
-                    return;
-                }
-            }
+    ) -> bool {
+        let Some(project_id) = self.active_project_id_for_space(space_id) else {
+            return false;
+        };
+        let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.space_id == space_id && project.id == project_id)
+        else {
+            return false;
+        };
+        let project_id = project.id.clone();
+        let active_thread_id = project
+            .active_thread_id
+            .clone()
+            .or_else(|| project.threads.first().map(|session| session.id.clone()));
+        let Some(active_thread_id) = active_thread_id else {
+            return false;
+        };
+        let Some(session) = project
+            .threads
+            .iter_mut()
+            .find(|session| session.id == active_thread_id)
+        else {
+            return false;
+        };
+
+        let expected_workspace = session
+            .materialized_workspace_name
+            .clone()
+            .unwrap_or_else(|| workspace_name_for_thread(&project_id, &session.id));
+        if expected_workspace != workspace {
+            return false;
         }
+
+        session.materialized_workspace_name = Some(workspace.to_string());
+        session.layout = Some(snapshot);
+        session.last_active_at = now_ts();
+        true
     }
 
     fn workspace_pane_font_scales(
@@ -1209,16 +1907,22 @@ impl WorkspaceThreadStore {
     }
 
     fn remove_project(&mut self, project_id: &str) -> Option<RemovedProject> {
-        if self.projects.len() <= 1 {
-            return None;
-        }
-
         let index = self
             .projects
             .iter()
             .position(|project| project.id == project_id)?;
+        let space_id = self.projects[index].space_id.clone();
+        if self
+            .projects
+            .iter()
+            .filter(|project| project.space_id == space_id)
+            .count()
+            <= 1
+        {
+            return None;
+        }
         let removed = self.projects.remove(index);
-        let was_active = self.active_project_id.as_deref() == Some(project_id);
+        let was_active = self.active_project_id_for_space(&space_id).as_deref() == Some(project_id);
         let materialized_workspace_names = removed
             .threads
             .iter()
@@ -1226,9 +1930,26 @@ impl WorkspaceThreadStore {
             .collect::<Vec<_>>();
 
         let next_thread_id = if was_active {
-            let next_index = index.saturating_sub(1).min(self.projects.len() - 1);
+            let Some(next_index) = self
+                .projects
+                .iter()
+                .enumerate()
+                .filter(|(_, project)| project.space_id == space_id)
+                .map(|(idx, _)| idx)
+                .find(|idx| *idx >= index)
+                .or_else(|| {
+                    self.projects
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, project)| project.space_id == space_id)
+                        .map(|(idx, _)| idx)
+                })
+            else {
+                return None;
+            };
             let project = &mut self.projects[next_index];
-            self.active_project_id = Some(project.id.clone());
+            let next_project_id = project.id.clone();
             let thread_id = project
                 .active_thread_id
                 .clone()
@@ -1247,6 +1968,8 @@ impl WorkspaceThreadStore {
                     thread_id
                 });
             project.active_thread_id = Some(thread_id.clone());
+            let _ = project;
+            self.set_active_project_for_space(&space_id, next_project_id);
             Some(thread_id)
         } else {
             None
@@ -1425,6 +2148,52 @@ where
         tabs,
         terminal_specs,
     })
+}
+
+pub fn window_layout_structure_fingerprint(window_id: MuxWindowId) -> Option<u64> {
+    let mux = Mux::get();
+    let window = mux.get_window(window_id)?;
+    let mut hasher = DefaultHasher::new();
+    window.get_active_idx().hash(&mut hasher);
+
+    let mut tab_count = 0usize;
+    for tab in window.iter() {
+        tab_count += 1;
+        let tree = tab.codec_pane_tree();
+        hash_pane_node_structure(&tree, &mut hasher);
+    }
+    tab_count.hash(&mut hasher);
+
+    Some(hasher.finish())
+}
+
+fn hash_pane_node_structure<H: Hasher>(node: &PaneNode, hasher: &mut H) {
+    match node {
+        PaneNode::Empty => {
+            0u8.hash(hasher);
+        }
+        PaneNode::Leaf(entry) => {
+            1u8.hash(hasher);
+            entry.pane_id.hash(hasher);
+        }
+        PaneNode::Stack(stack) => {
+            2u8.hash(hasher);
+            stack.active.hash(hasher);
+            stack.panes.len().hash(hasher);
+            for entry in &stack.panes {
+                entry.pane_id.hash(hasher);
+            }
+        }
+        PaneNode::Split { left, right, node } => {
+            3u8.hash(hasher);
+            match node.direction {
+                SplitDirection::Horizontal => 0u8.hash(hasher),
+                SplitDirection::Vertical => 1u8.hash(hasher),
+            }
+            hash_pane_node_structure(left, hasher);
+            hash_pane_node_structure(right, hasher);
+        }
+    }
 }
 
 fn pane_font_scales_for_window(
@@ -1787,9 +2556,13 @@ fn spawn_domain_for_entry(
         })
 }
 
-fn project_id_for_path(path: &Path) -> ProjectId {
+fn project_id_for_path(space_id: &str, path: &Path) -> ProjectId {
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in path.as_os_str().to_string_lossy().bytes() {
+    for byte in space_id
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(path.as_os_str().to_string_lossy().bytes())
+    {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -1855,6 +2628,10 @@ fn is_remote_project(project: &Project) -> bool {
         || project.path.to_string_lossy().starts_with("ssh://")
 }
 
+fn thread_has_restorable_workspace(thread: &WorkspaceThread) -> bool {
+    thread.layout.is_some() || thread.materialized_workspace_name.is_some()
+}
+
 fn normalize_project_path(path: &str) -> Result<PathBuf> {
     let trimmed = path.trim();
     ensure!(!trimmed.is_empty(), "project path is empty");
@@ -1888,6 +2665,36 @@ fn workspace_name_for_thread(project_id: &str, thread_id: &str) -> String {
     format!("thinkterm:{project_id}:{thread_id}")
 }
 
+pub fn remote_project_id_for_space(space_id: &str, host_id: &str) -> ProjectId {
+    format!("{host_id}{REMOTE_PROJECT_SPACE_SEPARATOR}{space_id}")
+}
+
+pub fn remote_host_id_for_project_id(project_id: &str) -> &str {
+    project_id
+        .split_once(REMOTE_PROJECT_SPACE_SEPARATOR)
+        .map(|(host_id, _)| host_id)
+        .unwrap_or(project_id)
+}
+
+pub fn remote_workspace_name_for_space(
+    space_id: &str,
+    host_id: &str,
+    base_workspace: &str,
+) -> String {
+    format!("thinkterm:ssh:{space_id}:{host_id}:{base_workspace}")
+}
+
+fn next_space_name(spaces: &[Space]) -> String {
+    let mut index = spaces.len() + 1;
+    loop {
+        let name = format!("Space {index}");
+        if !spaces.iter().any(|space| space.name == name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
 fn new_id(prefix: &str) -> String {
     format!(
         "{prefix}-{}-{:08x}",
@@ -1905,28 +2712,173 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_store() -> WorkspaceThreadStore {
+        let mut store = WorkspaceThreadStore::default();
+        store.normalize_after_load();
+        store
+    }
+
+    fn test_project(id: &str, name: &str, path: PathBuf, threads: Vec<WorkspaceThread>) -> Project {
+        test_project_in_space(&default_space_id(), id, name, path, threads)
+    }
+
+    fn test_project_in_space(
+        space_id: &str,
+        id: &str,
+        name: &str,
+        path: PathBuf,
+        threads: Vec<WorkspaceThread>,
+    ) -> Project {
+        Project {
+            id: id.to_string(),
+            space_id: space_id.to_string(),
+            name: name.to_string(),
+            path,
+            threads,
+            active_thread_id: None,
+            threads_collapsed: false,
+        }
+    }
+
+    #[test]
+    fn normalize_empty_space_without_active_project_is_stable() {
+        let mut store = test_store();
+        let space_id = store.create_space_record("Empty".to_string());
+
+        assert!(!store.normalize_after_load());
+        assert_eq!(
+            store
+                .spaces
+                .iter()
+                .find(|space| space.id == space_id)
+                .unwrap()
+                .active_project_id,
+            None
+        );
+    }
+
+    #[test]
+    fn materializing_layout_guard_is_scoped_to_workspace() {
+        let workspace = new_id("restoring-workspace");
+        let other_workspace = new_id("other-workspace");
+
+        assert!(!is_materializing_thread_layout(&workspace));
+        {
+            let _guard = MaterializeThreadLayoutGuard::new(workspace.clone());
+            assert!(is_materializing_thread_layout(&workspace));
+            assert!(!is_materializing_thread_layout(&other_workspace));
+
+            {
+                let _nested_guard = MaterializeThreadLayoutGuard::new(workspace.clone());
+                assert!(is_materializing_thread_layout(&workspace));
+                assert!(!is_materializing_thread_layout(&other_workspace));
+            }
+
+            assert!(is_materializing_thread_layout(&workspace));
+        }
+        assert!(!is_materializing_thread_layout(&workspace));
+    }
+
+    #[test]
+    fn empty_space_has_no_thread_to_restore() {
+        let mut store = test_store();
+        let space_id = store.create_space_record("Empty".to_string());
+
+        let (thread_id, changed) = store.thread_to_restore_for_space(&space_id);
+
+        assert_eq!(thread_id, None);
+        assert!(!changed);
+        assert!(store
+            .projects
+            .iter()
+            .all(|project| project.space_id != space_id));
+    }
+
+    #[test]
+    fn unbound_thread_without_layout_is_not_restored() {
+        let mut store = test_store();
+        let space_id = store.create_space_record("Fresh".to_string());
+        let thread = WorkspaceThread::new("project-fresh".to_string(), "main".to_string(), None);
+        let thread_id = thread.id.clone();
+        let mut project = test_project_in_space(
+            &space_id,
+            "project-fresh",
+            "Fresh",
+            PathBuf::from("/tmp/fresh"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id);
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-fresh".to_string());
+
+        let (thread_id, changed) = store.thread_to_restore_for_space(&space_id);
+
+        assert_eq!(thread_id, None);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn saved_layout_thread_is_restored() {
+        let mut store = test_store();
+        let space_id = store.create_space_record("Saved".to_string());
+        let mut thread =
+            WorkspaceThread::new("project-saved".to_string(), "main".to_string(), None);
+        let thread_id = thread.id.clone();
+        thread.layout = Some(WorkspaceThreadLayoutSnapshot {
+            active_tab: 0,
+            tabs: vec![serde_json::json!({"kind": "saved"})],
+            terminal_specs: vec![],
+        });
+        let project = test_project_in_space(
+            &space_id,
+            "project-saved",
+            "Saved",
+            PathBuf::from("/tmp/saved"),
+            vec![thread],
+        );
+        store.projects.push(project);
+
+        let (restored_thread_id, changed) = store.thread_to_restore_for_space(&space_id);
+
+        assert_eq!(restored_thread_id.as_deref(), Some(thread_id.as_str()));
+        assert!(changed);
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some("project-saved")
+        );
+        assert_eq!(
+            store.projects[0].active_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+    }
+
     #[test]
     fn workspace_thread_store_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("workspace_threads.json");
-        let mut store = WorkspaceThreadStore::default();
-        let project = Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![WorkspaceThread::new(
+        let mut store = test_store();
+        let project = test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![WorkspaceThread::new(
                 "project-1".to_string(),
                 "main".to_string(),
                 None,
             )],
-            active_thread_id: None,
-            threads_collapsed: false,
-        };
-        store.active_project_id = Some(project.id.clone());
+        );
+        store.set_active_project_for_space(&default_space_id(), project.id.clone());
         store.projects.push(project);
         save_workspace_thread_store_to_path(&path, &store).unwrap();
         let loaded = load_workspace_thread_store_from_path(&path).unwrap();
+        assert_eq!(
+            loaded
+                .active_project_id_for_space(&default_space_id())
+                .as_deref(),
+            Some("project-1")
+        );
         assert_eq!(loaded.projects[0].path, PathBuf::from("/tmp/thinkterm"));
+        assert_eq!(loaded.projects[0].space_id, default_space_id());
         assert_eq!(loaded.projects[0].threads[0].name, "main");
     }
 
@@ -1976,6 +2928,7 @@ mod tests {
 
         let loaded = load_workspace_thread_store_from_path(&path).unwrap();
         assert_eq!(loaded.projects[0].threads.len(), 1);
+        assert_eq!(loaded.projects[0].space_id, default_space_id());
         assert_eq!(loaded.projects[0].threads[0].id, "thread-live");
         assert_eq!(
             loaded.projects[0].active_thread_id.as_deref(),
@@ -1991,17 +2944,15 @@ mod tests {
     fn running_work_state_is_runtime_only() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("workspace_threads.json");
-        let mut store = WorkspaceThreadStore::default();
+        let mut store = test_store();
         let mut session = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
         session.work_is_running = true;
-        store.projects.push(Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![session],
-            active_thread_id: None,
-            threads_collapsed: false,
-        });
+        store.projects.push(test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![session],
+        ));
 
         save_workspace_thread_store_to_path(&path, &store).unwrap();
         let json = std::fs::read_to_string(&path).unwrap();
@@ -2021,15 +2972,17 @@ mod tests {
 
     #[test]
     fn synthetic_current_project_matches_ensured_project_ids() {
+        let space_id = default_space_id();
         let workspace = "workspace-1";
-        let synthetic = current_project_for_workspace(workspace);
+        let synthetic = current_project_for_workspace(&space_id, workspace);
         let synthetic_thread_id = synthetic.threads[0].id.clone();
 
-        let mut store = WorkspaceThreadStore::default();
-        let (project_id, changed) = store.ensure_current_project(workspace);
+        let mut store = test_store();
+        let (project_id, changed) = store.ensure_current_project(&space_id, workspace);
 
         assert!(changed);
         assert_eq!(project_id, synthetic.id);
+        assert_eq!(store.projects[0].space_id, space_id);
         assert_eq!(store.projects[0].threads[0].id, synthetic_thread_id);
         assert_eq!(
             store.projects[0].threads[0]
@@ -2041,20 +2994,18 @@ mod tests {
 
     #[test]
     fn workspace_work_observation_transitions_to_finished_unseen() {
-        let mut store = WorkspaceThreadStore::default();
+        let mut store = test_store();
         let session = WorkspaceThread::new(
             "project-1".to_string(),
             "main".to_string(),
             Some("workspace-1".to_string()),
         );
-        store.projects.push(Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![session],
-            active_thread_id: None,
-            threads_collapsed: false,
-        });
+        store.projects.push(test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![session],
+        ));
 
         let change = store
             .observe_thread_work_for_workspace("workspace-1", WorkspaceThreadWorkStatus::Running)
@@ -2079,21 +3030,19 @@ mod tests {
 
     #[test]
     fn acknowledged_finished_work_persists_but_runtime_running_state_does_not() {
-        let mut store = WorkspaceThreadStore::default();
+        let mut store = test_store();
         let mut session = WorkspaceThread::new(
             "project-1".to_string(),
             "main".to_string(),
             Some("workspace-1".to_string()),
         );
         session.work_finished_unseen = true;
-        store.projects.push(Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![session],
-            active_thread_id: None,
-            threads_collapsed: false,
-        });
+        store.projects.push(test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![session],
+        ));
 
         let change = store.acknowledge_thread_work_for_workspace("workspace-1");
         assert!(change.changed);
@@ -2109,19 +3058,17 @@ mod tests {
 
     #[test]
     fn inactive_thread_activation_materializes_once() {
-        let mut store = WorkspaceThreadStore::default();
-        let project = Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![WorkspaceThread::new(
+        let mut store = test_store();
+        let project = test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![WorkspaceThread::new(
                 "project-1".to_string(),
                 "main".to_string(),
                 None,
             )],
-            active_thread_id: None,
-            threads_collapsed: false,
-        };
+        );
         let thread_id = project.threads[0].id.clone();
         store.projects.push(project);
 
@@ -2135,15 +3082,16 @@ mod tests {
 
     #[test]
     fn created_project_gets_own_workspace_and_cwd() {
+        let space_id = default_space_id();
         let dir = tempdir().unwrap();
-        let mut store = WorkspaceThreadStore::default();
+        let mut store = test_store();
 
-        let thread_id = store.create_project_from_path(dir.path().to_path_buf());
-        let project_id = store.active_project_id.clone().unwrap();
+        let thread_id = store.create_project_from_path(&space_id, dir.path().to_path_buf());
+        let project_id = store.active_project_id_for_space(&space_id).unwrap();
         let workspace_name = workspace_name_for_thread(&project_id, &thread_id);
 
         assert_eq!(
-            store.project_id_for_workspace(&workspace_name),
+            store.project_id_for_workspace(&space_id, &workspace_name),
             Some(project_id.clone())
         );
 
@@ -2155,11 +3103,12 @@ mod tests {
 
     #[test]
     fn duplicate_project_path_reuses_existing_thread() {
+        let space_id = default_space_id();
         let dir = tempdir().unwrap();
-        let mut store = WorkspaceThreadStore::default();
+        let mut store = test_store();
 
-        let first_thread_id = store.create_project_from_path(dir.path().to_path_buf());
-        let second_thread_id = store.create_project_from_path(dir.path().to_path_buf());
+        let first_thread_id = store.create_project_from_path(&space_id, dir.path().to_path_buf());
+        let second_thread_id = store.create_project_from_path(&space_id, dir.path().to_path_buf());
 
         assert_eq!(second_thread_id, first_thread_id);
         assert_eq!(store.projects.len(), 1);
@@ -2168,90 +3117,377 @@ mod tests {
 
     #[test]
     fn duplicate_project_path_reuses_stored_project_id() {
+        let space_id = default_space_id();
         let dir = tempdir().unwrap();
-        let mut store = WorkspaceThreadStore::default();
+        let mut store = test_store();
 
-        let project = Project {
-            id: "stored-project-id".to_string(),
-            name: "existing".to_string(),
-            path: dir.path().to_path_buf(),
-            threads: vec![WorkspaceThread::new(
+        let project = test_project(
+            "stored-project-id",
+            "existing",
+            dir.path().to_path_buf(),
+            vec![WorkspaceThread::new(
                 "stored-project-id".to_string(),
                 "main".to_string(),
                 None,
             )],
-            active_thread_id: None,
-            threads_collapsed: false,
-        };
+        );
         let thread_id = project.threads[0].id.clone();
         store.projects.push(project);
 
-        let reused_thread_id = store.create_project_from_path(dir.path().to_path_buf());
+        let reused_thread_id = store.create_project_from_path(&space_id, dir.path().to_path_buf());
 
         assert_eq!(reused_thread_id, thread_id);
         assert_eq!(
-            store.active_project_id.as_deref(),
+            store.active_project_id_for_space(&space_id).as_deref(),
             Some("stored-project-id")
         );
         assert_eq!(store.projects.len(), 1);
     }
 
     #[test]
+    fn same_path_in_different_spaces_gets_distinct_projects() {
+        let dir = tempdir().unwrap();
+        let mut store = test_store();
+        let default_space = default_space_id();
+        let second_space = store.create_space_record("Second".to_string());
+
+        let first_thread_id =
+            store.create_project_from_path(&default_space, dir.path().to_path_buf());
+        let first_project_id = store.active_project_id_for_space(&default_space).unwrap();
+        let second_thread_id =
+            store.create_project_from_path(&second_space, dir.path().to_path_buf());
+        let second_project_id = store.active_project_id_for_space(&second_space).unwrap();
+
+        assert_ne!(first_project_id, second_project_id);
+        assert_ne!(first_thread_id, second_thread_id);
+        assert_eq!(store.projects.len(), 2);
+        assert_eq!(
+            store
+                .projects
+                .iter()
+                .filter(|project| project.path == dir.path())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn current_workspace_owned_by_another_space_is_not_rebound() {
+        let mut store = test_store();
+        let default_space = default_space_id();
+        let second_space = store.create_space_record("Second".to_string());
+        let mut default_thread = WorkspaceThread::new(
+            "project-default".to_string(),
+            "main".to_string(),
+            Some("workspace-default".to_string()),
+        );
+        let default_thread_id = default_thread.id.clone();
+        default_thread.layout = Some(WorkspaceThreadLayoutSnapshot {
+            active_tab: 0,
+            tabs: vec![serde_json::json!({"kind": "default"})],
+            terminal_specs: vec![],
+        });
+        let mut default_project = test_project_in_space(
+            &default_space,
+            "project-default",
+            "Default",
+            PathBuf::from("/tmp/default"),
+            vec![default_thread],
+        );
+        default_project.active_thread_id = Some(default_thread_id);
+        store.projects.push(default_project);
+        store.set_active_project_for_space(&default_space, "project-default".to_string());
+
+        store.sync_current_project(&second_space, "workspace-default");
+        assert!(store
+            .projects
+            .iter()
+            .filter(|project| project.space_id == second_space)
+            .all(|project| project.threads.iter().all(|thread| {
+                thread.materialized_workspace_name.as_deref() != Some("workspace-default")
+            })));
+    }
+
+    #[test]
+    fn normalize_repairs_local_thread_bound_to_another_thinkterm_workspace() {
+        let mut store = test_store();
+        let default_space = default_space_id();
+        let second_space = store.create_space_record("Second".to_string());
+        let first = WorkspaceThread::new(
+            "project-default".to_string(),
+            "main".to_string(),
+            Some("thinkterm:project-default:thread-default".to_string()),
+        );
+        let mut second = WorkspaceThread::new(
+            "project-second".to_string(),
+            "main".to_string(),
+            Some("thinkterm:project-default:thread-default".to_string()),
+        );
+        second.id = "thread-second".to_string();
+        store.projects.push(test_project_in_space(
+            &default_space,
+            "project-default",
+            "Default",
+            PathBuf::from("/tmp/default"),
+            vec![first],
+        ));
+        store.projects.push(test_project_in_space(
+            &second_space,
+            "project-second",
+            "Second",
+            PathBuf::from("/tmp/second"),
+            vec![second],
+        ));
+
+        assert!(store.normalize_after_load());
+        let repaired = &store.projects[1].threads[0];
+        assert_eq!(
+            repaired.materialized_workspace_name.as_deref(),
+            Some("thinkterm:project-second:thread-second")
+        );
+    }
+
+    #[test]
+    fn rename_space_keeps_id_and_project_ids_stable() {
+        let dir = tempdir().unwrap();
+        let mut store = test_store();
+        let space_id = store.create_space_record("Coding".to_string());
+        store.create_project_from_path(&space_id, dir.path().to_path_buf());
+        let project_id = store.active_project_id_for_space(&space_id).unwrap();
+
+        assert!(store.rename_space(&space_id, "Renamed Coding".to_string()));
+
+        let renamed = store
+            .spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .unwrap();
+        assert_eq!(renamed.name, "Renamed Coding");
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some(project_id.as_str())
+        );
+        assert!(store
+            .projects
+            .iter()
+            .any(|project| { project.id == project_id && project.space_id == space_id }));
+    }
+
+    #[test]
+    fn legacy_store_migration_keeps_project_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace_threads.json");
+        let legacy = serde_json::json!({
+            "active_project_id": "legacy-project-id",
+            "projects": [
+                {
+                    "id": "legacy-project-id",
+                    "name": "thinkterm",
+                    "path": "/tmp/thinkterm",
+                    "threads": [
+                        {
+                            "id": "legacy-thread-id",
+                            "name": "main",
+                            "project_id": "legacy-project-id",
+                            "layout": null,
+                            "materialized_workspace_name": "legacy-workspace",
+                            "last_active_at": 1,
+                            "is_pinned": false,
+                            "is_unread": false,
+                            "work_finished_unseen": false
+                        }
+                    ],
+                    "active_thread_id": "legacy-thread-id",
+                    "threads_collapsed": false
+                }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let loaded = load_workspace_thread_store_from_path(&path).unwrap();
+
+        assert_eq!(loaded.projects[0].id, "legacy-project-id");
+        assert_eq!(loaded.projects[0].space_id, default_space_id());
+        assert_eq!(
+            loaded
+                .active_project_id_for_space(&default_space_id())
+                .as_deref(),
+            Some("legacy-project-id")
+        );
+    }
+
+    #[test]
+    fn delete_space_removes_owned_projects_and_returns_live_workspaces() {
+        let mut store = test_store();
+        let space_id = store.create_space_record("Scratch".to_string());
+        let mut thread = WorkspaceThread::new(
+            "project-space".to_string(),
+            "main".to_string(),
+            Some("live-space-workspace".to_string()),
+        );
+        thread.materialized_workspace_name = Some("live-space-workspace".to_string());
+        store.projects.push(test_project_in_space(
+            &space_id,
+            "project-space",
+            "scratch",
+            PathBuf::from("/tmp/scratch"),
+            vec![thread],
+        ));
+
+        let deleted = store.delete_space(&space_id).unwrap();
+
+        assert_eq!(
+            deleted.materialized_workspace_names,
+            vec!["live-space-workspace".to_string()]
+        );
+        assert_eq!(deleted.fallback_space_id, default_space_id());
+        assert!(!store.spaces.iter().any(|space| space.id == space_id));
+        assert!(!store
+            .projects
+            .iter()
+            .any(|project| project.space_id == space_id));
+    }
+
+    #[test]
+    fn default_space_cannot_be_deleted() {
+        let mut store = test_store();
+        assert_eq!(
+            store.delete_space(&default_space_id()),
+            Err(DeleteSpaceError::DefaultSpace)
+        );
+    }
+
+    #[test]
     fn snapshot_layout_attaches_to_materialized_thread() {
-        let mut store = WorkspaceThreadStore::default();
+        let mut store = test_store();
+        let space_id = default_space_id();
         let mut session = WorkspaceThread::new(
             "project-1".to_string(),
             "main".to_string(),
             Some("ws".to_string()),
         );
         let thread_id = session.id.clone();
-        let project = Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![session.clone()],
-            active_thread_id: Some(thread_id),
-            threads_collapsed: false,
-        };
+        let mut project = test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![session.clone()],
+        );
+        project.active_thread_id = Some(thread_id);
         store.projects.push(project);
-        store.snapshot_workspace_layout(
+        store.set_active_project_for_space(&space_id, "project-1".to_string());
+        assert!(store.snapshot_active_space_thread_layout(
+            &space_id,
             "ws",
             WorkspaceThreadLayoutSnapshot {
                 active_tab: 0,
                 tabs: vec![serde_json::json!({"kind": "test"})],
                 terminal_specs: vec![],
             },
-        );
+        ));
         session = store.projects[0].threads[0].clone();
         assert_eq!(session.layout.unwrap().tabs.len(), 1);
     }
 
     #[test]
+    fn snapshot_active_space_layout_does_not_attach_to_other_space_workspace() {
+        let mut store = test_store();
+        let default_space = default_space_id();
+        let second_space = store.create_space_record("Second".to_string());
+        let default_thread = WorkspaceThread::new(
+            "project-default".to_string(),
+            "main".to_string(),
+            Some("workspace-default".to_string()),
+        );
+        let second_thread = WorkspaceThread::new(
+            "project-second".to_string(),
+            "main".to_string(),
+            Some("workspace-second".to_string()),
+        );
+        let second_thread_id = second_thread.id.clone();
+        let mut default_project = test_project_in_space(
+            &default_space,
+            "project-default",
+            "Default",
+            PathBuf::from("/tmp/default"),
+            vec![default_thread],
+        );
+        default_project.active_thread_id = default_project
+            .threads
+            .first()
+            .map(|thread| thread.id.clone());
+        let mut second_project = test_project_in_space(
+            &second_space,
+            "project-second",
+            "Second",
+            PathBuf::from("/tmp/second"),
+            vec![second_thread],
+        );
+        second_project.active_thread_id = Some(second_thread_id);
+        store.projects.push(default_project);
+        store.projects.push(second_project);
+        store.set_active_project_for_space(&second_space, "project-second".to_string());
+
+        let snapshot = WorkspaceThreadLayoutSnapshot {
+            active_tab: 0,
+            tabs: vec![serde_json::json!({"kind": "wrong"})],
+            terminal_specs: vec![],
+        };
+        assert!(!store.snapshot_active_space_thread_layout(
+            &second_space,
+            "workspace-default",
+            snapshot
+        ));
+        assert!(store.projects[1].threads[0].layout.is_none());
+
+        let snapshot = WorkspaceThreadLayoutSnapshot {
+            active_tab: 0,
+            tabs: vec![serde_json::json!({"kind": "right"})],
+            terminal_specs: vec![],
+        };
+        assert!(store.snapshot_active_space_thread_layout(
+            &second_space,
+            "workspace-second",
+            snapshot
+        ));
+        assert_eq!(
+            store.projects[1].threads[0]
+                .layout
+                .as_ref()
+                .unwrap()
+                .tabs
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn view_marks_only_global_active_workspace_thread_active() {
-        let mut store = WorkspaceThreadStore::default();
+        let space_id = default_space_id();
+        let mut store = test_store();
         let first = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
         let second = WorkspaceThread::new("project-2".to_string(), "current".to_string(), None);
         let first_id = first.id.clone();
         let second_id = second.id.clone();
-        store.projects.push(Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![first],
-            active_thread_id: Some(first_id),
-            threads_collapsed: false,
-        });
-        store.projects.push(Project {
-            id: "project-2".to_string(),
-            name: "agent_dock".to_string(),
-            path: PathBuf::from("/tmp/agent_dock"),
-            threads: vec![second],
-            active_thread_id: Some(second_id),
-            threads_collapsed: false,
-        });
-        store.active_project_id = Some("project-2".to_string());
+        let mut first_project = test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![first],
+        );
+        first_project.active_thread_id = Some(first_id);
+        store.projects.push(first_project);
+        let mut second_project = test_project(
+            "project-2",
+            "agent_dock",
+            PathBuf::from("/tmp/agent_dock"),
+            vec![second],
+        );
+        second_project.active_thread_id = Some(second_id);
+        store.projects.push(second_project);
+        store.set_active_project_for_space(&space_id, "project-2".to_string());
 
-        let view = store.view_for_project("project-2", &[]);
+        let view = store.view_for_project(&space_id, "project-2", &[]);
         assert!(!view.projects[0].is_active);
         assert!(!view.projects[0].threads[0].is_active);
         assert!(view.projects[1].is_active);
@@ -2260,28 +3496,29 @@ mod tests {
 
     #[test]
     fn project_menu_metadata_actions_update_store() {
-        let mut store = WorkspaceThreadStore::default();
+        let space_id = default_space_id();
+        let mut store = test_store();
         let first = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
         let second = WorkspaceThread::new("project-2".to_string(), "current".to_string(), None);
         let first_id = first.id.clone();
         let second_id = second.id.clone();
-        store.projects.push(Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![first],
-            active_thread_id: Some(first_id),
-            threads_collapsed: false,
-        });
-        store.projects.push(Project {
-            id: "project-2".to_string(),
-            name: "agent_dock".to_string(),
-            path: PathBuf::from("/tmp/agent_dock"),
-            threads: vec![second],
-            active_thread_id: Some(second_id.clone()),
-            threads_collapsed: false,
-        });
-        store.active_project_id = Some("project-2".to_string());
+        let mut first_project = test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![first],
+        );
+        first_project.active_thread_id = Some(first_id);
+        store.projects.push(first_project);
+        let mut second_project = test_project(
+            "project-2",
+            "agent_dock",
+            PathBuf::from("/tmp/agent_dock"),
+            vec![second],
+        );
+        second_project.active_thread_id = Some(second_id.clone());
+        store.projects.push(second_project);
+        store.set_active_project_for_space(&space_id, "project-2".to_string());
 
         assert!(store.rename_project("project-2", "Agents".to_string()));
         assert_eq!(store.projects[1].name, "Agents");
@@ -2293,13 +3530,17 @@ mod tests {
             Some(store.projects[0].threads[0].id.clone())
         );
         assert_eq!(store.projects.len(), 1);
-        assert_eq!(store.active_project_id.as_deref(), Some("project-1"));
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some("project-1")
+        );
         assert!(store.remove_project("project-1").is_none());
     }
 
     #[test]
     fn thread_menu_metadata_actions_update_store() {
-        let mut store = WorkspaceThreadStore::default();
+        let space_id = default_space_id();
+        let mut store = test_store();
         let mut first = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
         let second = WorkspaceThread::new("project-1".to_string(), "Thread 2".to_string(), None);
         let third = WorkspaceThread::new("project-1".to_string(), "Thread 3".to_string(), None);
@@ -2307,14 +3548,15 @@ mod tests {
         let second_id = second.id.clone();
         let third_id = third.id.clone();
         first.is_unread = true;
-        store.projects.push(Project {
-            id: "project-1".to_string(),
-            name: "thinkterm".to_string(),
-            path: PathBuf::from("/tmp/thinkterm"),
-            threads: vec![first, second, third],
-            active_thread_id: Some(first_id.clone()),
-            threads_collapsed: false,
-        });
+        let mut project = test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![first, second, third],
+        );
+        project.active_thread_id = Some(first_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-1".to_string());
 
         assert!(store.rename_thread(&second_id, "Review".to_string()));
         assert!(store.toggle_thread_pinned(&second_id));
@@ -2337,7 +3579,7 @@ mod tests {
         assert!(updated.is_pinned);
         assert!(updated.is_unread);
 
-        let view = store.view_for_project("project-1", &[]);
+        let view = store.view_for_project(&space_id, "project-1", &[]);
         assert_eq!(view.pinned_threads.len(), 1);
         assert_eq!(view.pinned_threads[0].id, second_id);
         assert_eq!(view.projects[0].threads.len(), 1);

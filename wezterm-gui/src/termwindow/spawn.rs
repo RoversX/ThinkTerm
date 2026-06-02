@@ -14,6 +14,11 @@ impl super::TermWindow {
             self.terminal_size
         };
         let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
+        let layout_mutation_reason = match spawn_where {
+            SpawnWhere::NewWindow => None,
+            SpawnWhere::NewTab | SpawnWhere::NewTabAt(_) => Some("tab spawned"),
+            SpawnWhere::SplitPane(_) => Some("pane split"),
+        };
 
         crate::spawn::spawn_command_impl(
             spawn,
@@ -21,6 +26,8 @@ impl super::TermWindow {
             size,
             Some(self.mux_window_id),
             term_config,
+            self.window.clone(),
+            layout_mutation_reason,
         )
     }
 

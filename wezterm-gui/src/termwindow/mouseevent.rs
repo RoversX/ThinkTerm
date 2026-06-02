@@ -24,6 +24,7 @@ use config::{MouseEventAltScreen, TermConfig};
 use mux::pane::{Pane, WithPaneLines};
 use mux::ssh::RemoteSshDomain;
 use mux::tab::{PositionedPane, SplitDirection};
+use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
@@ -573,6 +574,7 @@ impl super::TermWindow {
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
+            | UIItemType::SpaceMenu
             | UIItemType::ProjectToggleThreads(_)
             | UIItemType::Project(_)
             | UIItemType::WorkspaceThread(_)
@@ -602,6 +604,7 @@ impl super::TermWindow {
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
+            | UIItemType::SpaceMenu
             | UIItemType::ProjectToggleThreads(_)
             | UIItemType::Project(_)
             | UIItemType::WorkspaceThread(_)
@@ -772,6 +775,12 @@ impl super::TermWindow {
                         item.item_type == UIItemType::WorkspaceSidebarResize
                     }) {
                         self.persist_workspace_sidebar_width();
+                    }
+                    if completed_drag
+                        .as_ref()
+                        .is_some_and(|(item, _)| matches!(item.item_type, UIItemType::Split(_)))
+                    {
+                        self.persist_workspace_layout_after_mutation("split drag released");
                     }
                     if completed_drag.is_some() {
                         // Completed a drag
@@ -1116,6 +1125,9 @@ impl super::TermWindow {
             UIItemType::ProjectNew => {
                 self.mouse_event_project_new(event, context);
             }
+            UIItemType::SpaceMenu => {
+                self.mouse_event_space_menu(item, event, context);
+            }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
@@ -1283,6 +1295,28 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Arrow));
     }
 
+    pub fn mouse_event_space_menu(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                let coords = window::Point::new(
+                    item.x as isize,
+                    item.y.saturating_add(item.height) as isize,
+                );
+                context.show_context_menu(coords, self.space_menu_items());
+            }
+            WMEK::Press(MousePress::Right) => {
+                context.show_context_menu(event.coords, self.space_menu_items());
+            }
+            _ => {}
+        }
+    }
+
     pub fn mouse_event_project(
         &mut self,
         project_id: String,
@@ -1426,6 +1460,83 @@ impl super::TermWindow {
         ]
     }
 
+    fn space_menu_items(&self) -> Vec<ContextMenuItem> {
+        let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
+        let mut items = vec![];
+        for space in &spaces {
+            let mut item = ContextMenuItem::item_with_icon(
+                if space.is_occupied_by_other_window {
+                    format!("{} (occupied)", space.name)
+                } else {
+                    space.name.clone()
+                },
+                if space.is_default {
+                    "house"
+                } else {
+                    "square.stack"
+                },
+                KeyAssignment::SwitchSpace(space.id.to_string()),
+            )
+            .checked(space.is_active);
+            if space.is_occupied_by_other_window {
+                item = item.disabled();
+            }
+            items.push(item);
+        }
+
+        items.push(ContextMenuItem::Separator);
+        items.push(ContextMenuItem::item_with_icon(
+            "New Space",
+            "plus.square",
+            KeyAssignment::CreateSpace,
+        ));
+        items.push(ContextMenuItem::item_with_icon(
+            spaces
+                .iter()
+                .find(|space| space.is_active)
+                .map(|space| format!("Rename \"{}\"...", space.name))
+                .unwrap_or_else(|| "Rename Space...".to_string()),
+            "pencil",
+            KeyAssignment::PromptRenameSpace(self.active_space_id.clone()),
+        ));
+        let active_space_id = spaces
+            .iter()
+            .find(|space| space.is_active)
+            .map(|space| space.id.clone());
+        let delete_item = |space: crate::workspace_threads::SpaceView| {
+            ContextMenuItem::item_with_icon(
+                format!("Delete \"{}\"", space.name),
+                "trash",
+                KeyAssignment::DeleteSpace(space.id),
+            )
+        };
+        let delete_candidates = spaces
+            .iter()
+            .filter(|space| !space.is_default && !space.is_occupied_by_other_window)
+            .cloned()
+            .collect::<Vec<_>>();
+        let active_delete = delete_candidates
+            .iter()
+            .find(|space| active_space_id.as_deref() == Some(space.id.as_str()))
+            .cloned();
+        if let Some(space) = active_delete {
+            items.push(delete_item(space));
+        }
+
+        let other_delete_candidates = delete_candidates
+            .into_iter()
+            .filter(|space| active_space_id.as_deref() != Some(space.id.as_str()))
+            .map(delete_item)
+            .collect::<Vec<_>>();
+        if !other_delete_candidates.is_empty() {
+            items.push(ContextMenuItem::submenu(
+                "Delete Other Space",
+                other_delete_candidates,
+            ));
+        }
+        items
+    }
+
     fn workspace_sidebar_view_options_menu_items(&self) -> Vec<ContextMenuItem> {
         use config::keyassignment::KeyAssignment;
 
@@ -1502,6 +1613,24 @@ impl super::TermWindow {
     }
 
     pub(crate) fn activate_workspace_thread(&mut self, thread_id: String, context: &dyn WindowOps) {
+        self.activate_workspace_thread_impl(thread_id, context, None);
+    }
+
+    pub(crate) fn activate_workspace_thread_for_new_window(
+        &mut self,
+        thread_id: String,
+        context: &dyn WindowOps,
+        startup_window_id: MuxWindowId,
+    ) {
+        self.activate_workspace_thread_impl(thread_id, context, Some(startup_window_id));
+    }
+
+    fn activate_workspace_thread_impl(
+        &mut self,
+        thread_id: String,
+        context: &dyn WindowOps,
+        orphan_candidate_window_id: Option<MuxWindowId>,
+    ) {
         self.snapshot_active_workspace_thread_layout();
 
         let mux = Mux::get();
@@ -1522,7 +1651,9 @@ impl super::TermWindow {
         }
 
         let workspace_name = plan.workspace_name.clone();
-        let remote_spec = crate::ssh_hosts::host_spec(&plan.project_id);
+        let remote_spec = crate::ssh_hosts::host_spec(
+            crate::workspace_threads::remote_host_id_for_project_id(&plan.project_id),
+        );
         let (initial_cwd, default_domain) = if let Some(spec) = remote_spec.as_ref() {
             match crate::ssh_hosts::ensure_ssh_domain_registered(spec) {
                 Ok(domain_name) => (
@@ -1555,8 +1686,9 @@ impl super::TermWindow {
         let switcher = crate::frontend::WorkspaceSwitcher::new(&workspace_name);
         mux.set_active_workspace(&workspace_name);
 
+        let reconcile_window = self.window.clone();
         promise::spawn::spawn(async move {
-            if let Err(err) = crate::workspace_threads::materialize_thread(
+            let materialized = match crate::workspace_threads::materialize_thread(
                 workspace_name,
                 layout,
                 initial_cwd,
@@ -1567,9 +1699,17 @@ impl super::TermWindow {
             )
             .await
             {
-                log::error!("failed to materialize ThinkTerm thread: {err:#}");
-            }
+                Ok(()) => true,
+                Err(err) => {
+                    log::error!("failed to materialize ThinkTerm thread: {err:#}");
+                    false
+                }
+            };
             switcher.do_switch();
+            if materialized {
+                cleanup_orphaned_mux_window(orphan_candidate_window_id);
+            }
+            reconcile_workspace_layout_after_materialize(reconcile_window);
         })
         .detach();
 
@@ -1606,9 +1746,14 @@ impl super::TermWindow {
                 return;
             }
         };
-        let workspace_name = target_workspace
+        let base_workspace_name = target_workspace
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| crate::ssh_hosts::default_workspace_name(&spec));
+        let workspace_name = crate::workspace_threads::remote_workspace_name_for_space(
+            &self.active_space_id,
+            &project_id,
+            &base_workspace_name,
+        );
 
         let mux = Mux::get();
         // Already live? Just switch to it rather than spawning a duplicate.
@@ -1622,6 +1767,7 @@ impl super::TermWindow {
 
         self.snapshot_active_workspace_thread_layout();
         let _ = crate::workspace_threads::create_remote_host_thread(
+            &self.active_space_id,
             &project_id,
             &spec.label,
             crate::ssh_hosts::host_project_path(&spec),
@@ -1642,6 +1788,7 @@ impl super::TermWindow {
         let detect_domain = domain_name.clone();
         let detect_project = project_id.clone();
         let detect_window = window.clone();
+        let reconcile_window = window.clone();
         promise::spawn::spawn(async move {
             if let Err(err) = crate::workspace_threads::materialize_thread(
                 ws,
@@ -1657,6 +1804,7 @@ impl super::TermWindow {
                 log::error!("failed to connect SSH session: {err:#}");
             }
             switcher.do_switch();
+            reconcile_workspace_layout_after_materialize(reconcile_window);
 
             // Optional, user-controlled OS detection over the live session.
             if detect_os {
@@ -2737,4 +2885,43 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
     }
+}
+
+/// After a thread has finished materializing its saved layout, the materialize
+/// guard suppressed any layout saves (so we never persist a half-built tree).
+/// That means a structural change the user made *during* materialization (e.g.
+/// splitting an extra pane while the thread was still rebuilding) was skipped
+/// and never re-captured, and the per-window structure fingerprint is stale.
+/// Reconcile once here: snapshot whatever is actually live now and re-baseline
+/// the fingerprint so subsequent change detection is correct.
+fn reconcile_workspace_layout_after_materialize(window: Option<::window::Window>) {
+    if let Some(window) = window {
+        window.notify(TermWindowNotif::Apply(Box::new(|tw| {
+            tw.snapshot_active_workspace_thread_layout();
+            tw.remember_workspace_layout_structure_fingerprint();
+        })));
+    }
+}
+
+fn cleanup_orphaned_mux_window(window_id: Option<MuxWindowId>) {
+    let Some(window_id) = window_id else {
+        return;
+    };
+    if front_end().has_mux_window(window_id) {
+        return;
+    }
+
+    let mux = Mux::get();
+    let Some(window) = mux.get_window(window_id) else {
+        return;
+    };
+    let workspace = window.get_workspace().to_string();
+    drop(window);
+
+    if crate::workspace_threads::workspace_has_thread_binding(&workspace) {
+        return;
+    }
+
+    log::trace!("clean up unbound startup mux window {window_id} in workspace {workspace:?}");
+    mux.kill_window(window_id);
 }

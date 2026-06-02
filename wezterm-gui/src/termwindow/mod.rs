@@ -218,6 +218,7 @@ pub enum UIItemType {
         action: PaneNavAction,
     },
     ProjectNew,
+    SpaceMenu,
     ProjectToggleThreads(String),
     Project(String),
     WorkspaceThread(String),
@@ -263,6 +264,7 @@ pub(crate) enum TabWheelSurface {
 enum InlineTabRenameTarget {
     WindowTab(TabId),
     PaneTab(PaneId),
+    Space(String),
     Project(String),
     WorkspaceThread(String),
 }
@@ -724,6 +726,9 @@ pub struct TermWindow {
     /// terminal tab being shown).
     content_view: Option<Box<dyn crate::termwindow::content_view::ContentView>>,
     content_view_active: bool,
+    space_owner_id: u64,
+    active_space_id: String,
+    workspace_layout_structure_fingerprint: Option<u64>,
     workspace_sidebar_width: usize,
     workspace_sidebar_collapsed: bool,
     workspace_sidebar_scroll_offset: f32,
@@ -822,7 +827,26 @@ impl TermWindow {
         }
     }
 
+    fn remember_workspace_layout_structure_fingerprint(&mut self) {
+        self.workspace_layout_structure_fingerprint =
+            crate::workspace_threads::window_layout_structure_fingerprint(self.mux_window_id);
+    }
+
+    pub(crate) fn persist_workspace_layout_after_mutation(&mut self, reason: &'static str) {
+        if let Some(workspace) = self.current_mux_workspace() {
+            if crate::workspace_threads::is_materializing_thread_layout(&workspace) {
+                return;
+            }
+        }
+
+        log::trace!("snapshot workspace thread layout after {reason}");
+        self.snapshot_active_workspace_thread_layout();
+        self.remember_workspace_layout_structure_fingerprint();
+    }
+
     fn close_requested(&mut self, window: &Window) {
+        self.persist_workspace_layout_after_mutation("window close requested");
+
         let mux = Mux::get();
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
@@ -1027,6 +1051,11 @@ impl TermWindow {
         let render_state = None;
 
         let connection_name = Connection::get().unwrap().name();
+        let space_owner_id = crate::workspace_threads::next_space_owner_id();
+        let active_space_id =
+            crate::workspace_threads::claim_initial_space_for_window(space_owner_id);
+        let workspace_layout_structure_fingerprint =
+            crate::workspace_threads::window_layout_structure_fingerprint(mux_window_id);
 
         let myself = Self {
             created: Instant::now(),
@@ -1146,6 +1175,9 @@ impl TermWindow {
             dragging: None,
             content_view: None,
             content_view_active: false,
+            space_owner_id,
+            active_space_id,
+            workspace_layout_structure_fingerprint,
             workspace_sidebar_width,
             workspace_sidebar_collapsed: false,
             workspace_sidebar_scroll_offset: 0.0,
@@ -1272,7 +1304,13 @@ impl TermWindow {
             myself.apply_native_terminal_settings();
             myself.apply_workspace_thread_font_scales();
             myself.load_os_parameters();
-            myself.sync_current_workspace_thread();
+            if let Some(thread_id) =
+                crate::workspace_threads::thread_to_restore_for_space(&myself.active_space_id)
+            {
+                myself.activate_workspace_thread_for_new_window(thread_id, &window, mux_window_id);
+            } else {
+                myself.sync_current_workspace_thread();
+            }
             window.show();
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
@@ -1298,6 +1336,7 @@ impl TermWindow {
                 // the TermWindow alive via the frontend even though
                 // the window is gone and we'll linger forever.
                 // <https://github.com/wezterm/wezterm/issues/3522>
+                crate::workspace_threads::release_window_space(self.space_owner_id);
                 self.clear_all_overlays();
                 Ok(false)
             }
@@ -1683,6 +1722,7 @@ impl TermWindow {
                             tab.resize(self.terminal_size);
                         }
                     }
+                    self.persist_workspace_layout_after_mutation("tab added");
                 }
                 MuxNotification::PaneOutput(pane_id) => {
                     self.mux_pane_output_event(pane_id);
@@ -1714,9 +1754,11 @@ impl TermWindow {
                 }
                 MuxNotification::PaneAdded(pane_id) => {
                     self.refresh_thread_work_for_pane(pane_id);
+                    self.persist_workspace_layout_after_mutation("pane added");
                 }
                 MuxNotification::PaneRemoved(_) => {
                     self.refresh_all_thread_work();
+                    self.persist_workspace_layout_after_mutation("pane removed");
                 }
                 MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
@@ -1732,7 +1774,10 @@ impl TermWindow {
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
-                match crate::workspace_threads::create_project_from_path(path.as_ref()) {
+                match crate::workspace_threads::create_project_from_path(
+                    &self.active_space_id,
+                    path.as_ref(),
+                ) {
                     Ok(thread_id) => self.activate_workspace_thread(thread_id, window),
                     Err(err) => log::error!("failed to create ThinkTerm project: {err:#}"),
                 }
@@ -2015,7 +2060,10 @@ impl TermWindow {
         let Some(workspace) = self.current_mux_workspace() else {
             return;
         };
-        self.invalidate_window_if(crate::workspace_threads::sync_current_project(&workspace));
+        self.invalidate_window_if(crate::workspace_threads::sync_current_project(
+            &self.active_space_id,
+            &workspace,
+        ));
     }
 
     fn refresh_thread_work_for_pane(&mut self, pane_id: PaneId) {
@@ -2026,6 +2074,59 @@ impl TermWindow {
 
     fn refresh_all_thread_work(&mut self) {
         self.invalidate_window_if(crate::workspace_threads::refresh_all_thread_work());
+    }
+
+    fn switch_space(&mut self, space_id: String, window: &Window) {
+        if self.active_space_id == space_id {
+            window.invalidate();
+            return;
+        }
+        self.snapshot_active_workspace_thread_layout();
+        if !crate::workspace_threads::switch_window_space(self.space_owner_id, &space_id) {
+            window.invalidate();
+            return;
+        }
+        self.active_space_id = space_id.clone();
+        self.workspace_sidebar_scroll_offset = 0.0;
+        if let Some(thread_id) = crate::workspace_threads::ensure_active_thread_for_space(&space_id)
+        {
+            self.activate_workspace_thread(thread_id, window);
+        } else {
+            window.invalidate();
+        }
+    }
+
+    fn delete_space(&mut self, space_id: &str, window: Option<&Window>) {
+        match crate::workspace_threads::delete_space_for_window(self.space_owner_id, space_id) {
+            Ok(deleted) => {
+                let deleted_active_space = self.active_space_id == space_id;
+                if deleted_active_space {
+                    self.active_space_id = deleted.fallback_space_id.clone();
+                    self.workspace_sidebar_scroll_offset = 0.0;
+                    if let Some(window) = window {
+                        if let Some(thread_id) =
+                            crate::workspace_threads::ensure_active_thread_for_space(
+                                &self.active_space_id,
+                            )
+                        {
+                            self.activate_workspace_thread(thread_id, window);
+                        } else {
+                            window.invalidate();
+                        }
+                    }
+                }
+
+                let mux = Mux::get();
+                for workspace in deleted.materialized_workspace_names {
+                    for window_id in mux.iter_windows_in_workspace(&workspace) {
+                        mux.kill_window(window_id);
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!("failed to delete ThinkTerm space {space_id}: {err:?}");
+            }
+        }
     }
 
     fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
@@ -2813,6 +2914,7 @@ impl TermWindow {
 
             self.update_title();
             self.update_scrollbar();
+            self.persist_workspace_layout_after_mutation("active tab changed");
         }
         Ok(())
     }
@@ -2880,6 +2982,7 @@ impl TermWindow {
         drop(window);
         self.update_title();
         self.update_scrollbar();
+        self.persist_workspace_layout_after_mutation("tab moved");
 
         Ok(())
     }
@@ -2994,6 +3097,16 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    fn prompt_rename_space(&mut self, space_id: String) {
+        let initial_title = crate::workspace_threads::active_space_name(&space_id)
+            .unwrap_or_else(|| "Space".to_string());
+        self.inline_tab_rename = Some(InlineTabRename::new(
+            InlineTabRenameTarget::Space(space_id),
+            initial_title,
+        ));
+        self.update_title_impl();
+    }
+
     pub(crate) fn prompt_create_project(&mut self, context: &dyn WindowOps) {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
@@ -3026,6 +3139,9 @@ impl TermWindow {
                         self.pane_tab_title_overrides.insert(pane_id, title);
                     }
                 }
+                InlineTabRenameTarget::Space(space_id) => {
+                    crate::workspace_threads::rename_space(&space_id, title);
+                }
                 InlineTabRenameTarget::Project(project_id) => {
                     crate::workspace_threads::rename_project(&project_id, title);
                 }
@@ -3051,6 +3167,7 @@ impl TermWindow {
             .and_then(|rename| match rename.target {
                 InlineTabRenameTarget::WindowTab(tab_id) => Some(tab_id),
                 InlineTabRenameTarget::PaneTab(_)
+                | InlineTabRenameTarget::Space(_)
                 | InlineTabRenameTarget::Project(_)
                 | InlineTabRenameTarget::WorkspaceThread(_) => None,
             })
@@ -3082,6 +3199,14 @@ impl TermWindow {
         self.inline_tab_rename
             .as_ref()
             .filter(|rename| matches!(&rename.target, InlineTabRenameTarget::Project(id) if id == project_id))
+            .map(|rename| rename.display_text())
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    pub fn sidebar_space_title(&self, space_id: &str, name: &str) -> String {
+        self.inline_tab_rename
+            .as_ref()
+            .filter(|rename| matches!(&rename.target, InlineTabRenameTarget::Space(id) if id == space_id))
             .map(|rename| rename.display_text())
             .unwrap_or_else(|| name.to_string())
     }
@@ -3581,6 +3706,26 @@ impl TermWindow {
             PromptRenameWorkspaceThread(thread_id) => {
                 self.prompt_rename_workspace_thread(thread_id.clone())
             }
+            PromptRenameSpace(space_id) => self.prompt_rename_space(space_id.clone()),
+            CreateSpace => {
+                let space_id = crate::workspace_threads::create_space(None);
+                if let Some(window) = window.as_ref() {
+                    self.switch_space(space_id.clone(), window);
+                    self.prompt_rename_space(space_id);
+                    window.invalidate();
+                }
+            }
+            SwitchSpace(space_id) => {
+                if let Some(window) = window.as_ref() {
+                    self.switch_space(space_id.clone(), window);
+                }
+            }
+            DeleteSpace(space_id) => {
+                self.delete_space(space_id, window.as_ref());
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
+                }
+            }
             CreateWorkspaceThread(project_id) => {
                 let thread_id = crate::workspace_threads::create_thread(project_id, None);
                 if let Some(window) = window.as_ref() {
@@ -3823,6 +3968,7 @@ impl TermWindow {
 
                 if self.tab_state(tab_id).overlay.is_none() {
                     tab.adjust_pane_size(*direction, *amount);
+                    self.persist_workspace_layout_after_mutation("pane size adjusted");
                 }
             }
             ActivatePaneByIndex(index) => {
@@ -3975,6 +4121,7 @@ impl TermWindow {
                     RotationDirection::Clockwise => tab.rotate_clockwise(),
                     RotationDirection::CounterClockwise => tab.rotate_counter_clockwise(),
                 }
+                self.persist_workspace_layout_after_mutation("panes rotated");
             }
             SplitPane(split) => {
                 log::trace!("SplitPane {:?}", split);

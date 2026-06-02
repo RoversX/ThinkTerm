@@ -9,6 +9,7 @@ use mux::Mux;
 use portable_pty::CommandBuilder;
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
+use window::WindowOps;
 
 #[derive(Copy, Debug, Clone, Eq, PartialEq)]
 pub enum SpawnWhere {
@@ -24,14 +25,25 @@ pub fn spawn_command_impl(
     size: TerminalSize,
     src_window_id: Option<MuxWindowId>,
     term_config: Arc<TermConfig>,
+    completion_window: Option<::window::Window>,
+    layout_mutation_reason: Option<&'static str>,
 ) {
     let spawn = spawn.clone();
 
     promise::spawn::spawn(async move {
-        if let Err(err) =
-            spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config).await
-        {
-            log::error!("Failed to spawn: {:#}", err);
+        match spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config).await {
+            Ok(()) => {
+                if let (Some(window), Some(reason)) = (completion_window, layout_mutation_reason) {
+                    window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                        move |tw| {
+                            tw.persist_workspace_layout_after_mutation(reason);
+                        },
+                    )));
+                }
+            }
+            Err(err) => {
+                log::error!("Failed to spawn: {:#}", err);
+            }
         }
     })
     .detach();

@@ -41,7 +41,13 @@ impl super::TermWindow {
     }
 
     pub(crate) fn snapshot_active_workspace_thread_layout(&self) {
-        crate::workspace_threads::snapshot_active_thread_layout_with_font_scales(
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
+            &self.active_space_id,
+            window.get_workspace(),
             self.mux_window_id,
             |pane_id| self.persisted_font_scale_for_pane(pane_id),
         );
@@ -52,7 +58,8 @@ impl super::TermWindow {
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return;
         };
-        crate::workspace_threads::snapshot_workspace_layout_with_font_scales(
+        crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
+            &self.active_space_id,
             window.get_workspace(),
             self.mux_window_id,
             |pane_id| self.persisted_font_scale_for_pane(pane_id),
