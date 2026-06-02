@@ -3118,6 +3118,12 @@ impl TermWindow {
         }));
     }
 
+    fn reveal_project_in_folder(&self, project_id: &str) {
+        if let Some(path) = crate::workspace_threads::project_reveal_path(project_id) {
+            wezterm_open_url::reveal_path(&path);
+        }
+    }
+
     fn finish_inline_tab_rename(&mut self, commit: bool) {
         let rename = match self.inline_tab_rename.take() {
             Some(rename) => rename,
@@ -3703,6 +3709,7 @@ impl TermWindow {
             PromptRenameTab => self.prompt_rename_current_tab(),
             PromptRenamePaneTab(pane_id) => self.prompt_rename_pane_tab(*pane_id),
             PromptRenameProject(project_id) => self.prompt_rename_project(project_id.clone()),
+            RevealProjectInFolder(project_id) => self.reveal_project_in_folder(project_id),
             PromptRenameWorkspaceThread(thread_id) => {
                 self.prompt_rename_workspace_thread(thread_id.clone())
             }

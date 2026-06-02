@@ -856,6 +856,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_edit"),
         },
+        RevealProjectInFolder(_) => CommandDef {
+            brief: "Reveal in Folder".into(),
+            doc: "Reveals the ThinkTerm workspace folder in the system file manager".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_folder_open"),
+        },
         PromptRenameWorkspaceThread(_) => CommandDef {
             brief: "Rename Thread".into(),
             doc: "Prompts for a new name for the ThinkTerm thread".into(),

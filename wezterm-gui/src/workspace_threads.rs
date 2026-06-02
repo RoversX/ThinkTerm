@@ -974,6 +974,11 @@ pub fn project_name(project_id: &str) -> Option<String> {
         .map(|project| project.name.clone())
 }
 
+pub fn project_reveal_path(project_id: &str) -> Option<PathBuf> {
+    let store = THREAD_STORE.lock();
+    store.project_reveal_path(project_id)
+}
+
 pub fn workspace_pane_font_scales(
     workspace: &str,
     window_id: MuxWindowId,
@@ -1347,6 +1352,17 @@ impl WorkspaceThreadStore {
             pinned_threads,
             projects,
         }
+    }
+
+    fn project_reveal_path(&self, project_id: &str) -> Option<PathBuf> {
+        let project = self
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)?;
+        if is_remote_project(project) || !project.path.is_dir() {
+            return None;
+        }
+        Some(project.path.clone())
     }
 
     fn sync_active_workspace(
@@ -3535,6 +3551,38 @@ mod tests {
             Some("project-1")
         );
         assert!(store.remove_project("project-1").is_none());
+    }
+
+    #[test]
+    fn project_reveal_path_requires_existing_local_directory() {
+        let mut store = test_store();
+        let dir = tempdir().unwrap();
+        store.projects.push(test_project(
+            "project-local",
+            "Local",
+            dir.path().to_path_buf(),
+            vec![],
+        ));
+        store.projects.push(test_project(
+            "project-missing",
+            "Missing",
+            dir.path().join("missing"),
+            vec![],
+        ));
+        store.projects.push(test_project(
+            "ssh-host",
+            "Remote",
+            PathBuf::from("ssh://example/home"),
+            vec![],
+        ));
+
+        assert_eq!(
+            store.project_reveal_path("project-local"),
+            Some(dir.path().to_path_buf())
+        );
+        assert!(store.project_reveal_path("project-missing").is_none());
+        assert!(store.project_reveal_path("ssh-host").is_none());
+        assert!(store.project_reveal_path("project-unknown").is_none());
     }
 
     #[test]

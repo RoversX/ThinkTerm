@@ -54,6 +54,37 @@ pub fn open_with(url: &str, app: &str) {
     });
 }
 
+#[cfg(target_os = "macos")]
+pub fn reveal_path(path: &std::path::Path) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(path)
+            .status();
+    });
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub fn reveal_path(path: &std::path::Path) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        for candidate in ["xdg-open", "gio", "gnome-open", "kde-open", "wslview"] {
+            let mut cmd = std::process::Command::new(candidate);
+            if candidate == "gio" {
+                cmd.arg("open");
+            }
+            cmd.arg(&path);
+
+            if let Ok(status) = cmd.status() {
+                if status.success() {
+                    return;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(windows)]
 fn shell_execute(url: String, with: Option<String>) {
     use std::os::windows::ffi::OsStrExt;
@@ -97,4 +128,9 @@ pub fn open_url(url: &str) {
 #[cfg(windows)]
 pub fn open_with(url: &str, app: &str) {
     shell_execute(url.to_string(), Some(app.to_string()));
+}
+
+#[cfg(windows)]
+pub fn reveal_path(path: &std::path::Path) {
+    shell_execute(path.to_string_lossy().to_string(), None);
 }

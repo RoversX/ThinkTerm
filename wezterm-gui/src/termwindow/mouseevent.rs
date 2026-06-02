@@ -1435,12 +1435,22 @@ impl super::TermWindow {
 
     fn project_context_menu_items(&self, project_id: &str) -> Vec<ContextMenuItem> {
         let project_id = project_id.to_string();
+        let mut reveal_item = ContextMenuItem::item_with_icon(
+            "Reveal in Folder",
+            "folder",
+            KeyAssignment::RevealProjectInFolder(project_id.clone()),
+        );
+        if crate::workspace_threads::project_reveal_path(&project_id).is_none() {
+            reveal_item = reveal_item.disabled();
+        }
+
         vec![
             ContextMenuItem::item_with_icon(
                 "Rename Workspace...",
                 "pencil",
                 KeyAssignment::PromptRenameProject(project_id.clone()),
             ),
+            reveal_item,
             ContextMenuItem::item_with_icon(
                 "New Thread",
                 "plus.square",

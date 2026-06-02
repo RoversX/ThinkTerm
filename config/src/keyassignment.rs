@@ -576,6 +576,7 @@ pub enum KeyAssignment {
     PromptRenameTab,
     PromptRenamePaneTab(usize),
     PromptRenameProject(String),
+    RevealProjectInFolder(String),
     PromptRenameWorkspaceThread(String),
     PromptRenameSpace(String),
     CreateSpace,
