@@ -976,7 +976,6 @@ impl OnboardingView {
         section_font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
         let group_w = area.size.width.min(1120.0);
-        let line_h = Self::line_h(ctx);
         let language_h = Self::preference_group_height(ctx, 4);
         self.paint_preference_group(
             ctx,
