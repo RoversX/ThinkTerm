@@ -444,7 +444,12 @@ impl crate::TermWindow {
         }
 
         let mux = Mux::get();
-        let active_workspace = mux.active_workspace();
+        // Use THIS window's own workspace, not the global active one: with
+        // multiple windows open, a non-focused window must still highlight the
+        // thread it is actually showing.
+        let active_workspace = self
+            .current_mux_workspace()
+            .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
         let view = workspace_threads::view_for_current_project(
             &self.active_space_id,
@@ -486,7 +491,12 @@ impl crate::TermWindow {
         }
 
         let mux = Mux::get();
-        let active_workspace = mux.active_workspace();
+        // Use THIS window's own workspace, not the global active one: with
+        // multiple windows open, a non-focused window must still highlight the
+        // thread it is actually showing.
+        let active_workspace = self
+            .current_mux_workspace()
+            .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
         let view = workspace_threads::view_for_current_project(
             &self.active_space_id,
@@ -616,7 +626,12 @@ impl crate::TermWindow {
         }
 
         let mux = Mux::get();
-        let active_workspace = mux.active_workspace();
+        // Use THIS window's own workspace, not the global active one: with
+        // multiple windows open, a non-focused window must still highlight the
+        // thread it is actually showing.
+        let active_workspace = self
+            .current_mux_workspace()
+            .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
         let view = workspace_threads::view_for_current_project(
             &self.active_space_id,

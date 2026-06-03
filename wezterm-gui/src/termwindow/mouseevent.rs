@@ -1654,6 +1654,10 @@ impl super::TermWindow {
 
         if !plan.needs_materialize {
             self.adopt_workspace_in_this_window(&plan.workspace_name);
+            // Symmetric with the materialize branch below: if this switch
+            // orphaned a startup mux window, tidy it up. cleanup_orphaned_mux_window
+            // is a no-op when the window is still shown or has a thread binding.
+            cleanup_orphaned_mux_window(orphan_candidate_window_id);
             context.invalidate();
             return;
         }

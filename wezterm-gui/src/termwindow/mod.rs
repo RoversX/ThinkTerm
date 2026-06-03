@@ -1368,7 +1368,14 @@ impl TermWindow {
         }
 
         crate::update::start_update_checker();
-        front_end().record_known_window(window, mux_window_id);
+        // Register with the window's *current* mux id, not the one we were
+        // constructed with: restoring a saved thread above may have adopted
+        // this window onto a different (already-live) mux window via
+        // switch_to_mux_window. Recording the stale construction id would point
+        // known_windows at a mux window the restore just orphaned (and possibly
+        // killed), and the next reconcile would then close this brand-new window.
+        let adopted_mux_window_id = tw.borrow().mux_window_id;
+        front_end().record_known_window(window, adopted_mux_window_id);
 
         Ok(())
     }
