@@ -1173,7 +1173,7 @@ impl super::TermWindow {
             UIItemType::ContentViewClose => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
-                    self.close_content_view();
+                    self.request_close_content_view();
                 }
             }
             UIItemType::WorkspaceSidebarViewOptions => {
@@ -1653,9 +1653,7 @@ impl super::TermWindow {
         };
 
         if !plan.needs_materialize {
-            if mux.active_workspace() != plan.workspace_name {
-                front_end().switch_workspace(&plan.workspace_name);
-            }
+            self.adopt_workspace_in_this_window(&plan.workspace_name);
             context.invalidate();
             return;
         }
@@ -1693,10 +1691,14 @@ impl super::TermWindow {
         );
         let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
             Arc::new(TermConfig::with_config(self.config.clone()));
-        let switcher = crate::frontend::WorkspaceSwitcher::new(&workspace_name);
+        // Suppress the additive reconcile while we materialize the target
+        // workspace's mux window; we adopt it into THIS window afterwards so
+        // no duplicate window is spawned and no other window is disturbed.
+        front_end().set_switching_workspaces(true);
         mux.set_active_workspace(&workspace_name);
 
         let reconcile_window = self.window.clone();
+        let adopt_workspace = workspace_name.clone();
         promise::spawn::spawn(async move {
             let materialized = match crate::workspace_threads::materialize_thread(
                 workspace_name,
@@ -1715,7 +1717,8 @@ impl super::TermWindow {
                     false
                 }
             };
-            switcher.do_switch();
+            adopt_workspace_into_window(&reconcile_window, &adopt_workspace);
+            front_end().set_switching_workspaces(false);
             if materialized {
                 cleanup_orphaned_mux_window(orphan_candidate_window_id);
             }
@@ -1766,11 +1769,10 @@ impl super::TermWindow {
         );
 
         let mux = Mux::get();
-        // Already live? Just switch to it rather than spawning a duplicate.
+        // Already live? Just switch this window to it rather than spawning a
+        // duplicate.
         if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
-            if mux.active_workspace() != workspace_name {
-                front_end().switch_workspace(&workspace_name);
-            }
+            self.adopt_workspace_in_this_window(&workspace_name);
             invalidate(&window);
             return;
         }
@@ -1790,10 +1792,13 @@ impl super::TermWindow {
         );
         let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
             Arc::new(TermConfig::with_config(self.config.clone()));
-        let switcher = crate::frontend::WorkspaceSwitcher::new(&workspace_name);
+        // Suppress the additive reconcile while materializing; adopt the new
+        // mux window into THIS window afterwards (no duplicate, others intact).
+        front_end().set_switching_workspaces(true);
         mux.set_active_workspace(&workspace_name);
 
         let ws = workspace_name.clone();
+        let adopt_workspace = workspace_name.clone();
         let detect_os = spec.detect_os;
         let detect_domain = domain_name.clone();
         let detect_project = project_id.clone();
@@ -1813,7 +1818,8 @@ impl super::TermWindow {
             {
                 log::error!("failed to connect SSH session: {err:#}");
             }
-            switcher.do_switch();
+            adopt_workspace_into_window(&reconcile_window, &adopt_workspace);
+            front_end().set_switching_workspaces(false);
             reconcile_workspace_layout_after_materialize(reconcile_window);
 
             // Optional, user-controlled OS detection over the live session.
@@ -2910,6 +2916,23 @@ fn reconcile_workspace_layout_after_materialize(window: Option<::window::Window>
             tw.snapshot_active_workspace_thread_layout();
             tw.remember_workspace_layout_structure_fingerprint();
         })));
+    }
+}
+
+/// After a target workspace has been materialized in a background task, adopt
+/// its mux window into `window` (the window that initiated the switch) in
+/// place, without disturbing any other window. Rebinding the frontend mapping
+/// immediately closes the race where the additive reconcile might otherwise
+/// spawn a duplicate window for the freshly materialized mux window.
+pub(crate) fn adopt_workspace_into_window(window: &Option<::window::Window>, workspace: &str) {
+    let mux = Mux::get();
+    let Some(target) = mux.iter_windows_in_workspace(workspace).first().copied() else {
+        return;
+    };
+    mux.set_active_workspace(workspace);
+    if let Some(window) = window.as_ref() {
+        front_end().rebind_known_window(window, target);
+        window.notify(TermWindowNotif::SwitchToMuxWindow(target));
     }
 }
 

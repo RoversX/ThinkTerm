@@ -195,6 +195,12 @@ impl crate::TermWindow {
         let ui_font = self
             .fonts
             .command_palette_font_with_size_and_weight(font_size, font_weight)?;
+        let title_font = self
+            .fonts
+            .title_font_with_size_and_weight(font_size + 10.0, font_weight.max(760))?;
+        let section_font = self
+            .fonts
+            .title_font_with_size_and_weight(font_size + 2.0, font_weight.max(700))?;
         let render_metrics =
             crate::utilsprites::RenderMetrics::with_font_metrics(&ui_font.metrics());
         let dimensions = self.dimensions;
@@ -245,9 +251,22 @@ impl crate::TermWindow {
 
         let gl_state = self.render_state.as_ref().unwrap();
         let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
-        if let Some(view) = self.content_view.as_mut() {
-            view.paint(&ctx, layers, area, palette, &ui_font, cursor_on)?;
-        }
+        let next_frame = if let Some(view) = self.content_view.as_mut() {
+            view.paint(
+                &ctx,
+                layers,
+                area,
+                palette,
+                &ui_font,
+                &title_font,
+                &section_font,
+                cursor_on,
+            )?;
+            view.next_frame_time()
+        } else {
+            None
+        };
+        self.update_next_frame_time(next_frame);
         Ok(())
     }
 

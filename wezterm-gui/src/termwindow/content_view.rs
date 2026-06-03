@@ -7,7 +7,9 @@
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::TermWindow;
 use crate::ui::{DrawContext, UiPalette};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Instant;
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
 use window::{MouseEventKind as WMEK, RectF};
@@ -34,6 +36,11 @@ pub(crate) trait ContentView {
         false
     }
 
+    /// Schedule a follow-up repaint for view-local animations.
+    fn next_frame_time(&self) -> Option<Instant> {
+        None
+    }
+
     /// Paint the view into `area` (the terminal content rect). `cursor_on` is
     /// the current blink phase for any focused caret.
     fn paint(
@@ -43,6 +50,8 @@ pub(crate) trait ContentView {
         area: RectF,
         palette: UiPalette,
         font: &Rc<LoadedFont>,
+        title_font: &Rc<LoadedFont>,
+        section_font: &Rc<LoadedFont>,
         cursor_on: bool,
     ) -> anyhow::Result<()>;
 
@@ -53,6 +62,17 @@ pub(crate) trait ContentView {
     /// Insert pasted text into the focused field, if any.
     fn on_paste(&mut self, _text: &str) -> ContentViewResponse {
         ContentViewResponse::Redraw
+    }
+
+    /// Handle the synthetic tab close button / Escape-style close request.
+    fn on_close_requested(&mut self) -> ContentViewResponse {
+        ContentViewResponse::Close
+    }
+
+    /// Handle a folder selected by a native folder picker that was initiated by
+    /// this view.
+    fn on_folder_picked(&mut self, _path: PathBuf) -> ContentViewResponse {
+        ContentViewResponse::Ignored
     }
 
     /// Text to copy to the clipboard for ⌘C (e.g. the focused field), if any.

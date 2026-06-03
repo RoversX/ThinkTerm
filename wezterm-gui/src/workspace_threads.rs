@@ -420,21 +420,7 @@ pub fn claim_initial_space_for_window(owner_id: u64) -> SpaceId {
 
     let mut store = THREAD_STORE.lock();
     let changed = store.normalize_after_load();
-    let space_id = store
-        .last_active_space_id
-        .clone()
-        .filter(|space_id| store.has_space(space_id) && !occupied.contains(space_id))
-        .or_else(|| {
-            store
-                .spaces
-                .iter()
-                .find(|space| !occupied.contains(&space.id))
-                .map(|space| space.id.clone())
-        })
-        .unwrap_or_else(|| {
-            let name = next_space_name(&store.spaces);
-            store.create_space_record(name)
-        });
+    let space_id = store.claim_available_space_id(&occupied);
     if store.last_active_space_id.as_deref() != Some(&space_id) {
         store.last_active_space_id = Some(space_id.clone());
         persist_locked(&store);
@@ -445,6 +431,10 @@ pub fn claim_initial_space_for_window(owner_id: u64) -> SpaceId {
 
     WINDOW_SPACES.lock().insert(owner_id, space_id.clone());
     space_id
+}
+
+pub fn claim_space_for_new_window(owner_id: u64) -> SpaceId {
+    claim_initial_space_for_window(owner_id)
 }
 
 pub fn release_window_space(owner_id: u64) {
@@ -513,6 +503,30 @@ pub fn create_space(name: Option<String>) -> SpaceId {
     let id = store.create_space_record(name);
     store.last_active_space_id = Some(id.clone());
     persist_locked(&store);
+    id
+}
+
+pub fn ensure_space_named(name: &str) -> SpaceId {
+    let name = name.trim();
+    let name = if name.is_empty() { "Default" } else { name };
+    let mut store = THREAD_STORE.lock();
+    let mut changed = store.normalize_after_load();
+    let id = store
+        .spaces
+        .iter()
+        .find(|space| space.name.eq_ignore_ascii_case(name))
+        .map(|space| space.id.clone())
+        .unwrap_or_else(|| {
+            changed = true;
+            store.create_space_record(name.to_string())
+        });
+    if store.last_active_space_id.as_deref() != Some(&id) {
+        store.last_active_space_id = Some(id.clone());
+        changed = true;
+    }
+    if changed {
+        persist_locked(&store);
+    }
     id
 }
 
@@ -596,7 +610,7 @@ pub fn ensure_active_thread_for_space(space_id: &str) -> Option<WorkspaceThreadI
                 .map(|project| project.id.clone())
         })
         .unwrap_or_else(|| {
-            let mut project = current_project_from_cwd(space_id);
+            let mut project = default_project_for_space(space_id);
             let session = WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
             let thread_id = session.id.clone();
             project.active_thread_id = Some(thread_id);
@@ -632,19 +646,18 @@ pub fn workspace_has_thread_binding(workspace: &str) -> bool {
     store.workspace_space_id(workspace).is_some()
 }
 
-pub fn current_project_from_cwd(space_id: &str) -> Project {
-    let path = std::env::current_dir().unwrap_or_else(|_| config::HOME_DIR.to_path_buf());
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Home")
-        .to_string();
+/// A brand-new / empty Space has no project yet. Give it a stable default
+/// project rooted at the user's home directory. Previously this used the
+/// process launch cwd (`std::env::current_dir()`), which is arbitrary — `/`
+/// when launched from Finder, or whatever directory the binary was started
+/// from — and made a new Space appear to "inherit" the previous window's path.
+pub fn default_project_for_space(space_id: &str) -> Project {
+    let path = config::HOME_DIR.clone();
     let id = project_id_for_path(space_id, &path);
     Project {
         id,
         space_id: space_id.to_string(),
-        name,
+        name: "Home".to_string(),
         path,
         threads: vec![],
         active_thread_id: None,
@@ -653,7 +666,7 @@ pub fn current_project_from_cwd(space_id: &str) -> Project {
 }
 
 fn current_project_for_workspace(space_id: &str, active_workspace: &str) -> Project {
-    let mut project = current_project_from_cwd(space_id);
+    let mut project = default_project_for_space(space_id);
     let session = WorkspaceThread::new_initial(
         project.id.clone(),
         "main".to_string(),
@@ -1192,6 +1205,25 @@ impl WorkspaceThreadStore {
         id
     }
 
+    fn claim_available_space_id(
+        &mut self,
+        occupied: &std::collections::HashSet<SpaceId>,
+    ) -> SpaceId {
+        self.last_active_space_id
+            .clone()
+            .filter(|space_id| self.has_space(space_id) && !occupied.contains(space_id))
+            .or_else(|| {
+                self.spaces
+                    .iter()
+                    .find(|space| !occupied.contains(&space.id))
+                    .map(|space| space.id.clone())
+            })
+            .unwrap_or_else(|| {
+                let name = next_space_name(&self.spaces);
+                self.create_space_record(name)
+            })
+    }
+
     fn rename_space(&mut self, space_id: &str, name: String) -> bool {
         let name = name.trim();
         if name.is_empty() {
@@ -1276,7 +1308,7 @@ impl WorkspaceThreadStore {
         space_id: &str,
         active_workspace: &str,
     ) -> (ProjectId, bool) {
-        let current = current_project_from_cwd(space_id);
+        let current = default_project_for_space(space_id);
         let (project_id, mut changed) = if let Some(project) = self
             .projects
             .iter()
@@ -2793,6 +2825,37 @@ mod tests {
             assert!(is_materializing_thread_layout(&workspace));
         }
         assert!(!is_materializing_thread_layout(&workspace));
+    }
+
+    #[test]
+    fn claim_available_space_prefers_unoccupied_existing_space() {
+        let mut store = test_store();
+        let default_space = default_space_id();
+        let second_space = store.create_space_record("Second".to_string());
+        let third_space = store.create_space_record("Third".to_string());
+        store.last_active_space_id = Some(second_space.clone());
+        let occupied: std::collections::HashSet<SpaceId> =
+            vec![default_space, third_space].into_iter().collect();
+
+        let claimed = store.claim_available_space_id(&occupied);
+
+        assert_eq!(claimed, second_space);
+        assert_eq!(store.spaces.len(), 3);
+    }
+
+    #[test]
+    fn claim_available_space_creates_when_all_spaces_are_occupied() {
+        let mut store = test_store();
+        let default_space = default_space_id();
+        let second_space = store.create_space_record("Second".to_string());
+        let occupied: std::collections::HashSet<SpaceId> =
+            vec![default_space, second_space].into_iter().collect();
+
+        let claimed = store.claim_available_space_id(&occupied);
+
+        assert!(!occupied.contains(&claimed));
+        assert!(store.has_space(&claimed));
+        assert_eq!(store.spaces.len(), 3);
     }
 
     #[test]

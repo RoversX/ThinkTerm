@@ -224,6 +224,7 @@ enum SettingsAction {
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
     ToggleDeveloperMode,
+    ShowOnboardingNow,
     ToggleMemoryMonitoring,
     RefreshMemorySnapshot,
     CopyMemorySnapshot,
@@ -2129,6 +2130,29 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ShowOnboardingNow => {
+                self.ui.open_dropdown = None;
+                let Some(front_end) = crate::frontend::try_front_end() else {
+                    self.status = "No main ThinkTerm window is available.".to_string();
+                    return;
+                };
+                let windows = front_end.gui_windows();
+                if windows.is_empty() {
+                    self.status = "No main ThinkTerm window is open.".to_string();
+                } else {
+                    let count = windows.len();
+                    for gui_window in windows {
+                        gui_window
+                            .window
+                            .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                                |term_window| {
+                                    term_window.show_onboarding();
+                                },
+                            )));
+                    }
+                    self.status = format!("Onboarding opened in {count} main window(s).");
+                }
+            }
             SettingsAction::ToggleMemoryMonitoring => {
                 self.ui.open_dropdown = None;
                 self.ui.memory_monitoring = !self.ui.memory_monitoring;
@@ -3048,8 +3072,8 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 2);
-        let card_height = self.settings_card_height(2);
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 3);
+        let card_height = self.settings_card_height(3);
         let button_y = card_y + card_height + self.settings_section_card_gap();
         self.ui.content_scroll.set_extents(
             self.content_bottom(),
@@ -3096,26 +3120,39 @@ impl SettingsWindow {
             } else {
                 "Hidden"
             },
+            false,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 2.0,
+            row_width,
+            "Onboarding",
+            "Open the setup wizard without changing the saved seen version.",
+            "Manual test entry",
             true,
         )?;
+        let developer_label = if self.developer_mode_enabled() {
+            "Disable Developer Mode"
+        } else {
+            "Enable Developer Mode"
+        };
+        let developer_width = self.button_width_for_label(developer_label, 300.0);
         self.draw_button(
             layers,
             x,
             button_y,
-            self.button_width_for_label(
-                if self.developer_mode_enabled() {
-                    "Disable Developer Mode"
-                } else {
-                    "Enable Developer Mode"
-                },
-                300.0,
-            ),
-            if self.developer_mode_enabled() {
-                "Disable Developer Mode"
-            } else {
-                "Enable Developer Mode"
-            },
+            developer_width,
+            developer_label,
             SettingsAction::ToggleDeveloperMode,
+        )?;
+        self.draw_button(
+            layers,
+            x + developer_width + 14.0,
+            button_y,
+            self.button_width_for_label("Show Onboarding Now", 300.0),
+            "Show Onboarding Now",
+            SettingsAction::ShowOnboardingNow,
         )?;
 
         Ok(())

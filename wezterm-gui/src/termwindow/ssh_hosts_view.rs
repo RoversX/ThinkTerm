@@ -1394,6 +1394,8 @@ impl ContentView for SshHostsView {
         area: RectF,
         palette: UiPalette,
         font: &Rc<LoadedFont>,
+        _title_font: &Rc<LoadedFont>,
+        _section_font: &Rc<LoadedFont>,
         cursor_on: bool,
     ) -> anyhow::Result<()> {
         self.paint_impl(ctx, layers, area, palette, font, cursor_on)

@@ -11,8 +11,9 @@ pub(crate) const DEFAULT_SETTINGS_FONT_WEIGHT: u16 = 600;
 pub(crate) const DEFAULT_SIDEBAR_FONT_SIZE: f64 = 15.0;
 pub(crate) const DEFAULT_TAB_FONT_SIZE: f64 = 14.0;
 pub(crate) const DEFAULT_PANE_HEADER_FONT_SIZE: f64 = 14.0;
+pub(crate) const ONBOARDING_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum NativeThemeMode {
     System,
@@ -52,7 +53,7 @@ impl NativeThemeMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum NativeAppIcon {
     Default,
@@ -81,7 +82,7 @@ impl NativeAppIcon {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum NativeRendererBackend {
     OpenGL,
@@ -100,6 +101,32 @@ impl NativeRendererBackend {
         match front_end {
             config::FrontEndSelection::WebGpu => Self::WebGpu,
             config::FrontEndSelection::OpenGL | config::FrontEndSelection::Software => Self::OpenGL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NativeLanguagePreference {
+    System,
+    English,
+    Chinese,
+    Japanese,
+}
+
+impl Default for NativeLanguagePreference {
+    fn default() -> Self {
+        Self::System
+    }
+}
+
+impl NativeLanguagePreference {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::System => "Follow System",
+            Self::English => "English",
+            Self::Chinese => "中文",
+            Self::Japanese => "日本語",
         }
     }
 }
@@ -135,6 +162,24 @@ pub(crate) struct NativeDeveloperSettings {
     pub(crate) developer_mode: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeOnboardingSettings {
+    pub(crate) seen_version: u32,
+    pub(crate) language: NativeLanguagePreference,
+    pub(crate) show_left_sidebar_by_default: bool,
+}
+
+impl Default for NativeOnboardingSettings {
+    fn default() -> Self {
+        Self {
+            seen_version: 0,
+            language: NativeLanguagePreference::System,
+            show_left_sidebar_by_default: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeCompatibilitySettings {
@@ -167,6 +212,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) terminal: NativeTerminalSettings,
     pub(crate) chrome: NativeChromeSettings,
     pub(crate) developer: NativeDeveloperSettings,
+    pub(crate) onboarding: NativeOnboardingSettings,
     pub(crate) compatibility: NativeCompatibilitySettings,
     pub(crate) window: NativeWindowSettings,
 }
@@ -179,6 +225,7 @@ impl Default for ThinkTermNativeSettings {
             terminal: NativeTerminalSettings::default(),
             chrome: NativeChromeSettings::default(),
             developer: NativeDeveloperSettings::default(),
+            onboarding: NativeOnboardingSettings::default(),
             compatibility: NativeCompatibilitySettings::default(),
             window: NativeWindowSettings::default(),
         }
@@ -224,6 +271,10 @@ fn load_from_disk() -> ThinkTermNativeSettings {
 
 pub(crate) fn load() -> ThinkTermNativeSettings {
     settings_cache().lock().clone()
+}
+
+pub(crate) fn should_show_onboarding(settings: &ThinkTermNativeSettings) -> bool {
+    settings.onboarding.seen_version < ONBOARDING_VERSION
 }
 
 pub(crate) fn reload_from_disk() -> ThinkTermNativeSettings {
@@ -340,6 +391,10 @@ pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
     save(&settings)
 }
 
+pub(crate) fn mark_onboarding_seen(settings: &mut ThinkTermNativeSettings) {
+    settings.onboarding.seen_version = ONBOARDING_VERSION;
+}
+
 pub(crate) fn tab_font_size() -> f64 {
     load()
         .chrome
@@ -364,4 +419,34 @@ pub(crate) fn main_window_renderer(
         .window
         .main_renderer
         .unwrap_or_else(|| NativeRendererBackend::from_front_end(config_front_end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn onboarding_is_required_before_current_version() {
+        let mut settings = ThinkTermNativeSettings::default();
+        settings.onboarding.seen_version = 0;
+
+        assert!(should_show_onboarding(&settings));
+    }
+
+    #[test]
+    fn onboarding_is_not_required_after_current_version_is_seen() {
+        let mut settings = ThinkTermNativeSettings::default();
+        settings.onboarding.seen_version = ONBOARDING_VERSION;
+
+        assert!(!should_show_onboarding(&settings));
+    }
+
+    #[test]
+    fn mark_onboarding_seen_stores_current_version() {
+        let mut settings = ThinkTermNativeSettings::default();
+
+        mark_onboarding_seen(&mut settings);
+
+        assert_eq!(settings.onboarding.seen_version, ONBOARDING_VERSION);
+    }
 }

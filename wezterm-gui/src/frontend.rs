@@ -1,10 +1,9 @@
 use crate::scripting::guiwin::GuiWin;
 use crate::spawn::SpawnWhere;
-use crate::termwindow::TermWindowNotif;
 use crate::TermWindow;
 use ::window::*;
-use anyhow::{Context, Error};
-use config::keyassignment::{KeyAssignment, SpawnCommand};
+use anyhow::{anyhow, Context, Error};
+use config::keyassignment::{KeyAssignment, SpawnCommand, SpawnTabDomain};
 use config::{ConfigSubscription, NotificationHandling};
 use mux::client::ClientId;
 use mux::window::WindowId as MuxWindowId;
@@ -19,7 +18,12 @@ use wezterm_toast_notification::*;
 
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
-    switching_workspaces: RefCell<bool>,
+    // Depth counter: > 0 means at least one window is mid-switch (materializing
+    // a workspace it is about to adopt). While non-zero the additive reconcile
+    // is suppressed so it can't spawn a duplicate window for the mux window
+    // being adopted. A counter (rather than a bool) lets concurrent switches /
+    // Dock "New Window" clicks nest without one clobbering another's guard.
+    switching_workspaces: RefCell<usize>,
     spawned_mux_window: RefCell<HashSet<MuxWindowId>>,
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
     client_id: Arc<ClientId>,
@@ -43,7 +47,7 @@ impl GuiFrontEnd {
 
         let front_end = Rc::new(GuiFrontEnd {
             connection,
-            switching_workspaces: RefCell::new(false),
+            switching_workspaces: RefCell::new(0),
             spawned_mux_window: RefCell::new(HashSet::new()),
             known_windows: RefCell::new(BTreeMap::new()),
             client_id: client_id.clone(),
@@ -66,9 +70,20 @@ impl GuiFrontEnd {
                         .detach();
                     }
                 }
+                MuxNotification::WindowCreated(window_id) => {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        let fe = crate::frontend::front_end();
+                        if fe.spawned_mux_window.borrow().contains(&window_id) {
+                            return;
+                        }
+                        if !fe.is_switching_workspace() {
+                            fe.reconcile_workspace();
+                        }
+                    })
+                    .detach();
+                }
                 MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
-                | MuxNotification::WindowCreated(_)
                 | MuxNotification::WindowRemoved(_) => {
                     promise::spawn::spawn_into_main_thread(async move {
                         let fe = crate::frontend::front_end();
@@ -310,7 +325,7 @@ impl GuiFrontEnd {
                         Connection::get().unwrap().terminate_message_loop();
                     }
                     KeyAssignment::SpawnWindow => {
-                        spawn_command(&SpawnCommand::default(), SpawnWhere::NewWindow);
+                        front_end().spawn_space_window();
                     }
                     KeyAssignment::SpawnTab(spawn_where) => {
                         spawn_command(
@@ -357,70 +372,55 @@ impl GuiFrontEnd {
     pub fn reconcile_workspace(&self) -> Future<()> {
         let mut promise = Promise::new();
         let mux = Mux::get();
-        let workspace = mux.active_workspace_for_client(&self.client_id);
 
-        if mux.is_workspace_empty(&workspace) {
-            // We don't want to silently kill off things that might
-            // be running in other workspaces, so let's pick one
-            // and activate it
-            if self.is_switching_workspace() {
-                promise.ok(());
-                return promise.get_future().unwrap();
-            }
-            for workspace in mux.iter_workspaces() {
-                if !mux.is_workspace_empty(&workspace) {
-                    mux.set_active_workspace_for_client(&self.client_id, &workspace);
-                    log::debug!("using {} instead, as it is not empty", workspace);
-                    break;
-                }
-            }
-        }
+        // Each GUI window is pinned to its own mux window (its Space). We do
+        // NOT force every window onto a single active workspace any more, since
+        // ThinkTerm intentionally lets multiple windows live in different
+        // Spaces (workspaces) at the same time. Reconcile is therefore additive
+        // and only does two non-destructive things:
+        //   1. Close GUI windows whose mux window has gone away (e.g. the last
+        //      pane in that window exited and the mux killed the window).
+        //   2. Create GUI windows for mux windows in the active workspace that
+        //      don't have a GUI window yet (startup's first window, and the
+        //      native SpawnWindow path that adds a mux window to the current
+        //      workspace). Windows pinned to live mux windows in *other*
+        //      workspaces are never touched.
 
-        let workspace = mux.active_workspace_for_client(&self.client_id);
-        log::debug!("workspace is {}, fixup windows", workspace);
-
-        let mut mux_windows = mux.iter_windows_in_workspace(&workspace);
-
-        // First, repurpose existing windows.
-        // Note that both iter_windows_in_workspace and self.known_windows have a
-        // deterministic iteration order, so switching back and forth should result
-        // in a consistent mux <-> gui window mapping.
+        // 1. Drop GUI windows whose mux window no longer exists.
         let known_windows = std::mem::take(&mut *self.known_windows.borrow_mut());
         let mut windows = BTreeMap::new();
-        let mut unused = BTreeMap::new();
-
         for (window, window_id) in known_windows.into_iter() {
-            if let Some(idx) = mux_windows.iter().position(|&id| id == window_id) {
-                // it already points to the desired mux window
+            if mux.get_window(window_id).is_some() {
                 windows.insert(window, window_id);
-                mux_windows.remove(idx);
             } else {
-                unused.insert(window, window_id);
-            }
-        }
-
-        let mut mux_windows = mux_windows.into_iter();
-
-        for (window, old_id) in unused.into_iter() {
-            if let Some(mux_window_id) = mux_windows.next() {
-                window.notify(TermWindowNotif::SwitchToMuxWindow(mux_window_id));
-                windows.insert(window, mux_window_id);
-            } else {
-                // We have more windows than are in the new workspace;
-                // we no longer need this one!
                 window.close();
-                front_end().spawned_mux_window.borrow_mut().remove(&old_id);
+                self.spawned_mux_window.borrow_mut().remove(&window_id);
             }
         }
-
-        log::trace!("reconcile: windows -> {:?}", windows);
         *self.known_windows.borrow_mut() = windows;
 
-        let future = promise.get_future().unwrap();
+        // 2. Spawn GUI windows for active-workspace mux windows that lack one.
+        let workspace = mux.active_workspace_for_client(&self.client_id);
+        let mux_windows = mux.iter_windows_in_workspace(&workspace);
+        log::debug!(
+            "reconcile: active_ws={} mux_in_active={:?} known={:?} spawned={:?}",
+            workspace,
+            mux_windows,
+            self.known_windows
+                .borrow()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            self.spawned_mux_window
+                .borrow()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+        );
 
-        // then spawn any new windows that are needed
+        let future = promise.get_future().unwrap();
         promise::spawn::spawn(async move {
-            while let Some(mux_window_id) = mux_windows.next() {
+            for mux_window_id in mux_windows {
                 if front_end().has_mux_window(mux_window_id)
                     || front_end()
                         .spawned_mux_window
@@ -444,11 +444,107 @@ impl GuiFrontEnd {
                         .remove(&mux_window_id);
                 }
             }
-            *front_end().switching_workspaces.borrow_mut() = false;
+            // Note: reconcile does not touch the switch-depth counter; only the
+            // paired switch operations (which increment on entry) decrement it.
             promise.ok(());
         })
         .detach();
         future
+    }
+
+    fn spawn_space_window(&self) {
+        // Each Dock "New Window" gets its own Space and its own GUI window, and
+        // must work regardless of whatever else is in flight. We claim a
+        // distinct (unoccupied) Space synchronously so rapid repeated clicks
+        // each land on a different Space, then suppress reconcile only while we
+        // materialize + create this window.
+        let space_owner_id = crate::workspace_threads::next_space_owner_id();
+        let active_space_id = crate::workspace_threads::claim_space_for_new_window(space_owner_id);
+        self.set_switching_workspaces(true);
+
+        promise::spawn::spawn(async move {
+            let result = async {
+                let (mux_window_id, created_mux_window) =
+                    Self::materialize_space_window_for_app(&active_space_id).await?;
+                front_end()
+                    .spawned_mux_window
+                    .borrow_mut()
+                    .insert(mux_window_id);
+                if let Err(err) = TermWindow::new_window_with_claimed_space(
+                    mux_window_id,
+                    space_owner_id,
+                    active_space_id.clone(),
+                )
+                .await
+                {
+                    if created_mux_window {
+                        Mux::get().kill_window(mux_window_id);
+                    }
+                    return Err(err);
+                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(err) = result {
+                crate::workspace_threads::release_window_space(space_owner_id);
+                log::error!("failed to create ThinkTerm Space window: {err:#}");
+            }
+            front_end().set_switching_workspaces(false);
+        })
+        .detach();
+    }
+
+    async fn materialize_space_window_for_app(
+        space_id: &str,
+    ) -> anyhow::Result<(MuxWindowId, bool)> {
+        let mux = Mux::get();
+        let thread_id = crate::workspace_threads::ensure_active_thread_for_space(space_id)
+            .ok_or_else(|| anyhow!("failed to ensure active thread for Space {space_id}"))?;
+        let live_workspaces = mux.iter_workspaces();
+        let plan = crate::workspace_threads::activate_thread_record(&thread_id, &live_workspaces)
+            .ok_or_else(|| {
+            anyhow!("failed to activate thread {thread_id} for Space {space_id}")
+        })?;
+        let created_mux_window = plan.needs_materialize;
+
+        if plan.needs_materialize {
+            let config = config::configuration();
+            let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
+            let size = config.initial_size(dpi as u32, crate::cell_pixel_dims(&config, dpi).ok());
+            let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
+                Arc::new(config::TermConfig::with_config(config.clone()));
+            let layout = crate::workspace_threads::thread_layout(&plan.thread_id);
+            let remote_spec = crate::ssh_hosts::host_spec(
+                crate::workspace_threads::remote_host_id_for_project_id(&plan.project_id),
+            );
+            let (initial_cwd, default_domain) = if let Some(spec) = remote_spec.as_ref() {
+                let domain_name = crate::ssh_hosts::ensure_ssh_domain_registered(spec)?;
+                (None, SpawnTabDomain::DomainName(domain_name))
+            } else {
+                (
+                    plan.project_path.to_str().map(|path| path.to_string()),
+                    SpawnTabDomain::DefaultDomain,
+                )
+            };
+
+            crate::workspace_threads::materialize_thread(
+                plan.workspace_name.clone(),
+                layout,
+                initial_cwd,
+                size,
+                None,
+                term_config,
+                default_domain,
+            )
+            .await?;
+        }
+
+        mux.iter_windows_in_workspace(&plan.workspace_name)
+            .into_iter()
+            .next()
+            .map(|window_id| (window_id, created_mux_window))
+            .ok_or_else(|| anyhow!("Space workspace {} has no mux window", plan.workspace_name))
     }
 
     pub fn has_mux_window(&self, mux_window_id: MuxWindowId) -> bool {
@@ -463,11 +559,15 @@ impl GuiFrontEnd {
     pub fn switch_workspace(&self, workspace: &str) {
         let mux = Mux::get();
         mux.set_active_workspace_for_client(&self.client_id, workspace);
-        *self.switching_workspaces.borrow_mut() = false;
+        self.set_switching_workspaces(false);
         self.reconcile_workspace();
     }
 
     pub fn record_known_window(&self, window: Window, mux_window_id: MuxWindowId) {
+        // Mark this mux window as having a GUI window so the additive reconcile
+        // never re-creates a window for it (e.g. after the user closes it while
+        // its mux window keeps running in the background).
+        self.spawned_mux_window.borrow_mut().insert(mux_window_id);
         self.known_windows
             .borrow_mut()
             .insert(window, mux_window_id);
@@ -483,6 +583,24 @@ impl GuiFrontEnd {
         }
     }
 
+    /// Re-point an existing GUI window at a different mux window. Used when a
+    /// window switches the Space it is showing in place, so that
+    /// `known_windows` stays accurate without relying on reconcile to rebuild
+    /// the whole mux <-> gui mapping.
+    pub fn rebind_known_window(&self, window: &Window, mux_window_id: MuxWindowId) {
+        self.known_windows
+            .borrow_mut()
+            .insert(window.clone(), mux_window_id);
+        // Mark the adopted mux window as spawned so reconcile won't create a
+        // duplicate for it. We deliberately do NOT un-mark the window's
+        // *previous* mux window: after an in-window Space switch it keeps
+        // running in the background, and must stay protected so the additive
+        // reconcile never resurrects it as a stray "different" window (e.g.
+        // after another window is closed). A mux window only leaves the set
+        // when it actually dies (cleanup in `reconcile_workspace`).
+        self.spawned_mux_window.borrow_mut().insert(mux_window_id);
+    }
+
     pub fn invalidate_all_windows(&self) {
         for window in self.known_windows.borrow().keys() {
             window.invalidate();
@@ -490,7 +608,20 @@ impl GuiFrontEnd {
     }
 
     pub fn is_switching_workspace(&self) -> bool {
-        *self.switching_workspaces.borrow()
+        *self.switching_workspaces.borrow() > 0
+    }
+
+    /// Enter (true) or leave (false) a workspace-switch critical section,
+    /// during which the additive reconcile is suppressed so it doesn't spawn a
+    /// duplicate window for the mux window being adopted. Calls must be paired;
+    /// the underlying depth counter lets concurrent switches nest safely.
+    pub fn set_switching_workspaces(&self, value: bool) {
+        let mut depth = self.switching_workspaces.borrow_mut();
+        if value {
+            *depth += 1;
+        } else {
+            *depth = depth.saturating_sub(1);
+        }
     }
 
     pub fn gui_window_for_mux_window(&self, mux_window_id: MuxWindowId) -> Option<GuiWin> {
@@ -527,14 +658,10 @@ pub struct WorkspaceSwitcher {
 
 impl WorkspaceSwitcher {
     pub fn new(new_name: &str) -> Self {
-        *front_end().switching_workspaces.borrow_mut() = true;
+        front_end().set_switching_workspaces(true);
         Self {
             new_name: new_name.to_string(),
         }
-    }
-
-    pub fn do_switch(self) {
-        // Drop is invoked, which will complete the switch
     }
 }
 

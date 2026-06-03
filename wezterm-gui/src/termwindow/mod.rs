@@ -88,6 +88,7 @@ pub mod content_view;
 pub mod keyevent;
 pub mod modal;
 mod mouseevent;
+pub mod onboarding;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
@@ -896,6 +897,22 @@ impl TermWindow {
         self.quad_generation += 1;
         self.load_os_parameters();
 
+        if focused {
+            // Each window is pinned to its own Space (workspace). Keep the
+            // mux's single global "active workspace" pointed at whichever
+            // window is focused, so defaults like spawn-new-window land in the
+            // right place. Reconcile is additive, so this is non-destructive.
+            let mux = Mux::get();
+            let ws = mux
+                .get_window(self.mux_window_id)
+                .map(|w| w.get_workspace().to_string());
+            if let Some(ws) = ws {
+                if mux.active_workspace() != ws {
+                    mux.set_active_workspace(&ws);
+                }
+            }
+        }
+
         if self.focused.is_none() {
             self.last_mouse_click = None;
             self.current_mouse_buttons.clear();
@@ -951,6 +968,27 @@ impl TermWindow {
 
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
+        Self::new_window_impl(mux_window_id, None, true).await
+    }
+
+    pub async fn new_window_with_claimed_space(
+        mux_window_id: MuxWindowId,
+        space_owner_id: u64,
+        active_space_id: String,
+    ) -> anyhow::Result<()> {
+        Self::new_window_impl(
+            mux_window_id,
+            Some((space_owner_id, active_space_id)),
+            false,
+        )
+        .await
+    }
+
+    async fn new_window_impl(
+        mux_window_id: MuxWindowId,
+        claimed_space: Option<(u64, String)>,
+        restore_saved_thread: bool,
+    ) -> anyhow::Result<()> {
         let config = configuration();
         let native_settings = crate::native_settings::load();
         let main_renderer =
@@ -1051,9 +1089,12 @@ impl TermWindow {
         let render_state = None;
 
         let connection_name = Connection::get().unwrap().name();
-        let space_owner_id = crate::workspace_threads::next_space_owner_id();
-        let active_space_id =
-            crate::workspace_threads::claim_initial_space_for_window(space_owner_id);
+        let (space_owner_id, active_space_id) = claimed_space.unwrap_or_else(|| {
+            let space_owner_id = crate::workspace_threads::next_space_owner_id();
+            let active_space_id =
+                crate::workspace_threads::claim_initial_space_for_window(space_owner_id);
+            (space_owner_id, active_space_id)
+        });
         let workspace_layout_structure_fingerprint =
             crate::workspace_threads::window_layout_structure_fingerprint(mux_window_id);
 
@@ -1179,7 +1220,7 @@ impl TermWindow {
             active_space_id,
             workspace_layout_structure_fingerprint,
             workspace_sidebar_width,
-            workspace_sidebar_collapsed: false,
+            workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
             workspace_sidebar_scrollbar_visible_until: None,
             last_ui_item: None,
@@ -1304,13 +1345,22 @@ impl TermWindow {
             myself.apply_native_terminal_settings();
             myself.apply_workspace_thread_font_scales();
             myself.load_os_parameters();
-            if let Some(thread_id) =
-                crate::workspace_threads::thread_to_restore_for_space(&myself.active_space_id)
-            {
-                myself.activate_workspace_thread_for_new_window(thread_id, &window, mux_window_id);
+            if restore_saved_thread {
+                if let Some(thread_id) =
+                    crate::workspace_threads::thread_to_restore_for_space(&myself.active_space_id)
+                {
+                    myself.activate_workspace_thread_for_new_window(
+                        thread_id,
+                        &window,
+                        mux_window_id,
+                    );
+                } else {
+                    myself.sync_current_workspace_thread();
+                }
             } else {
                 myself.sync_current_workspace_thread();
             }
+            myself.maybe_show_onboarding();
             window.show();
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
@@ -1796,24 +1846,7 @@ impl TermWindow {
                 func(self);
             }
             TermWindowNotif::SwitchToMuxWindow(mux_window_id) => {
-                self.mux_window_id = mux_window_id;
-                *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
-
-                self.clear_all_overlays();
-                self.current_highlight.take();
-                self.apply_workspace_thread_font_scales();
-                self.invalidate_fancy_tab_bar();
-                self.invalidate_modal();
-
-                let mux = Mux::get();
-                if let Some(window) = mux.get_window(self.mux_window_id) {
-                    for tab in window.iter() {
-                        tab.resize(self.terminal_size);
-                    }
-                };
-                self.sync_current_workspace_thread();
-                self.update_title();
-                window.invalidate();
+                self.switch_to_mux_window(mux_window_id);
             }
             TermWindowNotif::SetInnerSize { width, height } => {
                 self.set_inner_size(window, width, height);
@@ -1826,6 +1859,63 @@ impl TermWindow {
     fn set_inner_size(&mut self, window: &Window, width: usize, height: usize) {
         self.resizes_pending += 1;
         window.set_inner_size(width, height);
+    }
+
+    /// Re-point THIS GUI window at a different mux window (the mux window of
+    /// the Space/workspace we want to display) without disturbing any other
+    /// window. This is the per-window primitive used both by the
+    /// `SwitchToMuxWindow` notification and by in-place Space/thread switches.
+    pub(crate) fn switch_to_mux_window(&mut self, mux_window_id: MuxWindowId) {
+        if self.mux_window_id == mux_window_id
+            && front_end()
+                .gui_window_for_mux_window(mux_window_id)
+                .is_some()
+        {
+            // Already showing it and the mapping is current; nothing to do.
+            return;
+        }
+
+        self.mux_window_id = mux_window_id;
+        *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
+
+        // Keep the frontend's window<->mux mapping accurate so that the
+        // additive reconcile does not try to spawn a duplicate window for the
+        // mux window we just adopted.
+        if let Some(window) = self.window.as_ref() {
+            front_end().rebind_known_window(window, mux_window_id);
+        }
+
+        self.clear_all_overlays();
+        self.current_highlight.take();
+        self.apply_workspace_thread_font_scales();
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
+
+        let mux = Mux::get();
+        if let Some(window) = mux.get_window(self.mux_window_id) {
+            for tab in window.iter() {
+                tab.resize(self.terminal_size);
+            }
+        };
+        self.sync_current_workspace_thread();
+        self.update_title();
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// Switch THIS window to display the (already-live) workspace `workspace`,
+    /// adopting its mux window in place, and make it the active workspace so
+    /// that spawn-new-window defaults stay correct. Returns false when the
+    /// workspace has no mux window to adopt.
+    pub(crate) fn adopt_workspace_in_this_window(&mut self, workspace: &str) -> bool {
+        let mux = Mux::get();
+        let Some(target) = mux.iter_windows_in_workspace(workspace).first().copied() else {
+            return false;
+        };
+        mux.set_active_workspace(workspace);
+        self.switch_to_mux_window(target);
+        true
     }
 
     /// Take care to remove our panes from the mux, otherwise
@@ -2427,6 +2517,50 @@ impl TermWindow {
         self.content_view = None;
         self.content_view_active = false;
         self.invalidate_window();
+    }
+
+    pub(crate) fn request_close_content_view(&mut self) {
+        let response = match self.content_view.as_mut() {
+            Some(view) => view.on_close_requested(),
+            None => crate::termwindow::content_view::ContentViewResponse::Ignored,
+        };
+        self.handle_content_response(response);
+    }
+
+    pub(crate) fn show_onboarding(&mut self) {
+        let space_name = crate::workspace_threads::active_space_name(&self.active_space_id)
+            .unwrap_or_else(|| self.active_space_id.clone());
+        self.open_content_view(Box::new(
+            crate::termwindow::onboarding::OnboardingView::new(
+                self.active_space_id.clone(),
+                space_name,
+            ),
+        ));
+    }
+
+    pub(crate) fn maybe_show_onboarding(&mut self) {
+        if crate::native_settings::should_show_onboarding(&crate::native_settings::load()) {
+            self.show_onboarding();
+        }
+    }
+
+    pub(crate) fn pick_content_view_folder(&mut self) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let notify_window = window.clone();
+        window.pick_folder_async(Box::new(move |path| {
+            if let Some(path) = path {
+                notify_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let response = term_window
+                        .content_view
+                        .as_mut()
+                        .map(|view| view.on_folder_picked(path))
+                        .unwrap_or(crate::termwindow::content_view::ContentViewResponse::Ignored);
+                    term_window.handle_content_response(response);
+                })));
+            }
+        }));
     }
 
     pub(crate) fn set_content_view_active(&mut self, active: bool) {
@@ -4035,8 +4169,8 @@ impl TermWindow {
                     new_idx
                 };
                 let new_idx = new_idx as usize % workspaces.len();
-                if let Some(w) = workspaces.get(new_idx) {
-                    front_end().switch_workspace(w);
+                if let Some(w) = workspaces.get(new_idx).cloned() {
+                    self.adopt_workspace_in_this_window(&w);
                 }
             }
             SwitchToWorkspace { name, spawn } => {
@@ -4046,14 +4180,18 @@ impl TermWindow {
                     .as_ref()
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| mux.generate_workspace_name());
-                let switcher = crate::frontend::WorkspaceSwitcher::new(&name);
-                mux.set_active_workspace(&name);
 
                 if mux.iter_windows_in_workspace(&name).is_empty() {
+                    // Materialize a window in the target workspace, then adopt
+                    // it into THIS window in place.
+                    front_end().set_switching_workspaces(true);
+                    mux.set_active_workspace(&name);
                     let spawn = spawn.as_ref().map(|s| s.clone()).unwrap_or_default();
                     let size = self.terminal_size;
                     let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
                     let src_window_id = self.mux_window_id;
+                    let reconcile_window = self.window.clone();
+                    let adopt_workspace = name.clone();
 
                     promise::spawn::spawn(async move {
                         if let Err(err) = crate::spawn::spawn_command_internal(
@@ -4067,12 +4205,17 @@ impl TermWindow {
                         {
                             log::error!("Failed to spawn: {:#}", err);
                         }
-                        switcher.do_switch();
+                        crate::termwindow::mouseevent::adopt_workspace_into_window(
+                            &reconcile_window,
+                            &adopt_workspace,
+                        );
+                        front_end().set_switching_workspaces(false);
                         drop(activity);
                     })
                     .detach();
                 } else {
-                    switcher.do_switch();
+                    self.adopt_workspace_in_this_window(&name);
+                    drop(activity);
                 }
             }
             DetachDomain(domain) => {
