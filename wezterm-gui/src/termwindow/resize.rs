@@ -170,7 +170,8 @@ impl super::TermWindow {
             let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
             let padding_bottom =
                 config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
-            let padding_right = effective_right_padding(&config, h_context);
+            let padding_right =
+                effective_right_padding(&config, h_context) + self.right_sidebar_width();
 
             let pixel_height = (rows * self.render_metrics.cell_size.height as usize)
                 + (padding_top + padding_bottom)
@@ -217,7 +218,8 @@ impl super::TermWindow {
             let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
             let padding_bottom =
                 config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
-            let padding_right = effective_right_padding(&config, h_context);
+            let padding_right =
+                effective_right_padding(&config, h_context) + self.right_sidebar_width();
 
             let avail_width = dimensions.pixel_width.saturating_sub(
                 (padding_left + padding_right) as usize

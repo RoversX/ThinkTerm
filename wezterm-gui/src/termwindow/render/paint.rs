@@ -432,6 +432,8 @@ impl crate::TermWindow {
 
         self.paint_workspace_sidebar(&mut layers)
             .context("paint_workspace_sidebar")?;
+        self.paint_right_sidebar(&mut layers)
+            .context("paint_right_sidebar")?;
 
         if self.show_tab_bar {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;

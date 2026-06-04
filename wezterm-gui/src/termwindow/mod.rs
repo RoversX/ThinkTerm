@@ -26,6 +26,7 @@ use crate::termwindow::render::{
     LineToElementShapeItem,
 };
 use crate::termwindow::webgpu::WebGpuState;
+use crate::ui::TextInputState;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::color::LinearRgba;
 use ::window::*;
@@ -235,12 +236,49 @@ pub enum UIItemType {
     WorkspaceSidebarViewOptions,
     WorkspaceSidebarSshHosts,
     WorkspaceSidebarNotifications,
+    RightSidebarToggle,
+    RightSidebarMode(RightSidebarMode),
+    RightSidebarBackground,
+    RightSidebarResize,
+    RightSidebarSnippetNew,
+    RightSidebarSnippetBack,
+    RightSidebarSnippetSave,
+    RightSidebarSnippetSearch,
+    RightSidebarSnippetTitle,
+    RightSidebarSnippetBody,
+    RightSidebarSnippetEdit(String),
+    RightSidebarSnippetPaste(String),
+    RightSidebarSnippetRun(String),
+    RightSidebarSnippetDelete(String),
+    RightSidebarSnippetScrollTrack,
+    RightSidebarSnippetScrollThumb,
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
     /// Close button on the synthetic content-view tab.
     ContentViewClose,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightSidebarMode {
+    Chat,
+    Tasks,
+    Snippets,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RightSidebarSnippetView {
+    List,
+    EditNew,
+    EditExisting(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightSidebarSnippetField {
+    Search,
+    Title,
+    Body,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -734,6 +772,16 @@ pub struct TermWindow {
     workspace_sidebar_collapsed: bool,
     workspace_sidebar_scroll_offset: f32,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
+    right_sidebar_width: usize,
+    right_sidebar_collapsed: bool,
+    right_sidebar_mode: RightSidebarMode,
+    right_sidebar_snippet_view: RightSidebarSnippetView,
+    right_sidebar_snippet_focus: Option<RightSidebarSnippetField>,
+    right_sidebar_snippet_search: TextInputState,
+    right_sidebar_snippet_title: TextInputState,
+    right_sidebar_snippet_body: TextInputState,
+    right_sidebar_snippet_scroll_offset: f32,
+    right_sidebar_snippet_scrollbar_visible_until: Option<Instant>,
 
     modal: RefCell<Option<Rc<dyn Modal>>>,
 
@@ -1223,6 +1271,16 @@ impl TermWindow {
             workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
             workspace_sidebar_scrollbar_visible_until: None,
+            right_sidebar_width: ui::right_sidebar_width_for_metrics(&render_metrics),
+            right_sidebar_collapsed: true,
+            right_sidebar_mode: RightSidebarMode::Snippets,
+            right_sidebar_snippet_view: RightSidebarSnippetView::List,
+            right_sidebar_snippet_focus: None,
+            right_sidebar_snippet_search: TextInputState::new(),
+            right_sidebar_snippet_title: TextInputState::new(),
+            right_sidebar_snippet_body: TextInputState::new(),
+            right_sidebar_snippet_scroll_offset: 0.0,
+            right_sidebar_snippet_scrollbar_visible_until: None,
             last_ui_item: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),

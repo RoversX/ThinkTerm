@@ -5,14 +5,14 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER,
 };
 use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, SvgIcon};
+use crate::termwindow::ui::platform_chrome;
 use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::tokens::{
-    CAPSULE_BORDER_WIDTH, MACOS_TITLEBAR_CONTENT_TOP_INSET, SIDEBAR_ICON_GAP, SIDEBAR_INSET,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP,
-    SIDEBAR_ROW_RADIUS, SIDEBAR_WIDTH_CELLS, WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT,
-    WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
+    CAPSULE_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP, SIDEBAR_ROW_RADIUS, SIDEBAR_WIDTH_CELLS,
+    WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT, WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
 };
 use crate::termwindow::{UIItem, UIItemType};
 use crate::ui::UiPalette;
@@ -26,7 +26,7 @@ use std::rc::Rc;
 use wezterm_bidi::Direction;
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
-use window::{MouseEventKind as WMEK, RectF, WindowOps, WindowState};
+use window::{MouseEventKind as WMEK, RectF, WindowOps};
 
 const SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
 const SIDEBAR_SETTINGS_FOOTER_HEIGHT: usize = 72;
@@ -350,13 +350,13 @@ impl crate::TermWindow {
     }
 
     fn workspace_sidebar_content_top(&self, panel_y: usize) -> usize {
-        let base_top = panel_y + SIDEBAR_INSET;
-        if cfg!(target_os = "macos") && !self.window_state.contains(WindowState::FULL_SCREEN) {
-            let tab_row_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
-            panel_y + MACOS_TITLEBAR_CONTENT_TOP_INSET.max(tab_row_height)
-        } else {
-            base_top
-        }
+        let tab_row_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
+        platform_chrome::workspace_sidebar_content_top(
+            panel_y,
+            SIDEBAR_INSET,
+            tab_row_height,
+            self.window_state,
+        )
     }
 
     fn workspace_sidebar_layout(
@@ -376,7 +376,8 @@ impl crate::TermWindow {
             .saturating_sub(settings_footer_height);
         let content_bottom = (panel_y + panel_height.saturating_sub(SIDEBAR_INSET))
             .min(settings_footer_y.max(panel_y));
-        let show_sidebar_toolbar = self.window_state.contains(WindowState::FULL_SCREEN);
+        let show_sidebar_toolbar =
+            platform_chrome::workspace_sidebar_shows_toolbar(self.window_state);
         let row_height =
             (ui_cell_height.max(icon_size) + SIDEBAR_INSET).max(SESSION_ROW_MIN_HEIGHT);
         let mut y = self.workspace_sidebar_content_top(panel_y);
@@ -2155,7 +2156,7 @@ impl crate::TermWindow {
         )
     }
 
-    fn paint_sidebar_text(
+    pub(crate) fn paint_sidebar_text(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         font: &Rc<LoadedFont>,
@@ -2220,7 +2221,11 @@ impl crate::TermWindow {
         Ok(Cow::Owned(output))
     }
 
-    fn sidebar_text_width(&self, font: &Rc<LoadedFont>, text: &str) -> anyhow::Result<f32> {
+    pub(crate) fn sidebar_text_width(
+        &self,
+        font: &Rc<LoadedFont>,
+        text: &str,
+    ) -> anyhow::Result<f32> {
         let Some(window) = self.window.as_ref().cloned() else {
             return Ok(0.0);
         };
@@ -2236,7 +2241,7 @@ impl crate::TermWindow {
         Ok(infos.iter().map(|info| info.x_advance.get() as f32).sum())
     }
 
-    fn paint_sidebar_icon(
+    pub(crate) fn paint_sidebar_icon(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         icon: SvgIcon,

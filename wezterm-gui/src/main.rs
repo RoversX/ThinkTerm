@@ -55,6 +55,7 @@ mod secret;
 mod selection;
 mod settings_window;
 mod shapecache;
+mod snippets;
 mod spawn;
 mod ssh_hosts;
 mod stats;

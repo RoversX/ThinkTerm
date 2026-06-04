@@ -5,11 +5,10 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
     TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
-    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_ADD_BUTTON_RADIUS,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
-    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS,
-    WINDOW_TAB_TOP_SPACER,
+    WINDOW_TAB_ADD_BUTTON_RADIUS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
+    WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
+    WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType};
 use crate::ui::UiPalette;
@@ -78,11 +77,13 @@ impl crate::TermWindow {
             .dimensions
             .pixel_width
             .saturating_sub(row_x + border.right.get() as usize)
+            .saturating_sub(self.right_sidebar_width())
             .max(1);
         let row_right = row_x + row_width;
         let viewport_left = (row_x as f32 + self.window_tab_left_padding_pixels()).ceil() as usize
             + TAB_ROW_START_PADDING;
-        let viewport_right = row_right.saturating_sub(WINDOW_TAB_ACTION_RESERVED_WIDTH);
+        let viewport_right =
+            row_right.saturating_sub(self.window_tab_trailing_action_reserved_width());
         let viewport_width = viewport_right.saturating_sub(viewport_left);
 
         self.filled_rectangle(
@@ -239,17 +240,47 @@ impl crate::TermWindow {
             }
         }
 
-        self.paint_window_tab_new_button(
-            layers,
-            &mut ui_items,
-            row_right,
-            content_row_y,
-            content_row_height,
-            button_size,
-            icon_size,
-            foreground,
-            muted_fg,
-        )?;
+        if self.right_sidebar_width() > 0 {
+            let new_button_x = row_right.saturating_sub(WINDOW_TAB_INSET + button_size + 2);
+            self.paint_window_tab_new_button(
+                layers,
+                &mut ui_items,
+                new_button_x,
+                content_row_y,
+                content_row_height,
+                button_size,
+                icon_size,
+                foreground,
+                muted_fg,
+            )?;
+        } else {
+            let right_sidebar_toggle_x =
+                row_right.saturating_sub(WINDOW_TAB_INSET + button_size + 2);
+            let new_button_x =
+                right_sidebar_toggle_x.saturating_sub(WINDOW_TAB_LEADING_ACTION_GAP + button_size);
+            self.paint_window_tab_new_button(
+                layers,
+                &mut ui_items,
+                new_button_x,
+                content_row_y,
+                content_row_height,
+                button_size,
+                icon_size,
+                foreground,
+                muted_fg,
+            )?;
+            self.paint_window_tab_right_sidebar_toggle_button(
+                layers,
+                &mut ui_items,
+                right_sidebar_toggle_x,
+                content_row_y,
+                content_row_height,
+                button_size,
+                icon_size,
+                foreground,
+                muted_fg,
+            )?;
+        }
 
         Ok(ui_items)
     }
@@ -704,7 +735,7 @@ impl crate::TermWindow {
         &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_items: &mut Vec<UIItem>,
-        row_right: usize,
+        button_x: usize,
         row_y: usize,
         row_height: usize,
         button_size: usize,
@@ -712,7 +743,6 @@ impl crate::TermWindow {
         foreground: LinearRgba,
         muted_fg: LinearRgba,
     ) -> anyhow::Result<()> {
-        let button_x = row_right.saturating_sub(WINDOW_TAB_INSET + button_size + 2);
         let button_y = row_y + (row_height.saturating_sub(button_size) / 2);
         let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
         let pressed = hovered
@@ -760,6 +790,73 @@ impl crate::TermWindow {
         self.paint_fancy_tab_icon(
             layers,
             SvgIcon::Plus,
+            button_x + press_inset + (visual_size.saturating_sub(icon_size) / 2),
+            button_y + press_inset + (visual_size.saturating_sub(icon_size) / 2),
+            icon_size,
+            if hovered { foreground } else { muted_fg },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_window_tab_right_sidebar_toggle_button(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        button_x: usize,
+        row_y: usize,
+        row_height: usize,
+        button_size: usize,
+        icon_size: usize,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let button_y = row_y + (row_height.saturating_sub(button_size) / 2);
+        let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
+        let pressed = hovered
+            && self.is_pointer_pressing_ui_rect(button_x, button_y, button_size, button_size);
+        let press_inset = if pressed { 1 } else { 0 };
+        let visual_size = button_size.saturating_sub(press_inset * 2);
+        if hovered {
+            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let fill = if pressed {
+                chrome.control_pressed_bg
+            } else {
+                chrome.control_hover_bg
+            };
+            let border_alpha = if pressed { 0.52 } else { 0.38 };
+            self.fill_rounded_rectangle_with_border(
+                layers,
+                1,
+                euclid::rect(
+                    (button_x + press_inset) as f32,
+                    (button_y + press_inset) as f32,
+                    visual_size as f32,
+                    visual_size as f32,
+                ),
+                fill,
+                foreground.mul_alpha(border_alpha),
+                WINDOW_TAB_ADD_BUTTON_RADIUS,
+                ICON_BUTTON_BORDER_WIDTH,
+            )
+            .context("window tab right sidebar toggle hover")?;
+        }
+
+        ui_items.push(UIItem {
+            x: button_x,
+            y: button_y,
+            width: button_size,
+            height: button_size,
+            item_type: UIItemType::RightSidebarToggle,
+        });
+
+        let icon_size = if pressed {
+            icon_size.saturating_sub(1).max(1)
+        } else {
+            icon_size
+        };
+        self.paint_fancy_tab_icon(
+            layers,
+            self.right_sidebar_toggle_icon(),
             button_x + press_inset + (visual_size.saturating_sub(icon_size) / 2),
             button_y + press_inset + (visual_size.saturating_sub(icon_size) / 2),
             icon_size,

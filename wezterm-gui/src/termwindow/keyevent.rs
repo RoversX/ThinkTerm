@@ -450,6 +450,25 @@ impl super::TermWindow {
                 }
             }
 
+            if only_key_bindings == OnlyKeyBindings::No && self.right_sidebar_has_text_focus() {
+                match self.win_key_code_to_termwiz_key_code(keycode) {
+                    Key::Code(term_key) => {
+                        let mods = raw_modifiers.remove_positional_mods();
+                        if self.handle_right_sidebar_key(term_key, mods) {
+                            context.invalidate();
+                            return true;
+                        }
+                    }
+                    Key::Composed(text) => {
+                        if self.push_right_sidebar_text(&text) {
+                            context.invalidate();
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             if only_key_bindings == OnlyKeyBindings::No && self.content_view_foreground() {
                 use ::termwiz::input::{KeyCode as TKC, Modifiers as TMods};
                 match self.win_key_code_to_termwiz_key_code(keycode) {

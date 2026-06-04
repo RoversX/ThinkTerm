@@ -5,16 +5,20 @@ use window::Image;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SvgIcon {
     Archive,
+    ArrowLeft,
     Bell,
+    Braces,
     ChevronDown,
     ChevronRight,
     Cloud,
+    CodeXml,
     Ellipsis,
     Expand,
     ExternalLink,
     Folder,
     FolderOpen,
     FolderPlus,
+    FolderTree,
     Globe,
     Info,
     Keyboard,
@@ -22,10 +26,13 @@ pub enum SvgIcon {
     Link2,
     Loader,
     LoaderCircle,
+    ListChecks,
     Maximize2,
     MemoryStick,
+    MessageCircle,
     Minimize2,
     Minus,
+    NotebookTabs,
     Palette,
     PanelLeft,
     PanelLeftClose,
@@ -57,7 +64,11 @@ impl SvgIcon {
     pub fn bytes(self) -> &'static [u8] {
         match self {
             Self::Archive => include_bytes!("../../../../third_party/lucide/icons/archive.svg"),
+            Self::ArrowLeft => {
+                include_bytes!("../../../../third_party/lucide/icons/arrow-left.svg")
+            }
             Self::Bell => include_bytes!("../../../../third_party/lucide/icons/bell.svg"),
+            Self::Braces => include_bytes!("../../../../third_party/lucide/icons/braces.svg"),
             Self::ChevronDown => {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-down.svg")
             }
@@ -65,6 +76,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-right.svg")
             }
             Self::Cloud => include_bytes!("../../../../third_party/lucide/icons/cloud.svg"),
+            Self::CodeXml => include_bytes!("../../../../third_party/lucide/icons/code-xml.svg"),
             Self::Ellipsis => include_bytes!("../../../../third_party/lucide/icons/ellipsis.svg"),
             Self::Expand => include_bytes!("../../../../third_party/lucide/icons/expand.svg"),
             Self::ExternalLink => {
@@ -77,6 +89,9 @@ impl SvgIcon {
             Self::FolderPlus => {
                 include_bytes!("../../../../third_party/lucide/icons/folder-plus.svg")
             }
+            Self::FolderTree => {
+                include_bytes!("../../../../third_party/lucide/icons/folder-tree.svg")
+            }
             Self::Globe => include_bytes!("../../../../third_party/lucide/icons/globe.svg"),
             Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
             Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),
@@ -86,16 +101,25 @@ impl SvgIcon {
             Self::LoaderCircle => {
                 include_bytes!("../../../../third_party/lucide/icons/loader-circle.svg")
             }
+            Self::ListChecks => {
+                include_bytes!("../../../../third_party/lucide/icons/list-checks.svg")
+            }
             Self::Maximize2 => {
                 include_bytes!("../../../../third_party/lucide/icons/maximize-2.svg")
             }
             Self::MemoryStick => {
                 include_bytes!("../../../../third_party/lucide/icons/memory-stick.svg")
             }
+            Self::MessageCircle => {
+                include_bytes!("../../../../third_party/lucide/icons/message-circle.svg")
+            }
             Self::Minimize2 => {
                 include_bytes!("../../../../third_party/lucide/icons/minimize-2.svg")
             }
             Self::Minus => include_bytes!("../../../../third_party/lucide/icons/minus.svg"),
+            Self::NotebookTabs => {
+                include_bytes!("../../../../third_party/lucide/icons/notebook-tabs.svg")
+            }
             Self::Palette => include_bytes!("../../../../third_party/lucide/icons/palette.svg"),
             Self::PanelLeft => {
                 include_bytes!("../../../../third_party/lucide/icons/panel-left.svg")
@@ -328,24 +352,31 @@ mod tests {
     fn svg_icons_rasterize() {
         for icon in [
             SvgIcon::Archive,
+            SvgIcon::ArrowLeft,
             SvgIcon::Bell,
+            SvgIcon::Braces,
             SvgIcon::Server,
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,
             SvgIcon::ChevronRight,
             SvgIcon::Cloud,
+            SvgIcon::CodeXml,
             SvgIcon::Expand,
             SvgIcon::Folder,
             SvgIcon::FolderOpen,
             SvgIcon::FolderPlus,
+            SvgIcon::FolderTree,
             SvgIcon::Globe,
             SvgIcon::Info,
             SvgIcon::Keyboard,
             SvgIcon::Loader,
             SvgIcon::LoaderCircle,
+            SvgIcon::ListChecks,
             SvgIcon::Maximize2,
+            SvgIcon::MessageCircle,
             SvgIcon::Minus,
             SvgIcon::Minimize2,
+            SvgIcon::NotebookTabs,
             SvgIcon::Palette,
             SvgIcon::PanelLeft,
             SvgIcon::PanelLeftClose,

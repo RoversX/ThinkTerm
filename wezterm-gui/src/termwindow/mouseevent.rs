@@ -1,12 +1,11 @@
 use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
+use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::tokens::{
-    MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH, MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS,
     PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_ROW_START_PADDING,
-    TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X,
-    WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
+    TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
+    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
 use crate::termwindow::{
     GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TabWheelSurface,
@@ -77,92 +76,43 @@ impl super::TermWindow {
             .ceil()
     }
 
+    fn window_tab_chrome_params(&self) -> WindowTabChromeParams {
+        WindowTabChromeParams {
+            use_fancy_tab_bar: self.config.use_fancy_tab_bar,
+            workspace_sidebar_width: self.workspace_sidebar_width(),
+            window_state: self.window_state,
+            window_decorations: self.config.window_decorations,
+            integrated_title_button_alignment: self.config.integrated_title_button_alignment,
+            integrated_title_button_style: self.config.integrated_title_button_style,
+            cell_width: self.render_metrics.cell_size.width.max(1) as f32,
+        }
+    }
+
     pub(super) fn window_tab_leading_action_slot_count(&self) -> usize {
-        if !self.config.use_fancy_tab_bar || self.workspace_sidebar_width() > 0 {
-            return 0;
-        }
-
-        if self.window_state.contains(WindowState::FULL_SCREEN) {
-            return 1;
-        }
-
-        if cfg!(target_os = "macos") {
-            return MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS;
-        }
-
-        0
+        self.window_tab_chrome_params().leading_action_slot_count()
     }
 
     pub(super) fn window_tab_shows_sidebar_toggle_action(&self) -> bool {
-        self.config.use_fancy_tab_bar
-            && self.workspace_sidebar_width() == 0
-            && self.window_state.contains(WindowState::FULL_SCREEN)
+        self.window_tab_chrome_params()
+            .shows_sidebar_toggle_action()
     }
 
     pub(super) fn window_tab_leading_action_start_pixels(&self) -> f32 {
-        if self.window_tab_leading_action_slot_count() == 0 {
-            0.0
-        } else if self.window_state.contains(WindowState::FULL_SCREEN) {
-            WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X as f32
-        } else if cfg!(target_os = "macos") {
-            MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH as f32
-        } else {
-            0.0
-        }
-    }
-
-    pub(super) fn window_tab_leading_action_area_width_pixels(&self) -> f32 {
-        let count = self.window_tab_leading_action_slot_count();
-        if count == 0 {
-            0.0
-        } else {
-            let button_size = if self.window_tab_shows_sidebar_toggle_action() {
-                WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
-            } else {
-                WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
-            };
-            (count * (button_size + WINDOW_TAB_LEADING_ACTION_GAP)) as f32
-        }
+        self.window_tab_chrome_params()
+            .leading_action_start_pixels()
     }
 
     pub(super) fn window_tab_left_padding_pixels(&self) -> f32 {
-        if self.workspace_sidebar_width() > 0 {
-            return 0.0;
-        }
+        self.window_tab_chrome_params().left_padding_pixels()
+    }
 
-        let cell_width = self.render_metrics.cell_size.width.max(1) as f32;
-        let leading_action_slot_count = self.window_tab_leading_action_slot_count();
-        let leading_action_padding = if leading_action_slot_count > 0 {
-            self.window_tab_leading_action_start_pixels()
-                + self.window_tab_leading_action_area_width_pixels()
+    pub(super) fn window_tab_trailing_action_reserved_width(&self) -> usize {
+        if self.right_sidebar_width() > 0 {
+            WINDOW_TAB_ACTION_RESERVED_WIDTH
         } else {
-            0.0
-        };
-        if cfg!(target_os = "macos") && !self.window_state.contains(WindowState::FULL_SCREEN) {
-            return leading_action_padding.max(MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH as f32);
-        }
-        if self
-            .config
-            .window_decorations
-            .contains(WindowDecorations::INTEGRATED_BUTTONS)
-            && (self.config.integrated_title_button_alignment
-                == window::IntegratedTitleButtonAlignment::Left
-                || self.config.integrated_title_button_style
-                    == window::IntegratedTitleButtonStyle::MacOsNative)
-        {
-            if self.config.integrated_title_button_style
-                == window::IntegratedTitleButtonStyle::MacOsNative
-            {
-                if self.window_state.contains(WindowState::FULL_SCREEN) {
-                    leading_action_padding + cell_width * 0.5
-                } else {
-                    70.0
-                }
-            } else {
-                leading_action_padding
-            }
-        } else {
-            leading_action_padding + cell_width * 0.5
+            WINDOW_TAB_ACTION_RESERVED_WIDTH
+                + WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
+                + WINDOW_TAB_LEADING_ACTION_GAP
         }
     }
 
@@ -181,10 +131,11 @@ impl super::TermWindow {
         self.dimensions
             .pixel_width
             .saturating_sub(self.tab_bar_left_edge())
+            .saturating_sub(self.right_sidebar_width())
             .saturating_sub(border.right.get() as usize)
             .saturating_sub(left_padding.max(0.0) as usize)
             .saturating_sub(if self.config.use_fancy_tab_bar {
-                TAB_ROW_START_PADDING + WINDOW_TAB_ACTION_RESERVED_WIDTH
+                TAB_ROW_START_PADDING + self.window_tab_trailing_action_reserved_width()
             } else {
                 0
             })
@@ -556,6 +507,36 @@ impl super::TermWindow {
         true
     }
 
+    fn mouse_wheel_right_sidebar(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
+        let Some(rect) = self.right_sidebar_rect() else {
+            return false;
+        };
+
+        let x = event.coords.x;
+        let y = event.coords.y;
+        if x < rect.x as isize
+            || x >= rect.x.saturating_add(rect.width) as isize
+            || y < rect.y as isize
+            || y >= rect.y.saturating_add(rect.height) as isize
+        {
+            return false;
+        }
+
+        let amount = match event.kind {
+            WMEK::VertWheel(amount) => amount,
+            WMEK::HorzWheel(_) => return true,
+            _ => return false,
+        };
+        if amount == 0 {
+            return true;
+        }
+
+        self.show_right_sidebar_snippet_scrollbar();
+        self.scroll_right_sidebar_snippets(amount);
+        context.invalidate();
+        true
+    }
+
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
         let y = event.coords.y;
@@ -590,6 +571,22 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarNotifications
+            | UIItemType::RightSidebarToggle
+            | UIItemType::RightSidebarMode(_)
+            | UIItemType::RightSidebarBackground
+            | UIItemType::RightSidebarResize
+            | UIItemType::RightSidebarSnippetNew
+            | UIItemType::RightSidebarSnippetBack
+            | UIItemType::RightSidebarSnippetSave
+            | UIItemType::RightSidebarSnippetSearch
+            | UIItemType::RightSidebarSnippetTitle
+            | UIItemType::RightSidebarSnippetBody
+            | UIItemType::RightSidebarSnippetEdit(_)
+            | UIItemType::RightSidebarSnippetPaste(_)
+            | UIItemType::RightSidebarSnippetRun(_)
+            | UIItemType::RightSidebarSnippetDelete(_)
+            | UIItemType::RightSidebarSnippetScrollTrack
+            | UIItemType::RightSidebarSnippetScrollThumb
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -620,6 +617,22 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarNotifications
+            | UIItemType::RightSidebarToggle
+            | UIItemType::RightSidebarMode(_)
+            | UIItemType::RightSidebarBackground
+            | UIItemType::RightSidebarResize
+            | UIItemType::RightSidebarSnippetNew
+            | UIItemType::RightSidebarSnippetBack
+            | UIItemType::RightSidebarSnippetSave
+            | UIItemType::RightSidebarSnippetSearch
+            | UIItemType::RightSidebarSnippetTitle
+            | UIItemType::RightSidebarSnippetBody
+            | UIItemType::RightSidebarSnippetEdit(_)
+            | UIItemType::RightSidebarSnippetPaste(_)
+            | UIItemType::RightSidebarSnippetRun(_)
+            | UIItemType::RightSidebarSnippetDelete(_)
+            | UIItemType::RightSidebarSnippetScrollTrack
+            | UIItemType::RightSidebarSnippetScrollThumb
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -699,6 +712,10 @@ impl super::TermWindow {
 
         self.current_mouse_event.replace(event.clone());
 
+        if self.mouse_wheel_right_sidebar(&event, context) {
+            return;
+        }
+
         if self.mouse_wheel_workspace_sidebar(&event, context) {
             return;
         }
@@ -775,6 +792,12 @@ impl super::TermWindow {
                         item.item_type == UIItemType::WorkspaceSidebarResize
                     }) {
                         self.persist_workspace_sidebar_width();
+                    }
+                    if completed_drag
+                        .as_ref()
+                        .is_some_and(|(item, _)| item.item_type == UIItemType::RightSidebarResize)
+                    {
+                        self.persist_right_sidebar_width();
                     }
                     if completed_drag
                         .as_ref()
@@ -893,6 +916,10 @@ impl super::TermWindow {
             self.current_mouse_capture,
             None | Some(MouseCapture::TerminalPane(_))
         ) {
+            if event.kind == WMEK::Press(MousePress::Left) && self.right_sidebar_has_text_focus() {
+                self.right_sidebar_snippet_focus = None;
+                context.invalidate();
+            }
             self.mouse_event_terminal(
                 pane,
                 ClickPosition {
@@ -1042,6 +1069,38 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
+    fn set_right_sidebar_snippet_scroll_from_thumb_top(
+        &mut self,
+        thumb_top: f32,
+        context: &dyn WindowOps,
+    ) {
+        let Some(scroll) = self.right_sidebar_snippet_scroll_geometry() else {
+            return;
+        };
+        let travel = (scroll.track_height as f32 - scroll.thumb_height).max(1.0);
+        let relative_top = (thumb_top - scroll.track_y as f32).clamp(0.0, travel);
+        let offset = (relative_top / travel * scroll.max_scroll).clamp(0.0, scroll.max_scroll);
+        self.show_right_sidebar_snippet_scrollbar();
+        if (offset - self.right_sidebar_snippet_scroll_offset).abs() > f32::EPSILON {
+            self.right_sidebar_snippet_scroll_offset = offset;
+        }
+        context.invalidate();
+    }
+
+    fn drag_right_sidebar_snippet_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let from_top = start_event.coords.y.saturating_sub(item.y as isize) as f32;
+        let thumb_top = event.coords.y as f32 - from_top;
+        self.set_right_sidebar_snippet_scroll_from_thumb_top(thumb_top, context);
+        context.set_cursor(Some(MouseCursor::Hand));
+        self.dragging.replace((item, start_event));
+    }
+
     fn drag_ui_item(
         &mut self,
         item: UIItem,
@@ -1060,6 +1119,12 @@ impl super::TermWindow {
             }
             UIItemType::WorkspaceSidebarResize => {
                 self.drag_workspace_sidebar_resize(item, start_event, event, context);
+            }
+            UIItemType::RightSidebarResize => {
+                self.drag_right_sidebar_resize(item, start_event, event, context);
+            }
+            UIItemType::RightSidebarSnippetScrollThumb => {
+                self.drag_right_sidebar_snippet_scroll_thumb(item, start_event, event, context);
             }
             UIItemType::WorkspaceSidebarScrollThumb => {
                 self.drag_workspace_sidebar_scroll_thumb(item, start_event, event, context);
@@ -1083,6 +1148,25 @@ impl super::TermWindow {
         self.expand_workspace_sidebar();
         self.set_workspace_sidebar_width(width);
         self.reflow_workspace_sidebar(context);
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drag_right_sidebar_resize(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let right_edge =
+            self.dimensions
+                .pixel_width
+                .saturating_sub(self.get_os_border().right.get() as usize) as isize;
+        let width = right_edge.saturating_sub(event.coords.x).max(0) as usize;
+        self.expand_right_sidebar();
+        self.set_right_sidebar_width(width);
+        self.reflow_right_sidebar(context);
         context.set_cursor(Some(MouseCursor::SizeLeftRight));
         self.dragging.replace((item, start_event));
     }
@@ -1161,6 +1245,40 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarResize => {
                 self.mouse_event_workspace_sidebar_resize(item, event, context);
             }
+            UIItemType::RightSidebarToggle => {
+                self.mouse_event_right_sidebar_toggle(event, context);
+            }
+            UIItemType::RightSidebarMode(mode) => {
+                self.mouse_event_right_sidebar_mode(mode, event, context);
+            }
+            UIItemType::RightSidebarBackground => {
+                context.set_cursor(Some(MouseCursor::Arrow));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.right_sidebar_snippet_focus = None;
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarResize => {
+                self.mouse_event_right_sidebar_resize(item, event, context);
+            }
+            UIItemType::RightSidebarSnippetScrollTrack => {
+                self.mouse_event_right_sidebar_snippet_scroll_track(item, event, context);
+            }
+            UIItemType::RightSidebarSnippetScrollThumb => {
+                self.mouse_event_right_sidebar_snippet_scroll_thumb(item, event, context);
+            }
+            UIItemType::RightSidebarSnippetNew
+            | UIItemType::RightSidebarSnippetBack
+            | UIItemType::RightSidebarSnippetSave
+            | UIItemType::RightSidebarSnippetSearch
+            | UIItemType::RightSidebarSnippetTitle
+            | UIItemType::RightSidebarSnippetBody
+            | UIItemType::RightSidebarSnippetEdit(_)
+            | UIItemType::RightSidebarSnippetPaste(_)
+            | UIItemType::RightSidebarSnippetRun(_)
+            | UIItemType::RightSidebarSnippetDelete(_) => {
+                self.mouse_event_right_sidebar_snippet(item.item_type.clone(), event, context);
+            }
             UIItemType::WorkspaceSidebarSettings => {
                 self.mouse_event_workspace_sidebar_settings(event, context);
             }
@@ -1193,6 +1311,14 @@ impl super::TermWindow {
         context.invalidate();
     }
 
+    fn reflow_right_sidebar(&mut self, context: &dyn WindowOps) {
+        if let Some(window) = self.window.as_ref().cloned() {
+            let dimensions = self.dimensions;
+            self.apply_dimensions(&dimensions, None, &window);
+        }
+        context.invalidate();
+    }
+
     pub fn mouse_event_workspace_sidebar_resize(
         &mut self,
         item: UIItem,
@@ -1215,6 +1341,109 @@ impl super::TermWindow {
             self.toggle_workspace_sidebar();
             self.reflow_workspace_sidebar(context);
         }
+    }
+
+    pub fn mouse_event_right_sidebar_resize(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_snippet_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        self.show_right_sidebar_snippet_scrollbar();
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_snippet_scroll_track(
+        &mut self,
+        _item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        self.show_right_sidebar_snippet_scrollbar();
+        if event.kind == WMEK::Press(MousePress::Left) {
+            if let Some(scroll) = self.right_sidebar_snippet_scroll_geometry() {
+                let thumb_top = event.coords.y as f32 - scroll.thumb_height / 2.0;
+                self.set_right_sidebar_snippet_scroll_from_thumb_top(thumb_top, context);
+            }
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_toggle(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.toggle_right_sidebar();
+            self.reflow_right_sidebar(context);
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_mode(
+        &mut self,
+        mode: super::RightSidebarMode,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.right_sidebar_mode = mode;
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_snippet(
+        &mut self,
+        item_type: UIItemType,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+
+        match item_type {
+            UIItemType::RightSidebarSnippetNew => self.open_new_snippet_editor(),
+            UIItemType::RightSidebarSnippetBack => self.close_snippet_editor(),
+            UIItemType::RightSidebarSnippetSave => self.save_snippet_editor(),
+            UIItemType::RightSidebarSnippetSearch => {
+                self.right_sidebar_snippet_focus = Some(super::RightSidebarSnippetField::Search);
+            }
+            UIItemType::RightSidebarSnippetTitle => {
+                self.right_sidebar_snippet_focus = Some(super::RightSidebarSnippetField::Title);
+            }
+            UIItemType::RightSidebarSnippetBody => {
+                self.right_sidebar_snippet_focus = Some(super::RightSidebarSnippetField::Body);
+            }
+            UIItemType::RightSidebarSnippetEdit(id) => self.open_existing_snippet_editor(&id),
+            UIItemType::RightSidebarSnippetPaste(id) => {
+                self.right_sidebar_snippet_focus = None;
+                self.paste_snippet_to_active_pane(&id, false);
+            }
+            UIItemType::RightSidebarSnippetRun(id) => {
+                self.right_sidebar_snippet_focus = None;
+                self.paste_snippet_to_active_pane(&id, true);
+            }
+            UIItemType::RightSidebarSnippetDelete(id) => self.delete_snippet(&id),
+            _ => {}
+        }
+        context.invalidate();
     }
 
     pub fn mouse_event_workspace_sidebar_settings(

@@ -152,6 +152,7 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) settings_font_weight: Option<u16>,
     pub(crate) sidebar_font_size: Option<f64>,
     pub(crate) workspace_sidebar_width: Option<usize>,
+    pub(crate) right_sidebar_width: Option<usize>,
     pub(crate) tab_font_size: Option<f64>,
     pub(crate) pane_header_font_size: Option<f64>,
 }
@@ -388,6 +389,16 @@ pub(crate) fn workspace_sidebar_width() -> Option<usize> {
 pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
     let mut settings = load();
     settings.chrome.workspace_sidebar_width = Some(width);
+    save(&settings)
+}
+
+pub(crate) fn right_sidebar_width() -> Option<usize> {
+    load().chrome.right_sidebar_width
+}
+
+pub(crate) fn save_right_sidebar_width(width: usize) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.chrome.right_sidebar_width = Some(width);
     save(&settings)
 }
 
