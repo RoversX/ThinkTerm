@@ -225,6 +225,7 @@ pub struct Config {
     /// Specifies the default current working directory if none is specified
     /// through configuration or OSC 7 (see docs for `default_cwd` for more
     /// info!)
+    #[dynamic(default = "default_cwd")]
     pub default_cwd: Option<PathBuf>,
 
     #[dynamic(default)]
@@ -919,6 +920,10 @@ fn default_ulimit_nofile() -> u64 {
 
 fn default_ulimit_nproc() -> u64 {
     2048
+}
+
+fn default_cwd() -> Option<PathBuf> {
+    Some(HOME_DIR.clone())
 }
 
 impl Default for Config {
@@ -2299,7 +2304,7 @@ fn default_colr_rasterizer() -> FontRasterizerSelection {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, HOME_DIR};
 
     struct EnvGuard {
         config_file: Option<std::ffi::OsString>,
@@ -2326,6 +2331,11 @@ mod tests {
                 None => std::env::remove_var("WEZTERM_CONFIG_DIR"),
             }
         }
+    }
+
+    #[test]
+    fn default_cwd_is_home() {
+        assert_eq!(Config::default().default_cwd.as_ref(), Some(&*HOME_DIR));
     }
 
     #[test]
