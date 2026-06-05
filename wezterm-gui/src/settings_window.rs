@@ -154,6 +154,12 @@ impl SettingsSection {
                 "Font Family",
                 "ThinkTerm Font Size",
                 "Native Font Family",
+                "Bottom Quote",
+                "Quote Font Size",
+                "Quote Rotation",
+                "Quote Interval",
+                "Open Quotes JSON",
+                "Reset Quotes JSON",
                 "Terminal",
             ],
             Self::Workspaces => &["Workspace", "Sidebar", "Session", "Layout"],
@@ -238,6 +244,16 @@ enum SettingsAction {
     ToggleMainRendererMenu,
     SetMainRenderer(NativeRendererBackend),
     RestartApplication,
+    ToggleBottomQuote,
+    CycleBottomQuoteMode,
+    DecreaseBottomQuoteFontSize,
+    IncreaseBottomQuoteFontSize,
+    ResetBottomQuoteFontSize,
+    DecreaseBottomQuoteInterval,
+    IncreaseBottomQuoteInterval,
+    ResetBottomQuoteInterval,
+    OpenBottomQuotesJson,
+    ResetBottomQuotesJson,
     SearchInput,
     DecreaseFontSize,
     IncreaseFontSize,
@@ -1716,6 +1732,84 @@ impl SettingsWindow {
         self.save_and_apply_native_terminal_settings();
     }
 
+    fn current_bottom_quote_interval_minutes(&self) -> u32 {
+        crate::native_settings::bottom_quote_interval_minutes(&self.native_settings)
+    }
+
+    fn bottom_quote_interval_label(&self) -> String {
+        Self::format_bottom_quote_interval(self.current_bottom_quote_interval_minutes())
+    }
+
+    fn step_bottom_quote_interval(&mut self, delta: i32) {
+        let current = self.current_bottom_quote_interval_minutes() as i32;
+        let value = (current + delta).clamp(1, 24 * 60) as u32;
+        self.native_settings.terminal.bottom_quote_interval_minutes = Some(value);
+        self.save_and_apply_bottom_quote_settings(format!(
+            "Bottom quote interval is now {}.",
+            Self::format_bottom_quote_interval(value)
+        ));
+    }
+
+    fn reset_bottom_quote_interval(&mut self) {
+        self.native_settings.terminal.bottom_quote_interval_minutes = None;
+        self.save_and_apply_bottom_quote_settings(format!(
+            "Bottom quote interval reset to {}.",
+            Self::format_bottom_quote_interval(
+                crate::native_settings::DEFAULT_BOTTOM_QUOTE_INTERVAL_MINUTES
+            )
+        ));
+    }
+
+    fn format_bottom_quote_interval(minutes: u32) -> String {
+        if minutes < 60 {
+            format!("{minutes} min")
+        } else if minutes % 60 == 0 {
+            let hours = minutes / 60;
+            if hours == 1 {
+                "1 h".to_string()
+            } else {
+                format!("{hours} h")
+            }
+        } else {
+            format!("{} h {} min", minutes / 60, minutes % 60)
+        }
+    }
+
+    fn current_bottom_quote_font_size(&self) -> f64 {
+        crate::native_settings::bottom_quote_font_size(&self.native_settings)
+    }
+
+    fn bottom_quote_font_size_label(&self) -> String {
+        Self::format_bottom_quote_font_size(self.current_bottom_quote_font_size())
+    }
+
+    fn step_bottom_quote_font_size(&mut self, delta: f64) {
+        let value = (self.current_bottom_quote_font_size() + delta).clamp(6.0, 20.0);
+        self.native_settings.terminal.bottom_quote_font_size = Some(value);
+        self.save_and_apply_bottom_quote_settings(format!(
+            "Bottom quote font size is now {}.",
+            Self::format_bottom_quote_font_size(value)
+        ));
+    }
+
+    fn reset_bottom_quote_font_size(&mut self) {
+        self.native_settings.terminal.bottom_quote_font_size = None;
+        self.save_and_apply_bottom_quote_settings(format!(
+            "Bottom quote font size reset to {}.",
+            Self::format_bottom_quote_font_size(
+                crate::native_settings::DEFAULT_BOTTOM_QUOTE_FONT_SIZE
+            )
+        ));
+    }
+
+    fn format_bottom_quote_font_size(size: f64) -> String {
+        if (size.round() - size).abs() < f64::EPSILON {
+            format!("{size:.0} pt")
+        } else {
+            format!("{size:.1} pt")
+        }
+    }
+
     fn current_chrome_font_size_value(&self, area: ChromeFontArea) -> f64 {
         let value = match area {
             ChromeFontArea::Settings => self.native_settings.chrome.settings_font_size,
@@ -1816,6 +1910,20 @@ impl SettingsWindow {
             }
             Err(err) => {
                 self.status = format!("Unable to save terminal settings: {err:#}");
+            }
+        }
+    }
+
+    fn save_and_apply_bottom_quote_settings(&mut self, status: String) {
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+                self.status = status;
+            }
+            Err(err) => {
+                self.status = format!("Unable to save bottom quote setting: {err:#}");
             }
         }
     }
@@ -2105,6 +2213,58 @@ impl SettingsWindow {
                     }
                     Err(err) => {
                         self.status = format!("Unable to restart ThinkTerm: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::ToggleBottomQuote => {
+                self.ui.open_dropdown = None;
+                self.native_settings.terminal.bottom_quote_enabled =
+                    !self.native_settings.terminal.bottom_quote_enabled;
+                let status = if self.native_settings.terminal.bottom_quote_enabled {
+                    "Bottom quote enabled.".to_string()
+                } else {
+                    "Bottom quote disabled.".to_string()
+                };
+                self.save_and_apply_bottom_quote_settings(status);
+            }
+            SettingsAction::CycleBottomQuoteMode => {
+                self.ui.open_dropdown = None;
+                self.native_settings.terminal.bottom_quote_mode =
+                    self.native_settings.terminal.bottom_quote_mode.next();
+                self.save_and_apply_bottom_quote_settings(format!(
+                    "Bottom quote rotation is now {}.",
+                    self.native_settings.terminal.bottom_quote_mode.label()
+                ));
+            }
+            SettingsAction::DecreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(-1.0),
+            SettingsAction::IncreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(1.0),
+            SettingsAction::ResetBottomQuoteFontSize => self.reset_bottom_quote_font_size(),
+            SettingsAction::DecreaseBottomQuoteInterval => self.step_bottom_quote_interval(-5),
+            SettingsAction::IncreaseBottomQuoteInterval => self.step_bottom_quote_interval(5),
+            SettingsAction::ResetBottomQuoteInterval => self.reset_bottom_quote_interval(),
+            SettingsAction::OpenBottomQuotesJson => {
+                self.ui.open_dropdown = None;
+                match crate::bottom_quotes::ensure_quotes_file() {
+                    Ok(path) => {
+                        self.status = format!("Opening bottom quotes JSON {}", path.display());
+                        Self::open_path(path);
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to prepare bottom quotes JSON: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::ResetBottomQuotesJson => {
+                self.ui.open_dropdown = None;
+                match crate::bottom_quotes::reset_quotes_file() {
+                    Ok(path) => {
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.invalidate_all_windows();
+                        }
+                        self.status = format!("Reset bottom quotes JSON {}", path.display());
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to reset bottom quotes JSON: {err:#}");
                     }
                 }
             }
@@ -2757,6 +2917,8 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
+        // Each settings card owns its row count because rows are painted manually.
+        // General currently paints six rows below; the count drives card height and scroll extent.
         let row_count = 6;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
@@ -2951,6 +3113,7 @@ impl SettingsWindow {
                 area.label(),
                 area.description(),
                 self.current_chrome_font_size_value(area),
+                None,
                 SettingsAction::ResetChromeFontSize(area),
                 SettingsAction::DecreaseChromeFontSize(area),
                 SettingsAction::IncreaseChromeFontSize(area),
@@ -2966,6 +3129,7 @@ impl SettingsWindow {
             "Settings UI Font Weight",
             "Controls the Settings window chrome and content text weight.",
             self.current_settings_font_weight_value(),
+            None,
             SettingsAction::ResetSettingsFontWeight,
             SettingsAction::DecreaseSettingsFontWeight,
             SettingsAction::IncreaseSettingsFontWeight,
@@ -2987,15 +3151,29 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let row_count = 4;
+        // Each settings card owns its row count because rows are painted manually.
+        // Terminal currently paints eight rows below; the count drives card height and scroll extent.
+        let row_count = 8;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
+        let button_y = card_y + card_height + self.settings_section_card_gap();
+        let open_quotes_width = self.button_width_for_label("Open Quotes JSON", 260.0);
+        let reset_quotes_width = self.button_width_for_label("Reset Quotes JSON", 260.0);
+        let button_gap = 16.0;
+        let reset_button_x = x + open_quotes_width + button_gap;
+        let reset_button_y = if open_quotes_width + button_gap + reset_quotes_width <= max_width {
+            button_y
+        } else {
+            button_y + CONTROL_HEIGHT + 14.0
+        };
         self.ui.content_scroll.set_extents(
             self.content_bottom(),
-            self.settings_content_extent(card_y + scroll + card_height),
+            self.settings_content_extent(reset_button_y + scroll + CONTROL_HEIGHT),
         );
         let font_size = format!("{:.1} pt", config.font_size);
         let font_family = Self::effective_font_family(&config);
+        let quote_font_size_label = self.bottom_quote_font_size_label();
+        let quote_interval_label = self.bottom_quote_interval_label();
 
         self.draw_text(
             layers,
@@ -3040,6 +3218,7 @@ impl SettingsWindow {
             "ThinkTerm Font Size",
             "Saved locally and applied immediately to open terminal windows.",
             self.current_terminal_font_size_value(),
+            None,
             SettingsAction::ResetFontSize,
             SettingsAction::DecreaseFontSize,
             SettingsAction::IncreaseFontSize,
@@ -3057,6 +3236,76 @@ impl SettingsWindow {
             "JetBrains Mono",
             SettingsAction::FontFamilyInput,
             true,
+        )?;
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 4.0,
+            row_width,
+            "Bottom Quote",
+            "Shows a small quote in the existing bottom gutter.",
+            self.native_settings.terminal.bottom_quote_enabled,
+            SettingsAction::ToggleBottomQuote,
+            true,
+        )?;
+        self.paint_font_size_stepper_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 5.0,
+            row_width,
+            "Quote Font Size",
+            "Changes only the painted quote text; gutter height stays unchanged.",
+            self.current_bottom_quote_font_size(),
+            Some(&quote_font_size_label),
+            SettingsAction::ResetBottomQuoteFontSize,
+            SettingsAction::DecreaseBottomQuoteFontSize,
+            SettingsAction::IncreaseBottomQuoteFontSize,
+            true,
+        )?;
+        self.paint_action_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 6.0,
+            row_width,
+            "Quote Rotation",
+            "Timed rotates in order; pseudo-random picks a stable quote per interval.",
+            self.native_settings.terminal.bottom_quote_mode.label(),
+            SettingsAction::CycleBottomQuoteMode,
+            true,
+        )?;
+        self.paint_font_size_stepper_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 7.0,
+            row_width,
+            "Quote Interval",
+            "Controls how often the bottom quote rotates.",
+            self.current_bottom_quote_interval_minutes() as f64,
+            Some(&quote_interval_label),
+            SettingsAction::ResetBottomQuoteInterval,
+            SettingsAction::DecreaseBottomQuoteInterval,
+            SettingsAction::IncreaseBottomQuoteInterval,
+            true,
+        )?;
+        self.draw_button(
+            layers,
+            x,
+            button_y,
+            open_quotes_width,
+            "Open Quotes JSON",
+            SettingsAction::OpenBottomQuotesJson,
+        )?;
+        self.draw_button(
+            layers,
+            if reset_button_y == button_y {
+                reset_button_x
+            } else {
+                x
+            },
+            reset_button_y,
+            reset_quotes_width,
+            "Reset Quotes JSON",
+            SettingsAction::ResetBottomQuotesJson,
         )?;
         Ok(())
     }
@@ -4396,6 +4645,83 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn paint_action_setting_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        description: &str,
+        value: &str,
+        action: SettingsAction,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - 28.0, width)?;
+        }
+        let control_width = if width >= 680.0 {
+            280.0_f32.min(width * 0.36)
+        } else {
+            220.0_f32.min(width * 0.44)
+        };
+        let control_x = x + width - control_width;
+        let control_y = y + 4.0;
+        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed {
+            palette.control_pressed_bg
+        } else if hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y),
+            description,
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            control_x,
+            control_y,
+            control_width,
+            CONTROL_HEIGHT,
+            bg,
+            border,
+            CONTROL_RADIUS,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            control_x + 14.0,
+            self.control_text_y(control_y, CONTROL_HEIGHT),
+            value,
+            palette.text,
+            control_width - 26.0,
+        )?;
+        Ok(())
+    }
+
     fn paint_import_field_row(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -4584,6 +4910,7 @@ impl SettingsWindow {
         label: &str,
         description: &str,
         value: f64,
+        value_label: Option<&str>,
         reset_action: SettingsAction,
         decrease_action: SettingsAction,
         increase_action: SettingsAction,
@@ -4681,11 +5008,13 @@ impl SettingsWindow {
             )?;
         }
 
-        let value_label = if value >= 100.0 && value.fract().abs() < f64::EPSILON {
-            format!("{value:.0}")
-        } else {
-            format!("{value:.1}")
-        };
+        let value_label = value_label.map(str::to_string).unwrap_or_else(|| {
+            if value >= 100.0 && value.fract().abs() < f64::EPSILON {
+                format!("{value:.0}")
+            } else {
+                format!("{value:.1}")
+            }
+        });
         let value_width = control_width - button_width * 2.0;
         let value_x = control_x + button_width;
         self.draw_text(

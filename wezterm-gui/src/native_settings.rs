@@ -11,6 +11,8 @@ pub(crate) const DEFAULT_SETTINGS_FONT_WEIGHT: u16 = 600;
 pub(crate) const DEFAULT_SIDEBAR_FONT_SIZE: f64 = 15.0;
 pub(crate) const DEFAULT_TAB_FONT_SIZE: f64 = 14.0;
 pub(crate) const DEFAULT_PANE_HEADER_FONT_SIZE: f64 = 14.0;
+pub(crate) const DEFAULT_BOTTOM_QUOTE_INTERVAL_MINUTES: u32 = 60;
+pub(crate) const DEFAULT_BOTTOM_QUOTE_FONT_SIZE: f64 = 10.0;
 pub(crate) const ONBOARDING_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -131,6 +133,35 @@ impl NativeLanguagePreference {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeBottomQuoteMode {
+    Timed,
+    PseudoRandom,
+}
+
+impl Default for NativeBottomQuoteMode {
+    fn default() -> Self {
+        Self::Timed
+    }
+}
+
+impl NativeBottomQuoteMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Timed => "Timed",
+            Self::PseudoRandom => "Pseudo-random",
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Timed => Self::PseudoRandom,
+            Self::PseudoRandom => Self::Timed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAppearanceSettings {
@@ -143,6 +174,10 @@ pub(crate) struct NativeAppearanceSettings {
 pub(crate) struct NativeTerminalSettings {
     pub(crate) font_size: Option<f64>,
     pub(crate) font_family: Option<String>,
+    pub(crate) bottom_quote_enabled: bool,
+    pub(crate) bottom_quote_mode: NativeBottomQuoteMode,
+    pub(crate) bottom_quote_interval_minutes: Option<u32>,
+    pub(crate) bottom_quote_font_size: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -420,6 +455,22 @@ pub(crate) fn pane_header_font_size() -> f64 {
         .pane_header_font_size
         .unwrap_or(DEFAULT_PANE_HEADER_FONT_SIZE)
         .clamp(10.0, 28.0)
+}
+
+pub(crate) fn bottom_quote_interval_minutes(settings: &ThinkTermNativeSettings) -> u32 {
+    settings
+        .terminal
+        .bottom_quote_interval_minutes
+        .unwrap_or(DEFAULT_BOTTOM_QUOTE_INTERVAL_MINUTES)
+        .clamp(1, 24 * 60)
+}
+
+pub(crate) fn bottom_quote_font_size(settings: &ThinkTermNativeSettings) -> f64 {
+    settings
+        .terminal
+        .bottom_quote_font_size
+        .unwrap_or(DEFAULT_BOTTOM_QUOTE_FONT_SIZE)
+        .clamp(6.0, 20.0)
 }
 
 pub(crate) fn main_window_renderer(

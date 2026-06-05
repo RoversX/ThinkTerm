@@ -2,6 +2,7 @@ use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::{RenderFrame, TermWindowNotif};
 use crate::ui::{DrawContext, UiPalette};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
+use ::window::color::LinearRgba;
 use ::window::WindowOps;
 use anyhow::Context;
 use smol::Timer;
@@ -285,6 +286,101 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    fn paint_bottom_quote(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+    ) -> anyhow::Result<()> {
+        let settings = crate::native_settings::load();
+        if !settings.terminal.bottom_quote_enabled {
+            return Ok(());
+        }
+
+        let interval_minutes = crate::native_settings::bottom_quote_interval_minutes(&settings);
+        let Some(quote) = crate::bottom_quotes::selected_quote(
+            settings.terminal.bottom_quote_mode,
+            interval_minutes,
+        ) else {
+            return Ok(());
+        };
+        let quote = quote.display_text();
+        if quote.is_empty() {
+            return Ok(());
+        }
+        self.update_next_frame_time(Some(
+            Instant::now() + crate::bottom_quotes::next_rotation_delay(interval_minutes),
+        ));
+
+        let (padding_left, padding_top) = self.padding_left_top();
+        let border = self.get_os_border();
+        let tab_bar_height = if self.show_tab_bar {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let (top_tab_height, bottom_tab_height) = if self.config.tab_bar_at_bottom {
+            (0.0, tab_bar_height)
+        } else {
+            (tab_bar_height, 0.0)
+        };
+
+        let grid_left = padding_left + border.left.get() as f32;
+        let grid_top = border.top.get() as f32 + top_tab_height + padding_top;
+        let grid_bottom = grid_top + self.terminal_size.pixel_height as f32;
+        let content_bottom =
+            self.dimensions.pixel_height as f32 - border.bottom.get() as f32 - bottom_tab_height;
+        let gutter_height = (content_bottom - grid_bottom).floor();
+        if gutter_height < 10.0 {
+            return Ok(());
+        }
+
+        let quote_font_size = crate::native_settings::bottom_quote_font_size(&settings);
+        let quote_font = self
+            .fonts
+            .command_palette_font_with_size_and_weight(quote_font_size, 500)?;
+        let quote_metrics =
+            crate::utilsprites::RenderMetrics::with_font_metrics(&quote_font.metrics());
+        let quote_height = quote_metrics.cell_size.height as f32;
+
+        let inset = 10.0;
+        let max_width = (self.terminal_size.pixel_width as f32 - inset * 2.0).max(0.0);
+        if max_width <= 0.0 {
+            return Ok(());
+        }
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &quote_metrics);
+        let display_text = ctx.text_with_ellipsis(&quote_font, &quote, max_width);
+        if display_text.is_empty() {
+            return Ok(());
+        }
+        let text_width = ctx
+            .measure_text_width(&quote_font, &display_text)
+            .min(max_width);
+        let x = (grid_left + self.terminal_size.pixel_width as f32 - inset - text_width).max(0.0);
+        let y = (grid_bottom + ((gutter_height - quote_height) / 2.0).max(0.0)).max(0.0);
+        let color = match crate::native_settings::effective_appearance() {
+            window::Appearance::Light | window::Appearance::LightHighContrast => {
+                LinearRgba::with_srgba(80, 80, 90, 255).mul_alpha(0.46)
+            }
+            window::Appearance::Dark | window::Appearance::DarkHighContrast => {
+                LinearRgba::with_srgba(210, 210, 220, 255).mul_alpha(0.38)
+            }
+        };
+
+        ctx.draw_text_on_layer(
+            layers,
+            2,
+            &quote_font,
+            x,
+            y,
+            &display_text,
+            color,
+            max_width,
+        )
+        .context("paint_bottom_quote")?;
+
+        Ok(())
+    }
+
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
         {
             let gl_state = self.render_state.as_ref().unwrap();
@@ -423,6 +519,11 @@ impl crate::TermWindow {
                         .context("paint_split")?;
                 }
             }
+        }
+
+        if !content_view_active {
+            self.paint_bottom_quote(&mut layers)
+                .context("paint_bottom_quote")?;
         }
 
         if content_view_active {
