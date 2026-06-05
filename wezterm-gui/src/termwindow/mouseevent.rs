@@ -13,7 +13,7 @@ use crate::termwindow::{
 };
 use ::window::{
     ContextMenuItem, MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK,
-    MousePress, WindowDecorations, WindowOps, WindowState,
+    MousePress, WindowOps, WindowState,
 };
 use config::keyassignment::{
     ClipboardPasteSource, KeyAssignment, MouseEventTrigger, PaneDirection, SpawnCommand,
@@ -565,6 +565,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarToggle
             | UIItemType::WorkspaceSidebarScrollTrack
             | UIItemType::WorkspaceSidebarScrollThumb
+            | UIItemType::WorkspaceSidebarHeaderBlank
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
@@ -611,6 +612,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarToggle
             | UIItemType::WorkspaceSidebarScrollTrack
             | UIItemType::WorkspaceSidebarScrollThumb
+            | UIItemType::WorkspaceSidebarHeaderBlank
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
@@ -1233,6 +1235,9 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarToggle => {
                 self.mouse_event_workspace_sidebar_toggle(event, context);
             }
+            UIItemType::WorkspaceSidebarHeaderBlank => {
+                self.mouse_event_workspace_sidebar_header_blank(event, context);
+            }
             UIItemType::WorkspaceSidebarBackground => {
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
@@ -1328,6 +1333,49 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::SizeLeftRight));
         if event.kind == WMEK::Press(MousePress::Left) {
             self.dragging.replace((item, event));
+        }
+    }
+
+    pub fn mouse_event_workspace_sidebar_header_blank(
+        &mut self,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        self.mouse_event_window_header_blank(event, context);
+    }
+
+    fn mouse_event_window_header_blank(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        context.set_cursor(Some(MouseCursor::Arrow));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+
+        let maximized = self
+            .window_state
+            .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
+        if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
+            if self.window_state.contains(WindowState::FULL_SCREEN) {
+                return;
+            }
+            if let Some(ref window) = self.window {
+                if self.window_state.contains(WindowState::MAXIMIZED) {
+                    window.restore();
+                } else {
+                    window.maximize();
+                }
+            }
+            return;
+        }
+
+        if !maximized {
+            #[cfg(target_os = "macos")]
+            {
+                context.request_drag_move();
+            }
+            #[cfg(not(target_os = "macos"))]
+            self.window_drag_position.replace(event);
+            #[cfg(not(target_os = "macos"))]
+            context.request_drag_move();
         }
     }
 
@@ -2508,33 +2556,7 @@ impl super::TermWindow {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
-                    let maximized = self
-                        .window_state
-                        .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
-                    if let Some(ref window) = self.window {
-                        if self.config.window_decorations
-                            == WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE
-                        {
-                            if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
-                                if maximized {
-                                    window.restore();
-                                } else {
-                                    window.maximize();
-                                }
-                            }
-                        }
-                    }
-                    // Potentially starting a drag by the tab bar
-                    if !maximized {
-                        #[cfg(target_os = "macos")]
-                        {
-                            context.request_drag_move();
-                        }
-                        #[cfg(not(target_os = "macos"))]
-                        self.window_drag_position.replace(event.clone());
-                        #[cfg(not(target_os = "macos"))]
-                        context.request_drag_move();
-                    }
+                    self.mouse_event_window_header_blank(event.clone(), context);
                 }
                 TabBarItem::WindowButton(button) => {
                     use window::IntegratedTitleButton as Button;

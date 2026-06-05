@@ -703,6 +703,54 @@ impl crate::TermWindow {
         let top_action_height = layout.top_action_height;
         let space_menu_x = item_x + SIDEBAR_INSET;
         let space_menu_y = layout.space_menu_y;
+        let mut push_header_blank = |x: usize, y: usize, width: usize, height: usize| {
+            if width > 0 && height > 0 {
+                self.ui_items.push(UIItem {
+                    x,
+                    y,
+                    width,
+                    height,
+                    item_type: UIItemType::WorkspaceSidebarHeaderBlank,
+                });
+            }
+        };
+        if space_menu_y > panel_y {
+            if show_sidebar_toolbar {
+                let header_bottom = space_menu_y;
+                let toggle_bottom = sidebar_toggle_y.saturating_add(sidebar_toggle_size);
+                push_header_blank(
+                    panel_x,
+                    panel_y,
+                    panel_width,
+                    sidebar_toggle_y.saturating_sub(panel_y),
+                );
+                push_header_blank(
+                    panel_x,
+                    toggle_bottom,
+                    panel_width,
+                    header_bottom.saturating_sub(toggle_bottom),
+                );
+                let toggle_band_y = sidebar_toggle_y.max(panel_y);
+                let toggle_band_bottom = toggle_bottom.min(header_bottom);
+                let toggle_band_height = toggle_band_bottom.saturating_sub(toggle_band_y);
+                push_header_blank(
+                    panel_x,
+                    toggle_band_y,
+                    sidebar_toggle_x.saturating_sub(panel_x),
+                    toggle_band_height,
+                );
+                push_header_blank(
+                    sidebar_toggle_x.saturating_add(sidebar_toggle_size),
+                    toggle_band_y,
+                    panel_x
+                        .saturating_add(panel_width)
+                        .saturating_sub(sidebar_toggle_x.saturating_add(sidebar_toggle_size)),
+                    toggle_band_height,
+                );
+            } else {
+                push_header_blank(panel_x, panel_y, panel_width, space_menu_y - panel_y);
+            }
+        }
         let space_menu_width = top_action_total_width;
         let space_menu_height = layout.space_menu_height;
         let space_menu_hovered = self.is_pointer_over_ui_rect(

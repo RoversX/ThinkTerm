@@ -75,7 +75,7 @@ impl RightSidebarMode {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Chat => "File Tree",
+            Self::Chat => "File",
             Self::Tasks => "Note",
             Self::Snippets => "Snippets",
         }
@@ -83,8 +83,8 @@ impl RightSidebarMode {
 
     fn empty_label(self) -> &'static str {
         match self {
-            Self::Chat => "No files",
-            Self::Tasks => "No notes",
+            Self::Chat => "Coming soon",
+            Self::Tasks => "Coming soon",
             Self::Snippets => "No snippets",
         }
     }

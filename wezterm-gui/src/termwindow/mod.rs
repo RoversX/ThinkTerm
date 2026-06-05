@@ -230,6 +230,7 @@ pub enum UIItemType {
     WorkspaceSidebarToggle,
     WorkspaceSidebarScrollTrack,
     WorkspaceSidebarScrollThumb,
+    WorkspaceSidebarHeaderBlank,
     WorkspaceSidebarBackground,
     WorkspaceSidebarResize,
     WorkspaceSidebarSettings,
