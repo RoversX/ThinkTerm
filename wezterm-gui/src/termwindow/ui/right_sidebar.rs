@@ -641,7 +641,8 @@ impl crate::TermWindow {
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
         let sidebar_bg = chrome.workspace_sidebar_bg;
-        let base_font_size = crate::native_settings::sidebar_font_size().clamp(12.0, 15.0);
+        let settings = crate::native_settings::load();
+        let base_font_size = crate::native_settings::home_font_size(&settings);
         let ui_font = self
             .fonts
             .title_font_with_size(base_font_size)
@@ -816,13 +817,15 @@ impl crate::TermWindow {
             RightSidebarMode::Tasks,
             RightSidebarMode::Snippets,
         ];
+        const MODE_LABEL_CLIP_SLOP: usize = 4;
         let mode_icon_size = (ui_cell_height + 12)
             .clamp(24, 30)
             .min(mode_height.saturating_sub(22))
             .max(1);
         let active_label_target_width = self
             .sidebar_text_width(&ui_font, self.right_sidebar_mode.label())?
-            .ceil() as usize;
+            .ceil() as usize
+            + MODE_LABEL_CLIP_SLOP;
         let inactive_segment_min_width = (mode_icon_size + SIDEBAR_INSET * 4)
             .max(70)
             .min((content_width / modes.len()).max(1));

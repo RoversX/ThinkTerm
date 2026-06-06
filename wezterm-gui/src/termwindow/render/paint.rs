@@ -191,7 +191,7 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator<'_>,
     ) -> anyhow::Result<()> {
         let settings = crate::native_settings::load();
-        let font_size = crate::native_settings::settings_font_size(&settings);
+        let font_size = crate::native_settings::home_font_size(&settings);
         let font_weight = crate::native_settings::settings_font_weight(&settings);
         let ui_font = self
             .fonts

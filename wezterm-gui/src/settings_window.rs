@@ -35,8 +35,8 @@ use window::{
 
 use crate::native_settings::{
     NativeAppIcon, NativeRendererBackend, NativeThemeMode, ThinkTermNativeSettings,
-    DEFAULT_PANE_HEADER_FONT_SIZE, DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE,
-    DEFAULT_TAB_FONT_SIZE,
+    DEFAULT_HOME_FONT_SIZE, DEFAULT_PANE_HEADER_FONT_SIZE, DEFAULT_SETTINGS_FONT_SIZE,
+    DEFAULT_SIDEBAR_FONT_SIZE, DEFAULT_TAB_FONT_SIZE,
 };
 
 const DEFAULT_WIDTH: usize = 1840;
@@ -621,6 +621,7 @@ impl MemorySnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChromeFontArea {
     Settings,
+    Home,
     Sidebar,
     TabBar,
     PaneHeader,
@@ -630,6 +631,7 @@ impl ChromeFontArea {
     fn label(self) -> &'static str {
         match self {
             Self::Settings => "Settings UI Font Size",
+            Self::Home => "Home Font Size",
             Self::Sidebar => "Workspace Sidebar Font Size",
             Self::TabBar => "Tab Bar Font Size",
             Self::PaneHeader => "Pane Header Font Size",
@@ -639,6 +641,7 @@ impl ChromeFontArea {
     fn description(self) -> &'static str {
         match self {
             Self::Settings => "Controls the Settings window chrome and content text.",
+            Self::Home => "Controls the main home/content view text.",
             Self::Sidebar => "Saved separately for the main workspace sidebar.",
             Self::TabBar => "Saved separately for the top terminal tab bar.",
             Self::PaneHeader => "Saved separately for split-pane header labels.",
@@ -648,6 +651,7 @@ impl ChromeFontArea {
     fn default_size(self) -> f64 {
         match self {
             Self::Settings => DEFAULT_SETTINGS_FONT_SIZE,
+            Self::Home => DEFAULT_HOME_FONT_SIZE,
             Self::Sidebar => DEFAULT_SIDEBAR_FONT_SIZE,
             Self::TabBar => DEFAULT_TAB_FONT_SIZE,
             Self::PaneHeader => DEFAULT_PANE_HEADER_FONT_SIZE,
@@ -1863,6 +1867,7 @@ impl SettingsWindow {
     fn current_chrome_font_size_value(&self, area: ChromeFontArea) -> f64 {
         let value = match area {
             ChromeFontArea::Settings => self.native_settings.chrome.settings_font_size,
+            ChromeFontArea::Home => self.native_settings.chrome.home_font_size,
             ChromeFontArea::Sidebar => self.native_settings.chrome.sidebar_font_size,
             ChromeFontArea::TabBar => self.native_settings.chrome.tab_font_size,
             ChromeFontArea::PaneHeader => self.native_settings.chrome.pane_header_font_size,
@@ -1873,6 +1878,7 @@ impl SettingsWindow {
     fn set_chrome_font_size_value(&mut self, area: ChromeFontArea, value: Option<f64>) {
         match area {
             ChromeFontArea::Settings => self.native_settings.chrome.settings_font_size = value,
+            ChromeFontArea::Home => self.native_settings.chrome.home_font_size = value,
             ChromeFontArea::Sidebar => self.native_settings.chrome.sidebar_font_size = value,
             ChromeFontArea::TabBar => self.native_settings.chrome.tab_font_size = value,
             ChromeFontArea::PaneHeader => self.native_settings.chrome.pane_header_font_size = value,
@@ -3292,7 +3298,7 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
         let theme_row_count = 4;
-        let typography_row_count = 5;
+        let typography_row_count = 6;
         let (theme_card_y, mut y) = self.settings_card_geometry(section_y, theme_row_count);
         let theme_card_height = self.settings_card_height(theme_row_count);
         let typography_title_y =
@@ -3383,6 +3389,7 @@ impl SettingsWindow {
         y = typography_first_row_y;
         for area in [
             ChromeFontArea::Settings,
+            ChromeFontArea::Home,
             ChromeFontArea::Sidebar,
             ChromeFontArea::TabBar,
             ChromeFontArea::PaneHeader,

@@ -8,6 +8,10 @@ use window::{Appearance, Connection, ConnectionOps};
 
 pub(crate) const DEFAULT_SETTINGS_FONT_SIZE: f64 = 14.0;
 pub(crate) const DEFAULT_SETTINGS_FONT_WEIGHT: u16 = 600;
+#[cfg(target_os = "windows")]
+pub(crate) const DEFAULT_HOME_FONT_SIZE: f64 = 14.0;
+#[cfg(not(target_os = "windows"))]
+pub(crate) const DEFAULT_HOME_FONT_SIZE: f64 = 15.0;
 pub(crate) const DEFAULT_SIDEBAR_FONT_SIZE: f64 = 15.0;
 pub(crate) const DEFAULT_TAB_FONT_SIZE: f64 = 14.0;
 pub(crate) const DEFAULT_PANE_HEADER_FONT_SIZE: f64 = 14.0;
@@ -185,6 +189,7 @@ pub(crate) struct NativeTerminalSettings {
 pub(crate) struct NativeChromeSettings {
     pub(crate) settings_font_size: Option<f64>,
     pub(crate) settings_font_weight: Option<u16>,
+    pub(crate) home_font_size: Option<f64>,
     pub(crate) sidebar_font_size: Option<f64>,
     pub(crate) workspace_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_width: Option<usize>,
@@ -408,6 +413,14 @@ pub(crate) fn settings_font_weight(settings: &ThinkTermNativeSettings) -> u16 {
         .settings_font_weight
         .unwrap_or(DEFAULT_SETTINGS_FONT_WEIGHT)
         .clamp(300, 800)
+}
+
+pub(crate) fn home_font_size(settings: &ThinkTermNativeSettings) -> f64 {
+    settings
+        .chrome
+        .home_font_size
+        .unwrap_or(DEFAULT_HOME_FONT_SIZE)
+        .clamp(10.0, 28.0)
 }
 
 pub(crate) fn sidebar_font_size() -> f64 {

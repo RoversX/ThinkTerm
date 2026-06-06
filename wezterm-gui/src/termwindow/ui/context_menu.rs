@@ -17,7 +17,6 @@ use wezterm_font::LoadedFont;
 const MENU_MIN_WIDTH: usize = 220;
 const MENU_MAX_WIDTH: usize = 500;
 const MENU_WINDOW_MARGIN: usize = 12;
-const MENU_FONT_SIZE: f64 = 15.0;
 const MENU_PADDING_X: usize = 14;
 const MENU_PADDING_Y: usize = 10;
 const MENU_LABEL_GAP: usize = 12;
@@ -270,9 +269,11 @@ impl crate::TermWindow {
         let items = menu.items.clone();
         let active_path = menu.active_path.clone();
 
+        let native_settings = crate::native_settings::load();
+        let menu_font_size = crate::native_settings::home_font_size(&native_settings);
         let ui_font = self
             .fonts
-            .title_font_with_size(MENU_FONT_SIZE)
+            .title_font_with_size(menu_font_size)
             .context("context menu ui font")?;
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let row_height = (ui_metrics.cell_size.height as usize + MENU_ROW_EXTRA_HEIGHT).max(28);
@@ -770,8 +771,8 @@ fn menu_icon(icon: &str) -> Option<SvgIcon> {
         "pin.slash" => Some(SvgIcon::PinOff),
         "plus" => Some(SvgIcon::Plus),
         "plus.square" => Some(SvgIcon::SquarePlus),
-        "rectangle.split.1x2" => Some(SvgIcon::SplitHorizontal),
-        "rectangle.split.2x1" => Some(SvgIcon::SplitVertical),
+        "rectangle.split.1x2" => Some(SvgIcon::SplitVertical),
+        "rectangle.split.2x1" => Some(SvgIcon::SplitHorizontal),
         "sidebar.leading" => Some(SvgIcon::PanelLeft),
         "square.and.pencil" => Some(SvgIcon::NotebookTabs),
         "square.stack" => Some(SvgIcon::SquareStack),

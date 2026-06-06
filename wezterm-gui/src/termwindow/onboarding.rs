@@ -26,10 +26,6 @@ const FOOTER_H: f32 = 150.0;
 const PROJECT_ROW_H: f32 = 118.0;
 const PROJECT_ROW_GAP: f32 = 10.0;
 const TRANSITION_MS: u64 = 280;
-const TRANSITION_IN_START_T: f32 = 0.52;
-const TRANSITION_OUT_END_T: f32 = 0.48;
-const TRANSITION_ENTER_SLIDE: f32 = 28.0;
-const TRANSITION_EXIT_SLIDE: f32 = 18.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -170,7 +166,6 @@ enum OnboardingAction {
 struct StepTransition {
     from: Step,
     to: Step,
-    direction: f32,
     started_at: Instant,
 }
 
@@ -270,7 +265,7 @@ impl OnboardingView {
             .count()
     }
 
-    fn start_step_transition(&mut self, next: Step, direction: f32) {
+    fn start_step_transition(&mut self, next: Step, _direction: f32) {
         let from = self.step;
         if from == next {
             return;
@@ -283,7 +278,6 @@ impl OnboardingView {
         self.transition = Some(StepTransition {
             from,
             to: next,
-            direction,
             started_at: Instant::now(),
         });
     }
@@ -550,32 +544,6 @@ impl OnboardingView {
         t * t * (3.0 - 2.0 * t)
     }
 
-    fn ease_out_cubic(t: f32) -> f32 {
-        let t = t.clamp(0.0, 1.0);
-        1.0 - (1.0 - t).powi(3)
-    }
-
-    fn faded_palette(mut palette: UiPalette, alpha: f32) -> UiPalette {
-        let alpha = alpha.clamp(0.0, 1.0);
-        palette.separator = palette.separator.mul_alpha(alpha);
-        palette.control_bg = palette.control_bg.mul_alpha(alpha);
-        palette.control_hover_bg = palette.control_hover_bg.mul_alpha(alpha);
-        palette.control_pressed_bg = palette.control_pressed_bg.mul_alpha(alpha);
-        palette.control_border = palette.control_border.mul_alpha(alpha);
-        palette.sidebar_button_bg = palette.sidebar_button_bg.mul_alpha(alpha);
-        palette.sidebar_button_hover_bg = palette.sidebar_button_hover_bg.mul_alpha(alpha);
-        palette.sidebar_row_hover_bg = palette.sidebar_row_hover_bg.mul_alpha(alpha);
-        palette.sidebar_row_active_bg = palette.sidebar_row_active_bg.mul_alpha(alpha);
-        palette.sidebar_row_active_border = palette.sidebar_row_active_border.mul_alpha(alpha);
-        palette.selected_bg = palette.selected_bg.mul_alpha(alpha);
-        palette.text = palette.text.mul_alpha(alpha);
-        palette.secondary_text = palette.secondary_text.mul_alpha(alpha);
-        palette.muted_text = palette.muted_text.mul_alpha(alpha);
-        palette.selected_text = palette.selected_text.mul_alpha(alpha);
-        palette.scrollbar_thumb = palette.scrollbar_thumb.mul_alpha(alpha);
-        palette
-    }
-
     fn transition_t(&self) -> Option<f32> {
         self.transition.map(|transition| {
             let elapsed = transition.started_at.elapsed();
@@ -606,24 +574,6 @@ impl OnboardingView {
         Ok(())
     }
 
-    fn paint_body_for_step_without_widgets(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        step: Step,
-        body: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        tokens: UiTokens,
-        section_font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        let real_widgets = std::mem::take(&mut self.widgets);
-        let result =
-            self.paint_body_for_step(ctx, layers, step, body, palette, font, tokens, section_font);
-        self.widgets = real_widgets;
-        result
-    }
-
     fn paint_body(
         &mut self,
         ctx: &DrawContext,
@@ -634,76 +584,20 @@ impl OnboardingView {
         tokens: UiTokens,
         section_font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
-        let Some(transition) = self.transition else {
-            return self.paint_body_for_step(
-                ctx,
-                layers,
-                self.step,
-                body,
-                palette,
-                font,
-                tokens,
-                section_font,
-            );
-        };
-
-        let raw_t = self.transition_t().unwrap_or(1.0);
-        if raw_t >= 1.0 {
+        if self.transition_t().is_some_and(|raw_t| raw_t >= 1.0) {
             self.transition = None;
-            return self.paint_body_for_step(
-                ctx,
-                layers,
-                self.step,
-                body,
-                palette,
-                font,
-                tokens,
-                section_font,
-            );
         }
 
-        let direction = transition.direction;
-        if raw_t < TRANSITION_OUT_END_T {
-            let t = Self::ease_out_cubic(raw_t / TRANSITION_OUT_END_T);
-            let outgoing = rect(
-                body.origin.x - direction * TRANSITION_EXIT_SLIDE * t,
-                body.origin.y,
-                body.size.width,
-                body.size.height,
-            );
-            self.paint_body_for_step_without_widgets(
-                ctx,
-                layers,
-                transition.from,
-                outgoing,
-                Self::faded_palette(palette, 1.0 - t),
-                font,
-                tokens,
-                section_font,
-            )?;
-        }
-        if raw_t >= TRANSITION_IN_START_T {
-            let t = Self::ease_out_cubic(
-                (raw_t - TRANSITION_IN_START_T) / (1.0 - TRANSITION_IN_START_T),
-            );
-            let incoming = rect(
-                body.origin.x + direction * TRANSITION_ENTER_SLIDE * (1.0 - t),
-                body.origin.y,
-                body.size.width,
-                body.size.height,
-            );
-            self.paint_body_for_step(
-                ctx,
-                layers,
-                transition.to,
-                incoming,
-                Self::faded_palette(palette, t),
-                font,
-                tokens,
-                section_font,
-            )?;
-        }
-        Ok(())
+        self.paint_body_for_step(
+            ctx,
+            layers,
+            self.step,
+            body,
+            palette,
+            font,
+            tokens,
+            section_font,
+        )
     }
 
     fn paint_impl(
@@ -1275,7 +1169,7 @@ impl OnboardingView {
         let track_x = area.origin.x + area.size.width - track_w;
         let center_y = area.origin.y + area.size.height / 2.0;
         let segment_w = track_w / steps.len().max(1) as f32;
-        let active_progress = palette.secondary_text.mul_alpha(0.78);
+        let active_progress = palette.secondary_text;
         ctx.draw_rounded_rect(
             layers,
             0,
@@ -1283,7 +1177,7 @@ impl OnboardingView {
             center_y - 2.0,
             track_w,
             4.0,
-            palette.control_border.mul_alpha(0.55),
+            palette.control_border,
             2.0,
         )?;
         let fill_w = segment_w * (progress_index + 1.0);
@@ -1305,7 +1199,7 @@ impl OnboardingView {
             let cx = track_x + segment_w * idx as f32 + segment_w / 2.0;
             let size = 14.0 + 4.0 * active_strength;
             let color = if complete || active || active_strength > 0.01 {
-                active_progress.mul_alpha((0.58 + active_strength * 0.42).clamp(0.0, 1.0))
+                active_progress
             } else {
                 palette.control_border
             };
