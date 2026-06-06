@@ -55,12 +55,12 @@ const SIDEBAR_LIST_TOP: f32 = 222.0;
 const CONTENT_TITLE_Y: f32 = 82.0;
 const CONTENT_SECTION_Y: f32 = 168.0;
 const CONTENT_RULE_Y: f32 = 202.0;
-const SETTINGS_WINDOW_CHROME_HEIGHT: f32 = 58.0;
-const SETTINGS_WINDOW_BUTTON_TOP_INSET: f32 = 14.0;
-const SETTINGS_WINDOW_BUTTON_RIGHT_INSET: f32 = 18.0;
-const SETTINGS_WINDOW_BUTTON_SIZE: f32 = 36.0;
-const SETTINGS_WINDOW_BUTTON_GAP: f32 = 5.0;
-const SETTINGS_WINDOW_BUTTON_ICON_SIZE: f32 = 24.0;
+const SETTINGS_WINDOW_CHROME_HEIGHT: f32 = 74.0;
+const SETTINGS_WINDOW_BUTTON_TOP_INSET: f32 = 18.0;
+const SETTINGS_WINDOW_BUTTON_RIGHT_INSET: f32 = 22.0;
+const SETTINGS_WINDOW_BUTTON_SIZE: f32 = 52.0;
+const SETTINGS_WINDOW_BUTTON_GAP: f32 = 4.0;
+const SETTINGS_WINDOW_BUTTON_ICON_SIZE: f32 = 26.0;
 
 thread_local! {
     static SETTINGS_WINDOW: RefCell<Option<Rc<RefCell<SettingsWindow>>>> = RefCell::new(None);
@@ -1151,8 +1151,11 @@ impl SettingsWindow {
 
         window.set_title("ThinkTerm Settings");
         let webgpu = Rc::new(WebGpuState::new(&window, dimensions, &config).await?);
+        webgpu.resize(dimensions);
+        let dimensions = *webgpu.dimensions.borrow();
         {
             let mut settings = settings.borrow_mut();
+            settings.dimensions = dimensions;
             settings.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             settings.webgpu.replace(webgpu);
             settings.window.replace(window.clone());
