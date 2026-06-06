@@ -141,6 +141,8 @@ pub fn workspace_sidebar_toolbar_uses_fullscreen_style(window_state: WindowState
 pub fn workspace_sidebar_toolbar_button_size(window_state: WindowState) -> usize {
     if workspace_sidebar_toolbar_uses_fullscreen_style(window_state) {
         WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
+    } else if !cfg!(target_os = "macos") {
+        WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE + 8
     } else {
         WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
     }
@@ -149,6 +151,8 @@ pub fn workspace_sidebar_toolbar_button_size(window_state: WindowState) -> usize
 pub fn workspace_sidebar_toolbar_icon_size(window_state: WindowState) -> usize {
     if workspace_sidebar_toolbar_uses_fullscreen_style(window_state) {
         WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE
+    } else if !cfg!(target_os = "macos") {
+        WINDOW_TAB_LEADING_ACTION_ICON_SIZE + 6
     } else {
         WINDOW_TAB_LEADING_ACTION_ICON_SIZE
     }

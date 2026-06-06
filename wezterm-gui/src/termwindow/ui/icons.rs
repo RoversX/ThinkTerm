@@ -14,6 +14,7 @@ pub enum SvgIcon {
     Cloud,
     CodeXml,
     ClipboardPaste,
+    Copy,
     Ellipsis,
     Expand,
     ExternalLink,
@@ -58,6 +59,7 @@ pub enum SvgIcon {
     CircleCheck,
     CirclePlus,
     SquarePlus,
+    Square,
     SquareStack,
     SquareTerminal,
     SplitHorizontal,
@@ -88,6 +90,7 @@ impl SvgIcon {
             Self::ClipboardPaste => {
                 include_bytes!("../../../../third_party/lucide/icons/clipboard-paste.svg")
             }
+            Self::Copy => include_bytes!("../../../../third_party/lucide/icons/copy.svg"),
             Self::Ellipsis => include_bytes!("../../../../third_party/lucide/icons/ellipsis.svg"),
             Self::Expand => include_bytes!("../../../../third_party/lucide/icons/expand.svg"),
             Self::ExternalLink => {
@@ -177,6 +180,7 @@ impl SvgIcon {
             Self::CirclePlus => {
                 include_bytes!("../../../../third_party/lucide/icons/circle-plus.svg")
             }
+            Self::Square => include_bytes!("../../../../third_party/lucide/icons/square.svg"),
             Self::SquarePlus => {
                 include_bytes!("../../../../third_party/lucide/icons/square-plus.svg")
             }
@@ -383,6 +387,7 @@ mod tests {
             SvgIcon::ChevronRight,
             SvgIcon::Cloud,
             SvgIcon::CodeXml,
+            SvgIcon::Copy,
             SvgIcon::Expand,
             SvgIcon::Folder,
             SvgIcon::FolderOpen,
@@ -417,6 +422,7 @@ mod tests {
             SvgIcon::CircleAlert,
             SvgIcon::CircleCheck,
             SvgIcon::CirclePlus,
+            SvgIcon::Square,
             SvgIcon::SquareTerminal,
             SvgIcon::SplitHorizontal,
             SvgIcon::SplitVertical,

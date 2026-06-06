@@ -125,10 +125,11 @@ impl super::TermWindow {
         };
 
         sidebar_actions_width
-            + if self
-                .config
-                .window_decorations
-                .contains(WindowDecorations::INTEGRATED_BUTTONS)
+            + if self.right_sidebar_width() == 0
+                && self
+                    .config
+                    .window_decorations
+                    .contains(WindowDecorations::INTEGRATED_BUTTONS)
                 && self.config.integrated_title_button_style
                     != IntegratedTitleButtonStyle::MacOsNative
             {

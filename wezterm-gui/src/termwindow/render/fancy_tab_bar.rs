@@ -243,10 +243,18 @@ impl crate::TermWindow {
 
         let mut action_right = row_right.saturating_sub(WINDOW_TAB_INSET + 2);
         if self.fancy_tab_bar_shows_window_buttons() {
-            action_right = self.paint_window_tab_window_buttons(
+            let window_button_right = if self.right_sidebar_width() > 0 {
+                self.dimensions
+                    .pixel_width
+                    .saturating_sub(border.right.get() as usize)
+                    .saturating_sub(WINDOW_TAB_INSET + 2)
+            } else {
+                action_right
+            };
+            let window_button_left = self.paint_window_tab_window_buttons(
                 layers,
                 &mut ui_items,
-                action_right,
+                window_button_right,
                 content_row_y,
                 content_row_height,
                 button_size,
@@ -254,6 +262,9 @@ impl crate::TermWindow {
                 foreground,
                 muted_fg,
             )?;
+            if self.right_sidebar_width() == 0 {
+                action_right = window_button_left;
+            }
         }
 
         if self.right_sidebar_width() > 0 {
@@ -535,8 +546,8 @@ impl crate::TermWindow {
             .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
         let icon = match button {
             IntegratedTitleButton::Hide => SvgIcon::Minus,
-            IntegratedTitleButton::Maximize if maximized => SvgIcon::Minimize2,
-            IntegratedTitleButton::Maximize => SvgIcon::Maximize2,
+            IntegratedTitleButton::Maximize if maximized => SvgIcon::Copy,
+            IntegratedTitleButton::Maximize => SvgIcon::Square,
             IntegratedTitleButton::Close => SvgIcon::X,
         };
         let icon_size = if pressed {

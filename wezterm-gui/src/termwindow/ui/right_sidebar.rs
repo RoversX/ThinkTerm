@@ -3,6 +3,7 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET,
     SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_RADIUS, WINDOW_TAB_ADD_BUTTON_RADIUS,
+    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
 use crate::termwindow::{
     RightSidebarMode, RightSidebarSnippetField, RightSidebarSnippetView, TermWindowNotif, UIItem,
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 use termwiz::input::{KeyCode as TermKeyCode, Modifiers as TermModifiers};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
-use window::{Clipboard, WindowOps};
+use window::{Clipboard, IntegratedTitleButtonStyle, WindowDecorations, WindowOps};
 
 const RIGHT_SIDEBAR_SECTION_GAP: usize = 12;
 const RIGHT_SIDEBAR_WIDTH_CELLS: usize = 34;
@@ -110,6 +111,22 @@ impl crate::TermWindow {
 
     pub fn right_sidebar_max_width(&self) -> usize {
         RIGHT_SIDEBAR_MAX_WIDTH.min((self.dimensions.pixel_width / 2).max(RIGHT_SIDEBAR_MIN_WIDTH))
+    }
+
+    fn right_sidebar_window_button_reserved_width(&self) -> usize {
+        if cfg!(target_os = "macos")
+            || !self
+                .config
+                .window_decorations
+                .contains(WindowDecorations::INTEGRATED_BUTTONS)
+            || self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
+        {
+            return 0;
+        }
+
+        self.config.integrated_title_buttons.len()
+            * (WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE + WINDOW_TAB_LEADING_ACTION_GAP / 2)
+            + WINDOW_TAB_LEADING_ACTION_GAP
     }
 
     pub fn set_right_sidebar_width(&mut self, width: usize) {
@@ -692,16 +709,18 @@ impl crate::TermWindow {
             .min(top_bar_height)
             .min(content_width)
             .max(1);
+        let window_button_reserve = self.right_sidebar_window_button_reserved_width();
+        let close_button_right_limit = rect
+            .x
+            .saturating_add(rect.width)
+            .saturating_sub(SIDEBAR_INSET)
+            .saturating_sub(close_button_size)
+            .saturating_sub(window_button_reserve);
         let close_button_x = content_x
             .saturating_add(content_width)
             .saturating_sub(close_button_size)
             .saturating_add(RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST)
-            .min(
-                rect.x
-                    .saturating_add(rect.width)
-                    .saturating_sub(SIDEBAR_INSET)
-                    .saturating_sub(close_button_size),
-            );
+            .min(close_button_right_limit);
         let close_button_y = (top_bar_y + (top_bar_height.saturating_sub(close_button_size)) / 2)
             .saturating_sub(RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST);
         let close_hovered = self.is_pointer_over_ui_rect(
