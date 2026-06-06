@@ -1,0 +1,74 @@
+name: thinkterm-windows-x64-portable
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      RUSTUP_WINDOWS_PATH_ADD_BIN: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Compile with sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build release binaries
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "ThinkTerm-windows-x64-portable"
+          $zip = "$package.zip"
+
+          Remove-Item -Recurse -Force $package, $zip -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $package | Out-Null
+          New-Item -ItemType Directory -Path "$package\mesa" | Out-Null
+
+          Copy-Item target\release\wezterm.exe $package\
+          Copy-Item target\release\wezterm-gui.exe $package\
+          Copy-Item target\release\wezterm-mux-server.exe $package\
+          Copy-Item target\release\strip-ansi-escapes.exe $package\
+
+          if (Test-Path target\release\wezterm.pdb) {
+            Copy-Item target\release\wezterm.pdb $package\
+          }
+
+          Copy-Item assets\windows\conhost\conpty.dll $package\
+          Copy-Item assets\windows\conhost\OpenConsole.exe $package\
+          Copy-Item assets\windows\angle\libEGL.dll $package\
+          Copy-Item assets\windows\angle\libGLESv2.dll $package\
+
+          if (Test-Path target\release\mesa\opengl32.dll) {
+            Copy-Item target\release\mesa\opengl32.dll "$package\mesa\"
+          } else {
+            Copy-Item assets\windows\mesa\opengl32.dll "$package\mesa\"
+          }
+
+          Compress-Archive -Path $package -DestinationPath $zip -Force
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThinkTerm-windows-x64-portable
+          path: ThinkTerm-windows-x64-portable.zip
+          retention-days: 7

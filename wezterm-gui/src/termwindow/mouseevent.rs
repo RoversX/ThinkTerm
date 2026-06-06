@@ -97,6 +97,15 @@ impl super::TermWindow {
             .shows_sidebar_toggle_action()
     }
 
+    pub(super) fn window_tab_sidebar_toggle_uses_fullscreen_style(&self) -> bool {
+        self.window_tab_chrome_params()
+            .sidebar_toggle_uses_fullscreen_style()
+    }
+
+    pub(super) fn window_tab_sidebar_toggle_button_size(&self) -> usize {
+        self.window_tab_chrome_params().sidebar_toggle_button_size()
+    }
+
     pub(super) fn window_tab_leading_action_start_pixels(&self) -> f32 {
         self.window_tab_chrome_params()
             .leading_action_start_pixels()

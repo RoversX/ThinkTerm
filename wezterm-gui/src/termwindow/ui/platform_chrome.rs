@@ -25,7 +25,7 @@ impl WindowTabChromeParams {
             return 0;
         }
 
-        if self.window_state.contains(WindowState::FULL_SCREEN) {
+        if self.shows_sidebar_toggle_action() {
             return 1;
         }
 
@@ -39,7 +39,7 @@ impl WindowTabChromeParams {
     pub fn shows_sidebar_toggle_action(self) -> bool {
         self.use_fancy_tab_bar
             && self.workspace_sidebar_width == 0
-            && self.window_state.contains(WindowState::FULL_SCREEN)
+            && (self.window_state.contains(WindowState::FULL_SCREEN) || !cfg!(target_os = "macos"))
     }
 
     pub fn leading_action_start_pixels(self) -> f32 {
@@ -50,7 +50,7 @@ impl WindowTabChromeParams {
         } else if cfg!(target_os = "macos") {
             MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH as f32
         } else {
-            0.0
+            WINDOW_TAB_LEADING_ACTION_GAP as f32
         }
     }
 
@@ -61,11 +61,23 @@ impl WindowTabChromeParams {
         }
 
         let button_size = if self.shows_sidebar_toggle_action() {
-            WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
+            self.sidebar_toggle_button_size()
         } else {
             WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
         };
         (count * (button_size + WINDOW_TAB_LEADING_ACTION_GAP)) as f32
+    }
+
+    pub fn sidebar_toggle_uses_fullscreen_style(self) -> bool {
+        self.window_state.contains(WindowState::FULL_SCREEN)
+    }
+
+    pub fn sidebar_toggle_button_size(self) -> usize {
+        if self.sidebar_toggle_uses_fullscreen_style() {
+            WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
+        } else {
+            WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
+        }
     }
 
     pub fn left_padding_pixels(self) -> f32 {

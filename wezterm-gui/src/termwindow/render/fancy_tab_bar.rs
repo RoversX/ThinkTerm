@@ -5,10 +5,10 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
     TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
-    WINDOW_TAB_ADD_BUTTON_RADIUS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
-    WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
-    WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
+    WINDOW_TAB_ADD_BUTTON_RADIUS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
+    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS,
+    WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType};
 use crate::ui::UiPalette;
@@ -305,17 +305,19 @@ impl crate::TermWindow {
         for action_idx in 0..action_slot_count {
             let is_sidebar_toggle =
                 action_idx == 0 && self.window_tab_shows_sidebar_toggle_action();
+            let is_fullscreen_sidebar_toggle =
+                is_sidebar_toggle && self.window_tab_sidebar_toggle_uses_fullscreen_style();
             let action_button_size = if is_sidebar_toggle {
-                WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
+                self.window_tab_sidebar_toggle_button_size()
             } else {
                 WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
             };
-            let action_icon_size = if is_sidebar_toggle {
+            let action_icon_size = if is_fullscreen_sidebar_toggle {
                 WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE
             } else {
                 WINDOW_TAB_LEADING_ACTION_ICON_SIZE
             };
-            let button_size = if is_sidebar_toggle {
+            let button_size = if is_fullscreen_sidebar_toggle {
                 action_button_size
             } else {
                 action_button_size.min(row_height.saturating_sub(4)).max(1)
@@ -323,7 +325,7 @@ impl crate::TermWindow {
             let icon_size = action_icon_size.min(button_size.saturating_sub(2));
 
             if is_sidebar_toggle {
-                let button_y = if self.config.tab_bar_at_bottom {
+                let button_y = if self.config.tab_bar_at_bottom || !is_fullscreen_sidebar_toggle {
                     row_y + (row_height.saturating_sub(button_size) / 2)
                 } else {
                     row_y.saturating_sub(WINDOW_TAB_TOP_SPACER)
