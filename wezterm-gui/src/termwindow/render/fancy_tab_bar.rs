@@ -268,18 +268,32 @@ impl crate::TermWindow {
         }
 
         if self.right_sidebar_width() > 0 {
-            let new_button_x = action_right.saturating_sub(button_size);
-            self.paint_window_tab_new_button(
-                layers,
-                &mut ui_items,
-                new_button_x,
-                content_row_y,
-                content_row_height,
-                button_size,
-                icon_size,
-                foreground,
-                muted_fg,
-            )?;
+            let action_button_x = action_right.saturating_sub(button_size);
+            if cfg!(target_os = "macos") {
+                self.paint_window_tab_new_button(
+                    layers,
+                    &mut ui_items,
+                    action_button_x,
+                    content_row_y,
+                    content_row_height,
+                    button_size,
+                    icon_size,
+                    foreground,
+                    muted_fg,
+                )?;
+            } else {
+                self.paint_window_tab_right_sidebar_toggle_button(
+                    layers,
+                    &mut ui_items,
+                    action_button_x,
+                    content_row_y,
+                    content_row_height,
+                    button_size,
+                    icon_size,
+                    foreground,
+                    muted_fg,
+                )?;
+            }
         } else {
             let right_sidebar_toggle_x = action_right.saturating_sub(button_size);
             let new_button_x =

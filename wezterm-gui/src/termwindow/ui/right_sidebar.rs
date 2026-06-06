@@ -705,83 +705,86 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let close_button_size = RIGHT_SIDEBAR_CLOSE_BUTTON_SIZE
-            .min(top_bar_height)
-            .min(content_width)
-            .max(1);
-        let window_button_reserve = self.right_sidebar_window_button_reserved_width();
-        let close_button_right_limit = rect
-            .x
-            .saturating_add(rect.width)
-            .saturating_sub(SIDEBAR_INSET)
-            .saturating_sub(close_button_size)
-            .saturating_sub(window_button_reserve);
-        let close_button_x = content_x
-            .saturating_add(content_width)
-            .saturating_sub(close_button_size)
-            .saturating_add(RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST)
-            .min(close_button_right_limit);
-        let close_button_y = (top_bar_y + (top_bar_height.saturating_sub(close_button_size)) / 2)
-            .saturating_sub(RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST);
-        let close_hovered = self.is_pointer_over_ui_rect(
-            close_button_x,
-            close_button_y,
-            close_button_size,
-            close_button_size,
-        );
-        let close_pressed = close_hovered
-            && self.is_pointer_pressing_ui_rect(
+        if cfg!(target_os = "macos") {
+            let close_button_size = RIGHT_SIDEBAR_CLOSE_BUTTON_SIZE
+                .min(top_bar_height)
+                .min(content_width)
+                .max(1);
+            let window_button_reserve = self.right_sidebar_window_button_reserved_width();
+            let close_button_right_limit = rect
+                .x
+                .saturating_add(rect.width)
+                .saturating_sub(SIDEBAR_INSET)
+                .saturating_sub(close_button_size)
+                .saturating_sub(window_button_reserve);
+            let close_button_x = content_x
+                .saturating_add(content_width)
+                .saturating_sub(close_button_size)
+                .saturating_add(RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST)
+                .min(close_button_right_limit);
+            let close_button_y = (top_bar_y
+                + (top_bar_height.saturating_sub(close_button_size)) / 2)
+                .saturating_sub(RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST);
+            let close_hovered = self.is_pointer_over_ui_rect(
                 close_button_x,
                 close_button_y,
                 close_button_size,
                 close_button_size,
             );
-        let close_press_inset = if close_pressed { 1 } else { 0 };
-        let close_visual_size = close_button_size.saturating_sub(close_press_inset * 2);
-        if close_hovered || close_pressed {
-            let close_fill = if close_pressed {
-                chrome.control_pressed_bg
-            } else {
-                chrome.control_hover_bg
-            };
-            self.fill_rounded_rectangle_with_border(
+            let close_pressed = close_hovered
+                && self.is_pointer_pressing_ui_rect(
+                    close_button_x,
+                    close_button_y,
+                    close_button_size,
+                    close_button_size,
+                );
+            let close_press_inset = if close_pressed { 1 } else { 0 };
+            let close_visual_size = close_button_size.saturating_sub(close_press_inset * 2);
+            if close_hovered || close_pressed {
+                let close_fill = if close_pressed {
+                    chrome.control_pressed_bg
+                } else {
+                    chrome.control_hover_bg
+                };
+                self.fill_rounded_rectangle_with_border(
+                    layers,
+                    2,
+                    euclid::rect(
+                        (close_button_x + close_press_inset) as f32,
+                        (close_button_y + close_press_inset) as f32,
+                        close_visual_size as f32,
+                        close_visual_size as f32,
+                    ),
+                    close_fill,
+                    foreground.mul_alpha(0.58),
+                    WINDOW_TAB_ADD_BUTTON_RADIUS,
+                    ICON_BUTTON_BORDER_WIDTH,
+                )
+                .context("right sidebar close button")?;
+            }
+            self.ui_items.push(UIItem {
+                x: close_button_x,
+                y: close_button_y,
+                width: close_button_size,
+                height: close_button_size,
+                item_type: UIItemType::RightSidebarToggle,
+            });
+            let close_icon_size = RIGHT_SIDEBAR_CLOSE_ICON_SIZE
+                .min(close_visual_size.saturating_sub(4))
+                .max(1);
+            self.paint_sidebar_icon(
                 layers,
-                2,
-                euclid::rect(
-                    (close_button_x + close_press_inset) as f32,
-                    (close_button_y + close_press_inset) as f32,
-                    close_visual_size as f32,
-                    close_visual_size as f32,
-                ),
-                close_fill,
-                foreground.mul_alpha(0.58),
-                WINDOW_TAB_ADD_BUTTON_RADIUS,
-                ICON_BUTTON_BORDER_WIDTH,
-            )
-            .context("right sidebar close button")?;
+                self.right_sidebar_toggle_icon(),
+                close_button_x
+                    + close_press_inset
+                    + (close_visual_size.saturating_sub(close_icon_size)) / 2,
+                close_button_y
+                    + close_press_inset
+                    + (close_visual_size.saturating_sub(close_icon_size)) / 2,
+                close_icon_size,
+                if close_hovered { foreground } else { muted_fg },
+            )?;
         }
-        self.ui_items.push(UIItem {
-            x: close_button_x,
-            y: close_button_y,
-            width: close_button_size,
-            height: close_button_size,
-            item_type: UIItemType::RightSidebarToggle,
-        });
-        let close_icon_size = RIGHT_SIDEBAR_CLOSE_ICON_SIZE
-            .min(close_visual_size.saturating_sub(4))
-            .max(1);
-        self.paint_sidebar_icon(
-            layers,
-            self.right_sidebar_toggle_icon(),
-            close_button_x
-                + close_press_inset
-                + (close_visual_size.saturating_sub(close_icon_size)) / 2,
-            close_button_y
-                + close_press_inset
-                + (close_visual_size.saturating_sub(close_icon_size)) / 2,
-            close_icon_size,
-            if close_hovered { foreground } else { muted_fg },
-        )?;
 
         let mode_y = top_bar_y + top_bar_height + RIGHT_SIDEBAR_SECTION_GAP;
         let mode_height = RIGHT_SIDEBAR_MODE_HEIGHT.min(
