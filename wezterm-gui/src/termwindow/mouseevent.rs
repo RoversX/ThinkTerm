@@ -588,6 +588,8 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_)
             | UIItemType::RightSidebarSnippetScrollTrack
             | UIItemType::RightSidebarSnippetScrollThumb
+            | UIItemType::ContextMenuBackdrop
+            | UIItemType::ContextMenuItem(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -635,6 +637,8 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_)
             | UIItemType::RightSidebarSnippetScrollTrack
             | UIItemType::RightSidebarSnippetScrollThumb
+            | UIItemType::ContextMenuBackdrop
+            | UIItemType::ContextMenuItem(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -713,6 +717,14 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+
+        if self.consume_context_menu_suppressed_release(&event) {
+            return;
+        }
+
+        if self.mouse_event_context_menu(&event, &pane, context) {
+            return;
+        }
 
         if self.mouse_wheel_right_sidebar(&event, context) {
             return;
@@ -1131,6 +1143,7 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarScrollThumb => {
                 self.drag_workspace_sidebar_scroll_thumb(item, start_event, event, context);
             }
+            UIItemType::ContextMenuBackdrop | UIItemType::ContextMenuItem(_) => {}
             UIItemType::PaneNav { .. } => {}
             _ => {
                 log::error!("drag not implemented for {:?}", item);
@@ -1303,6 +1316,12 @@ impl super::TermWindow {
                 self.mouse_event_workspace_sidebar_view_options(item, event, context);
             }
             UIItemType::WorkspaceSidebarNotifications => {
+                context.set_cursor(Some(MouseCursor::Hand));
+            }
+            UIItemType::ContextMenuBackdrop => {
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
+            UIItemType::ContextMenuItem(_) => {
                 context.set_cursor(Some(MouseCursor::Hand));
             }
         }
@@ -1517,7 +1536,11 @@ impl super::TermWindow {
                 item.x.saturating_add(item.width) as isize,
                 item.y.saturating_add(item.height / 2) as isize,
             );
-            context.show_context_menu(coords, self.workspace_sidebar_view_options_menu_items());
+            self.show_term_context_menu(
+                context,
+                coords,
+                self.workspace_sidebar_view_options_menu_items(),
+            );
         }
     }
 
@@ -1585,10 +1608,10 @@ impl super::TermWindow {
                     item.x as isize,
                     item.y.saturating_add(item.height) as isize,
                 );
-                context.show_context_menu(coords, self.space_menu_items());
+                self.show_term_context_menu(context, coords, self.space_menu_items());
             }
             WMEK::Press(MousePress::Right) => {
-                context.show_context_menu(event.coords, self.space_menu_items());
+                self.show_term_context_menu(context, event.coords, self.space_menu_items());
             }
             _ => {}
         }
@@ -1606,8 +1629,11 @@ impl super::TermWindow {
                 context.invalidate();
             }
             WMEK::Press(MousePress::Right) => {
-                context
-                    .show_context_menu(event.coords, self.project_context_menu_items(&project_id));
+                self.show_term_context_menu(
+                    context,
+                    event.coords,
+                    self.project_context_menu_items(&project_id),
+                );
             }
             _ => {}
         }
@@ -1626,8 +1652,11 @@ impl super::TermWindow {
                 context.invalidate();
             }
             WMEK::Press(MousePress::Right) => {
-                context
-                    .show_context_menu(event.coords, self.project_context_menu_items(&project_id));
+                self.show_term_context_menu(
+                    context,
+                    event.coords,
+                    self.project_context_menu_items(&project_id),
+                );
             }
             _ => {}
         }
@@ -1645,7 +1674,8 @@ impl super::TermWindow {
                 self.activate_workspace_thread(thread_id, context);
             }
             WMEK::Press(MousePress::Right) => {
-                context.show_context_menu(
+                self.show_term_context_menu(
+                    context,
                     event.coords,
                     self.workspace_thread_context_menu_items(&thread_id),
                 );
@@ -1667,7 +1697,8 @@ impl super::TermWindow {
                 context.invalidate();
             }
             WMEK::Press(MousePress::Right) => {
-                context.show_context_menu(
+                self.show_term_context_menu(
+                    context,
                     event.coords,
                     self.workspace_thread_context_menu_items(&thread_id),
                 );
@@ -1700,7 +1731,8 @@ impl super::TermWindow {
                 }
             }
             WMEK::Press(MousePress::Right) => {
-                context.show_context_menu(
+                self.show_term_context_menu(
+                    context,
                     event.coords,
                     self.workspace_thread_context_menu_items(&thread_id),
                 );
@@ -2157,7 +2189,8 @@ impl super::TermWindow {
 
         if event.kind == WMEK::Press(MousePress::Right) {
             if let PaneNavAction::Activate(target_pane_id) = action {
-                context.show_context_menu(
+                self.show_term_context_menu(
+                    context,
                     event.coords,
                     self.pane_nav_tab_context_menu_items(target_pane_id),
                 );
@@ -2593,7 +2626,11 @@ impl super::TermWindow {
             },
             WMEK::Press(MousePress::Right) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
-                    context.show_context_menu(event.coords, self.tab_context_menu_items(tab_idx));
+                    self.show_term_context_menu(
+                        context,
+                        event.coords,
+                        self.tab_context_menu_items(tab_idx),
+                    );
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Right);
@@ -3090,7 +3127,7 @@ impl super::TermWindow {
             && matches!(event.kind, WMEK::Release(MousePress::Right))
             && !pane.is_mouse_grabbed()
         {
-            context.show_context_menu(event.coords, self.terminal_context_menu_items());
+            self.show_term_context_menu(context, event.coords, self.terminal_context_menu_items());
             return;
         }
 

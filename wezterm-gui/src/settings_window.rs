@@ -184,6 +184,9 @@ impl SettingsSection {
                 "Memory Diagnostics",
                 "Input Diagnostics",
                 "UI Kit",
+                "Context Menu",
+                "Fallback Menu",
+                "Right Click",
             ],
             Self::UiKit => &[
                 "Search Field",
@@ -230,6 +233,7 @@ enum SettingsAction {
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
     ToggleDeveloperMode,
+    ToggleFallbackContextMenu,
     ShowOnboardingNow,
     ToggleMemoryMonitoring,
     RefreshMemorySnapshot,
@@ -2290,6 +2294,31 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleFallbackContextMenu => {
+                self.ui.open_dropdown = None;
+                self.native_settings.developer.force_fallback_context_menu =
+                    !self.native_settings.developer.force_fallback_context_menu;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = if self.native_settings.developer.force_fallback_context_menu
+                        {
+                            "macOS fallback context menu enabled for future right-click menus."
+                                .to_string()
+                        } else if std::env::var_os("THINKTERM_FORCE_FALLBACK_CONTEXT_MENU")
+                            .is_some()
+                        {
+                            "Fallback context menu setting disabled, but the environment variable still forces fallback."
+                                .to_string()
+                        } else {
+                            "macOS native context menu restored for future right-click menus."
+                                .to_string()
+                        };
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to save context menu setting: {err:#}");
+                    }
+                }
+            }
             SettingsAction::ShowOnboardingNow => {
                 self.ui.open_dropdown = None;
                 let Some(front_end) = crate::frontend::try_front_end() else {
@@ -3321,8 +3350,8 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 3);
-        let card_height = self.settings_card_height(3);
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 4);
+        let card_height = self.settings_card_height(4);
         let button_y = card_y + card_height + self.settings_section_card_gap();
         self.ui.content_scroll.set_extents(
             self.content_bottom(),
@@ -3357,10 +3386,23 @@ impl SettingsWindow {
             },
             false,
         )?;
-        self.paint_setting_row(
+        self.paint_toggle_setting_row(
             layers,
             row_x,
             first_row_y + row_step,
+            row_width,
+            "Use Fallback Context Menu",
+            "On macOS, route right-click menus through the app-rendered fallback for local testing.",
+            self.native_settings
+                .developer
+                .force_fallback_context_menu,
+            SettingsAction::ToggleFallbackContextMenu,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 2.0,
             row_width,
             "Visible Developer Tabs",
             "UI Kit and Memory/Input tabs are shown here; diagnostics do not run automatically.",
@@ -3374,7 +3416,7 @@ impl SettingsWindow {
         self.paint_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 2.0,
+            first_row_y + row_step * 3.0,
             row_width,
             "Onboarding",
             "Open the setup wizard without changing the saved seen version.",

@@ -196,6 +196,7 @@ pub(crate) struct NativeChromeSettings {
 #[serde(default)]
 pub(crate) struct NativeDeveloperSettings {
     pub(crate) developer_mode: bool,
+    pub(crate) force_fallback_context_menu: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -429,6 +430,11 @@ pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
 
 pub(crate) fn right_sidebar_width() -> Option<usize> {
     load().chrome.right_sidebar_width
+}
+
+pub(crate) fn force_fallback_context_menu() -> bool {
+    std::env::var_os("THINKTERM_FORCE_FALLBACK_CONTEXT_MENU").is_some()
+        || load().developer.force_fallback_context_menu
 }
 
 pub(crate) fn save_right_sidebar_width(width: usize) -> anyhow::Result<()> {

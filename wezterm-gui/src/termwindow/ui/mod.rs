@@ -1,3 +1,4 @@
+pub mod context_menu;
 pub mod icons;
 pub mod platform_chrome;
 pub mod right_sidebar;

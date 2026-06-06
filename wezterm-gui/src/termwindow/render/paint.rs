@@ -544,6 +544,7 @@ impl crate::TermWindow {
             .context("paint_window_borders")?;
         drop(layers);
         self.paint_modal().context("paint_modal")?;
+        self.paint_context_menu().context("paint_context_menu")?;
 
         Ok(())
     }

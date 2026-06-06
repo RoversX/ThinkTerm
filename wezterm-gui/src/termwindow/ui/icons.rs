@@ -8,18 +8,22 @@ pub enum SvgIcon {
     ArrowLeft,
     Bell,
     Braces,
+    Check,
     ChevronDown,
     ChevronRight,
     Cloud,
     CodeXml,
+    ClipboardPaste,
     Ellipsis,
     Expand,
     ExternalLink,
     Folder,
+    FolderMinus,
     FolderOpen,
     FolderPlus,
     FolderTree,
     Globe,
+    House,
     Info,
     Keyboard,
     Layers,
@@ -39,6 +43,7 @@ pub enum SvgIcon {
     PanelLeftOpen,
     PanelRightClose,
     PanelRightOpen,
+    Pencil,
     Pin,
     PinOff,
     Plus,
@@ -52,6 +57,8 @@ pub enum SvgIcon {
     CircleAlert,
     CircleCheck,
     CirclePlus,
+    SquarePlus,
+    SquareStack,
     SquareTerminal,
     SplitHorizontal,
     SplitVertical,
@@ -69,6 +76,7 @@ impl SvgIcon {
             }
             Self::Bell => include_bytes!("../../../../third_party/lucide/icons/bell.svg"),
             Self::Braces => include_bytes!("../../../../third_party/lucide/icons/braces.svg"),
+            Self::Check => include_bytes!("../../../../third_party/lucide/icons/check.svg"),
             Self::ChevronDown => {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-down.svg")
             }
@@ -77,12 +85,18 @@ impl SvgIcon {
             }
             Self::Cloud => include_bytes!("../../../../third_party/lucide/icons/cloud.svg"),
             Self::CodeXml => include_bytes!("../../../../third_party/lucide/icons/code-xml.svg"),
+            Self::ClipboardPaste => {
+                include_bytes!("../../../../third_party/lucide/icons/clipboard-paste.svg")
+            }
             Self::Ellipsis => include_bytes!("../../../../third_party/lucide/icons/ellipsis.svg"),
             Self::Expand => include_bytes!("../../../../third_party/lucide/icons/expand.svg"),
             Self::ExternalLink => {
                 include_bytes!("../../../../third_party/lucide/icons/external-link.svg")
             }
             Self::Folder => include_bytes!("../../../../third_party/lucide/icons/folder.svg"),
+            Self::FolderMinus => {
+                include_bytes!("../../../../third_party/lucide/icons/folder-minus.svg")
+            }
             Self::FolderOpen => {
                 include_bytes!("../../../../third_party/lucide/icons/folder-open.svg")
             }
@@ -93,6 +107,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/folder-tree.svg")
             }
             Self::Globe => include_bytes!("../../../../third_party/lucide/icons/globe.svg"),
+            Self::House => include_bytes!("../../../../third_party/lucide/icons/house.svg"),
             Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
             Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),
             Self::Layers => include_bytes!("../../../../third_party/lucide/icons/layers.svg"),
@@ -136,6 +151,7 @@ impl SvgIcon {
             Self::PanelRightOpen => {
                 include_bytes!("../../../../third_party/lucide/icons/panel-right-open.svg")
             }
+            Self::Pencil => include_bytes!("../../../../third_party/lucide/icons/pencil.svg"),
             Self::Pin => include_bytes!("../../../../third_party/lucide/icons/pin.svg"),
             Self::PinOff => include_bytes!("../../../../third_party/lucide/icons/pin-off.svg"),
             Self::Plus => include_bytes!("../../../../third_party/lucide/icons/plus.svg"),
@@ -160,6 +176,12 @@ impl SvgIcon {
             }
             Self::CirclePlus => {
                 include_bytes!("../../../../third_party/lucide/icons/circle-plus.svg")
+            }
+            Self::SquarePlus => {
+                include_bytes!("../../../../third_party/lucide/icons/square-plus.svg")
+            }
+            Self::SquareStack => {
+                include_bytes!("../../../../third_party/lucide/icons/square-stack.svg")
             }
             Self::SquareTerminal => {
                 include_bytes!("../../../../third_party/lucide/icons/square-terminal.svg")

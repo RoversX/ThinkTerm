@@ -253,6 +253,8 @@ pub enum UIItemType {
     RightSidebarSnippetDelete(String),
     RightSidebarSnippetScrollTrack,
     RightSidebarSnippetScrollThumb,
+    ContextMenuBackdrop,
+    ContextMenuItem(Vec<usize>),
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
@@ -760,6 +762,8 @@ pub struct TermWindow {
     palette: Option<ColorPalette>,
 
     ui_items: Vec<UIItem>,
+    context_menu: Option<ui::context_menu::ContextMenuState>,
+    context_menu_suppressed_release: Option<MousePress>,
     dragging: Option<(UIItem, MouseEvent)>,
     /// When `Some`, a content view (e.g. SSH hosts) is available as a synthetic
     /// tab. `content_view_active` is whether it is the foreground content (vs a
@@ -1262,6 +1266,8 @@ impl TermWindow {
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),
             ui_items: vec![],
+            context_menu: None,
+            context_menu_suppressed_release: None,
             dragging: None,
             content_view: None,
             content_view_active: false,
