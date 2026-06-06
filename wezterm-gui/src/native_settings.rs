@@ -62,28 +62,29 @@ impl NativeThemeMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum NativeAppIcon {
-    Default,
     Simple,
+    #[serde(alias = "default")]
+    Classic,
 }
 
 impl Default for NativeAppIcon {
     fn default() -> Self {
-        Self::Default
+        Self::Simple
     }
 }
 
 impl NativeAppIcon {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Default => "Default",
             Self::Simple => "Simple",
+            Self::Classic => "Classic",
         }
     }
 
     fn file_name(self) -> &'static str {
         match self {
-            Self::Default => "ThinkTerm.icns",
             Self::Simple => "ThinkTerm_simple.icns",
+            Self::Classic => "ThinkTerm.icns",
         }
     }
 }

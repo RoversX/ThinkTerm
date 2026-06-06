@@ -23,7 +23,7 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>CFBundleIconFile</key>
-	<string>ThinkTerm.icns</string>
+	<string>ThinkTerm_simple.icns</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>NSHighResolutionCapable</key>
@@ -70,7 +70,7 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleTypeIconFile</key>
-			<string>ThinkTerm.icns</string>
+			<string>ThinkTerm_simple.icns</string>
 			<key>CFBundleTypeExtensions</key>
 			<array>
 				<string>command</string>

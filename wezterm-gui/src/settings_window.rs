@@ -3299,8 +3299,9 @@ impl SettingsWindow {
         let section_y = CONTENT_SECTION_Y - scroll;
         let theme_row_count = 4;
         let typography_row_count = 6;
+        let app_icon_note_space = self.metrics.cell_size.height as f32 + 10.0;
         let (theme_card_y, mut y) = self.settings_card_geometry(section_y, theme_row_count);
-        let theme_card_height = self.settings_card_height(theme_row_count);
+        let theme_card_height = self.settings_card_height(theme_row_count) + app_icon_note_space;
         let typography_title_y =
             theme_card_y + theme_card_height + self.settings_section_card_gap();
         let typography_card_y = typography_title_y + self.settings_section_card_gap().min(54.0);
@@ -3339,10 +3340,11 @@ impl SettingsWindow {
             row_x,
             y,
             row_width,
-            "Switch the running macOS Dock and app switcher icon.",
+            "Switch the running Dock and app switcher icon.",
+            "Currently only works on macOS.",
             true,
         )?;
-        y += row_step;
+        y += row_step + app_icon_note_space;
         self.paint_setting_row(
             layers,
             row_x,
@@ -5554,6 +5556,7 @@ impl SettingsWindow {
         y: f32,
         width: f32,
         description: &str,
+        note: &str,
         draw_top_rule: bool,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
@@ -5592,6 +5595,15 @@ impl SettingsWindow {
             self.settings_row_description_y(y),
             description,
             palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y) + self.metrics.cell_size.height as f32 + 4.0,
+            note,
+            palette.muted_text,
             text_width,
         )?;
         self.draw_rounded_frame(
@@ -5872,14 +5884,14 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let options = [
             (
-                NativeAppIcon::Default.label(),
-                SettingsAction::SetAppIcon(NativeAppIcon::Default),
-                self.native_settings.appearance.app_icon == NativeAppIcon::Default,
-            ),
-            (
                 NativeAppIcon::Simple.label(),
                 SettingsAction::SetAppIcon(NativeAppIcon::Simple),
                 self.native_settings.appearance.app_icon == NativeAppIcon::Simple,
+            ),
+            (
+                NativeAppIcon::Classic.label(),
+                SettingsAction::SetAppIcon(NativeAppIcon::Classic),
+                self.native_settings.appearance.app_icon == NativeAppIcon::Classic,
             ),
         ];
         self.paint_dropdown_menu(layers, x, y, width, &options)
