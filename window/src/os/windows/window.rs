@@ -985,16 +985,20 @@ impl WindowOps for Window {
     }
 
     fn pick_folder_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
-        let path = unsafe {
-            match pick_folder_dialog(self.0 .0) {
-                Ok(path) => path,
-                Err(err) => {
-                    log::warn!("failed to show folder picker: {err:#}");
-                    None
+        let hwnd = self.0 .0;
+        promise::spawn::spawn(async move {
+            let path = unsafe {
+                match pick_folder_dialog(hwnd) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        log::warn!("failed to show folder picker: {err:#}");
+                        None
+                    }
                 }
-            }
-        };
-        callback(path);
+            };
+            callback(path);
+        })
+        .detach();
     }
 
     fn invalidate(&self) {
