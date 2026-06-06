@@ -1138,6 +1138,11 @@ impl WorkspaceThreadStore {
             .map(|space| space.id.clone())
             .collect::<std::collections::HashSet<_>>();
         for project in &mut self.projects {
+            let shell_path = shell_compatible_project_path(project.path.clone());
+            if shell_path != project.path {
+                project.path = shell_path;
+                changed = true;
+            }
             if project.space_id.is_empty() || !known_spaces.contains(&project.space_id) {
                 project.space_id = default_space_id.clone();
                 changed = true;
@@ -2706,7 +2711,36 @@ fn normalize_project_path(path: &str) -> Result<PathBuf> {
         "project path is not a directory: {}",
         canonical.display()
     );
-    Ok(canonical)
+    Ok(shell_compatible_project_path(canonical))
+}
+
+#[cfg(windows)]
+fn shell_compatible_project_path(path: PathBuf) -> PathBuf {
+    let stripped = {
+        let text = path.to_string_lossy();
+        strip_windows_verbatim_prefix_text(&text)
+    };
+    stripped.map(PathBuf::from).unwrap_or(path)
+}
+
+#[cfg(not(windows))]
+fn shell_compatible_project_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(any(test, windows))]
+fn strip_windows_verbatim_prefix_text(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(r"\\?\")?;
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return Some(rest.to_string());
+    }
+    rest.strip_prefix(r"UNC\")
+        .map(|unc_path| format!(r"\\{unc_path}"))
 }
 
 fn workspace_name_for_thread(project_id: &str, thread_id: &str) -> String {
@@ -3178,6 +3212,22 @@ mod tests {
         assert!(plan.needs_materialize);
         assert_eq!(plan.project_path, dir.path());
         assert_eq!(plan.workspace_name, workspace_name);
+    }
+
+    #[test]
+    fn strips_windows_verbatim_drive_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix_text(r"\\?\C:\Users\Dev\Documents\GitHub").as_deref(),
+            Some(r"C:\Users\Dev\Documents\GitHub")
+        );
+    }
+
+    #[test]
+    fn strips_windows_verbatim_unc_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix_text(r"\\?\UNC\server\share\project").as_deref(),
+            Some(r"\\server\share\project")
+        );
     }
 
     #[test]
