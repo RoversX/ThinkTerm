@@ -140,6 +140,7 @@ impl SettingsSection {
                 "OpenGL",
                 "WebGpu",
                 "Restart",
+                "Quit",
                 "Window Size",
                 "Window Position",
                 "Configuration",
@@ -261,6 +262,7 @@ enum SettingsAction {
     ToggleMainRendererMenu,
     SetMainRenderer(NativeRendererBackend),
     RestartApplication,
+    QuitApplication,
     ToggleBottomQuote,
     CycleBottomQuoteMode,
     DecreaseBottomQuoteFontSize,
@@ -2291,6 +2293,13 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::QuitApplication => {
+                self.ui.open_dropdown = None;
+                self.status = "Quitting ThinkTerm...".to_string();
+                if let Some(conn) = Connection::get() {
+                    conn.terminate_message_loop();
+                }
+            }
             SettingsAction::ToggleBottomQuote => {
                 self.ui.open_dropdown = None;
                 self.native_settings.terminal.bottom_quote_enabled =
@@ -3206,8 +3215,8 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = CONTENT_SECTION_Y - scroll;
         // Each settings card owns its row count because rows are painted manually.
-        // General currently paints six rows below; the count drives card height and scroll extent.
-        let row_count = 6;
+        // General currently paints seven rows below; the count drives card height and scroll extent.
+        let row_count = 7;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         self.ui.content_scroll.set_extents(
@@ -3282,6 +3291,17 @@ impl SettingsWindow {
             true,
         )?;
         self.paint_restart_row(layers, row_x, first_row_y + row_step * 5.0, row_width, true)?;
+        self.paint_action_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 6.0,
+            row_width,
+            "Quit",
+            "Close all ThinkTerm windows and exit the app.",
+            "Quit ThinkTerm",
+            SettingsAction::QuitApplication,
+            true,
+        )?;
         Ok(())
     }
 
@@ -5800,7 +5820,7 @@ impl SettingsWindow {
         let card_padding = 36.0;
         let section_y = CONTENT_SECTION_Y - scroll;
         let row_count = match self.selected {
-            SettingsSection::General => 6,
+            SettingsSection::General => 7,
             SettingsSection::Appearance => 4,
             _ => 4,
         };

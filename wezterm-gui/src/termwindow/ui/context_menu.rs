@@ -752,6 +752,7 @@ fn menu_icon(icon: &str) -> Option<SvgIcon> {
         "arrow.triangle.2.circlepath" => Some(SvgIcon::RotateCcw),
         "checkmark.circle" => Some(SvgIcon::CircleCheck),
         "chevron.right" => Some(SvgIcon::ChevronRight),
+        "doc.on.doc" => Some(SvgIcon::Copy),
         "doc.on.clipboard" => Some(SvgIcon::ClipboardPaste),
         "envelope.badge" => Some(SvgIcon::Bell),
         "exclamationmark.circle" => Some(SvgIcon::CircleAlert),

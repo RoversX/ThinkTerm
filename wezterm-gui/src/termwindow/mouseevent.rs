@@ -16,8 +16,8 @@ use ::window::{
     MouseEventKind as WMEK, MousePress, WindowDecorations, WindowOps, WindowState,
 };
 use config::keyassignment::{
-    ClipboardPasteSource, KeyAssignment, MouseEventTrigger, PaneDirection, SpawnCommand,
-    SpawnTabDomain, SplitPane, SplitSize,
+    ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment, MouseEventTrigger,
+    PaneDirection, SpawnCommand, SpawnTabDomain, SplitPane, SplitSize,
 };
 use config::{MouseEventAltScreen, TermConfig};
 use mux::pane::{Pane, WithPaneLines};
@@ -2800,6 +2800,11 @@ impl super::TermWindow {
         }
 
         vec![
+            ContextMenuItem::item_with_icon(
+                "Copy",
+                "doc.on.doc",
+                KeyAssignment::CopyTo(ClipboardCopyDestination::Clipboard),
+            ),
             ContextMenuItem::item_with_icon(
                 "Paste",
                 "doc.on.clipboard",
