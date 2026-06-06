@@ -27,9 +27,10 @@ use wezterm_font::{FontConfiguration, LoadedFont};
 use window::bitmaps::atlas::OutOfTextureSpace;
 use window::color::LinearRgba;
 use window::{
-    Appearance, Clipboard, Connection, ConnectionOps, Dimensions, KeyCode, KeyEvent, Modifiers,
-    MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, RequestedWindowGeometry,
-    Window, WindowEvent, WindowOps,
+    Appearance, Clipboard, Connection, ConnectionOps, Dimensions, IntegratedTitleButton,
+    IntegratedTitleButtonStyle, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor,
+    MouseEvent, MouseEventKind, MousePress, RequestedWindowGeometry, Window, WindowDecorations,
+    WindowEvent, WindowOps, WindowState,
 };
 
 use crate::native_settings::{
@@ -54,6 +55,12 @@ const SIDEBAR_LIST_TOP: f32 = 222.0;
 const CONTENT_TITLE_Y: f32 = 82.0;
 const CONTENT_SECTION_Y: f32 = 168.0;
 const CONTENT_RULE_Y: f32 = 202.0;
+const SETTINGS_WINDOW_CHROME_HEIGHT: f32 = 58.0;
+const SETTINGS_WINDOW_BUTTON_TOP_INSET: f32 = 14.0;
+const SETTINGS_WINDOW_BUTTON_RIGHT_INSET: f32 = 18.0;
+const SETTINGS_WINDOW_BUTTON_SIZE: f32 = 36.0;
+const SETTINGS_WINDOW_BUTTON_GAP: f32 = 5.0;
+const SETTINGS_WINDOW_BUTTON_ICON_SIZE: f32 = 24.0;
 
 thread_local! {
     static SETTINGS_WINDOW: RefCell<Option<Rc<RefCell<SettingsWindow>>>> = RefCell::new(None);
@@ -223,6 +230,9 @@ impl SettingsSection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsAction {
+    WindowHide,
+    WindowMaximize,
+    WindowClose,
     Select(SettingsSection),
     OpenThinkTermConfigFile,
     OpenWezTermConfigFile,
@@ -1038,6 +1048,7 @@ pub fn show() {
 struct SettingsWindow {
     window: Option<Window>,
     dimensions: Dimensions,
+    window_state: WindowState,
     fonts: Rc<FontConfiguration>,
     ui_font: Rc<LoadedFont>,
     title_font: Rc<LoadedFont>,
@@ -1096,6 +1107,7 @@ impl SettingsWindow {
         let settings = Rc::new(RefCell::new(Self {
             window: None,
             dimensions,
+            window_state: WindowState::default(),
             fonts: Rc::clone(&fonts),
             ui_font,
             title_font,
@@ -1180,8 +1192,13 @@ impl SettingsWindow {
                 });
                 Ok(true)
             }
-            WindowEvent::Resized { dimensions, .. } => {
+            WindowEvent::Resized {
+                dimensions,
+                window_state,
+                ..
+            } => {
                 self.dimensions = dimensions;
+                self.window_state = window_state;
                 if let Some(webgpu) = self.webgpu.as_ref() {
                     webgpu.resize(dimensions);
                 }
@@ -1225,6 +1242,22 @@ impl SettingsWindow {
 
         match event.kind {
             MouseEventKind::Move => {
+                if action.is_none() && self.settings_window_chrome_drag_hit(x, y) {
+                    window.set_window_drag_position(event.screen_coords);
+                } else if let Some(target) =
+                    hit.filter(|target| target.action == SettingsAction::WindowMaximize)
+                {
+                    let bounds: window::ScreenRect = euclid::rect(
+                        target.rect.origin.x as isize
+                            - (event.coords.x as isize - event.screen_coords.x),
+                        target.rect.origin.y as isize
+                            - (event.coords.y as isize - event.screen_coords.y),
+                        target.rect.size.width as isize,
+                        target.rect.size.height as isize,
+                    );
+                    window.set_maximize_button_position(bounds);
+                }
+
                 if let Some(SettingsDrag::SidebarResize {
                     start_x,
                     start_width,
@@ -1283,6 +1316,10 @@ impl SettingsWindow {
                     None => {
                         self.set_focused_input(None);
                         self.ui.open_dropdown = None;
+                        if self.settings_window_chrome_drag_hit(x, y) {
+                            window.set_window_drag_position(event.screen_coords);
+                            window.request_drag_move();
+                        }
                     }
                 }
                 window.invalidate();
@@ -2098,6 +2135,25 @@ impl SettingsWindow {
 
     fn perform_action(&mut self, action: SettingsAction, window: &Window) {
         match action {
+            SettingsAction::WindowHide => {
+                self.ui.open_dropdown = None;
+                window.hide();
+            }
+            SettingsAction::WindowMaximize => {
+                self.ui.open_dropdown = None;
+                if self
+                    .window_state
+                    .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN)
+                {
+                    window.restore();
+                } else {
+                    window.maximize();
+                }
+            }
+            SettingsAction::WindowClose => {
+                self.commit_focused_input();
+                window.close();
+            }
             SettingsAction::Select(section) => {
                 self.commit_focused_input();
                 self.selected = section;
@@ -2618,8 +2674,138 @@ impl SettingsWindow {
         self.paint_background(&mut layers)?;
         self.paint_sidebar(&mut layers)?;
         self.paint_content(&mut layers)?;
+        self.paint_window_chrome(&mut layers)?;
 
         Ok(())
+    }
+
+    fn settings_window_shows_window_buttons(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            return false;
+        }
+
+        let config = configuration();
+        config
+            .window_decorations
+            .contains(WindowDecorations::INTEGRATED_BUTTONS)
+            && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
+            && !config.integrated_title_buttons.is_empty()
+    }
+
+    fn settings_window_chrome_drag_hit(&self, x: f32, y: f32) -> bool {
+        self.settings_window_shows_window_buttons()
+            && x >= 0.0
+            && x <= self.dimensions.pixel_width as f32
+            && (0.0..=SETTINGS_WINDOW_CHROME_HEIGHT).contains(&y)
+    }
+
+    fn paint_window_chrome(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+    ) -> anyhow::Result<()> {
+        if !self.settings_window_shows_window_buttons() {
+            return Ok(());
+        }
+
+        let config = configuration();
+        let mut right = self.dimensions.pixel_width as f32 - SETTINGS_WINDOW_BUTTON_RIGHT_INSET;
+        let y = SETTINGS_WINDOW_BUTTON_TOP_INSET;
+        for button in config.integrated_title_buttons.iter().rev() {
+            right -= SETTINGS_WINDOW_BUTTON_SIZE;
+            self.paint_window_chrome_button(layers, *button, right, y)?;
+            right -= SETTINGS_WINDOW_BUTTON_GAP;
+        }
+
+        Ok(())
+    }
+
+    fn paint_window_chrome_button(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        button: IntegratedTitleButton,
+        x: f32,
+        y: f32,
+    ) -> anyhow::Result<()> {
+        let action = match button {
+            IntegratedTitleButton::Hide => SettingsAction::WindowHide,
+            IntegratedTitleButton::Maximize => SettingsAction::WindowMaximize,
+            IntegratedTitleButton::Close => SettingsAction::WindowClose,
+        };
+        let palette = self.palette();
+        let button_rect = rect(
+            x,
+            y,
+            SETTINGS_WINDOW_BUTTON_SIZE,
+            SETTINGS_WINDOW_BUTTON_SIZE,
+        );
+        self.ui_context
+            .push(button_rect, WidgetKind::Button, action);
+
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let close_button = button == IntegratedTitleButton::Close;
+        let press_inset = if pressed { 1.0 } else { 0.0 };
+        let visual_size = SETTINGS_WINDOW_BUTTON_SIZE - press_inset * 2.0;
+
+        if hovered {
+            let fill = if close_button {
+                if pressed {
+                    LinearRgba::with_srgba(232, 17, 35, 209)
+                } else {
+                    LinearRgba::with_srgba(232, 17, 35, 255)
+                }
+            } else if pressed {
+                palette.control_pressed_bg
+            } else {
+                palette.control_hover_bg
+            };
+            let border = if close_button {
+                LinearRgba::TRANSPARENT
+            } else {
+                palette.text.mul_alpha(if pressed { 0.52 } else { 0.38 })
+            };
+            self.draw_rounded_frame(
+                layers,
+                1,
+                x + press_inset,
+                y + press_inset,
+                visual_size,
+                visual_size,
+                fill,
+                border,
+                999.0,
+            )?;
+        }
+
+        let maximized = self
+            .window_state
+            .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
+        let icon = match button {
+            IntegratedTitleButton::Hide => SvgIcon::Minus,
+            IntegratedTitleButton::Maximize if maximized => SvgIcon::Copy,
+            IntegratedTitleButton::Maximize => SvgIcon::Square,
+            IntegratedTitleButton::Close => SvgIcon::X,
+        };
+        let icon_size = if pressed {
+            SETTINGS_WINDOW_BUTTON_ICON_SIZE - 1.0
+        } else {
+            SETTINGS_WINDOW_BUTTON_ICON_SIZE
+        };
+        let icon_color = if close_button && hovered {
+            LinearRgba(1.0, 1.0, 1.0, 1.0)
+        } else if hovered {
+            palette.text
+        } else {
+            palette.muted_text
+        };
+        self.draw_svg_icon(
+            layers,
+            icon,
+            x + press_inset + (visual_size - icon_size) / 2.0,
+            y + press_inset + (visual_size - icon_size) / 2.0,
+            icon_size,
+            icon_color,
+        )
     }
 
     fn paint_background(&self, layers: &mut TripleLayerQuadAllocator<'_>) -> anyhow::Result<()> {
