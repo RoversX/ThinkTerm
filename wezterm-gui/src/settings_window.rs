@@ -50,12 +50,14 @@ const NAV_ROW_HEIGHT: f32 = 56.0;
 const NAV_ROW_STEP: f32 = 68.0;
 const HEADER_HEIGHT: f32 = 132.0;
 const SIDEBAR_TITLE_Y: f32 = 78.0;
+const SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME: f32 = 54.0;
 const SIDEBAR_SEARCH_Y: f32 = 142.0;
 const SIDEBAR_LIST_TOP: f32 = 222.0;
 const CONTENT_TITLE_Y: f32 = 82.0;
 const CONTENT_SECTION_Y: f32 = 168.0;
 const CONTENT_RULE_Y: f32 = 202.0;
 const SETTINGS_WINDOW_CHROME_HEIGHT: f32 = 74.0;
+const SETTINGS_WINDOW_CHROME_FADE_HEIGHT: usize = 18;
 const SETTINGS_WINDOW_BUTTON_TOP_INSET: f32 = 18.0;
 const SETTINGS_WINDOW_BUTTON_RIGHT_INSET: f32 = 22.0;
 const SETTINGS_WINDOW_BUTTON_SIZE: f32 = 52.0;
@@ -1360,11 +1362,12 @@ impl SettingsWindow {
     fn scroll_event(&mut self, event: &MouseEvent, window: &Window) -> bool {
         let sidebar_width = self.ui.sidebar.width;
         let sidebar_area = rect(0.0, HEADER_HEIGHT, sidebar_width, self.content_bottom());
+        let content_top = self.content_scroll_area_top();
         let content_area = rect(
             sidebar_width + 1.0,
-            0.0,
+            content_top,
             self.dimensions.pixel_width as f32 - sidebar_width - 1.0,
-            self.content_bottom(),
+            (self.content_bottom() - content_top).max(0.0),
         );
         if crate::ui::apply_wheel_to_area(event, sidebar_area, &mut self.ui.sidebar_scroll) {
             self.show_sidebar_scrollbar(window);
@@ -2677,6 +2680,7 @@ impl SettingsWindow {
         self.paint_background(&mut layers)?;
         self.paint_sidebar(&mut layers)?;
         self.paint_content(&mut layers)?;
+        self.paint_content_chrome_mask(&mut layers)?;
         self.paint_window_chrome(&mut layers)?;
 
         Ok(())
@@ -2811,6 +2815,48 @@ impl SettingsWindow {
         )
     }
 
+    fn paint_content_chrome_mask(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+    ) -> anyhow::Result<()> {
+        if !self.settings_window_shows_window_buttons() {
+            return Ok(());
+        }
+
+        let palette = self.palette();
+        let x = self.ui.sidebar.width + 1.0;
+        let width = (self.dimensions.pixel_width as f32 - x).max(0.0);
+        self.draw_rect(
+            layers,
+            2,
+            x,
+            0.0,
+            width,
+            SETTINGS_WINDOW_CHROME_HEIGHT,
+            palette.window_bg,
+        )?;
+
+        let fade_height = SETTINGS_WINDOW_CHROME_FADE_HEIGHT
+            .min((self.content_bottom() - SETTINGS_WINDOW_CHROME_HEIGHT).max(0.0) as usize);
+        if self.ui.content_scroll.offset > 0.0 && fade_height > 0 {
+            for step in 0..fade_height {
+                let progress = (step + 1) as f32 / fade_height as f32;
+                let alpha = 1.0 - progress * progress * (3.0 - 2.0 * progress);
+                self.draw_rect(
+                    layers,
+                    2,
+                    x,
+                    SETTINGS_WINDOW_CHROME_HEIGHT + step as f32,
+                    width,
+                    1.0,
+                    palette.window_bg.mul_alpha(alpha),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn paint_background(&self, layers: &mut TripleLayerQuadAllocator<'_>) -> anyhow::Result<()> {
         let palette = self.palette();
         let width = self.dimensions.pixel_width as f32;
@@ -2853,7 +2899,7 @@ impl SettingsWindow {
             layers,
             &sidebar_title_font,
             tokens.sidebar_padding + 6.0,
-            SIDEBAR_TITLE_Y,
+            self.sidebar_title_y(),
             "ThinkTerm",
             palette.title,
             sidebar_width - tokens.sidebar_padding * 2.0,
@@ -3060,11 +3106,12 @@ impl SettingsWindow {
         let right_margin = if window_width < 980.0 { 34.0 } else { 50.0 };
         let x = sidebar_width + content_gap;
         let max_width = (window_width - x - right_margin).max(280.0);
+        let content_top = self.content_scroll_area_top();
         let content_area = rect(
             sidebar_width + 1.0,
-            0.0,
+            content_top,
             self.dimensions.pixel_width as f32 - sidebar_width - 1.0,
-            self.content_bottom(),
+            (self.content_bottom() - content_top).max(0.0),
         );
         self.ui_context.push(
             content_area,
@@ -3141,7 +3188,7 @@ impl SettingsWindow {
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         self.ui.content_scroll.set_extents(
-            self.content_bottom(),
+            self.content_viewport_extent(),
             self.settings_content_extent(card_y + scroll + card_height),
         );
         let source = Self::config_source_summary();
@@ -3237,7 +3284,7 @@ impl SettingsWindow {
         let typography_first_row_y = typography_card_y + self.settings_card_top_padding();
         let typography_card_height = self.settings_card_height(typography_row_count);
         self.ui.content_scroll.set_extents(
-            self.content_bottom(),
+            self.content_viewport_extent(),
             self.settings_content_extent(typography_card_y + scroll + typography_card_height),
         );
 
@@ -3385,7 +3432,7 @@ impl SettingsWindow {
             button_y + CONTROL_HEIGHT + 14.0
         };
         self.ui.content_scroll.set_extents(
-            self.content_bottom(),
+            self.content_viewport_extent(),
             self.settings_content_extent(reset_button_y + scroll + CONTROL_HEIGHT),
         );
         let font_size = format!("{:.1} pt", config.font_size);
@@ -3543,7 +3590,7 @@ impl SettingsWindow {
         let card_height = self.settings_card_height(4);
         let button_y = card_y + card_height + self.settings_section_card_gap();
         self.ui.content_scroll.set_extents(
-            self.content_bottom(),
+            self.content_viewport_extent(),
             self.settings_content_extent(button_y + scroll + CONTROL_HEIGHT),
         );
 
@@ -3981,7 +4028,7 @@ impl SettingsWindow {
         let resource_line_height = 30.0;
         let resource_card_height = 88.0 + resource_line_height * resource_lines.len() as f32;
         self.ui.content_scroll.set_extents(
-            self.content_bottom(),
+            self.content_viewport_extent(),
             self.settings_content_extent(resource_card_y + scroll + resource_card_height),
         );
 
@@ -4511,7 +4558,7 @@ impl SettingsWindow {
         let card_height = self.settings_card_height(row_count);
         let buttons_y = card_y + card_height + self.settings_section_card_gap();
         self.ui.content_scroll.set_extents(
-            self.content_bottom(),
+            self.content_viewport_extent(),
             self.settings_content_extent(buttons_y + scroll + CONTROL_HEIGHT * 2.0 + 14.0),
         );
         let thinkterm_path = Self::thinkterm_compatible_config_path();
@@ -5918,6 +5965,26 @@ impl SettingsWindow {
 
     fn content_bottom(&self) -> f32 {
         self.dimensions.pixel_height as f32
+    }
+
+    fn content_scroll_area_top(&self) -> f32 {
+        if self.settings_window_shows_window_buttons() {
+            SETTINGS_WINDOW_CHROME_HEIGHT
+        } else {
+            0.0
+        }
+    }
+
+    fn content_viewport_extent(&self) -> f32 {
+        (self.content_bottom() - self.content_scroll_area_top()).max(0.0)
+    }
+
+    fn sidebar_title_y(&self) -> f32 {
+        if self.settings_window_shows_window_buttons() {
+            SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME
+        } else {
+            SIDEBAR_TITLE_Y
+        }
     }
 
     fn sidebar_scrollbar_visible(&self) -> bool {
