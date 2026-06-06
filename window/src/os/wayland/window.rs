@@ -249,6 +249,8 @@ impl WaylandWindow {
 
         let decor_mode = if decorations == WindowDecorations::NONE {
             None
+        } else if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS) {
+            Some(DecorationMode::Client)
         } else if decorations == WindowDecorations::default() {
             Some(DecorationMode::Server)
         } else {

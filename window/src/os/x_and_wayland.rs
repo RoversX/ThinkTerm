@@ -19,6 +19,7 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
 };
 use std::any::Any;
+use std::path::PathBuf;
 use std::rc::Rc;
 use wezterm_font::FontConfiguration;
 
@@ -304,6 +305,10 @@ impl WindowOps for Window {
             #[cfg(feature = "wayland")]
             Self::Wayland(w) => w.set_cursor(cursor),
         }
+    }
+
+    fn pick_folder_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        crate::os::xdg_desktop_portal::pick_folder_async(callback);
     }
 
     fn invalidate(&self) {

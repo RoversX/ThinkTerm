@@ -1,8 +1,9 @@
 use crate::termwindow::ui::tokens::{
     MACOS_TITLEBAR_CONTENT_TOP_INSET, MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH,
     MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
-    WINDOW_TAB_LEADING_ACTION_GAP,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
+    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
+    WINDOW_TAB_LEADING_ACTION_ICON_SIZE,
 };
 use window::{
     IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle, WindowDecorations, WindowState,
@@ -130,5 +131,25 @@ pub fn workspace_sidebar_content_top(
 }
 
 pub fn workspace_sidebar_shows_toolbar(window_state: WindowState) -> bool {
+    window_state.contains(WindowState::FULL_SCREEN) || !cfg!(target_os = "macos")
+}
+
+pub fn workspace_sidebar_toolbar_uses_fullscreen_style(window_state: WindowState) -> bool {
     window_state.contains(WindowState::FULL_SCREEN)
+}
+
+pub fn workspace_sidebar_toolbar_button_size(window_state: WindowState) -> usize {
+    if workspace_sidebar_toolbar_uses_fullscreen_style(window_state) {
+        WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
+    } else {
+        WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
+    }
+}
+
+pub fn workspace_sidebar_toolbar_icon_size(window_state: WindowState) -> usize {
+    if workspace_sidebar_toolbar_uses_fullscreen_style(window_state) {
+        WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE
+    } else {
+        WINDOW_TAB_LEADING_ACTION_ICON_SIZE
+    }
 }

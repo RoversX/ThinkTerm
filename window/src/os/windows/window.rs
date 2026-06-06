@@ -35,11 +35,20 @@ use wezterm_input_types::KeyboardLedStatus;
 use winapi::shared::minwindef::*;
 use winapi::shared::ntdef::*;
 use winapi::shared::windef::*;
-use winapi::shared::winerror::S_OK;
+use winapi::shared::winerror::{
+    ERROR_CANCELLED, FAILED, HRESULT_FROM_WIN32, RPC_E_CHANGED_MODE, S_FALSE, S_OK,
+};
+use winapi::shared::wtypesbase::CLSCTX_INPROC_SERVER;
+use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize};
 use winapi::um::imm::*;
 use winapi::um::libloaderapi::GetModuleHandleW;
+use winapi::um::objbase::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use winapi::um::shellapi::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use winapi::um::shellscalingapi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use winapi::um::shobjidl::{
+    IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
+};
+use winapi::um::shobjidl_core::{CLSID_FileOpenDialog, IShellItem, SIGDN_FILESYSPATH};
 use winapi::um::sysinfoapi::{GetTickCount, GetVersionExW};
 use winapi::um::uxtheme::{
     CloseThemeData, GetThemeFont, GetThemeSysFont, OpenThemeData, SetWindowTheme,
@@ -47,6 +56,7 @@ use winapi::um::uxtheme::{
 use winapi::um::wingdi::{LOGFONTW, MAKEPOINTS};
 use winapi::um::winnt::OSVERSIONINFOW;
 use winapi::um::winuser::*;
+use winapi::Interface;
 use windows::UI::Color as WUIColor;
 use windows::UI::ViewManagement::{UIColorType, UISettings};
 use winreg::enums::HKEY_CURRENT_USER;
@@ -138,6 +148,116 @@ fn wuicolor_to_linearrgba(color: WUIColor) -> LinearRgba {
 
 fn rect_width(r: &RECT) -> i32 {
     r.right - r.left
+}
+
+fn hresult_to_result(hr: HRESULT, context: &str) -> anyhow::Result<()> {
+    if FAILED(hr) {
+        anyhow::bail!("{context} failed with HRESULT {:#x}", hr as u32);
+    }
+    Ok(())
+}
+
+fn wide_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+unsafe fn pathbuf_from_shell_string(raw_path: LPWSTR) -> Option<PathBuf> {
+    if raw_path.is_null() {
+        return None;
+    }
+
+    let mut len = 0;
+    while *raw_path.add(len) != 0 {
+        len += 1;
+    }
+
+    let path = OsString::from_wide(std::slice::from_raw_parts(raw_path, len));
+    Some(PathBuf::from(path))
+}
+
+unsafe fn pick_folder_dialog(hwnd: HWND) -> anyhow::Result<Option<PathBuf>> {
+    let coinit = CoInitializeEx(
+        null_mut(),
+        COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+    );
+    let should_uninitialize = coinit == S_OK || coinit == S_FALSE;
+    if FAILED(coinit) && coinit != RPC_E_CHANGED_MODE {
+        hresult_to_result(coinit, "CoInitializeEx")?;
+    }
+
+    let result = (|| {
+        let mut dialog: *mut IFileOpenDialog = null_mut();
+        hresult_to_result(
+            CoCreateInstance(
+                &CLSID_FileOpenDialog,
+                null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IFileOpenDialog::uuidof(),
+                &mut dialog as *mut _ as *mut _,
+            ),
+            "CoCreateInstance(FileOpenDialog)",
+        )?;
+
+        let title = wide_null("Open Project");
+        let open = wide_null("Open");
+        let mut selected_path = None;
+        let mut result_item: *mut IShellItem = null_mut();
+        let mut raw_path: LPWSTR = null_mut();
+
+        let dialog_result = (|| {
+            let mut options = std::mem::zeroed();
+            hresult_to_result(
+                (*dialog).GetOptions(&mut options),
+                "IFileDialog::GetOptions",
+            )?;
+            let options = std::mem::transmute(
+                options as u32
+                    | FOS_PICKFOLDERS as u32
+                    | FOS_FORCEFILESYSTEM as u32
+                    | FOS_PATHMUSTEXIST as u32
+                    | FOS_NOCHANGEDIR as u32,
+            );
+            hresult_to_result((*dialog).SetOptions(options), "IFileDialog::SetOptions")?;
+            hresult_to_result((*dialog).SetTitle(title.as_ptr()), "IFileDialog::SetTitle")?;
+            hresult_to_result(
+                (*dialog).SetOkButtonLabel(open.as_ptr()),
+                "IFileDialog::SetOkButtonLabel",
+            )?;
+
+            let show_result = (*dialog).Show(hwnd);
+            if show_result == HRESULT_FROM_WIN32(ERROR_CANCELLED) {
+                return Ok(());
+            }
+            hresult_to_result(show_result, "IFileDialog::Show")?;
+
+            hresult_to_result(
+                (*dialog).GetResult(&mut result_item),
+                "IFileDialog::GetResult",
+            )?;
+            hresult_to_result(
+                (*result_item).GetDisplayName(SIGDN_FILESYSPATH, &mut raw_path),
+                "IShellItem::GetDisplayName",
+            )?;
+            selected_path = pathbuf_from_shell_string(raw_path);
+            Ok(())
+        })();
+
+        if !raw_path.is_null() {
+            CoTaskMemFree(raw_path as *mut _);
+        }
+        if !result_item.is_null() {
+            (*result_item).Release();
+        }
+        (*dialog).Release();
+
+        dialog_result.map(|_| selected_path)
+    })();
+
+    if should_uninitialize {
+        CoUninitialize();
+    }
+
+    result
 }
 
 fn rect_height(r: &RECT) -> i32 {
@@ -388,7 +508,10 @@ fn apply_decoration_immediate(hwnd: HWND, decorations: WindowDecorations) {
 }
 
 fn decorations_to_style(decorations: WindowDecorations) -> u32 {
-    if decorations == WindowDecorations::RESIZE {
+    if decorations == WindowDecorations::RESIZE
+        || decorations == (WindowDecorations::RESIZE | WindowDecorations::INTEGRATED_BUTTONS)
+        || decorations == WindowDecorations::INTEGRATED_BUTTONS
+    {
         WS_OVERLAPPEDWINDOW
     } else if decorations == WindowDecorations::TITLE {
         WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
@@ -859,6 +982,19 @@ impl WindowOps for Window {
             inner.set_cursor(cursor);
             Ok(())
         });
+    }
+
+    fn pick_folder_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        let path = unsafe {
+            match pick_folder_dialog(self.0 .0) {
+                Ok(path) => path,
+                Err(err) => {
+                    log::warn!("failed to show folder picker: {err:#}");
+                    None
+                }
+            }
+        };
+        callback(path);
     }
 
     fn invalidate(&self) {

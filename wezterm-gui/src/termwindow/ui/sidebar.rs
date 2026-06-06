@@ -11,8 +11,7 @@ use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
     SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP, SIDEBAR_ROW_RADIUS, SIDEBAR_WIDTH_CELLS,
     WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT, WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
 };
 use crate::termwindow::{UIItem, UIItemType};
 use crate::ui::UiPalette;
@@ -378,19 +377,22 @@ impl crate::TermWindow {
             .min(settings_footer_y.max(panel_y));
         let show_sidebar_toolbar =
             platform_chrome::workspace_sidebar_shows_toolbar(self.window_state);
+        let sidebar_toolbar_uses_fullscreen_style =
+            platform_chrome::workspace_sidebar_toolbar_uses_fullscreen_style(self.window_state);
         let row_height =
             (ui_cell_height.max(icon_size) + SIDEBAR_INSET).max(SESSION_ROW_MIN_HEIGHT);
         let mut y = self.workspace_sidebar_content_top(panel_y);
         if show_sidebar_toolbar {
-            y += WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE + SIDEBAR_INSET;
+            y += platform_chrome::workspace_sidebar_toolbar_button_size(self.window_state)
+                + SIDEBAR_INSET;
         }
         let top_action_height = row_height.min(48).max(ui_cell_height + SIDEBAR_INSET)
-            + if show_sidebar_toolbar {
+            + if sidebar_toolbar_uses_fullscreen_style {
                 WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT
             } else {
                 0
             };
-        let top_action_y_offset = if show_sidebar_toolbar {
+        let top_action_y_offset = if sidebar_toolbar_uses_fullscreen_style {
             WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET
         } else {
             0
@@ -644,11 +646,25 @@ impl crate::TermWindow {
         let button_size = (header_icon_size + 8).clamp(32, 40);
         let header_y = self.workspace_sidebar_content_top(panel_y);
         let show_sidebar_toolbar = layout.show_sidebar_toolbar;
-        let sidebar_toggle_size = WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE;
-        let sidebar_toggle_x = panel_x + WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X;
-        let sidebar_toggle_y = header_y + WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET;
+        let sidebar_toolbar_uses_fullscreen_style =
+            platform_chrome::workspace_sidebar_toolbar_uses_fullscreen_style(self.window_state);
+        let sidebar_toggle_size =
+            platform_chrome::workspace_sidebar_toolbar_button_size(self.window_state);
+        let sidebar_toggle_x = panel_x
+            + if sidebar_toolbar_uses_fullscreen_style {
+                WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X
+            } else {
+                SIDEBAR_INSET
+            };
+        let sidebar_toggle_y = header_y
+            + if sidebar_toolbar_uses_fullscreen_style {
+                WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET
+            } else {
+                0
+            };
         let sidebar_toggle_icon_size =
-            WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE.min(sidebar_toggle_size.saturating_sub(2));
+            platform_chrome::workspace_sidebar_toolbar_icon_size(self.window_state)
+                .min(sidebar_toggle_size.saturating_sub(2));
         if show_sidebar_toolbar {
             let toggle_hovered = self.is_pointer_over_ui_rect(
                 sidebar_toggle_x,

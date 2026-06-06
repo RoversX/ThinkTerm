@@ -12,8 +12,8 @@ use crate::termwindow::{
     TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    ContextMenuItem, MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK,
-    MousePress, WindowOps, WindowState,
+    ContextMenuItem, IntegratedTitleButtonStyle, MouseButtons as WMB, MouseCursor, MouseEvent,
+    MouseEventKind as WMEK, MousePress, WindowDecorations, WindowOps, WindowState,
 };
 use config::keyassignment::{
     ClipboardPasteSource, KeyAssignment, MouseEventTrigger, PaneDirection, SpawnCommand,
@@ -116,13 +116,28 @@ impl super::TermWindow {
     }
 
     pub(super) fn window_tab_trailing_action_reserved_width(&self) -> usize {
-        if self.right_sidebar_width() > 0 {
+        let sidebar_actions_width = if self.right_sidebar_width() > 0 {
             WINDOW_TAB_ACTION_RESERVED_WIDTH
         } else {
             WINDOW_TAB_ACTION_RESERVED_WIDTH
                 + WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
                 + WINDOW_TAB_LEADING_ACTION_GAP
-        }
+        };
+
+        sidebar_actions_width
+            + if self
+                .config
+                .window_decorations
+                .contains(WindowDecorations::INTEGRATED_BUTTONS)
+                && self.config.integrated_title_button_style
+                    != IntegratedTitleButtonStyle::MacOsNative
+            {
+                self.config.integrated_title_buttons.len()
+                    * (WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE + WINDOW_TAB_LEADING_ACTION_GAP / 2)
+                    + WINDOW_TAB_LEADING_ACTION_GAP
+            } else {
+                0
+            }
     }
 
     pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize) -> usize {

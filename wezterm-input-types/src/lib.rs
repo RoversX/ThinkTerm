@@ -2141,7 +2141,11 @@ impl TryFrom<String> for WindowDecorations {
 
 impl Default for WindowDecorations {
     fn default() -> Self {
-        WindowDecorations::TITLE | WindowDecorations::RESIZE
+        if cfg!(target_os = "macos") {
+            WindowDecorations::TITLE | WindowDecorations::RESIZE
+        } else {
+            WindowDecorations::RESIZE | WindowDecorations::INTEGRATED_BUTTONS
+        }
     }
 }
 

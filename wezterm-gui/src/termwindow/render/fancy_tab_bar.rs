@@ -23,6 +23,7 @@ use wezterm_font::LoadedFont;
 use wezterm_term::Line;
 use window::color::LinearRgba;
 use window::WindowOps;
+use window::{IntegratedTitleButton, IntegratedTitleButtonStyle, WindowDecorations, WindowState};
 
 const WINDOW_TAB_INSET: usize = 8;
 const WINDOW_TAB_ICON_GAP: usize = 8;
@@ -240,8 +241,23 @@ impl crate::TermWindow {
             }
         }
 
+        let mut action_right = row_right.saturating_sub(WINDOW_TAB_INSET + 2);
+        if self.fancy_tab_bar_shows_window_buttons() {
+            action_right = self.paint_window_tab_window_buttons(
+                layers,
+                &mut ui_items,
+                action_right,
+                content_row_y,
+                content_row_height,
+                button_size,
+                icon_size,
+                foreground,
+                muted_fg,
+            )?;
+        }
+
         if self.right_sidebar_width() > 0 {
-            let new_button_x = row_right.saturating_sub(WINDOW_TAB_INSET + button_size + 2);
+            let new_button_x = action_right.saturating_sub(button_size);
             self.paint_window_tab_new_button(
                 layers,
                 &mut ui_items,
@@ -254,8 +270,7 @@ impl crate::TermWindow {
                 muted_fg,
             )?;
         } else {
-            let right_sidebar_toggle_x =
-                row_right.saturating_sub(WINDOW_TAB_INSET + button_size + 2);
+            let right_sidebar_toggle_x = action_right.saturating_sub(button_size);
             let new_button_x =
                 right_sidebar_toggle_x.saturating_sub(WINDOW_TAB_LEADING_ACTION_GAP + button_size);
             self.paint_window_tab_new_button(
@@ -283,6 +298,14 @@ impl crate::TermWindow {
         }
 
         Ok(ui_items)
+    }
+
+    fn fancy_tab_bar_shows_window_buttons(&self) -> bool {
+        self.config
+            .window_decorations
+            .contains(WindowDecorations::INTEGRATED_BUTTONS)
+            && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
+            && !self.config.integrated_title_buttons.is_empty()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -405,6 +428,136 @@ impl crate::TermWindow {
             button_y + (button_size.saturating_sub(icon_size) / 2),
             icon_size,
             if hovered { foreground } else { muted_fg },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_window_tab_window_buttons(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        mut action_right: usize,
+        row_y: usize,
+        row_height: usize,
+        button_size: usize,
+        icon_size: usize,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+    ) -> anyhow::Result<usize> {
+        let gap = WINDOW_TAB_LEADING_ACTION_GAP / 2;
+        for button in self.config.integrated_title_buttons.iter().rev() {
+            action_right = action_right.saturating_sub(button_size);
+            self.paint_window_tab_window_button(
+                layers,
+                ui_items,
+                *button,
+                action_right,
+                row_y,
+                row_height,
+                button_size,
+                icon_size,
+                foreground,
+                muted_fg,
+            )?;
+            action_right = action_right.saturating_sub(gap);
+        }
+
+        Ok(action_right.saturating_sub(WINDOW_TAB_LEADING_ACTION_GAP / 2))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_window_tab_window_button(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        button: IntegratedTitleButton,
+        button_x: usize,
+        row_y: usize,
+        row_height: usize,
+        button_size: usize,
+        icon_size: usize,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let button_y = row_y + (row_height.saturating_sub(button_size) / 2);
+        let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
+        let pressed = hovered
+            && self.is_pointer_pressing_ui_rect(button_x, button_y, button_size, button_size);
+        let press_inset = if pressed { 1 } else { 0 };
+        let visual_size = button_size.saturating_sub(press_inset * 2);
+        let close_button = button == IntegratedTitleButton::Close;
+
+        if hovered {
+            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let fill = if close_button {
+                let mut red = LinearRgba::with_srgba(232, 17, 35, 255);
+                if pressed {
+                    red.3 = 0.82;
+                }
+                red
+            } else if pressed {
+                chrome.control_pressed_bg
+            } else {
+                chrome.control_hover_bg
+            };
+            let border = if close_button {
+                LinearRgba::TRANSPARENT
+            } else {
+                foreground.mul_alpha(if pressed { 0.52 } else { 0.38 })
+            };
+            self.fill_rounded_rectangle_with_border(
+                layers,
+                1,
+                euclid::rect(
+                    (button_x + press_inset) as f32,
+                    (button_y + press_inset) as f32,
+                    visual_size as f32,
+                    visual_size as f32,
+                ),
+                fill,
+                border,
+                WINDOW_TAB_ADD_BUTTON_RADIUS,
+                ICON_BUTTON_BORDER_WIDTH,
+            )
+            .context("window tab title button hover")?;
+        }
+
+        ui_items.push(UIItem {
+            x: button_x,
+            y: button_y,
+            width: button_size,
+            height: button_size,
+            item_type: UIItemType::TabBar(TabBarItem::WindowButton(button)),
+        });
+
+        let maximized = self
+            .window_state
+            .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
+        let icon = match button {
+            IntegratedTitleButton::Hide => SvgIcon::Minus,
+            IntegratedTitleButton::Maximize if maximized => SvgIcon::Minimize2,
+            IntegratedTitleButton::Maximize => SvgIcon::Maximize2,
+            IntegratedTitleButton::Close => SvgIcon::X,
+        };
+        let icon_size = if pressed {
+            icon_size.saturating_sub(1).max(1)
+        } else {
+            icon_size
+        };
+        let icon_color = if close_button && hovered {
+            LinearRgba(1.0, 1.0, 1.0, 1.0)
+        } else if hovered {
+            foreground
+        } else {
+            muted_fg
+        };
+        self.paint_fancy_tab_icon(
+            layers,
+            icon,
+            button_x + press_inset + (visual_size.saturating_sub(icon_size) / 2),
+            button_y + press_inset + (visual_size.saturating_sub(icon_size) / 2),
+            icon_size,
+            icon_color,
         )
     }
 
