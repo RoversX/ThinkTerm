@@ -1,9 +1,9 @@
 use crate::termwindow::ui::tokens::{
     MACOS_TITLEBAR_CONTENT_TOP_INSET, MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH,
-    MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE,
-    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
-    WINDOW_TAB_LEADING_ACTION_ICON_SIZE,
+    MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS, SIDEBAR_INSET,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
+    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_LEADING_ACTION_ICON_SIZE,
 };
 use window::{
     IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle, WindowDecorations, WindowState,
@@ -51,7 +51,7 @@ impl WindowTabChromeParams {
         } else if cfg!(target_os = "macos") {
             MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH as f32
         } else {
-            WINDOW_TAB_LEADING_ACTION_GAP as f32
+            SIDEBAR_INSET as f32
         }
     }
 
@@ -74,11 +74,11 @@ impl WindowTabChromeParams {
     }
 
     pub fn sidebar_toggle_button_size(self) -> usize {
-        if self.sidebar_toggle_uses_fullscreen_style() {
-            WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
-        } else {
-            WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
-        }
+        workspace_sidebar_toolbar_button_size(self.window_state)
+    }
+
+    pub fn sidebar_toggle_icon_size(self) -> usize {
+        workspace_sidebar_toolbar_icon_size(self.window_state)
     }
 
     pub fn left_padding_pixels(self) -> f32 {

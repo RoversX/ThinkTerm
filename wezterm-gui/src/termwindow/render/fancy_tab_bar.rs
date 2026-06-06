@@ -5,10 +5,9 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
     TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
-    WINDOW_TAB_ADD_BUTTON_RADIUS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
-    WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
-    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS,
-    WINDOW_TAB_TOP_SPACER,
+    WINDOW_TAB_ADD_BUTTON_RADIUS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_GAP,
+    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
+    WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType};
 use crate::ui::UiPalette;
@@ -282,10 +281,24 @@ impl crate::TermWindow {
                     muted_fg,
                 )?;
             } else {
+                let right_sidebar_toggle_x = action_button_x;
+                let new_button_x = right_sidebar_toggle_x
+                    .saturating_sub(WINDOW_TAB_LEADING_ACTION_GAP + button_size);
+                self.paint_window_tab_new_button(
+                    layers,
+                    &mut ui_items,
+                    new_button_x,
+                    content_row_y,
+                    content_row_height,
+                    button_size,
+                    icon_size,
+                    foreground,
+                    muted_fg,
+                )?;
                 self.paint_window_tab_right_sidebar_toggle_button(
                     layers,
                     &mut ui_items,
-                    action_button_x,
+                    right_sidebar_toggle_x,
                     content_row_y,
                     content_row_height,
                     button_size,
@@ -360,8 +373,8 @@ impl crate::TermWindow {
             } else {
                 WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
             };
-            let action_icon_size = if is_fullscreen_sidebar_toggle {
-                WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE
+            let action_icon_size = if is_sidebar_toggle {
+                self.window_tab_sidebar_toggle_icon_size()
             } else {
                 WINDOW_TAB_LEADING_ACTION_ICON_SIZE
             };
@@ -373,12 +386,16 @@ impl crate::TermWindow {
             let icon_size = action_icon_size.min(button_size.saturating_sub(2));
 
             if is_sidebar_toggle {
-                let button_y = if self.config.tab_bar_at_bottom || !is_fullscreen_sidebar_toggle {
+                let button_y = if self.config.tab_bar_at_bottom {
                     row_y + (row_height.saturating_sub(button_size) / 2)
-                } else {
+                } else if is_fullscreen_sidebar_toggle {
                     row_y.saturating_sub(WINDOW_TAB_TOP_SPACER)
                         + SIDEBAR_INSET
                         + WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET
+                } else if !cfg!(target_os = "macos") {
+                    row_y.saturating_sub(WINDOW_TAB_TOP_SPACER) + SIDEBAR_INSET
+                } else {
+                    row_y + (row_height.saturating_sub(button_size) / 2)
                 };
                 self.paint_window_sidebar_toggle_button(
                     layers,

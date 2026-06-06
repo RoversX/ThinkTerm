@@ -106,6 +106,10 @@ impl super::TermWindow {
         self.window_tab_chrome_params().sidebar_toggle_button_size()
     }
 
+    pub(super) fn window_tab_sidebar_toggle_icon_size(&self) -> usize {
+        self.window_tab_chrome_params().sidebar_toggle_icon_size()
+    }
+
     pub(super) fn window_tab_leading_action_start_pixels(&self) -> f32 {
         self.window_tab_chrome_params()
             .leading_action_start_pixels()
@@ -118,6 +122,11 @@ impl super::TermWindow {
     pub(super) fn window_tab_trailing_action_reserved_width(&self) -> usize {
         let sidebar_actions_width = if self.right_sidebar_width() > 0 {
             WINDOW_TAB_ACTION_RESERVED_WIDTH
+                + if !cfg!(target_os = "macos") {
+                    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE + WINDOW_TAB_LEADING_ACTION_GAP
+                } else {
+                    0
+                }
         } else {
             WINDOW_TAB_ACTION_RESERVED_WIDTH
                 + WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
