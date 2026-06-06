@@ -50,7 +50,8 @@ const NAV_ROW_HEIGHT: f32 = 56.0;
 const NAV_ROW_STEP: f32 = 68.0;
 const HEADER_HEIGHT: f32 = 132.0;
 const SIDEBAR_TITLE_Y: f32 = 78.0;
-const SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME: f32 = 54.0;
+const SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME: f32 = 34.0;
+const SIDEBAR_BRAND_FONT_SIZE_WITH_CUSTOM_CHROME: f64 = 22.0;
 const SIDEBAR_SEARCH_Y: f32 = 142.0;
 const SIDEBAR_LIST_TOP: f32 = 222.0;
 const CONTENT_TITLE_Y: f32 = 82.0;
@@ -1080,8 +1081,10 @@ impl SettingsWindow {
         let settings_font_weight = crate::native_settings::settings_font_weight(&native_settings);
         let title_font = fonts
             .title_font_with_size_and_weight(settings_font_size + 4.0, settings_font_weight)?;
-        let sidebar_title_font = fonts
-            .title_font_with_size_and_weight(SIDEBAR_BRAND_FONT_SIZE, SIDEBAR_BRAND_FONT_WEIGHT)?;
+        let sidebar_title_font = fonts.title_font_with_size_and_weight(
+            Self::sidebar_brand_font_size_for_config(&config),
+            SIDEBAR_BRAND_FONT_WEIGHT,
+        )?;
         let ui_font = fonts
             .command_palette_font_with_size_and_weight(settings_font_size, settings_font_weight)?;
         let metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
@@ -2692,11 +2695,25 @@ impl SettingsWindow {
         }
 
         let config = configuration();
+        Self::settings_window_shows_window_buttons_for_config(&config)
+    }
+
+    fn settings_window_shows_window_buttons_for_config(config: &config::ConfigHandle) -> bool {
         config
             .window_decorations
             .contains(WindowDecorations::INTEGRATED_BUTTONS)
             && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
             && !config.integrated_title_buttons.is_empty()
+    }
+
+    fn sidebar_brand_font_size_for_config(config: &config::ConfigHandle) -> f64 {
+        if !cfg!(target_os = "macos")
+            && Self::settings_window_shows_window_buttons_for_config(config)
+        {
+            SIDEBAR_BRAND_FONT_SIZE_WITH_CUSTOM_CHROME
+        } else {
+            SIDEBAR_BRAND_FONT_SIZE
+        }
     }
 
     fn settings_window_chrome_drag_hit(&self, x: f32, y: f32) -> bool {
