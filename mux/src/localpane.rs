@@ -270,6 +270,22 @@ impl Pane for LocalPane {
             config/lua/config/exit_behavior.html\
             \x1b\\exit_behavior\x1b]8;;\x1b\\";
 
+        fn clean_exit_message(cmd: &str) -> String {
+            if cmd == "RemoteSshDomain" {
+                "👍 SSH connection closed.".to_string()
+            } else {
+                format!("👍 Process {cmd} completed.")
+            }
+        }
+
+        fn dirty_exit_message(cmd: &str) -> String {
+            if cmd == "RemoteSshDomain" {
+                "⚠️  Remote SSH process didn't exit cleanly.".to_string()
+            } else {
+                format!("⚠️  Process {cmd} didn't exit cleanly")
+            }
+        }
+
         let mut terse = String::new();
         let mut brief = String::new();
         let mut trailer = String::new();
@@ -303,7 +319,7 @@ impl Pane for LocalPane {
                     ) {
                         (ExitBehavior::Close, _, _) => *proc = ProcessState::Dead,
                         (ExitBehavior::CloseOnCleanExit, false, _) => {
-                            brief = format!("⚠️  Process {cmd} didn't exit cleanly");
+                            brief = dirty_exit_message(cmd);
                             terse = format!("{status}.");
                             trailer = format!("{EXIT_BEHAVIOR}=\"CloseOnCleanExit\"");
 
@@ -314,10 +330,10 @@ impl Pane for LocalPane {
                             trailer = format!("{EXIT_BEHAVIOR}=\"Hold\"");
 
                             if success {
-                                brief = format!("👍 Process {cmd} completed.");
+                                brief = clean_exit_message(cmd);
                                 terse = "done".to_string();
                             } else {
-                                brief = format!("⚠️  Process {cmd} didn't exit cleanly");
+                                brief = dirty_exit_message(cmd);
                                 terse = format!("{status}");
                             }
                             *proc = ProcessState::DeadPendingClose { killed: false }

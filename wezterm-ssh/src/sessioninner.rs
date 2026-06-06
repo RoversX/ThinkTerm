@@ -446,13 +446,19 @@ impl SessionInner {
 
     fn request_loop(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
         let mut sleep_delay = Duration::from_millis(100);
+        let initial_sleep_delay = Duration::from_millis(100);
+        let max_sleep_delay = Duration::from_secs(2);
+        let immediate_wakeup = Duration::from_millis(10);
+        let busy_loop_throttle = Duration::from_millis(50);
+        let busy_loop_disconnect_after = Duration::from_secs(30);
+        let mut busy_loop_started = None;
 
         loop {
             self.do_keepalive(sess)?;
-            self.tick_io()?;
-            self.drain_request_pipe();
-            self.dispatch_pending_requests(sess)?;
-            self.connect_pending_agent_forward_channels(sess);
+            let mut made_progress = self.tick_io()?;
+            made_progress |= self.drain_request_pipe();
+            made_progress |= self.dispatch_pending_requests(sess)?;
+            made_progress |= self.connect_pending_agent_forward_channels(sess);
 
             if self.channels.is_empty() && self.session_was_dropped {
                 log::trace!(
@@ -494,12 +500,19 @@ impl SessionInner {
                 }
             }
 
-            poll(&mut poll_array, Some(sleep_delay)).context("poll")?;
-            sleep_delay += sleep_delay;
+            let poll_started = Instant::now();
+            let _ready = poll(&mut poll_array, Some(sleep_delay)).context("poll")?;
+            let poll_elapsed = poll_started.elapsed();
+            sleep_delay = sleep_delay
+                .checked_mul(2)
+                .map(|delay| delay.min(max_sleep_delay))
+                .unwrap_or(max_sleep_delay);
+            let mut saw_revents = false;
 
             for (idx, poll) in poll_array.iter().enumerate() {
                 if poll.revents != 0 {
-                    sleep_delay = Duration::from_millis(100);
+                    saw_revents = true;
+                    sleep_delay = initial_sleep_delay;
                 }
                 if idx == 0 || idx == 1 {
                     // Dealt with at the top of the loop
@@ -512,7 +525,7 @@ impl SessionInner {
                     if fd_num == 0 {
                         // There's data we can read into the buffer
                         match read_into_buf(fd, &mut state.buf) {
-                            Ok(_) => {}
+                            Ok(progress) => made_progress |= progress,
                             Err(err) => {
                                 log::debug!(
                                     "error reading from channel {channel_id} stdin pipe: {:#}",
@@ -520,16 +533,18 @@ impl SessionInner {
                                 );
                                 info.channel.close();
                                 state.fd.take();
+                                made_progress = true;
                             }
                         }
                     } else {
                         if info.exited && state.buf.is_empty() {
                             log::trace!("channel {channel_id} exited and we have no data to send to fd {fd_num}: close it!");
                             state.fd.take();
+                            made_progress = true;
                         } else {
                             // We can write our buffered output
                             match write_from_buf(fd, &mut state.buf) {
-                                Ok(_) => {}
+                                Ok(progress) => made_progress |= progress,
                                 Err(err) => {
                                     log::debug!(
                                         "error while writing to channel {} fd {}: {:#}",
@@ -540,18 +555,32 @@ impl SessionInner {
 
                                     // Close it out
                                     state.fd.take();
+                                    made_progress = true;
                                 }
                             }
                         }
                     }
                 }
             }
+
+            if made_progress || !saw_revents || poll_elapsed >= immediate_wakeup {
+                busy_loop_started = None;
+            } else {
+                let started = *busy_loop_started.get_or_insert_with(Instant::now);
+                if started.elapsed() >= busy_loop_disconnect_after {
+                    anyhow::bail!(
+                        "SSH session made no IO progress after repeated immediate wakeups; closing it to avoid a busy loop"
+                    );
+                }
+                std::thread::sleep(busy_loop_throttle);
+            }
         }
     }
 
     /// Goal: if we have data to write to channels, try to send it.
     /// If we have room in our channel fd write buffers, try to fill it
-    fn tick_io(&mut self) -> anyhow::Result<()> {
+    fn tick_io(&mut self) -> anyhow::Result<bool> {
+        let mut made_progress = false;
         let mut dead = vec![];
         for (id, chan) in self.channels.iter_mut() {
             if chan.exit.is_some() {
@@ -560,20 +589,25 @@ impl SessionInner {
                     chan.exited = true;
                     let exit = chan.exit.take().unwrap();
                     smol::block_on(exit.send(status)).ok();
+                    made_progress = true;
                 }
             }
 
             let stdin = &mut chan.descriptors[0];
             if stdin.fd.is_some() && !stdin.buf.is_empty() {
-                if let Err(err) = write_from_buf(&mut chan.channel.writer(), &mut stdin.buf)
+                match write_from_buf(&mut chan.channel.writer(), &mut stdin.buf)
                     .context("writing to channel")
                 {
-                    log::trace!(
-                        "Failed to write data to channel {} stdin: {:#}, closing pipe",
-                        id,
-                        err
-                    );
-                    stdin.fd.take();
+                    Ok(progress) => made_progress |= progress,
+                    Err(err) => {
+                        log::trace!(
+                            "Failed to write data to channel {} stdin: {:#}, closing pipe",
+                            id,
+                            err
+                        );
+                        stdin.fd.take();
+                        made_progress = true;
+                    }
                 }
             }
 
@@ -593,7 +627,7 @@ impl SessionInner {
                     continue;
                 }
                 match read_into_buf(&mut chan.channel.reader(idx), &mut out.buf) {
-                    Ok(_) => {}
+                    Ok(progress) => made_progress |= progress,
                     Err(err) => {
                         if out.buf.is_empty() {
                             log::trace!(
@@ -603,6 +637,7 @@ impl SessionInner {
                                 err
                             );
                             out.fd.take();
+                            made_progress = true;
                         } else {
                             log::trace!(
                                 "Failed to read data from channel {} stream {}: {:#}, but \
@@ -627,18 +662,26 @@ impl SessionInner {
         }
         for id in dead {
             self.channels.remove(&id);
+            made_progress = true;
         }
-        Ok(())
+        Ok(made_progress)
     }
 
-    fn drain_request_pipe(&mut self) {
+    fn drain_request_pipe(&mut self) -> bool {
         let mut buf = [0u8; 16];
-        let _ = self.sender_read.read(&mut buf);
+        match self.sender_read.read(&mut buf) {
+            Ok(len) => len > 0,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(_) => false,
+        }
     }
 
-    fn dispatch_pending_requests(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
-        while self.dispatch_one_request(sess)? {}
-        Ok(())
+    fn dispatch_pending_requests(&mut self, sess: &mut SessionWrap) -> anyhow::Result<bool> {
+        let mut made_progress = false;
+        while self.dispatch_one_request(sess)? {
+            made_progress = true;
+        }
+        Ok(made_progress)
     }
 
     fn dispatch_one_request(&mut self, sess: &mut SessionWrap) -> anyhow::Result<bool> {
@@ -861,7 +904,8 @@ impl SessionInner {
         }
     }
 
-    fn connect_pending_agent_forward_channels(&mut self, sess: &mut SessionWrap) {
+    fn connect_pending_agent_forward_channels(&mut self, sess: &mut SessionWrap) -> bool {
+        let mut made_progress = false;
         fn process_one(sess: &mut SessionInner, channel: ChannelWrap) -> anyhow::Result<()> {
             let identity_agent = sess
                 .identity_agent()
@@ -910,10 +954,12 @@ impl SessionInner {
             Ok(())
         }
         while let Some(channel) = sess.accept_agent_forward() {
+            made_progress = true;
             if let Err(err) = process_one(self, channel) {
                 log::error!("error connecting agent forward: {:#}", err);
             }
         }
+        made_progress
     }
 
     pub fn signal_channel(&mut self, info: &SignalChannel) -> anyhow::Result<()> {
@@ -1072,22 +1118,22 @@ impl SessionInner {
     }
 }
 
-fn write_from_buf<W: Write>(w: &mut W, buf: &mut VecDeque<u8>) -> std::io::Result<()> {
+fn write_from_buf<W: Write>(w: &mut W, buf: &mut VecDeque<u8>) -> std::io::Result<bool> {
     match w.write(buf.make_contiguous()) {
         Ok(len) => {
             buf.drain(0..len);
-            Ok(())
+            Ok(len > 0)
         }
         Err(err) => {
             if err.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(());
+                return Ok(false);
             }
             Err(err)
         }
     }
 }
 
-fn read_into_buf<R: Read>(r: &mut R, buf: &mut VecDeque<u8>) -> std::io::Result<()> {
+fn read_into_buf<R: Read>(r: &mut R, buf: &mut VecDeque<u8>) -> std::io::Result<bool> {
     let current_len = buf.len();
     buf.resize(buf.capacity(), 0);
     let target_buf = &mut buf.make_contiguous()[current_len..];
@@ -1100,14 +1146,14 @@ fn read_into_buf<R: Read>(r: &mut R, buf: &mut VecDeque<u8>) -> std::io::Result<
                     "EOF",
                 ))
             } else {
-                Ok(())
+                Ok(true)
             }
         }
         Err(err) => {
             buf.resize(current_len, 0);
 
             if err.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(());
+                return Ok(false);
             }
             Err(err)
         }
