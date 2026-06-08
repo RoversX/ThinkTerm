@@ -2618,6 +2618,32 @@ impl TermWindow {
         self.active_content_view_index().is_some()
     }
 
+    pub(crate) fn content_view_area(&self) -> RectF {
+        let (padding_left, padding_top) = self.padding_left_top();
+        let border = self.get_os_border();
+        let top_tab_h = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let bottom_tab_h = if self.show_tab_bar && self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let left = padding_left + border.left.get() as f32;
+        let top = border.top.get() as f32 + top_tab_h + padding_top;
+        let right = self
+            .dimensions
+            .pixel_width
+            .saturating_sub(border.right.get() as usize)
+            .saturating_sub(self.right_sidebar_width()) as f32;
+        let bottom =
+            (self.dimensions.pixel_height as f32 - border.bottom.get() as f32 - bottom_tab_h)
+                .max(top);
+        euclid::rect(left, top, (right - left).max(0.0), (bottom - top).max(0.0))
+    }
+
     fn content_view_visible_in_active_space(&self, tab: &ContentViewTab) -> bool {
         match tab.space_id.as_deref() {
             Some(space_id) => space_id == self.active_space_id,

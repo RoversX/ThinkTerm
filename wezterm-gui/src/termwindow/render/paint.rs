@@ -207,28 +207,9 @@ impl crate::TermWindow {
         let dimensions = self.dimensions;
         let palette = UiPalette::for_appearance(crate::native_settings::effective_appearance());
 
-        // Occupy exactly the terminal content area: right of the (possibly
-        // collapsed) sidebar and below the tab bar. padding_left_top().0 already
-        // includes the effective sidebar width.
-        let (padding_left, padding_top) = self.padding_left_top();
-        let border = self.get_os_border();
-        let top_tab_h = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let bottom_tab_h = if self.show_tab_bar && self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let left = padding_left + border.left.get() as f32;
-        let top = border.top.get() as f32 + top_tab_h + padding_top;
-        let width = (dimensions.pixel_width as f32 - left - border.right.get() as f32).max(0.0);
-        let height =
-            (dimensions.pixel_height as f32 - top - border.bottom.get() as f32 - bottom_tab_h)
-                .max(0.0);
-        let area = euclid::rect(left, top, width, height);
+        // Occupy the terminal content area between the workspace and right
+        // sidebars, below the top tab bar and above a bottom tab bar.
+        let area = self.content_view_area();
         let active_content_view_idx = self.active_content_view_index();
 
         // Cursor blink: only animate when the view wants it (focused input).

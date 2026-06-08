@@ -982,11 +982,14 @@ impl super::TermWindow {
             context.set_cursor(Some(MouseCursor::Arrow));
             let px = event.coords.x as f32;
             let py = event.coords.y as f32;
-            let resp = self
-                .active_content_view_mut()
-                .map(|v| v.on_mouse(px, py, event.kind));
-            if let Some(resp) = resp {
-                self.handle_content_response(resp);
+            let area = self.content_view_area();
+            if px >= area.min_x() && px < area.max_x() && py >= area.min_y() && py < area.max_y() {
+                let resp = self
+                    .active_content_view_mut()
+                    .map(|v| v.on_mouse(px, py, event.kind));
+                if let Some(resp) = resp {
+                    self.handle_content_response(resp);
+                }
             }
         } else if matches!(
             self.current_mouse_capture,
