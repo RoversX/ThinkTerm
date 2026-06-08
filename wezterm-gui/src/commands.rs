@@ -928,6 +928,22 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_delete"),
         },
+        ConnectWorkspaceThread(_) => CommandDef {
+            brief: "Connect Thread".into(),
+            doc: "Connects or reconnects the ThinkTerm remote thread".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
+        DisconnectWorkspaceThread(_) => CommandDef {
+            brief: "Disconnect Thread".into(),
+            doc: "Disconnects the remote session while keeping the ThinkTerm thread".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
         ToggleWorkspaceThreadPinned(_) => CommandDef {
             brief: "Pin Thread".into(),
             doc: "Toggles the pinned state for the ThinkTerm thread".into(),

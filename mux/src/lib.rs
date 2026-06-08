@@ -2,7 +2,7 @@ use crate::client::{ClientId, ClientInfo};
 use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
-use crate::window::{Window, WindowId};
+use crate::window::{Window, WindowId, WindowUiSurfaceId};
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
-use wezterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
+use wezterm_term::{
+    Clipboard, ClipboardSelection, DownloadHandler, TerminalConfiguration, TerminalSize,
+};
 #[cfg(windows)]
 use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
@@ -371,6 +373,11 @@ pub struct MuxWindowBuilder {
     window_id: WindowId,
     activity: Option<Activity>,
     notified: bool,
+}
+
+struct ExistingWindowSpawnContext {
+    size: TerminalSize,
+    term_config: Option<Arc<dyn TerminalConfiguration>>,
 }
 
 impl MuxWindowBuilder {
@@ -1005,6 +1012,41 @@ impl Mux {
         Ok(())
     }
 
+    pub fn register_window_ui_surface(
+        &self,
+        window_id: WindowId,
+        surface_id: WindowUiSurfaceId,
+    ) -> bool {
+        let changed = {
+            let mut windows = self.windows.write();
+            let Some(window) = windows.get_mut(&window_id) else {
+                return false;
+            };
+            window.add_ui_surface(surface_id)
+        };
+
+        if changed {
+            self.notify(MuxNotification::WindowInvalidated(window_id));
+        }
+        changed
+    }
+
+    pub fn unregister_window_ui_surface(&self, window_id: WindowId, surface_id: &str) -> bool {
+        let changed = {
+            let mut windows = self.windows.write();
+            let Some(window) = windows.get_mut(&window_id) else {
+                return false;
+            };
+            window.remove_ui_surface(surface_id)
+        };
+
+        if changed {
+            self.notify(MuxNotification::WindowInvalidated(window_id));
+            self.prune_dead_windows();
+        }
+        changed
+    }
+
     pub fn window_containing_tab(&self, tab_id: TabId) -> Option<WindowId> {
         for w in self.windows.read().values() {
             for t in w.iter() {
@@ -1018,6 +1060,11 @@ impl Mux {
 
     pub fn is_empty(&self) -> bool {
         self.panes.read().is_empty()
+            && self
+                .windows
+                .read()
+                .values()
+                .all(|window| window.ui_surface_count() == 0)
     }
 
     pub fn is_workspace_empty(&self, workspace: &str) -> bool {
@@ -1409,27 +1456,13 @@ impl Mux {
             .context("resolve_spawn_tab_domain")?;
 
         let window_builder;
-        let term_config;
 
-        let (window_id, size) = if let Some(window_id) = window_id {
-            let window = self
-                .get_window_mut(window_id)
-                .ok_or_else(|| anyhow!("window_id {} not found on this server", window_id))?;
-            let tab = window
-                .get_active()
-                .ok_or_else(|| anyhow!("window {} has no tabs", window_id))?;
-            let pane = tab
-                .get_active_pane()
-                .ok_or_else(|| anyhow!("active tab in window {} has no panes", window_id))?;
-            term_config = pane.get_config();
-
-            let size = tab.get_size();
-
-            (window_id, size)
+        let (window_id, size, term_config) = if let Some(window_id) = window_id {
+            let context = self.existing_window_spawn_context(window_id, size)?;
+            (window_id, context.size, context.term_config)
         } else {
-            term_config = None;
             window_builder = self.new_empty_window(Some(workspace_for_new_window), window_position);
-            (*window_builder, size)
+            (*window_builder, size, None)
         };
 
         if domain.state() == DomainState::Detached {
@@ -1485,6 +1518,26 @@ impl Mux {
         }
 
         Ok((tab, pane, window_id))
+    }
+
+    fn existing_window_spawn_context(
+        &self,
+        window_id: WindowId,
+        requested_size: TerminalSize,
+    ) -> anyhow::Result<ExistingWindowSpawnContext> {
+        let window = self
+            .get_window_mut(window_id)
+            .ok_or_else(|| anyhow!("window_id {} not found on this server", window_id))?;
+        let Some(tab) = window.get_active() else {
+            return Ok(ExistingWindowSpawnContext {
+                size: requested_size,
+                term_config: None,
+            });
+        };
+        let size = tab.get_size();
+        let term_config = tab.get_active_pane().and_then(|pane| pane.get_config());
+
+        Ok(ExistingWindowSpawnContext { size, term_config })
     }
 }
 
@@ -1551,5 +1604,56 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
                 data: Arc::new(data),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_ui_surfaces_are_distinct_prune_anchors() {
+        let mux = Mux::new(None);
+        let window = Window::new(Some("test-workspace".to_string()), None);
+        let window_id = window.window_id();
+        mux.windows.write().insert(window_id, window);
+
+        assert!(mux.is_empty());
+        assert!(mux.register_window_ui_surface(window_id, "remote-thread:a".to_string()));
+        assert!(mux.register_window_ui_surface(window_id, "ssh-hosts".to_string()));
+        assert!(!mux.register_window_ui_surface(window_id, "ssh-hosts".to_string()));
+        assert!(!mux.is_empty());
+
+        mux.prune_dead_windows();
+        assert!(mux.get_window(window_id).is_some());
+
+        assert!(mux.unregister_window_ui_surface(window_id, "remote-thread:a"));
+        assert!(mux.get_window(window_id).is_some());
+
+        assert!(mux.unregister_window_ui_surface(window_id, "ssh-hosts"));
+        assert!(mux.get_window(window_id).is_none());
+        assert!(mux.is_empty());
+    }
+
+    #[test]
+    fn existing_window_spawn_context_allows_empty_window() {
+        let mux = Mux::new(None);
+        let window = Window::new(Some("test-workspace".to_string()), None);
+        let window_id = window.window_id();
+        mux.windows.write().insert(window_id, window);
+
+        let requested_size = TerminalSize {
+            rows: 33,
+            cols: 111,
+            pixel_width: 999,
+            pixel_height: 777,
+            dpi: 144,
+        };
+        let context = mux
+            .existing_window_spawn_context(window_id, requested_size)
+            .unwrap();
+
+        assert_eq!(context.size, requested_size);
+        assert!(context.term_config.is_none());
     }
 }

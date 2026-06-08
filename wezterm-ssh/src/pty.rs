@@ -1,12 +1,16 @@
-use crate::session::{SessionRequest, SessionSender, SignalChannel};
+use crate::session::{DeadSession, SessionRequest, SessionSender, SignalChannel};
 use crate::sessioninner::{ChannelId, ChannelInfo, DescriptorState};
 use crate::sessionwrap::SessionWrap;
 use filedescriptor::{socketpair, FileDescriptor};
 use portable_pty::{ExitStatus, PtySize};
-use smol::channel::{bounded, Receiver, TryRecvError};
+use smol::channel::{bounded, Receiver, TryRecvError, TrySendError};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const RESIZE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 pub(crate) struct NewPty {
@@ -29,6 +33,8 @@ pub struct SshPty {
     pub(crate) reader: FileDescriptor,
     pub(crate) writer: FileDescriptor,
     pub(crate) size: Mutex<PtySize>,
+    pending_resize: Arc<Mutex<Option<PtySize>>>,
+    resize_retry_scheduled: Arc<AtomicBool>,
 }
 
 impl std::io::Write for SshPty {
@@ -41,20 +47,64 @@ impl std::io::Write for SshPty {
     }
 }
 
+impl SshPty {
+    fn schedule_resize_retry(&self, tx: SessionSender) {
+        if self.resize_retry_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let pending_resize = Arc::clone(&self.pending_resize);
+        let retry_scheduled = Arc::clone(&self.resize_retry_scheduled);
+        let channel = self.channel;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(RESIZE_RETRY_DELAY);
+            let Some(size) = pending_resize.lock().unwrap().take() else {
+                retry_scheduled.store(false, Ordering::Release);
+                if pending_resize.lock().unwrap().is_none() {
+                    return;
+                }
+                if retry_scheduled.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                continue;
+            };
+
+            match try_send_resize(&tx, channel, size) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    restore_pending_resize_if_missing(&pending_resize, size);
+                }
+                Err(TrySendError::Closed(_)) => {
+                    retry_scheduled.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        });
+    }
+}
+
 impl portable_pty::MasterPty for SshPty {
     fn resize(&self, size: PtySize) -> anyhow::Result<()> {
-        self.tx
-            .as_ref()
-            .unwrap()
-            .try_send(SessionRequest::ResizePty(
-                ResizePty {
-                    channel: self.channel,
-                    size,
-                },
-                None,
-            ))?;
-
         *self.size.lock().unwrap() = size;
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(DeadSession.into());
+        };
+        match try_send_resize(tx, self.channel, size) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                // Resize events are coalescable and can arrive in bursts during
+                // live resizing or UI view transitions. Keep the latest size
+                // and retry it so the remote PTY doesn't get stuck at stale
+                // rows/cols when the burst stops.
+                *self.pending_resize.lock().unwrap() = Some(size);
+                self.schedule_resize_retry(tx.clone());
+                log::debug!(
+                    "coalescing SSH resize for channel {} because the request queue is full",
+                    self.channel
+                );
+            }
+            Err(TrySendError::Closed(_)) => return Err(DeadSession.into()),
+        }
         Ok(())
     }
 
@@ -86,6 +136,21 @@ impl portable_pty::MasterPty for SshPty {
     #[cfg(unix)]
     fn tty_name(&self) -> Option<std::path::PathBuf> {
         None
+    }
+}
+
+fn try_send_resize(
+    tx: &SessionSender,
+    channel: ChannelId,
+    size: PtySize,
+) -> Result<(), TrySendError<SessionRequest>> {
+    tx.try_send_request(SessionRequest::ResizePty(ResizePty { channel, size }, None))
+}
+
+fn restore_pending_resize_if_missing(pending_resize: &Mutex<Option<PtySize>>, size: PtySize) {
+    let mut pending = pending_resize.lock().unwrap();
+    if pending.is_none() {
+        *pending = Some(size);
     }
 }
 
@@ -280,6 +345,8 @@ impl crate::sessioninner::SessionInner {
             reader: read_from_stdout,
             writer: write_to_stdin,
             size: Mutex::new(newpty.size),
+            pending_resize: Arc::new(Mutex::new(None)),
+            resize_retry_scheduled: Arc::new(AtomicBool::new(false)),
         };
 
         let (exit_tx, exit_rx) = bounded(1);
@@ -324,5 +391,93 @@ impl crate::sessioninner::SessionInner {
             .ok_or_else(|| anyhow::anyhow!("invalid channel id {}", resize.channel))?;
         info.channel.resize_pty(&resize)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{SessionRequest, SessionSender};
+    use portable_pty::MasterPty;
+    use smol::channel::bounded;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn resize_retries_latest_request_when_session_queue_is_full() {
+        let (tx, rx) = bounded(1);
+        tx.try_send(SessionRequest::SessionDropped).unwrap();
+        let (pipe_write, _pipe_read) = socketpair().unwrap();
+        let (writer, reader) = socketpair().unwrap();
+        let pty = SshPty {
+            channel: 7,
+            tx: Some(SessionSender {
+                tx,
+                pipe: Arc::new(Mutex::new(pipe_write)),
+            }),
+            reader,
+            writer,
+            size: Mutex::new(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 480,
+            }),
+            pending_resize: Arc::new(Mutex::new(None)),
+            resize_retry_scheduled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let size = PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 960,
+            pixel_height: 800,
+        };
+
+        pty.resize(size).unwrap();
+        assert_eq!(*pty.size.lock().unwrap(), size);
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionRequest::SessionDropped
+        ));
+        let mut retried = None;
+        for _ in 0..40 {
+            if let Ok(request) = rx.try_recv() {
+                retried = Some(request);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let Some(SessionRequest::ResizePty(resize, None)) = retried else {
+            panic!("expected retried resize request");
+        };
+        assert_eq!(resize.channel, 7);
+        assert_eq!(resize.size, size);
+    }
+
+    #[test]
+    fn resize_retry_restore_preserves_newer_pending_request() {
+        let old_size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 480,
+        };
+        let newer_size = PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 960,
+            pixel_height: 800,
+        };
+
+        let pending = Mutex::new(Some(newer_size));
+        restore_pending_resize_if_missing(&pending, old_size);
+        assert_eq!(*pending.lock().unwrap(), Some(newer_size));
+
+        let pending = Mutex::new(None);
+        restore_pending_resize_if_missing(&pending, old_size);
+        assert_eq!(*pending.lock().unwrap(), Some(old_size));
     }
 }

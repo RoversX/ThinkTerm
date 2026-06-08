@@ -314,6 +314,7 @@ impl GuiFrontEnd {
                         term_config,
                         None,
                         None,
+                        None,
                     )
                 }
 

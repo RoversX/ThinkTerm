@@ -1,8 +1,7 @@
 //! Reusable "content view" framework: a GPU-drawn panel that occupies the
-//! terminal content area and behaves like a synthetic tab (switch / close /
-//! preserve state). The SSH hosts manager is the first implementer; other
-//! native panels can plug in by implementing [`ContentView`] and calling
-//! `TermWindow::open_content_view`.
+//! terminal content area. Some views behave like synthetic tabs (switch /
+//! close / preserve state), while thread-owned views can stay driven by the
+//! workspace sidebar instead.
 
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::TermWindow;
@@ -13,6 +12,18 @@ use std::time::Instant;
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
 use window::{MouseEventKind as WMEK, RectF};
+
+pub(crate) type ContentViewId = u64;
+
+/// Progress of an SSH connection that a content view kicked off, pushed by the
+/// owning `TermWindow` while it polls the remote domain. Only the remote-thread
+/// view consumes it; `Authenticating`/`Connected` are not pushed because at that
+/// point the view is closed and the real terminal is revealed instead.
+#[derive(Clone, Debug)]
+pub(crate) enum RemoteConnectPhase {
+    Connecting,
+    Failed { message: String },
+}
 
 /// What `TermWindow` should do after a content view handled an input event.
 pub(crate) enum ContentViewResponse {
@@ -29,6 +40,32 @@ pub(crate) enum ContentViewResponse {
 pub(crate) trait ContentView {
     /// Title shown on the synthetic tab.
     fn title(&self) -> String;
+
+    /// Whether this view should appear in the window's top tab bar.
+    fn show_in_tab_bar(&self) -> bool {
+        true
+    }
+
+    /// Stable key used to activate an existing tab instead of opening a duplicate.
+    fn tab_key(&self) -> Option<String> {
+        None
+    }
+
+    /// Space id that owns this synthetic tab. `None` means the view is global
+    /// and remains visible while switching Spaces.
+    fn space_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Called when a deduplicated or background synthetic tab is explicitly
+    /// brought back to the foreground by user action.
+    fn on_reactivated(&mut self) -> ContentViewResponse {
+        ContentViewResponse::Ignored
+    }
+
+    /// Push SSH connection progress into a view that initiated a connection.
+    /// Default is a no-op; only the remote-thread view reacts.
+    fn on_remote_connect_phase(&mut self, _phase: RemoteConnectPhase) {}
 
     /// Whether the view currently wants the cursor-blink animation running
     /// (true only while a text field is focused, to avoid needless repaints).

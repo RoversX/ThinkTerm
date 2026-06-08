@@ -21,6 +21,8 @@ use wezterm_term::{KeyCode, KeyModifiers};
 use window::color::LinearRgba;
 use window::{MouseEventKind as WMEK, MousePress, RectF};
 
+pub(crate) const SSH_HOSTS_CONTENT_VIEW_KEY: &str = "ssh-hosts";
+
 const FIELD_NAME: usize = 0;
 const FIELD_HOST: usize = 1;
 const FIELD_PORT: usize = 2;
@@ -409,7 +411,7 @@ impl SshHostsView {
                 ContentViewResponse::Redraw
             }
             SshViewAction::SaveAndConnect => match self.persist_form() {
-                Some(id) => connect_response(id),
+                Some(id) => open_thread_response(id),
                 None => ContentViewResponse::Redraw,
             },
             SshViewAction::Cancel => {
@@ -423,7 +425,7 @@ impl SshHostsView {
             }
             SshViewAction::ResizeLeftPane => ContentViewResponse::Redraw,
             SshViewAction::Connect(i) => match self.filtered.get(i) {
-                Some(entry) => connect_response(entry.id.clone()),
+                Some(entry) => open_thread_response(entry.id.clone()),
                 None => ContentViewResponse::Redraw,
             },
         }
@@ -443,11 +445,11 @@ impl SshHostsView {
             (KeyCode::Enter, _) => {
                 if in_form {
                     match self.persist_form() {
-                        Some(id) => connect_response(id),
+                        Some(id) => open_thread_response(id),
                         None => ContentViewResponse::Redraw,
                     }
                 } else if let Some(entry) = self.filtered.get(self.selected) {
-                    connect_response(entry.id.clone())
+                    open_thread_response(entry.id.clone())
                 } else {
                     ContentViewResponse::Redraw
                 }
@@ -1338,7 +1340,7 @@ impl SshHostsView {
         let btn_w = |label: &str| ctx.measure_text_width(font, label) + 36.0;
         let mut bx = x;
         for (label, action, primary) in [
-            ("Save & Connect", SshViewAction::SaveAndConnect, true),
+            ("Save & Open", SshViewAction::SaveAndConnect, true),
             ("Save", SshViewAction::Save, false),
             ("Cancel", SshViewAction::Cancel, false),
         ] {
@@ -1369,17 +1371,25 @@ impl SshHostsView {
     }
 }
 
-/// Close the view and connect to the given remote project on the main window.
-fn connect_response(project_id: String) -> ContentViewResponse {
+/// Close the view and open a disconnected remote thread on the main window.
+fn open_thread_response(project_id: String) -> ContentViewResponse {
     ContentViewResponse::Run(Box::new(move |tw: &mut TermWindow| {
-        tw.close_content_view();
-        tw.connect_ssh_host(project_id, None);
+        let window = tw.window.as_ref().cloned();
+        if let Some(window) = window {
+            if tw.open_ssh_host_thread_without_connecting(project_id, &window) {
+                tw.close_content_view();
+            }
+        }
     }))
 }
 
 impl ContentView for SshHostsView {
     fn title(&self) -> String {
         "SSH Hosts".to_string()
+    }
+
+    fn tab_key(&self) -> Option<String> {
+        Some(SSH_HOSTS_CONTENT_VIEW_KEY.to_string())
     }
 
     fn wants_cursor_blink(&self) -> bool {

@@ -70,6 +70,8 @@ pub struct WorkspaceThread {
     pub name: String,
     pub project_id: ProjectId,
     pub layout: Option<WorkspaceThreadLayoutSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_workspace_name: Option<String>,
     pub materialized_workspace_name: Option<String>,
     pub last_active_at: i64,
     #[serde(default)]
@@ -161,6 +163,18 @@ pub struct ActivationPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadConnectionState {
+    pub space_id: SpaceId,
+    pub project_id: ProjectId,
+    pub thread_id: WorkspaceThreadId,
+    pub project_name: String,
+    pub thread_name: String,
+    pub workspace_name: String,
+    pub is_remote: bool,
+    pub is_live: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletedWorkspaceThread {
     pub was_active: bool,
     pub next_thread_id: Option<WorkspaceThreadId>,
@@ -172,6 +186,20 @@ pub struct RemovedProject {
     pub was_active: bool,
     pub next_thread_id: Option<WorkspaceThreadId>,
     pub materialized_workspace_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndWorkspaceThreadResult {
+    DeletedThread(DeletedWorkspaceThread),
+    RemovedProject(RemovedProject),
+    Noop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectedWorkspaceThread {
+    pub was_active: bool,
+    pub next_thread_id: Option<WorkspaceThreadId>,
+    pub workspace_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -646,6 +674,11 @@ pub fn workspace_has_thread_binding(workspace: &str) -> bool {
     store.workspace_space_id(workspace).is_some()
 }
 
+pub fn thread_id_for_workspace(space_id: &str, workspace: &str) -> Option<WorkspaceThreadId> {
+    let store = THREAD_STORE.lock();
+    store.thread_id_for_workspace(space_id, workspace)
+}
+
 /// A brand-new / empty Space has no project yet. Give it a stable default
 /// project rooted at the user's home directory. Previously this used the
 /// process launch cwd (`std::env::current_dir()`), which is arbitrary — `/`
@@ -727,54 +760,22 @@ pub fn create_project_from_path(space_id: &str, path: &str) -> Result<WorkspaceT
     Ok(thread_id)
 }
 
-/// Create a new thread under a remote (SSH) project bound to `workspace_name`,
-/// mark it active, and return its id. Remote host connection details live in
-/// `ssh_hosts.json`; the project record here is layout/sidebar state only.
-pub fn create_remote_host_thread(
+pub fn create_disconnected_remote_host_thread(
     space_id: &str,
     host_id: &str,
     label: &str,
     path: PathBuf,
-    workspace_name: &str,
+    workspace_override: Option<String>,
 ) -> WorkspaceThreadId {
     let mut store = THREAD_STORE.lock();
     store.normalize_after_load();
-    let project_id = if store
-        .projects
-        .iter()
-        .any(|project| project.id == host_id && project.space_id == space_id)
-    {
-        host_id.to_string()
-    } else {
-        remote_project_id_for_space(space_id, host_id)
-    };
-    if let Some(project) = store.projects.iter_mut().find(|p| p.id == project_id) {
-        project.space_id = space_id.to_string();
-        project.name = label.to_string();
-        project.path = path.clone();
-    } else {
-        store.projects.push(Project {
-            id: project_id.clone(),
-            space_id: space_id.to_string(),
-            name: label.to_string(),
-            path,
-            threads: vec![],
-            active_thread_id: None,
-            threads_collapsed: false,
-        });
-    }
-
-    let project = store
-        .projects
-        .iter_mut()
-        .find(|p| p.id == project_id)
-        .expect("remote project was just inserted");
-    let name = format!("Thread {}", project.threads.len() + 1);
-    let session = WorkspaceThread::new(project_id.clone(), name, Some(workspace_name.to_string()));
-    let thread_id = session.id.clone();
-    project.active_thread_id = Some(thread_id.clone());
-    project.threads.push(session);
-    store.set_active_project_for_space(space_id, project_id);
+    let thread_id = store.create_disconnected_remote_host_thread(
+        space_id,
+        host_id,
+        label,
+        path,
+        workspace_override,
+    );
     persist_locked(&store);
     thread_id
 }
@@ -787,6 +788,36 @@ pub fn activate_thread_record(
     let plan = store.activate_thread_record(thread_id, live_workspaces);
     persist_locked(&store);
     plan
+}
+
+pub fn activation_plan_for_thread(
+    thread_id: &str,
+    live_workspaces: &[String],
+) -> Option<ActivationPlan> {
+    let store = THREAD_STORE.lock();
+    store.activation_plan_for_thread(thread_id, live_workspaces)
+}
+
+pub fn thread_connection_state(
+    thread_id: &str,
+    live_workspaces: &[String],
+) -> Option<ThreadConnectionState> {
+    let store = THREAD_STORE.lock();
+    store.thread_connection_state(thread_id, live_workspaces)
+}
+
+pub fn thread_space_id(thread_id: &str) -> Option<SpaceId> {
+    let store = THREAD_STORE.lock();
+    store.thread_space_id(thread_id)
+}
+
+pub fn project_is_remote(project_id: &str) -> bool {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .is_some_and(is_remote_project)
 }
 
 pub fn refresh_thread_work_for_pane(pane_id: PaneId) -> bool {
@@ -1045,6 +1076,7 @@ pub fn mark_thread_unread(thread_id: &str) -> bool {
     changed
 }
 
+#[allow(dead_code)]
 pub fn delete_thread(thread_id: &str) -> Option<DeletedWorkspaceThread> {
     let mut store = THREAD_STORE.lock();
     let deleted = store.delete_thread(thread_id);
@@ -1052,6 +1084,28 @@ pub fn delete_thread(thread_id: &str) -> Option<DeletedWorkspaceThread> {
         persist_locked(&store);
     }
     deleted
+}
+
+pub fn end_workspace_thread_record(thread_id: &str) -> EndWorkspaceThreadResult {
+    let mut store = THREAD_STORE.lock();
+    let result = store.end_workspace_thread_record(thread_id);
+    if !matches!(result, EndWorkspaceThreadResult::Noop) {
+        persist_locked(&store);
+    }
+    result
+}
+
+pub fn disconnect_workspace_thread_record(
+    thread_id: &str,
+    live_workspaces: &[String],
+) -> Option<DisconnectedWorkspaceThread> {
+    let mut store = THREAD_STORE.lock();
+    let (disconnected, changed) =
+        store.disconnect_workspace_thread_record(thread_id, live_workspaces);
+    if changed {
+        persist_locked(&store);
+    }
+    disconnected
 }
 
 pub fn toggle_project_threads_collapsed(project_id: &str) -> bool {
@@ -1192,6 +1246,7 @@ impl WorkspaceThreadStore {
             changed = true;
         }
         changed |= self.repair_cross_space_local_workspace_bindings();
+        changed |= self.ensure_unique_thread_names();
         changed
     }
 
@@ -1482,6 +1537,26 @@ impl WorkspaceThreadStore {
         })
     }
 
+    fn thread_id_for_workspace(
+        &self,
+        space_id: &str,
+        workspace: &str,
+    ) -> Option<WorkspaceThreadId> {
+        self.projects.iter().find_map(|project| {
+            if project.space_id != space_id {
+                return None;
+            }
+            project
+                .threads
+                .iter()
+                .find(|session| {
+                    session.materialized_workspace_name.as_deref() == Some(workspace)
+                        || workspace_name_for_thread(&project.id, &session.id) == workspace
+                })
+                .map(|session| session.id.clone())
+        })
+    }
+
     fn workspace_belongs_to_other_space(&self, space_id: &str, workspace: &str) -> bool {
         self.workspace_space_id(workspace)
             .is_some_and(|owner_space_id| owner_space_id != space_id)
@@ -1514,17 +1589,106 @@ impl WorkspaceThreadStore {
         changed
     }
 
+    fn ensure_unique_thread_names(&mut self) -> bool {
+        let mut changed = false;
+        for project in &mut self.projects {
+            let mut used = Vec::<String>::new();
+            let mut next_index = project.threads.len().saturating_add(1).max(1);
+
+            for session in &mut project.threads {
+                let trimmed = session.name.trim();
+                if !trimmed.is_empty() && !used.iter().any(|name| name == trimmed) {
+                    if session.name != trimmed {
+                        session.name = trimmed.to_string();
+                        changed = true;
+                    }
+                    used.push(session.name.clone());
+                    continue;
+                }
+
+                loop {
+                    let candidate = format!("Thread {next_index}");
+                    next_index += 1;
+                    if !used.iter().any(|name| name == &candidate) {
+                        session.name = candidate.clone();
+                        used.push(candidate);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     fn create_thread(&mut self, project_id: &str, name: Option<String>) -> WorkspaceThreadId {
         let project = self
             .projects
             .iter_mut()
             .find(|project| project.id == project_id)
             .expect("project_id should exist before creating session");
-        let name = name.unwrap_or_else(|| format!("Thread {}", project.threads.len() + 1));
+        let name = name
+            .map(|name| unique_thread_name(project, None, name.trim()))
+            .unwrap_or_else(|| next_thread_name(project));
         let session = WorkspaceThread::new(project.id.clone(), name, None);
         let id = session.id.clone();
         project.threads.push(session);
         id
+    }
+
+    fn create_disconnected_remote_host_thread(
+        &mut self,
+        space_id: &str,
+        host_id: &str,
+        label: &str,
+        path: PathBuf,
+        workspace_override: Option<String>,
+    ) -> WorkspaceThreadId {
+        let project_id = if self
+            .projects
+            .iter()
+            .any(|project| project.id == host_id && project.space_id == space_id)
+        {
+            host_id.to_string()
+        } else {
+            remote_project_id_for_space(space_id, host_id)
+        };
+
+        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
+            project.space_id = space_id.to_string();
+            project.name = label.to_string();
+            project.path = path.clone();
+        } else {
+            self.projects.push(Project {
+                id: project_id.clone(),
+                space_id: space_id.to_string(),
+                name: label.to_string(),
+                path,
+                threads: vec![],
+                active_thread_id: None,
+                threads_collapsed: false,
+            });
+        }
+
+        let project = self
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project_id)
+            .expect("remote project was just inserted");
+        let name = next_thread_name(project);
+        let mut session = WorkspaceThread::new(project_id.clone(), name, None);
+        if let Some(workspace) = workspace_override.as_deref().map(str::trim) {
+            if !workspace.is_empty() {
+                session.planned_workspace_name = Some(workspace_name_for_remote_default(
+                    &project_id,
+                    &session.id,
+                    workspace,
+                ));
+            }
+        }
+        let thread_id = session.id.clone();
+        project.threads.push(session);
+        thread_id
     }
 
     fn create_project_from_path(&mut self, space_id: &str, path: PathBuf) -> WorkspaceThreadId {
@@ -1689,39 +1853,96 @@ impl WorkspaceThreadStore {
         thread_id: &str,
         live_workspaces: &[String],
     ) -> Option<ActivationPlan> {
-        let project = self.projects.iter_mut().find(|project| {
+        let plan = self.activation_plan_for_thread(thread_id, live_workspaces)?;
+        let project = self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == plan.project_id)?;
+        let session = project
+            .threads
+            .iter_mut()
+            .find(|session| session.id == plan.thread_id)?;
+        session.materialized_workspace_name = Some(plan.workspace_name.clone());
+        session.last_active_at = now_ts();
+        session.is_unread = false;
+        session.work_finished_unseen = false;
+        project.active_thread_id = Some(plan.thread_id.clone());
+        let space_id = project.space_id.clone();
+        let active_project_id = project.id.clone();
+        let _ = project;
+        self.set_active_project_for_space(&space_id, active_project_id);
+        Some(plan)
+    }
+
+    fn activation_plan_for_thread(
+        &self,
+        thread_id: &str,
+        live_workspaces: &[String],
+    ) -> Option<ActivationPlan> {
+        let project = self.projects.iter().find(|project| {
             project
                 .threads
                 .iter()
                 .any(|session| session.id == thread_id)
         })?;
-        let project_id = project.id.clone();
         let session = project
             .threads
-            .iter_mut()
+            .iter()
             .find(|session| session.id == thread_id)?;
         let workspace_name = session
             .materialized_workspace_name
             .clone()
-            .unwrap_or_else(|| workspace_name_for_thread(&project_id, &session.id));
+            .or_else(|| session.planned_workspace_name.clone())
+            .unwrap_or_else(|| workspace_name_for_thread(&project.id, &session.id));
         let needs_materialize = !live_workspaces.iter().any(|live| live == &workspace_name);
-        session.materialized_workspace_name = Some(workspace_name.clone());
-        session.last_active_at = now_ts();
-        session.is_unread = false;
-        session.work_finished_unseen = false;
-        let thread_id = session.id.clone();
-        project.active_thread_id = Some(thread_id.clone());
-        let space_id = project.space_id.clone();
-        let active_project_id = project.id.clone();
-        let project_path = project.path.clone();
-        let _ = project;
-        self.set_active_project_for_space(&space_id, active_project_id);
         Some(ActivationPlan {
-            project_id,
-            thread_id,
+            project_id: project.id.clone(),
+            thread_id: session.id.clone(),
             workspace_name,
-            project_path,
+            project_path: project.path.clone(),
             needs_materialize,
+        })
+    }
+
+    fn thread_connection_state(
+        &self,
+        thread_id: &str,
+        live_workspaces: &[String],
+    ) -> Option<ThreadConnectionState> {
+        let project = self.projects.iter().find(|project| {
+            project
+                .threads
+                .iter()
+                .any(|session| session.id == thread_id)
+        })?;
+        let session = project
+            .threads
+            .iter()
+            .find(|session| session.id == thread_id)?;
+        let workspace_name = session
+            .materialized_workspace_name
+            .clone()
+            .or_else(|| session.planned_workspace_name.clone())
+            .unwrap_or_else(|| workspace_name_for_thread(&project.id, &session.id));
+        Some(ThreadConnectionState {
+            space_id: project.space_id.clone(),
+            project_id: project.id.clone(),
+            thread_id: session.id.clone(),
+            project_name: project.name.clone(),
+            thread_name: session.name.clone(),
+            workspace_name: workspace_name.clone(),
+            is_remote: is_remote_project(project),
+            is_live: live_workspaces.iter().any(|live| live == &workspace_name),
+        })
+    }
+
+    fn thread_space_id(&self, thread_id: &str) -> Option<SpaceId> {
+        self.projects.iter().find_map(|project| {
+            project
+                .threads
+                .iter()
+                .any(|session| session.id == thread_id)
+                .then(|| project.space_id.clone())
         })
     }
 
@@ -1811,18 +2032,22 @@ impl WorkspaceThreadStore {
         }
 
         for project in &mut self.projects {
-            if let Some(session) = project
+            let Some(index) = project
                 .threads
-                .iter_mut()
-                .find(|session| session.id == thread_id)
-            {
-                if session.name == name {
-                    return false;
-                }
-                session.name = name.to_string();
-                session.last_active_at = now_ts();
-                return true;
+                .iter()
+                .position(|session| session.id == thread_id)
+            else {
+                continue;
+            };
+
+            let unique_name = unique_thread_name(project, Some(thread_id), name);
+            let session = &mut project.threads[index];
+            if session.name == unique_name {
+                return false;
             }
+            session.name = unique_name;
+            session.last_active_at = now_ts();
+            return true;
         }
         false
     }
@@ -1959,6 +2184,131 @@ impl WorkspaceThreadStore {
         None
     }
 
+    fn end_workspace_thread_record(&mut self, thread_id: &str) -> EndWorkspaceThreadResult {
+        if let Some(deleted) = self.delete_thread(thread_id) {
+            return EndWorkspaceThreadResult::DeletedThread(deleted);
+        }
+
+        let Some(project_index) = self.projects.iter().position(|project| {
+            project
+                .threads
+                .iter()
+                .any(|session| session.id == thread_id)
+        }) else {
+            return EndWorkspaceThreadResult::Noop;
+        };
+
+        if !is_remote_project(&self.projects[project_index]) {
+            return EndWorkspaceThreadResult::Noop;
+        }
+
+        let project_id = self.projects[project_index].id.clone();
+        let space_id = self.projects[project_index].space_id.clone();
+        let project_count = self
+            .projects
+            .iter()
+            .filter(|project| project.space_id == space_id)
+            .count();
+
+        if project_count <= 1 {
+            let mut project = default_project_for_space(&space_id);
+            let session = WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
+            project.active_thread_id = Some(session.id.clone());
+            project.threads.push(session);
+            self.projects.push(project);
+            self.set_active_project_for_space(&space_id, project_id.clone());
+        }
+
+        self.remove_project(&project_id)
+            .map(EndWorkspaceThreadResult::RemovedProject)
+            .unwrap_or(EndWorkspaceThreadResult::Noop)
+    }
+
+    fn disconnect_workspace_thread_record(
+        &mut self,
+        thread_id: &str,
+        live_workspaces: &[String],
+    ) -> (Option<DisconnectedWorkspaceThread>, bool) {
+        let Some(project_index) = self.projects.iter().position(|project| {
+            project
+                .threads
+                .iter()
+                .any(|session| session.id == thread_id)
+        }) else {
+            return (None, false);
+        };
+
+        if !is_remote_project(&self.projects[project_index]) {
+            return (None, false);
+        }
+
+        let project_id = self.projects[project_index].id.clone();
+        let space_id = self.projects[project_index].space_id.clone();
+        let workspace_name = self.projects[project_index]
+            .threads
+            .iter()
+            .find(|session| session.id == thread_id)
+            .and_then(|session| session.materialized_workspace_name.clone())
+            .unwrap_or_else(|| workspace_name_for_thread(&project_id, thread_id));
+
+        if !live_workspaces.iter().any(|live| live == &workspace_name) {
+            return (None, false);
+        }
+
+        let was_active = self.active_project_id_for_space(&space_id).as_deref()
+            == Some(project_id.as_str())
+            && self.projects[project_index].active_thread_id.as_deref() == Some(thread_id);
+        let mut changed = false;
+        let next_thread_id = if was_active {
+            let default_project_id = default_project_for_space(&space_id).id;
+            if self
+                .projects
+                .iter()
+                .all(|project| project.id != default_project_id || project.space_id != space_id)
+            {
+                let mut project = default_project_for_space(&space_id);
+                let session = WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
+                let thread_id = session.id.clone();
+                project.active_thread_id = Some(thread_id);
+                project.threads.push(session);
+                self.projects.push(project);
+                changed = true;
+            }
+
+            let next_thread_id = {
+                let project = self
+                    .projects
+                    .iter_mut()
+                    .find(|project| {
+                        project.id == default_project_id && project.space_id == space_id
+                    })
+                    .expect("default project should exist");
+                project.active_thread_id.clone().unwrap_or_else(|| {
+                    let session =
+                        WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
+                    let thread_id = session.id.clone();
+                    project.active_thread_id = Some(thread_id.clone());
+                    project.threads.push(session);
+                    changed = true;
+                    thread_id
+                })
+            };
+            changed |= self.set_active_project_for_space(&space_id, default_project_id);
+            Some(next_thread_id)
+        } else {
+            None
+        };
+
+        (
+            Some(DisconnectedWorkspaceThread {
+                was_active,
+                next_thread_id,
+                workspace_name,
+            }),
+            changed,
+        )
+    }
+
     fn remove_project(&mut self, project_id: &str) -> Option<RemovedProject> {
         let index = self
             .projects
@@ -2055,6 +2405,7 @@ impl WorkspaceThread {
             name,
             project_id,
             layout: None,
+            planned_workspace_name: None,
             materialized_workspace_name: workspace,
             last_active_at: now_ts(),
             is_pinned: false,
@@ -2075,6 +2426,7 @@ impl WorkspaceThread {
             name,
             project_id,
             layout: None,
+            planned_workspace_name: None,
             materialized_workspace_name: workspace,
             last_active_at: now_ts(),
             is_pinned: false,
@@ -2747,6 +3099,14 @@ fn workspace_name_for_thread(project_id: &str, thread_id: &str) -> String {
     format!("thinkterm:{project_id}:{thread_id}")
 }
 
+fn workspace_name_for_remote_default(project_id: &str, thread_id: &str, workspace: &str) -> String {
+    format!(
+        "{}:{}",
+        workspace_name_for_thread(project_id, thread_id),
+        workspace
+    )
+}
+
 pub fn remote_project_id_for_space(space_id: &str, host_id: &str) -> ProjectId {
     format!("{host_id}{REMOTE_PROJECT_SPACE_SEPARATOR}{space_id}")
 }
@@ -2758,19 +3118,52 @@ pub fn remote_host_id_for_project_id(project_id: &str) -> &str {
         .unwrap_or(project_id)
 }
 
-pub fn remote_workspace_name_for_space(
-    space_id: &str,
-    host_id: &str,
-    base_workspace: &str,
-) -> String {
-    format!("thinkterm:ssh:{space_id}:{host_id}:{base_workspace}")
-}
-
 fn next_space_name(spaces: &[Space]) -> String {
     let mut index = spaces.len() + 1;
     loop {
         let name = format!("Space {index}");
         if !spaces.iter().any(|space| space.name == name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+fn thread_name_in_use(project: &Project, ignored_thread_id: Option<&str>, name: &str) -> bool {
+    project
+        .threads
+        .iter()
+        .any(|thread| ignored_thread_id != Some(thread.id.as_str()) && thread.name == name)
+}
+
+fn next_thread_name(project: &Project) -> String {
+    let mut index = project.threads.len().saturating_add(1).max(1);
+    loop {
+        let name = format!("Thread {index}");
+        if !thread_name_in_use(project, None, &name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+fn unique_thread_name(
+    project: &Project,
+    ignored_thread_id: Option<&str>,
+    requested: &str,
+) -> String {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return next_thread_name(project);
+    }
+    if !thread_name_in_use(project, ignored_thread_id, requested) {
+        return requested.to_string();
+    }
+
+    let mut index = 2;
+    loop {
+        let name = format!("{requested} {index}");
+        if !thread_name_in_use(project, ignored_thread_id, &name) {
             return name;
         }
         index += 1;
@@ -2820,6 +3213,73 @@ mod tests {
             active_thread_id: None,
             threads_collapsed: false,
         }
+    }
+
+    #[test]
+    fn normalize_makes_thread_names_unique_per_project() {
+        let mut store = test_store();
+        store.projects.push(test_project(
+            "project-1",
+            "Project",
+            PathBuf::from("/tmp/project"),
+            vec![
+                WorkspaceThread::new("project-1".to_string(), "Thread 2".to_string(), None),
+                WorkspaceThread::new("project-1".to_string(), "Thread 2".to_string(), None),
+                WorkspaceThread::new("project-1".to_string(), "Thread 3".to_string(), None),
+            ],
+        ));
+
+        assert!(store.normalize_after_load());
+        let names = store.projects[0]
+            .threads
+            .iter()
+            .map(|thread| thread.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Thread 2", "Thread 4", "Thread 3"]);
+    }
+
+    #[test]
+    fn create_thread_skips_existing_default_thread_names() {
+        let mut store = test_store();
+        store.projects.push(test_project(
+            "project-1",
+            "Project",
+            PathBuf::from("/tmp/project"),
+            vec![
+                WorkspaceThread::new("project-1".to_string(), "Thread 1".to_string(), None),
+                WorkspaceThread::new("project-1".to_string(), "Thread 3".to_string(), None),
+            ],
+        ));
+
+        let thread_id = store.create_thread("project-1", None);
+        let thread = store.projects[0]
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .expect("created thread");
+        assert_eq!(thread.name, "Thread 4");
+    }
+
+    #[test]
+    fn rename_thread_keeps_names_unique_in_project() {
+        let mut store = test_store();
+        let first = WorkspaceThread::new("project-1".to_string(), "Build".to_string(), None);
+        let second = WorkspaceThread::new("project-1".to_string(), "Review".to_string(), None);
+        let second_id = second.id.clone();
+        store.projects.push(test_project(
+            "project-1",
+            "Project",
+            PathBuf::from("/tmp/project"),
+            vec![first, second],
+        ));
+
+        assert!(store.rename_thread(&second_id, "Build".to_string()));
+        let renamed = store.projects[0]
+            .threads
+            .iter()
+            .find(|thread| thread.id == second_id)
+            .expect("renamed thread");
+        assert_eq!(renamed.name, "Build 2");
     }
 
     #[test]
@@ -2966,6 +3426,40 @@ mod tests {
     }
 
     #[test]
+    fn thread_id_for_workspace_matches_materialized_or_expected_name() {
+        let mut store = test_store();
+        let space_id = store.create_space_record("Remote".to_string());
+        let mut thread = WorkspaceThread::new("ssh-host".to_string(), "main".to_string(), None);
+        let thread_id = thread.id.clone();
+        let expected_workspace = workspace_name_for_thread("ssh-host", &thread_id);
+        thread.materialized_workspace_name = Some("custom-remote".to_string());
+        store.projects.push(test_project_in_space(
+            &space_id,
+            "ssh-host",
+            "Remote",
+            PathBuf::from("ssh://user@example.com"),
+            vec![thread],
+        ));
+
+        assert_eq!(
+            store
+                .thread_id_for_workspace(&space_id, "custom-remote")
+                .as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            store
+                .thread_id_for_workspace(&space_id, &expected_workspace)
+                .as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            store.thread_id_for_workspace("other-space", "custom-remote"),
+            None
+        );
+    }
+
+    #[test]
     fn workspace_thread_store_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("workspace_threads.json");
@@ -3103,6 +3597,134 @@ mod tests {
                 .as_deref(),
             Some(workspace)
         );
+    }
+
+    #[test]
+    fn remote_thread_connection_state_does_not_select_or_materialize() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let thread = WorkspaceThread::new("ssh-host".to_string(), "main".to_string(), None);
+        let thread_id = thread.id.clone();
+        store.projects.push(Project {
+            id: "ssh-host".to_string(),
+            space_id: space_id.clone(),
+            name: "Remote".to_string(),
+            path: PathBuf::from("ssh://user@example.com"),
+            threads: vec![thread],
+            active_thread_id: None,
+            threads_collapsed: false,
+        });
+
+        let state = store
+            .thread_connection_state(&thread_id, &[])
+            .expect("remote thread state");
+        assert_eq!(state.space_id, space_id);
+        assert!(state.is_remote);
+        assert!(!state.is_live);
+        assert_eq!(
+            state.workspace_name,
+            workspace_name_for_thread("ssh-host", &thread_id)
+        );
+        assert!(store.projects[0].active_thread_id.is_none());
+        assert!(store.spaces[0].active_project_id.is_none());
+        assert!(store.projects[0].threads[0]
+            .materialized_workspace_name
+            .is_none());
+        assert_eq!(store.thread_space_id(&thread_id), Some(space_id));
+    }
+
+    #[test]
+    fn activation_plan_for_thread_does_not_select_or_materialize() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let thread = WorkspaceThread::new("ssh-host".to_string(), "main".to_string(), None);
+        let thread_id = thread.id.clone();
+        store.projects.push(Project {
+            id: "ssh-host".to_string(),
+            space_id: space_id.clone(),
+            name: "Remote".to_string(),
+            path: PathBuf::from("ssh://user@example.com"),
+            threads: vec![thread],
+            active_thread_id: None,
+            threads_collapsed: false,
+        });
+
+        let plan = store
+            .activation_plan_for_thread(&thread_id, &[])
+            .expect("activation plan");
+        assert!(plan.needs_materialize);
+        assert_eq!(
+            plan.workspace_name,
+            workspace_name_for_thread("ssh-host", &thread_id)
+        );
+        assert!(store.projects[0].active_thread_id.is_none());
+        assert!(store.spaces[0].active_project_id.is_none());
+        assert!(store.projects[0].threads[0]
+            .materialized_workspace_name
+            .is_none());
+        assert_eq!(store.thread_to_restore_for_space(&space_id), (None, false));
+
+        let plan = store.activate_thread_record(&thread_id, &[]).unwrap();
+        assert!(plan.needs_materialize);
+        assert_eq!(
+            store.projects[0].active_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            store.spaces[0].active_project_id.as_deref(),
+            Some("ssh-host")
+        );
+        assert!(thread_has_restorable_workspace(
+            &store.projects[0].threads[0]
+        ));
+        assert_eq!(
+            store.thread_to_restore_for_space(&space_id),
+            (Some(thread_id), false)
+        );
+    }
+
+    #[test]
+    fn disconnected_remote_host_thread_preserves_workspace_override() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let thread_id = store.create_disconnected_remote_host_thread(
+            &space_id,
+            "ssh-host",
+            "Remote",
+            PathBuf::from("ssh://user@example.com"),
+            Some("custom-remote-workspace".to_string()),
+        );
+
+        let project = store
+            .projects
+            .iter()
+            .find(|project| project.threads.iter().any(|thread| thread.id == thread_id))
+            .expect("remote project");
+        let thread = project
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .expect("remote thread");
+        let expected_workspace =
+            workspace_name_for_remote_default(&project.id, &thread_id, "custom-remote-workspace");
+        assert_eq!(
+            thread.planned_workspace_name.as_deref(),
+            Some(expected_workspace.as_str())
+        );
+        assert!(thread.materialized_workspace_name.is_none());
+        assert!(!thread_has_restorable_workspace(thread));
+
+        let state = store
+            .thread_connection_state(&thread_id, &["custom-remote-workspace".to_string()])
+            .expect("remote thread state");
+        assert_eq!(state.space_id, space_id);
+        assert_eq!(state.workspace_name, expected_workspace);
+        assert!(!state.is_live);
+
+        let plan = store
+            .activate_thread_record(&thread_id, &[])
+            .expect("activation plan");
+        assert_eq!(plan.workspace_name, expected_workspace);
     }
 
     #[test]
@@ -3664,6 +4286,236 @@ mod tests {
             Some("project-1")
         );
         assert!(store.remove_project("project-1").is_none());
+    }
+
+    #[test]
+    fn end_workspace_thread_deletes_thread_when_project_has_fallback_thread() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let first = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
+        let second = WorkspaceThread::new("project-1".to_string(), "Thread 2".to_string(), None);
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        let mut project = test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![first, second],
+        );
+        project.active_thread_id = Some(second_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-1".to_string());
+
+        let result = store.end_workspace_thread_record(&second_id);
+        let EndWorkspaceThreadResult::DeletedThread(deleted) = result else {
+            panic!("expected deleted thread result");
+        };
+        assert!(deleted.was_active);
+        assert_eq!(deleted.next_thread_id, Some(first_id.clone()));
+        assert_eq!(store.projects[0].threads.len(), 1);
+        assert_eq!(
+            store.projects[0].active_thread_id.as_deref(),
+            Some(first_id.as_str())
+        );
+    }
+
+    #[test]
+    fn end_workspace_thread_removes_remote_project_when_space_has_fallback_project() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let local = WorkspaceThread::new("project-local".to_string(), "main".to_string(), None);
+        let local_id = local.id.clone();
+        let mut local_project = test_project(
+            "project-local",
+            "Home",
+            PathBuf::from("/tmp/home"),
+            vec![local],
+        );
+        local_project.active_thread_id = Some(local_id.clone());
+        store.projects.push(local_project);
+
+        let remote = WorkspaceThread::new("ssh-host".to_string(), "Session 1".to_string(), None);
+        let remote_id = remote.id.clone();
+        let mut remote_project = test_project(
+            "ssh-host",
+            "Remote",
+            PathBuf::from("ssh://root@example.com"),
+            vec![remote],
+        );
+        remote_project.active_thread_id = Some(remote_id.clone());
+        store.projects.push(remote_project);
+        store.set_active_project_for_space(&space_id, "ssh-host".to_string());
+
+        let result = store.end_workspace_thread_record(&remote_id);
+        let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
+            panic!("expected removed project result");
+        };
+        assert!(removed.was_active);
+        assert_eq!(removed.next_thread_id, Some(local_id.clone()));
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].id, "project-local");
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some("project-local")
+        );
+    }
+
+    #[test]
+    fn end_workspace_thread_seeds_default_project_before_removing_last_remote_project() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let remote = WorkspaceThread::new("ssh-host".to_string(), "Session 1".to_string(), None);
+        let remote_id = remote.id.clone();
+        let mut remote_project = test_project(
+            "ssh-host",
+            "Remote",
+            PathBuf::from("ssh://root@example.com"),
+            vec![remote],
+        );
+        remote_project.active_thread_id = Some(remote_id.clone());
+        store.projects.push(remote_project);
+        store.set_active_project_for_space(&space_id, "ssh-host".to_string());
+
+        let result = store.end_workspace_thread_record(&remote_id);
+        let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
+            panic!("expected removed project result");
+        };
+        assert!(removed.was_active);
+        let next_thread_id = removed
+            .next_thread_id
+            .clone()
+            .expect("new default thread id");
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].name, "Home");
+        assert_eq!(store.projects[0].threads.len(), 1);
+        assert_eq!(store.projects[0].threads[0].name, "main");
+        assert_eq!(store.projects[0].threads[0].id, next_thread_id);
+        assert_eq!(store.projects[0].active_thread_id, Some(next_thread_id));
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some(store.projects[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn end_workspace_thread_noops_for_last_local_thread() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let thread = WorkspaceThread::new("project-local".to_string(), "main".to_string(), None);
+        let thread_id = thread.id.clone();
+        let mut project = test_project(
+            "project-local",
+            "Home",
+            PathBuf::from("/tmp/home"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-local".to_string());
+
+        assert_eq!(
+            store.end_workspace_thread_record(&thread_id),
+            EndWorkspaceThreadResult::Noop
+        );
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].threads.len(), 1);
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some("project-local")
+        );
+    }
+
+    #[test]
+    fn disconnect_active_remote_thread_keeps_record_and_switches_to_default_project() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let remote = WorkspaceThread::new("ssh-host".to_string(), "Session 1".to_string(), None);
+        let remote_id = remote.id.clone();
+        let remote_workspace = workspace_name_for_thread("ssh-host", &remote_id);
+        let mut remote_project = test_project(
+            "ssh-host",
+            "Remote",
+            PathBuf::from("ssh://root@example.com"),
+            vec![remote],
+        );
+        remote_project.active_thread_id = Some(remote_id.clone());
+        store.projects.push(remote_project);
+        store.set_active_project_for_space(&space_id, "ssh-host".to_string());
+
+        let (disconnected, changed) =
+            store.disconnect_workspace_thread_record(&remote_id, &[remote_workspace.clone()]);
+        let disconnected = disconnected.expect("disconnected remote thread");
+        assert!(changed);
+        assert!(disconnected.was_active);
+        assert_eq!(disconnected.workspace_name, remote_workspace);
+        assert!(disconnected.next_thread_id.is_some());
+        assert!(store.projects.iter().any(|project| project.id == "ssh-host"
+            && project.threads.iter().any(|thread| thread.id == remote_id)));
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some(store.projects[1].id.as_str())
+        );
+    }
+
+    #[test]
+    fn disconnect_inactive_remote_thread_keeps_active_project() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let local = WorkspaceThread::new("project-local".to_string(), "main".to_string(), None);
+        let local_id = local.id.clone();
+        let mut local_project = test_project(
+            "project-local",
+            "Home",
+            PathBuf::from("/tmp/home"),
+            vec![local],
+        );
+        local_project.active_thread_id = Some(local_id);
+        store.projects.push(local_project);
+
+        let remote = WorkspaceThread::new("ssh-host".to_string(), "Session 1".to_string(), None);
+        let remote_id = remote.id.clone();
+        let remote_workspace = workspace_name_for_thread("ssh-host", &remote_id);
+        let mut remote_project = test_project(
+            "ssh-host",
+            "Remote",
+            PathBuf::from("ssh://root@example.com"),
+            vec![remote],
+        );
+        remote_project.active_thread_id = Some(remote_id.clone());
+        store.projects.push(remote_project);
+        store.set_active_project_for_space(&space_id, "project-local".to_string());
+
+        let (disconnected, changed) =
+            store.disconnect_workspace_thread_record(&remote_id, &[remote_workspace.clone()]);
+        let disconnected = disconnected.expect("disconnected remote thread");
+        assert!(!changed);
+        assert!(!disconnected.was_active);
+        assert_eq!(disconnected.next_thread_id, None);
+        assert_eq!(disconnected.workspace_name, remote_workspace);
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some("project-local")
+        );
+    }
+
+    #[test]
+    fn disconnect_non_live_remote_thread_noops() {
+        let mut store = test_store();
+        let remote = WorkspaceThread::new("ssh-host".to_string(), "Session 1".to_string(), None);
+        let remote_id = remote.id.clone();
+        let mut remote_project = test_project(
+            "ssh-host",
+            "Remote",
+            PathBuf::from("ssh://root@example.com"),
+            vec![remote],
+        );
+        remote_project.active_thread_id = Some(remote_id.clone());
+        store.projects.push(remote_project);
+
+        assert_eq!(
+            store.disconnect_workspace_thread_record(&remote_id, &[]),
+            (None, false)
+        );
     }
 
     #[test]

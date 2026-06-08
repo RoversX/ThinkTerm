@@ -147,62 +147,71 @@ impl crate::TermWindow {
                 .and_then(|window| window.idx_by_id(tab_id))
         });
 
-        // When a content view is the foreground, no mux tab is "active".
-        let cv_present = self.content_view.is_some();
-        let cv_active = self.content_view_active;
+        // Remote thread connection views are selected from the sidebar and must
+        // not expose the underlying mux tabs here; clicking those stale tabs
+        // would leave the remote thread UI and jump to the prior terminal.
+        let active_content_view_id = self.active_content_view_id;
+        let cv_active = self.active_content_view_shown_in_tab_bar();
+        let show_mux_tabs = !self.active_content_view_is_remote_thread();
 
         let tab_step = tab_width + WINDOW_TAB_GAP;
         let mut tab_sequence_idx = 0usize;
-        for item in self.tab_bar.items() {
-            let TabBarItem::Tab { tab_idx, active } = item.item else {
-                continue;
-            };
-            let active = active && !cv_active;
+        if show_mux_tabs {
+            for item in self.tab_bar.items() {
+                let TabBarItem::Tab { tab_idx, active } = item.item else {
+                    continue;
+                };
+                let active = active && !cv_active;
 
-            let virtual_left = tab_sequence_idx as f32 * tab_step as f32 - scroll_offset;
-            tab_sequence_idx += 1;
+                let virtual_left = tab_sequence_idx as f32 * tab_step as f32 - scroll_offset;
+                tab_sequence_idx += 1;
 
-            let tab_left = viewport_left as f32 + virtual_left;
-            let tab_right = tab_left + tab_width as f32;
-            if tab_right <= viewport_left as f32 || tab_left >= viewport_right as f32 {
-                continue;
+                let tab_left = viewport_left as f32 + virtual_left;
+                let tab_right = tab_left + tab_width as f32;
+                if tab_right <= viewport_left as f32 || tab_left >= viewport_right as f32 {
+                    continue;
+                }
+
+                let visible_left = tab_left.max(viewport_left as f32);
+                let visible_right = tab_right.min(viewport_right as f32);
+                let visible_width = (visible_right - visible_left).max(0.0);
+                if visible_width <= 1.0 {
+                    continue;
+                }
+
+                self.paint_window_tab(
+                    layers,
+                    &mut ui_items,
+                    item,
+                    tab_idx,
+                    active,
+                    inline_rename_tab_idx == Some(tab_idx),
+                    tab_left,
+                    visible_left,
+                    visible_width,
+                    viewport_left,
+                    viewport_right,
+                    content_row_y,
+                    content_row_height,
+                    tab_width,
+                    button_size,
+                    icon_size,
+                    &font,
+                    metrics,
+                    chrome,
+                    background,
+                    if active { foreground } else { muted_fg },
+                )?;
             }
-
-            let visible_left = tab_left.max(viewport_left as f32);
-            let visible_right = tab_right.min(viewport_right as f32);
-            let visible_width = (visible_right - visible_left).max(0.0);
-            if visible_width <= 1.0 {
-                continue;
-            }
-
-            self.paint_window_tab(
-                layers,
-                &mut ui_items,
-                item,
-                tab_idx,
-                active,
-                inline_rename_tab_idx == Some(tab_idx),
-                tab_left,
-                visible_left,
-                visible_width,
-                viewport_left,
-                viewport_right,
-                content_row_y,
-                content_row_height,
-                tab_width,
-                button_size,
-                icon_size,
-                &font,
-                metrics,
-                chrome,
-                background,
-                if active { foreground } else { muted_fg },
-            )?;
         }
 
-        // Synthetic content-view tab (e.g. SSH Hosts), placed after the mux tabs.
-        if cv_present {
+        // Synthetic content-view tabs (e.g. SSH Hosts), placed after the mux tabs.
+        for content_tab in &self.content_views {
+            if !self.content_view_shown_in_tab_bar(content_tab) {
+                continue;
+            }
             let virtual_left = tab_sequence_idx as f32 * tab_step as f32 - scroll_offset;
+            tab_sequence_idx += 1;
             let tab_left = viewport_left as f32 + virtual_left;
             let tab_right = tab_left + tab_width as f32;
             if tab_right > viewport_left as f32 && tab_left < viewport_right as f32 {
@@ -210,16 +219,13 @@ impl crate::TermWindow {
                 let visible_right = tab_right.min(viewport_right as f32);
                 let visible_width = (visible_right - visible_left).max(0.0);
                 if visible_width > 1.0 {
-                    let title = self
-                        .content_view
-                        .as_ref()
-                        .map(|v| v.title())
-                        .unwrap_or_default();
+                    let active = active_content_view_id == Some(content_tab.id);
                     self.paint_content_view_tab(
                         layers,
                         &mut ui_items,
-                        &title,
-                        cv_active,
+                        content_tab.id,
+                        &content_tab.view.title(),
+                        active,
                         tab_left,
                         visible_left,
                         visible_width,
@@ -234,7 +240,7 @@ impl crate::TermWindow {
                         metrics,
                         chrome,
                         background,
-                        if cv_active { foreground } else { muted_fg },
+                        if active { foreground } else { muted_fg },
                     )?;
                 }
             }
@@ -803,6 +809,7 @@ impl crate::TermWindow {
         &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_items: &mut Vec<UIItem>,
+        id: crate::termwindow::content_view::ContentViewId,
         title: &str,
         active: bool,
         tab_left: f32,
@@ -860,7 +867,7 @@ impl crate::TermWindow {
             y: row_y,
             width: visible_width.max(0.0) as usize,
             height: row_height,
-            item_type: UIItemType::TabBar(TabBarItem::ContentView),
+            item_type: UIItemType::TabBar(TabBarItem::ContentView { id }),
         });
 
         let tab_left = tab_left.max(0.0) as usize;
@@ -891,7 +898,7 @@ impl crate::TermWindow {
                 y: close_y,
                 width: button_size,
                 height: button_size,
-                item_type: UIItemType::ContentViewClose,
+                item_type: UIItemType::ContentViewClose(id),
             });
             self.paint_fancy_tab_icon(
                 layers,

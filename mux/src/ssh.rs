@@ -177,6 +177,19 @@ fn format_host_verification_for_terminal(failed: HostVerificationFailed) -> Vec<
 /// pane, we play some tricks with wrapped versions of the pty, child
 /// and the reader and writer instances so that we can inject the
 /// interactive setup.  The bulk of that is driven by `connect_ssh_session`.
+/// Coarse lifecycle of the SSH connection backing a [`RemoteSshDomain`], so the
+/// GUI can show a "Connecting…" state and detect unreachable hosts instead of
+/// staring at a blank pane. `Authenticating` means the TCP connect + handshake
+/// succeeded and we are talking to the SSH daemon (any interactive prompts now
+/// render in the real pane).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshConnectionStatus {
+    Connecting,
+    Authenticating,
+    Connected,
+    Failed(String),
+}
+
 pub struct RemoteSshDomain {
     session: Mutex<Option<Session>>,
     dom: SshDomain,
@@ -184,6 +197,8 @@ pub struct RemoteSshDomain {
     name: String,
     /// Optional stored password used to auto-answer the first password prompt.
     password: Option<String>,
+    /// Shared, updated by the connection thread so the GUI can poll progress.
+    connection_status: Arc<Mutex<SshConnectionStatus>>,
 }
 
 pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
@@ -263,7 +278,18 @@ impl RemoteSshDomain {
             session: Mutex::new(None),
             dom: dom.clone(),
             password,
+            connection_status: Arc::new(Mutex::new(SshConnectionStatus::Connecting)),
         })
+    }
+
+    /// Current connection lifecycle status; the GUI polls this while a
+    /// "Connecting…" view is shown.
+    pub fn connection_status(&self) -> SshConnectionStatus {
+        self.connection_status.lock().unwrap().clone()
+    }
+
+    fn set_connection_status(&self, status: SshConnectionStatus) {
+        *self.connection_status.lock().unwrap() = status;
     }
 
     /// Run a one-shot, read-only `cat /etc/os-release` over the already
@@ -288,6 +314,12 @@ impl RemoteSshDomain {
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
         ssh_domain_to_ssh_config(&self.dom)
+    }
+
+    fn prepare_connection_attempt(&self) -> anyhow::Result<ConfigMap> {
+        let ssh_config = self.ssh_config().context("obtain ssh config")?;
+        self.set_connection_status(SshConnectionStatus::Connecting);
+        Ok(ssh_config)
     }
 
     fn build_command(
@@ -377,9 +409,17 @@ impl RemoteSshDomain {
         size: TerminalSize,
         password: Option<String>,
     ) -> anyhow::Result<StartNewSessionResult> {
-        let (session, events) = Session::connect(self.ssh_config().context("obtain ssh config")?)
-            .context("connect to ssh server")?;
+        let (session, events) = match Session::connect(self.prepare_connection_attempt()?)
+            .context("connect to ssh server")
+        {
+            Ok(result) => result,
+            Err(err) => {
+                self.set_connection_status(SshConnectionStatus::Failed(format!("{:#}", err)));
+                return Err(err);
+            }
+        };
         self.session.lock().unwrap().replace(session.clone());
+        let status = Arc::clone(&self.connection_status);
 
         // We get to establish the session!
         //
@@ -434,6 +474,7 @@ impl RemoteSshDomain {
         // to perform the blocking (from its perspective) terminal
         // UI to carry out any authentication.
         let mut stdout_write = BufWriter::new(stdout_write);
+        let thread_status = Arc::clone(&status);
         std::thread::spawn(move || {
             if let Err(err) = connect_ssh_session(
                 session,
@@ -448,7 +489,9 @@ impl RemoteSshDomain {
                 command_line,
                 env,
                 password,
+                Arc::clone(&thread_status),
             ) {
+                *thread_status.lock().unwrap() = SshConnectionStatus::Failed(format!("{:#}", err));
                 let _ = write!(stdout_write, "{:#}", err);
                 log::error!("Failed to connect ssh: {:#}", err);
             }
@@ -479,7 +522,11 @@ fn connect_ssh_session(
     command_line: Option<String>,
     env: HashMap<String, String>,
     mut password: Option<String>,
+    status: Arc<Mutex<SshConnectionStatus>>,
 ) -> anyhow::Result<()> {
+    let set_status = |next: SshConnectionStatus| {
+        *status.lock().unwrap() = next;
+    };
     struct StdoutShim<'a> {
         size: Arc<Mutex<TerminalSize>>,
         stdout: &'a mut BufWriter<FileDescriptor>,
@@ -647,6 +694,8 @@ fn connect_ssh_session(
                 }
             }
             SessionEvent::HostVerify(verify) => {
+                // Handshake succeeded; we're now interacting with the daemon.
+                set_status(SshConnectionStatus::Authenticating);
                 shim.output_line(&verify.message)?;
                 let mut editor = LineEditor::new(&mut shim);
                 let mut host = PasswordPromptHost::default();
@@ -663,6 +712,7 @@ fn connect_ssh_session(
                 smol::block_on(verify.answer(ok)).context("send verify response")?;
             }
             SessionEvent::Authenticate(auth) => {
+                set_status(SshConnectionStatus::Authenticating);
                 if !auth.username.is_empty() {
                     shim.output_line(&format!("Authentication for {}", auth.username))?;
                 }
@@ -700,13 +750,16 @@ fn connect_ssh_session(
                 smol::block_on(auth.answer(answers))?;
             }
             SessionEvent::Error(err) => {
+                set_status(SshConnectionStatus::Failed(err.clone()));
                 shim.output_line(&format!("Error: {}", err))?;
             }
             SessionEvent::HostVerificationFailed(failed) => {
+                set_status(SshConnectionStatus::Failed(failed.to_string()));
                 let message = format_host_verification_for_terminal(failed);
                 shim.render(&message)?;
             }
             SessionEvent::Authenticated => {
+                set_status(SshConnectionStatus::Connected);
                 // Our session has been authenticated: we can now
                 // set up the real pty for the pane
                 match smol::block_on(session.request_pty(
@@ -792,6 +845,8 @@ impl Domain for RemoteSshDomain {
                     let child = Box::new(concrete_child);
                     let writer = Box::new(pty.take_writer().context("take writer from pty")?);
 
+                    // Reusing a session that was already authenticated.
+                    self.set_connection_status(SshConnectionStatus::Connected);
                     StartNewSessionResult { pty, child, writer }
                 }
                 Err(err) => {
@@ -1206,5 +1261,25 @@ impl std::io::Read for PtyReader {
                 _ => res,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_connection_attempt_resets_failed_status() {
+        let dom = SshDomain {
+            name: "test-ssh".to_string(),
+            remote_address: "example.invalid:22".to_string(),
+            ..SshDomain::default()
+        };
+        let domain = RemoteSshDomain::with_ssh_domain(&dom).unwrap();
+
+        domain.set_connection_status(SshConnectionStatus::Failed("old failure".to_string()));
+        domain.prepare_connection_attempt().unwrap();
+
+        assert_eq!(domain.connection_status(), SshConnectionStatus::Connecting);
     }
 }

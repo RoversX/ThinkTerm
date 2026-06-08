@@ -1,14 +1,17 @@
 use crate::pane::CloseReason;
 use crate::{Mux, MuxNotification, Tab, TabId};
 use config::GuiPosition;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 static WIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type WindowId = usize;
+pub type WindowUiSurfaceId = String;
 
 pub struct Window {
     id: WindowId,
     tabs: Vec<Arc<Tab>>,
+    ui_surfaces: BTreeSet<WindowUiSurfaceId>,
     active: usize,
     last_active: Option<TabId>,
     workspace: String,
@@ -21,6 +24,7 @@ impl Window {
         Self {
             id: WIN_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed),
             tabs: vec![],
+            ui_surfaces: BTreeSet::new(),
             active: 0,
             last_active: None,
             title: String::new(),
@@ -89,7 +93,19 @@ impl Window {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty()
+        self.tabs.is_empty() && self.ui_surfaces.is_empty()
+    }
+
+    pub fn ui_surface_count(&self) -> usize {
+        self.ui_surfaces.len()
+    }
+
+    pub fn add_ui_surface(&mut self, surface_id: WindowUiSurfaceId) -> bool {
+        self.ui_surfaces.insert(surface_id)
+    }
+
+    pub fn remove_ui_surface(&mut self, surface_id: &str) -> bool {
+        self.ui_surfaces.remove(surface_id)
     }
 
     pub fn len(&self) -> usize {
@@ -264,5 +280,29 @@ impl Window {
         if invalidated {
             self.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_surfaces_keep_empty_window_alive_individually() {
+        let mut window = Window::new(Some("test-workspace".to_string()), None);
+        assert!(window.is_empty());
+
+        assert!(window.add_ui_surface("remote-thread:a".to_string()));
+        assert!(window.add_ui_surface("ssh-hosts".to_string()));
+        assert!(!window.add_ui_surface("ssh-hosts".to_string()));
+        assert_eq!(window.ui_surface_count(), 2);
+        assert!(!window.is_empty());
+
+        assert!(window.remove_ui_surface("remote-thread:a"));
+        assert_eq!(window.ui_surface_count(), 1);
+        assert!(!window.is_empty());
+
+        assert!(window.remove_ui_surface("ssh-hosts"));
+        assert!(window.is_empty());
     }
 }

@@ -493,7 +493,9 @@ impl super::TermWindow {
                             self.content_view_copy();
                             return true;
                         }
-                        let resp = self.content_view.as_mut().map(|v| v.on_key(term_key, mods));
+                        let resp = self
+                            .active_content_view_mut()
+                            .map(|v| v.on_key(term_key, mods));
                         match resp {
                             Some(crate::termwindow::content_view::ContentViewResponse::Ignored)
                             | None => {}
@@ -505,7 +507,7 @@ impl super::TermWindow {
                     }
                     // IME / composed text (e.g. CJK input) arrives here.
                     Key::Composed(text) => {
-                        let resp = self.content_view.as_mut().map(|v| v.on_paste(&text));
+                        let resp = self.active_content_view_mut().map(|v| v.on_paste(&text));
                         if let Some(resp) = resp {
                             self.handle_content_response(resp);
                         }
@@ -722,7 +724,31 @@ impl super::TermWindow {
         stage.finish(pane.is_some());
         let pane = match pane {
             Some(pane) => pane,
-            None => return,
+            None => {
+                if self.content_view_foreground() && key.key_is_down {
+                    match self.win_key_code_to_termwiz_key_code(&key.key) {
+                        Key::Code(term_key) => {
+                            let mods = key.modifiers.remove_positional_mods();
+                            let resp = self
+                                .active_content_view_mut()
+                                .map(|view| view.on_key(term_key, mods));
+                            if let Some(resp) = resp {
+                                self.handle_content_response(resp);
+                            }
+                        }
+                        Key::Composed(text) => {
+                            let resp = self
+                                .active_content_view_mut()
+                                .map(|view| view.on_paste(&text));
+                            if let Some(resp) = resp {
+                                self.handle_content_response(resp);
+                            }
+                        }
+                        Key::None => {}
+                    }
+                }
+                return;
+            }
         };
 
         // First, try to match raw physical key
@@ -884,7 +910,31 @@ impl super::TermWindow {
         stage.finish(pane.is_some());
         let pane = match pane {
             Some(pane) => pane,
-            None => return,
+            None => {
+                if self.content_view_foreground() && window_key.key_is_down {
+                    match self.win_key_code_to_termwiz_key_code(&window_key.key) {
+                        Key::Code(term_key) => {
+                            let mods = window_key.modifiers.remove_positional_mods();
+                            let resp = self
+                                .active_content_view_mut()
+                                .map(|view| view.on_key(term_key, mods));
+                            if let Some(resp) = resp {
+                                self.handle_content_response(resp);
+                            }
+                        }
+                        Key::Composed(text) => {
+                            let resp = self
+                                .active_content_view_mut()
+                                .map(|view| view.on_paste(&text));
+                            if let Some(resp) = resp {
+                                self.handle_content_response(resp);
+                            }
+                        }
+                        Key::None => {}
+                    }
+                }
+                return;
+            }
         };
 
         // The leader key is a kind of modal modifier key.

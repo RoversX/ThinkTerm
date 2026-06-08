@@ -11,6 +11,8 @@ use std::sync::Arc;
 use wezterm_term::TerminalSize;
 use window::WindowOps;
 
+pub type SpawnSuccessAction = Box<dyn FnOnce(&mut crate::termwindow::TermWindow) + Send + Sync>;
+
 #[derive(Copy, Debug, Clone, Eq, PartialEq)]
 pub enum SpawnWhere {
     NewWindow,
@@ -27,16 +29,22 @@ pub fn spawn_command_impl(
     term_config: Arc<TermConfig>,
     completion_window: Option<::window::Window>,
     layout_mutation_reason: Option<&'static str>,
+    success_action: Option<SpawnSuccessAction>,
 ) {
     let spawn = spawn.clone();
 
     promise::spawn::spawn(async move {
         match spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config).await {
             Ok(()) => {
-                if let (Some(window), Some(reason)) = (completion_window, layout_mutation_reason) {
+                if let Some(window) = completion_window {
                     window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                         move |tw| {
-                            tw.persist_workspace_layout_after_mutation(reason);
+                            if let Some(action) = success_action {
+                                action(tw);
+                            }
+                            if let Some(reason) = layout_mutation_reason {
+                                tw.persist_workspace_layout_after_mutation(reason);
+                            }
                         },
                     )));
                 }

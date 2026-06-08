@@ -267,6 +267,17 @@ impl crate::TermWindow {
         }
     }
 
+    fn is_workspace_sidebar_thread_selected(
+        &self,
+        session: &workspace_threads::WorkspaceThreadView,
+    ) -> bool {
+        if let Some(thread_id) = self.workspace_sidebar_pending_thread_selection.as_deref() {
+            thread_id == session.id.as_str()
+        } else {
+            session.is_active
+        }
+    }
+
     fn sidebar_thread_dot_color(
         &self,
         session: &workspace_threads::WorkspaceThreadView,
@@ -1069,7 +1080,8 @@ impl crate::TermWindow {
                             session_row_height,
                         );
                     let is_renaming_session = self.is_renaming_sidebar_thread(&session.id);
-                    if session.is_active {
+                    let is_selected = self.is_workspace_sidebar_thread_selected(session);
+                    if is_selected {
                         self.fill_rounded_rectangle_with_border(
                             layers,
                             0,
@@ -1135,11 +1147,7 @@ impl crate::TermWindow {
                         pinned_text_x,
                         text_y,
                         text_right.saturating_sub(pinned_text_x + SIDEBAR_INSET),
-                        if session.is_active {
-                            active_fg
-                        } else {
-                            foreground
-                        },
+                        if is_selected { active_fg } else { foreground },
                     )?;
 
                     if is_hovered && !is_renaming_session {
@@ -1426,7 +1434,8 @@ impl crate::TermWindow {
                         row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
                     let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
 
-                    if row_is_visible && session.is_active {
+                    let is_selected = self.is_workspace_sidebar_thread_selected(session);
+                    if row_is_visible && is_selected {
                         self.fill_rounded_rectangle_with_border(
                             layers,
                             0,
@@ -1477,7 +1486,7 @@ impl crate::TermWindow {
                                 .saturating_sub(SIDEBAR_INSET)
                         };
                         let text_width = text_right.saturating_sub(session_text_x + SIDEBAR_INSET);
-                        if is_hovered && !session.is_active && !is_renaming_session {
+                        if is_hovered && !is_selected && !is_renaming_session {
                             self.fill_rounded_rectangle(
                                 layers,
                                 0,
@@ -1510,11 +1519,7 @@ impl crate::TermWindow {
                             session_text_x,
                             text_y,
                             text_width,
-                            if session.is_active {
-                                active_fg
-                            } else {
-                                foreground
-                            },
+                            if is_selected { active_fg } else { foreground },
                         )?;
                         if is_hovered && !is_renaming_session {
                             let pin_icon = if session.is_pinned {

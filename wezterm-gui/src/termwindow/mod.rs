@@ -18,6 +18,7 @@ use crate::tabbar::{TabBarItem, TabBarState};
 use crate::termwindow::background::{
     load_background_image, reload_background_image, LoadedBackgroundLayer,
 };
+use crate::termwindow::content_view::{ContentView, ContentViewId};
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::paint::AllowImage;
@@ -56,7 +57,7 @@ use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList};
 use std::ops::Add;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -93,6 +94,7 @@ pub mod onboarding;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
+pub mod remote_thread_view;
 pub mod render;
 pub mod resize;
 mod selection;
@@ -141,6 +143,30 @@ pub(crate) fn theme_aligned_tab_bar_colors_from_palette(palette: &ColorPalette) 
         inactive_tab_edge_hover: Some(rgba(background)),
     }
 }
+
+struct ContentViewTab {
+    id: ContentViewId,
+    key: Option<String>,
+    space_id: Option<String>,
+    view: Box<dyn ContentView>,
+}
+
+/// An in-flight SSH connection started from a `RemoteThreadView`. The view stays
+/// foreground as the "Connecting…" UI while we poll the background SSH domain;
+/// on success we adopt the materialized workspace, on failure we kill it.
+pub(crate) struct RemoteConnectState {
+    pub generation: u64,
+    pub thread_id: String,
+    pub workspace_name: String,
+    pub domain_name: String,
+    pub started: std::time::Instant,
+    /// Startup-created mux window that should be cleaned up only if the remote
+    /// workspace is successfully adopted.
+    pub orphan_candidate_window_id: Option<MuxWindowId>,
+    /// `(domain_name, host_id)` to run OS detection on once connected.
+    pub detect_os: Option<(String, String)>,
+}
+
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
@@ -260,7 +286,7 @@ pub enum UIItemType {
     BelowScrollThumb,
     Split(PositionedSplit),
     /// Close button on the synthetic content-view tab.
-    ContentViewClose,
+    ContentViewClose(ContentViewId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -765,15 +791,20 @@ pub struct TermWindow {
     context_menu: Option<ui::context_menu::ContextMenuState>,
     context_menu_suppressed_release: Option<MousePress>,
     dragging: Option<(UIItem, MouseEvent)>,
-    /// When `Some`, a content view (e.g. SSH hosts) is available as a synthetic
-    /// tab. `content_view_active` is whether it is the foreground content (vs a
-    /// terminal tab being shown).
-    content_view: Option<Box<dyn crate::termwindow::content_view::ContentView>>,
-    content_view_active: bool,
+    /// Content views (e.g. SSH hosts) shown as synthetic tabs.
+    content_views: Vec<ContentViewTab>,
+    active_content_view_id: Option<ContentViewId>,
+    content_view_response_tab_id: Option<ContentViewId>,
+    next_content_view_id: ContentViewId,
+    registered_content_view_surfaces: HashMap<ContentViewId, MuxWindowId>,
+    /// Tracks SSH connections kicked off by `RemoteThreadView`s.
+    remote_connects: HashMap<ContentViewId, RemoteConnectState>,
+    next_remote_connect_generation: u64,
     space_owner_id: u64,
     active_space_id: String,
     workspace_layout_structure_fingerprint: Option<u64>,
     workspace_sidebar_width: usize,
+    workspace_sidebar_pending_thread_selection: Option<String>,
     workspace_sidebar_collapsed: bool,
     workspace_sidebar_scroll_offset: f32,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
@@ -1269,12 +1300,18 @@ impl TermWindow {
             context_menu: None,
             context_menu_suppressed_release: None,
             dragging: None,
-            content_view: None,
-            content_view_active: false,
+            content_views: vec![],
+            active_content_view_id: None,
+            content_view_response_tab_id: None,
+            next_content_view_id: 1,
+            registered_content_view_surfaces: HashMap::new(),
+            remote_connects: HashMap::new(),
+            next_remote_connect_generation: 1,
             space_owner_id,
             active_space_id,
             workspace_layout_structure_fingerprint,
             workspace_sidebar_width,
+            workspace_sidebar_pending_thread_selection: None,
             workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
             workspace_sidebar_scrollbar_visible_until: None,
@@ -1957,6 +1994,7 @@ impl TermWindow {
             front_end().rebind_known_window(window, mux_window_id);
         }
 
+        self.sync_content_view_surfaces_with_mux();
         self.clear_all_overlays();
         self.current_highlight.take();
         self.apply_workspace_thread_font_scales();
@@ -2244,11 +2282,14 @@ impl TermWindow {
             return;
         }
         self.snapshot_active_workspace_thread_layout();
+        self.workspace_sidebar_pending_thread_selection = None;
         if !crate::workspace_threads::switch_window_space(self.space_owner_id, &space_id) {
             window.invalidate();
             return;
         }
+        self.set_content_view_active(false);
         self.active_space_id = space_id.clone();
+        self.sync_content_view_surfaces_with_mux();
         self.workspace_sidebar_scroll_offset = 0.0;
         if let Some(thread_id) = crate::workspace_threads::ensure_active_thread_for_space(&space_id)
         {
@@ -2264,6 +2305,7 @@ impl TermWindow {
                 let deleted_active_space = self.active_space_id == space_id;
                 if deleted_active_space {
                     self.active_space_id = deleted.fallback_space_id.clone();
+                    self.sync_content_view_surfaces_with_mux();
                     self.workspace_sidebar_scroll_offset = 0.0;
                     if let Some(window) = window {
                         if let Some(thread_id) =
@@ -2573,30 +2615,234 @@ impl TermWindow {
     /// True when a content view is the foreground content (occupying the
     /// content area instead of terminal panes).
     pub(crate) fn content_view_foreground(&self) -> bool {
-        self.content_view.is_some() && self.content_view_active
+        self.active_content_view_index().is_some()
     }
 
-    pub(crate) fn open_content_view(
-        &mut self,
-        view: Box<dyn crate::termwindow::content_view::ContentView>,
-    ) {
-        self.content_view = Some(view);
-        self.content_view_active = true;
+    fn content_view_visible_in_active_space(&self, tab: &ContentViewTab) -> bool {
+        match tab.space_id.as_deref() {
+            Some(space_id) => space_id == self.active_space_id,
+            None => true,
+        }
+    }
+
+    fn content_view_shown_in_tab_bar(&self, tab: &ContentViewTab) -> bool {
+        self.content_view_visible_in_active_space(tab) && tab.view.show_in_tab_bar()
+    }
+
+    fn active_content_view_shown_in_tab_bar(&self) -> bool {
+        self.active_content_view_id.is_some_and(|active_id| {
+            self.content_views
+                .iter()
+                .any(|tab| tab.id == active_id && self.content_view_shown_in_tab_bar(tab))
+        })
+    }
+
+    fn content_view_surface_id(id: ContentViewId) -> String {
+        format!("thinkterm-content-view:{id}")
+    }
+
+    fn sync_content_view_surfaces_with_mux(&mut self) {
+        let mux = Mux::get();
+        let mux_window_id = self.mux_window_id;
+        let foreground_ids = self
+            .active_content_view_id
+            .filter(|active_id| {
+                self.content_views.iter().any(|tab| {
+                    tab.id == *active_id && self.content_view_visible_in_active_space(tab)
+                })
+            })
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        let registered = self
+            .registered_content_view_surfaces
+            .iter()
+            .map(|(id, window_id)| (*id, *window_id))
+            .collect::<Vec<_>>();
+        for (id, window_id) in registered {
+            if window_id != mux_window_id || !foreground_ids.contains(&id) {
+                mux.unregister_window_ui_surface(window_id, &Self::content_view_surface_id(id));
+                self.registered_content_view_surfaces.remove(&id);
+            }
+        }
+
+        for id in foreground_ids {
+            if self.registered_content_view_surfaces.get(&id).copied() == Some(mux_window_id) {
+                continue;
+            }
+
+            if mux.register_window_ui_surface(mux_window_id, Self::content_view_surface_id(id)) {
+                self.registered_content_view_surfaces
+                    .insert(id, mux_window_id);
+            }
+        }
+    }
+
+    fn active_content_view_index(&self) -> Option<usize> {
+        let active_id = self.active_content_view_id?;
+        self.content_views
+            .iter()
+            .position(|tab| tab.id == active_id && self.content_view_visible_in_active_space(tab))
+    }
+
+    pub(crate) fn active_content_view(&self) -> Option<&dyn ContentView> {
+        self.active_content_view_index()
+            .map(|idx| self.content_views[idx].view.as_ref())
+    }
+
+    pub(crate) fn active_content_view_mut(&mut self) -> Option<&mut dyn ContentView> {
+        let idx = self.active_content_view_index()?;
+        Some(self.content_views[idx].view.as_mut())
+    }
+
+    fn content_view_mut_by_id(&mut self, id: ContentViewId) -> Option<&mut dyn ContentView> {
+        let idx = self.content_views.iter().position(|tab| tab.id == id)?;
+        Some(self.content_views[idx].view.as_mut())
+    }
+
+    fn content_view_id_for_key(&self, key: &str) -> Option<ContentViewId> {
+        self.content_views
+            .iter()
+            .find(|tab| {
+                tab.key.as_deref() == Some(key) && self.content_view_visible_in_active_space(tab)
+            })
+            .map(|tab| tab.id)
+    }
+
+    fn active_content_view_key_is(&self, key: &str) -> bool {
+        self.active_content_view_id
+            .and_then(|id| self.content_views.iter().find(|tab| tab.id == id))
+            .and_then(|tab| tab.key.as_deref())
+            == Some(key)
+    }
+
+    pub(crate) fn active_content_view_is_remote_thread(&self) -> bool {
+        self.active_content_view()
+            .and_then(|view| view.tab_key())
+            .is_some_and(|key| {
+                key.starts_with(
+                    crate::termwindow::remote_thread_view::REMOTE_THREAD_CONTENT_VIEW_KEY_PREFIX,
+                )
+            })
+    }
+
+    pub(crate) fn content_view_count(&self) -> usize {
+        self.content_views
+            .iter()
+            .filter(|tab| self.content_view_shown_in_tab_bar(tab))
+            .count()
+    }
+
+    fn content_view_pending_thread_selection(&self, id: ContentViewId) -> Option<String> {
+        self.content_views
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.key.as_deref())
+            .and_then(|key| {
+                key.strip_prefix(
+                    crate::termwindow::remote_thread_view::REMOTE_THREAD_CONTENT_VIEW_KEY_PREFIX,
+                )
+            })
+            .map(ToString::to_string)
+    }
+
+    fn sync_workspace_sidebar_pending_thread_selection(&mut self) {
+        self.workspace_sidebar_pending_thread_selection = self
+            .active_content_view_id
+            .and_then(|id| self.content_view_pending_thread_selection(id));
+    }
+
+    fn set_active_content_view_id(&mut self, id: Option<ContentViewId>) {
+        let was_foreground = self.content_view_foreground();
+        self.active_content_view_id = id.filter(|id| {
+            self.content_views
+                .iter()
+                .any(|tab| tab.id == *id && self.content_view_visible_in_active_space(tab))
+        });
+        self.sync_content_view_surfaces_with_mux();
+        self.sync_workspace_sidebar_pending_thread_selection();
+        if was_foreground && !self.content_view_foreground() {
+            self.resize_mux_tabs_to_current_terminal_size();
+        }
         self.invalidate_window();
+    }
+
+    fn reactivate_content_view_by_id(&mut self, id: ContentViewId) {
+        let response = self
+            .content_view_mut_by_id(id)
+            .map(|view| view.on_reactivated())
+            .unwrap_or(crate::termwindow::content_view::ContentViewResponse::Ignored);
+        self.handle_content_response_for(id, response);
+    }
+
+    pub(crate) fn open_content_view(&mut self, view: Box<dyn ContentView>) -> ContentViewId {
+        let key = view.tab_key();
+        let space_id = view.space_id().map(ToString::to_string);
+        if let Some(existing_id) = key
+            .as_deref()
+            .and_then(|key| self.content_view_id_for_key(key))
+        {
+            self.set_active_content_view_id(Some(existing_id));
+            // A reactivation response may close the tab; callers only use this
+            // as an activation request and do not rely on the returned id
+            // remaining open.
+            self.reactivate_content_view_by_id(existing_id);
+            return existing_id;
+        }
+
+        let id = self.next_content_view_id;
+        self.next_content_view_id = self.next_content_view_id.saturating_add(1).max(1);
+        self.content_views.push(ContentViewTab {
+            id,
+            key,
+            space_id,
+            view,
+        });
+        self.set_active_content_view_id(Some(id));
+        id
     }
 
     pub(crate) fn close_content_view(&mut self) {
-        self.content_view = None;
-        self.content_view_active = false;
+        if let Some(id) = self
+            .content_view_response_tab_id
+            .or(self.active_content_view_id)
+        {
+            self.close_content_view_by_id(id);
+        }
+    }
+
+    pub(crate) fn close_content_view_by_id(&mut self, id: ContentViewId) {
+        let was_foreground = self.active_content_view_id == Some(id);
+        let Some(idx) = self.content_views.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        self.content_views.remove(idx);
+
+        if was_foreground {
+            self.active_content_view_id = self
+                .content_views
+                .iter()
+                .take(idx)
+                .rev()
+                .chain(self.content_views.iter().skip(idx))
+                .find(|tab| self.content_view_visible_in_active_space(tab))
+                .map(|tab| tab.id);
+        }
+        self.sync_content_view_surfaces_with_mux();
+        self.sync_workspace_sidebar_pending_thread_selection();
+
+        if was_foreground && !self.content_view_foreground() {
+            self.resize_mux_tabs_to_current_terminal_size();
+        }
         self.invalidate_window();
     }
 
-    pub(crate) fn request_close_content_view(&mut self) {
-        let response = match self.content_view.as_mut() {
-            Some(view) => view.on_close_requested(),
-            None => crate::termwindow::content_view::ContentViewResponse::Ignored,
-        };
-        self.handle_content_response(response);
+    pub(crate) fn request_close_content_view_by_id(&mut self, id: ContentViewId) {
+        let response = self
+            .content_view_mut_by_id(id)
+            .map(|view| view.on_close_requested())
+            .unwrap_or(crate::termwindow::content_view::ContentViewResponse::Ignored);
+        self.handle_content_response_for(id, response);
     }
 
     pub(crate) fn show_onboarding(&mut self) {
@@ -2617,6 +2863,9 @@ impl TermWindow {
     }
 
     pub(crate) fn pick_content_view_folder(&mut self) {
+        let Some(view_id) = self.active_content_view_id else {
+            return;
+        };
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
@@ -2625,27 +2874,55 @@ impl TermWindow {
             if let Some(path) = path {
                 notify_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                     let response = term_window
-                        .content_view
-                        .as_mut()
+                        .content_view_mut_by_id(view_id)
                         .map(|view| view.on_folder_picked(path))
                         .unwrap_or(crate::termwindow::content_view::ContentViewResponse::Ignored);
-                    term_window.handle_content_response(response);
+                    term_window.handle_content_response_for(view_id, response);
                 })));
             }
         }));
     }
 
     pub(crate) fn set_content_view_active(&mut self, active: bool) {
-        if self.content_view.is_some() {
-            self.content_view_active = active;
-            self.invalidate_window();
+        if active {
+            let id = self
+                .active_content_view_id
+                .filter(|id| {
+                    self.content_views
+                        .iter()
+                        .any(|tab| tab.id == *id && self.content_view_visible_in_active_space(tab))
+                })
+                .or_else(|| {
+                    self.content_views
+                        .iter()
+                        .rev()
+                        .find(|tab| self.content_view_visible_in_active_space(tab))
+                        .map(|tab| tab.id)
+                });
+            self.set_active_content_view_id(id);
+        } else {
+            self.set_active_content_view_id(None);
+        }
+    }
+
+    pub(crate) fn activate_content_view(&mut self, id: ContentViewId) {
+        if self
+            .content_views
+            .iter()
+            .any(|tab| tab.id == id && self.content_view_visible_in_active_space(tab))
+        {
+            self.set_active_content_view_id(Some(id));
+            self.reactivate_content_view_by_id(id);
         }
     }
 
     /// Toggle the SSH hosts content view (sidebar button / OpenSshHosts).
     pub(crate) fn toggle_ssh_hosts_view(&mut self) {
-        if self.content_view.is_some() {
+        let key = crate::termwindow::ssh_hosts_view::SSH_HOSTS_CONTENT_VIEW_KEY;
+        if self.active_content_view_key_is(key) {
             self.close_content_view();
+        } else if let Some(id) = self.content_view_id_for_key(key) {
+            self.activate_content_view(id);
         } else {
             self.open_content_view(Box::new(
                 crate::termwindow::ssh_hosts_view::SshHostsView::new(),
@@ -2661,7 +2938,7 @@ impl TermWindow {
 
     /// Copy the active content view's focused text to the clipboard (⌘C).
     pub(crate) fn content_view_copy(&mut self) {
-        if let Some(text) = self.content_view.as_ref().and_then(|v| v.copy_text()) {
+        if let Some(text) = self.active_content_view().and_then(|v| v.copy_text()) {
             if !text.is_empty() {
                 self.copy_to_clipboard(
                     config::keyassignment::ClipboardCopyDestination::Clipboard,
@@ -2673,7 +2950,7 @@ impl TermWindow {
 
     /// Cut the active content view's selected text to the clipboard (⌘X).
     pub(crate) fn content_view_cut(&mut self) {
-        if let Some(text) = self.content_view.as_mut().and_then(|v| v.cut_text()) {
+        if let Some(text) = self.active_content_view_mut().and_then(|v| v.cut_text()) {
             if !text.is_empty() {
                 self.copy_to_clipboard(
                     config::keyassignment::ClipboardCopyDestination::Clipboard,
@@ -2685,6 +2962,9 @@ impl TermWindow {
     }
 
     fn content_view_paste_from(&mut self, clipboard: ClipboardPasteSource) {
+        let Some(view_id) = self.active_content_view_id else {
+            return;
+        };
         let Some(window) = self.window.as_ref().map(|w| w.clone()) else {
             return;
         };
@@ -2696,9 +2976,11 @@ impl TermWindow {
         promise::spawn::spawn(async move {
             if let Ok(clip) = future.await {
                 window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
-                    let resp = myself.content_view.as_mut().map(|v| v.on_paste(&clip));
+                    let resp = myself
+                        .content_view_mut_by_id(view_id)
+                        .map(|v| v.on_paste(&clip));
                     if let Some(resp) = resp {
-                        myself.handle_content_response(resp);
+                        myself.handle_content_response_for(view_id, resp);
                     }
                 })));
             }
@@ -2717,16 +2999,29 @@ impl TermWindow {
         &mut self,
         response: crate::termwindow::content_view::ContentViewResponse,
     ) {
+        let Some(id) = self.active_content_view_id else {
+            return;
+        };
+        self.handle_content_response_for(id, response);
+    }
+
+    pub(crate) fn handle_content_response_for(
+        &mut self,
+        id: ContentViewId,
+        response: crate::termwindow::content_view::ContentViewResponse,
+    ) {
         use crate::termwindow::content_view::ContentViewResponse;
         match response {
             ContentViewResponse::Ignored => return,
             ContentViewResponse::Redraw => {}
             ContentViewResponse::Close => {
-                self.content_view = None;
-                self.content_view_active = false;
+                self.close_content_view_by_id(id);
+                return;
             }
             ContentViewResponse::Run(func) => {
+                let previous_response_tab_id = self.content_view_response_tab_id.replace(id);
                 func(self);
+                self.content_view_response_tab_id = previous_response_tab_id;
             }
         }
         self.invalidate_window();
@@ -3709,7 +4004,7 @@ impl TermWindow {
         if self.content_view_foreground() {
             match assignment {
                 CopyTo(destination) => {
-                    if let Some(text) = self.content_view.as_ref().and_then(|v| v.copy_text()) {
+                    if let Some(text) = self.active_content_view().and_then(|v| v.copy_text()) {
                         if !text.is_empty() {
                             self.copy_to_clipboard(*destination, text);
                         }
@@ -3940,9 +4235,8 @@ impl TermWindow {
                 }
             }
             CreateWorkspaceThread(project_id) => {
-                let thread_id = crate::workspace_threads::create_thread(project_id, None);
                 if let Some(window) = window.as_ref() {
-                    self.activate_workspace_thread(thread_id, window);
+                    self.create_workspace_thread(project_id, window);
                 }
             }
             ToggleWorkspaceThreadsCollapsed(project_id) => {
@@ -3971,6 +4265,17 @@ impl TermWindow {
                     }
                 }
             }
+            ConnectWorkspaceThread(thread_id) => {
+                if let Some(window) = window.as_ref() {
+                    self.connect_remote_thread(thread_id.clone(), window);
+                }
+            }
+            DisconnectWorkspaceThread(thread_id) => {
+                self.disconnect_workspace_thread(
+                    thread_id,
+                    window.as_ref().map(|w| w as &dyn WindowOps),
+                );
+            }
             ToggleWorkspaceThreadPinned(thread_id) => {
                 crate::workspace_threads::toggle_thread_pinned(thread_id);
                 if let Some(window) = window.as_ref() {
@@ -3978,23 +4283,7 @@ impl TermWindow {
                 }
             }
             DeleteWorkspaceThread(thread_id) => {
-                if let Some(deleted) = crate::workspace_threads::delete_thread(thread_id) {
-                    if deleted.was_active {
-                        if let (Some(next_thread_id), Some(window)) =
-                            (deleted.next_thread_id, window.as_ref())
-                        {
-                            self.activate_workspace_thread(next_thread_id, window);
-                        }
-                    } else if let Some(workspace) = deleted.materialized_workspace_name {
-                        let mux = Mux::get();
-                        for window_id in mux.iter_windows_in_workspace(&workspace) {
-                            mux.kill_window(window_id);
-                        }
-                    }
-                    if let Some(window) = window.as_ref() {
-                        window.invalidate();
-                    }
-                }
+                self.end_workspace_thread(thread_id, window.as_ref().map(|w| w as &dyn WindowOps));
             }
             MarkWorkspaceThreadUnread(thread_id) => {
                 crate::workspace_threads::mark_thread_unread(thread_id);

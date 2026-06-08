@@ -229,12 +229,11 @@ impl crate::TermWindow {
             (dimensions.pixel_height as f32 - top - border.bottom.get() as f32 - bottom_tab_h)
                 .max(0.0);
         let area = euclid::rect(left, top, width, height);
+        let active_content_view_idx = self.active_content_view_index();
 
         // Cursor blink: only animate when the view wants it (focused input).
-        let wants_blink = self
-            .content_view
-            .as_ref()
-            .map(|v| v.wants_cursor_blink())
+        let wants_blink = active_content_view_idx
+            .map(|idx| self.content_views[idx].view.wants_cursor_blink())
             .unwrap_or(false);
         let blink_ms = (self.config.cursor_blink_rate as u64).max(100);
         let cursor_on = if wants_blink {
@@ -252,7 +251,8 @@ impl crate::TermWindow {
 
         let gl_state = self.render_state.as_ref().unwrap();
         let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
-        let next_frame = if let Some(view) = self.content_view.as_mut() {
+        let next_frame = if let Some(idx) = active_content_view_idx {
+            let view = self.content_views[idx].view.as_mut();
             view.paint(
                 &ctx,
                 layers,

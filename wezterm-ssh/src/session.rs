@@ -40,6 +40,15 @@ impl SessionSender {
         Ok(())
     }
 
+    pub(crate) fn try_send_request(
+        &self,
+        event: SessionRequest,
+    ) -> Result<(), smol::channel::TrySendError<SessionRequest>> {
+        self.tx.try_send(event)?;
+        self.post_send();
+        Ok(())
+    }
+
     pub async fn send(&self, event: SessionRequest) -> anyhow::Result<()> {
         self.tx.send(event).await?;
         self.post_send();

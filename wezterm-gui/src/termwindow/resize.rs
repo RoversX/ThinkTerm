@@ -313,6 +313,10 @@ impl super::TermWindow {
     }
 
     pub fn sync_pane_font_sizes(&self) {
+        if self.content_view_foreground() {
+            return;
+        }
+
         for pos in self.get_panes_to_render() {
             if let Err(err) = self.sync_positioned_pane_font_size(&pos) {
                 log::error!(
@@ -322,6 +326,17 @@ impl super::TermWindow {
                 );
             }
         }
+    }
+
+    pub(crate) fn resize_mux_tabs_to_current_terminal_size(&mut self) {
+        let mux = Mux::get();
+        if let Some(window) = mux.get_window(self.mux_window_id) {
+            for tab in window.iter() {
+                tab.resize(self.terminal_size);
+            }
+        }
+        self.reapply_collapsed_panes_for_window();
+        self.sync_pane_font_sizes();
     }
 
     pub fn resize(
@@ -490,14 +505,11 @@ impl super::TermWindow {
         let terminal_size_changed = self.terminal_size != size;
         self.terminal_size = size;
         if terminal_size_changed {
-            let mux = Mux::get();
-            if let Some(window) = mux.get_window(self.mux_window_id) {
-                for tab in window.iter() {
-                    tab.resize(size);
-                }
+            if self.content_view_foreground() {
+                log::trace!("content view foreground; deferring mux tab resize");
+            } else {
+                self.resize_mux_tabs_to_current_terminal_size();
             }
-            self.reapply_collapsed_panes_for_window();
-            self.sync_pane_font_sizes();
         } else {
             log::trace!("terminal size unchanged; skipping mux tab resize");
         }

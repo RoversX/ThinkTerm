@@ -4,7 +4,28 @@ use config::TermConfig;
 use std::sync::Arc;
 
 impl super::TermWindow {
-    pub fn spawn_command(&self, spawn: &SpawnCommand, spawn_where: SpawnWhere) {
+    pub fn spawn_command(&mut self, spawn: &SpawnCommand, spawn_where: SpawnWhere) {
+        if matches!(spawn_where, SpawnWhere::NewTab | SpawnWhere::NewTabAt(_))
+            && self.active_content_view_is_remote_thread()
+        {
+            return;
+        }
+
+        if matches!(spawn_where, SpawnWhere::NewTab | SpawnWhere::NewTabAt(_))
+            && spawn.domain == SpawnTabDomain::CurrentPaneDomain
+        {
+            if let Some(pane_id) = self.get_active_pane_or_overlay().map(|pane| pane.pane_id()) {
+                if self.redirect_failed_remote_tab_spawn_to_thread_view(pane_id) {
+                    return;
+                }
+            }
+        }
+
+        let deactivate_content_view_after_spawn = matches!(
+            spawn_where,
+            SpawnWhere::NewTab | SpawnWhere::NewTabAt(_) | SpawnWhere::SplitPane(_)
+        ) && self.content_view_foreground();
+
         let size = if spawn_where == SpawnWhere::NewWindow {
             self.config.initial_size(
                 self.dimensions.dpi as u32,
@@ -28,6 +49,11 @@ impl super::TermWindow {
             term_config,
             self.window.clone(),
             layout_mutation_reason,
+            deactivate_content_view_after_spawn.then(|| {
+                Box::new(|term_window: &mut crate::termwindow::TermWindow| {
+                    term_window.set_content_view_active(false);
+                }) as crate::spawn::SpawnSuccessAction
+            }),
         )
     }
 

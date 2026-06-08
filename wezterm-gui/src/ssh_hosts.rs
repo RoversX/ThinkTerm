@@ -318,15 +318,6 @@ pub fn ssh_domain_name(spec: &SshHostSpec) -> String {
     format!("ssh:{}", endpoint(spec))
 }
 
-/// Default workspace a connection lands in: `ssh:<endpoint>`, unless the host
-/// overrides it.
-pub fn default_workspace_name(spec: &SshHostSpec) -> String {
-    spec.default_workspace
-        .clone()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| format!("ssh:{}", endpoint(spec)))
-}
-
 /// Translate a stored host spec into a `config::SshDomain`.
 pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
     let mut ssh_option = HashMap::new();
@@ -338,6 +329,11 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
             ssh_option.insert("identityfile".to_string(), identity.clone());
         }
     }
+    // Default connect timeout so an unreachable host fails fast instead of
+    // hanging on the OS default TCP timeout. Users can override via ssh_options.
+    ssh_option
+        .entry("connecttimeout".to_string())
+        .or_insert_with(|| "10".to_string());
 
     let remote_address = match spec.port {
         Some(port) => format!("{}:{port}", spec.host),
@@ -582,5 +578,44 @@ Host prod *.internal
             .as_deref()
             .unwrap()
             .ends_with("/.ssh/prod"));
+    }
+
+    fn spec_with_options(ssh_options: HashMap<String, String>) -> SshHostSpec {
+        SshHostSpec {
+            label: "t".to_string(),
+            host: "example.com".to_string(),
+            port: None,
+            username: None,
+            identity_file: None,
+            password: None,
+            ssh_options,
+            multiplexing: false,
+            default_workspace: None,
+            detect_os: false,
+            detected_distro: None,
+        }
+    }
+
+    #[test]
+    fn build_ssh_domain_injects_default_connect_timeout() {
+        let dom = build_ssh_domain(&spec_with_options(HashMap::new()));
+        assert_eq!(
+            dom.ssh_option.get("connecttimeout").map(String::as_str),
+            Some("10"),
+            "an unreachable host should fail fast via a default connect timeout"
+        );
+    }
+
+    #[test]
+    fn build_ssh_domain_preserves_user_connect_timeout() {
+        let mut options = HashMap::new();
+        // User-provided key with mixed case; build_ssh_domain lowercases it.
+        options.insert("ConnectTimeout".to_string(), "3".to_string());
+        let dom = build_ssh_domain(&spec_with_options(options));
+        assert_eq!(
+            dom.ssh_option.get("connecttimeout").map(String::as_str),
+            Some("3"),
+            "an explicit connecttimeout override must win over the default"
+        );
     }
 }

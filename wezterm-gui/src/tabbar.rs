@@ -1,3 +1,4 @@
+use crate::termwindow::content_view::ContentViewId;
 use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::terminal_title_for_display;
 use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
@@ -34,7 +35,9 @@ pub enum TabBarItem {
     NewTabButton,
     WindowButton(IntegratedTitleButton),
     /// Synthetic tab for a ThinkTerm content view (e.g. SSH hosts).
-    ContentView,
+    ContentView {
+        id: ContentViewId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

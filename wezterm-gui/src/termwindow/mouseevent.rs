@@ -1,5 +1,6 @@
 use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
+use crate::termwindow::content_view::ContentViewId;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::tokens::{
@@ -21,7 +22,7 @@ use config::keyassignment::{
 };
 use config::{MouseEventAltScreen, TermConfig};
 use mux::pane::{Pane, WithPaneLines};
-use mux::ssh::RemoteSshDomain;
+use mux::ssh::{RemoteSshDomain, SshConnectionStatus};
 use mux::tab::{PositionedPane, SplitDirection};
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
@@ -39,6 +40,10 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
+/// Overall ceiling on the "Connecting…" phase, as a backstop for the case where
+/// the TCP connect succeeds but the SSH banner/handshake then stalls (the
+/// per-connect `connecttimeout` only bounds the TCP connect itself).
+const REMOTE_CONNECT_OVERALL_TIMEOUT_SECS: u64 = 20;
 
 impl super::TermWindow {
     pub(crate) fn collapsed_pane_min_cells(&self) -> usize {
@@ -181,7 +186,12 @@ impl super::TermWindow {
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return 0.0;
         };
-        let tab_count = window.len();
+        let window_tab_count = if self.active_content_view_is_remote_thread() {
+            0
+        } else {
+            window.len()
+        };
+        let tab_count = window_tab_count + self.content_view_count();
         if tab_count <= 1 {
             return 0.0;
         }
@@ -628,7 +638,7 @@ impl super::TermWindow {
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::Split(_)
-            | UIItemType::ContentViewClose => {}
+            | UIItemType::ContentViewClose(_) => {}
         }
     }
 
@@ -677,7 +687,7 @@ impl super::TermWindow {
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::Split(_)
-            | UIItemType::ContentViewClose => {}
+            | UIItemType::ContentViewClose(_) => {}
         }
     }
 
@@ -745,10 +755,7 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
-        let pane = match self.get_active_pane_or_overlay() {
-            Some(pane) => pane,
-            None => return,
-        };
+        let pane = self.get_active_pane_or_overlay();
 
         self.current_mouse_event.replace(event.clone());
 
@@ -756,8 +763,25 @@ impl super::TermWindow {
             return;
         }
 
-        if self.mouse_event_context_menu(&event, &pane, context) {
-            return;
+        if let Some(pane) = pane.as_ref() {
+            if self.mouse_event_context_menu(&event, pane, context) {
+                return;
+            }
+        } else if matches!(
+            self.current_mouse_capture,
+            Some(MouseCapture::TerminalPane(_))
+        ) {
+            self.current_mouse_capture = None;
+        }
+
+        if pane.is_none()
+            && matches!(
+                self.current_mouse_capture,
+                None | Some(MouseCapture::TerminalPane(_))
+            )
+            && !self.content_view_foreground()
+        {
+            self.current_mouse_capture = None;
         }
 
         if self.mouse_wheel_right_sidebar(&event, context) {
@@ -796,7 +820,8 @@ impl super::TermWindow {
             .sub((padding_left + border.left.get() as f32) as isize)
             .max(0) as f32)
             / self.render_metrics.cell_size.width as f32;
-        let x = if !pane.is_mouse_grabbed() {
+        let pane_mouse_grabbed = pane.as_ref().is_some_and(|pane| pane.is_mouse_grabbed());
+        let x = if !pane_mouse_grabbed {
             // Round the x coordinate so that we're a bit more forgiving of
             // the horizontal position when selecting cells
             x.round()
@@ -947,15 +972,18 @@ impl super::TermWindow {
             if capture_mouse {
                 self.current_mouse_capture = Some(MouseCapture::UI);
             }
-            self.mouse_event_ui_item(item, pane, y, event, context);
+            if let Some(pane) = pane.clone() {
+                self.mouse_event_ui_item(item, pane, y, event, context);
+            } else {
+                self.mouse_event_ui_item_without_pane(item, event, context);
+            }
         } else if self.content_view_foreground() {
             // The content view owns the content area; route by pixel coords.
             context.set_cursor(Some(MouseCursor::Arrow));
             let px = event.coords.x as f32;
             let py = event.coords.y as f32;
             let resp = self
-                .content_view
-                .as_mut()
+                .active_content_view_mut()
                 .map(|v| v.on_mouse(px, py, event.kind));
             if let Some(resp) = resp {
                 self.handle_content_response(resp);
@@ -964,6 +992,14 @@ impl super::TermWindow {
             self.current_mouse_capture,
             None | Some(MouseCapture::TerminalPane(_))
         ) {
+            let Some(pane) = pane else {
+                context.set_cursor(Some(MouseCursor::Arrow));
+                context.invalidate();
+                if prior_ui_item != ui_item {
+                    self.update_title_post_status();
+                }
+                return;
+            };
             if event.kind == WMEK::Press(MousePress::Left) && self.right_sidebar_has_text_focus() {
                 self.right_sidebar_snippet_focus = None;
                 context.invalidate();
@@ -1230,6 +1266,16 @@ impl super::TermWindow {
     ) {
         self.last_ui_item.replace(item.clone());
         match item.item_type {
+            UIItemType::TabBar(TabBarItem::NewTabButton { .. })
+                if self.active_content_view_is_remote_thread() =>
+            {
+                self.mouse_event_disabled_new_tab_button(context);
+            }
+            UIItemType::TabBar(TabBarItem::NewTabButton { .. })
+                if self.content_view_foreground() =>
+            {
+                self.mouse_event_local_new_tab_button(event, context);
+            }
             UIItemType::TabBar(item) => {
                 self.mouse_event_tab_bar(item, event, context);
             }
@@ -1340,10 +1386,10 @@ impl super::TermWindow {
                     self.toggle_ssh_hosts_view();
                 }
             }
-            UIItemType::ContentViewClose => {
+            UIItemType::ContentViewClose(id) => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
-                    self.request_close_content_view();
+                    self.request_close_content_view_by_id(id);
                 }
             }
             UIItemType::WorkspaceSidebarViewOptions => {
@@ -1357,6 +1403,141 @@ impl super::TermWindow {
             }
             UIItemType::ContextMenuItem(_) => {
                 context.set_cursor(Some(MouseCursor::Hand));
+            }
+        }
+    }
+
+    fn mouse_event_ui_item_without_pane(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        self.last_ui_item.replace(item.clone());
+        match item.item_type {
+            UIItemType::TabBar(TabBarItem::NewTabButton { .. })
+                if self.active_content_view_is_remote_thread() =>
+            {
+                self.mouse_event_disabled_new_tab_button(context);
+            }
+            UIItemType::TabBar(TabBarItem::NewTabButton { .. }) => {
+                self.mouse_event_local_new_tab_button(event, context);
+            }
+            UIItemType::TabBar(item) => {
+                self.mouse_event_tab_bar(item, event, context);
+            }
+            UIItemType::CloseTab(idx) => {
+                self.mouse_event_close_tab(idx, event, context);
+            }
+            UIItemType::ProjectNew => {
+                self.mouse_event_project_new(event, context);
+            }
+            UIItemType::SpaceMenu => {
+                self.mouse_event_space_menu(item, event, context);
+            }
+            UIItemType::ProjectToggleThreads(project_id) => {
+                self.mouse_event_project_toggle_threads(project_id, event, context);
+            }
+            UIItemType::Project(project_id) => {
+                self.mouse_event_project(project_id, event, context);
+            }
+            UIItemType::WorkspaceThread(thread_id) => {
+                self.mouse_event_workspace_thread(thread_id, event, context);
+            }
+            UIItemType::WorkspaceThreadPin(thread_id) => {
+                self.mouse_event_workspace_thread_pin(thread_id, event, context);
+            }
+            UIItemType::WorkspaceThreadDelete(thread_id) => {
+                self.mouse_event_workspace_thread_delete(thread_id, event, context);
+            }
+            UIItemType::WorkspaceThreadNew(project_id) => {
+                self.mouse_event_workspace_thread_new(project_id, event, context);
+            }
+            UIItemType::WorkspaceSidebarToggle => {
+                self.mouse_event_workspace_sidebar_toggle(event, context);
+            }
+            UIItemType::WorkspaceSidebarHeaderBlank => {
+                self.mouse_event_workspace_sidebar_header_blank(event, context);
+            }
+            UIItemType::WorkspaceSidebarBackground => {
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
+            UIItemType::WorkspaceSidebarScrollTrack => {
+                self.mouse_event_workspace_sidebar_scroll_track(item, event, context);
+            }
+            UIItemType::WorkspaceSidebarScrollThumb => {
+                self.mouse_event_workspace_sidebar_scroll_thumb(item, event, context);
+            }
+            UIItemType::WorkspaceSidebarResize => {
+                self.mouse_event_workspace_sidebar_resize(item, event, context);
+            }
+            UIItemType::WorkspaceSidebarSettings => {
+                self.mouse_event_workspace_sidebar_settings(event, context);
+            }
+            UIItemType::WorkspaceSidebarSshHosts => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_ssh_hosts_view();
+                }
+            }
+            UIItemType::WorkspaceSidebarViewOptions => {
+                self.mouse_event_workspace_sidebar_view_options(item, event, context);
+            }
+            UIItemType::WorkspaceSidebarNotifications => {
+                context.set_cursor(Some(MouseCursor::Hand));
+            }
+            UIItemType::RightSidebarToggle => {
+                self.mouse_event_right_sidebar_toggle(event, context);
+            }
+            UIItemType::RightSidebarMode(mode) => {
+                self.mouse_event_right_sidebar_mode(mode, event, context);
+            }
+            UIItemType::RightSidebarBackground => {
+                context.set_cursor(Some(MouseCursor::Arrow));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.right_sidebar_snippet_focus = None;
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarResize => {
+                self.mouse_event_right_sidebar_resize(item, event, context);
+            }
+            UIItemType::RightSidebarSnippetScrollTrack => {
+                self.mouse_event_right_sidebar_snippet_scroll_track(item, event, context);
+            }
+            UIItemType::RightSidebarSnippetScrollThumb => {
+                self.mouse_event_right_sidebar_snippet_scroll_thumb(item, event, context);
+            }
+            UIItemType::RightSidebarSnippetNew
+            | UIItemType::RightSidebarSnippetBack
+            | UIItemType::RightSidebarSnippetSave
+            | UIItemType::RightSidebarSnippetSearch
+            | UIItemType::RightSidebarSnippetTitle
+            | UIItemType::RightSidebarSnippetBody
+            | UIItemType::RightSidebarSnippetEdit(_)
+            | UIItemType::RightSidebarSnippetPaste(_)
+            | UIItemType::RightSidebarSnippetRun(_)
+            | UIItemType::RightSidebarSnippetDelete(_) => {
+                self.mouse_event_right_sidebar_snippet(item.item_type.clone(), event, context);
+            }
+            UIItemType::ContentViewClose(id) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.request_close_content_view_by_id(id);
+                }
+            }
+            UIItemType::ContextMenuBackdrop => {
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
+            UIItemType::ContextMenuItem(_) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+            }
+            UIItemType::AboveScrollThumb
+            | UIItemType::ScrollThumb
+            | UIItemType::BelowScrollThumb
+            | UIItemType::Split(_)
+            | UIItemType::PaneNav { .. } => {
+                context.set_cursor(Some(MouseCursor::Arrow));
             }
         }
     }
@@ -1384,7 +1565,7 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         context.set_cursor(Some(MouseCursor::SizeLeftRight));
-        if event.kind == WMEK::Press(MousePress::Left) {
+        if matches!(event.kind, WMEK::Press(MousePress::Left)) {
             self.dragging.replace((item, event));
         }
     }
@@ -1616,8 +1797,7 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
-            let thread_id = crate::workspace_threads::create_thread(&project_id, None);
-            self.activate_workspace_thread(thread_id, context);
+            self.create_workspace_thread(&project_id, context);
         }
         context.set_cursor(Some(MouseCursor::Arrow));
     }
@@ -1705,7 +1885,9 @@ impl super::TermWindow {
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                self.activate_workspace_thread(thread_id, context);
+                if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
+                    self.activate_workspace_thread(thread_id, context);
+                }
             }
             WMEK::Press(MousePress::Right) => {
                 self.show_term_context_menu(
@@ -1750,19 +1932,7 @@ impl super::TermWindow {
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                if let Some(deleted) = crate::workspace_threads::delete_thread(&thread_id) {
-                    if deleted.was_active {
-                        if let Some(next_thread_id) = deleted.next_thread_id {
-                            self.activate_workspace_thread(next_thread_id, context);
-                        }
-                    } else if let Some(workspace) = deleted.materialized_workspace_name {
-                        let mux = Mux::get();
-                        for window_id in mux.iter_windows_in_workspace(&workspace) {
-                            mux.kill_window(window_id);
-                        }
-                    }
-                    context.invalidate();
-                }
+                self.end_workspace_thread(&thread_id, Some(context));
             }
             WMEK::Press(MousePress::Right) => {
                 self.show_term_context_menu(
@@ -1774,6 +1944,121 @@ impl super::TermWindow {
             _ => {}
         }
         context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    pub(crate) fn end_workspace_thread(
+        &mut self,
+        thread_id: &str,
+        context: Option<&dyn WindowOps>,
+    ) {
+        match crate::workspace_threads::end_workspace_thread_record(thread_id) {
+            crate::workspace_threads::EndWorkspaceThreadResult::DeletedThread(deleted) => {
+                self.finish_deleted_workspace_thread(deleted, context);
+            }
+            crate::workspace_threads::EndWorkspaceThreadResult::RemovedProject(removed) => {
+                self.finish_removed_project(removed, context);
+            }
+            crate::workspace_threads::EndWorkspaceThreadResult::Noop => {
+                if let Some(context) = context {
+                    context.invalidate();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn disconnect_workspace_thread(
+        &mut self,
+        thread_id: &str,
+        context: Option<&dyn WindowOps>,
+    ) {
+        let live_workspaces = Mux::get().iter_workspaces();
+        let Some(disconnected) = crate::workspace_threads::disconnect_workspace_thread_record(
+            thread_id,
+            &live_workspaces,
+        ) else {
+            if let Some(context) = context {
+                context.invalidate();
+            }
+            return;
+        };
+
+        let cleanup_workspaces = vec![disconnected.workspace_name];
+        if disconnected.was_active {
+            if let (Some(next_thread_id), Some(context)) = (disconnected.next_thread_id, context) {
+                self.activate_workspace_thread_with_cleanup(
+                    next_thread_id,
+                    context,
+                    cleanup_workspaces,
+                );
+                return;
+            }
+            if context.is_none() {
+                return;
+            }
+        }
+
+        kill_workspace_windows(&cleanup_workspaces, None);
+
+        if let Some(context) = context {
+            context.invalidate();
+        }
+    }
+
+    fn finish_deleted_workspace_thread(
+        &mut self,
+        deleted: crate::workspace_threads::DeletedWorkspaceThread,
+        context: Option<&dyn WindowOps>,
+    ) {
+        let cleanup_workspaces = deleted
+            .materialized_workspace_name
+            .into_iter()
+            .collect::<Vec<_>>();
+        if deleted.was_active {
+            if let (Some(next_thread_id), Some(context)) = (deleted.next_thread_id, context) {
+                self.activate_workspace_thread_with_cleanup(
+                    next_thread_id,
+                    context,
+                    cleanup_workspaces,
+                );
+                return;
+            }
+            if context.is_none() {
+                return;
+            }
+        }
+
+        kill_workspace_windows(&cleanup_workspaces, None);
+
+        if let Some(context) = context {
+            context.invalidate();
+        }
+    }
+
+    fn finish_removed_project(
+        &mut self,
+        removed: crate::workspace_threads::RemovedProject,
+        context: Option<&dyn WindowOps>,
+    ) {
+        let cleanup_workspaces = removed.materialized_workspace_names;
+        if removed.was_active {
+            if let (Some(next_thread_id), Some(context)) = (removed.next_thread_id, context) {
+                self.activate_workspace_thread_with_cleanup(
+                    next_thread_id,
+                    context,
+                    cleanup_workspaces,
+                );
+                return;
+            }
+            if context.is_none() {
+                return;
+            }
+        }
+
+        kill_workspace_windows(&cleanup_workspaces, None);
+
+        if let Some(context) = context {
+            context.invalidate();
+        }
     }
 
     fn project_context_menu_items(&self, project_id: &str) -> Vec<ContextMenuItem> {
@@ -1934,10 +2219,92 @@ impl super::TermWindow {
         ]
     }
 
+    fn open_remote_workspace_thread_without_connecting(
+        &mut self,
+        thread_id: &str,
+        context: &dyn WindowOps,
+    ) -> bool {
+        self.open_remote_workspace_thread_view(thread_id, context, false)
+    }
+
+    fn open_remote_workspace_thread_view(
+        &mut self,
+        thread_id: &str,
+        context: &dyn WindowOps,
+        force_disconnected: bool,
+    ) -> bool {
+        let live_workspaces = Mux::get().iter_workspaces();
+        let Some(mut state) =
+            crate::workspace_threads::thread_connection_state(thread_id, &live_workspaces)
+        else {
+            return false;
+        };
+
+        if !state.is_remote || (!force_disconnected && state.is_live) {
+            if !state.is_remote {
+                return false;
+            }
+
+            let key = format!(
+                "{}{}",
+                crate::termwindow::remote_thread_view::REMOTE_THREAD_CONTENT_VIEW_KEY_PREFIX,
+                thread_id
+            );
+            if let Some(view_id) = self.content_view_id_for_key(&key) {
+                self.snapshot_active_workspace_thread_layout();
+                self.workspace_sidebar_pending_thread_selection = Some(thread_id.to_string());
+                self.activate_content_view(view_id);
+                context.invalidate();
+                return true;
+            }
+
+            return false;
+        }
+        if force_disconnected {
+            state.is_live = false;
+        }
+
+        self.snapshot_active_workspace_thread_layout();
+        self.workspace_sidebar_pending_thread_selection = Some(thread_id.to_string());
+        self.open_content_view(Box::new(
+            crate::termwindow::remote_thread_view::RemoteThreadView::new(state),
+        ));
+        context.invalidate();
+        true
+    }
+
     fn workspace_thread_context_menu_items(&self, thread_id: &str) -> Vec<ContextMenuItem> {
         let thread_id = thread_id.to_string();
         let is_pinned = crate::workspace_threads::thread_is_pinned(&thread_id);
-        vec![
+        let live_workspaces = Mux::get().iter_workspaces();
+        let connection =
+            crate::workspace_threads::thread_connection_state(&thread_id, &live_workspaces);
+        let mut items = vec![];
+
+        if let Some(connection) = connection.as_ref() {
+            let remote_host_exists = connection.is_remote
+                && crate::ssh_hosts::host_spec(
+                    crate::workspace_threads::remote_host_id_for_project_id(&connection.project_id),
+                )
+                .is_some();
+            if connection.is_remote && connection.is_live {
+                items.push(ContextMenuItem::item_with_icon(
+                    "Disconnect Thread",
+                    "unlink",
+                    KeyAssignment::DisconnectWorkspaceThread(thread_id.clone()),
+                ));
+                items.push(ContextMenuItem::Separator);
+            } else if connection.is_remote && remote_host_exists {
+                items.push(ContextMenuItem::item_with_icon(
+                    "Connect Thread",
+                    "link",
+                    KeyAssignment::ConnectWorkspaceThread(thread_id.clone()),
+                ));
+                items.push(ContextMenuItem::Separator);
+            }
+        }
+
+        items.extend([
             ContextMenuItem::item_with_icon(
                 if is_pinned {
                     "Unpin Thread"
@@ -1962,11 +2329,58 @@ impl super::TermWindow {
                 "envelope.badge",
                 KeyAssignment::MarkWorkspaceThreadUnread(thread_id),
             ),
-        ]
+        ]);
+        items
     }
 
     pub(crate) fn activate_workspace_thread(&mut self, thread_id: String, context: &dyn WindowOps) {
-        self.activate_workspace_thread_impl(thread_id, context, None);
+        self.activate_workspace_thread_impl(thread_id, context, None, Vec::new());
+    }
+
+    fn activate_workspace_thread_with_cleanup(
+        &mut self,
+        thread_id: String,
+        context: &dyn WindowOps,
+        workspaces_to_kill_after_adopt: Vec<String>,
+    ) {
+        self.activate_workspace_thread_impl(
+            thread_id,
+            context,
+            None,
+            workspaces_to_kill_after_adopt,
+        );
+    }
+
+    pub(crate) fn create_workspace_thread(&mut self, project_id: &str, context: &dyn WindowOps) {
+        let thread_id = crate::workspace_threads::create_thread(project_id, None);
+        if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
+            self.activate_workspace_thread(thread_id, context);
+        }
+    }
+
+    pub(crate) fn open_ssh_host_thread_without_connecting(
+        &mut self,
+        host_id: String,
+        context: &dyn WindowOps,
+    ) -> bool {
+        let Some(spec) = crate::ssh_hosts::host_spec(&host_id) else {
+            context.invalidate();
+            return false;
+        };
+
+        self.snapshot_active_workspace_thread_layout();
+        let thread_id = crate::workspace_threads::create_disconnected_remote_host_thread(
+            &self.active_space_id,
+            &host_id,
+            &spec.label,
+            crate::ssh_hosts::host_project_path(&spec),
+            spec.default_workspace.clone(),
+        );
+        if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
+            context.invalidate();
+            return false;
+        }
+        true
     }
 
     pub(crate) fn activate_workspace_thread_for_new_window(
@@ -1975,7 +2389,19 @@ impl super::TermWindow {
         context: &dyn WindowOps,
         startup_window_id: MuxWindowId,
     ) {
-        self.activate_workspace_thread_impl(thread_id, context, Some(startup_window_id));
+        if self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
+            // Do not auto-connect remote threads while restoring a new window.
+            // Remote hosts may be unavailable or expensive to wake; let the
+            // disconnected view make the connection an explicit user action.
+            return;
+        }
+
+        self.activate_workspace_thread_impl(
+            thread_id,
+            context,
+            Some(startup_window_id),
+            Vec::new(),
+        );
     }
 
     fn activate_workspace_thread_impl(
@@ -1983,8 +2409,18 @@ impl super::TermWindow {
         thread_id: String,
         context: &dyn WindowOps,
         orphan_candidate_window_id: Option<MuxWindowId>,
+        workspaces_to_kill_after_adopt: Vec<String>,
     ) {
+        if crate::workspace_threads::thread_space_id(&thread_id).as_deref()
+            != Some(self.active_space_id.as_str())
+        {
+            context.invalidate();
+            return;
+        }
+
         self.snapshot_active_workspace_thread_layout();
+        self.workspace_sidebar_pending_thread_selection = None;
+        self.set_content_view_active(false);
 
         let mux = Mux::get();
         let live_workspaces = mux.iter_workspaces();
@@ -2001,20 +2437,36 @@ impl super::TermWindow {
             // orphaned a startup mux window, tidy it up. cleanup_orphaned_mux_window
             // is a no-op when the window is still shown or has a thread binding.
             cleanup_orphaned_mux_window(orphan_candidate_window_id);
+            kill_workspace_windows(&workspaces_to_kill_after_adopt, Some(&plan.workspace_name));
             context.invalidate();
             return;
         }
 
         let workspace_name = plan.workspace_name.clone();
-        let remote_spec = crate::ssh_hosts::host_spec(
-            crate::workspace_threads::remote_host_id_for_project_id(&plan.project_id),
-        );
+        let remote_host_id =
+            crate::workspace_threads::remote_host_id_for_project_id(&plan.project_id).to_string();
+        let remote_spec = crate::ssh_hosts::host_spec(&remote_host_id);
+        if remote_spec.is_none() && crate::workspace_threads::project_is_remote(&plan.project_id) {
+            log::warn!(
+                "refusing to connect remote thread {:?}: SSH host {:?} no longer exists",
+                plan.thread_id,
+                remote_host_id
+            );
+            context.invalidate();
+            return;
+        }
+        let mut detect_remote_os = None;
         let (initial_cwd, default_domain) = if let Some(spec) = remote_spec.as_ref() {
             match crate::ssh_hosts::ensure_ssh_domain_registered(spec) {
-                Ok(domain_name) => (
-                    None,
-                    config::keyassignment::SpawnTabDomain::DomainName(domain_name),
-                ),
+                Ok(domain_name) => {
+                    if spec.detect_os {
+                        detect_remote_os = Some((domain_name.clone(), remote_host_id));
+                    }
+                    (
+                        None,
+                        config::keyassignment::SpawnTabDomain::DomainName(domain_name),
+                    )
+                }
                 Err(err) => {
                     log::error!(
                         "failed to register SSH domain for session {:?}: {err:#}",
@@ -2046,6 +2498,8 @@ impl super::TermWindow {
 
         let reconcile_window = self.window.clone();
         let adopt_workspace = workspace_name.clone();
+        let detect_window = self.window.clone();
+        let cleanup_workspaces = workspaces_to_kill_after_adopt;
         promise::spawn::spawn(async move {
             let materialized = match crate::workspace_threads::materialize_thread(
                 workspace_name,
@@ -2068,93 +2522,229 @@ impl super::TermWindow {
             front_end().set_switching_workspaces(false);
             if materialized {
                 cleanup_orphaned_mux_window(orphan_candidate_window_id);
+                kill_workspace_windows(&cleanup_workspaces, Some(&adopt_workspace));
             }
             reconcile_workspace_layout_after_materialize(reconcile_window);
+
+            if materialized {
+                if let Some((detect_domain, detect_project)) = detect_remote_os {
+                    if let Some(domain) = Mux::get().get_domain_by_name(&detect_domain) {
+                        if let Some(ssh) = domain.as_ref().downcast_ref::<RemoteSshDomain>() {
+                            if let Some(distro) = ssh.detect_os_release().await {
+                                if crate::ssh_hosts::set_host_distro(&detect_project, &distro) {
+                                    if let Some(win) = detect_window.as_ref() {
+                                        win.invalidate();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         })
         .detach();
 
         context.invalidate();
     }
 
-    /// Connect to a stored SSH host: ensure its mux domain is registered, then
-    /// create/restore a session in the target workspace (default `ssh:<host>`)
-    /// whose panes spawn into that SSH domain. Mirrors
-    /// [`Self::activate_workspace_thread`] but targets the SSH domain.
-    pub(crate) fn connect_ssh_host(
-        &mut self,
-        project_id: String,
-        target_workspace: Option<String>,
-    ) {
-        let window = self.window.clone();
-        let invalidate = |window: &_| {
-            if let Some(win) = window {
-                WindowOps::invalidate(win);
-            }
+    fn failed_remote_thread_for_pane(
+        &self,
+        pane_id: mux::pane::PaneId,
+    ) -> Option<(String, String)> {
+        let mux = Mux::get();
+        let pane = mux.get_pane(pane_id)?;
+        let domain = mux.get_domain(pane.domain_id())?;
+        let ssh = domain.as_ref().downcast_ref::<RemoteSshDomain>()?;
+        let SshConnectionStatus::Failed(message) = ssh.connection_status() else {
+            return None;
         };
 
-        let Some(spec) = crate::ssh_hosts::host_spec(&project_id) else {
-            invalidate(&window);
+        let workspace = self.current_mux_workspace()?;
+        let thread_id =
+            crate::workspace_threads::thread_id_for_workspace(&self.active_space_id, &workspace)?;
+        let live_workspaces = mux.iter_workspaces();
+        let state =
+            crate::workspace_threads::thread_connection_state(&thread_id, &live_workspaces)?;
+        state.is_remote.then_some((thread_id, message))
+    }
+
+    pub(crate) fn redirect_failed_remote_tab_spawn_to_thread_view(
+        &mut self,
+        pane_id: mux::pane::PaneId,
+    ) -> bool {
+        let Some((thread_id, message)) = self.failed_remote_thread_for_pane(pane_id) else {
+            return false;
+        };
+        let Some(window) = self.window.clone() else {
+            return false;
+        };
+
+        if self.open_remote_workspace_thread_view(&thread_id, &window, true) {
+            let key = format!(
+                "{}{}",
+                crate::termwindow::remote_thread_view::REMOTE_THREAD_CONTENT_VIEW_KEY_PREFIX,
+                thread_id
+            );
+            if let Some(view_id) = self.content_view_id_for_key(&key) {
+                if let Some(view) = self.content_view_mut_by_id(view_id) {
+                    view.on_remote_connect_phase(
+                        crate::termwindow::content_view::RemoteConnectPhase::Failed { message },
+                    );
+                }
+            }
+        } else {
+            window.invalidate();
+        }
+        true
+    }
+
+    /// Single entry point for "connect this thread" (context menu, etc). For a
+    /// disconnected remote thread it routes through the `RemoteThreadView`
+    /// "Connecting…" UI; otherwise it activates the thread directly.
+    pub(crate) fn connect_remote_thread(&mut self, thread_id: String, context: &dyn WindowOps) {
+        let live_workspaces = Mux::get().iter_workspaces();
+        let is_disconnected_remote =
+            crate::workspace_threads::thread_connection_state(&thread_id, &live_workspaces)
+                .map(|state| state.is_remote && !state.is_live)
+                .unwrap_or(false);
+
+        if is_disconnected_remote
+            && self.open_remote_workspace_thread_without_connecting(&thread_id, context)
+        {
+            if self.begin_open_remote_thread_connection(thread_id.clone(), context, None) {
+                return;
+            }
+        }
+
+        self.activate_workspace_thread(thread_id, context);
+    }
+
+    fn begin_open_remote_thread_connection(
+        &mut self,
+        thread_id: String,
+        context: &dyn WindowOps,
+        orphan_candidate_window_id: Option<MuxWindowId>,
+    ) -> bool {
+        let key = format!(
+            "{}{}",
+            crate::termwindow::remote_thread_view::REMOTE_THREAD_CONTENT_VIEW_KEY_PREFIX,
+            thread_id
+        );
+        let Some(view_id) = self.content_view_id_for_key(&key) else {
+            return false;
+        };
+
+        // Show the spinner immediately, then start the connection.
+        if let Some(view) = self.content_view_mut_by_id(view_id) {
+            view.on_remote_connect_phase(
+                crate::termwindow::content_view::RemoteConnectPhase::Connecting,
+            );
+        }
+        self.begin_remote_thread_connection_impl(
+            thread_id,
+            view_id,
+            context,
+            orphan_candidate_window_id,
+        );
+        true
+    }
+
+    /// Start connecting a remote thread while keeping its `RemoteThreadView`
+    /// foreground as the "Connecting…" UI. The SSH workspace is materialized in
+    /// the background (we do not switch this window's active workspace, so the
+    /// additive reconcile leaves the new mux window alone); a poll loop adopts
+    /// it once authenticated, or kills it on failure.
+    pub(crate) fn begin_remote_thread_connection(
+        &mut self,
+        thread_id: String,
+        view_id: ContentViewId,
+        context: &dyn WindowOps,
+    ) {
+        self.begin_remote_thread_connection_impl(thread_id, view_id, context, None);
+    }
+
+    fn begin_remote_thread_connection_impl(
+        &mut self,
+        thread_id: String,
+        view_id: ContentViewId,
+        context: &dyn WindowOps,
+        orphan_candidate_window_id: Option<MuxWindowId>,
+    ) {
+        let mux = Mux::get();
+        let live_workspaces = mux.iter_workspaces();
+        let Some(plan) =
+            crate::workspace_threads::activation_plan_for_thread(&thread_id, &live_workspaces)
+        else {
+            self.fail_remote_connect(view_id, "This thread could not be activated.");
+            return;
+        };
+
+        // Already live (or a local thread that needs no session): just reveal.
+        if !plan.needs_materialize {
+            self.remote_connects.remove(&view_id);
+            let window = self.window.as_ref().cloned();
+            self.close_content_view_by_id(view_id);
+            if let Some(window) = window {
+                self.activate_workspace_thread_impl(
+                    thread_id,
+                    &window,
+                    orphan_candidate_window_id,
+                    Vec::new(),
+                );
+            }
+            return;
+        }
+
+        let remote_host_id =
+            crate::workspace_threads::remote_host_id_for_project_id(&plan.project_id).to_string();
+        let Some(spec) = crate::ssh_hosts::host_spec(&remote_host_id) else {
+            self.fail_remote_connect(view_id, "The saved SSH host no longer exists.");
             return;
         };
         let domain_name = match crate::ssh_hosts::ensure_ssh_domain_registered(&spec) {
             Ok(name) => name,
             Err(err) => {
-                log::error!(
-                    "failed to register SSH domain for {:?}: {err:#}",
-                    spec.label
-                );
+                self.fail_remote_connect(view_id, &format!("{err:#}"));
                 return;
             }
         };
-        let base_workspace_name = target_workspace
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| crate::ssh_hosts::default_workspace_name(&spec));
-        let workspace_name = crate::workspace_threads::remote_workspace_name_for_space(
-            &self.active_space_id,
-            &project_id,
-            &base_workspace_name,
-        );
-
-        let mux = Mux::get();
-        // Already live? Just switch this window to it rather than spawning a
-        // duplicate.
-        if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
-            self.adopt_workspace_in_this_window(&workspace_name);
-            invalidate(&window);
-            return;
-        }
 
         self.snapshot_active_workspace_thread_layout();
-        let _ = crate::workspace_threads::create_remote_host_thread(
-            &self.active_space_id,
-            &project_id,
-            &spec.label,
-            crate::ssh_hosts::host_project_path(&spec),
-            &workspace_name,
-        );
 
+        let workspace_name = plan.workspace_name.clone();
+        let layout = crate::workspace_threads::thread_layout(&plan.thread_id);
         let size = self.config.initial_size(
             self.dimensions.dpi as u32,
             crate::cell_pixel_dims(&self.config, self.dimensions.dpi as f64).ok(),
         );
         let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
             Arc::new(TermConfig::with_config(self.config.clone()));
-        // Suppress the additive reconcile while materializing; adopt the new
-        // mux window into THIS window afterwards (no duplicate, others intact).
-        front_end().set_switching_workspaces(true);
-        mux.set_active_workspace(&workspace_name);
 
-        let ws = workspace_name.clone();
-        let adopt_workspace = workspace_name.clone();
-        let detect_os = spec.detect_os;
-        let detect_domain = domain_name.clone();
-        let detect_project = project_id.clone();
-        let detect_window = window.clone();
-        let reconcile_window = window.clone();
+        let generation = self.next_remote_connect_generation;
+        self.next_remote_connect_generation =
+            self.next_remote_connect_generation.saturating_add(1).max(1);
+        if let Some(previous) = self.remote_connects.insert(
+            view_id,
+            super::RemoteConnectState {
+                generation,
+                thread_id,
+                workspace_name: workspace_name.clone(),
+                domain_name: domain_name.clone(),
+                started: Instant::now(),
+                orphan_candidate_window_id,
+                detect_os: spec
+                    .detect_os
+                    .then(|| (domain_name.clone(), remote_host_id)),
+            },
+        ) {
+            self.kill_remote_connect_workspace(&previous.workspace_name);
+        }
+
+        let materialize_workspace = workspace_name;
         promise::spawn::spawn(async move {
             if let Err(err) = crate::workspace_threads::materialize_thread(
-                ws,
-                None,
+                materialize_workspace,
+                layout,
                 None,
                 size,
                 None,
@@ -2163,14 +2753,100 @@ impl super::TermWindow {
             )
             .await
             {
-                log::error!("failed to connect SSH session: {err:#}");
+                log::error!("failed to materialize connecting SSH thread: {err:#}");
             }
-            adopt_workspace_into_window(&reconcile_window, &adopt_workspace);
-            front_end().set_switching_workspaces(false);
-            reconcile_workspace_layout_after_materialize(reconcile_window);
+        })
+        .detach();
 
-            // Optional, user-controlled OS detection over the live session.
-            if detect_os {
+        self.schedule_remote_connect_poll(view_id, generation);
+        context.invalidate();
+    }
+
+    fn schedule_remote_connect_poll(&self, view_id: ContentViewId, generation: u64) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(200)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                tw.poll_remote_connect(view_id, generation);
+            })));
+        })
+        .detach();
+    }
+
+    fn poll_remote_connect(&mut self, view_id: ContentViewId, generation: u64) {
+        let Some(state) = self.remote_connects.get(&view_id) else {
+            return;
+        };
+        if state.generation != generation {
+            return; // superseded by a newer attempt or cancelled
+        }
+        let domain_name = state.domain_name.clone();
+        let workspace_name = state.workspace_name.clone();
+        let elapsed = state.started.elapsed();
+
+        let status = Mux::get()
+            .get_domain_by_name(&domain_name)
+            .and_then(|domain| {
+                domain
+                    .as_ref()
+                    .downcast_ref::<RemoteSshDomain>()
+                    .map(|ssh| ssh.connection_status())
+            });
+
+        match status {
+            Some(SshConnectionStatus::Authenticating) | Some(SshConnectionStatus::Connected) => {
+                self.reveal_remote_connect(view_id, generation);
+            }
+            Some(SshConnectionStatus::Failed(message)) => {
+                self.kill_remote_connect_workspace(&workspace_name);
+                self.fail_remote_connect(view_id, &message);
+            }
+            _ => {
+                if elapsed >= Duration::from_secs(REMOTE_CONNECT_OVERALL_TIMEOUT_SECS) {
+                    self.kill_remote_connect_workspace(&workspace_name);
+                    self.fail_remote_connect(view_id, "Connection timed out.");
+                    return;
+                }
+                if let Some(view) = self.content_view_mut_by_id(view_id) {
+                    view.on_remote_connect_phase(
+                        crate::termwindow::content_view::RemoteConnectPhase::Connecting,
+                    );
+                }
+                self.schedule_remote_connect_poll(view_id, generation);
+                self.invalidate_window();
+            }
+        }
+    }
+
+    fn reveal_remote_connect(&mut self, view_id: ContentViewId, generation: u64) {
+        let Some(state) = self.remote_connects.remove(&view_id) else {
+            return;
+        };
+        if state.generation != generation {
+            self.remote_connects.insert(view_id, state);
+            return;
+        }
+        let detect = state.detect_os;
+        let orphan_candidate_window_id = state.orphan_candidate_window_id;
+        let window = self.window.as_ref().cloned();
+        let reveal_now = self.active_content_view_id == Some(view_id);
+        self.close_content_view_by_id(view_id);
+        if reveal_now {
+            if let Some(window) = window.clone() {
+                self.activate_workspace_thread_impl(
+                    state.thread_id,
+                    &window,
+                    orphan_candidate_window_id,
+                    Vec::new(),
+                );
+            }
+        }
+
+        if let Some((detect_domain, detect_project)) = detect {
+            let detect_window = window;
+            promise::spawn::spawn(async move {
                 if let Some(domain) = Mux::get().get_domain_by_name(&detect_domain) {
                     if let Some(ssh) = domain.as_ref().downcast_ref::<RemoteSshDomain>() {
                         if let Some(distro) = ssh.detect_os_release().await {
@@ -2182,11 +2858,37 @@ impl super::TermWindow {
                         }
                     }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
+    }
 
-        invalidate(&window);
+    fn fail_remote_connect(&mut self, view_id: ContentViewId, message: &str) {
+        self.remote_connects.remove(&view_id);
+        if let Some(view) = self.content_view_mut_by_id(view_id) {
+            view.on_remote_connect_phase(
+                crate::termwindow::content_view::RemoteConnectPhase::Failed {
+                    message: message.to_string(),
+                },
+            );
+        }
+        self.invalidate_window();
+    }
+
+    /// Cancel an in-flight connection started from `view_id` and tear down its
+    /// background SSH workspace. The view has already reset itself to Idle.
+    pub(crate) fn cancel_remote_thread_connection(&mut self, view_id: ContentViewId) {
+        if let Some(state) = self.remote_connects.remove(&view_id) {
+            self.kill_remote_connect_workspace(&state.workspace_name);
+        }
+        self.invalidate_window();
+    }
+
+    fn kill_remote_connect_workspace(&self, workspace_name: &str) {
+        let mux = Mux::get();
+        for window_id in mux.iter_windows_in_workspace(workspace_name) {
+            mux.kill_window(window_id);
+        }
     }
 
     fn pane_nav_tab_context_menu_items(&self, pane_id: mux::pane::PaneId) -> Vec<ContextMenuItem> {
@@ -2379,6 +3081,10 @@ impl super::TermWindow {
     }
 
     fn spawn_pane_nav_tab(&mut self, pane_id: mux::pane::PaneId, pane_index: usize) {
+        if self.redirect_failed_remote_tab_spawn_to_thread_view(pane_id) {
+            return;
+        }
+
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
@@ -2435,6 +3141,23 @@ impl super::TermWindow {
                 self.close_specific_tab(idx, true);
             }
             _ => {}
+        }
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn mouse_event_disabled_new_tab_button(&mut self, context: &dyn WindowOps) {
+        context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    fn mouse_event_local_new_tab_button(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.spawn_command(
+                &SpawnCommand {
+                    domain: SpawnTabDomain::DomainName("local".to_string()),
+                    ..SpawnCommand::default()
+                },
+                crate::spawn::SpawnWhere::NewTab,
+            );
         }
         context.set_cursor(Some(MouseCursor::Arrow));
     }
@@ -2610,14 +3333,24 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
+        if self.active_content_view_is_remote_thread()
+            && matches!(
+                item,
+                TabBarItem::Tab { .. } | TabBarItem::NewTabButton { .. }
+            )
+        {
+            context.set_cursor(Some(MouseCursor::Arrow));
+            return;
+        }
+
         match event.kind {
             WMEK::Press(MousePress::Left) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
                     self.set_content_view_active(false);
                     self.activate_tab(tab_idx as isize).ok();
                 }
-                TabBarItem::ContentView => {
-                    self.set_content_view_active(true);
+                TabBarItem::ContentView { id } => {
+                    self.activate_content_view(id);
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
@@ -2655,7 +3388,7 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
-                | TabBarItem::ContentView
+                | TabBarItem::ContentView { .. }
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match item {
@@ -2672,7 +3405,7 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
-                | TabBarItem::ContentView
+                | TabBarItem::ContentView { .. }
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match item {
@@ -2691,7 +3424,7 @@ impl super::TermWindow {
                 }
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
-                | TabBarItem::ContentView
+                | TabBarItem::ContentView { .. }
                 | TabBarItem::NewTabButton { .. } => {}
             },
             WMEK::HorzWheel(amount) => {
@@ -3288,4 +4021,16 @@ fn cleanup_orphaned_mux_window(window_id: Option<MuxWindowId>) {
 
     log::trace!("clean up unbound startup mux window {window_id} in workspace {workspace:?}");
     mux.kill_window(window_id);
+}
+
+fn kill_workspace_windows(workspaces: &[String], skip_workspace: Option<&str>) {
+    let mux = Mux::get();
+    for workspace in workspaces {
+        if skip_workspace == Some(workspace.as_str()) {
+            continue;
+        }
+        for window_id in mux.iter_windows_in_workspace(workspace) {
+            mux.kill_window(window_id);
+        }
+    }
 }

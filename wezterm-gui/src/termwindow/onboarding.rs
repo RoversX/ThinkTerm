@@ -1885,6 +1885,14 @@ impl ContentView for OnboardingView {
         "ThinkTerm Setup".to_string()
     }
 
+    fn tab_key(&self) -> Option<String> {
+        Some(format!("onboarding:{}", self.initial_space_id))
+    }
+
+    fn space_id(&self) -> Option<&str> {
+        Some(&self.initial_space_id)
+    }
+
     fn wants_cursor_blink(&self) -> bool {
         false
     }

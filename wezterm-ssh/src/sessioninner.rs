@@ -398,8 +398,31 @@ impl SessionInner {
                 .with_context(|| format!("binding to {bind_addr:?}"))?;
         }
 
-        sock.connect(&addr.into())
-            .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
+        // Honor a connect timeout so that an unreachable host fails promptly
+        // instead of blocking for the OS default (~75s on macOS, or indefinitely
+        // for blackhole routes). `connect_timeout` leaves the socket in
+        // non-blocking mode, so restore blocking afterwards for the handshake.
+        match self
+            .config
+            .get("connecttimeout")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+        {
+            Some(timeout) => {
+                sock.connect_timeout(&addr.into(), timeout)
+                    .with_context(|| {
+                        format!("Connecting to {hostname}:{port} ({addr:?}) within {timeout:?}")
+                    })?;
+                sock.set_nonblocking(false).with_context(|| {
+                    format!("restoring blocking mode after connect to {hostname}:{port}")
+                })?;
+            }
+            None => {
+                sock.connect(&addr.into())
+                    .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
+            }
+        }
         Ok((sock, None))
     }
 
@@ -1135,6 +1158,12 @@ fn write_from_buf<W: Write>(w: &mut W, buf: &mut VecDeque<u8>) -> std::io::Resul
 
 fn read_into_buf<R: Read>(r: &mut R, buf: &mut VecDeque<u8>) -> std::io::Result<bool> {
     let current_len = buf.len();
+    if current_len == buf.capacity() {
+        // The channel buffer is full. Report no progress so the event loop
+        // applies backpressure instead of reading an empty slice and treating
+        // the resulting Ok(0) as EOF.
+        return Ok(false);
+    }
     buf.resize(buf.capacity(), 0);
     let target_buf = &mut buf.make_contiguous()[current_len..];
     match r.read(target_buf) {
@@ -1184,5 +1213,53 @@ impl Drop for KillOnDropChild {
         if let Err(err) = self.0.wait() {
             log::error!("Error waiting for ProxyCommand to finish: {}", err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct CountingReader {
+        calls: usize,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            panic!("full buffers must not call read");
+        }
+    }
+
+    #[test]
+    fn read_into_full_buf_reports_backpressure_without_reading() {
+        let mut buf = VecDeque::with_capacity(3);
+        while buf.len() < buf.capacity() {
+            buf.push_back(0);
+        }
+        let mut reader = CountingReader { calls: 0 };
+
+        assert_eq!(read_into_buf(&mut reader, &mut buf).unwrap(), false);
+        assert_eq!(reader.calls, 0);
+        assert_eq!(buf.len(), buf.capacity());
+    }
+
+    #[test]
+    fn read_into_non_full_buf_keeps_eof_semantics() {
+        let mut buf = VecDeque::with_capacity(8);
+        let mut reader = Cursor::new(Vec::<u8>::new());
+
+        let err = read_into_buf(&mut reader, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn read_into_non_full_buf_reports_progress() {
+        let mut buf = VecDeque::with_capacity(8);
+        let mut reader = Cursor::new(b"abc".to_vec());
+
+        assert_eq!(read_into_buf(&mut reader, &mut buf).unwrap(), true);
+        assert_eq!(buf.iter().copied().collect::<Vec<_>>(), b"abc");
     }
 }
