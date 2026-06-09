@@ -382,20 +382,24 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn xdg_config_home() -> PathBuf {
-    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join("wezterm")) {
+fn xdg_config_home(product_dir: &str) -> PathBuf {
+    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join(product_dir)) {
         Some(p) => p,
-        None => HOME_DIR.join(".config").join("wezterm"),
+        None => HOME_DIR.join(".config").join(product_dir),
     }
 }
 
 fn config_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    dirs.push(xdg_config_home());
+    dirs.push(xdg_config_home("thinkterm"));
+    dirs.push(xdg_config_home("wezterm"));
 
     #[cfg(unix)]
     if let Some(d) = std::env::var_os("XDG_CONFIG_DIRS") {
-        dirs.extend(std::env::split_paths(&d).map(|s| PathBuf::from(s).join("wezterm")));
+        for base in std::env::split_paths(&d) {
+            dirs.push(base.join("thinkterm"));
+            dirs.push(base.join("wezterm"));
+        }
     }
 
     dirs

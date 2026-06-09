@@ -879,7 +879,7 @@ impl Domain for RemoteSshDomain {
         let terminal = wezterm_term::Terminal::new(
             size,
             std::sync::Arc::new(config::TermConfig::new()),
-            "WezTerm",
+            "ThinkTerm",
             config::wezterm_version(),
             Box::new(writer.clone()),
         );

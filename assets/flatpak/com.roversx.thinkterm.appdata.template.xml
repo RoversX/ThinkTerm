@@ -5,7 +5,7 @@
   <metadata_license>MIT</metadata_license>
   <project_license>MIT</project_license>
   <name>ThinkTerm</name>
-  <summary>A workspace-first terminal emulator and multiplexer</summary>
+  <summary>Workspace-first terminal and multiplexer</summary>
   <description>
     <p>
       ThinkTerm is a workspace-first terminal emulator with support for
@@ -35,13 +35,12 @@
   <developer_name>RoversX</developer_name>
 
   <releases>
-    <release version="20220807-113146-c2fee766" date="2022-08-07">
+    <release version="@TAG_NAME@" date="@DATE@">
       <description>
         <p>
-          Featuring more powerful key and mouse bindings, new lua functions for
-          working with color, json, time, processes and windows, reduced
-          scrollback memory consumption, increased search performance, IME on
-          Wayland and more!
+          A very long list of improvements to performance and
+          resource utilization as well as new features.
+          The changelog has a complete list!
         </p>
       </description>
     </release>

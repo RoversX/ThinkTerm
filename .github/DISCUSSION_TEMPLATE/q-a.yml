@@ -33,10 +33,10 @@ body:
   - type: input
     id: version
     attributes:
-      label: WezTerm version
+      label: ThinkTerm version
       description: |
         Please run `wezterm -V` and include its output here.
-        If you installed the flatpak version of wezterm, please consider trying
+        If you installed the flatpak version of ThinkTerm, please consider trying
         the native package format for your system and comparing the behavior,
         as flatpak runs in an isolated sandbox that can prevent some functionality
         from working fully.

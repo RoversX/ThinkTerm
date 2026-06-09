@@ -85,7 +85,7 @@ pub struct TlsDomainClient {
     #[dynamic(default = "default_local_echo_threshold_ms")]
     pub local_echo_threshold_ms: Option<u64>,
 
-    /// The path to the wezterm binary on the remote host
+    /// The path to a compatible ThinkTerm/WezTerm mux binary on the remote host
     pub remote_wezterm_path: Option<String>,
 
     /// Show time since last response when waiting for a response.

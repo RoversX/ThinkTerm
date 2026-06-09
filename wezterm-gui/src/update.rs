@@ -39,10 +39,7 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
     let mut latest = Vec::new();
     let _res = Request::new(&uri)
         .version(HttpVersion::Http10)
-        .header(
-            "User-Agent",
-            &format!("wezterm/wezterm-{}", wezterm_version()),
-        )
+        .header("User-Agent", &format!("thinkterm/{}", wezterm_version()))
         .send(&mut latest)
         .map_err(|e| anyhow!("failed to query github releases: {}", e))?;
 
@@ -56,12 +53,12 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
 }
 
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/wezterm/wezterm/releases/latest")
+    get_github_release_info("https://api.github.com/repos/RoversX/thinkterm/releases/latest")
 }
 
 #[allow(unused)]
 pub fn get_nightly_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/wezterm/wezterm/releases/tags/nightly")
+    get_github_release_info("https://api.github.com/repos/RoversX/thinkterm/releases/tags/nightly")
 }
 
 lazy_static::lazy_static! {
@@ -81,7 +78,7 @@ pub fn load_last_release_info_and_set_banner() {
         };
 
         let current = wezterm_version();
-        let force_ui = std::env::var_os("WEZTERM_ALWAYS_SHOW_UPDATE_UI").is_some();
+        let force_ui = always_show_update_ui();
         if latest.tag_name.as_str() <= current && !force_ui {
             return;
         }
@@ -92,7 +89,10 @@ pub fn load_last_release_info_and_set_banner() {
 
 fn set_banner_from_release_info(latest: &Release) {
     let mux = crate::Mux::get();
-    let url = format!("https://wezterm.org/changelog.html#{}", latest.tag_name);
+    let url = format!(
+        "https://github.com/RoversX/thinkterm/releases/tag/{}",
+        latest.tag_name
+    );
 
     let icon = ITermFileData {
         name: None,
@@ -119,7 +119,7 @@ fn set_banner_from_release_info(latest: &Release) {
     let reset = CSI::Sgr(Sgr::Reset);
     let link_off = OperatingSystemCommand::SetHyperlink(None);
     mux.set_banner(Some(format!(
-        "{}{}WezTerm Update Available\r\n{}{}{}{}Click to see what's new{}{}\r\n",
+        "{}{}ThinkTerm Update Available\r\n{}{}{}{}Click to see what's new{}{}\r\n",
         icon,
         top_line_pos,
         second_line_pos,
@@ -154,7 +154,7 @@ fn update_checker() {
     let update_interval = Duration::from_secs(configuration().check_for_updates_interval_seconds);
     let initial_interval = Duration::from_secs(10);
 
-    let force_ui = std::env::var_os("WEZTERM_ALWAYS_SHOW_UPDATE_UI").is_some();
+    let force_ui = always_show_update_ui();
 
     let update_file_name = config::DATA_DIR.join("check_update");
     let delay = update_file_name
@@ -191,11 +191,14 @@ fn update_checker() {
                         current
                     );
 
-                    let url = format!("https://wezterm.org/changelog.html#{}", latest.tag_name);
+                    let url = format!(
+                        "https://github.com/RoversX/thinkterm/releases/tag/{}",
+                        latest.tag_name
+                    );
 
                     if force_ui || socks.is_empty() || socks[0] == my_sock {
                         persistent_toast_notification_with_click_to_open_url(
-                            "WezTerm Update Available",
+                            "ThinkTerm Update Available",
                             "Click to see what's new",
                             &url,
                         );
@@ -220,6 +223,11 @@ fn update_checker() {
             configuration().check_for_updates_interval_seconds,
         ));
     }
+}
+
+fn always_show_update_ui() -> bool {
+    std::env::var_os("THINKTERM_ALWAYS_SHOW_UPDATE_UI").is_some()
+        || std::env::var_os("WEZTERM_ALWAYS_SHOW_UPDATE_UI").is_some()
 }
 
 pub fn start_update_checker() {

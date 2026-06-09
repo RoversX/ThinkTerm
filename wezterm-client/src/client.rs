@@ -63,7 +63,7 @@ pub struct Client {
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[error(
-    "Please install the same version of wezterm on both the client and server!\n\
+    "Please install a compatible ThinkTerm/WezTerm remote mux binary on the server!\n\
      The server version is {} (codec version {}),\n\
      which is not compatible with our version \n\
      {} (codec version {}).",
@@ -660,18 +660,21 @@ impl Reconnectable {
         }
     }
 
-    /// Resolve the path to wezterm for the remote system.
+    /// Build a command that runs a compatible mux binary on the remote system.
     /// We can't simply derive this from the current executable because
     /// we are being asked to produce a path for the remote system and
     /// we don't really know anything about it.
     /// `path` comes from the SshDoman::remote_wezterm_path option; if set
     /// then the user has told us where to look.
-    /// Otherwise, we have to rely on the `PATH` environment for the remote
-    /// system, and we don't know if it is even running unix, or whether
-    /// any given shell syntax will help us provide a more meaningful
-    /// message to the user.
-    fn wezterm_bin_path(path: &Option<String>) -> String {
-        path.as_deref().unwrap_or("wezterm").to_string()
+    /// Otherwise, use `wezterm` for compatibility with existing remote hosts.
+    /// This string is passed directly to SSH exec, so avoid shell-specific
+    /// fallback logic here; users can set remote_wezterm_path or
+    /// override_proxy_command when their remote binary has another name.
+    fn remote_mux_command(path: &Option<String>, args: &str) -> String {
+        match path {
+            Some(path) => format!("{path} {args}"),
+            None => format!("wezterm {args}"),
+        }
     }
 
     fn ssh_connect(
@@ -683,14 +686,15 @@ impl Reconnectable {
         let ssh_config = mux::ssh::ssh_domain_to_ssh_config(&ssh_dom)?;
 
         let sess = ssh_connect_with_ui(ssh_config, ui)?;
-        let proxy_bin = Self::wezterm_bin_path(&ssh_dom.remote_wezterm_path);
-
         let cmd = if let Some(cmd) = ssh_dom.override_proxy_command.clone() {
             cmd
         } else if initial {
-            format!("{} cli --prefer-mux proxy", proxy_bin)
+            Self::remote_mux_command(&ssh_dom.remote_wezterm_path, "cli --prefer-mux proxy")
         } else {
-            format!("{} cli --prefer-mux --no-auto-start proxy", proxy_bin)
+            Self::remote_mux_command(
+                &ssh_dom.remote_wezterm_path,
+                "cli --prefer-mux --no-auto-start proxy",
+            )
         };
         ui.output_str(&format!("Running: {}\n", cmd));
         log::debug!("going to run {}", cmd);
@@ -882,10 +886,8 @@ impl Reconnectable {
                 let creds = ui.run_and_log_error(|| {
                     // The `tlscreds` command will start the server if needed and then
                     // obtain client credentials that we can use for tls.
-                    let cmd = format!(
-                        "{} cli tlscreds",
-                        Self::wezterm_bin_path(&tls_client.remote_wezterm_path)
-                    );
+                    let cmd =
+                        Self::remote_mux_command(&tls_client.remote_wezterm_path, "cli tlscreds");
 
                     ui.output_str(&format!("Running: {}\n", cmd));
                     let mut exec = smol::block_on(sess.exec(&cmd, None))
@@ -1073,7 +1075,7 @@ impl Client {
                     }
 
                     let mut ui = ConnectionUI::new();
-                    ui.title("wezterm: Reconnecting...");
+                    ui.title("ThinkTerm: Reconnecting...");
 
                     loop {
                         ui.sleep_with_reason(
@@ -1199,8 +1201,8 @@ impl Client {
                         .to_string()
                 } else {
                     format!(
-                        "Please install the same version of wezterm on both \
-                     the client and server! \
+                        "Please install a compatible ThinkTerm/WezTerm remote mux binary \
+                     on the server! \
                      The server reported error '{err}' while being asked for its \
                      version.  This likely means that the server is older \
                      than the client, but it could also happen if the remote \
@@ -1389,4 +1391,28 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reconnectable;
+
+    #[test]
+    fn remote_mux_command_uses_configured_path() {
+        assert_eq!(
+            Reconnectable::remote_mux_command(
+                &Some("/opt/bin/wezterm".to_string()),
+                "cli tlscreds"
+            ),
+            "/opt/bin/wezterm cli tlscreds"
+        );
+    }
+
+    #[test]
+    fn remote_mux_command_defaults_to_wezterm_without_shell_fallback() {
+        assert_eq!(
+            Reconnectable::remote_mux_command(&None, "cli --prefer-mux proxy"),
+            "wezterm cli --prefer-mux proxy"
+        );
+    }
 }

@@ -1,11 +1,11 @@
 [Desktop Entry]
-Name=WezTerm
-Comment=Wez's Terminal Emulator
+Name=ThinkTerm
+Comment=Workspace-first terminal emulator
 Keywords=shell;prompt;command;commandline;cmd;
-Icon=org.wezfurlong.wezterm
-StartupWMClass=org.wezfurlong.wezterm
+Icon=com.roversx.thinkterm
+StartupWMClass=com.roversx.thinkterm
 TryExec=wezterm
-Exec=wezterm start --cwd .
+Exec=wezterm start --class com.roversx.thinkterm --cwd .
 Type=Application
 Categories=System;TerminalEmulator;Utility;
 Terminal=false

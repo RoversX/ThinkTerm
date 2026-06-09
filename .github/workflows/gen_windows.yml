@@ -92,5 +92,5 @@ jobs:
         with:
           name: "windows"
           path: |
-            WezTerm-*.zip
-            WezTerm-*.exe
+            ThinkTerm-*.zip
+            ThinkTerm-*.exe

@@ -562,9 +562,9 @@ rustup default {toolchain}
         if self.uses_yum() or self.uses_zypper():
             patterns += ["wezterm-*.rpm"]
         elif "win" in self.name:
-            patterns += ["WezTerm-*.zip", "WezTerm-*.exe"]
+            patterns += ["ThinkTerm-*.zip", "ThinkTerm-*.exe"]
         elif "mac" in self.name:
-            patterns += ["WezTerm-*.zip"]
+            patterns += ["ThinkTerm-*.zip"]
         elif ("ubuntu" in self.name) or ("debian" in self.name):
             patterns += ["wezterm-*.deb", "wezterm-*.xz"]
         elif "alpine" in self.name:
@@ -703,10 +703,10 @@ rustup default {toolchain}
             return []
         return [
             ActionStep(
-                "Checkout flathub/org.wezfurlong.wezterm",
+                "Checkout flathub/com.roversx.thinkterm",
                 action="actions/checkout@v4",
                 params={
-                    "repository": "flathub/org.wezfurlong.wezterm",
+                    "repository": "flathub/com.roversx.thinkterm",
                     "path": "flathub",
                     "token": "${{ secrets.GH_PAT }}",
                 },
@@ -717,7 +717,7 @@ rustup default {toolchain}
             ),
             RunStep(
                 "Submit PR",
-                'cd flathub && gh pr create --fill --body "PR automatically created by release automation in the wezterm repo"',
+                'cd flathub && gh pr create --fill --body "PR automatically created by release automation in the ThinkTerm repo"',
                 env={
                     "GITHUB_TOKEN": "${{ secrets.GH_PAT }}",
                 },
@@ -725,93 +725,17 @@ rustup default {toolchain}
         ]
 
     def create_winget_pr(self):
-        steps = []
-        if "windows" in self.name:
-            steps += [
-                ActionStep(
-                    "Checkout winget-pkgs",
-                    action="actions/checkout@v4",
-                    params={
-                        "repository": "wez/winget-pkgs",
-                        "path": "winget-pkgs",
-                        "token": "${{ secrets.GH_PAT }}",
-                    },
-                ),
-                RunStep(
-                    "Setup email for winget repo",
-                    "cd winget-pkgs && git config user.email wez@wezfurlong.org",
-                ),
-                RunStep(
-                    "Setup name for winget repo",
-                    "cd winget-pkgs && git config user.name 'Wez Furlong'",
-                ),
-                RunStep(
-                    "Create winget manifest and push to fork",
-                    "bash ci/make-winget-pr.sh winget-pkgs WezTerm-*.exe",
-                ),
-                RunStep(
-                    "Submit PR",
-                    'cd winget-pkgs && gh pr create --fill --body "PR automatically created by release automation in the wezterm repo"',
-                    env={
-                        "GITHUB_TOKEN": "${{ secrets.GH_PAT }}",
-                    },
-                ),
-            ]
-
-        return steps
+        # ThinkTerm release uploads are enabled for RoversX/thinkterm, but the
+        # upstream Winget automation still targets wez-owned forks and paths.
+        # Keep publishing to GitHub releases; re-enable this after a ThinkTerm
+        # Winget fork/package id is configured.
+        return []
 
     def update_homebrew_tap(self):
-        steps = []
-        if "macos" in self.name:
-            steps += [
-                ActionStep(
-                    "Checkout homebrew tap",
-                    action="actions/checkout@v4",
-                    params={
-                        "repository": "wez/homebrew-wezterm",
-                        "path": "homebrew-wezterm",
-                        "token": "${{ secrets.GH_PAT }}",
-                    },
-                ),
-                RunStep(
-                    "Update homebrew tap formula",
-                    "cp wezterm.rb homebrew-wezterm/Casks/wezterm.rb",
-                ),
-                ActionStep(
-                    "Commit homebrew tap changes",
-                    action="stefanzweifel/git-auto-commit-action@v5",
-                    params={
-                        "commit_message": "Automated update to match latest tag",
-                        "repository": "homebrew-wezterm",
-                    },
-                ),
-            ]
-        elif self.app_image:
-            steps += [
-                ActionStep(
-                    "Checkout linuxbrew tap",
-                    action="actions/checkout@v4",
-                    params={
-                        "repository": "wez/homebrew-wezterm-linuxbrew",
-                        "path": "linuxbrew-wezterm",
-                        "token": "${{ secrets.GH_PAT }}",
-                    },
-                ),
-                RunStep(
-                    "Update linuxbrew tap formula",
-                    "cp wezterm-linuxbrew.rb linuxbrew-wezterm/Formula/wezterm.rb",
-                ),
-                ActionStep(
-                    "Commit linuxbrew tap changes",
-                    action="stefanzweifel/git-auto-commit-action@v5",
-                    params={
-                        "commit_message": "Automated update to match latest tag",
-                        "repository": "linuxbrew-wezterm",
-                    },
-                ),
-            ]
-
-        return steps
+        # The upstream tap automation still targets Wez-owned Homebrew taps.
+        # Do not run it from ThinkTerm tag uploads; configure ThinkTerm-owned
+        # taps before restoring this.
+        return []
 
     def global_env(self):
         self.env["CARGO_INCREMENTAL"] = "0"
@@ -1087,7 +1011,7 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     needs: build
-    if: github.repository == 'wezterm/wezterm'
+    if: github.repository == 'RoversX/thinkterm'
     permissions:
       contents: write
       pages: write

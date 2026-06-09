@@ -102,13 +102,13 @@ case $OSTYPE in
 
     ;;
   msys)
-    zipdir=WezTerm-windows-$TAG_NAME
+    zipdir=ThinkTerm-windows-$TAG_NAME
     if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-      zipname=WezTerm-windows-nightly.zip
-      instname=WezTerm-nightly-setup
+      zipname=ThinkTerm-windows-nightly.zip
+      instname=ThinkTerm-nightly-setup
     else
       zipname=$zipdir.zip
-      instname=WezTerm-${TAG_NAME}-setup
+      instname=ThinkTerm-${TAG_NAME}-setup
     fi
     rm -rf $zipdir $zipname
     mkdir $zipdir
@@ -189,23 +189,23 @@ BUILDEOFEOF
 Name: wezterm
 Version: ${WEZTERM_RPM_VERSION}
 Release: ${SPEC_RELEASE}
-Packager: Wez Furlong <wez@wezfurlong.org>
+Packager: RoversX
 License: MIT
-URL: https://wezterm.org/
-Summary: Wez's Terminal Emulator.
+URL: https://github.com/RoversX/thinkterm
+Summary: ThinkTerm workspace-first terminal emulator.
 ${BUILD_REQUIRES}
 Requires: wezterm-common, wezterm-gui, wezterm-mux-server
 
 %global debug_package %{nil}
 
 %description
-wezterm is a terminal emulator with support for modern features
+ThinkTerm is a terminal emulator with support for modern features
 such as fonts with ligatures, hyperlinks, tabs and multiple
 windows.
 
 # Subpackage: wezterm-common
 %package -n wezterm-common
-Summary: Wez's Terminal Emulator - Common CLI components
+Summary: ThinkTerm - Common CLI components
 Requires: openssl
 %description -n wezterm-common
 wezterm-common provides the base CLI launcher and utilities shared by
@@ -213,7 +213,7 @@ all wezterm components.
 
 # Subpackage: wezterm-gui
 %package -n wezterm-gui
-Summary: Wez's Terminal Emulator - GUI and multiplexer
+Summary: ThinkTerm - GUI and multiplexer
 Requires: wezterm-common
 %if 0%{?suse_version}
 Requires: dbus-1, fontconfig, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-egl1, libwayland-cursor0, Mesa-libEGL1, libxcb-keysyms1, libxcb-ewmh2, libxcb-icccm4
@@ -227,7 +227,7 @@ tabs and multiple windows.
 
 # Subpackage: wezterm-mux-server
 %package -n wezterm-mux-server
-Summary: Wez's Terminal Emulator - Multiplexer server (headless)
+Summary: ThinkTerm - Multiplexer server (headless)
 Requires: openssl
 %description -n wezterm-mux-server
 wezterm-mux-server is a headless terminal multiplexer that can be used
@@ -248,9 +248,9 @@ install -Dsm755 $TARGET_DIR/release/strip-ansi-escapes -t %{buildroot}/usr/bin
 install -Dm644 assets/shell-integration/* -t %{buildroot}/etc/profile.d
 install -Dm644 assets/shell-completion/zsh %{buildroot}/usr/share/zsh/site-functions/_wezterm
 install -Dm644 assets/shell-completion/bash %{buildroot}/etc/bash_completion.d/wezterm
-install -Dm644 assets/icon/terminal.png %{buildroot}/usr/share/icons/hicolor/128x128/apps/org.wezfurlong.wezterm.png
-install -Dm644 assets/wezterm.desktop %{buildroot}/usr/share/applications/org.wezfurlong.wezterm.desktop
-install -Dm644 assets/wezterm.appdata.xml %{buildroot}/usr/share/metainfo/org.wezfurlong.wezterm.appdata.xml
+install -Dm644 assets/icon/terminal.png %{buildroot}/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
+install -Dm644 assets/wezterm.desktop %{buildroot}/usr/share/applications/com.roversx.thinkterm.desktop
+install -Dm644 assets/wezterm.appdata.xml %{buildroot}/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 
 %files
@@ -266,9 +266,9 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 %files -n wezterm-gui
 /usr/bin/open-wezterm-here
 /usr/bin/wezterm-gui
-/usr/share/icons/hicolor/128x128/apps/org.wezfurlong.wezterm.png
-/usr/share/applications/org.wezfurlong.wezterm.desktop
-/usr/share/metainfo/org.wezfurlong.wezterm.appdata.xml
+/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
+/usr/share/applications/com.roversx.thinkterm.desktop
+/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 /usr/share/nautilus-python/extensions/wezterm-nautilus.py*
 
 %files -n wezterm-mux-server
@@ -304,16 +304,16 @@ Package: $pkgname
 Version: ${TAG_NAME#nightly-}
 Conflicts: $conflicts
 Architecture: $(dpkg-architecture -q DEB_BUILD_ARCH_CPU)
-Maintainer: Wez Furlong <wez@wezfurlong.org>
+Maintainer: RoversX
 Section: utils
 Priority: optional
-Homepage: https://wezterm.org/
-Description: Wez's Terminal Emulator.
- wezterm is a terminal emulator with support for modern features
+Homepage: https://github.com/RoversX/thinkterm
+Description: ThinkTerm workspace-first terminal emulator.
+ ThinkTerm is a terminal emulator with support for modern features
  such as fonts with ligatures, hyperlinks, tabs and multiple
  windows.
 Provides: x-terminal-emulator
-Source: https://wezterm.org/
+Source: https://github.com/RoversX/thinkterm
 EOF
 
         cat > pkg/debian/postinst <<EOF
@@ -348,9 +348,9 @@ EOF
         echo $deps | sed -e 's/shlibs:Depends=/Depends: /' >> pkg/debian/DEBIAN/control
         cat pkg/debian/DEBIAN/control
 
-        install -Dm644 assets/icon/terminal.png pkg/debian/usr/share/icons/hicolor/128x128/apps/org.wezfurlong.wezterm.png
-        install -Dm644 assets/wezterm.desktop pkg/debian/usr/share/applications/org.wezfurlong.wezterm.desktop
-        install -Dm644 assets/wezterm.appdata.xml pkg/debian/usr/share/metainfo/org.wezfurlong.wezterm.appdata.xml
+        install -Dm644 assets/icon/terminal.png pkg/debian/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
+        install -Dm644 assets/wezterm.desktop pkg/debian/usr/share/applications/com.roversx.thinkterm.desktop
+        install -Dm644 assets/wezterm.appdata.xml pkg/debian/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
         install -Dm644 assets/wezterm-nautilus.py pkg/debian/usr/share/nautilus-python/extensions/wezterm-nautilus.py
         install -Dm644 assets/shell-completion/bash pkg/debian/usr/share/bash-completion/completions/wezterm
         install -Dm644 assets/shell-completion/zsh pkg/debian/usr/share/zsh/functions/Completion/Unix/_wezterm
@@ -394,11 +394,11 @@ pkgname=wezterm
 pkgver=$(echo "$pkgver" | cut -d'-' -f1-2 | tr - .)
 _pkgver=$pkgver
 pkgrel=0
-pkgdesc="A GPU-accelerated cross-platform terminal emulator and multiplexer written in Rust"
+pkgdesc="A workspace-first terminal emulator and multiplexer written in Rust"
 license="MIT"
 arch="all"
 options="!check"
-url="https://wezterm.org/"
+url="https://github.com/RoversX/thinkterm"
 makedepends="cmd:tic"
 source="
   $TARGET_DIR/release/wezterm
@@ -423,12 +423,12 @@ package() {
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm-gui
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm-mux-server
 
-  install -Dm644 -t "\$pkgdir"/usr/share/applications "\$srcdir"/wezterm.desktop
-  install -Dm644 -t "\$pkgdir"/usr/share/metainfo "\$srcdir"/wezterm.appdata.xml
-  install -Dm644 "\$srcdir"/terminal.png "\$pkgdir"/usr/share/pixmaps/wezterm.png
-  install -Dm644 "\$srcdir"/wezterm-icon.svg "\$pkgdir"/usr/share/pixmaps/wezterm.svg
-  install -Dm644 "\$srcdir"/terminal.png "\$pkgdir"/usr/share/icons/hicolor/128x128/apps/wezterm.png
-  install -Dm644 "\$srcdir"/wezterm-icon.svg "\$pkgdir"/usr/share/icons/hicolor/scalable/apps/wezterm.svg
+  install -Dm644 "\$srcdir"/wezterm.desktop "\$pkgdir"/usr/share/applications/com.roversx.thinkterm.desktop
+  install -Dm644 "\$srcdir"/wezterm.appdata.xml "\$pkgdir"/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
+  install -Dm644 "\$srcdir"/terminal.png "\$pkgdir"/usr/share/pixmaps/com.roversx.thinkterm.png
+  install -Dm644 "\$srcdir"/wezterm-icon.svg "\$pkgdir"/usr/share/pixmaps/com.roversx.thinkterm.svg
+  install -Dm644 "\$srcdir"/terminal.png "\$pkgdir"/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
+  install -Dm644 "\$srcdir"/wezterm-icon.svg "\$pkgdir"/usr/share/icons/hicolor/scalable/apps/com.roversx.thinkterm.svg
   install -Dm644 "\$builddir"/wezterm.terminfo "\$pkgdir"/usr/share/terminfo/w/wezterm
 }
 EOF

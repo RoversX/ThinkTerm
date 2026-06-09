@@ -17,8 +17,8 @@ _wezterm() {
     _arguments "${_arguments_options[@]}" \
 '(-n --skip-config)--config-file=[Specify the configuration file to use, overrides the normal configuration file resolution]:CONFIG_FILE:_files' \
 '*--config=[Override specific configuration values]:name=value: ' \
-'-n[Skip loading wezterm.lua]' \
-'--skip-config[Skip loading wezterm.lua]' \
+'-n[Skip loading the ThinkTerm configuration]' \
+'--skip-config[Skip loading the ThinkTerm configuration]' \
 '-h[Print help]' \
 '--help[Print help]' \
 '-V[Print version]' \
@@ -35,7 +35,7 @@ _wezterm() {
             (start)
 _arguments "${_arguments_options[@]}" \
 '--cwd=[Specify the current working directory for the initially spawned program]:CWD:_files -/' \
-'--class=[Override the default windowing system class. The default is "org.wezfurlong.wezterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this instance of wezterm, including error, update and ssh authentication dialogs]:CLASS: ' \
+'--class=[Override the default windowing system class. The default is "com.roversx.thinkterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this ThinkTerm instance, including error, update and ssh authentication dialogs]:CLASS: ' \
 '--workspace=[Override the default workspace with the provided name. The default is "default"]:WORKSPACE: ' \
 '--position=[Override the position for the initial window launched by this process.]:POSITION: ' \
 '--domain=[Name of the multiplexer domain section from the configuration to which you'\''d like to connect. If omitted, the default domain will be used]:DOMAIN: ' \
@@ -52,7 +52,7 @@ _arguments "${_arguments_options[@]}" \
 (blocking-start)
 _arguments "${_arguments_options[@]}" \
 '--cwd=[Specify the current working directory for the initially spawned program]:CWD:_files -/' \
-'--class=[Override the default windowing system class. The default is "org.wezfurlong.wezterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this instance of wezterm, including error, update and ssh authentication dialogs]:CLASS: ' \
+'--class=[Override the default windowing system class. The default is "com.roversx.thinkterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this ThinkTerm instance, including error, update and ssh authentication dialogs]:CLASS: ' \
 '--workspace=[Override the default workspace with the provided name. The default is "default"]:WORKSPACE: ' \
 '--position=[Override the position for the initial window launched by this process.]:POSITION: ' \
 '--domain=[Name of the multiplexer domain section from the configuration to which you'\''d like to connect. If omitted, the default domain will be used]:DOMAIN: ' \
@@ -70,7 +70,7 @@ _arguments "${_arguments_options[@]}" \
 _arguments "${_arguments_options[@]}" \
 '*-o+[Override specific SSH configuration options. \`wezterm ssh\` is able to parse some (but not all!) options from your \`~/.ssh/config\` and \`/etc/ssh/ssh_config\` files. This command line switch allows you to override or otherwise specify ssh_config style options]:name=value: ' \
 '*--ssh-option=[Override specific SSH configuration options. \`wezterm ssh\` is able to parse some (but not all!) options from your \`~/.ssh/config\` and \`/etc/ssh/ssh_config\` files. This command line switch allows you to override or otherwise specify ssh_config style options]:name=value: ' \
-'--class=[Override the default windowing system class. The default is "org.wezfurlong.wezterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this instance of wezterm, including error, update and ssh authentication dialogs]:CLASS: ' \
+'--class=[Override the default windowing system class. The default is "com.roversx.thinkterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this ThinkTerm instance, including error, update and ssh authentication dialogs]:CLASS: ' \
 '--position=[Override the position for the initial window launched by this process.]:POSITION: ' \
 '-v[Enable verbose ssh protocol tracing. The trace information is printed to the stderr stream of the process]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -82,7 +82,7 @@ _arguments "${_arguments_options[@]}" \
 (serial)
 _arguments "${_arguments_options[@]}" \
 '--baud=[Set the baud rate.  The default is 9600 baud]:BAUD: ' \
-'--class=[Override the default windowing system class. The default is "org.wezfurlong.wezterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this instance of wezterm, including error, update and ssh authentication dialogs]:CLASS: ' \
+'--class=[Override the default windowing system class. The default is "com.roversx.thinkterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this ThinkTerm instance, including error, update and ssh authentication dialogs]:CLASS: ' \
 '--position=[Override the position for the initial window launched by this process.]:POSITION: ' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -91,7 +91,7 @@ _arguments "${_arguments_options[@]}" \
 ;;
 (connect)
 _arguments "${_arguments_options[@]}" \
-'--class=[Override the default windowing system class. The default is "org.wezfurlong.wezterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this instance of wezterm, including error, update and ssh authentication dialogs]:CLASS: ' \
+'--class=[Override the default windowing system class. The default is "com.roversx.thinkterm". Under X11 and Windows this changes the window class. Under Wayland this changes the app_id. This changes the class for all windows spawned by this ThinkTerm instance, including error, update and ssh authentication dialogs]:CLASS: ' \
 '--workspace=[Override the default workspace with the provided name. The default is "default"]:WORKSPACE: ' \
 '--position=[Override the position for the initial window launched by this process.]:POSITION: ' \
 '--new-tab[When spawning into an existing GUI instance, spawn a new tab into the active window rather than spawn a new window]' \

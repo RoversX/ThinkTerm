@@ -9,9 +9,9 @@ install -Dsm755 -t AppDir/usr/bin target/release/wezterm-mux-server
 install -Dsm755 -t AppDir/usr/bin target/release/wezterm
 install -Dsm755 -t AppDir/usr/bin target/release/wezterm-gui
 install -Dsm755 -t AppDir/usr/bin target/release/strip-ansi-escapes
-install -Dm644 assets/icon/terminal.png AppDir/usr/share/icons/hicolor/128x128/apps/org.wezfurlong.wezterm.png
-install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/org.wezfurlong.wezterm.desktop
-install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/org.wezfurlong.wezterm.appdata.xml
+install -Dm644 assets/icon/terminal.png AppDir/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
+install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/com.roversx.thinkterm.desktop
+install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py AppDir/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 
 [ -x /tmp/linuxdeploy ] || ( curl -L 'https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage' -o /tmp/linuxdeploy && chmod +x /tmp/linuxdeploy )
@@ -23,11 +23,11 @@ distver=$(lsb_release -rs 2>/dev/null || sh -c "source /etc/os-release && echo \
 # Embed appropriate update info
 # https://github.com/AppImage/AppImageSpec/blob/master/draft.md#github-releases
 if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-  UPDATE="gh-releases-zsync|wez|wezterm|nightly|WezTerm-*.AppImage.zsync"
-  OUTPUT=WezTerm-nightly-$distro$distver.AppImage
+  UPDATE="gh-releases-zsync|RoversX|thinkterm|nightly|ThinkTerm-*.AppImage.zsync"
+  OUTPUT=ThinkTerm-nightly-$distro$distver.AppImage
 else
-  UPDATE="gh-releases-zsync|wez|wezterm|latest|WezTerm-*.AppImage.zsync"
-  OUTPUT=WezTerm-$TAG_NAME-$distro$distver.AppImage
+  UPDATE="gh-releases-zsync|RoversX|thinkterm|latest|ThinkTerm-*.AppImage.zsync"
+  OUTPUT=ThinkTerm-$TAG_NAME-$distro$distver.AppImage
 fi
 
 # Munge the path so that it finds our appstreamcli wrapper

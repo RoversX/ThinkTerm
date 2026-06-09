@@ -158,9 +158,9 @@
             mkdir -p $out/nix-support
             echo "${passthru.terminfo}" >> $out/nix-support/propagated-user-env-packages
 
-            install -Dm644 assets/icon/terminal.png $out/share/icons/hicolor/128x128/apps/org.wezfurlong.wezterm.png
-            install -Dm644 assets/wezterm.desktop $out/share/applications/org.wezfurlong.wezterm.desktop
-            install -Dm644 assets/wezterm.appdata.xml $out/share/metainfo/org.wezfurlong.wezterm.appdata.xml
+            install -Dm644 assets/icon/terminal.png $out/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
+            install -Dm644 assets/wezterm.desktop $out/share/applications/com.roversx.thinkterm.desktop
+            install -Dm644 assets/wezterm.appdata.xml $out/share/metainfo/com.roversx.thinkterm.appdata.xml
 
             install -Dm644 assets/shell-integration/wezterm.sh -t $out/etc/profile.d
             installShellCompletion --cmd wezterm \

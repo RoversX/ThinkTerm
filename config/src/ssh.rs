@@ -81,7 +81,7 @@ pub struct SshDomain {
     #[dynamic(default)]
     pub overlay_lag_indicator: bool,
 
-    /// The path to the wezterm binary on the remote host
+    /// The path to a compatible ThinkTerm/WezTerm mux binary on the remote host
     pub remote_wezterm_path: Option<String>,
     /// Override the entire `wezterm cli proxy` invocation that would otherwise
     /// be computed from remote_wezterm_path and other information.
@@ -91,7 +91,7 @@ pub struct SshDomain {
 
     /// If false, then don't use a multiplexer connection,
     /// just connect directly using ssh. This doesn't require
-    /// that the remote host have wezterm installed, and is equivalent
+    /// that the remote host have a compatible mux binary installed, and is equivalent
     /// to using `wezterm ssh` to connect.
     #[dynamic(default)]
     pub multiplexing: SshMultiplexing,

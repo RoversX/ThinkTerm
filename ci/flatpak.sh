@@ -18,6 +18,6 @@ if [ "${CI}" != "yes" ] ; then
   flatpak-builder \
     --state-dir /var/tmp/wezterm-flatpak-builder \
     --install /var/tmp/wezterm-flatpak-repo \
-    assets/flatpak/org.wezfurlong.wezterm.json \
+    assets/flatpak/com.roversx.thinkterm.json \
     --force-clean --user -y
 fi

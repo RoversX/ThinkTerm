@@ -3,14 +3,11 @@ set -x
 name="$1"
 
 notes=$(cat <<EOT
-See https://wezterm.org/changelog.html#$name for the changelog
+See https://github.com/RoversX/thinkterm/releases/tag/$name for the release notes
 
 If you're looking for nightly downloads or more detailed installation instructions:
 
-[Windows](https://wezterm.org/install/windows.html)
-[macOS](https://wezterm.org/install/macos.html)
-[Linux](https://wezterm.org/install/linux.html)
-[FreeBSD](https://wezterm.org/install/freebsd.html)
+[ThinkTerm releases](https://github.com/RoversX/thinkterm/releases)
 EOT
 )
 

@@ -301,7 +301,7 @@ fn read_from_pane_pty(
             localpane::emit_output_for_pane(
                 pane_id,
                 &format!(
-                    "⚠️  wezterm: read_from_pane_pty: \
+                    "⚠️  ThinkTerm: read_from_pane_pty: \
                     Unable to allocate a socketpair: {err:#}"
                 ),
             );

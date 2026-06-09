@@ -1,6 +1,6 @@
 # Maintainer:  Wez Furlong <wez at wezfurlong dot org>
 # NOTE: if you're looking at this on AUR, this file is generated from
-# https://github.com/wezterm/wezterm/blob/main/ci/PKGBUILD.template
+# https://github.com/RoversX/thinkterm/blob/main/ci/PKGBUILD.template
 # by automation in the wezterm repo.
 
 pkgname=wezterm-bin
@@ -9,7 +9,7 @@ pkgver=$(echo $_tag | tr - .)
 pkgrel=2
 pkgdesc='A GPU-accelerated cross-platform terminal emulator and multiplexer implemented in Rust'
 arch=('i686' 'x86_64')
-url='https://wezterm.org'
+url='https://github.com/RoversX/thinkterm'
 license=('MIT')
 provides=('wezterm')
 conflicts=('wezterm')
@@ -27,11 +27,11 @@ depends=(
   'xcb-util-wm'
 )
 optdepends=(
-  'python-nautilus: WezTerm context menu in Nautilus'
+  'python-nautilus: ThinkTerm context menu in Nautilus'
 )
 source=(
-  "wezterm::https://github.com/wezterm/wezterm/releases/download/${_tag}/WezTerm-${_tag}-Ubuntu16.04.AppImage"
-  'LICENSE::https://github.com/wezterm/wezterm/raw/main/LICENSE.md'
+  "wezterm::https://github.com/RoversX/thinkterm/releases/download/${_tag}/ThinkTerm-${_tag}-Ubuntu20.04.AppImage"
+  'LICENSE::https://github.com/RoversX/thinkterm/raw/main/LICENSE.md'
 )
 sha256sums=(
   '@SHA256@'
@@ -55,10 +55,10 @@ package() {
   install -Dm755 squashfs-root/usr/bin/wezterm-gui -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/wezterm-mux-server -t "${pkgdir}/usr/bin/"
   install -Dm644 LICENSE -t "${pkgdir}/usr/share/licenses/${pkgname}"
-  install -Dm644 squashfs-root/usr/share/icons/hicolor/128x128/apps/org.wezfurlong.wezterm.png \
-                 "${pkgdir}/usr/share/icons/hicolor/128x128/apps/org.wezfurlong.wezterm.png"
-  install -Dm644 squashfs-root/usr/share/applications/org.wezfurlong.wezterm.desktop \
-                 "${pkgdir}/usr/share/applications/org.wezfurlong.wezterm.desktop"
+  install -Dm644 squashfs-root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png \
+                 "${pkgdir}/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png"
+  install -Dm644 squashfs-root/usr/share/applications/com.roversx.thinkterm.desktop \
+                 "${pkgdir}/usr/share/applications/com.roversx.thinkterm.desktop"
   install -Dm644 squashfs-root/usr/share/nautilus-python/extensions/wezterm-nautilus.py \
                  "${pkgdir}/usr/share/nautilus-python/extensions/wezterm-nautilus.py"
 }

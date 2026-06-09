@@ -46,7 +46,7 @@ class OpenInWezTermAction(GObject.GObject, Nautilus.MenuProvider):
             pid = int(child.get_identifier())
             props = [("PIDs", GLib.Variant('au', [pid])),
                 ('CollectMode', GLib.Variant('s', 'inactive-or-failed'))]
-            name = 'app-nautilus-org.wezfurlong.wezterm-{}.scope'.format(pid)
+            name = 'app-nautilus-com.roversx.thinkterm-{}.scope'.format(pid)
             args = GLib.Variant('(ssa(sv)a(sa(sv)))', (name, 'fail', props, []))
             self._systemd.call_sync('StartTransientUnit', args,
                     Gio.DBusCallFlags.NO_AUTO_START, 500, None)
@@ -56,8 +56,8 @@ class OpenInWezTermAction(GObject.GObject, Nautilus.MenuProvider):
             self._open_terminal(path)
 
     def _make_item(self, name, paths):
-        item = Nautilus.MenuItem(name=name, label='Open in WezTerm',
-            icon='org.wezfurlong.wezterm')
+        item = Nautilus.MenuItem(name=name, label='Open in ThinkTerm',
+            icon='com.roversx.thinkterm')
         item.connect('activate', self._menu_item_activated, paths)
         return item
 

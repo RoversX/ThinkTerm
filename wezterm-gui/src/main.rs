@@ -82,7 +82,7 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
     version = config::wezterm_version()
 )]
 struct Opt {
-    /// Skip loading wezterm.lua
+    /// Skip loading the ThinkTerm configuration
     #[arg(long, short = 'n')]
     skip_config: bool,
 
@@ -421,6 +421,9 @@ async fn async_run_terminal_gui(
     opts: StartCommand,
     should_publish: bool,
 ) -> anyhow::Result<()> {
+    config::create_user_owned_dirs(&*config::RUNTIME_DIR)?;
+    config::create_user_owned_dirs(&*config::CACHE_DIR)?;
+
     let unix_socket_path =
         config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
     std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());
@@ -571,9 +574,10 @@ impl Publish {
                             anyhow::bail!(
                                 "Running GUI is a different executable from us, will start a new one");
                         }
-                        if vers.config_file_path
-                            != std::env::var_os("WEZTERM_CONFIG_FILE").map(Into::into)
-                        {
+                        let config_file_path = std::env::var_os("THINKTERM_CONFIG_FILE")
+                            .or_else(|| std::env::var_os("WEZTERM_CONFIG_FILE"))
+                            .map(Into::into);
+                        if vers.config_file_path != config_file_path {
                             *self = Publish::NoConnectNoPublish;
                             anyhow::bail!(
                                 "Running GUI has different config from us, will start a new one"
@@ -632,8 +636,8 @@ impl Publish {
                     match res {
                         Ok(res) => {
                             log::info!(
-                                "Spawned your command via the existing GUI instance. \
-                             Use wezterm start --always-new-process if you do not want this behavior. \
+                                "Spawned your command via the existing ThinkTerm GUI instance. \
+                             Use thinkterm start --always-new-process if you do not want this behavior. \
                              Result={:?}",
                                 res
                             );
@@ -1188,7 +1192,7 @@ fn run() -> anyhow::Result<()> {
     {
         unsafe {
             ::windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
-                ::windows::core::PCWSTR(wide_string("org.wezfurlong.wezterm").as_ptr()),
+                ::windows::core::PCWSTR(wide_string("com.roversx.thinkterm").as_ptr()),
             )
             .unwrap();
         }

@@ -9,7 +9,7 @@ cask "thinkterm" do
 
   url "https://github.com/RoversX/thinkterm/releases/download/#{version}/ThinkTerm-macos-#{version}.zip"
   name "ThinkTerm"
-  desc "A workspace-first terminal based on WezTerm"
+  desc "A workspace-first terminal"
   homepage "https://github.com/RoversX/thinkterm"
 
   conflicts_with cask: [

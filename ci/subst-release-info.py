@@ -18,9 +18,9 @@ CATEGORIZE = {
     r"Ubuntu20.04.tar.xz$": "linux_raw_bin",
     r"^wezterm-\d+-\d+-[a-f0-9]+.tar.xz$": "linux_raw_bin",
     r"src.tar.gz$": "src",
-    r"^WezTerm-macos-.*.zip$": "macos_zip",
-    r"^WezTerm-windows-.*.zip$": "windows_zip",
-    r"^WezTerm-.*.setup.exe$": "windows_exe",
+    r"^ThinkTerm-macos-.*.zip$": "macos_zip",
+    r"^ThinkTerm-windows-.*.zip$": "windows_zip",
+    r"^ThinkTerm-.*.setup.exe$": "windows_exe",
     r"alpine(\d+)\.(\d+)(:?-\S+)?.apk": "alpine\\1_\\2_apk",
 }
 

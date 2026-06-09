@@ -93,12 +93,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: "macos"
-          path: "WezTerm-*.zip"
+          path: "ThinkTerm-*.zip"
 
   upload:
     runs-on: ubuntu-latest
     needs: build
-    if: github.repository == 'wezterm/wezterm'
+    if: github.repository == 'RoversX/thinkterm'
     permissions:
       contents: write
       pages: write
@@ -107,27 +107,13 @@ jobs:
     steps:
       - name: "checkout repo"
         uses: actions/checkout@v4
-      - name: "Checkout homebrew tap"
-        uses: actions/checkout@v4
-        with:
-          repository: "wez/homebrew-wezterm"
-          path: "homebrew-wezterm"
-          token: "${{ secrets.GH_PAT }}"
-      - name: "Update homebrew tap formula"
-        shell: bash
-        run: "cp wezterm.rb homebrew-wezterm/Casks/wezterm.rb"
-      - name: "Commit homebrew tap changes"
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Automated update to match latest tag"
-          repository: "homebrew-wezterm"
       - name: "Download artifact"
         uses: actions/download-artifact@v4
         with:
           name: "macos"
       - name: "Checksum"
         shell: bash
-        run: "for f in WezTerm-*.zip ; do sha256sum $f > $f.sha256 ; done"
+        run: "for f in ThinkTerm-*.zip ; do sha256sum $f > $f.sha256 ; done"
       - name: "Create pre-release"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -137,4 +123,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
-        run: "bash ci/retry.sh gh release upload --clobber $(ci/tag-name.sh) WezTerm-*.zip *.sha256"
+        run: "bash ci/retry.sh gh release upload --clobber $(ci/tag-name.sh) ThinkTerm-*.zip *.sha256"

@@ -82,10 +82,12 @@ pub fn fixup_appimage() {
         }
 
         /// Our config stuff exports these env vars to help portable apps locate
-        /// the correct environment when it is launched via wezterm.
-        /// However, if we are using the system wezterm to spawn a portable
+        /// the correct environment when it is launched via ThinkTerm.
+        /// However, if we are using the system ThinkTerm to spawn a portable
         /// AppImage then we want these to not take effect.
-        fn clean_wezterm_config_env() {
+        fn clean_thinkterm_config_env() {
+            std::env::remove_var("THINKTERM_CONFIG_FILE");
+            std::env::remove_var("THINKTERM_CONFIG_DIR");
             std::env::remove_var("WEZTERM_CONFIG_FILE");
             std::env::remove_var("WEZTERM_CONFIG_DIR");
         }
@@ -97,7 +99,7 @@ pub fn fixup_appimage() {
                 "HOME",
                 dirs_next::home_dir().expect("can't resolve HOME dir"),
             );
-            clean_wezterm_config_env();
+            clean_thinkterm_config_env();
         }
 
         if std::env::var("XDG_CONFIG_HOME")
@@ -107,7 +109,7 @@ pub fn fixup_appimage() {
             .unwrap_or_default()
         {
             std::env::remove_var("XDG_CONFIG_HOME");
-            clean_wezterm_config_env();
+            clean_thinkterm_config_env();
         }
     }
 }

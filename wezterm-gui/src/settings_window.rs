@@ -17,7 +17,7 @@ use anyhow::Context;
 use config::{configuration, Dimension, GeometryOrigin};
 use std::cell::RefCell;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -915,6 +915,56 @@ TOTAL                              94.4M      19.3M      19.3M         0K       
         );
         assert_eq!(parsed.malloc_resident, Some(192 * 1024));
         assert_eq!(parsed.text_resident, parse_vmmap_size("421.4M"));
+    }
+}
+
+#[cfg(test)]
+mod config_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn wezterm_import_candidates_do_not_search_thinkterm_config_dir() {
+        let candidates = SettingsWindow::wezterm_config_candidates();
+        let legacy_user_config_dir = std::env::var_os("XDG_CONFIG_HOME")
+            .map(|dir| PathBuf::from(dir).join("wezterm"))
+            .unwrap_or_else(|| config::HOME_DIR.join(".config").join("wezterm"));
+        assert!(candidates.contains(&legacy_user_config_dir.join("wezterm.lua")));
+        assert!(!candidates.contains(
+            &config::HOME_DIR
+                .join(".config")
+                .join("thinkterm")
+                .join("wezterm.lua")
+        ));
+    }
+
+    #[test]
+    fn thinkterm_import_entry_defaults_to_thinkterm_lua() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            SettingsWindow::preferred_thinkterm_config_entry(dir.path()),
+            dir.path().join("thinkterm.lua")
+        );
+    }
+
+    #[test]
+    fn thinkterm_import_entry_prefers_existing_thinkterm_lua() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("thinkterm.lua"), "").unwrap();
+        fs::write(dir.path().join("wezterm.lua"), "").unwrap();
+        assert_eq!(
+            SettingsWindow::preferred_thinkterm_config_entry(dir.path()),
+            dir.path().join("thinkterm.lua")
+        );
+    }
+
+    #[test]
+    fn thinkterm_import_entry_preserves_legacy_wezterm_lua_without_native_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("wezterm.lua"), "").unwrap();
+        assert_eq!(
+            SettingsWindow::preferred_thinkterm_config_entry(dir.path()),
+            dir.path().join("wezterm.lua")
+        );
     }
 }
 
@@ -3275,7 +3325,7 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 2.0,
             row_width,
-            "Small ThinkTerm-native state; terminal config stays in ThinkTerm's own wezterm.lua.",
+            "Small ThinkTerm-native state; terminal config stays in ThinkTerm's own thinkterm.lua.",
             true,
         )?;
         self.paint_main_renderer_row(layers, row_x, first_row_y + row_step * 3.0, row_width, true)?;
@@ -6663,16 +6713,32 @@ impl SettingsWindow {
     }
 
     fn thinkterm_compatible_config_path() -> PathBuf {
-        config::HOME_DIR
-            .join(".config")
-            .join("thinkterm")
-            .join("wezterm.lua")
+        Self::preferred_thinkterm_config_entry(&config::HOME_DIR.join(".config").join("thinkterm"))
+    }
+
+    fn preferred_thinkterm_config_entry(config_dir: &Path) -> PathBuf {
+        let thinkterm = config_dir.join("thinkterm.lua");
+        let legacy = config_dir.join("wezterm.lua");
+        if thinkterm.exists() || !legacy.exists() {
+            thinkterm
+        } else {
+            legacy
+        }
     }
 
     fn wezterm_config_candidates() -> Vec<PathBuf> {
         let mut paths = vec![config::HOME_DIR.join(".wezterm.lua")];
-        for dir in config::CONFIG_DIRS.iter() {
-            paths.push(dir.join("wezterm.lua"));
+
+        let legacy_user_config_dir = std::env::var_os("XDG_CONFIG_HOME")
+            .map(|dir| PathBuf::from(dir).join("wezterm"))
+            .unwrap_or_else(|| config::HOME_DIR.join(".config").join("wezterm"));
+        paths.push(legacy_user_config_dir.join("wezterm.lua"));
+
+        #[cfg(unix)]
+        if let Some(dirs) = std::env::var_os("XDG_CONFIG_DIRS") {
+            for base in std::env::split_paths(&dirs) {
+                paths.push(base.join("wezterm").join("wezterm.lua"));
+            }
         }
         paths
     }

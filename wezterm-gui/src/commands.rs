@@ -1825,25 +1825,25 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_pipe_disconnected"),
         },
         OpenUri(uri) => match uri.as_ref() {
-            "https://wezterm.org/" => CommandDef {
+            "https://github.com/RoversX/thinkterm" => CommandDef {
                 brief: "Documentation".into(),
-                doc: "Visit the wezterm documentation website".into(),
+                doc: "Visit the ThinkTerm project page".into(),
                 keys: vec![],
                 args: &[],
                 menubar: &["Help"],
                 icon: Some("md_help"),
             },
-            "https://github.com/wezterm/wezterm/discussions/" => CommandDef {
+            "https://github.com/RoversX/thinkterm/discussions/" => CommandDef {
                 brief: "Discuss on GitHub".into(),
-                doc: "Visit wezterm's GitHub discussion".into(),
+                doc: "Visit ThinkTerm's GitHub discussions".into(),
                 keys: vec![],
                 args: &[],
                 menubar: &["Help"],
                 icon: Some("oct_comment_discussion"),
             },
-            "https://github.com/wezterm/wezterm/issues/" => CommandDef {
+            "https://github.com/RoversX/thinkterm/issues/" => CommandDef {
                 brief: "Search or report issue on GitHub".into(),
-                doc: "Visit wezterm's GitHub issues".into(),
+                doc: "Visit ThinkTerm's GitHub issues".into(),
                 keys: vec![],
                 args: &[],
                 menubar: &["Help"],
@@ -2293,9 +2293,9 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ShowLauncher,
         ShowTabNavigator,
         // ----------------- Help
-        OpenUri("https://wezterm.org/".to_string()),
-        OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),
-        OpenUri("https://github.com/wezterm/wezterm/issues/".to_string()),
+        OpenUri("https://github.com/RoversX/thinkterm".to_string()),
+        OpenUri("https://github.com/RoversX/thinkterm/discussions/".to_string()),
+        OpenUri("https://github.com/RoversX/thinkterm/issues/".to_string()),
         ShowDebugOverlay,
         // ----------------- Misc
         OpenLinkAtMouseCursor,

@@ -49,6 +49,14 @@ use wezterm_input_types::{
 use wezterm_term::TerminalSize;
 
 const MACOS_DEFAULT_COLOR_SCHEME: &str = "Apple System Colors";
+const PRODUCT_DIR_NAME: &str = "thinkterm";
+const LEGACY_PRODUCT_DIR_NAME: &str = "wezterm";
+const DURABLE_LEGACY_DATA_ITEMS: &[&str] = &[
+    "plugins",
+    "recent-commands.json",
+    "recent-emoji.json",
+    "repl-history",
+];
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
 pub struct Config {
@@ -1031,15 +1039,10 @@ impl Config {
         // multiple.  In addition, it spawns a lot of subprocesses,
         // so we do this bit "by-hand"
 
-        let mut paths = vec![
-            PathPossibility::optional(
-                HOME_DIR
-                    .join(".config")
-                    .join("thinkterm")
-                    .join("wezterm.lua"),
-            ),
-            PathPossibility::optional(HOME_DIR.join(".thinkterm.lua")),
-        ];
+        let mut paths = active_thinkterm_config_candidates(&HOME_DIR)
+            .into_iter()
+            .map(PathPossibility::optional)
+            .collect::<Vec<_>>();
 
         if cfg!(windows) {
             // On Windows, a common use case is to maintain a thumb drive
@@ -1053,11 +1056,16 @@ impl Config {
             if let Ok(exe_name) = std::env::current_exe() {
                 if let Some(exe_dir) = exe_name.parent() {
                     paths.insert(0, PathPossibility::optional(exe_dir.join("wezterm.lua")));
+                    paths.insert(0, PathPossibility::optional(exe_dir.join("thinkterm.lua")));
                 }
             }
         }
         if let Some(path) = std::env::var_os("WEZTERM_CONFIG_FILE") {
             log::trace!("Note: WEZTERM_CONFIG_FILE is set in the environment");
+            paths.insert(0, PathPossibility::required(path.into()));
+        }
+        if let Some(path) = std::env::var_os("THINKTERM_CONFIG_FILE") {
+            log::trace!("Note: THINKTERM_CONFIG_FILE is set in the environment");
             paths.insert(0, PathPossibility::required(path.into()));
         }
 
@@ -1085,9 +1093,11 @@ impl Config {
             }
         }
 
-        // We didn't find (or were asked to skip) a wezterm.lua file, so
+        // We didn't find (or were asked to skip) a config file, so
         // update the environment to make it simpler to understand this
         // state.
+        std::env::remove_var("THINKTERM_CONFIG_FILE");
+        std::env::remove_var("THINKTERM_CONFIG_DIR");
         std::env::remove_var("WEZTERM_CONFIG_FILE");
         std::env::remove_var("WEZTERM_CONFIG_DIR");
 
@@ -1118,12 +1128,22 @@ impl Config {
 
     pub fn load_file_for_import(path: &Path) -> anyhow::Result<ConfigImportResult> {
         struct EnvRestore {
+            thinkterm_config_file: Option<std::ffi::OsString>,
+            thinkterm_config_dir: Option<std::ffi::OsString>,
             config_file: Option<std::ffi::OsString>,
             config_dir: Option<std::ffi::OsString>,
         }
 
         impl Drop for EnvRestore {
             fn drop(&mut self) {
+                match self.thinkterm_config_file.take() {
+                    Some(value) => std::env::set_var("THINKTERM_CONFIG_FILE", value),
+                    None => std::env::remove_var("THINKTERM_CONFIG_FILE"),
+                }
+                match self.thinkterm_config_dir.take() {
+                    Some(value) => std::env::set_var("THINKTERM_CONFIG_DIR", value),
+                    None => std::env::remove_var("THINKTERM_CONFIG_DIR"),
+                }
                 match self.config_file.take() {
                     Some(value) => std::env::set_var("WEZTERM_CONFIG_FILE", value),
                     None => std::env::remove_var("WEZTERM_CONFIG_FILE"),
@@ -1136,6 +1156,8 @@ impl Config {
         }
 
         let _env_restore = EnvRestore {
+            thinkterm_config_file: std::env::var_os("THINKTERM_CONFIG_FILE"),
+            thinkterm_config_dir: std::env::var_os("THINKTERM_CONFIG_DIR"),
             config_file: std::env::var_os("WEZTERM_CONFIG_FILE"),
             config_dir: std::env::var_os("WEZTERM_CONFIG_DIR"),
         };
@@ -1208,8 +1230,10 @@ impl Config {
                 // problems earlier than we use them.
                 let _ = cfg.key_bindings();
 
+                std::env::set_var("THINKTERM_CONFIG_FILE", p);
                 std::env::set_var("WEZTERM_CONFIG_FILE", p);
                 if let Some(dir) = p.parent() {
+                    std::env::set_var("THINKTERM_CONFIG_DIR", dir);
                     std::env::set_var("WEZTERM_CONFIG_DIR", dir);
                 }
                 Ok((cfg, raw_keys))
@@ -1697,7 +1721,9 @@ impl Config {
             if !wsl_env.is_empty() {
                 wsl_env.push(':');
             }
-            wsl_env.push_str("TERM:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION");
+            wsl_env.push_str(
+                "TERM:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION:THINKTERM:THINKTERM_VERSION",
+            );
             cmd.env("WSLENV", wsl_env);
         }
 
@@ -1706,9 +1732,13 @@ impl Config {
         cmd.env("TERM", &self.term);
         cmd.env("COLORTERM", "truecolor");
         // TERM_PROGRAM and TERM_PROGRAM_VERSION are an emerging
-        // de-facto standard for identifying the terminal.
+        // de-facto standard for terminal capability detection. Keep the
+        // WezTerm identity for compatibility with third-party tools; use the
+        // THINKTERM variables below for ThinkTerm-specific detection.
         cmd.env("TERM_PROGRAM", "WezTerm");
         cmd.env("TERM_PROGRAM_VERSION", crate::wezterm_version());
+        cmd.env("THINKTERM", "1");
+        cmd.env("THINKTERM_VERSION", crate::wezterm_version());
     }
 }
 
@@ -1846,31 +1876,89 @@ fn default_font_size() -> f64 {
 }
 
 pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
-    if let Some(runtime) = dirs_next::cache_dir() {
-        return Ok(runtime.join("wezterm"));
+    if let Some(cache) = dirs_next::cache_dir() {
+        return Ok(cache.join(PRODUCT_DIR_NAME));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share").join(PRODUCT_DIR_NAME))
 }
 
 pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
-    if let Some(runtime) = dirs_next::data_dir() {
-        return Ok(runtime.join("wezterm"));
-    }
+    let base = dirs_next::data_dir().unwrap_or_else(|| crate::HOME_DIR.join(".local/share"));
+    let data_dir = base.join(PRODUCT_DIR_NAME);
+    migrate_legacy_data_dir(&base, &data_dir);
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(data_dir)
 }
 
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::runtime_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join(PRODUCT_DIR_NAME));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share").join(PRODUCT_DIR_NAME))
 }
 
 pub fn pki_dir() -> anyhow::Result<PathBuf> {
     compute_runtime_dir().map(|d| d.join("pki"))
+}
+
+fn active_thinkterm_config_candidates(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".config")
+            .join(PRODUCT_DIR_NAME)
+            .join("thinkterm.lua"),
+        home.join(".config")
+            .join(PRODUCT_DIR_NAME)
+            .join("wezterm.lua"),
+        home.join(".thinkterm.lua"),
+    ]
+}
+
+fn migrate_legacy_data_dir(base: &Path, data_dir: &Path) {
+    let legacy_dir = base.join(LEGACY_PRODUCT_DIR_NAME);
+    if !legacy_dir.exists() {
+        return;
+    }
+
+    if let Err(err) = crate::create_user_owned_dirs(data_dir) {
+        log::warn!(
+            "failed to create ThinkTerm data dir {} for legacy migration: {err:#}",
+            data_dir.display()
+        );
+        return;
+    }
+
+    for item in DURABLE_LEGACY_DATA_ITEMS {
+        let from = legacy_dir.join(item);
+        let to = data_dir.join(item);
+        if !from.exists() || to.exists() {
+            continue;
+        }
+        if let Err(err) = copy_legacy_data_item(&from, &to) {
+            log::warn!(
+                "failed to migrate legacy WezTerm data item {}: {err:#}",
+                from.display()
+            );
+        }
+    }
+}
+
+fn copy_legacy_data_item(from: &Path, to: &Path) -> anyhow::Result<()> {
+    let meta = std::fs::symlink_metadata(from)?;
+    if meta.is_file() {
+        if let Some(parent) = to.parent() {
+            crate::create_user_owned_dirs(parent)?;
+        }
+        std::fs::copy(from, to)?;
+    } else if meta.is_dir() {
+        crate::create_user_owned_dirs(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_legacy_data_item(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn default_read_timeout() -> Duration {
@@ -2304,9 +2392,17 @@ fn default_colr_rasterizer() -> FontRasterizerSelection {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, HOME_DIR};
+    use super::{
+        active_thinkterm_config_candidates, copy_legacy_data_item, migrate_legacy_data_dir, Config,
+        HOME_DIR, LEGACY_PRODUCT_DIR_NAME, PRODUCT_DIR_NAME,
+    };
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
+        thinkterm_config_file: Option<std::ffi::OsString>,
+        thinkterm_config_dir: Option<std::ffi::OsString>,
         config_file: Option<std::ffi::OsString>,
         config_dir: Option<std::ffi::OsString>,
     }
@@ -2314,6 +2410,8 @@ mod tests {
     impl EnvGuard {
         fn new() -> Self {
             Self {
+                thinkterm_config_file: std::env::var_os("THINKTERM_CONFIG_FILE"),
+                thinkterm_config_dir: std::env::var_os("THINKTERM_CONFIG_DIR"),
                 config_file: std::env::var_os("WEZTERM_CONFIG_FILE"),
                 config_dir: std::env::var_os("WEZTERM_CONFIG_DIR"),
             }
@@ -2322,6 +2420,14 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
+            match self.thinkterm_config_file.take() {
+                Some(value) => std::env::set_var("THINKTERM_CONFIG_FILE", value),
+                None => std::env::remove_var("THINKTERM_CONFIG_FILE"),
+            }
+            match self.thinkterm_config_dir.take() {
+                Some(value) => std::env::set_var("THINKTERM_CONFIG_DIR", value),
+                None => std::env::remove_var("THINKTERM_CONFIG_DIR"),
+            }
             match self.config_file.take() {
                 Some(value) => std::env::set_var("WEZTERM_CONFIG_FILE", value),
                 None => std::env::remove_var("WEZTERM_CONFIG_FILE"),
@@ -2340,7 +2446,10 @@ mod tests {
 
     #[test]
     fn import_loader_restores_env_and_collects_raw_keys() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::new();
+        std::env::set_var("THINKTERM_CONFIG_FILE", "/tmp/original-thinkterm.lua");
+        std::env::set_var("THINKTERM_CONFIG_DIR", "/tmp/original-thinkterm-dir");
         std::env::set_var("WEZTERM_CONFIG_FILE", "/tmp/original-wezterm.lua");
         std::env::set_var("WEZTERM_CONFIG_DIR", "/tmp/original-wezterm-dir");
 
@@ -2363,6 +2472,14 @@ return config
         assert!(imported.raw_keys.contains("font_size"));
         assert!(imported.raw_keys.contains("color_scheme"));
         assert_eq!(
+            std::env::var_os("THINKTERM_CONFIG_FILE").as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/original-thinkterm.lua"))
+        );
+        assert_eq!(
+            std::env::var_os("THINKTERM_CONFIG_DIR").as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/original-thinkterm-dir"))
+        );
+        assert_eq!(
             std::env::var_os("WEZTERM_CONFIG_FILE").as_deref(),
             Some(std::ffi::OsStr::new("/tmp/original-wezterm.lua"))
         );
@@ -2370,5 +2487,149 @@ return config
             std::env::var_os("WEZTERM_CONFIG_DIR").as_deref(),
             Some(std::ffi::OsStr::new("/tmp/original-wezterm-dir"))
         );
+    }
+
+    fn write_test_config(path: &std::path::Path, font_size: f64) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+local wezterm = require "wezterm"
+local config = wezterm.config_builder and wezterm.config_builder() or {{}}
+config.font_size = {font_size}
+return config
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn thinkterm_config_env_takes_precedence_over_legacy_env() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let thinkterm = dir.path().join("thinkterm.lua");
+        let wezterm = dir.path().join("wezterm.lua");
+        write_test_config(&thinkterm, 18.0);
+        write_test_config(&wezterm, 9.0);
+
+        std::env::set_var("THINKTERM_CONFIG_FILE", &thinkterm);
+        std::env::remove_var("THINKTERM_CONFIG_DIR");
+        std::env::set_var("WEZTERM_CONFIG_FILE", &wezterm);
+        std::env::remove_var("WEZTERM_CONFIG_DIR");
+
+        let loaded = Config::load_with_overrides(&wezterm_dynamic::Value::default());
+        assert_eq!(loaded.config.unwrap().font_size, 18.0);
+        assert_eq!(
+            std::env::var_os("THINKTERM_CONFIG_FILE").as_deref(),
+            Some(thinkterm.as_os_str())
+        );
+        assert_eq!(
+            std::env::var_os("WEZTERM_CONFIG_FILE").as_deref(),
+            Some(thinkterm.as_os_str())
+        );
+    }
+
+    #[test]
+    fn active_config_candidates_do_not_auto_load_upstream_wezterm_configs() {
+        let home = std::path::Path::new("/home/example");
+        let paths = active_thinkterm_config_candidates(home);
+
+        assert_eq!(
+            paths,
+            vec![
+                home.join(".config").join("thinkterm").join("thinkterm.lua"),
+                home.join(".config").join("thinkterm").join("wezterm.lua"),
+                home.join(".thinkterm.lua"),
+            ]
+        );
+        assert!(!paths
+            .iter()
+            .any(|path| path == &home.join(".config").join("wezterm").join("wezterm.lua")));
+        assert!(!paths.iter().any(|path| path == &home.join(".wezterm.lua")));
+    }
+
+    #[test]
+    fn terminal_identity_preserves_wezterm_capabilities_and_adds_thinkterm_markers() {
+        let config = Config::default();
+        let mut cmd = portable_pty::CommandBuilder::new("sh");
+        config.apply_cmd_defaults(&mut cmd, None, None);
+
+        assert_eq!(
+            cmd.get_env("TERM_PROGRAM").as_deref(),
+            Some(std::ffi::OsStr::new("WezTerm"))
+        );
+        assert_eq!(
+            cmd.get_env("THINKTERM").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            cmd.get_env("THINKTERM_VERSION"),
+            cmd.get_env("TERM_PROGRAM_VERSION")
+        );
+    }
+
+    #[test]
+    fn legacy_data_migration_only_copies_durable_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_PRODUCT_DIR_NAME);
+        let next = dir.path().join(PRODUCT_DIR_NAME);
+        std::fs::create_dir_all(legacy.join("plugins/example/plugin")).unwrap();
+        std::fs::write(legacy.join("plugins/example/plugin/init.lua"), "return {}").unwrap();
+        std::fs::write(legacy.join("recent-commands.json"), "[]").unwrap();
+        std::fs::write(legacy.join("recent-emoji.json"), "[]").unwrap();
+        std::fs::write(legacy.join("repl-history"), "help()").unwrap();
+        std::fs::write(legacy.join("check_update"), "{}").unwrap();
+        std::fs::write(legacy.join("gui-sock-1"), "").unwrap();
+
+        migrate_legacy_data_dir(dir.path(), &next);
+
+        assert!(next.join("plugins/example/plugin/init.lua").exists());
+        assert_eq!(
+            std::fs::read_to_string(next.join("recent-commands.json")).unwrap(),
+            "[]"
+        );
+        assert!(next.join("recent-emoji.json").exists());
+        assert!(next.join("repl-history").exists());
+        assert!(!next.join("check_update").exists());
+        assert!(!next.join("gui-sock-1").exists());
+    }
+
+    #[test]
+    fn legacy_data_migration_does_not_modify_existing_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_PRODUCT_DIR_NAME);
+        let next = dir.path().join(PRODUCT_DIR_NAME);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&next).unwrap();
+        std::fs::write(legacy.join("recent-commands.json"), "[\"legacy\"]").unwrap();
+        std::fs::write(legacy.join("recent-emoji.json"), "[\"emoji\"]").unwrap();
+        std::fs::write(next.join("recent-commands.json"), "[\"new\"]").unwrap();
+
+        migrate_legacy_data_dir(dir.path(), &next);
+
+        assert_eq!(
+            std::fs::read_to_string(next.join("recent-commands.json")).unwrap(),
+            "[\"new\"]"
+        );
+        assert_eq!(
+            std::fs::read_to_string(next.join("recent-emoji.json")).unwrap(),
+            "[\"emoji\"]"
+        );
+    }
+
+    #[test]
+    fn legacy_data_copy_skips_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/tmp/target", &from).unwrap();
+            copy_legacy_data_item(&from, &to).unwrap();
+            assert!(!to.exists());
+        }
     }
 }

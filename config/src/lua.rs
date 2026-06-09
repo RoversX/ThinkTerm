@@ -229,7 +229,9 @@ pub fn make_lua_context(config_file: &Path) -> anyhow::Result<Lua> {
 
         prefix_path(&mut path_array, config_dir);
         prefix_path(&mut path_array, &crate::HOME_DIR.join(".wezterm"));
-        for dir in crate::CONFIG_DIRS.iter() {
+        // prefix_path inserts at the front, so walk backwards to preserve
+        // CONFIG_DIRS precedence.
+        for dir in crate::CONFIG_DIRS.iter().rev() {
             prefix_path(&mut path_array, dir);
         }
         path_array.insert(

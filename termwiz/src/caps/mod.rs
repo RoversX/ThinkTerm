@@ -302,7 +302,7 @@ impl Capabilities {
                         "2.9.20150512",
                     )
                 }
-                Some("WezTerm") => true,
+                Some("WezTerm" | "ThinkTerm") => true,
                 _ => false,
             }
         });
@@ -556,6 +556,12 @@ mod test {
             ProbeHints::default()
                 .term_program(Some("iTerm.app".into()))
                 .term_program_version(Some("3.2.0beta5".into())),
+        )
+        .unwrap();
+        assert_eq!(caps.iterm2_image(), true);
+
+        let caps = Capabilities::new_with_hints(
+            ProbeHints::default().term_program(Some("ThinkTerm".into())),
         )
         .unwrap();
         assert_eq!(caps.iterm2_image(), true);

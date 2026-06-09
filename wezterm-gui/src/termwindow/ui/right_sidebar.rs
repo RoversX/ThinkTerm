@@ -45,6 +45,7 @@ const SNIPPET_ROW_GAP: usize = 16;
 const SNIPPET_LIST_TOP_GAP: usize = 18;
 const SNIPPET_LIST_BOTTOM_PADDING: usize = 40;
 const RIGHT_SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
+const SNIPPET_CARET_WIDTH: f32 = 3.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RightSidebarRect {
@@ -266,14 +267,15 @@ impl crate::TermWindow {
         let Some(pane) = self.get_active_pane_or_overlay() else {
             return;
         };
-        if let Err(err) = pane.send_paste(&snippet.body) {
-            log::error!("failed to paste snippet {id}: {err:#}");
-            return;
-        }
         if run {
-            if let Err(err) = pane.writer().write_all(b"\r") {
+            let Some(buffer) = snippet_run_buffer(&snippet.body) else {
+                return;
+            };
+            if let Err(err) = pane.writer().write_all(&buffer) {
                 log::error!("failed to run snippet {id}: {err:#}");
             }
+        } else if let Err(err) = pane.send_paste(&snippet.body) {
+            log::error!("failed to paste snippet {id}: {err:#}");
         }
     }
 
@@ -611,6 +613,16 @@ impl crate::TermWindow {
             || self
                 .right_sidebar_snippet_scrollbar_visible_until
                 .is_some_and(|until| until > Instant::now())
+    }
+
+    fn right_sidebar_snippet_cursor_on(&self) -> bool {
+        let blink_ms = (self.config.cursor_blink_rate as u64).max(100);
+        self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(blink_ms)));
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        snippet_cursor_visible(ms, blink_ms)
     }
 
     fn filtered_snippet_count(&self) -> usize {
@@ -1710,24 +1722,28 @@ impl crate::TermWindow {
             let line_height = ui_metrics.cell_size.height as usize + 4;
             let max_lines = height.saturating_sub(SIDEBAR_INSET * 2).max(1) / line_height.max(1);
             let mut line_y = y + SIDEBAR_INSET + 2;
-            let mut last_line = "";
+            let text_width = width.saturating_sub((text_x - x) + text_pad);
+            let visible_lines = wrap_snippet_text_for_width(text, max_lines.max(1), focused, |s| {
+                self.sidebar_text_width(ui_font, s).unwrap_or(f32::MAX) / text_width.max(1) as f32
+            });
+            let mut last_line = visible_lines.last().map(String::as_str).unwrap_or("");
             let mut last_line_y = line_y;
-            for line in text.lines().take(max_lines.max(1)) {
+            for line in &visible_lines {
                 last_line = line;
                 last_line_y = line_y;
-                self.paint_sidebar_text(
+                self.paint_ui_title_text(
                     layers,
                     ui_font,
-                    ui_metrics,
+                    &ui_metrics,
                     line,
                     text_x,
                     line_y,
-                    width.saturating_sub((text_x - x) + text_pad),
+                    text_width,
                     text_color,
                 )?;
                 line_y += line_height;
             }
-            if focused {
+            if focused && self.right_sidebar_snippet_cursor_on() {
                 let caret_x = text_x
                     + (self.sidebar_text_width(ui_font, last_line)?.ceil() as usize)
                         .min(width.saturating_sub((text_x - x) + text_pad));
@@ -1737,10 +1753,10 @@ impl crate::TermWindow {
                     euclid::rect(
                         caret_x as f32,
                         last_line_y as f32,
-                        2.0,
+                        SNIPPET_CARET_WIDTH,
                         (ui_metrics.cell_size.height as f32).max(1.0),
                     ),
-                    chrome.selected_bg,
+                    chrome.text,
                 )
                 .context("right sidebar snippet body caret")?;
             }
@@ -1755,7 +1771,7 @@ impl crate::TermWindow {
                 width.saturating_sub((text_x - x) + text_pad),
                 text_color,
             )?;
-            if focused {
+            if focused && self.right_sidebar_snippet_cursor_on() {
                 let caret_x = text_x
                     + (self.sidebar_text_width(ui_font, text)?.ceil() as usize)
                         .min(width.saturating_sub((text_x - x) + text_pad));
@@ -1766,10 +1782,10 @@ impl crate::TermWindow {
                         caret_x as f32,
                         (y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2)
                             as f32,
-                        2.0,
+                        SNIPPET_CARET_WIDTH,
                         (ui_metrics.cell_size.height as f32).max(1.0),
                     ),
-                    chrome.selected_bg,
+                    chrome.text,
                 )
                 .context("right sidebar snippet text caret")?;
             }
@@ -1923,4 +1939,304 @@ fn snippet_preview(body: &str) -> String {
         .chars()
         .take(96)
         .collect()
+}
+
+fn snippet_run_buffer(body: &str) -> Option<Vec<u8>> {
+    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<_> = normalized.split('\n').collect();
+    let start = lines.iter().position(|line| !line.trim().is_empty())?;
+    let end = lines.iter().rposition(|line| !line.trim().is_empty())?;
+    let trimmed = lines[start..=end].join("\n");
+
+    let mut buffer = String::with_capacity(trimmed.len() + 1);
+    buffer.push_str(&trimmed);
+    buffer.push('\n');
+    Some(buffer.replace('\n', "\r").into_bytes())
+}
+
+fn wrap_snippet_text_for_width<F>(
+    text: &str,
+    max_lines: usize,
+    focused: bool,
+    mut measure: F,
+) -> Vec<String>
+where
+    F: FnMut(&str) -> f32,
+{
+    let max_lines = max_lines.max(1);
+    let mut lines = if focused {
+        let tail = bounded_snippet_tail(text, max_lines);
+        let budget = max_lines.saturating_mul(16).max(max_lines);
+        let mut lines = wrap_snippet_text_from_head(&tail, budget, &mut measure);
+        if lines.len() > max_lines {
+            lines.split_off(lines.len() - max_lines)
+        } else {
+            lines
+        }
+    } else {
+        wrap_snippet_text_from_head(text, max_lines, &mut measure)
+    };
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn wrap_snippet_text_from_head<F>(text: &str, max_lines: usize, measure: &mut F) -> Vec<String>
+where
+    F: FnMut(&str) -> f32,
+{
+    let max_lines = max_lines.max(1);
+    let mut lines = vec![];
+    for hard_line in text.split('\n') {
+        wrap_snippet_hard_line(hard_line, measure, &mut lines, max_lines);
+        if lines.len() >= max_lines {
+            break;
+        }
+    }
+    lines
+}
+
+fn wrap_snippet_hard_line<F>(
+    line: &str,
+    measure: &mut F,
+    wrapped: &mut Vec<String>,
+    max_lines: usize,
+) where
+    F: FnMut(&str) -> f32,
+{
+    if wrapped.len() >= max_lines {
+        return;
+    }
+    if line.is_empty() || measure(line) <= 1.0 {
+        wrapped.push(line.to_string());
+        return;
+    }
+
+    let mut current = String::new();
+    for token in whitespace_tokens(line) {
+        let token_is_whitespace = token.chars().all(char::is_whitespace);
+        if current.is_empty() && token_is_whitespace {
+            current.push_str(token);
+            continue;
+        }
+
+        let candidate = format!("{current}{token}");
+        if measure(&candidate) <= 1.0 {
+            current = candidate;
+            continue;
+        }
+
+        if !current.trim().is_empty() {
+            wrapped.push(current.trim_end().to_string());
+            if wrapped.len() >= max_lines {
+                return;
+            }
+        }
+        current.clear();
+
+        let token = if token_is_whitespace {
+            ""
+        } else {
+            token.trim_start()
+        };
+        if token.is_empty() {
+            continue;
+        }
+        if measure(token) <= 1.0 {
+            current.push_str(token);
+        } else {
+            current = wrap_long_snippet_token(token, measure, wrapped, max_lines);
+            if wrapped.len() >= max_lines {
+                return;
+            }
+        }
+    }
+
+    if !current.trim().is_empty() && wrapped.len() < max_lines {
+        wrapped.push(current.trim_end().to_string());
+    }
+}
+
+fn bounded_snippet_tail(text: &str, max_lines: usize) -> String {
+    const TAIL_CHARS_PER_VISIBLE_LINE: usize = 256;
+
+    let hard_line_limit = max_lines.max(1);
+    let char_limit = hard_line_limit.saturating_mul(TAIL_CHARS_PER_VISIBLE_LINE);
+    let mut lines = text
+        .rsplit('\n')
+        .take(hard_line_limit)
+        .map(|line| tail_chars(line, char_limit))
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+
+    let mut seen = 0;
+    for (idx, _) in text.char_indices().rev() {
+        seen += 1;
+        if seen == max_chars {
+            return &text[idx..];
+        }
+    }
+    text
+}
+
+fn whitespace_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = vec![];
+    let mut start = 0;
+    let mut current_is_whitespace = None;
+    for (idx, ch) in text.char_indices() {
+        let is_whitespace = ch.is_whitespace();
+        match current_is_whitespace {
+            Some(kind) if kind != is_whitespace => {
+                tokens.push(&text[start..idx]);
+                start = idx;
+                current_is_whitespace = Some(is_whitespace);
+            }
+            None => current_is_whitespace = Some(is_whitespace),
+            _ => {}
+        }
+    }
+    if start < text.len() {
+        tokens.push(&text[start..]);
+    }
+    tokens
+}
+
+fn wrap_long_snippet_token<F>(
+    token: &str,
+    measure: &mut F,
+    wrapped: &mut Vec<String>,
+    max_lines: usize,
+) -> String
+where
+    F: FnMut(&str) -> f32,
+{
+    let mut current = String::new();
+    for ch in token.chars() {
+        if wrapped.len() >= max_lines {
+            return current;
+        }
+        let mut candidate = current.clone();
+        candidate.push(ch);
+        if !current.is_empty() && measure(&candidate) > 1.0 {
+            wrapped.push(std::mem::take(&mut current));
+            if wrapped.len() >= max_lines {
+                return String::new();
+            }
+            current.push(ch);
+        } else {
+            current = candidate;
+        }
+    }
+    current
+}
+
+fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
+    let blink_ms = u128::from(blink_ms.max(1));
+    (now_ms / blink_ms) % 2 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{snippet_cursor_visible, snippet_run_buffer, wrap_snippet_text_for_width};
+
+    #[test]
+    fn snippet_run_buffer_appends_single_enter() {
+        assert_eq!(
+            snippet_run_buffer("sudo apt update").unwrap(),
+            b"sudo apt update\r"
+        );
+    }
+
+    #[test]
+    fn snippet_run_buffer_trims_outer_blank_lines() {
+        assert_eq!(snippet_run_buffer("\n\ncmd\r\n").unwrap(), b"cmd\r");
+    }
+
+    #[test]
+    fn snippet_run_buffer_preserves_internal_script_lines() {
+        assert_eq!(snippet_run_buffer("one\ntwo").unwrap(), b"one\rtwo\r");
+    }
+
+    #[test]
+    fn snippet_run_buffer_ignores_blank_body() {
+        assert!(snippet_run_buffer("\n \r\n\t").is_none());
+    }
+
+    #[test]
+    fn wrap_snippet_text_wraps_at_word_boundaries() {
+        let lines = wrap_snippet_text_for_width("sudo apt update", 8, false, |s| {
+            s.chars().count() as f32 / 8.0
+        });
+        assert_eq!(lines, vec!["sudo apt", "update"]);
+    }
+
+    #[test]
+    fn wrap_snippet_text_falls_back_to_char_boundaries_for_long_tokens() {
+        let lines =
+            wrap_snippet_text_for_width("abcdef", 8, false, |s| s.chars().count() as f32 / 3.0);
+        assert_eq!(lines, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn wrap_snippet_text_preserves_explicit_newlines() {
+        let lines = wrap_snippet_text_for_width("one\ntwo", 8, false, |_| 0.5);
+        assert_eq!(lines, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn wrap_snippet_text_shows_tail_when_focused() {
+        let lines = wrap_snippet_text_for_width("one\ntwo\nthree", 2, true, |_| 0.5);
+        assert_eq!(lines, vec!["two", "three"]);
+    }
+
+    #[test]
+    fn wrap_snippet_text_shows_head_when_unfocused() {
+        let lines = wrap_snippet_text_for_width("one\ntwo\nthree", 2, false, |_| 0.5);
+        assert_eq!(lines, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn wrap_snippet_text_stops_after_visible_unfocused_lines() {
+        let text = format!("{}\nshould-not-be-measured", "abcdefghij ".repeat(1000));
+        let mut calls = 0;
+        let lines = wrap_snippet_text_for_width(&text, 2, false, |s| {
+            calls += 1;
+            s.chars().count() as f32 / 5.0
+        });
+        assert_eq!(lines.len(), 2);
+        assert!(calls < 100, "measure called {} times", calls);
+    }
+
+    #[test]
+    fn wrap_snippet_text_focus_uses_bounded_tail_lines() {
+        let text = (0..1000)
+            .map(|idx| format!("line{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut calls = 0;
+        let lines = wrap_snippet_text_for_width(&text, 2, true, |_| {
+            calls += 1;
+            0.5
+        });
+        assert_eq!(lines, vec!["line998", "line999"]);
+        assert!(calls < 20, "measure called {} times", calls);
+    }
+
+    #[test]
+    fn snippet_cursor_visible_alternates_by_blink_period() {
+        assert!(snippet_cursor_visible(0, 500));
+        assert!(snippet_cursor_visible(499, 500));
+        assert!(!snippet_cursor_visible(500, 500));
+        assert!(!snippet_cursor_visible(999, 500));
+        assert!(snippet_cursor_visible(1000, 500));
+    }
 }
