@@ -8,7 +8,7 @@ pub mod tokens;
 
 use crate::utilsprites::RenderMetrics;
 
-pub use right_sidebar::right_sidebar_width_for_metrics;
+pub use right_sidebar::{right_sidebar_file_preview_width, right_sidebar_width_for_metrics};
 pub use sidebar::workspace_sidebar_width_for_metrics;
 
 pub fn pane_nav_bar_height_for_metrics(render_metrics: RenderMetrics) -> usize {

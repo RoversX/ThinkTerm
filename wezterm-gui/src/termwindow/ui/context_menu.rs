@@ -748,7 +748,9 @@ fn context_menu_palette(appearance: Appearance) -> UiPalette {
 
 fn menu_icon(icon: &str) -> Option<SvgIcon> {
     match icon {
+        "app" => Some(SvgIcon::ExternalLink),
         "arrow.clockwise" => Some(SvgIcon::RotateCcw),
+        "arrow.up.right.square" => Some(SvgIcon::ExternalLink),
         "arrow.triangle.2.circlepath" => Some(SvgIcon::RotateCcw),
         "checkmark.circle" => Some(SvgIcon::CircleCheck),
         "chevron.right" => Some(SvgIcon::ChevronRight),

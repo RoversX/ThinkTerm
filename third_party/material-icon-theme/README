@@ -1,0 +1,16 @@
+Material Icon Theme
+===================
+
+This directory contains a vendored snapshot of the static assets from
+`material-icon-theme` version 5.35.0.
+
+Source: https://www.npmjs.com/package/material-icon-theme/v/5.35.0
+Repository: https://github.com/material-extensions/vscode-material-icon-theme
+License: MIT, copied in `LICENSE`.
+
+Only the static VS Code file icon theme data is used by ThinkTerm:
+
+- `dist/material-icons.json`
+- `icons/*.svg`
+
+ThinkTerm does not run the VS Code extension JavaScript.

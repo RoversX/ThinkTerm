@@ -212,6 +212,7 @@ ssh2 = "0.9.3"
 starship-battery = "0.10"
 strsim = "0.11"
 syn = "1.0"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
 tabout = { path = "tabout" }
 tar = "0.4"
 tempfile = "3.20"

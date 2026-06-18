@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
+use termwiz::image::ImageData;
 use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
 use wezterm_font::FontConfiguration;
@@ -267,6 +268,7 @@ pub enum UIItemType {
     RightSidebarMode(RightSidebarMode),
     RightSidebarBackground,
     RightSidebarResize,
+    RightSidebarFilePreviewResize,
     RightSidebarSnippetNew,
     RightSidebarSnippetBack,
     RightSidebarSnippetSave,
@@ -279,6 +281,18 @@ pub enum UIItemType {
     RightSidebarSnippetDelete(String),
     RightSidebarSnippetScrollTrack,
     RightSidebarSnippetScrollThumb,
+    RightSidebarFilePreviewScrollTrack,
+    RightSidebarFilePreviewScrollThumb,
+    RightSidebarFilePreviewHorizontalScrollTrack,
+    RightSidebarFilePreviewHorizontalScrollThumb,
+    RightSidebarFilePreviewText,
+    RightSidebarFileFilter,
+    RightSidebarFileRow(PathBuf),
+    RightSidebarFileBack,
+    RightSidebarFileOpen,
+    RightSidebarFileOpenMenu,
+    RightSidebarFileReveal,
+    RightSidebarFileCopyText,
     ContextMenuBackdrop,
     ContextMenuItem(Vec<usize>),
     AboveScrollThumb,
@@ -308,6 +322,103 @@ pub enum RightSidebarSnippetField {
     Search,
     Title,
     Body,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RightSidebarFileView {
+    Tree,
+    Preview,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightSidebarFileField {
+    Filter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RightSidebarFileTreeRow {
+    pub path: PathBuf,
+    pub name: String,
+    pub depth: usize,
+    pub is_dir: bool,
+    pub is_expanded: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RightSidebarFileCharBag(pub u128);
+
+#[derive(Clone, Debug)]
+pub(crate) struct RightSidebarFileIndexEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub display_path: String,
+    pub is_dir: bool,
+    pub depth: usize,
+    pub name_char_bag: RightSidebarFileCharBag,
+    pub char_bag: RightSidebarFileCharBag,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RightSidebarFileIndex {
+    pub entries: Vec<RightSidebarFileIndexEntry>,
+    pub children_by_parent: HashMap<PathBuf, Vec<usize>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RightSidebarFileIndexStatus {
+    Empty,
+    Indexing,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Clone)]
+pub(crate) struct RightSidebarFilePreviewSpan {
+    pub text: String,
+    pub color: LinearRgba,
+}
+
+#[derive(Clone)]
+pub(crate) struct RightSidebarFilePreviewLine {
+    pub plain: String,
+    pub spans: Vec<RightSidebarFilePreviewSpan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RightSidebarFilePreviewSelectionPoint {
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RightSidebarFilePreviewSelection {
+    pub anchor: RightSidebarFilePreviewSelectionPoint,
+    pub focus: RightSidebarFilePreviewSelectionPoint,
+}
+
+#[derive(Clone)]
+pub(crate) struct RightSidebarFilePreviewImage {
+    pub data: Arc<ImageData>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum RightSidebarOpenWithCacheEntry {
+    Loading(u64),
+    Ready(Vec<wezterm_open_url::OpenWithCandidate>),
+    Failed,
+}
+
+/// Painted geometry of a single-line sidebar text input, recorded each frame so
+/// a later mouse click can be hit-tested back to a caret position.
+#[derive(Clone)]
+pub(crate) struct RightSidebarInputLayout {
+    pub item_type: UIItemType,
+    pub text_x: f32,
+    pub text_width: f32,
+    pub first_char: usize,
+    pub font: Rc<wezterm_font::LoadedFont>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -818,6 +929,43 @@ pub struct TermWindow {
     right_sidebar_snippet_body: TextInputState,
     right_sidebar_snippet_scroll_offset: f32,
     right_sidebar_snippet_scrollbar_visible_until: Option<Instant>,
+    right_sidebar_file_view: RightSidebarFileView,
+    right_sidebar_file_focus: Option<RightSidebarFileField>,
+    right_sidebar_file_filter: TextInputState,
+    right_sidebar_file_applied_filter: String,
+    right_sidebar_file_filter_debounce_until: Option<Instant>,
+    right_sidebar_file_expanded: HashSet<String>,
+    right_sidebar_file_expanded_version: u64,
+    right_sidebar_file_index_generation: u64,
+    right_sidebar_file_index_root: Option<PathBuf>,
+    right_sidebar_file_index_project_name: String,
+    right_sidebar_file_index_status: RightSidebarFileIndexStatus,
+    right_sidebar_file_index: Option<Arc<RightSidebarFileIndex>>,
+    right_sidebar_file_index_cancel: Option<Arc<AtomicBool>>,
+    right_sidebar_file_search_generation: u64,
+    right_sidebar_file_search_cancel: Option<Arc<AtomicBool>>,
+    right_sidebar_file_search_query: String,
+    right_sidebar_file_search_rows: Vec<RightSidebarFileTreeRow>,
+    right_sidebar_file_searching: bool,
+    right_sidebar_file_browse_rows: Vec<RightSidebarFileTreeRow>,
+    right_sidebar_file_browse_cache_key: Option<(u64, u64)>,
+    right_sidebar_file_selected: Option<PathBuf>,
+    right_sidebar_file_tree_width: usize,
+    right_sidebar_file_preview_width: usize,
+    right_sidebar_file_preview_generation: u64,
+    right_sidebar_file_preview_lines: Vec<RightSidebarFilePreviewLine>,
+    right_sidebar_file_preview_max_columns: usize,
+    right_sidebar_file_preview_image: Option<RightSidebarFilePreviewImage>,
+    right_sidebar_file_preview_message: Option<String>,
+    right_sidebar_file_preview_truncated: bool,
+    right_sidebar_file_preview_selection: Option<RightSidebarFilePreviewSelection>,
+    right_sidebar_file_tree_scroll_offset: f32,
+    right_sidebar_file_preview_scroll_offset: f32,
+    right_sidebar_file_preview_horizontal_offset: usize,
+    right_sidebar_open_with_generation: u64,
+    right_sidebar_open_with_cache: HashMap<String, RightSidebarOpenWithCacheEntry>,
+    right_sidebar_open_with_app: Option<crate::native_settings::NativeOpenWithApp>,
+    right_sidebar_input_layouts: Vec<RightSidebarInputLayout>,
 
     modal: RefCell<Option<Rc<dyn Modal>>>,
 
@@ -1325,6 +1473,43 @@ impl TermWindow {
             right_sidebar_snippet_body: TextInputState::new(),
             right_sidebar_snippet_scroll_offset: 0.0,
             right_sidebar_snippet_scrollbar_visible_until: None,
+            right_sidebar_file_view: RightSidebarFileView::Tree,
+            right_sidebar_file_focus: None,
+            right_sidebar_file_filter: TextInputState::new(),
+            right_sidebar_file_applied_filter: String::new(),
+            right_sidebar_file_filter_debounce_until: None,
+            right_sidebar_file_expanded: HashSet::new(),
+            right_sidebar_file_expanded_version: 0,
+            right_sidebar_file_index_generation: 0,
+            right_sidebar_file_index_root: None,
+            right_sidebar_file_index_project_name: String::new(),
+            right_sidebar_file_index_status: RightSidebarFileIndexStatus::Empty,
+            right_sidebar_file_index: None,
+            right_sidebar_file_index_cancel: None,
+            right_sidebar_file_search_generation: 0,
+            right_sidebar_file_search_cancel: None,
+            right_sidebar_file_search_query: String::new(),
+            right_sidebar_file_search_rows: Vec::new(),
+            right_sidebar_file_searching: false,
+            right_sidebar_file_browse_rows: Vec::new(),
+            right_sidebar_file_browse_cache_key: None,
+            right_sidebar_file_selected: None,
+            right_sidebar_file_tree_width: ui::right_sidebar_width_for_metrics(&render_metrics),
+            right_sidebar_file_preview_width: ui::right_sidebar_file_preview_width(),
+            right_sidebar_file_preview_generation: 0,
+            right_sidebar_file_preview_lines: Vec::new(),
+            right_sidebar_file_preview_max_columns: 0,
+            right_sidebar_file_preview_image: None,
+            right_sidebar_file_preview_message: None,
+            right_sidebar_file_preview_truncated: false,
+            right_sidebar_file_preview_selection: None,
+            right_sidebar_file_tree_scroll_offset: 0.0,
+            right_sidebar_file_preview_scroll_offset: 0.0,
+            right_sidebar_file_preview_horizontal_offset: 0,
+            right_sidebar_open_with_generation: 0,
+            right_sidebar_open_with_cache: HashMap::new(),
+            right_sidebar_open_with_app: crate::native_settings::right_sidebar_open_with_app(),
+            right_sidebar_input_layouts: Vec::new(),
             last_ui_item: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),
@@ -4027,13 +4212,35 @@ impl TermWindow {
             }
         }
 
+        if self.right_sidebar_has_text_focus() {
+            match assignment {
+                CopyTo(destination) => {
+                    self.copy_right_sidebar_focused_input(*destination);
+                    return Ok(PerformAssignmentResult::Handled);
+                }
+                PasteFrom(source) => {
+                    self.paste_into_right_sidebar_from_clipboard(*source);
+                    return Ok(PerformAssignmentResult::Handled);
+                }
+                ClearSelection => {
+                    self.clear_right_sidebar_focused_input_selection();
+                    return Ok(PerformAssignmentResult::Handled);
+                }
+                _ => {}
+            }
+        }
+
         if self.content_view_foreground() {
             match assignment {
                 CopyTo(destination) => {
-                    if let Some(text) = self.active_content_view().and_then(|v| v.copy_text()) {
-                        if !text.is_empty() {
-                            self.copy_to_clipboard(*destination, text);
-                        }
+                    if let Some(text) = self
+                        .active_content_view()
+                        .and_then(|v| v.copy_text())
+                        .filter(|text| !text.is_empty())
+                    {
+                        self.copy_to_clipboard(*destination, text);
+                    } else if let Some(text) = self.right_sidebar_file_preview_selected_text() {
+                        self.copy_to_clipboard(*destination, text);
                     }
                     return Ok(PerformAssignmentResult::Handled);
                 }
@@ -4042,6 +4249,18 @@ impl TermWindow {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 _ => {}
+            }
+        }
+
+        if let CopyTo(destination) = assignment {
+            let text = self.selection_text(pane);
+            if !text.is_empty() {
+                self.copy_to_clipboard(*destination, text);
+                return Ok(PerformAssignmentResult::Handled);
+            }
+            if let Some(text) = self.right_sidebar_file_preview_selected_text() {
+                self.copy_to_clipboard(*destination, text);
+                return Ok(PerformAssignmentResult::Handled);
             }
         }
 
@@ -4237,6 +4456,25 @@ impl TermWindow {
             PromptRenamePaneTab(pane_id) => self.prompt_rename_pane_tab(*pane_id),
             PromptRenameProject(project_id) => self.prompt_rename_project(project_id.clone()),
             RevealProjectInFolder(project_id) => self.reveal_project_in_folder(project_id),
+            OpenFileWith { path, app, label } => {
+                let selected_app = crate::native_settings::NativeOpenWithApp {
+                    id: app.clone(),
+                    label: label.clone(),
+                };
+                self.right_sidebar_open_with_app = Some(selected_app.clone());
+                if let Err(err) =
+                    crate::native_settings::save_right_sidebar_open_with_app(selected_app)
+                {
+                    log::error!("failed to save Open With app selection: {err:#}");
+                }
+                wezterm_open_url::open_path_with_candidate(std::path::Path::new(path), app);
+            }
+            OpenFileWithSystemDefault(path) => {
+                wezterm_open_url::open_url(path);
+            }
+            RevealFileInFolder(path) => {
+                wezterm_open_url::reveal_path(std::path::Path::new(path));
+            }
             PromptRenameWorkspaceThread(thread_id) => {
                 self.prompt_rename_workspace_thread(thread_id.clone())
             }
@@ -4376,6 +4614,11 @@ impl TermWindow {
                 self.emit_window_event(name, None);
             }
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
+                // Note: the right sidebar file preview keeps its own selection,
+                // which is copied only on explicit Cmd+C / the Copy button (see
+                // the `CopyTo` handling above). We deliberately do not auto-copy
+                // it on mouse release here — on macOS that would clobber the
+                // system clipboard just from selecting/clicking.
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);

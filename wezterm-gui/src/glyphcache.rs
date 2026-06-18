@@ -2,7 +2,7 @@ use super::utilsprites::RenderMetrics;
 use crate::customglyph::*;
 use crate::renderstate::RenderContext;
 use crate::termwindow::render::paint::AllowImage;
-use crate::termwindow::ui::icons::{BrandIcon, SvgIcon};
+use crate::termwindow::ui::icons::{BrandIcon, MaterialIcon, SvgIcon};
 use ::window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
 use ::window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
 use ::window::color::SrgbaPixel;
@@ -88,6 +88,12 @@ pub struct SizedRotatedSvgIconKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SizedBrandIconKey {
     pub icon: BrandIcon,
+    pub size: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SizedMaterialIconKey {
+    pub icon: MaterialIcon,
     pub size: u16,
 }
 
@@ -587,6 +593,7 @@ pub struct GlyphCache {
     pub block_glyphs: HashMap<SizedBlockKey, Sprite>,
     pub svg_icons: HashMap<SizedSvgIconKey, Sprite>,
     pub brand_icons: HashMap<SizedBrandIconKey, Sprite>,
+    pub material_icons: HashMap<SizedMaterialIconKey, Sprite>,
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
     pub rotated_svg_icons: HashMap<SizedRotatedSvgIconKey, Sprite>,
@@ -642,6 +649,7 @@ impl GlyphCache {
             block_glyphs: HashMap::new(),
             svg_icons: HashMap::new(),
             brand_icons: HashMap::new(),
+            material_icons: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
@@ -674,6 +682,7 @@ impl GlyphCache {
             block_glyphs: HashMap::new(),
             svg_icons: HashMap::new(),
             brand_icons: HashMap::new(),
+            material_icons: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
@@ -1223,6 +1232,27 @@ impl GlyphCache {
         let image = icon.rasterize(size)?;
         let sprite = self.atlas.allocate(&image)?;
         self.brand_icons.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    pub fn cached_material_icon(
+        &mut self,
+        icon: MaterialIcon,
+        size: usize,
+    ) -> anyhow::Result<Sprite> {
+        let size = size.max(1).min(u16::MAX as usize);
+        let key = SizedMaterialIconKey {
+            icon,
+            size: size as u16,
+        };
+
+        if let Some(sprite) = self.material_icons.get(&key) {
+            return Ok(sprite.clone());
+        }
+
+        let image = icon.rasterize(size)?;
+        let sprite = self.atlas.allocate(&image)?;
+        self.material_icons.insert(key, sprite.clone());
         Ok(sprite)
     }
 

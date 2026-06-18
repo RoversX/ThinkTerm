@@ -1,30 +1,54 @@
-use crate::quad::TripleLayerQuadAllocator;
-use crate::termwindow::ui::icons::SvgIcon;
+use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::termwindow::ui::icons::{
+    material_file_icon_for_name, material_folder_icon_for_name, MaterialIcon, SvgIcon,
+};
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET,
     SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_RADIUS, WINDOW_TAB_ADD_BUTTON_RADIUS,
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
 use crate::termwindow::{
-    RightSidebarMode, RightSidebarSnippetField, RightSidebarSnippetView, TermWindowNotif, UIItem,
-    UIItemType,
+    RightSidebarFileCharBag, RightSidebarFileField, RightSidebarFileIndex,
+    RightSidebarFileIndexEntry, RightSidebarFileIndexStatus, RightSidebarFilePreviewImage,
+    RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
+    RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
+    RightSidebarFileView, RightSidebarInputLayout, RightSidebarMode,
+    RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
+    TermWindowNotif, UIItem, UIItemType,
 };
 use crate::ui::TextInputState;
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
+use crate::workspace_threads;
 use anyhow::Context;
-use config::keyassignment::ClipboardCopyDestination;
+use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment};
+use mux::Mux;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Color as SyntectColor, Style as SyntectStyle, Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use termwiz::image::{ImageData, ImageDataType};
 use termwiz::input::{KeyCode as TermKeyCode, Modifiers as TermModifiers};
+use walkdir::{DirEntry as WalkDirEntry, WalkDir};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
-use window::{Clipboard, IntegratedTitleButtonStyle, WindowDecorations, WindowOps};
+use window::{
+    Clipboard, ContextMenuItem, IntegratedTitleButtonStyle, WindowDecorations, WindowOps,
+};
 
 const RIGHT_SIDEBAR_SECTION_GAP: usize = 12;
-const RIGHT_SIDEBAR_WIDTH_CELLS: usize = 34;
+const RIGHT_SIDEBAR_WIDTH_CELLS: usize = 40;
 const RIGHT_SIDEBAR_MIN_WIDTH: usize = 340;
-const RIGHT_SIDEBAR_MAX_WIDTH: usize = 600;
+const RIGHT_SIDEBAR_MAX_WIDTH: usize = 900;
 const RIGHT_SIDEBAR_TOP_BAR_HEIGHT: usize = 82;
 const RIGHT_SIDEBAR_CLOSE_BUTTON_SIZE: usize = 58;
 const RIGHT_SIDEBAR_CLOSE_ICON_SIZE: usize = 27;
@@ -46,6 +70,27 @@ const SNIPPET_LIST_TOP_GAP: usize = 18;
 const SNIPPET_LIST_BOTTOM_PADDING: usize = 40;
 const RIGHT_SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
 const SNIPPET_CARET_WIDTH: f32 = 3.0;
+const FILE_FONT_MIN_SIZE: f64 = 14.0;
+const FILE_FILTER_HEIGHT: usize = 66;
+const FILE_TREE_TOP_GAP: usize = 14;
+const FILE_SCROLL_FADE_HEIGHT: usize = 32;
+const FILE_PREVIEW_HEADER_HEIGHT: usize = 64;
+const FILE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
+const FILE_PREVIEW_TRUNCATED_LABEL: &str = "Preview truncated to 256 KiB";
+const FILE_PREVIEW_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const FILE_PREVIEW_PANE_MIN_WIDTH: usize = 360;
+const FILE_PREVIEW_PANE_DEFAULT_WIDTH: usize = 560;
+// Per-line we keep the *full* content (bounded only by FILE_PREVIEW_MAX_BYTES
+// for the whole file) so minified CSS/JS, lockfiles and JSON aren't truncated.
+// We only bound the *syntax-highlighting* work per line: characters past this
+// point are rendered in the default colour instead of being dropped. This keeps
+// syntect cost bounded on pathological single-line files without losing data.
+const FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT: usize = 8192;
+const FILE_PREVIEW_SCROLLBAR_THICKNESS: usize = 4;
+const FILE_PREVIEW_SCROLLBAR_HIT_SLOP: usize = 6;
+const FILE_TREE_ROW_LIMIT: usize = 2000;
+const FILE_INDEX_ENTRY_LIMIT: usize = 100_000;
+const FILE_FILTER_DEBOUNCE_MS: u64 = 350;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RightSidebarRect {
@@ -64,6 +109,61 @@ pub(crate) struct RightSidebarSnippetScrollGeometry {
     pub thumb_y: f32,
     pub thumb_height: f32,
     pub max_scroll: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RightSidebarFilePreviewScrollGeometry {
+    pub track_x: usize,
+    pub track_y: usize,
+    pub track_width: usize,
+    pub track_height: usize,
+    pub thumb_y: f32,
+    pub thumb_height: f32,
+    pub max_scroll: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RightSidebarFilePreviewHorizontalScrollGeometry {
+    pub track_x: usize,
+    pub track_y: usize,
+    pub track_width: usize,
+    pub track_height: usize,
+    pub thumb_x: f32,
+    pub thumb_width: f32,
+    pub max_scroll: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RightSidebarFilePreviewBodyMetrics {
+    x: usize,
+    y: usize,
+    width: usize,
+    bottom: usize,
+    line_height: usize,
+    visible_height: usize,
+    total_height: usize,
+}
+
+struct RightSidebarLoadedFilePreview {
+    lines: Vec<RightSidebarFilePreviewLine>,
+    image: Option<RightSidebarFilePreviewImage>,
+    message: Option<String>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RightSidebarFileRoot {
+    project_name: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RightSidebarFileRowMetrics {
+    row_height: usize,
+    icon_size: usize,
+    chevron_size: usize,
+    indent_step: usize,
+    icon_gap: usize,
 }
 
 impl RightSidebarMode {
@@ -100,18 +200,90 @@ pub fn right_sidebar_width_for_metrics(render_metrics: &RenderMetrics) -> usize 
         .clamp(RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH)
 }
 
+pub fn right_sidebar_file_preview_width() -> usize {
+    crate::native_settings::right_sidebar_file_preview_width()
+        .unwrap_or(FILE_PREVIEW_PANE_DEFAULT_WIDTH)
+        .max(FILE_PREVIEW_PANE_MIN_WIDTH)
+}
+
 impl crate::TermWindow {
+    fn right_sidebar_file_preview_active(&self) -> bool {
+        !self.right_sidebar_collapsed
+            && self.right_sidebar_mode == RightSidebarMode::Chat
+            && self.right_sidebar_file_view == RightSidebarFileView::Preview
+            && self.right_sidebar_file_selected.is_some()
+    }
+
+    fn right_sidebar_tree_width(&self) -> usize {
+        let width = if self.right_sidebar_file_preview_active() {
+            self.right_sidebar_file_tree_width
+        } else {
+            self.right_sidebar_width
+        };
+        width.clamp(RIGHT_SIDEBAR_MIN_WIDTH, self.right_sidebar_max_width())
+    }
+
+    fn right_sidebar_available_width(&self) -> usize {
+        let border = self.get_os_border();
+        self.dimensions
+            .pixel_width
+            .saturating_sub((border.left + border.right).get() as usize)
+    }
+
+    fn right_sidebar_file_preview_total_max_width(&self) -> usize {
+        let available_width = self.right_sidebar_available_width();
+        let content_width = available_width.saturating_sub(self.workspace_sidebar_width());
+        let min_preview_total = RIGHT_SIDEBAR_MIN_WIDTH + FILE_PREVIEW_PANE_MIN_WIDTH;
+        let terminal_reserve = content_width / 5;
+        content_width
+            .saturating_sub(terminal_reserve)
+            .max(min_preview_total.min(content_width))
+            .min(available_width)
+    }
+
+    fn right_sidebar_file_preview_width(&self) -> Option<usize> {
+        if self.right_sidebar_collapsed
+            || self.right_sidebar_mode != RightSidebarMode::Chat
+            || self.right_sidebar_file_view != RightSidebarFileView::Preview
+            || self.right_sidebar_file_selected.is_none()
+        {
+            return None;
+        }
+
+        let max_preview_width = self
+            .right_sidebar_file_preview_total_max_width()
+            .saturating_sub(self.right_sidebar_tree_width());
+        if max_preview_width < FILE_PREVIEW_PANE_MIN_WIDTH {
+            return None;
+        }
+
+        let configured_width = if self.right_sidebar_file_preview_width == 0 {
+            FILE_PREVIEW_PANE_DEFAULT_WIDTH
+        } else {
+            self.right_sidebar_file_preview_width
+        };
+        let width = configured_width.clamp(FILE_PREVIEW_PANE_MIN_WIDTH, max_preview_width);
+        Some(width)
+    }
+
     pub fn right_sidebar_width(&self) -> usize {
         if self.right_sidebar_collapsed {
             0
         } else {
-            self.right_sidebar_width
-                .clamp(RIGHT_SIDEBAR_MIN_WIDTH, self.right_sidebar_max_width())
+            self.right_sidebar_tree_width()
+                .saturating_add(self.right_sidebar_file_preview_width().unwrap_or(0))
+                .min(if self.right_sidebar_file_preview_active() {
+                    self.right_sidebar_file_preview_total_max_width()
+                } else {
+                    self.right_sidebar_available_width()
+                })
         }
     }
 
     pub fn right_sidebar_max_width(&self) -> usize {
-        RIGHT_SIDEBAR_MAX_WIDTH.min((self.dimensions.pixel_width / 2).max(RIGHT_SIDEBAR_MIN_WIDTH))
+        let available_width = self.right_sidebar_available_width();
+        let proportional_max = (available_width * 2 / 3).max(RIGHT_SIDEBAR_MIN_WIDTH);
+        RIGHT_SIDEBAR_MAX_WIDTH.min(proportional_max)
     }
 
     fn right_sidebar_window_button_reserved_width(&self) -> usize {
@@ -135,12 +307,57 @@ impl crate::TermWindow {
             width.clamp(RIGHT_SIDEBAR_MIN_WIDTH, self.right_sidebar_max_width());
     }
 
+    fn set_right_sidebar_file_tree_width(&mut self, width: usize) -> bool {
+        let old_width = self.right_sidebar_file_tree_width;
+        self.right_sidebar_file_tree_width =
+            width.clamp(RIGHT_SIDEBAR_MIN_WIDTH, self.right_sidebar_max_width());
+        old_width != self.right_sidebar_file_tree_width
+    }
+
+    pub(crate) fn set_right_sidebar_file_preview_total_width(&mut self, width: usize) -> bool {
+        if !self.right_sidebar_file_preview_active() {
+            return false;
+        }
+
+        let tree_width = self.right_sidebar_tree_width();
+        let preview_width = width.saturating_sub(tree_width);
+        self.set_right_sidebar_file_preview_width_for_drag(preview_width)
+    }
+
+    fn set_right_sidebar_file_preview_width_for_drag(&mut self, width: usize) -> bool {
+        if !self.right_sidebar_file_preview_active() {
+            return false;
+        }
+
+        let max_preview_width = self
+            .right_sidebar_file_preview_total_max_width()
+            .saturating_sub(self.right_sidebar_tree_width());
+        if max_preview_width < FILE_PREVIEW_PANE_MIN_WIDTH {
+            return false;
+        }
+
+        let old_width = self.right_sidebar_file_preview_width;
+        self.right_sidebar_file_preview_width =
+            width.clamp(FILE_PREVIEW_PANE_MIN_WIDTH, max_preview_width);
+        old_width != self.right_sidebar_file_preview_width
+    }
+
     pub fn persist_right_sidebar_width(&self) {
         let width = self
             .right_sidebar_width
             .clamp(RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH);
         if let Err(err) = crate::native_settings::save_right_sidebar_width(width) {
             log::warn!("failed to save right sidebar width: {err:#}");
+        }
+    }
+
+    pub fn persist_right_sidebar_file_preview_width(&self) {
+        let width = self
+            .right_sidebar_file_preview_width()
+            .unwrap_or(self.right_sidebar_file_preview_width)
+            .max(FILE_PREVIEW_PANE_MIN_WIDTH);
+        if let Err(err) = crate::native_settings::save_right_sidebar_file_preview_width(width) {
+            log::warn!("failed to save right sidebar file preview width: {err:#}");
         }
     }
 
@@ -161,8 +378,16 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn right_sidebar_has_text_focus(&self) -> bool {
-        self.right_sidebar_mode == RightSidebarMode::Snippets
-            && self.right_sidebar_snippet_focus.is_some()
+        match self.right_sidebar_mode {
+            RightSidebarMode::Chat => self.right_sidebar_file_focus.is_some(),
+            RightSidebarMode::Snippets => self.right_sidebar_snippet_focus.is_some(),
+            RightSidebarMode::Tasks => false,
+        }
+    }
+
+    pub(crate) fn clear_right_sidebar_text_focus(&mut self) {
+        self.right_sidebar_snippet_focus = None;
+        self.right_sidebar_file_focus = None;
     }
 
     pub(crate) fn open_new_snippet_editor(&mut self) {
@@ -181,10 +406,8 @@ impl crate::TermWindow {
         self.right_sidebar_mode = RightSidebarMode::Snippets;
         self.right_sidebar_snippet_view = RightSidebarSnippetView::EditExisting(snippet.id);
         self.right_sidebar_snippet_scroll_offset = 0.0;
-        self.right_sidebar_snippet_title.text = snippet.title;
-        self.right_sidebar_snippet_title.selected_all = false;
-        self.right_sidebar_snippet_body.text = snippet.body;
-        self.right_sidebar_snippet_body.selected_all = false;
+        self.right_sidebar_snippet_title.set_text_end(snippet.title);
+        self.right_sidebar_snippet_body.set_text_end(snippet.body);
         self.right_sidebar_snippet_focus = Some(RightSidebarSnippetField::Title);
     }
 
@@ -260,6 +483,773 @@ impl crate::TermWindow {
         (old - self.right_sidebar_snippet_scroll_offset).abs() > f32::EPSILON
     }
 
+    pub(crate) fn scroll_right_sidebar_files(&mut self, amount: i16) -> bool {
+        if self.right_sidebar_collapsed
+            || self.right_sidebar_mode != RightSidebarMode::Chat
+            || amount == 0
+        {
+            return false;
+        }
+
+        let old = self.right_sidebar_file_tree_scroll_offset;
+        let steps = amount.unsigned_abs().max(1) as f32;
+        let delta = (steps * 14.0).min(98.0);
+        if amount < 0 {
+            self.right_sidebar_file_tree_scroll_offset += delta;
+        } else {
+            self.right_sidebar_file_tree_scroll_offset =
+                (self.right_sidebar_file_tree_scroll_offset - delta).max(0.0);
+        }
+        (old - self.right_sidebar_file_tree_scroll_offset).abs() > f32::EPSILON
+    }
+
+    pub(crate) fn scroll_right_sidebar_file_preview(&mut self, amount: i16) -> bool {
+        if self.right_sidebar_collapsed
+            || self.right_sidebar_mode != RightSidebarMode::Chat
+            || self.right_sidebar_file_view != RightSidebarFileView::Preview
+            || self.right_sidebar_file_selected.is_none()
+            || amount == 0
+        {
+            return false;
+        }
+
+        let old = self.right_sidebar_file_preview_scroll_offset;
+        let max = self.right_sidebar_file_preview_scroll_max();
+        let steps = amount.unsigned_abs().max(1) as f32;
+        let delta = (steps * 14.0).min(98.0);
+        if amount < 0 {
+            self.right_sidebar_file_preview_scroll_offset =
+                (self.right_sidebar_file_preview_scroll_offset + delta).clamp(0.0, max);
+        } else {
+            self.right_sidebar_file_preview_scroll_offset =
+                (self.right_sidebar_file_preview_scroll_offset - delta).clamp(0.0, max);
+        }
+        (old - self.right_sidebar_file_preview_scroll_offset).abs() > f32::EPSILON
+    }
+
+    pub(crate) fn scroll_right_sidebar_file_preview_horizontal(&mut self, amount: i16) -> bool {
+        if self.right_sidebar_collapsed
+            || self.right_sidebar_mode != RightSidebarMode::Chat
+            || self.right_sidebar_file_view != RightSidebarFileView::Preview
+            || self.right_sidebar_file_selected.is_none()
+            || amount == 0
+        {
+            return false;
+        }
+
+        let old = self.right_sidebar_file_preview_horizontal_offset;
+        let max = self.right_sidebar_file_preview_horizontal_scroll_max();
+        let steps = amount.unsigned_abs().max(1) as usize;
+        let delta = steps.saturating_mul(4).min(32);
+        if amount < 0 {
+            self.right_sidebar_file_preview_horizontal_offset = self
+                .right_sidebar_file_preview_horizontal_offset
+                .saturating_add(delta)
+                .min(max);
+        } else {
+            self.right_sidebar_file_preview_horizontal_offset = self
+                .right_sidebar_file_preview_horizontal_offset
+                .saturating_sub(delta);
+        }
+        old != self.right_sidebar_file_preview_horizontal_offset
+    }
+
+    pub(crate) fn open_right_sidebar_file_path(&mut self, path: PathBuf) {
+        self.right_sidebar_file_focus = None;
+        if path.is_dir() {
+            let key = path_key(&path);
+            if self.right_sidebar_file_expanded.contains(&key) {
+                self.right_sidebar_file_expanded.remove(&key);
+            } else {
+                self.right_sidebar_file_expanded.insert(key);
+            }
+            self.right_sidebar_file_expanded_version =
+                self.right_sidebar_file_expanded_version.wrapping_add(1);
+            return;
+        }
+
+        if !self.right_sidebar_file_preview_active() {
+            let max_tree_for_preview = self
+                .right_sidebar_file_preview_total_max_width()
+                .saturating_sub(FILE_PREVIEW_PANE_MIN_WIDTH)
+                .max(RIGHT_SIDEBAR_MIN_WIDTH);
+            self.right_sidebar_file_tree_width = self
+                .right_sidebar_width
+                .clamp(RIGHT_SIDEBAR_MIN_WIDTH, max_tree_for_preview);
+        }
+        self.right_sidebar_file_selected = Some(path.clone());
+        self.right_sidebar_file_preview_generation =
+            self.right_sidebar_file_preview_generation.wrapping_add(1);
+        let generation = self.right_sidebar_file_preview_generation;
+        self.right_sidebar_file_preview_lines.clear();
+        self.right_sidebar_file_preview_max_columns = 0;
+        self.right_sidebar_file_preview_image = None;
+        self.right_sidebar_file_preview_message = Some("Loading file preview...".to_string());
+        self.right_sidebar_file_preview_truncated = false;
+        self.right_sidebar_file_preview_selection = None;
+        self.right_sidebar_file_preview_scroll_offset = 0.0;
+        self.right_sidebar_file_preview_horizontal_offset = 0;
+        self.right_sidebar_file_view = RightSidebarFileView::Preview;
+        self.prefetch_right_sidebar_file_open_with(&path);
+
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.right_sidebar_file_preview_message = Some("Window is unavailable".to_string());
+            return;
+        };
+        let use_dark_syntax_theme = matches!(
+            crate::native_settings::effective_appearance(),
+            window::Appearance::Dark | window::Appearance::DarkHighContrast
+        );
+        let load_path = path.clone();
+        promise::spawn::spawn(async move {
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                Ok(load_right_sidebar_file_preview(
+                    &load_path,
+                    use_dark_syntax_theme,
+                ))
+            })
+            .await
+            .unwrap_or_else(|err| RightSidebarLoadedFilePreview {
+                lines: Vec::new(),
+                image: None,
+                message: Some(format!("Unable to load file preview: {err}")),
+                truncated: false,
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_right_sidebar_file_preview_result(generation, path, result);
+            })));
+        })
+        .detach();
+    }
+
+    pub(crate) fn close_right_sidebar_file_preview(&mut self) {
+        self.right_sidebar_file_view = RightSidebarFileView::Tree;
+        self.right_sidebar_file_selected = None;
+        self.right_sidebar_file_preview_generation =
+            self.right_sidebar_file_preview_generation.wrapping_add(1);
+        self.right_sidebar_file_preview_lines.clear();
+        self.right_sidebar_file_preview_max_columns = 0;
+        self.right_sidebar_file_preview_image = None;
+        self.right_sidebar_file_preview_message = None;
+        self.right_sidebar_file_preview_truncated = false;
+        self.right_sidebar_file_preview_selection = None;
+        self.right_sidebar_file_preview_scroll_offset = 0.0;
+        self.right_sidebar_file_preview_horizontal_offset = 0;
+    }
+
+    fn apply_right_sidebar_file_preview_result(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        result: RightSidebarLoadedFilePreview,
+    ) {
+        if generation != self.right_sidebar_file_preview_generation
+            || self.right_sidebar_file_selected.as_ref() != Some(&path)
+        {
+            return;
+        }
+
+        self.right_sidebar_file_preview_lines = result.lines;
+        self.right_sidebar_file_preview_max_columns = self
+            .right_sidebar_file_preview_lines
+            .iter()
+            .map(|line| line.plain.chars().count())
+            .max()
+            .unwrap_or(0);
+        self.right_sidebar_file_preview_image = result.image;
+        self.right_sidebar_file_preview_message = result.message;
+        self.right_sidebar_file_preview_truncated = result.truncated;
+        self.right_sidebar_file_preview_selection = None;
+        self.right_sidebar_file_preview_scroll_offset = 0.0;
+        self.right_sidebar_file_preview_horizontal_offset = 0;
+        self.invalidate_window();
+    }
+
+    fn prefetch_right_sidebar_file_open_with(&mut self, path: &Path) {
+        let key = right_sidebar_open_with_cache_key(path);
+        self.start_right_sidebar_open_with_load_if_needed(&key, path);
+    }
+
+    pub(crate) fn open_right_sidebar_selected_file_with_current_app(&self) {
+        let Some(path) = self.right_sidebar_file_selected.as_ref() else {
+            return;
+        };
+
+        let key = right_sidebar_open_with_cache_key(path);
+        if let Some(app) = self.current_right_sidebar_open_with_app(&key) {
+            wezterm_open_url::open_path_with_candidate(path, &app.id);
+        } else {
+            wezterm_open_url::open_url(&path.to_string_lossy());
+        }
+    }
+
+    pub(crate) fn show_right_sidebar_file_open_with_menu(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: window::Point,
+    ) {
+        let Some(path) = self.right_sidebar_file_selected.clone() else {
+            return;
+        };
+        let key = right_sidebar_open_with_cache_key(&path);
+        self.start_right_sidebar_open_with_load_if_needed(&key, &path);
+        let items = self.right_sidebar_open_with_menu_items(&key, &path);
+        self.show_term_context_menu(context, anchor, items);
+    }
+
+    fn start_right_sidebar_open_with_load_if_needed(&mut self, key: &str, path: &Path) {
+        if self
+            .right_sidebar_open_with_cache
+            .get(key)
+            .is_some_and(|entry| {
+                matches!(
+                    entry,
+                    RightSidebarOpenWithCacheEntry::Loading(_)
+                        | RightSidebarOpenWithCacheEntry::Ready(_)
+                )
+            })
+        {
+            return;
+        }
+
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.right_sidebar_open_with_cache
+                .insert(key.to_string(), RightSidebarOpenWithCacheEntry::Failed);
+            return;
+        };
+
+        self.right_sidebar_open_with_generation =
+            self.right_sidebar_open_with_generation.wrapping_add(1);
+        let generation = self.right_sidebar_open_with_generation;
+        let key = key.to_string();
+        let path = path.to_path_buf();
+        self.right_sidebar_open_with_cache.insert(
+            key.clone(),
+            RightSidebarOpenWithCacheEntry::Loading(generation),
+        );
+
+        promise::spawn::spawn(async move {
+            let load_path = path.clone();
+            let candidates = promise::spawn::spawn_into_new_thread(move || {
+                Ok(wezterm_open_url::open_with_candidates(&load_path))
+            })
+            .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window
+                    .apply_right_sidebar_open_with_candidates(generation, key, path, candidates);
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_right_sidebar_open_with_candidates(
+        &mut self,
+        generation: u64,
+        key: String,
+        _path: PathBuf,
+        candidates: anyhow::Result<Vec<wezterm_open_url::OpenWithCandidate>>,
+    ) {
+        if !matches!(
+            self.right_sidebar_open_with_cache.get(&key),
+            Some(RightSidebarOpenWithCacheEntry::Loading(loading_generation))
+                if *loading_generation == generation
+        ) {
+            return;
+        }
+
+        let entry = match candidates {
+            Ok(candidates) => RightSidebarOpenWithCacheEntry::Ready(candidates),
+            Err(_) => RightSidebarOpenWithCacheEntry::Failed,
+        };
+        self.right_sidebar_open_with_cache
+            .insert(key.clone(), entry);
+        self.invalidate_window();
+    }
+
+    fn right_sidebar_open_with_menu_items(&self, key: &str, path: &Path) -> Vec<ContextMenuItem> {
+        let path_string = path.to_string_lossy().to_string();
+        let current_id = self
+            .current_right_sidebar_open_with_app(key)
+            .map(|app| app.id);
+        let Some(RightSidebarOpenWithCacheEntry::Ready(candidates)) =
+            self.right_sidebar_open_with_cache.get(key)
+        else {
+            return Vec::new();
+        };
+
+        sorted_open_with_candidates(candidates.clone(), current_id.as_deref())
+            .into_iter()
+            .filter(|candidate| current_id.as_deref() != Some(candidate.id.as_str()))
+            .map(|candidate| {
+                ContextMenuItem::item_with_icon(
+                    format!("Open With {}", candidate.label),
+                    "app",
+                    KeyAssignment::OpenFileWith {
+                        path: path_string.clone(),
+                        app: candidate.id,
+                        label: candidate.label,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn current_right_sidebar_open_with_app(
+        &self,
+        key: &str,
+    ) -> Option<crate::native_settings::NativeOpenWithApp> {
+        if let Some(app) = self.right_sidebar_open_with_app.clone() {
+            return Some(app);
+        }
+
+        let Some(RightSidebarOpenWithCacheEntry::Ready(candidates)) =
+            self.right_sidebar_open_with_cache.get(key)
+        else {
+            return None;
+        };
+
+        if let Some(candidate) = candidates.iter().find(|candidate| candidate.is_default) {
+            return Some(crate::native_settings::NativeOpenWithApp {
+                id: candidate.id.clone(),
+                label: candidate.label.clone(),
+            });
+        }
+
+        sorted_open_with_candidates(candidates.clone(), None)
+            .into_iter()
+            .next()
+            .map(|candidate| crate::native_settings::NativeOpenWithApp {
+                id: candidate.id,
+                label: candidate.label,
+            })
+    }
+
+    fn right_sidebar_current_open_with_app_label(&self, path: &Path) -> Option<String> {
+        let key = right_sidebar_open_with_cache_key(path);
+        self.current_right_sidebar_open_with_app(&key)
+            .map(|app| app.label)
+    }
+
+    pub(crate) fn reveal_right_sidebar_selected_file(&self) {
+        if let Some(path) = self.right_sidebar_file_selected.as_ref() {
+            wezterm_open_url::reveal_path(path);
+        }
+    }
+
+    pub(crate) fn copy_right_sidebar_selected_file_preview_text(&mut self) {
+        if let Some(text) = self.right_sidebar_file_preview_selected_text() {
+            self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+            return;
+        }
+
+        if self.right_sidebar_file_preview_lines.is_empty() {
+            return;
+        }
+
+        let mut text = String::new();
+        for (idx, line) in self.right_sidebar_file_preview_lines.iter().enumerate() {
+            if idx > 0 {
+                text.push('\n');
+            }
+            text.push_str(&line.plain);
+        }
+        self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+    }
+
+    pub(crate) fn right_sidebar_file_preview_selected_text(&self) -> Option<String> {
+        if !self.right_sidebar_file_preview_active() {
+            return None;
+        }
+        let (start, end) = self.right_sidebar_file_preview_selection_range()?;
+        let mut text = String::new();
+        for line_idx in start.line..=end.line {
+            let Some(line) = self.right_sidebar_file_preview_lines.get(line_idx) else {
+                break;
+            };
+            if line_idx > start.line {
+                text.push('\n');
+            }
+            let line_start = if line_idx == start.line {
+                start.column
+            } else {
+                0
+            };
+            let line_end = if line_idx == end.line {
+                end.column
+            } else {
+                line.plain.chars().count()
+            };
+            if line_end > line_start {
+                text.push_str(&preview_text_range(&line.plain, line_start, line_end));
+            }
+        }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn right_sidebar_file_preview_selection_range(
+        &self,
+    ) -> Option<(
+        RightSidebarFilePreviewSelectionPoint,
+        RightSidebarFilePreviewSelectionPoint,
+    )> {
+        let selection = self.right_sidebar_file_preview_selection?;
+        if selection.anchor == selection.focus {
+            return None;
+        }
+        if selection.anchor <= selection.focus {
+            Some((selection.anchor, selection.focus))
+        } else {
+            Some((selection.focus, selection.anchor))
+        }
+    }
+
+    fn right_sidebar_file_preview_text_point_for_coords(
+        &self,
+        x: isize,
+        y: isize,
+    ) -> Option<RightSidebarFilePreviewSelectionPoint> {
+        if self.right_sidebar_file_preview_image.is_some()
+            || self.right_sidebar_file_preview_message.is_some()
+        {
+            return None;
+        }
+        let preview_metrics = self.right_sidebar_file_preview_render_metrics();
+        let metrics = self.right_sidebar_file_preview_body_metrics(preview_metrics)?;
+        let visible_height =
+            self.right_sidebar_file_preview_effective_visible_height(metrics, preview_metrics);
+        if visible_height == 0 {
+            return None;
+        }
+
+        let line_height = metrics.line_height.max(1);
+        let scroll_offset = self.right_sidebar_file_preview_scroll_offset.clamp(
+            0.0,
+            self.right_sidebar_file_preview_scroll_max_with_metrics(preview_metrics),
+        );
+        let relative_y = (y as f32 - metrics.y as f32 + scroll_offset).max(0.0);
+        let line_count = preview_line_count(&self.right_sidebar_file_preview_lines).max(1);
+        let line = (relative_y / line_height as f32).floor() as usize;
+        let line = line.min(line_count.saturating_sub(1));
+        let line_len = self
+            .right_sidebar_file_preview_lines
+            .get(line)
+            .map(|line| line.plain.chars().count())
+            .unwrap_or(0);
+
+        let (_, _, text_x, text_width) =
+            self.right_sidebar_file_preview_text_layout(metrics, preview_metrics);
+        let cell_width = preview_metrics.cell_size.width.max(1) as f32;
+        let relative_x = (x as f32 - text_x as f32).max(0.0);
+        let visible_column = (relative_x / cell_width).round().max(0.0) as usize;
+        let column = self
+            .right_sidebar_file_preview_horizontal_offset
+            .saturating_add(visible_column)
+            .min(line_len);
+
+        if x >= text_x.saturating_add(text_width) as isize {
+            return Some(RightSidebarFilePreviewSelectionPoint {
+                line,
+                column: line_len,
+            });
+        }
+        Some(RightSidebarFilePreviewSelectionPoint { line, column })
+    }
+
+    pub(crate) fn begin_right_sidebar_file_preview_selection(
+        &mut self,
+        x: isize,
+        y: isize,
+    ) -> bool {
+        let Some(point) = self.right_sidebar_file_preview_text_point_for_coords(x, y) else {
+            self.right_sidebar_file_preview_selection = None;
+            return false;
+        };
+        self.clear_right_sidebar_text_focus();
+        self.right_sidebar_file_preview_selection = Some(RightSidebarFilePreviewSelection {
+            anchor: point,
+            focus: point,
+        });
+        true
+    }
+
+    pub(crate) fn update_right_sidebar_file_preview_selection(
+        &mut self,
+        x: isize,
+        y: isize,
+    ) -> bool {
+        let Some(point) = self.right_sidebar_file_preview_text_point_for_coords(x, y) else {
+            return false;
+        };
+        let Some(selection) = self.right_sidebar_file_preview_selection.as_mut() else {
+            return false;
+        };
+        if selection.focus == point {
+            return false;
+        }
+        selection.focus = point;
+        true
+    }
+
+    fn mark_right_sidebar_file_filter_changed(&mut self) {
+        self.right_sidebar_file_tree_scroll_offset = 0.0;
+        if self.right_sidebar_file_filter.text == self.right_sidebar_file_applied_filter {
+            self.right_sidebar_file_filter_debounce_until = None;
+        } else {
+            self.right_sidebar_file_filter_debounce_until =
+                Some(Instant::now() + Duration::from_millis(FILE_FILTER_DEBOUNCE_MS));
+        }
+    }
+
+    fn right_sidebar_file_filter_for_tree(&mut self) -> String {
+        let current = self.right_sidebar_file_filter.text.clone();
+        if current == self.right_sidebar_file_applied_filter {
+            self.right_sidebar_file_filter_debounce_until = None;
+            return self.right_sidebar_file_applied_filter.clone();
+        }
+
+        if let Some(until) = self.right_sidebar_file_filter_debounce_until {
+            let now = Instant::now();
+            if now < until {
+                self.update_next_frame_time(Some(until));
+                return self.right_sidebar_file_applied_filter.clone();
+            }
+        }
+
+        self.right_sidebar_file_applied_filter = current;
+        self.right_sidebar_file_filter_debounce_until = None;
+        self.right_sidebar_file_tree_scroll_offset = 0.0;
+        self.right_sidebar_file_applied_filter.clone()
+    }
+
+    fn clear_right_sidebar_file_search(&mut self) {
+        if let Some(cancel) = self.right_sidebar_file_search_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        self.right_sidebar_file_search_query.clear();
+        self.right_sidebar_file_search_rows.clear();
+        self.right_sidebar_file_searching = false;
+    }
+
+    fn schedule_right_sidebar_reflow(&self) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+
+        window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+            if let Some(window) = term_window.window.as_ref().cloned() {
+                let dimensions = term_window.dimensions;
+                term_window.apply_dimensions(&dimensions, None, &window);
+            }
+            term_window.invalidate_window();
+        })));
+    }
+
+    fn start_right_sidebar_file_index_if_needed(&mut self, root: &RightSidebarFileRoot) {
+        let same_root = self
+            .right_sidebar_file_index_root
+            .as_ref()
+            .is_some_and(|path| path == &root.path)
+            && self.right_sidebar_file_index_project_name == root.project_name;
+        if same_root
+            && matches!(
+                self.right_sidebar_file_index_status,
+                RightSidebarFileIndexStatus::Indexing | RightSidebarFileIndexStatus::Ready
+            )
+        {
+            return;
+        }
+
+        if !same_root {
+            let previous_width = self.right_sidebar_width();
+            self.close_right_sidebar_file_preview();
+            self.right_sidebar_file_browse_rows.clear();
+            self.right_sidebar_file_browse_cache_key = None;
+            self.right_sidebar_file_expanded.clear();
+            self.right_sidebar_file_expanded
+                .insert(path_key(&root.path));
+            self.right_sidebar_file_expanded_version =
+                self.right_sidebar_file_expanded_version.wrapping_add(1);
+            if self.right_sidebar_width() != previous_width {
+                self.schedule_right_sidebar_reflow();
+            }
+        }
+
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.right_sidebar_file_index_status =
+                RightSidebarFileIndexStatus::Failed("Window is unavailable".to_string());
+            return;
+        };
+
+        if let Some(cancel) = self.right_sidebar_file_index_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        if let Some(cancel) = self.right_sidebar_file_search_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        let index_cancel = Arc::new(AtomicBool::new(false));
+        self.right_sidebar_file_index_cancel = Some(index_cancel.clone());
+        self.right_sidebar_file_index_generation =
+            self.right_sidebar_file_index_generation.wrapping_add(1);
+        let generation = self.right_sidebar_file_index_generation;
+        let root_path = root.path.clone();
+        let project_name = root.project_name.clone();
+
+        self.right_sidebar_file_index_root = Some(root_path.clone());
+        self.right_sidebar_file_index_project_name = project_name.clone();
+        self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Indexing;
+        self.right_sidebar_file_index = None;
+        self.right_sidebar_file_search_generation =
+            self.right_sidebar_file_search_generation.wrapping_add(1);
+        self.right_sidebar_file_search_query.clear();
+        self.right_sidebar_file_search_rows.clear();
+        self.right_sidebar_file_searching = false;
+        self.right_sidebar_file_tree_scroll_offset = 0.0;
+
+        let index_root_path = root_path.clone();
+        let index_project_name = project_name.clone();
+        let worker_cancel = index_cancel.clone();
+        promise::spawn::spawn(async move {
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                Ok(build_right_sidebar_file_index_with_cancel(
+                    &index_root_path,
+                    &index_project_name,
+                    &worker_cancel,
+                )
+                .map(Arc::new))
+            })
+            .await
+            .unwrap_or_else(|err| Err(format!("Unable to index files: {err}")));
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_right_sidebar_file_index_result(
+                    generation,
+                    root_path,
+                    project_name,
+                    result,
+                );
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_right_sidebar_file_index_result(
+        &mut self,
+        generation: u64,
+        root_path: PathBuf,
+        project_name: String,
+        result: Result<Arc<RightSidebarFileIndex>, String>,
+    ) {
+        if generation != self.right_sidebar_file_index_generation
+            || self.right_sidebar_file_index_root.as_ref() != Some(&root_path)
+            || self.right_sidebar_file_index_project_name != project_name
+        {
+            return;
+        }
+        self.right_sidebar_file_index_cancel = None;
+
+        match result {
+            Ok(index) => {
+                self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Ready;
+                self.right_sidebar_file_index = Some(index);
+            }
+            Err(err) => {
+                self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Failed(err);
+                self.right_sidebar_file_index = None;
+            }
+        }
+        self.invalidate_window();
+    }
+
+    fn start_right_sidebar_file_search_if_needed(&mut self, query: &str) {
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            if !self.right_sidebar_file_search_query.is_empty()
+                || !self.right_sidebar_file_search_rows.is_empty()
+                || self.right_sidebar_file_searching
+            {
+                self.clear_right_sidebar_file_search();
+            }
+            return;
+        }
+
+        if self.right_sidebar_file_search_query == query {
+            return;
+        }
+
+        let Some(index) = self.right_sidebar_file_index.clone() else {
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.right_sidebar_file_searching = false;
+            return;
+        };
+
+        if let Some(cancel) = self.right_sidebar_file_search_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.right_sidebar_file_search_cancel = Some(cancel.clone());
+        self.right_sidebar_file_search_generation =
+            self.right_sidebar_file_search_generation.wrapping_add(1);
+        let generation = self.right_sidebar_file_search_generation;
+
+        self.right_sidebar_file_search_query = query.clone();
+        self.right_sidebar_file_search_rows.clear();
+        self.right_sidebar_file_searching = true;
+        self.right_sidebar_file_tree_scroll_offset = 0.0;
+
+        let worker_index = index.clone();
+        let worker_query = query.clone();
+        let worker_cancel = cancel.clone();
+        let completion_cancel = cancel.clone();
+        let notify_query = query.clone();
+        promise::spawn::spawn(async move {
+            let rows = promise::spawn::spawn_into_new_thread(move || {
+                Ok(search_right_sidebar_file_index(
+                    &worker_index,
+                    &worker_query,
+                    &worker_cancel,
+                ))
+            })
+            .await
+            .unwrap_or_else(|err| {
+                log::warn!("Unable to search files: {err:#}");
+                Vec::new()
+            });
+            if !completion_cancel.load(AtomicOrdering::Relaxed) {
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.apply_right_sidebar_file_search_result(
+                        generation,
+                        notify_query,
+                        rows,
+                    );
+                })));
+            }
+        })
+        .detach();
+    }
+
+    fn apply_right_sidebar_file_search_result(
+        &mut self,
+        generation: u64,
+        query: String,
+        rows: Vec<RightSidebarFileTreeRow>,
+    ) {
+        if generation != self.right_sidebar_file_search_generation
+            || self.right_sidebar_file_search_query != query
+        {
+            return;
+        }
+
+        self.right_sidebar_file_search_rows = rows;
+        self.right_sidebar_file_searching = false;
+        self.right_sidebar_file_search_cancel = None;
+        self.invalidate_window();
+    }
+
     pub(crate) fn paste_snippet_to_active_pane(&mut self, id: &str, run: bool) {
         let Some(snippet) = crate::snippets::get_snippet(id) else {
             return;
@@ -279,15 +1269,15 @@ impl crate::TermWindow {
         }
     }
 
-    pub(crate) fn copy_right_sidebar_focused_input(&self) {
-        let Some(text) = self
-            .right_sidebar_focused_input()
-            .map(|input| input.text.clone())
-        else {
+    pub(crate) fn copy_right_sidebar_focused_input(&self, destination: ClipboardCopyDestination) {
+        let Some(input) = self.right_sidebar_focused_input() else {
             return;
         };
+        let text = input
+            .caret_selected_text()
+            .unwrap_or_else(|| input.text.clone());
         if !text.is_empty() {
-            self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+            self.copy_to_clipboard(destination, text);
         }
     }
 
@@ -295,8 +1285,8 @@ impl crate::TermWindow {
         let Some(input) = self.right_sidebar_focused_input_mut() else {
             return;
         };
-        let text = if input.selected_all {
-            input.take_selected_text().unwrap_or_default()
+        let text = if let Some(text) = input.caret_take_selected_text() {
+            text
         } else {
             let text = input.text.clone();
             input.clear();
@@ -305,13 +1295,18 @@ impl crate::TermWindow {
         if !text.is_empty() {
             self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
         }
+        self.after_right_sidebar_text_edit();
     }
 
-    pub(crate) fn paste_into_right_sidebar_from_clipboard(&mut self) {
+    pub(crate) fn paste_into_right_sidebar_from_clipboard(&mut self, source: ClipboardPasteSource) {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
-        let future = window.get_clipboard(Clipboard::Clipboard);
+        let clipboard = match source {
+            ClipboardPasteSource::Clipboard => Clipboard::Clipboard,
+            ClipboardPasteSource::PrimarySelection => Clipboard::PrimarySelection,
+        };
+        let future = window.get_clipboard(clipboard);
         promise::spawn::spawn(async move {
             if let Ok(text) = future.await {
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -324,6 +1319,12 @@ impl crate::TermWindow {
         .detach();
     }
 
+    pub(crate) fn clear_right_sidebar_focused_input_selection(&mut self) {
+        if let Some(input) = self.right_sidebar_focused_input_mut() {
+            input.clear_selection();
+        }
+    }
+
     pub(crate) fn handle_right_sidebar_key(
         &mut self,
         key: TermKeyCode,
@@ -333,16 +1334,23 @@ impl crate::TermWindow {
             return false;
         }
 
-        if mods.contains(TermModifiers::SUPER) && !mods.contains(TermModifiers::ALT) {
+        let shift = mods.contains(TermModifiers::SHIFT);
+        let super_ = mods.contains(TermModifiers::SUPER);
+        let alt = mods.contains(TermModifiers::ALT);
+        let ctrl = mods.contains(TermModifiers::CTRL);
+        let multiline = self.right_sidebar_focused_is_multiline();
+
+        // Cmd shortcuts (macOS): clipboard, select-all, jump to line start/end.
+        if super_ && !alt && !ctrl {
             return match key {
                 TermKeyCode::Char('a') | TermKeyCode::Char('A') => {
                     if let Some(input) = self.right_sidebar_focused_input_mut() {
-                        input.select_all();
+                        input.caret_select_all();
                     }
                     true
                 }
                 TermKeyCode::Char('c') | TermKeyCode::Char('C') => {
-                    self.copy_right_sidebar_focused_input();
+                    self.copy_right_sidebar_focused_input(ClipboardCopyDestination::Clipboard);
                     true
                 }
                 TermKeyCode::Char('x') | TermKeyCode::Char('X') => {
@@ -350,28 +1358,137 @@ impl crate::TermWindow {
                     true
                 }
                 TermKeyCode::Char('v') | TermKeyCode::Char('V') => {
-                    self.paste_into_right_sidebar_from_clipboard();
+                    self.paste_into_right_sidebar_from_clipboard(ClipboardPasteSource::Clipboard);
+                    true
+                }
+                TermKeyCode::LeftArrow if !multiline => {
+                    if let Some(input) = self.right_sidebar_focused_input_mut() {
+                        input.caret_move_home(shift);
+                    }
+                    true
+                }
+                TermKeyCode::RightArrow if !multiline => {
+                    if let Some(input) = self.right_sidebar_focused_input_mut() {
+                        input.caret_move_end(shift);
+                    }
+                    true
+                }
+                TermKeyCode::Backspace if !multiline => {
+                    if let Some(input) = self.right_sidebar_focused_input_mut() {
+                        input.caret_delete_to_start();
+                    }
+                    self.after_right_sidebar_text_edit();
                     true
                 }
                 _ => false,
             };
         }
 
-        if mods.intersects(TermModifiers::SUPER | TermModifiers::CTRL | TermModifiers::ALT) {
+        // Option/Alt shortcuts (macOS): word navigation / deletion.
+        if alt && !super_ && !ctrl {
+            return match key {
+                TermKeyCode::LeftArrow if !multiline => {
+                    if let Some(input) = self.right_sidebar_focused_input_mut() {
+                        input.caret_word_left(shift);
+                    }
+                    true
+                }
+                TermKeyCode::RightArrow if !multiline => {
+                    if let Some(input) = self.right_sidebar_focused_input_mut() {
+                        input.caret_word_right(shift);
+                    }
+                    true
+                }
+                TermKeyCode::Backspace if !multiline => {
+                    if let Some(input) = self.right_sidebar_focused_input_mut() {
+                        input.caret_delete_word_back();
+                    }
+                    self.after_right_sidebar_text_edit();
+                    true
+                }
+                _ => false,
+            };
+        }
+
+        if ctrl {
             return false;
+        }
+
+        // Plain caret navigation, shared by every single-line input.
+        match key {
+            TermKeyCode::LeftArrow if !multiline => {
+                if let Some(input) = self.right_sidebar_focused_input_mut() {
+                    input.caret_move_left(shift);
+                }
+                return true;
+            }
+            TermKeyCode::RightArrow if !multiline => {
+                if let Some(input) = self.right_sidebar_focused_input_mut() {
+                    input.caret_move_right(shift);
+                }
+                return true;
+            }
+            TermKeyCode::Home if !multiline => {
+                if let Some(input) = self.right_sidebar_focused_input_mut() {
+                    input.caret_move_home(shift);
+                }
+                return true;
+            }
+            TermKeyCode::End if !multiline => {
+                if let Some(input) = self.right_sidebar_focused_input_mut() {
+                    input.caret_move_end(shift);
+                }
+                return true;
+            }
+            TermKeyCode::LeftArrow
+            | TermKeyCode::RightArrow
+            | TermKeyCode::Home
+            | TermKeyCode::End => {
+                // Multiline body: swallow so the arrow does not leak to the pane.
+                return true;
+            }
+            TermKeyCode::Delete if !multiline => {
+                if let Some(input) = self.right_sidebar_focused_input_mut() {
+                    input.caret_delete_forward();
+                }
+                self.after_right_sidebar_text_edit();
+                return true;
+            }
+            _ => {}
+        }
+
+        if self.right_sidebar_mode == RightSidebarMode::Chat {
+            return match key {
+                TermKeyCode::Escape => {
+                    self.right_sidebar_file_focus = None;
+                    true
+                }
+                TermKeyCode::Enter | TermKeyCode::Tab => true,
+                TermKeyCode::Backspace => {
+                    if let Some(input) = self.right_sidebar_focused_input_mut() {
+                        input.caret_backspace();
+                    }
+                    self.after_right_sidebar_text_edit();
+                    true
+                }
+                TermKeyCode::Char(ch) => {
+                    if !ch.is_control() {
+                        self.push_right_sidebar_text(&ch.to_string());
+                        return true;
+                    }
+                    false
+                }
+                _ => false,
+            };
         }
 
         match key {
             TermKeyCode::Escape => {
-                self.right_sidebar_snippet_focus = None;
+                self.clear_right_sidebar_text_focus();
                 true
             }
             TermKeyCode::Tab => {
-                self.step_right_sidebar_snippet_field(if mods.contains(TermModifiers::SHIFT) {
-                    -1
-                } else {
-                    1
-                });
+                self.step_right_sidebar_snippet_field(if shift { -1 } else { 1 });
                 true
             }
             TermKeyCode::Enter => {
@@ -387,14 +1504,10 @@ impl crate::TermWindow {
                 true
             }
             TermKeyCode::Backspace => {
-                let reset_scroll =
-                    self.right_sidebar_snippet_focus == Some(RightSidebarSnippetField::Search);
                 if let Some(input) = self.right_sidebar_focused_input_mut() {
-                    input.backspace();
+                    input.caret_backspace();
                 }
-                if reset_scroll {
-                    self.right_sidebar_snippet_scroll_offset = 0.0;
-                }
+                self.after_right_sidebar_text_edit();
                 true
             }
             TermKeyCode::Char(ch) => {
@@ -408,32 +1521,107 @@ impl crate::TermWindow {
         }
     }
 
-    pub(crate) fn push_right_sidebar_text(&mut self, text: &str) -> bool {
-        match self.right_sidebar_snippet_focus {
-            Some(RightSidebarSnippetField::Body) => {
-                let input = &mut self.right_sidebar_snippet_body;
-                if input.selected_all {
-                    input.clear();
+    fn right_sidebar_focused_is_multiline(&self) -> bool {
+        self.right_sidebar_mode == RightSidebarMode::Snippets
+            && self.right_sidebar_snippet_focus == Some(RightSidebarSnippetField::Body)
+    }
+
+    /// Side effects that must run after the focused input's text changes:
+    /// re-filter the file tree, or reset the snippet list scroll.
+    fn after_right_sidebar_text_edit(&mut self) {
+        match self.right_sidebar_mode {
+            RightSidebarMode::Chat => {
+                if self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter) {
+                    self.mark_right_sidebar_file_filter_changed();
                 }
-                input.text.extend(
-                    text.chars()
-                        .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t'),
-                );
-                true
             }
-            Some(_) => {
-                let reset_scroll =
-                    self.right_sidebar_snippet_focus == Some(RightSidebarSnippetField::Search);
-                let Some(input) = self.right_sidebar_focused_input_mut() else {
-                    return false;
-                };
-                input.push_text(text);
-                if reset_scroll {
+            RightSidebarMode::Snippets => {
+                if self.right_sidebar_snippet_focus == Some(RightSidebarSnippetField::Search) {
                     self.right_sidebar_snippet_scroll_offset = 0.0;
                 }
-                true
             }
-            None => false,
+            RightSidebarMode::Tasks => {}
+        }
+    }
+
+    pub(crate) fn push_right_sidebar_text(&mut self, text: &str) -> bool {
+        let multiline = self.right_sidebar_focused_is_multiline();
+        let Some(input) = self.right_sidebar_focused_input_mut() else {
+            return false;
+        };
+        input.caret_insert(text, multiline);
+        self.after_right_sidebar_text_edit();
+        true
+    }
+
+    /// Map a sidebar text-input `UIItemType` to its `TextInputState`.
+    fn right_sidebar_input_for_item(&self, item_type: &UIItemType) -> Option<&TextInputState> {
+        match item_type {
+            UIItemType::RightSidebarFileFilter => Some(&self.right_sidebar_file_filter),
+            UIItemType::RightSidebarSnippetSearch => Some(&self.right_sidebar_snippet_search),
+            UIItemType::RightSidebarSnippetTitle => Some(&self.right_sidebar_snippet_title),
+            _ => None,
+        }
+    }
+
+    /// Hit-test an x coordinate against a single-line input painted this frame,
+    /// returning the closest caret char index.
+    pub(crate) fn right_sidebar_input_char_index_for_x(
+        &self,
+        item_type: &UIItemType,
+        x: isize,
+    ) -> Option<usize> {
+        let layout = self
+            .right_sidebar_input_layouts
+            .iter()
+            .find(|layout| &layout.item_type == item_type)?;
+        let input = self.right_sidebar_input_for_item(item_type)?;
+        let font = layout.font.clone();
+        let chars: Vec<char> = input.text.chars().collect();
+        let first = layout.first_char.min(chars.len());
+        let relative = (x as f32 - layout.text_x).clamp(0.0, layout.text_width.max(0.0));
+        let mut best_idx = first;
+        let mut best_dist = f32::MAX;
+        for idx in first..=chars.len() {
+            let prefix: String = chars[first..idx].iter().collect();
+            let width = self.sidebar_text_width(&font, &prefix).unwrap_or(0.0);
+            let dist = (width - relative).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = idx;
+            }
+            if width > relative {
+                break;
+            }
+        }
+        Some(best_idx)
+    }
+
+    fn right_sidebar_input_for_item_mut(
+        &mut self,
+        item_type: &UIItemType,
+    ) -> Option<&mut TextInputState> {
+        match item_type {
+            UIItemType::RightSidebarFileFilter => Some(&mut self.right_sidebar_file_filter),
+            UIItemType::RightSidebarSnippetSearch => Some(&mut self.right_sidebar_snippet_search),
+            UIItemType::RightSidebarSnippetTitle => Some(&mut self.right_sidebar_snippet_title),
+            _ => None,
+        }
+    }
+
+    /// Move (or, with `extend`, stretch the selection to) the caret of a
+    /// single-line sidebar input to the character nearest the given x.
+    pub(crate) fn position_right_sidebar_input_caret(
+        &mut self,
+        item_type: &UIItemType,
+        x: isize,
+        extend: bool,
+    ) {
+        let Some(idx) = self.right_sidebar_input_char_index_for_x(item_type, x) else {
+            return;
+        };
+        if let Some(input) = self.right_sidebar_input_for_item_mut(item_type) {
+            input.caret_set(idx, extend);
         }
     }
 
@@ -459,20 +1647,38 @@ impl crate::TermWindow {
     }
 
     fn right_sidebar_focused_input(&self) -> Option<&TextInputState> {
-        match self.right_sidebar_snippet_focus {
-            Some(RightSidebarSnippetField::Search) => Some(&self.right_sidebar_snippet_search),
-            Some(RightSidebarSnippetField::Title) => Some(&self.right_sidebar_snippet_title),
-            Some(RightSidebarSnippetField::Body) => Some(&self.right_sidebar_snippet_body),
-            None => None,
+        match self.right_sidebar_mode {
+            RightSidebarMode::Chat => match self.right_sidebar_file_focus {
+                Some(RightSidebarFileField::Filter) => Some(&self.right_sidebar_file_filter),
+                None => None,
+            },
+            RightSidebarMode::Snippets => match self.right_sidebar_snippet_focus {
+                Some(RightSidebarSnippetField::Search) => Some(&self.right_sidebar_snippet_search),
+                Some(RightSidebarSnippetField::Title) => Some(&self.right_sidebar_snippet_title),
+                Some(RightSidebarSnippetField::Body) => Some(&self.right_sidebar_snippet_body),
+                None => None,
+            },
+            RightSidebarMode::Tasks => None,
         }
     }
 
     fn right_sidebar_focused_input_mut(&mut self) -> Option<&mut TextInputState> {
-        match self.right_sidebar_snippet_focus {
-            Some(RightSidebarSnippetField::Search) => Some(&mut self.right_sidebar_snippet_search),
-            Some(RightSidebarSnippetField::Title) => Some(&mut self.right_sidebar_snippet_title),
-            Some(RightSidebarSnippetField::Body) => Some(&mut self.right_sidebar_snippet_body),
-            None => None,
+        match self.right_sidebar_mode {
+            RightSidebarMode::Chat => match self.right_sidebar_file_focus {
+                Some(RightSidebarFileField::Filter) => Some(&mut self.right_sidebar_file_filter),
+                None => None,
+            },
+            RightSidebarMode::Snippets => match self.right_sidebar_snippet_focus {
+                Some(RightSidebarSnippetField::Search) => {
+                    Some(&mut self.right_sidebar_snippet_search)
+                }
+                Some(RightSidebarSnippetField::Title) => {
+                    Some(&mut self.right_sidebar_snippet_title)
+                }
+                Some(RightSidebarSnippetField::Body) => Some(&mut self.right_sidebar_snippet_body),
+                None => None,
+            },
+            RightSidebarMode::Tasks => None,
         }
     }
 
@@ -506,6 +1712,317 @@ impl crate::TermWindow {
             y,
             width,
             height,
+        })
+    }
+
+    pub(crate) fn right_sidebar_file_preview_rect(&self) -> Option<RightSidebarRect> {
+        let sidebar = self.right_sidebar_rect()?;
+        let width = self.right_sidebar_file_preview_width()?;
+        if sidebar.width <= width {
+            return None;
+        }
+        Some(RightSidebarRect {
+            x: sidebar.x,
+            y: sidebar.y,
+            width,
+            height: sidebar.height,
+        })
+    }
+
+    fn right_sidebar_tree_rect(&self, total_rect: RightSidebarRect) -> RightSidebarRect {
+        let tree_width = self.right_sidebar_tree_width().min(total_rect.width);
+        RightSidebarRect {
+            x: total_rect
+                .x
+                .saturating_add(total_rect.width.saturating_sub(tree_width)),
+            y: total_rect.y,
+            width: tree_width,
+            height: total_rect.height,
+        }
+    }
+
+    pub(crate) fn set_right_sidebar_file_preview_split_x(&mut self, split_x: isize) -> bool {
+        let Some(total_rect) = self.right_sidebar_rect() else {
+            return false;
+        };
+        if self.right_sidebar_file_preview_rect().is_none() {
+            return false;
+        }
+
+        let total_left = total_rect.x;
+        let total_right = total_rect.x.saturating_add(total_rect.width);
+        let min_preview = FILE_PREVIEW_PANE_MIN_WIDTH;
+        let max_preview = total_rect.width.saturating_sub(RIGHT_SIDEBAR_MIN_WIDTH);
+        let min_tree = RIGHT_SIDEBAR_MIN_WIDTH;
+        let max_tree = self.right_sidebar_max_width().min(total_rect.width);
+        let min_split = total_left
+            .saturating_add(min_preview)
+            .max(total_right.saturating_sub(max_tree));
+        let max_split = total_right
+            .saturating_sub(min_tree)
+            .min(total_left.saturating_add(max_preview));
+        if min_split > max_split {
+            return false;
+        }
+
+        let split_x = split_x.clamp(min_split as isize, max_split as isize) as usize;
+        let preview_width = split_x.saturating_sub(total_left);
+        let tree_width = total_right.saturating_sub(split_x);
+        let old_preview = self.right_sidebar_file_preview_width;
+        self.right_sidebar_file_preview_width = preview_width;
+        let tree_changed = self.set_right_sidebar_file_tree_width(tree_width);
+        old_preview != self.right_sidebar_file_preview_width || tree_changed
+    }
+
+    fn right_sidebar_file_preview_font_size(&self) -> f64 {
+        let settings = crate::native_settings::load();
+        let base_font_size = crate::native_settings::home_font_size(&settings);
+        (base_font_size + 2.0).max(FILE_FONT_MIN_SIZE)
+    }
+
+    fn right_sidebar_file_preview_render_metrics(&self) -> RenderMetrics {
+        self.fonts
+            .title_font_with_size(self.right_sidebar_file_preview_font_size())
+            .map(|font| RenderMetrics::with_font_metrics(&font.metrics()))
+            .unwrap_or(self.render_metrics)
+    }
+
+    fn right_sidebar_file_preview_body_metrics(
+        &self,
+        preview_metrics: RenderMetrics,
+    ) -> Option<RightSidebarFilePreviewBodyMetrics> {
+        if self.right_sidebar_file_view != RightSidebarFileView::Preview
+            || self.right_sidebar_file_selected.is_none()
+        {
+            return None;
+        }
+
+        let rect = self.right_sidebar_file_preview_rect()?;
+        let content_x = rect.x + SIDEBAR_INSET * 2;
+        let content_width = rect.width.saturating_sub(SIDEBAR_INSET * 4);
+        let content_top = rect.y + SIDEBAR_INSET * 2;
+        let content_bottom = rect.y.saturating_add(rect.height);
+        let y = content_top + FILE_PREVIEW_HEADER_HEIGHT;
+        let bottom = content_bottom.saturating_sub(SIDEBAR_INSET);
+        let visible_height = bottom.saturating_sub(y);
+        if visible_height == 0 || content_width == 0 {
+            return None;
+        }
+
+        let line_height = preview_metrics.cell_size.height as usize + 4;
+        let total_height = if self.right_sidebar_file_preview_image.is_some() {
+            visible_height
+        } else {
+            let line_count = preview_line_count(&self.right_sidebar_file_preview_lines);
+            line_count.saturating_mul(line_height)
+                + usize::from(self.right_sidebar_file_preview_truncated).saturating_mul(line_height)
+        };
+
+        Some(RightSidebarFilePreviewBodyMetrics {
+            x: content_x,
+            y,
+            width: content_width,
+            bottom,
+            line_height,
+            visible_height,
+            total_height,
+        })
+    }
+
+    fn right_sidebar_file_preview_vertical_scrollbar_active(
+        &self,
+        metrics: RightSidebarFilePreviewBodyMetrics,
+    ) -> bool {
+        metrics.total_height > metrics.visible_height
+    }
+
+    fn right_sidebar_file_preview_text_layout(
+        &self,
+        metrics: RightSidebarFilePreviewBodyMetrics,
+        preview_metrics: RenderMetrics,
+    ) -> (usize, usize, usize, usize) {
+        let scrollbar_reserve =
+            if self.right_sidebar_file_preview_vertical_scrollbar_active(metrics) {
+                SIDEBAR_INSET + 4
+            } else {
+                0
+            };
+        let body_width = metrics.width.saturating_sub(scrollbar_reserve);
+        let line_count = preview_line_count(&self.right_sidebar_file_preview_lines);
+        let number_digits = decimal_digit_count(line_count);
+        let number_width = file_preview_line_number_width(
+            number_digits,
+            preview_metrics.cell_size.width.max(1) as usize,
+            body_width,
+        );
+        let text_x = metrics
+            .x
+            .saturating_add(number_width)
+            .saturating_add(SIDEBAR_ICON_GAP);
+        let text_width = metrics.x.saturating_add(body_width).saturating_sub(text_x);
+        (body_width, number_width, text_x, text_width)
+    }
+
+    fn right_sidebar_file_preview_text_width(
+        &self,
+        preview_metrics: RenderMetrics,
+    ) -> Option<usize> {
+        let metrics = self.right_sidebar_file_preview_body_metrics(preview_metrics)?;
+        let (_, _, _, text_width) =
+            self.right_sidebar_file_preview_text_layout(metrics, preview_metrics);
+        Some(text_width)
+    }
+
+    fn right_sidebar_file_preview_visible_columns(&self, preview_metrics: RenderMetrics) -> usize {
+        let Some(text_width) = self.right_sidebar_file_preview_text_width(preview_metrics) else {
+            return 0;
+        };
+        let cell_width = preview_metrics.cell_size.width.max(1) as usize;
+        estimated_file_preview_visible_columns(text_width, cell_width)
+    }
+
+    fn right_sidebar_file_preview_max_line_columns(&self) -> usize {
+        // `right_sidebar_file_preview_max_columns` is the cached max over all
+        // preview lines, recomputed only when the lines change (see
+        // `apply_right_sidebar_file_preview_result`). This getter is called
+        // several times per frame, so it must stay O(1).
+        let max_line_columns = self.right_sidebar_file_preview_max_columns;
+        if self.right_sidebar_file_preview_truncated {
+            max_line_columns.max(FILE_PREVIEW_TRUNCATED_LABEL.chars().count())
+        } else {
+            max_line_columns
+        }
+    }
+
+    pub(crate) fn right_sidebar_file_preview_horizontal_scroll_max(&self) -> usize {
+        let preview_metrics = self.right_sidebar_file_preview_render_metrics();
+        self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(preview_metrics)
+    }
+
+    fn right_sidebar_file_preview_horizontal_scroll_max_with_metrics(
+        &self,
+        preview_metrics: RenderMetrics,
+    ) -> usize {
+        self.right_sidebar_file_preview_max_line_columns()
+            .saturating_sub(self.right_sidebar_file_preview_visible_columns(preview_metrics))
+    }
+
+    fn right_sidebar_file_preview_horizontal_scroll_active(
+        &self,
+        preview_metrics: RenderMetrics,
+    ) -> bool {
+        self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(preview_metrics) > 0
+    }
+
+    fn right_sidebar_file_preview_effective_visible_height(
+        &self,
+        metrics: RightSidebarFilePreviewBodyMetrics,
+        preview_metrics: RenderMetrics,
+    ) -> usize {
+        let horizontal_reserve =
+            if self.right_sidebar_file_preview_horizontal_scroll_active(preview_metrics) {
+                SIDEBAR_INSET + FILE_PREVIEW_SCROLLBAR_THICKNESS
+            } else {
+                0
+            };
+        metrics.visible_height.saturating_sub(horizontal_reserve)
+    }
+
+    pub(crate) fn right_sidebar_file_preview_scroll_max(&self) -> f32 {
+        let preview_metrics = self.right_sidebar_file_preview_render_metrics();
+        self.right_sidebar_file_preview_scroll_max_with_metrics(preview_metrics)
+    }
+
+    fn right_sidebar_file_preview_scroll_max_with_metrics(
+        &self,
+        preview_metrics: RenderMetrics,
+    ) -> f32 {
+        let Some(metrics) = self.right_sidebar_file_preview_body_metrics(preview_metrics) else {
+            return 0.0;
+        };
+        metrics.total_height.saturating_sub(
+            self.right_sidebar_file_preview_effective_visible_height(metrics, preview_metrics),
+        ) as f32
+    }
+
+    pub(crate) fn right_sidebar_file_preview_scroll_geometry(
+        &self,
+    ) -> Option<RightSidebarFilePreviewScrollGeometry> {
+        let preview_metrics = self.right_sidebar_file_preview_render_metrics();
+        let metrics = self.right_sidebar_file_preview_body_metrics(preview_metrics)?;
+        let visible_height =
+            self.right_sidebar_file_preview_effective_visible_height(metrics, preview_metrics);
+        let max_scroll = metrics.total_height.saturating_sub(visible_height) as f32;
+        if max_scroll <= 0.0 || metrics.total_height == 0 {
+            return None;
+        }
+
+        let track_width = FILE_PREVIEW_SCROLLBAR_THICKNESS;
+        let track_height = visible_height.max(1);
+        let thumb_height = ((visible_height as f32 / metrics.total_height as f32)
+            * track_height as f32)
+            .clamp(28.0, track_height as f32);
+        let travel = (track_height as f32 - thumb_height).max(1.0);
+        let scroll_offset = self
+            .right_sidebar_file_preview_scroll_offset
+            .clamp(0.0, max_scroll);
+        let thumb_y = metrics.y as f32 + (scroll_offset / max_scroll) * travel;
+        let track_x = metrics
+            .x
+            .saturating_add(metrics.width)
+            .saturating_sub(track_width);
+
+        Some(RightSidebarFilePreviewScrollGeometry {
+            track_x,
+            track_y: metrics.y,
+            track_width,
+            track_height,
+            thumb_y,
+            thumb_height,
+            max_scroll,
+        })
+    }
+
+    pub(crate) fn right_sidebar_file_preview_horizontal_scroll_geometry(
+        &self,
+    ) -> Option<RightSidebarFilePreviewHorizontalScrollGeometry> {
+        let preview_metrics = self.right_sidebar_file_preview_render_metrics();
+        let metrics = self.right_sidebar_file_preview_body_metrics(preview_metrics)?;
+        let max_scroll =
+            self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(preview_metrics);
+        if max_scroll == 0 {
+            return None;
+        }
+
+        let (_, _, text_x, text_width) =
+            self.right_sidebar_file_preview_text_layout(metrics, preview_metrics);
+        if text_width == 0 {
+            return None;
+        }
+
+        let max_columns = self.right_sidebar_file_preview_max_line_columns().max(1);
+        let visible_columns = self
+            .right_sidebar_file_preview_visible_columns(preview_metrics)
+            .max(1);
+        let track_width = text_width.max(1);
+        let track_height = FILE_PREVIEW_SCROLLBAR_THICKNESS;
+        let thumb_width = ((visible_columns as f32 / max_columns as f32) * track_width as f32)
+            .clamp(28.0, track_width as f32);
+        let travel = (track_width as f32 - thumb_width).max(1.0);
+        let scroll_offset = self
+            .right_sidebar_file_preview_horizontal_offset
+            .min(max_scroll);
+        let thumb_x = text_x as f32 + (scroll_offset as f32 / max_scroll as f32) * travel;
+        let track_y = metrics.bottom.saturating_sub(track_height);
+
+        Some(RightSidebarFilePreviewHorizontalScrollGeometry {
+            track_x: text_x,
+            track_y,
+            track_width,
+            track_height,
+            thumb_x,
+            thumb_width,
+            max_scroll,
         })
     }
 
@@ -645,10 +2162,13 @@ impl crate::TermWindow {
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
-        let rect = match self.right_sidebar_rect() {
+        // Recorded fresh each frame; consumed by mouse hit-testing.
+        self.right_sidebar_input_layouts.clear();
+        let total_rect = match self.right_sidebar_rect() {
             Some(rect) => rect,
             None => return Ok(()),
         };
+        let rect = self.right_sidebar_tree_rect(total_rect);
         let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
@@ -662,6 +2182,24 @@ impl crate::TermWindow {
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let ui_cell_height = ui_metrics.cell_size.height as usize;
         let icon_size = (ui_cell_height + 6).clamp(20, 24);
+
+        if let Some(preview_rect) = self.right_sidebar_file_preview_rect() {
+            let file_font_size = self.right_sidebar_file_preview_font_size();
+            let file_font = self
+                .fonts
+                .title_font_with_size(file_font_size)
+                .context("right sidebar file preview font")?;
+            let file_metrics = RenderMetrics::with_font_metrics(&file_font.metrics());
+            self.paint_right_sidebar_file_preview_pane(
+                layers,
+                &file_font,
+                file_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                preview_rect,
+            )?;
+        }
 
         if rect.y > 0 {
             self.filled_rectangle(
@@ -699,12 +2237,21 @@ impl crate::TermWindow {
         )
         .context("right sidebar separator")?;
         self.ui_items.push(UIItem {
-            x: rect.x.saturating_sub(SIDEBAR_RESIZE_HANDLE_WIDTH / 2),
-            y: rect.y,
+            x: total_rect.x.saturating_sub(SIDEBAR_RESIZE_HANDLE_WIDTH / 2),
+            y: total_rect.y,
             width: SIDEBAR_RESIZE_HANDLE_WIDTH,
-            height: rect.height,
+            height: total_rect.height,
             item_type: UIItemType::RightSidebarResize,
         });
+        if self.right_sidebar_file_preview_rect().is_some() {
+            self.ui_items.push(UIItem {
+                x: rect.x.saturating_sub(SIDEBAR_RESIZE_HANDLE_WIDTH / 2),
+                y: rect.y,
+                width: SIDEBAR_RESIZE_HANDLE_WIDTH,
+                height: rect.height,
+                item_type: UIItemType::RightSidebarFilePreviewResize,
+            });
+        }
 
         let content_x = rect.x + SIDEBAR_INSET * 2;
         let content_width = rect.width.saturating_sub(SIDEBAR_INSET * 4);
@@ -969,21 +2516,47 @@ impl crate::TermWindow {
         }
 
         let content_top = mode_y + mode_height + RIGHT_SIDEBAR_SECTION_GAP;
-        if self.right_sidebar_mode == RightSidebarMode::Snippets {
-            self.paint_snippets_sidebar(
-                layers,
-                &ui_font,
-                ui_metrics,
-                chrome,
-                foreground,
-                muted_fg,
-                content_x,
-                content_top,
-                content_width,
-                rect.y.saturating_add(rect.height),
-                icon_size,
-            )?;
-            return Ok(());
+        match self.right_sidebar_mode {
+            RightSidebarMode::Chat => {
+                let file_font_size = self.right_sidebar_file_preview_font_size();
+                let file_font = self
+                    .fonts
+                    .title_font_with_size(file_font_size)
+                    .context("right sidebar file font")?;
+                let file_metrics = RenderMetrics::with_font_metrics(&file_font.metrics());
+                let file_icon_size = (file_metrics.cell_size.height as usize + 6).clamp(22, 28);
+                self.paint_files_sidebar(
+                    layers,
+                    &file_font,
+                    file_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    content_top,
+                    content_width,
+                    rect.y.saturating_add(rect.height),
+                    file_icon_size,
+                )?;
+                return Ok(());
+            }
+            RightSidebarMode::Snippets => {
+                self.paint_snippets_sidebar(
+                    layers,
+                    &ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    content_top,
+                    content_width,
+                    rect.y.saturating_add(rect.height),
+                    icon_size,
+                )?;
+                return Ok(());
+            }
+            RightSidebarMode::Tasks => {}
         }
 
         let empty_top = content_top;
@@ -1039,6 +2612,85 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn paint_right_sidebar_file_preview_pane(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        rect: RightSidebarRect,
+    ) -> anyhow::Result<()> {
+        let sidebar_bg = chrome.workspace_sidebar_bg;
+        if rect.y > 0 {
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(rect.x as f32, 0.0, rect.width as f32, rect.y as f32),
+                sidebar_bg,
+            )
+            .context("right sidebar file preview top background")?;
+        }
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(
+                rect.x as f32,
+                rect.y as f32,
+                rect.width as f32,
+                rect.height as f32,
+            ),
+            sidebar_bg,
+        )
+        .context("right sidebar file preview background")?;
+        self.ui_items.push(UIItem {
+            x: rect.x,
+            y: 0,
+            width: rect.width,
+            height: rect.y.saturating_add(rect.height),
+            item_type: UIItemType::RightSidebarBackground,
+        });
+
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(rect.x as f32, rect.y as f32, 1.0, rect.height as f32),
+            chrome.separator,
+        )
+        .context("right sidebar file preview left separator")?;
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(
+                rect.x.saturating_add(rect.width).saturating_sub(1) as f32,
+                rect.y as f32,
+                1.0,
+                rect.height as f32,
+            ),
+            chrome.separator,
+        )
+        .context("right sidebar file preview right separator")?;
+
+        let content_x = rect.x + SIDEBAR_INSET * 2;
+        let content_width = rect.width.saturating_sub(SIDEBAR_INSET * 4);
+        let content_top = rect.y + SIDEBAR_INSET * 2;
+        let content_bottom = rect.y.saturating_add(rect.height);
+        self.paint_files_preview(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            content_top,
+            content_width,
+            content_bottom,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn paint_snippets_sidebar(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -1082,6 +2734,1268 @@ impl crate::TermWindow {
                     icon_size,
                 ),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Rebuild the flattened browse-tree rows only when the index or the set of
+    /// expanded folders has changed; otherwise reuse the cached rows. This runs
+    /// on every paint, so it avoids re-cloning up to `FILE_TREE_ROW_LIMIT` rows
+    /// (each holding a `PathBuf` + `String`) on frames where nothing changed.
+    fn refresh_right_sidebar_file_browse_rows(&mut self, index: &RightSidebarFileIndex) {
+        let key = (
+            self.right_sidebar_file_index_generation,
+            self.right_sidebar_file_expanded_version,
+        );
+        if self.right_sidebar_file_browse_cache_key == Some(key) {
+            return;
+        }
+        self.right_sidebar_file_browse_rows =
+            right_sidebar_file_browse_rows_from_index(index, &self.right_sidebar_file_expanded);
+        self.right_sidebar_file_browse_cache_key = Some(key);
+    }
+
+    fn paint_files_sidebar(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        icon_size: usize,
+    ) -> anyhow::Result<()> {
+        self.paint_files_tree(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            content_top,
+            content_width,
+            content_bottom,
+            icon_size,
+        )
+    }
+
+    fn active_local_project_for_files(&self) -> Result<RightSidebarFileRoot, String> {
+        let mux = Mux::get();
+        let active_workspace = self
+            .current_mux_workspace()
+            .unwrap_or_else(|| mux.active_workspace());
+        let workspaces = mux.iter_workspaces();
+        let view = workspace_threads::view_for_current_project(
+            &self.active_space_id,
+            &active_workspace,
+            &workspaces,
+        );
+        let project = view
+            .projects
+            .iter()
+            .find(|project| project.is_active)
+            .or_else(|| view.projects.first())
+            .ok_or_else(|| "No active project".to_string())?;
+
+        if project.is_remote {
+            return Err("Remote file browsing is not supported yet".to_string());
+        }
+
+        let path = workspace_threads::project_reveal_path(&project.id)
+            .ok_or_else(|| "Project folder is unavailable".to_string())?;
+        Ok(RightSidebarFileRoot {
+            project_name: project.name.clone(),
+            path,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_tree(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        icon_size: usize,
+    ) -> anyhow::Result<()> {
+        let filter_input = self.right_sidebar_file_filter.clone();
+        self.paint_snippet_text_box(
+            layers,
+            1,
+            ui_font,
+            ui_metrics,
+            chrome,
+            muted_fg,
+            content_x,
+            content_top,
+            content_width,
+            FILE_FILTER_HEIGHT,
+            Some(SvgIcon::Search),
+            "Filter files",
+            &filter_input,
+            self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter),
+            UIItemType::RightSidebarFileFilter,
+            false,
+        )?;
+
+        let tree_top = content_top + FILE_FILTER_HEIGHT + FILE_TREE_TOP_GAP;
+        let root = match self.active_local_project_for_files() {
+            Ok(root) => root,
+            Err(message) => {
+                return self.paint_files_message(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    muted_fg,
+                    content_x,
+                    tree_top,
+                    content_width,
+                    content_bottom,
+                    icon_size,
+                    &message,
+                );
+            }
+        };
+        if self
+            .right_sidebar_file_expanded
+            .insert(path_key(&root.path))
+        {
+            self.right_sidebar_file_expanded_version =
+                self.right_sidebar_file_expanded_version.wrapping_add(1);
+        }
+        self.start_right_sidebar_file_index_if_needed(&root);
+
+        let applied_filter = self.right_sidebar_file_filter_for_tree();
+        let index = match self.right_sidebar_file_index_status.clone() {
+            RightSidebarFileIndexStatus::Ready => match self.right_sidebar_file_index.clone() {
+                Some(index) => index,
+                None => {
+                    return self.paint_files_message(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        chrome,
+                        muted_fg,
+                        content_x,
+                        tree_top,
+                        content_width,
+                        content_bottom,
+                        icon_size,
+                        "Indexing files...",
+                    );
+                }
+            },
+            RightSidebarFileIndexStatus::Failed(message) => {
+                return self.paint_files_message(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    muted_fg,
+                    content_x,
+                    tree_top,
+                    content_width,
+                    content_bottom,
+                    icon_size,
+                    &message,
+                );
+            }
+            RightSidebarFileIndexStatus::Empty | RightSidebarFileIndexStatus::Indexing => {
+                return self.paint_files_message(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    muted_fg,
+                    content_x,
+                    tree_top,
+                    content_width,
+                    content_bottom,
+                    icon_size,
+                    "Indexing files...",
+                );
+            }
+        };
+
+        let query = applied_filter.trim().to_string();
+        self.start_right_sidebar_file_search_if_needed(&query);
+        let row_count = if query.is_empty() {
+            self.refresh_right_sidebar_file_browse_rows(&index);
+            self.right_sidebar_file_browse_rows.len()
+        } else {
+            self.right_sidebar_file_search_rows.len()
+        };
+
+        if row_count == 0 && self.right_sidebar_file_searching {
+            return self.paint_files_message(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                muted_fg,
+                content_x,
+                tree_top,
+                content_width,
+                content_bottom,
+                icon_size,
+                "Searching files...",
+            );
+        }
+
+        if row_count == 0 && !query.is_empty() {
+            return self.paint_files_message(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                muted_fg,
+                content_x,
+                tree_top,
+                content_width,
+                content_bottom,
+                icon_size,
+                "No matching files",
+            );
+        }
+
+        let row_metrics = right_sidebar_file_row_metrics(ui_metrics);
+        let viewport_bottom = content_bottom.saturating_sub(SIDEBAR_INSET);
+        let visible_height = viewport_bottom.saturating_sub(tree_top);
+        let total_height = row_count.saturating_mul(row_metrics.row_height);
+        let max_scroll = total_height.saturating_sub(visible_height) as f32;
+        self.right_sidebar_file_tree_scroll_offset = self
+            .right_sidebar_file_tree_scroll_offset
+            .clamp(0.0, max_scroll);
+        let scroll_offset = self.right_sidebar_file_tree_scroll_offset;
+
+        let tree_top_f = tree_top as f32;
+        let viewport_bottom_f = viewport_bottom as f32;
+        let selected = self.right_sidebar_file_selected.clone();
+        let visible_rows = visible_file_row_range(
+            row_count,
+            scroll_offset,
+            visible_height,
+            row_metrics.row_height,
+        );
+        let rows = if query.is_empty() {
+            self.right_sidebar_file_browse_rows
+                .get(visible_rows.clone())
+                .unwrap_or(&[])
+                .to_vec()
+        } else {
+            self.right_sidebar_file_search_rows
+                .get(visible_rows.clone())
+                .unwrap_or(&[])
+                .to_vec()
+        };
+        for (offset, row) in rows.iter().enumerate() {
+            let idx = visible_rows.start + offset;
+            let row_top = tree_top_f + (idx * row_metrics.row_height) as f32 - scroll_offset;
+            let row_bottom = row_top + row_metrics.row_height as f32;
+            if row_bottom <= tree_top_f {
+                continue;
+            }
+            if row_top >= viewport_bottom_f {
+                break;
+            }
+            self.paint_file_tree_row(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                row_top.floor().max(0.0) as usize,
+                content_width,
+                &row,
+                selected.as_ref(),
+                tree_top,
+                viewport_bottom,
+                row_metrics,
+            )?;
+        }
+
+        if max_scroll > 0.0 && scroll_offset > 0.0 {
+            let fade_top = content_top + FILE_FILTER_HEIGHT;
+            let fade_height = FILE_TREE_TOP_GAP
+                .saturating_add(FILE_SCROLL_FADE_HEIGHT)
+                .min(viewport_bottom.saturating_sub(fade_top));
+            self.paint_right_sidebar_file_mask(
+                layers,
+                chrome,
+                content_x,
+                content_top,
+                content_width,
+                tree_top.saturating_sub(content_top),
+            )?;
+            self.paint_snippet_text_box(
+                layers,
+                2,
+                ui_font,
+                ui_metrics,
+                chrome,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                FILE_FILTER_HEIGHT,
+                Some(SvgIcon::Search),
+                "Filter files",
+                &filter_input,
+                self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter),
+                UIItemType::RightSidebarFileFilter,
+                false,
+            )?;
+            self.paint_right_sidebar_file_top_fade(
+                layers,
+                chrome,
+                content_x,
+                fade_top,
+                content_width,
+                fade_height,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_message(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+        content_bottom: usize,
+        icon_size: usize,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        let height =
+            RIGHT_SIDEBAR_EMPTY_HEIGHT.min(content_bottom.saturating_sub(y + SIDEBAR_INSET));
+        if height == 0 {
+            return Ok(());
+        }
+        self.fill_rounded_rectangle_with_border(
+            layers,
+            1,
+            euclid::rect(x as f32, y as f32, width as f32, height as f32),
+            chrome.sidebar_button_bg,
+            chrome.control_border,
+            SIDEBAR_ROW_RADIUS + 6.0,
+            CAPSULE_BORDER_WIDTH,
+        )
+        .context("right sidebar files message")?;
+        let empty_icon_size = icon_size.min(22).min(height.saturating_sub(20)).max(1);
+        let icon_x = x + SIDEBAR_INSET + 2;
+        let icon_y = y + (height.saturating_sub(empty_icon_size)) / 2;
+        self.paint_sidebar_icon(
+            layers,
+            SvgIcon::CircleAlert,
+            icon_x,
+            icon_y,
+            empty_icon_size,
+            muted_fg,
+        )?;
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            message,
+            icon_x + empty_icon_size + SIDEBAR_ICON_GAP + 2,
+            y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
+            width.saturating_sub(empty_icon_size + SIDEBAR_ICON_GAP + SIDEBAR_INSET * 3),
+            muted_fg,
+        )
+    }
+
+    fn paint_right_sidebar_file_mask(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> anyhow::Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(x as f32, y as f32, width as f32, height as f32),
+            chrome.workspace_sidebar_bg,
+        )
+        .context("right sidebar file scroll mask")?;
+        Ok(())
+    }
+
+    fn paint_right_sidebar_file_top_fade(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> anyhow::Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        for step in 0..height {
+            let progress = step as f32 / height as f32;
+            let alpha = 1.0 - progress * progress * (3.0 - 2.0 * progress);
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(x as f32, (y + step) as f32, width as f32, 1.0),
+                chrome.workspace_sidebar_bg.mul_alpha(alpha),
+            )
+            .context("right sidebar file top fade")?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_file_tree_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+        row: &RightSidebarFileTreeRow,
+        selected: Option<&PathBuf>,
+        clip_top: usize,
+        clip_bottom: usize,
+        row_metrics: RightSidebarFileRowMetrics,
+    ) -> anyhow::Result<()> {
+        let row_bottom = y.saturating_add(row_metrics.row_height);
+        let visible_y = y.max(clip_top);
+        let visible_bottom = row_bottom.min(clip_bottom);
+        let visible_height = visible_bottom.saturating_sub(visible_y);
+        if visible_height == 0 {
+            return Ok(());
+        }
+        let hovered = self.is_pointer_over_ui_rect(x, visible_y, width, visible_height);
+        let is_selected = selected.is_some_and(|path| path == &row.path);
+        if hovered || is_selected {
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    x as f32,
+                    visible_y as f32,
+                    width as f32,
+                    visible_height as f32,
+                ),
+                if is_selected {
+                    chrome.selected_bg.mul_alpha(0.46)
+                } else {
+                    chrome.sidebar_button_hover_bg
+                },
+                SIDEBAR_ROW_RADIUS,
+            )
+            .context("right sidebar file row hover")?;
+        }
+        self.ui_items.push(UIItem {
+            x,
+            y: visible_y,
+            width,
+            height: visible_height,
+            item_type: UIItemType::RightSidebarFileRow(row.path.clone()),
+        });
+
+        let row_icon_size = row_metrics.icon_size;
+        let chevron_size = row_metrics.chevron_size;
+        let indent = row
+            .depth
+            .saturating_mul(row_metrics.indent_step)
+            .min(width.saturating_sub(24));
+        let chevron_x = x + SIDEBAR_INSET + indent;
+        let icon_y = y + (row_metrics.row_height.saturating_sub(row_icon_size)) / 2;
+        let chevron_y = y + (row_metrics.row_height.saturating_sub(chevron_size)) / 2;
+        if row.is_dir {
+            self.paint_sidebar_icon(
+                layers,
+                if row.is_expanded {
+                    SvgIcon::ChevronDown
+                } else {
+                    SvgIcon::ChevronRight
+                },
+                chevron_x,
+                chevron_y,
+                chevron_size,
+                muted_fg,
+            )?;
+        }
+
+        let file_icon_x = chevron_x + chevron_size + row_metrics.icon_gap;
+        match file_icon_for_row(row) {
+            RightSidebarFileIcon::Material(icon) => {
+                self.paint_sidebar_material_icon(layers, icon, file_icon_x, icon_y, row_icon_size)?;
+            }
+            RightSidebarFileIcon::Svg(icon) => {
+                self.paint_sidebar_icon(
+                    layers,
+                    icon,
+                    file_icon_x,
+                    icon_y,
+                    row_icon_size,
+                    if row.is_dir { muted_fg } else { foreground },
+                )?;
+            }
+        }
+        let text_x = file_icon_x + row_icon_size + row_metrics.icon_gap;
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            &row.name,
+            text_x,
+            y + (row_metrics
+                .row_height
+                .saturating_sub(ui_metrics.cell_size.height as usize))
+                / 2,
+            x.saturating_add(width)
+                .saturating_sub(text_x + SIDEBAR_INSET),
+            if row.is_dir || is_selected {
+                foreground
+            } else {
+                muted_fg
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_preview_header(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        let header_top = content_top + 4;
+        let button_size = 44.min(content_width);
+        self.paint_files_preview_header_icon_button(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            header_top,
+            button_size,
+            SvgIcon::X,
+            UIItemType::RightSidebarFileBack,
+        )?;
+
+        let action_gap = 6;
+        let available_after_back = content_width.saturating_sub(button_size + SIDEBAR_INSET);
+        // The label is always shown in full. Size the button to fit it, limited
+        // only by the room left after the two icon buttons, the gaps and a small
+        // reserved minimum for the filename — no fixed cap, so a wide pane is
+        // actually used.
+        let app_label = self.right_sidebar_current_open_with_app_label(path);
+        let open_label = match &app_label {
+            Some(app) => format!("Open With {app}"),
+            None => "Open".to_string(),
+        };
+        let label_px = self
+            .sidebar_text_width(ui_font, &open_label)
+            .unwrap_or(0.0)
+            .ceil() as usize;
+        let desired_open_width = label_px + 12 + 10 + 36 + 6;
+        let max_open_width =
+            available_after_back.saturating_sub((button_size * 2) + action_gap * 3 + 72);
+        let open_button_width = if max_open_width >= 80 {
+            desired_open_width.min(max_open_width).max(80)
+        } else {
+            button_size
+        };
+        let action_width = open_button_width
+            .saturating_add(button_size * 2)
+            .saturating_add(action_gap * 2);
+        let actions_x = content_x
+            .saturating_add(content_width)
+            .saturating_sub(action_width);
+        let mut action_x = actions_x;
+        self.paint_files_preview_header_open_with_button(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            action_x,
+            header_top,
+            open_button_width,
+            button_size,
+            &open_label,
+        )?;
+        action_x += open_button_width + action_gap;
+        for (icon, item_type) in [
+            (SvgIcon::FolderOpen, UIItemType::RightSidebarFileReveal),
+            (SvgIcon::Copy, UIItemType::RightSidebarFileCopyText),
+        ] {
+            self.paint_files_preview_header_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                action_x,
+                header_top,
+                button_size,
+                icon,
+                item_type,
+            )?;
+            action_x += button_size + action_gap;
+        }
+
+        let title_x = content_x + button_size + SIDEBAR_INSET;
+        let title_right = actions_x.saturating_sub(SIDEBAR_INSET);
+        let title_width = title_right.saturating_sub(title_x);
+        let title = file_name_for_path(path);
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            &title,
+            title_x,
+            header_top + (button_size.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
+            title_width,
+            foreground,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_preview_header_open_with_button(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        label: &str,
+    ) -> anyhow::Result<()> {
+        let arrow_width = if width >= 112 { 36.min(width / 3) } else { 0 };
+        let main_width = width.saturating_sub(arrow_width);
+        let main_hover = self.is_pointer_over_ui_rect(x, y, main_width, height);
+        let menu_hover =
+            arrow_width > 0 && self.is_pointer_over_ui_rect(x + main_width, y, arrow_width, height);
+        if main_hover || menu_hover {
+            self.fill_rounded_rectangle(
+                layers,
+                2,
+                euclid::rect(x as f32, y as f32, width as f32, height as f32),
+                chrome.control_hover_bg,
+                WINDOW_TAB_ADD_BUTTON_RADIUS,
+            )
+            .context("right sidebar file preview open with hover")?;
+        }
+
+        self.ui_items.push(UIItem {
+            x,
+            y,
+            width: main_width.max(1),
+            height,
+            item_type: UIItemType::RightSidebarFileOpen,
+        });
+        if arrow_width > 0 {
+            self.ui_items.push(UIItem {
+                x: x + main_width,
+                y,
+                width: arrow_width,
+                height,
+                item_type: UIItemType::RightSidebarFileOpenMenu,
+            });
+        }
+
+        if main_width >= 28 {
+            let text_x = x + 12;
+            let text_right = x + main_width.saturating_sub(10);
+            let text_width = text_right.saturating_sub(text_x);
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                label,
+                text_x,
+                y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
+                text_width,
+                if main_hover { foreground } else { muted_fg },
+            )?;
+        }
+
+        if arrow_width > 0 {
+            let chevron_size = (height * 40 / 100).clamp(14, 18);
+            self.paint_sidebar_icon(
+                layers,
+                SvgIcon::ChevronDown,
+                x + main_width + (arrow_width.saturating_sub(chevron_size)) / 2,
+                y + (height.saturating_sub(chevron_size)) / 2,
+                chevron_size,
+                if menu_hover { foreground } else { muted_fg },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_preview_header_icon_button(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        size: usize,
+        icon: SvgIcon,
+        item_type: UIItemType,
+    ) -> anyhow::Result<()> {
+        let hovered = self.is_pointer_over_ui_rect(x, y, size, size);
+        if hovered {
+            self.fill_rounded_rectangle(
+                layers,
+                2,
+                euclid::rect(x as f32, y as f32, size as f32, size as f32),
+                chrome.control_hover_bg,
+                WINDOW_TAB_ADD_BUTTON_RADIUS,
+            )
+            .context("right sidebar file preview header button hover")?;
+        }
+        self.ui_items.push(UIItem {
+            x,
+            y,
+            width: size,
+            height: size,
+            item_type,
+        });
+        let icon_size = (size * 58 / 100).max(16);
+        self.paint_sidebar_icon(
+            layers,
+            icon,
+            x + (size.saturating_sub(icon_size)) / 2,
+            y + (size.saturating_sub(icon_size)) / 2,
+            icon_size,
+            if hovered { foreground } else { muted_fg },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_preview(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        _content_bottom: usize,
+    ) -> anyhow::Result<()> {
+        let Some(path) = self.right_sidebar_file_selected.clone() else {
+            return Ok(());
+        };
+
+        let Some(metrics) = self.right_sidebar_file_preview_body_metrics(ui_metrics) else {
+            self.paint_files_preview_header(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                &path,
+            )?;
+            return Ok(());
+        };
+
+        let body_x = metrics.x;
+        let body_y = metrics.y;
+        let body_bottom = metrics.y.saturating_add(
+            self.right_sidebar_file_preview_effective_visible_height(metrics, ui_metrics),
+        );
+        let (body_width, number_width, text_x, text_width) =
+            self.right_sidebar_file_preview_text_layout(metrics, ui_metrics);
+        let mut show_top_fade = false;
+        let mut show_scrollbars = false;
+
+        if let Some(message) = self.right_sidebar_file_preview_message.clone() {
+            self.paint_sidebar_text(
+                layers, ui_font, ui_metrics, &message, body_x, body_y, body_width, muted_fg,
+            )?;
+        } else if let Some(image) = self.right_sidebar_file_preview_image.clone() {
+            self.paint_right_sidebar_file_preview_image(layers, metrics, &image)?;
+        } else {
+            let line_height = metrics.line_height;
+            let visible_height =
+                self.right_sidebar_file_preview_effective_visible_height(metrics, ui_metrics);
+            let line_count = preview_line_count(&self.right_sidebar_file_preview_lines);
+            let max_scroll = metrics.total_height.saturating_sub(visible_height) as f32;
+            self.right_sidebar_file_preview_scroll_offset = self
+                .right_sidebar_file_preview_scroll_offset
+                .clamp(0.0, max_scroll);
+            let scroll_offset = self.right_sidebar_file_preview_scroll_offset;
+            show_top_fade = max_scroll > 0.0 && scroll_offset > 0.0;
+            show_scrollbars = true;
+
+            let cell_width = ui_metrics.cell_size.width.max(1) as usize;
+            let visible_columns =
+                estimated_file_preview_visible_columns(text_width, cell_width).max(1);
+            self.right_sidebar_file_preview_horizontal_offset =
+                self.right_sidebar_file_preview_horizontal_offset.min(
+                    self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(ui_metrics),
+                );
+            let horizontal_offset = self.right_sidebar_file_preview_horizontal_offset;
+            // Render only the visible horizontal window, never the whole line
+            // (lines can be tens of thousands of columns wide). The preview font
+            // is proportional, so `visible_columns` (text_width / cell_width)
+            // under-counts how many glyphs actually fit; over-slice generously
+            // and let the per-glyph pixel clip in the painter stop at the edge.
+            let paint_columns = visible_columns.saturating_mul(3).saturating_add(8);
+            self.ui_items.push(UIItem {
+                x: body_x,
+                y: body_y,
+                width: body_width,
+                height: visible_height,
+                item_type: UIItemType::RightSidebarFilePreviewText,
+            });
+            let first_visible_line = (scroll_offset / line_height as f32).floor().max(0.0) as usize;
+            let visible_line_count = visible_height / line_height + 3;
+            for (idx, line) in preview_visible_lines(
+                &self.right_sidebar_file_preview_lines,
+                first_visible_line,
+                visible_line_count,
+            ) {
+                let line_top = body_y as f32 + (idx * line_height) as f32 - scroll_offset;
+                let line_bottom = line_top + line_height as f32;
+                if line_bottom <= body_y as f32 {
+                    continue;
+                }
+                if line_top >= body_bottom as f32 {
+                    break;
+                }
+                let line_y = line_top.floor().max(0.0) as usize;
+                self.paint_right_sidebar_file_preview_selection_for_line(
+                    layers,
+                    chrome,
+                    line,
+                    idx,
+                    horizontal_offset,
+                    visible_columns,
+                    text_x,
+                    line_y,
+                    line_height,
+                    cell_width,
+                )?;
+                self.paint_ui_title_text(
+                    layers,
+                    ui_font,
+                    &ui_metrics,
+                    &(idx + 1).to_string(),
+                    body_x,
+                    line_y,
+                    number_width,
+                    muted_fg.mul_alpha(0.72),
+                )?;
+                if line.spans.is_empty() {
+                    let visible_text =
+                        preview_text_slice(&line.plain, horizontal_offset, paint_columns);
+                    // Clip at the edge (no "..."); the horizontal scrollbar
+                    // indicates there is more content off-screen.
+                    self.paint_ui_title_text(
+                        layers,
+                        ui_font,
+                        &ui_metrics,
+                        &visible_text,
+                        text_x,
+                        line_y,
+                        text_width,
+                        foreground,
+                    )?;
+                } else {
+                    self.paint_highlighted_preview_line(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        line,
+                        horizontal_offset,
+                        paint_columns,
+                        text_x,
+                        line_y,
+                        text_width,
+                        foreground,
+                    )?;
+                }
+            }
+
+            if self.right_sidebar_file_preview_truncated {
+                let line_top = body_y as f32 + (line_count * line_height) as f32 - scroll_offset;
+                if line_top < body_bottom as f32 {
+                    let visible_text = preview_text_slice(
+                        FILE_PREVIEW_TRUNCATED_LABEL,
+                        horizontal_offset,
+                        paint_columns,
+                    );
+                    self.paint_sidebar_text(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        &visible_text,
+                        text_x,
+                        line_top.floor().max(0.0) as usize,
+                        text_width,
+                        muted_fg,
+                    )?;
+                }
+            }
+        }
+
+        self.paint_right_sidebar_file_mask(
+            layers,
+            chrome,
+            content_x,
+            content_top,
+            content_width,
+            metrics.y.saturating_sub(content_top),
+        )?;
+        if show_top_fade {
+            self.paint_right_sidebar_file_top_fade(
+                layers,
+                chrome,
+                metrics.x,
+                metrics.y,
+                metrics.width,
+                FILE_SCROLL_FADE_HEIGHT.min(body_bottom.saturating_sub(metrics.y)),
+            )?;
+        }
+        self.paint_files_preview_header(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            content_top,
+            content_width,
+            &path,
+        )?;
+        if show_scrollbars {
+            self.paint_right_sidebar_file_preview_scrollbar(layers, chrome)?;
+            self.paint_right_sidebar_file_preview_horizontal_scrollbar(layers, chrome)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_right_sidebar_file_preview_selection_for_line(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        line: &RightSidebarFilePreviewLine,
+        line_idx: usize,
+        horizontal_offset: usize,
+        visible_columns: usize,
+        text_x: usize,
+        line_y: usize,
+        line_height: usize,
+        cell_width: usize,
+    ) -> anyhow::Result<()> {
+        let Some((start, end)) = self.right_sidebar_file_preview_selection_range() else {
+            return Ok(());
+        };
+        if line_idx < start.line || line_idx > end.line || visible_columns == 0 {
+            return Ok(());
+        }
+
+        let line_len = line.plain.chars().count();
+        let selection_start = if line_idx == start.line {
+            start.column
+        } else {
+            0
+        };
+        let selection_end = if line_idx == end.line {
+            end.column
+        } else {
+            line_len
+        };
+        if selection_end <= selection_start {
+            return Ok(());
+        }
+
+        let visible_start = horizontal_offset;
+        let visible_end = horizontal_offset.saturating_add(visible_columns);
+        let paint_start = selection_start.max(visible_start);
+        let paint_end = selection_end.min(visible_end);
+        if paint_end <= paint_start {
+            return Ok(());
+        }
+
+        let x = text_x.saturating_add(paint_start.saturating_sub(horizontal_offset) * cell_width);
+        let width = paint_end
+            .saturating_sub(paint_start)
+            .saturating_mul(cell_width);
+        if width == 0 {
+            return Ok(());
+        }
+
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(x as f32, line_y as f32, width as f32, line_height as f32),
+            chrome.selected_bg.mul_alpha(0.48),
+        )
+        .context("right sidebar file preview selection")?;
+        Ok(())
+    }
+
+    fn paint_right_sidebar_file_preview_image(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        metrics: RightSidebarFilePreviewBodyMetrics,
+        image: &RightSidebarFilePreviewImage,
+    ) -> anyhow::Result<()> {
+        if image.width == 0
+            || image.height == 0
+            || metrics.width == 0
+            || metrics.visible_height == 0
+        {
+            return Ok(());
+        }
+
+        let max_width = metrics.width as f32;
+        let max_height = metrics.visible_height as f32;
+        let scale = (max_width / image.width as f32).min(max_height / image.height as f32);
+        if !scale.is_finite() || scale <= 0.0 {
+            return Ok(());
+        }
+
+        let draw_width = (image.width as f32 * scale).max(1.0).min(max_width);
+        let draw_height = (image.height as f32 * scale).max(1.0).min(max_height);
+        let draw_x = metrics.x as f32 + (max_width - draw_width) / 2.0;
+        let draw_y = metrics.y as f32 + (max_height - draw_height) / 2.0;
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let (sprite, next_due, _load_state) = gl_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_image(&image.data, None, self.allow_images)
+            .context("right sidebar file preview image")?;
+        self.update_next_frame_time(next_due);
+
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        let mut quad = layers.allocate(2)?;
+        quad.set_position(
+            draw_x - left_offset,
+            draw_y - top_offset,
+            draw_x + draw_width - left_offset,
+            draw_y + draw_height - top_offset,
+        );
+        quad.set_texture(sprite.texture_coords());
+        quad.set_hsv(None);
+        quad.set_has_color(true);
+        quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
+
+        Ok(())
+    }
+
+    fn paint_right_sidebar_file_preview_scrollbar(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+    ) -> anyhow::Result<()> {
+        let Some(scroll) = self.right_sidebar_file_preview_scroll_geometry() else {
+            return Ok(());
+        };
+
+        let track_radius = scroll.track_width as f32 / 2.0;
+        self.fill_rounded_rectangle(
+            layers,
+            2,
+            euclid::rect(
+                scroll.track_x as f32,
+                scroll.track_y as f32,
+                scroll.track_width as f32,
+                scroll.track_height as f32,
+            ),
+            chrome.separator,
+            track_radius,
+        )
+        .context("right sidebar file preview scroll track")?;
+
+        self.fill_rounded_rectangle(
+            layers,
+            2,
+            euclid::rect(
+                scroll.track_x as f32,
+                scroll.thumb_y,
+                scroll.track_width as f32,
+                scroll.thumb_height,
+            ),
+            chrome.scrollbar_thumb,
+            track_radius,
+        )
+        .context("right sidebar file preview scroll thumb")?;
+
+        let hit_slop = FILE_PREVIEW_SCROLLBAR_HIT_SLOP;
+        self.ui_items.push(UIItem {
+            x: scroll.track_x.saturating_sub(hit_slop),
+            y: scroll.track_y,
+            width: scroll.track_width + hit_slop * 2,
+            height: scroll.track_height,
+            item_type: UIItemType::RightSidebarFilePreviewScrollTrack,
+        });
+        self.ui_items.push(UIItem {
+            x: scroll.track_x.saturating_sub(hit_slop),
+            y: scroll.thumb_y.round().max(0.0) as usize,
+            width: scroll.track_width + hit_slop * 2,
+            height: scroll.thumb_height.round().max(1.0) as usize,
+            item_type: UIItemType::RightSidebarFilePreviewScrollThumb,
+        });
+
+        Ok(())
+    }
+
+    fn paint_right_sidebar_file_preview_horizontal_scrollbar(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+    ) -> anyhow::Result<()> {
+        let Some(scroll) = self.right_sidebar_file_preview_horizontal_scroll_geometry() else {
+            return Ok(());
+        };
+
+        let track_radius = scroll.track_height as f32 / 2.0;
+        self.fill_rounded_rectangle(
+            layers,
+            2,
+            euclid::rect(
+                scroll.track_x as f32,
+                scroll.track_y as f32,
+                scroll.track_width as f32,
+                scroll.track_height as f32,
+            ),
+            chrome.separator,
+            track_radius,
+        )
+        .context("right sidebar file preview horizontal scroll track")?;
+
+        self.fill_rounded_rectangle(
+            layers,
+            2,
+            euclid::rect(
+                scroll.thumb_x,
+                scroll.track_y as f32,
+                scroll.thumb_width,
+                scroll.track_height as f32,
+            ),
+            chrome.scrollbar_thumb,
+            track_radius,
+        )
+        .context("right sidebar file preview horizontal scroll thumb")?;
+
+        self.ui_items.push(UIItem {
+            x: scroll.track_x,
+            y: scroll
+                .track_y
+                .saturating_sub(FILE_PREVIEW_SCROLLBAR_HIT_SLOP),
+            width: scroll.track_width,
+            height: scroll.track_height + FILE_PREVIEW_SCROLLBAR_HIT_SLOP * 2,
+            item_type: UIItemType::RightSidebarFilePreviewHorizontalScrollTrack,
+        });
+        self.ui_items.push(UIItem {
+            x: scroll.thumb_x.round().max(0.0) as usize,
+            y: scroll
+                .track_y
+                .saturating_sub(FILE_PREVIEW_SCROLLBAR_HIT_SLOP),
+            width: scroll.thumb_width.round().max(1.0) as usize,
+            height: scroll.track_height + FILE_PREVIEW_SCROLLBAR_HIT_SLOP * 2,
+            item_type: UIItemType::RightSidebarFilePreviewHorizontalScrollThumb,
+        });
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_highlighted_preview_line(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        line: &RightSidebarFilePreviewLine,
+        horizontal_offset: usize,
+        visible_columns: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        fallback: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if width == 0 || visible_columns == 0 {
+            return Ok(());
+        }
+
+        // Build the visible window's text + a per-character colour list from the
+        // spans, then shape it in a single call. Shaping once per line (instead
+        // of once per coloured span) is what keeps scrolling smooth.
+        let (visible_text, colors) =
+            preview_visible_colored(line, horizontal_offset, visible_columns);
+        if visible_text.is_empty() {
+            return Ok(());
+        }
+        self.paint_ui_colored_text(
+            layers,
+            ui_font,
+            &ui_metrics,
+            &visible_text,
+            &colors,
+            fallback,
+            x,
+            y,
+            width,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1148,6 +4062,7 @@ impl crate::TermWindow {
             let search_input = self.right_sidebar_snippet_search.clone();
             self.paint_snippet_text_box(
                 layers,
+                1,
                 ui_font,
                 ui_metrics,
                 chrome,
@@ -1436,6 +4351,7 @@ impl crate::TermWindow {
         let title_input = self.right_sidebar_snippet_title.clone();
         self.paint_snippet_text_box(
             layers,
+            1,
             ui_font,
             ui_metrics,
             chrome,
@@ -1468,6 +4384,7 @@ impl crate::TermWindow {
         let body_input = self.right_sidebar_snippet_body.clone();
         self.paint_snippet_text_box(
             layers,
+            1,
             ui_font,
             ui_metrics,
             chrome,
@@ -1645,6 +4562,7 @@ impl crate::TermWindow {
     fn paint_snippet_text_box(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
         ui_font: &Rc<LoadedFont>,
         ui_metrics: RenderMetrics,
         chrome: UiPalette,
@@ -1664,10 +4582,13 @@ impl crate::TermWindow {
             return Ok(());
         }
         let hovered = self.is_pointer_over_ui_rect(x, y, width, height);
-        let is_search_field = matches!(&item_type, UIItemType::RightSidebarSnippetSearch);
+        let is_search_field = matches!(
+            &item_type,
+            UIItemType::RightSidebarSnippetSearch | UIItemType::RightSidebarFileFilter
+        );
         self.fill_rounded_rectangle_with_border(
             layers,
-            1,
+            layer_num,
             euclid::rect(x as f32, y as f32, width as f32, height as f32),
             chrome.control_bg,
             if focused {
@@ -1690,7 +4611,7 @@ impl crate::TermWindow {
             y,
             width,
             height,
-            item_type,
+            item_type: item_type.clone(),
         });
 
         let text_pad = SIDEBAR_INSET + 2;
@@ -1761,33 +4682,109 @@ impl crate::TermWindow {
                 .context("right sidebar snippet body caret")?;
             }
         } else {
-            self.paint_sidebar_text(
-                layers,
-                ui_font,
-                ui_metrics,
-                text,
-                text_x,
-                y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
-                width.saturating_sub((text_x - x) + text_pad),
-                text_color,
-            )?;
-            if focused && self.right_sidebar_snippet_cursor_on() {
-                let caret_x = text_x
-                    + (self.sidebar_text_width(ui_font, text)?.ceil() as usize)
-                        .min(width.saturating_sub((text_x - x) + text_pad));
-                self.filled_rectangle(
+            let text_area_width = width.saturating_sub((text_x - x) + text_pad);
+            let baseline_y = y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2;
+
+            if input.text.is_empty() && !focused {
+                self.paint_sidebar_text(
                     layers,
-                    2,
-                    euclid::rect(
-                        caret_x as f32,
-                        (y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2)
-                            as f32,
-                        SNIPPET_CARET_WIDTH,
-                        (ui_metrics.cell_size.height as f32).max(1.0),
-                    ),
-                    chrome.text,
-                )
-                .context("right sidebar snippet text caret")?;
+                    ui_font,
+                    ui_metrics,
+                    placeholder,
+                    text_x,
+                    baseline_y,
+                    text_area_width,
+                    text_color,
+                )?;
+            } else {
+                let chars: Vec<char> = input.text.chars().collect();
+                let cursor = input.cursor.min(chars.len());
+                let avail = text_area_width as f32;
+                let caret_margin = SNIPPET_CARET_WIDTH + 2.0;
+
+                // Horizontal scroll: push the first visible char forward until
+                // the caret is back inside the field.
+                let mut first = 0usize;
+                if focused {
+                    while first < cursor {
+                        let prefix: String = chars[first..cursor].iter().collect();
+                        let prefix_w = self.sidebar_text_width(ui_font, &prefix)?;
+                        if prefix_w <= (avail - caret_margin).max(0.0) {
+                            break;
+                        }
+                        first += 1;
+                    }
+                }
+
+                // Selection highlight, behind the glyphs.
+                if let Some((sel_start, sel_end)) = input.caret_selection_range() {
+                    let vis_start = sel_start.max(first);
+                    let vis_end = sel_end.max(first);
+                    if vis_end > vis_start {
+                        let start_prefix: String = chars[first..vis_start].iter().collect();
+                        let end_prefix: String = chars[first..vis_end].iter().collect();
+                        let start_w = self.sidebar_text_width(ui_font, &start_prefix)?;
+                        let end_w = self.sidebar_text_width(ui_font, &end_prefix)?.min(avail);
+                        let sel_w = (end_w - start_w).max(0.0);
+                        if sel_w > 0.0 {
+                            self.filled_rectangle(
+                                layers,
+                                2,
+                                euclid::rect(
+                                    text_x as f32 + start_w,
+                                    baseline_y as f32 - 2.0,
+                                    sel_w,
+                                    ui_metrics.cell_size.height as f32 + 4.0,
+                                ),
+                                chrome.selected_bg.mul_alpha(0.55),
+                            )
+                            .context("right sidebar input selection")?;
+                        }
+                    }
+                }
+
+                // Visible text, clipped to the field (no ellipsis).
+                let visible: String = chars[first..].iter().collect();
+                self.paint_ui_title_text(
+                    layers,
+                    ui_font,
+                    &ui_metrics,
+                    &visible,
+                    text_x,
+                    baseline_y,
+                    text_area_width,
+                    text_color,
+                )?;
+
+                // Caret (hidden while a selection is active).
+                if focused
+                    && input.caret_selection_range().is_none()
+                    && self.right_sidebar_snippet_cursor_on()
+                {
+                    let prefix: String = chars[first..cursor].iter().collect();
+                    let caret_offset = self.sidebar_text_width(ui_font, &prefix)?.min(avail);
+                    self.filled_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(
+                            text_x as f32 + caret_offset,
+                            baseline_y as f32,
+                            SNIPPET_CARET_WIDTH,
+                            (ui_metrics.cell_size.height as f32).max(1.0),
+                        ),
+                        chrome.text,
+                    )
+                    .context("right sidebar input caret")?;
+                }
+
+                self.right_sidebar_input_layouts
+                    .push(RightSidebarInputLayout {
+                        item_type: item_type.clone(),
+                        text_x: text_x as f32,
+                        text_width: text_area_width as f32,
+                        first_char: first,
+                        font: ui_font.clone(),
+                    });
             }
         }
         Ok(())
@@ -1925,6 +4922,841 @@ impl crate::TermWindow {
             y + (size.saturating_sub(icon_size)) / 2,
             icon_size,
             if hovered { foreground } else { muted_fg },
+        )
+    }
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn file_name_for_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+lazy_static::lazy_static! {
+    static ref FILE_PREVIEW_SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
+    static ref FILE_PREVIEW_THEME_SET: ThemeSet = ThemeSet::load_defaults();
+}
+
+fn preview_lines_from_text(
+    path: &Path,
+    text: &str,
+    use_dark_theme: bool,
+) -> Vec<RightSidebarFilePreviewLine> {
+    let Some(syntax) = FILE_PREVIEW_SYNTAX_SET
+        .find_syntax_for_file(path)
+        .ok()
+        .flatten()
+    else {
+        return preview_plain_lines_from_text(text);
+    };
+    let Some(theme) = preview_syntax_theme(use_dark_theme) else {
+        return preview_plain_lines_from_text(text);
+    };
+
+    let default_color = theme
+        .settings
+        .foreground
+        .map(syntect_color_to_linear)
+        .unwrap_or_else(|| LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
+
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let raw_lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.lines().collect()
+    };
+    let mut lines = Vec::with_capacity(raw_lines.len());
+    for line in raw_lines {
+        // Highlight only the head of very long lines to bound syntect cost, but
+        // keep the tail verbatim (rendered in the default colour) so no content
+        // is lost.
+        let (head, tail) = match line
+            .char_indices()
+            .nth(FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT)
+            .map(|(idx, _)| idx)
+        {
+            Some(split) => (&line[..split], &line[split..]),
+            None => (line, ""),
+        };
+        let ranges = match highlighter.highlight_line(head, &FILE_PREVIEW_SYNTAX_SET) {
+            Ok(ranges) => ranges,
+            Err(err) => {
+                log::warn!("failed to highlight file preview line: {err:#}");
+                return preview_plain_lines_from_text(text);
+            }
+        };
+        lines.push(preview_line_from_highlighted_ranges(
+            ranges,
+            tail,
+            default_color,
+        ));
+    }
+    lines
+}
+
+fn preview_syntax_theme(use_dark_theme: bool) -> Option<&'static Theme> {
+    let dark_theme_names = [
+        "base16-eighties.dark",
+        "Solarized (dark)",
+        "base16-ocean.dark",
+    ];
+    let light_theme_names = ["base16-ocean.light", "Solarized (light)", "InspiredGitHub"];
+    let names = if use_dark_theme {
+        &dark_theme_names[..]
+    } else {
+        &light_theme_names[..]
+    };
+    names
+        .iter()
+        .find_map(|name| FILE_PREVIEW_THEME_SET.themes.get(*name))
+        .or_else(|| FILE_PREVIEW_THEME_SET.themes.values().next())
+}
+
+fn preview_plain_lines_from_text(text: &str) -> Vec<RightSidebarFilePreviewLine> {
+    if text.is_empty() {
+        vec![preview_line_from_plain("")]
+    } else {
+        text.lines().map(preview_line_from_plain).collect()
+    }
+}
+
+fn preview_line_from_plain(line: &str) -> RightSidebarFilePreviewLine {
+    RightSidebarFilePreviewLine {
+        plain: line.to_string(),
+        spans: Vec::new(),
+    }
+}
+
+fn preview_line_from_highlighted_ranges(
+    ranges: Vec<(SyntectStyle, &str)>,
+    tail: &str,
+    default_color: LinearRgba,
+) -> RightSidebarFilePreviewLine {
+    let mut plain = String::new();
+    let mut spans = Vec::new();
+
+    for (style, text) in ranges {
+        if text.is_empty() {
+            continue;
+        }
+        let color = syntect_color_to_linear(style.foreground);
+        plain.push_str(text);
+        spans.push(RightSidebarFilePreviewSpan {
+            text: text.to_string(),
+            color,
+        });
+    }
+
+    // The un-highlighted remainder of a very long line is kept verbatim so no
+    // content is dropped; it just renders in the editor's default colour.
+    if !tail.is_empty() {
+        plain.push_str(tail);
+        spans.push(RightSidebarFilePreviewSpan {
+            text: tail.to_string(),
+            color: default_color,
+        });
+    }
+
+    RightSidebarFilePreviewLine { plain, spans }
+}
+
+fn syntect_color_to_linear(color: SyntectColor) -> LinearRgba {
+    LinearRgba::with_srgba(color.r, color.g, color.b, color.a)
+}
+
+fn preview_line_count(lines: &[RightSidebarFilePreviewLine]) -> usize {
+    if lines.is_empty() {
+        1
+    } else {
+        lines.len()
+    }
+}
+
+fn decimal_digit_count(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn file_preview_line_number_width(
+    number_digits: usize,
+    cell_width: usize,
+    body_width: usize,
+) -> usize {
+    number_digits
+        .saturating_mul(cell_width.max(1))
+        .saturating_add(SIDEBAR_ICON_GAP * 2)
+        .max(36)
+        .min(body_width / 2)
+}
+
+fn estimated_file_preview_visible_columns(text_width: usize, cell_width: usize) -> usize {
+    text_width / cell_width.max(1)
+}
+
+/// Collect the visible horizontal window of a highlighted line into a single
+/// string plus a parallel per-character colour list, so the whole window can be
+/// shaped in one call. `start_column`/`max_columns` are in characters.
+fn preview_visible_colored(
+    line: &RightSidebarFilePreviewLine,
+    start_column: usize,
+    max_columns: usize,
+) -> (String, Vec<LinearRgba>) {
+    let mut text = String::new();
+    let mut colors = Vec::new();
+    let mut skip = start_column;
+    let mut remaining = max_columns;
+    for span in &line.spans {
+        if remaining == 0 {
+            break;
+        }
+        let span_columns = span.text.chars().count();
+        if skip >= span_columns {
+            skip -= span_columns;
+            continue;
+        }
+        for ch in span.text.chars().skip(skip) {
+            if remaining == 0 {
+                break;
+            }
+            text.push(ch);
+            colors.push(span.color);
+            remaining -= 1;
+        }
+        skip = 0;
+    }
+    (text, colors)
+}
+
+fn preview_text_slice(text: &str, start_column: usize, max_columns: usize) -> Cow<'_, str> {
+    if text.is_empty() || max_columns == 0 {
+        return Cow::Borrowed("");
+    }
+
+    let start_byte = text
+        .char_indices()
+        .nth(start_column)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    if start_byte >= text.len() {
+        return Cow::Borrowed("");
+    }
+
+    let end_byte = text[start_byte..]
+        .char_indices()
+        .nth(max_columns)
+        .map(|(idx, _)| start_byte + idx)
+        .unwrap_or(text.len());
+    if start_byte == 0 && end_byte == text.len() {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text[start_byte..end_byte].to_string())
+    }
+}
+
+fn preview_text_range(text: &str, start_column: usize, end_column: usize) -> Cow<'_, str> {
+    if end_column <= start_column {
+        Cow::Borrowed("")
+    } else {
+        preview_text_slice(text, start_column, end_column - start_column)
+    }
+}
+
+fn preview_visible_lines(
+    lines: &[RightSidebarFilePreviewLine],
+    first_line: usize,
+    max_lines: usize,
+) -> Vec<(usize, &RightSidebarFilePreviewLine)> {
+    if max_lines == 0 {
+        return vec![];
+    }
+    if lines.is_empty() {
+        return if first_line == 0 {
+            static EMPTY_LINE: std::sync::OnceLock<RightSidebarFilePreviewLine> =
+                std::sync::OnceLock::new();
+            vec![(0, EMPTY_LINE.get_or_init(|| preview_line_from_plain("")))]
+        } else {
+            vec![]
+        };
+    }
+
+    lines
+        .iter()
+        .enumerate()
+        .skip(first_line)
+        .take(max_lines)
+        .collect()
+}
+
+fn right_sidebar_file_row_metrics(ui_metrics: RenderMetrics) -> RightSidebarFileRowMetrics {
+    let cell_height = ui_metrics.cell_size.height as usize;
+    let row_height = cell_height.saturating_add(18).clamp(38, 58);
+    let icon_size = cell_height
+        .saturating_add(8)
+        .clamp(22, row_height.saturating_sub(8));
+    let chevron_size = (icon_size * 72 / 100).clamp(14, 24);
+    let indent_step = (icon_size * 58 / 100).clamp(14, 22);
+    let icon_gap = (icon_size / 3).clamp(8, 14);
+    RightSidebarFileRowMetrics {
+        row_height,
+        icon_size,
+        chevron_size,
+        indent_step,
+        icon_gap,
+    }
+}
+
+fn right_sidebar_open_with_cache_key(path: &Path) -> String {
+    path.extension()
+        .map(|extension| format!("ext:{}", extension.to_string_lossy().to_lowercase()))
+        .unwrap_or_else(|| format!("path:{}", path.to_string_lossy()))
+}
+
+fn sorted_open_with_candidates(
+    mut candidates: Vec<wezterm_open_url::OpenWithCandidate>,
+    preferred_candidate_id: Option<&str>,
+) -> Vec<wezterm_open_url::OpenWithCandidate> {
+    candidates.sort_by(|a, b| {
+        let a_preferred = preferred_candidate_id == Some(a.id.as_str());
+        let b_preferred = preferred_candidate_id == Some(b.id.as_str());
+        b_preferred
+            .cmp(&a_preferred)
+            .then_with(|| open_with_candidate_rank(a).cmp(&open_with_candidate_rank(b)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    candidates.truncate(20);
+    candidates
+}
+
+fn open_with_candidate_rank(candidate: &wezterm_open_url::OpenWithCandidate) -> (u8, String) {
+    let text = format!("{} {}", candidate.label, candidate.id).to_lowercase();
+    let is_developer_tool = [
+        "zed",
+        "visual studio code",
+        "vscode",
+        "code",
+        "cursor",
+        "xcode",
+        "android studio",
+        "sublime",
+        "webstorm",
+        "intellij",
+        "pycharm",
+        "goland",
+        "rustrover",
+        "vim",
+        "neovim",
+        "emacs",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    let rank = if is_developer_tool {
+        0
+    } else if candidate.is_default {
+        1
+    } else {
+        2
+    };
+    (rank, candidate.label.to_lowercase())
+}
+
+fn visible_file_row_range(
+    row_count: usize,
+    scroll_offset: f32,
+    visible_height: usize,
+    row_height: usize,
+) -> std::ops::Range<usize> {
+    if row_count == 0 || visible_height == 0 || row_height == 0 {
+        return 0..0;
+    }
+
+    let row_height = row_height as f32;
+    let start = (scroll_offset / row_height).floor().max(0.0) as usize;
+    let end = ((scroll_offset + visible_height as f32) / row_height)
+        .ceil()
+        .max(0.0) as usize
+        + 1;
+    start.min(row_count)..end.min(row_count)
+}
+
+fn load_right_sidebar_file_preview(
+    path: &Path,
+    use_dark_syntax_theme: bool,
+) -> RightSidebarLoadedFilePreview {
+    if is_preview_image_path(path) {
+        return match load_file_preview_image(path) {
+            Ok(image) => RightSidebarLoadedFilePreview {
+                lines: Vec::new(),
+                image: Some(image),
+                message: None,
+                truncated: false,
+            },
+            Err(err) => RightSidebarLoadedFilePreview {
+                lines: Vec::new(),
+                image: None,
+                message: Some(format!("Unable to load image preview: {err}")),
+                truncated: false,
+            },
+        };
+    }
+
+    let (text, message, truncated) = load_file_preview(path);
+    let lines = if message.is_none() {
+        preview_lines_from_text(path, &text, use_dark_syntax_theme)
+    } else {
+        Vec::new()
+    };
+    RightSidebarLoadedFilePreview {
+        lines,
+        image: None,
+        message,
+        truncated,
+    }
+}
+
+fn is_preview_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff")
+    )
+}
+
+fn load_file_preview_image(path: &Path) -> anyhow::Result<RightSidebarFilePreviewImage> {
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if metadata.len() > FILE_PREVIEW_IMAGE_MAX_BYTES as u64 {
+        anyhow::bail!(
+            "image is larger than {} MiB",
+            FILE_PREVIEW_IMAGE_MAX_BYTES / 1024 / 1024
+        );
+    }
+
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let image_data = ImageDataType::EncodedFile(bytes);
+    let (width, height) = image_data.dimensions().context("decode image dimensions")?;
+    Ok(RightSidebarFilePreviewImage {
+        data: Arc::new(ImageData::with_data(image_data)),
+        width,
+        height,
+    })
+}
+
+fn load_file_preview(path: &Path) -> (String, Option<String>, bool) {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            return (
+                String::new(),
+                Some(format!("Unable to open file: {err}")),
+                false,
+            )
+        }
+    };
+    let mut bytes = Vec::with_capacity(FILE_PREVIEW_MAX_BYTES + 1);
+    let mut limited = file.take((FILE_PREVIEW_MAX_BYTES + 1) as u64);
+    if let Err(err) = limited.read_to_end(&mut bytes) {
+        return (
+            String::new(),
+            Some(format!("Unable to read file: {err}")),
+            false,
+        );
+    }
+
+    let truncated = bytes.len() > FILE_PREVIEW_MAX_BYTES;
+    if truncated {
+        bytes.truncate(FILE_PREVIEW_MAX_BYTES);
+        truncate_preview_bytes_to_utf8_boundary(&mut bytes);
+    }
+    if bytes.contains(&0) {
+        return (
+            String::new(),
+            Some("Preview unavailable for binary file".to_string()),
+            truncated,
+        );
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) if text.is_empty() => (String::new(), Some("Empty file".to_string()), false),
+        Ok(text) => (text, None, truncated),
+        Err(_) => (
+            String::new(),
+            Some("Preview unavailable for non-UTF-8 text".to_string()),
+            truncated,
+        ),
+    }
+}
+
+fn truncate_preview_bytes_to_utf8_boundary(bytes: &mut Vec<u8>) {
+    if let Err(err) = std::str::from_utf8(bytes) {
+        if err.error_len().is_none() {
+            bytes.truncate(err.valid_up_to());
+        }
+    }
+}
+
+impl RightSidebarFileCharBag {
+    fn from_str(value: &str) -> Self {
+        let mut bits = 0u128;
+        for ch in value.chars().flat_map(char::to_lowercase) {
+            let bit = if ch.is_ascii_alphanumeric() {
+                Some((ch as u8).wrapping_sub(b'0') as u32)
+            } else {
+                match ch {
+                    '/' | '\\' => Some(75),
+                    '.' => Some(76),
+                    '-' => Some(77),
+                    '_' => Some(78),
+                    _ => None,
+                }
+            };
+            if let Some(bit) = bit.filter(|bit| *bit < 128) {
+                bits |= 1u128 << bit;
+            }
+        }
+        Self(bits)
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+#[cfg(test)]
+fn build_right_sidebar_file_index(
+    root: &Path,
+    project_name: &str,
+) -> Result<RightSidebarFileIndex, String> {
+    let cancel = AtomicBool::new(false);
+    build_right_sidebar_file_index_with_cancel(root, project_name, &cancel)
+}
+
+fn build_right_sidebar_file_index_with_cancel(
+    root: &Path,
+    project_name: &str,
+    cancel: &AtomicBool,
+) -> Result<RightSidebarFileIndex, String> {
+    if !root.is_dir() {
+        return Err("Project folder is unavailable".to_string());
+    }
+
+    let root_path = root.to_path_buf();
+    let mut entries = vec![RightSidebarFileIndexEntry {
+        path: root_path.clone(),
+        name: project_name.to_string(),
+        display_path: project_name.to_string(),
+        is_dir: true,
+        depth: 0,
+        name_char_bag: RightSidebarFileCharBag::from_str(project_name),
+        char_bag: RightSidebarFileCharBag::from_str(project_name),
+    }];
+    let mut children_by_parent: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(should_index_file_entry);
+    for entry in walker {
+        if entries.len() >= FILE_INDEX_ENTRY_LIMIT {
+            break;
+        }
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err("File indexing canceled".to_string());
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let is_dir = entry.file_type().is_dir();
+        let path = entry.path().to_path_buf();
+        let parent = path.parent().unwrap_or(root).to_path_buf();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let display_path = path
+            .strip_prefix(root)
+            .map(path_to_display_string)
+            .unwrap_or_else(|_| name.clone());
+        let name_char_bag = RightSidebarFileCharBag::from_str(&name);
+        let index = entries.len();
+        entries.push(RightSidebarFileIndexEntry {
+            path: path.clone(),
+            name,
+            display_path: display_path.clone(),
+            is_dir,
+            depth: entry.depth(),
+            name_char_bag,
+            char_bag: RightSidebarFileCharBag::from_str(&display_path),
+        });
+        children_by_parent.entry(parent).or_default().push(index);
+    }
+
+    if cancel.load(AtomicOrdering::Relaxed) {
+        return Err("File indexing canceled".to_string());
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_by(|left, right| file_index_entry_cmp(&entries[*left], &entries[*right]));
+    }
+
+    Ok(RightSidebarFileIndex {
+        entries,
+        children_by_parent,
+    })
+}
+
+fn right_sidebar_file_browse_rows_from_index(
+    index: &RightSidebarFileIndex,
+    expanded: &HashSet<String>,
+) -> Vec<RightSidebarFileTreeRow> {
+    let mut rows = Vec::new();
+    collect_file_index_rows(index, 0, expanded, &mut rows);
+    rows
+}
+
+fn collect_file_index_rows(
+    index: &RightSidebarFileIndex,
+    entry_index: usize,
+    expanded: &HashSet<String>,
+    rows: &mut Vec<RightSidebarFileTreeRow>,
+) {
+    if rows.len() >= FILE_TREE_ROW_LIMIT {
+        return;
+    }
+    let Some(entry) = index.entries.get(entry_index) else {
+        return;
+    };
+    let is_expanded = entry.depth == 0 || expanded.contains(&path_key(&entry.path));
+    rows.push(RightSidebarFileTreeRow {
+        path: entry.path.clone(),
+        name: entry.name.clone(),
+        depth: entry.depth,
+        is_dir: entry.is_dir,
+        is_expanded,
+    });
+
+    if !entry.is_dir || !is_expanded {
+        return;
+    }
+    if let Some(children) = index.children_by_parent.get(&entry.path) {
+        for child in children {
+            collect_file_index_rows(index, *child, expanded, rows);
+            if rows.len() >= FILE_TREE_ROW_LIMIT {
+                break;
+            }
+        }
+    }
+}
+
+fn search_right_sidebar_file_index(
+    index: &RightSidebarFileIndex,
+    query: &str,
+    cancel: &AtomicBool,
+) -> Vec<RightSidebarFileTreeRow> {
+    let query = query.trim();
+    if query.is_empty() {
+        return vec![];
+    }
+
+    let query_bag = RightSidebarFileCharBag::from_str(query);
+    let lower_query = query.to_ascii_lowercase();
+    let search_path = query.contains('/') || query.contains('\\');
+    let mut matches = vec![];
+    for (index_position, entry) in index.entries.iter().enumerate().skip(1) {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return vec![];
+        }
+        let haystack = if search_path {
+            entry.display_path.as_str()
+        } else {
+            entry.name.as_str()
+        };
+        let haystack_bag = if search_path {
+            entry.char_bag
+        } else {
+            entry.name_char_bag
+        };
+        if !haystack_bag.contains(query_bag) {
+            continue;
+        }
+        let haystack_lower = haystack.to_ascii_lowercase();
+        let Some(match_offset) = haystack_lower.find(&lower_query) else {
+            continue;
+        };
+        matches.push((match_offset, haystack.len(), index_position));
+    }
+
+    matches.sort_by(
+        |(left_offset, left_len, left_index), (right_offset, right_len, right_index)| {
+            left_offset
+                .cmp(right_offset)
+                .then_with(|| left_len.cmp(right_len))
+                .then_with(|| {
+                    file_index_entry_cmp(&index.entries[*left_index], &index.entries[*right_index])
+                })
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
+
+    matches
+        .into_iter()
+        .take(FILE_TREE_ROW_LIMIT)
+        .filter_map(|(_, _, entry_index)| index.entries.get(entry_index))
+        .map(|entry| RightSidebarFileTreeRow {
+            path: entry.path.clone(),
+            name: entry.display_path.clone(),
+            depth: 0,
+            is_dir: entry.is_dir,
+            is_expanded: false,
+        })
+        .collect()
+}
+
+fn should_index_file_entry(entry: &WalkDirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return true;
+    }
+    let name = entry.file_name().to_string_lossy();
+    !should_skip_file_index_dir(&name)
+}
+
+fn should_skip_file_index_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".hg"
+            | ".svn"
+            | "target"
+            | "node_modules"
+            | ".next"
+            | ".nuxt"
+            | ".turbo"
+            | ".cache"
+            | "dist"
+            | "build"
+            | "coverage"
+            | "vendor"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+    )
+}
+
+fn path_to_display_string(path: &Path) -> String {
+    let mut display = String::new();
+    for component in path.components() {
+        if !display.is_empty() {
+            display.push('/');
+        }
+        display.push_str(&component.as_os_str().to_string_lossy());
+    }
+    display
+}
+
+fn file_index_entry_cmp(
+    a: &RightSidebarFileIndexEntry,
+    b: &RightSidebarFileIndexEntry,
+) -> Ordering {
+    match (a.is_dir, b.is_dir) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => naturalish_cmp(&a.name, &b.name),
+    }
+}
+
+fn naturalish_cmp(a: &str, b: &str) -> Ordering {
+    let mut ai = 0;
+    let mut bi = 0;
+    while ai < a.len() && bi < b.len() {
+        let a_ch = a[ai..].chars().next().unwrap();
+        let b_ch = b[bi..].chars().next().unwrap();
+        if a_ch.is_ascii_digit() && b_ch.is_ascii_digit() {
+            let a_start = ai;
+            let b_start = bi;
+            while ai < a.len() && a.as_bytes()[ai].is_ascii_digit() {
+                ai += 1;
+            }
+            while bi < b.len() && b.as_bytes()[bi].is_ascii_digit() {
+                bi += 1;
+            }
+            let a_digits = &a[a_start..ai];
+            let b_digits = &b[b_start..bi];
+            let a_trimmed = a_digits.trim_start_matches('0');
+            let b_trimmed = b_digits.trim_start_matches('0');
+            let cmp = a_trimmed
+                .len()
+                .cmp(&b_trimmed.len())
+                .then_with(|| a_trimmed.cmp(b_trimmed))
+                .then_with(|| a_digits.len().cmp(&b_digits.len()));
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
+            continue;
+        }
+
+        ai += a_ch.len_utf8();
+        bi += b_ch.len_utf8();
+        let cmp = a_ch
+            .to_ascii_lowercase()
+            .cmp(&b_ch.to_ascii_lowercase())
+            .then_with(|| a_ch.cmp(&b_ch));
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightSidebarFileIcon {
+    Material(MaterialIcon),
+    Svg(SvgIcon),
+}
+
+fn file_icon_for_row(row: &RightSidebarFileTreeRow) -> RightSidebarFileIcon {
+    if row.is_dir {
+        let is_root = row.depth == 0;
+        if let Some(icon) = material_folder_icon_for_name(&row.name, row.is_expanded, is_root) {
+            return RightSidebarFileIcon::Material(icon);
+        }
+
+        RightSidebarFileIcon::Svg(if row.is_expanded {
+            SvgIcon::FolderOpen
+        } else {
+            SvgIcon::Folder
+        })
+    } else {
+        let name = row
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&row.name);
+        if let Some(icon) = material_file_icon_for_name(name) {
+            return RightSidebarFileIcon::Material(icon);
+        }
+
+        RightSidebarFileIcon::Svg(
+            match row
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some(
+                    "rs" | "toml" | "lua" | "js" | "jsx" | "ts" | "tsx" | "json" | "css" | "html"
+                    | "sh" | "py" | "rb" | "go" | "swift" | "kt" | "java" | "c" | "cc" | "cpp"
+                    | "h" | "hpp" | "m" | "mm",
+                ) => SvgIcon::FileCode,
+                Some("md" | "txt" | "log" | "yaml" | "yml" | "xml") => SvgIcon::FileText,
+                _ => SvgIcon::File,
+            },
         )
     }
 }
@@ -2146,7 +5978,395 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{snippet_cursor_visible, snippet_run_buffer, wrap_snippet_text_for_width};
+    use super::{
+        build_right_sidebar_file_index, load_file_preview, load_file_preview_image, naturalish_cmp,
+        path_key, preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
+        preview_text_range, preview_visible_lines, right_sidebar_file_browse_rows_from_index,
+        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key,
+        search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
+        sorted_open_with_candidates, visible_file_row_range, wrap_snippet_text_for_width,
+        FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT, FILE_PREVIEW_MAX_BYTES,
+    };
+    use crate::utilsprites::RenderMetrics;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use wezterm_font::units::PixelLength;
+    use window::Size;
+
+    fn test_render_metrics(cell_height: isize, cell_width: isize) -> RenderMetrics {
+        RenderMetrics {
+            descender: PixelLength::new(0.0),
+            descender_row: 0,
+            descender_plus_two: 0,
+            underline_height: 1,
+            strike_row: 0,
+            cell_size: Size::new(cell_width, cell_height),
+        }
+    }
+
+    #[test]
+    fn file_index_sorts_dirs_first_and_natural() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("dir10")).unwrap();
+        fs::create_dir(dir.path().join("dir2")).unwrap();
+        fs::write(dir.path().join("file10.txt"), "").unwrap();
+        fs::write(dir.path().join("file2.txt"), "").unwrap();
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let rows = right_sidebar_file_browse_rows_from_index(&index, &HashSet::new());
+        let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
+        assert_eq!(
+            names,
+            vec!["Project", "dir2", "dir10", "file2.txt", "file10.txt"]
+        );
+    }
+
+    #[test]
+    fn naturalish_cmp_sorts_digit_runs_by_value() {
+        assert_eq!(naturalish_cmp("tab2", "tab10"), std::cmp::Ordering::Less);
+        assert_eq!(naturalish_cmp("tab10", "tab2"), std::cmp::Ordering::Greater);
+        assert_eq!(naturalish_cmp("tab01", "tab1"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn file_index_search_matches_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let docs = dir.path().join("docs");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&docs).unwrap();
+        fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(docs.join("readme.md"), "# docs\n").unwrap();
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let cancel = AtomicBool::new(false);
+        let rows = search_right_sidebar_file_index(&index, "main", &cancel);
+        let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
+        assert_eq!(names, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn file_index_search_does_not_join_directory_and_extension_for_basename_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let elio = dir.path().join("research").join("elio-main").join("src");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir_all(&elio).unwrap();
+        fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(elio.join("cli.rs"), "").unwrap();
+        fs::write(elio.join("lib.rs"), "").unwrap();
+        fs::write(elio.parent().unwrap().join("build.rs"), "").unwrap();
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let cancel = AtomicBool::new(false);
+        let rows = search_right_sidebar_file_index(&index, "main.rs", &cancel);
+        let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
+
+        assert_eq!(names, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn file_index_search_is_not_fuzzy() {
+        let dir = tempfile::tempdir().unwrap();
+        let icons = dir.path().join("third_party").join("lucide").join("icons");
+        let docs = dir.path().join("docs");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&icons).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&src).unwrap();
+        fs::write(icons.join("mail-minus.js"), "").unwrap();
+        fs::write(icons.join("map-pin.js"), "").unwrap();
+        fs::write(docs.join("mermaid-init.js"), "").unwrap();
+        fs::write(src.join("main.js"), "").unwrap();
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let cancel = AtomicBool::new(false);
+        let rows = search_right_sidebar_file_index(&index, "main.js", &cancel);
+        let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
+
+        assert_eq!(names, vec!["src/main.js"]);
+    }
+
+    #[test]
+    fn file_index_search_uses_relative_path_when_query_has_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let cancel = AtomicBool::new(false);
+        let rows = search_right_sidebar_file_index(&index, "src/main", &cancel);
+        let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
+
+        assert_eq!(names, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn file_index_skips_generated_heavy_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("generated-artifact.rs"), "fn generated() {}\n").unwrap();
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let cancel = AtomicBool::new(false);
+        let rows = search_right_sidebar_file_index(&index, "generated", &cancel);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn file_index_browse_only_descends_expanded_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let rows = right_sidebar_file_browse_rows_from_index(&index, &HashSet::new());
+        let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["Project", "src"]);
+
+        let mut expanded = HashSet::new();
+        expanded.insert(path_key(&src));
+        let rows = right_sidebar_file_browse_rows_from_index(&index, &expanded);
+        let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["Project", "src", "main.rs"]);
+    }
+
+    #[test]
+    fn file_index_search_respects_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let rows = search_right_sidebar_file_index(&index, "main", &cancel);
+
+        assert!(rows.is_empty());
+        assert!(cancel.load(AtomicOrdering::Relaxed));
+    }
+
+    #[test]
+    fn load_file_preview_rejects_binary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        fs::write(&path, [0, 1, 2, 3]).unwrap();
+
+        let (text, message, truncated) = load_file_preview(&path);
+        assert!(text.is_empty());
+        assert_eq!(
+            message.as_deref(),
+            Some("Preview unavailable for binary file")
+        );
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn load_file_preview_truncates_large_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        fs::write(&path, vec![b'a'; FILE_PREVIEW_MAX_BYTES + 1]).unwrap();
+
+        let (text, message, truncated) = load_file_preview(&path);
+        assert!(message.is_none());
+        assert!(truncated);
+        assert_eq!(text.len(), FILE_PREVIEW_MAX_BYTES);
+    }
+
+    #[test]
+    fn load_file_preview_truncates_large_utf8_text_at_character_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-utf8.txt");
+        let prefix = "a".repeat(FILE_PREVIEW_MAX_BYTES - 1);
+        fs::write(&path, format!("{prefix}你好")).unwrap();
+
+        let (text, message, truncated) = load_file_preview(&path);
+
+        assert!(message.is_none());
+        assert!(truncated);
+        assert_eq!(text, prefix);
+    }
+
+    #[test]
+    fn load_file_preview_image_reads_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        fs::write(&path, bytes.into_inner()).unwrap();
+
+        let preview = load_file_preview_image(&path).unwrap();
+
+        assert_eq!((preview.width, preview.height), (2, 1));
+    }
+
+    #[test]
+    fn preview_visible_lines_only_returns_requested_window() {
+        let cached_lines = preview_plain_lines_from_text("one\ntwo\nthree\nfour");
+        let lines = preview_visible_lines(&cached_lines, 1, 2);
+
+        assert_eq!(preview_line_count(&cached_lines), 4);
+        assert_eq!(lines[0].0, 1);
+        assert_eq!(lines[0].1.plain, "two");
+        assert_eq!(lines[1].0, 2);
+        assert_eq!(lines[1].1.plain, "three");
+
+        let empty_lines = preview_plain_lines_from_text("");
+        assert_eq!(preview_line_count(&empty_lines), 1);
+        let visible = preview_visible_lines(&empty_lines, 0, 2);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0, 0);
+        assert_eq!(visible[0].1.plain, "");
+    }
+
+    #[test]
+    fn visible_file_row_range_only_returns_rows_near_viewport() {
+        let row_height = 44;
+        assert_eq!(visible_file_row_range(0, 0.0, 400, row_height), 0..0);
+        assert_eq!(
+            visible_file_row_range(100, 0.0, row_height * 3, row_height),
+            0..4
+        );
+        assert_eq!(
+            visible_file_row_range(100, (row_height * 50) as f32, row_height * 3, row_height),
+            50..54
+        );
+        assert_eq!(
+            visible_file_row_range(10, (row_height * 9) as f32, row_height * 4, row_height),
+            9..10
+        );
+        assert_eq!(visible_file_row_range(10, 0.0, 400, 0), 0..0);
+    }
+
+    #[test]
+    fn file_row_metrics_scale_with_font_height() {
+        let small = right_sidebar_file_row_metrics(test_render_metrics(18, 9));
+        let normal = right_sidebar_file_row_metrics(test_render_metrics(26, 13));
+        let large = right_sidebar_file_row_metrics(test_render_metrics(48, 24));
+
+        assert_eq!(small.row_height, 38);
+        assert_eq!(small.icon_size, 26);
+        assert!(normal.row_height > small.row_height);
+        assert!(normal.icon_size > small.icon_size);
+        assert!(normal.indent_step >= small.indent_step);
+        assert!(normal.icon_gap >= small.icon_gap);
+        assert_eq!(large.row_height, 58);
+        assert_eq!(large.icon_size, 50);
+        assert!(large.chevron_size <= 24);
+    }
+
+    #[test]
+    fn open_with_cache_key_uses_extension_when_available() {
+        assert_eq!(
+            right_sidebar_open_with_cache_key(std::path::Path::new("/tmp/App.RS")),
+            "ext:rs"
+        );
+        assert_eq!(
+            right_sidebar_open_with_cache_key(std::path::Path::new("/tmp/Makefile")),
+            "path:/tmp/Makefile"
+        );
+    }
+
+    #[test]
+    fn open_with_candidates_sort_preferred_first_then_developer_tools() {
+        let candidates = vec![
+            wezterm_open_url::OpenWithCandidate {
+                id: "zed".to_string(),
+                label: "Zed".to_string(),
+                icon_path: None,
+                is_default: false,
+            },
+            wezterm_open_url::OpenWithCandidate {
+                id: "code".to_string(),
+                label: "VS Code".to_string(),
+                icon_path: None,
+                is_default: false,
+            },
+            wezterm_open_url::OpenWithCandidate {
+                id: "/Applications/TextEdit.app".to_string(),
+                label: "TextEdit".to_string(),
+                icon_path: None,
+                is_default: true,
+            },
+        ];
+
+        let labels = sorted_open_with_candidates(candidates, Some("zed"))
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["Zed", "VS Code", "TextEdit"]);
+    }
+
+    #[test]
+    fn preview_lines_from_text_highlights_known_file_types() {
+        let path = std::path::Path::new("main.rs");
+        let lines = preview_lines_from_text(path, "fn main() {}", true);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].plain, "fn main() {}");
+        assert!(!lines[0].spans.is_empty());
+    }
+
+    #[test]
+    fn preview_lines_from_text_highlights_python_files() {
+        let path = std::path::Path::new("script.py");
+        let lines = preview_lines_from_text(path, "def main():\n    return 1", true);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].plain, "def main():");
+        assert!(!lines[0].spans.is_empty());
+        let colors: HashSet<_> = lines[0]
+            .spans
+            .iter()
+            .map(|span| {
+                let color = span.color.to_srgb().to_tuple_rgba();
+                (
+                    (color.0 * 255.0).round() as u8,
+                    (color.1 * 255.0).round() as u8,
+                    (color.2 * 255.0).round() as u8,
+                    (color.3 * 255.0).round() as u8,
+                )
+            })
+            .collect();
+        assert!(
+            colors.len() > 1,
+            "python preview should render visibly different token colors"
+        );
+    }
+
+    #[test]
+    fn preview_keeps_long_lines_intact() {
+        // A line far longer than the highlight cap must be preserved verbatim
+        // (no 640-char truncation, no "...") on both the plain and highlighted
+        // paths.
+        let line = "a".repeat(FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT * 2);
+
+        let plain = preview_plain_lines_from_text(&line);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].plain.chars().count(), line.chars().count());
+        assert!(!plain[0].plain.contains("..."));
+
+        let highlighted = preview_lines_from_text(std::path::Path::new("min.css"), &line, true);
+        assert_eq!(highlighted.len(), 1);
+        assert_eq!(highlighted[0].plain.chars().count(), line.chars().count());
+        assert!(!highlighted[0].plain.contains("..."));
+    }
+
+    #[test]
+    fn preview_text_range_slices_by_character_columns() {
+        assert_eq!(preview_text_range("ab你好cd", 2, 4), "你好");
+        assert_eq!(preview_text_range("ab日本語cd", 2, 5), "日本語");
+        assert_eq!(preview_text_range("ab한글cd", 2, 4), "한글");
+        assert_eq!(preview_text_range("abسلامcd", 2, 6), "سلام");
+        assert_eq!(preview_text_range("abприветcd", 2, 8), "привет");
+        assert_eq!(preview_text_range("ab你好cd", 4, 2), "");
+        assert_eq!(preview_text_range("ab你好cd", 4, 99), "cd");
+    }
 
     #[test]
     fn snippet_run_buffer_appends_single_enter() {

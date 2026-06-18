@@ -577,6 +577,13 @@ pub enum KeyAssignment {
     PromptRenamePaneTab(usize),
     PromptRenameProject(String),
     RevealProjectInFolder(String),
+    OpenFileWith {
+        path: String,
+        app: String,
+        label: String,
+    },
+    OpenFileWithSystemDefault(String),
+    RevealFileInFolder(String),
     PromptRenameWorkspaceThread(String),
     PromptRenameSpace(String),
     CreateSpace,

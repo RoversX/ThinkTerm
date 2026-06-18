@@ -29,6 +29,8 @@ dhat-ad-hoc = ["dhat"]  # if you are doing ad hoc profiling
 
 [build-dependencies]
 anyhow.workspace = true
+phf_codegen.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 cc.workspace = true
@@ -71,6 +73,7 @@ nucleo-matcher.workspace = true
 openssl.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
+phf.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 promise.workspace = true
 rangeset.workspace = true
@@ -82,6 +85,7 @@ serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
 shlex.workspace = true
 smol.workspace = true
+syntect.workspace = true
 tabout.workspace = true
 tempfile.workspace = true
 terminfo.workspace = true

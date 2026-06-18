@@ -18,6 +18,9 @@ pub enum SvgIcon {
     Ellipsis,
     Expand,
     ExternalLink,
+    File,
+    FileCode,
+    FileText,
     Folder,
     FolderMinus,
     FolderOpen,
@@ -95,6 +98,13 @@ impl SvgIcon {
             Self::Expand => include_bytes!("../../../../third_party/lucide/icons/expand.svg"),
             Self::ExternalLink => {
                 include_bytes!("../../../../third_party/lucide/icons/external-link.svg")
+            }
+            Self::File => include_bytes!("../../../../third_party/lucide/icons/file.svg"),
+            Self::FileCode => {
+                include_bytes!("../../../../third_party/lucide/icons/file-code.svg")
+            }
+            Self::FileText => {
+                include_bytes!("../../../../third_party/lucide/icons/file-text.svg")
             }
             Self::Folder => include_bytes!("../../../../third_party/lucide/icons/folder.svg"),
             Self::FolderMinus => {
@@ -211,6 +221,107 @@ impl SvgIcon {
         // Lucide icons use `currentColor`; tint them white for the dark UI.
         let svg = svg.replace("currentColor", "#ffffff");
         rasterize_svg_str(&svg, size, degrees)
+    }
+}
+
+/// A full-color file/folder icon from the vendored Material Icon Theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MaterialIcon(pub(crate) u16);
+
+mod material_icons_generated {
+    include!(concat!(env!("OUT_DIR"), "/material_icons_generated.rs"));
+}
+
+impl MaterialIcon {
+    pub fn bytes(self) -> &'static [u8] {
+        material_icons_generated::material_icon_bytes(self)
+    }
+
+    pub fn rasterize(self, size: usize) -> Result<Image> {
+        let svg = std::str::from_utf8(self.bytes()).context("material SVG asset is not UTF-8")?;
+        rasterize_svg_str(svg, size, 0.0)
+    }
+}
+
+pub fn material_file_icon_for_name(name: &str) -> Option<MaterialIcon> {
+    let key = name.to_ascii_lowercase();
+    if let Some(icon) = material_icons_generated::FILE_NAMES
+        .get(key.as_str())
+        .copied()
+    {
+        return Some(icon);
+    }
+
+    for extension in material_icons_generated::FILE_EXTENSION_SUFFIXES {
+        if key
+            .strip_suffix(extension)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+        {
+            if let Some(icon) = material_icons_generated::FILE_EXTENSIONS
+                .get(*extension)
+                .copied()
+            {
+                return Some(icon);
+            }
+        }
+    }
+
+    material_icons_generated::DEFAULT_FILE
+}
+
+pub fn material_folder_icon_for_name(
+    name: &str,
+    expanded: bool,
+    root: bool,
+) -> Option<MaterialIcon> {
+    let key = name.to_ascii_lowercase();
+    if root {
+        if expanded {
+            if let Some(icon) = material_icons_generated::ROOT_FOLDER_NAMES_EXPANDED
+                .get(key.as_str())
+                .copied()
+            {
+                return Some(icon);
+            }
+        }
+        if let Some(icon) = material_icons_generated::ROOT_FOLDER_NAMES
+            .get(key.as_str())
+            .copied()
+        {
+            return Some(icon);
+        }
+    }
+
+    if expanded {
+        if let Some(icon) = material_icons_generated::FOLDER_NAMES_EXPANDED
+            .get(key.as_str())
+            .copied()
+        {
+            return Some(icon);
+        }
+    }
+    if let Some(icon) = material_icons_generated::FOLDER_NAMES
+        .get(key.as_str())
+        .copied()
+    {
+        return Some(icon);
+    }
+
+    if root {
+        if expanded {
+            material_icons_generated::DEFAULT_ROOT_FOLDER_EXPANDED
+                .or(material_icons_generated::DEFAULT_ROOT_FOLDER)
+                .or(material_icons_generated::DEFAULT_FOLDER_EXPANDED)
+                .or(material_icons_generated::DEFAULT_FOLDER)
+        } else {
+            material_icons_generated::DEFAULT_ROOT_FOLDER
+                .or(material_icons_generated::DEFAULT_FOLDER)
+        }
+    } else if expanded {
+        material_icons_generated::DEFAULT_FOLDER_EXPANDED
+            .or(material_icons_generated::DEFAULT_FOLDER)
+    } else {
+        material_icons_generated::DEFAULT_FOLDER
     }
 }
 
@@ -372,7 +483,7 @@ fn rasterize_svg_str(svg: &str, size: usize, degrees: f32) -> Result<Image> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrandIcon, SvgIcon};
+    use super::{material_file_icon_for_name, material_folder_icon_for_name, BrandIcon, SvgIcon};
 
     #[test]
     fn svg_icons_rasterize() {
@@ -474,5 +585,41 @@ mod tests {
         assert_eq!(BrandIcon::GitHub.display_color(), (0xFF, 0xFF, 0xFF));
         // Ubuntu (#E95420) keeps its brand color.
         assert_eq!(BrandIcon::Ubuntu.display_color(), (0xE9, 0x54, 0x20));
+    }
+
+    #[test]
+    fn material_file_icons_resolve_common_names_and_suffixes() {
+        let package_json = material_file_icon_for_name("package.json").unwrap();
+        let plain_json = material_file_icon_for_name("plain.json").unwrap();
+        assert_ne!(package_json, plain_json);
+
+        assert!(material_file_icon_for_name("main.rs").is_some());
+        assert!(material_file_icon_for_name("Cargo.toml").is_some());
+        assert!(material_file_icon_for_name("README.md").is_some());
+        assert!(material_file_icon_for_name(".gitignore").is_some());
+        assert!(material_file_icon_for_name("component.tsx").is_some());
+
+        let typescript_definition = material_file_icon_for_name("index.d.ts").unwrap();
+        let typescript = material_file_icon_for_name("index.ts").unwrap();
+        assert_ne!(typescript_definition, typescript);
+    }
+
+    #[test]
+    fn material_folder_icons_resolve_names_and_expanded_state() {
+        let src_closed = material_folder_icon_for_name("src", false, false).unwrap();
+        let src_open = material_folder_icon_for_name("src", true, false).unwrap();
+        assert_ne!(src_closed, src_open);
+
+        assert!(material_folder_icon_for_name("node_modules", false, false).is_some());
+        assert!(material_folder_icon_for_name(".github", true, false).is_some());
+        assert!(material_folder_icon_for_name("Project", true, true).is_some());
+    }
+
+    #[test]
+    fn material_icons_rasterize() {
+        let icon = material_file_icon_for_name("main.rs").unwrap();
+        let data: Vec<u8> = icon.rasterize(24).unwrap().into();
+        assert_eq!(data.len(), 24 * 24 * 4);
+        assert!(data.iter().any(|value| *value != 0));
     }
 }

@@ -4,7 +4,7 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, SvgIcon};
+use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, MaterialIcon, SvgIcon};
 use crate::termwindow::ui::platform_chrome;
 use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::tokens::{
@@ -2361,6 +2361,38 @@ impl crate::TermWindow {
             .glyph_cache
             .borrow_mut()
             .cached_brand_icon(icon, size)?
+            .texture_coords();
+
+        let mut quad = layers.allocate(2)?;
+        quad.set_position(
+            x as f32 - left_offset,
+            y as f32 - top_offset,
+            x as f32 + size as f32 - left_offset,
+            y as f32 + size as f32 - top_offset,
+        );
+        quad.set_texture(sprite);
+        quad.set_hsv(None);
+        quad.set_has_color(true);
+        quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
+
+        Ok(())
+    }
+
+    pub(crate) fn paint_sidebar_material_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        icon: MaterialIcon,
+        x: usize,
+        y: usize,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        let gl_state = self.render_state.as_ref().unwrap();
+        let sprite = gl_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_material_icon(icon, size)?
             .texture_coords();
 
         let mut quad = layers.allocate(2)?;

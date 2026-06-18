@@ -194,8 +194,16 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) sidebar_font_size: Option<f64>,
     pub(crate) workspace_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_width: Option<usize>,
+    pub(crate) right_sidebar_file_preview_width: Option<usize>,
+    pub(crate) right_sidebar_open_with_app: Option<NativeOpenWithApp>,
     pub(crate) tab_font_size: Option<f64>,
     pub(crate) pane_header_font_size: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct NativeOpenWithApp {
+    pub(crate) id: String,
+    pub(crate) label: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -446,6 +454,14 @@ pub(crate) fn right_sidebar_width() -> Option<usize> {
     load().chrome.right_sidebar_width
 }
 
+pub(crate) fn right_sidebar_file_preview_width() -> Option<usize> {
+    load().chrome.right_sidebar_file_preview_width
+}
+
+pub(crate) fn right_sidebar_open_with_app() -> Option<NativeOpenWithApp> {
+    load().chrome.right_sidebar_open_with_app
+}
+
 pub(crate) fn force_fallback_context_menu() -> bool {
     std::env::var_os("THINKTERM_FORCE_FALLBACK_CONTEXT_MENU").is_some()
         || load().developer.force_fallback_context_menu
@@ -454,6 +470,18 @@ pub(crate) fn force_fallback_context_menu() -> bool {
 pub(crate) fn save_right_sidebar_width(width: usize) -> anyhow::Result<()> {
     let mut settings = load();
     settings.chrome.right_sidebar_width = Some(width);
+    save(&settings)
+}
+
+pub(crate) fn save_right_sidebar_file_preview_width(width: usize) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.chrome.right_sidebar_file_preview_width = Some(width);
+    save(&settings)
+}
+
+pub(crate) fn save_right_sidebar_open_with_app(app: NativeOpenWithApp) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.chrome.right_sidebar_open_with_app = Some(app);
     save(&settings)
 }
 

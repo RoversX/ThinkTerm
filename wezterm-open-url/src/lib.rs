@@ -2,6 +2,39 @@
 // Copyright © 2015 Sebastian Thiel
 // <https://github.com/Byron/open-rs>
 
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenWithCandidate {
+    pub id: String,
+    pub label: String,
+    pub icon_path: Option<PathBuf>,
+    pub is_default: bool,
+}
+
+pub fn open_path_with_candidate(path: &Path, candidate_id: &str) {
+    open_with(&path.to_string_lossy(), candidate_id);
+}
+
+pub fn open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
+    platform_open_with_candidates(path)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
+    macos_open_with_candidates(path)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn platform_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
+    linux_open_with_candidates(path)
+}
+
+#[cfg(windows)]
+fn platform_open_with_candidates(_path: &Path) -> Vec<OpenWithCandidate> {
+    Vec::new()
+}
+
 #[cfg(not(windows))]
 pub fn open_url(url: &str) {
     let url = url.to_string();
@@ -41,10 +74,22 @@ pub fn open_with(url: &str, app: &str) {
         let args: &[&str] = &["/usr/bin/open", "-a", &app, &url];
 
         #[cfg(not(target_os = "macos"))]
-        let args: &[&str] = &[&app, &url];
+        let mut cmd = if let Some(desktop_id) = app.strip_prefix("desktop:") {
+            let mut cmd = std::process::Command::new("gtk-launch");
+            cmd.arg(desktop_id).arg(&url);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new(&app);
+            cmd.arg(&url);
+            cmd
+        };
 
-        let mut cmd = std::process::Command::new(args[0]);
-        cmd.args(&args[1..]);
+        #[cfg(target_os = "macos")]
+        let mut cmd = {
+            let mut cmd = std::process::Command::new(args[0]);
+            cmd.args(&args[1..]);
+            cmd
+        };
 
         if let Ok(status) = cmd.status() {
             if status.success() {
@@ -133,4 +178,301 @@ pub fn open_with(url: &str, app: &str) {
 #[cfg(windows)]
 pub fn reveal_path(path: &std::path::Path) {
     shell_execute(path.to_string_lossy().to_string(), None);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
+    use core_foundation::array::{CFArray, CFArrayRef};
+    use core_foundation::base::TCFType;
+    use core_foundation::bundle::CFBundle;
+    use core_foundation::string::{CFString, CFStringRef};
+    use core_foundation::url::{kCFURLPOSIXPathStyle, CFURLRef, CFURL};
+    use core_foundation_sys::base::CFTypeRef;
+    use core_foundation_sys::error::CFErrorRef;
+
+    #[link(name = "CoreServices", kind = "framework")]
+    extern "C" {
+        fn LSCopyApplicationURLsForURL(url: CFURLRef, roles: u32) -> CFArrayRef;
+        fn LSCopyDefaultApplicationURLForURL(
+            url: CFURLRef,
+            roles: u32,
+            out_error: *mut CFErrorRef,
+        ) -> CFURLRef;
+    }
+
+    const K_LS_ROLES_ALL: u32 = 0xffff_ffff;
+
+    fn app_display_name(app_url: &CFURL) -> Option<String> {
+        let bundle = CFBundle::new(app_url.clone())?;
+        let info = bundle.info_dictionary();
+        for key in ["CFBundleDisplayName", "CFBundleName"] {
+            let key = CFString::new(key);
+            if let Some(value) = info.find(&key) {
+                let name =
+                    unsafe { CFString::wrap_under_get_rule(value.as_CFTypeRef() as CFStringRef) };
+                let name = name.to_string();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+
+    let Some(file_url) = CFURL::from_path(path, path.is_dir()) else {
+        return Vec::new();
+    };
+
+    let default_app_path = unsafe {
+        let default_ref = LSCopyDefaultApplicationURLForURL(
+            file_url.as_concrete_TypeRef(),
+            K_LS_ROLES_ALL,
+            std::ptr::null_mut(),
+        );
+        (!default_ref.is_null()).then(|| {
+            CFURL::wrap_under_create_rule(default_ref)
+                .get_file_system_path(kCFURLPOSIXPathStyle)
+                .to_string()
+        })
+    };
+
+    let mut candidates: Vec<OpenWithCandidate> = Vec::new();
+    let array_ref =
+        unsafe { LSCopyApplicationURLsForURL(file_url.as_concrete_TypeRef(), K_LS_ROLES_ALL) };
+    if !array_ref.is_null() {
+        let array: CFArray<CFTypeRef> = unsafe { TCFType::wrap_under_create_rule(array_ref) };
+        for value in array.get_all_values() {
+            if value.is_null() {
+                continue;
+            }
+
+            let app_url = unsafe { CFURL::wrap_under_get_rule(value as CFURLRef) };
+            let app_path = app_url
+                .get_file_system_path(kCFURLPOSIXPathStyle)
+                .to_string();
+            if app_path.is_empty() || candidates.iter().any(|candidate| candidate.id == app_path) {
+                continue;
+            }
+
+            let label = app_display_name(&app_url)
+                .or_else(|| {
+                    Path::new(&app_path)
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().to_string())
+                })
+                .unwrap_or_else(|| app_path.clone());
+            candidates.push(OpenWithCandidate {
+                is_default: default_app_path.as_deref() == Some(app_path.as_str()),
+                id: app_path,
+                label,
+                icon_path: None,
+            });
+        }
+    }
+
+    if let Some(default_app_path) = default_app_path {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.id == default_app_path)
+        {
+            let label = Path::new(&default_app_path)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| default_app_path.clone());
+            candidates.push(OpenWithCandidate {
+                is_default: true,
+                id: default_app_path,
+                label,
+                icon_path: None,
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+    });
+    candidates.truncate(20);
+    candidates
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn linux_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
+    let Some(mime) = xdg_mime_type(path) else {
+        return Vec::new();
+    };
+
+    let default_desktop_id = xdg_default_desktop_id(&mime);
+    let mut desktop_ids = Vec::new();
+    if let Some(default_id) = default_desktop_id.clone() {
+        desktop_ids.push(default_id);
+    }
+    desktop_ids.extend(xdg_associated_desktop_ids(&mime));
+    desktop_ids.sort();
+    desktop_ids.dedup();
+    if let Some(default_id) = default_desktop_id.as_deref() {
+        desktop_ids.sort_by(|a, b| {
+            (a.as_str() != default_id)
+                .cmp(&(b.as_str() != default_id))
+                .then_with(|| a.cmp(b))
+        });
+    }
+
+    desktop_ids
+        .into_iter()
+        .take(20)
+        .filter_map(|desktop_id| {
+            let desktop = find_desktop_file(&desktop_id)?;
+            let label = desktop_name(&desktop).unwrap_or_else(|| desktop_id.clone());
+            Some(OpenWithCandidate {
+                is_default: default_desktop_id.as_deref() == Some(desktop_id.as_str()),
+                id: format!("desktop:{desktop_id}"),
+                label,
+                icon_path: None,
+            })
+        })
+        .collect()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn xdg_mime_type(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("xdg-mime")
+        .arg("query")
+        .arg("filetype")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mime = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!mime.is_empty()).then_some(mime)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn xdg_default_desktop_id(mime: &str) -> Option<String> {
+    let output = std::process::Command::new("xdg-mime")
+        .arg("query")
+        .arg("default")
+        .arg(mime)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let desktop_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!desktop_id.is_empty()).then_some(desktop_id)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn xdg_associated_desktop_ids(mime: &str) -> Vec<String> {
+    xdg_mimeapps_files()
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|contents| desktop_ids_for_mimeapps(&contents, mime))
+        .collect()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn desktop_ids_for_mimeapps(contents: &str, mime: &str) -> Vec<String> {
+    let mut in_interesting_section = false;
+    let mut ids = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_interesting_section = matches!(
+                line,
+                "[Default Applications]" | "[Added Associations]" | "[MIME Cache]"
+            );
+            continue;
+        }
+        if !in_interesting_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key != mime {
+            continue;
+        }
+        ids.extend(
+            value
+                .split(';')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+        );
+    }
+    ids
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn xdg_mimeapps_files() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        paths.push(PathBuf::from(config_home).join("mimeapps.list"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".config/mimeapps.list"));
+    }
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        paths.push(PathBuf::from(data_home).join("applications/mimeapps.list"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".local/share/applications/mimeapps.list"));
+    }
+    paths.extend(
+        std::env::var_os("XDG_DATA_DIRS")
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .map(|path| path.join("applications/mimeapps.list"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    PathBuf::from("/usr/local/share/applications/mimeapps.list"),
+                    PathBuf::from("/usr/share/applications/mimeapps.list"),
+                ]
+            }),
+    );
+    paths
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn find_desktop_file(desktop_id: &str) -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        roots.push(PathBuf::from(data_home).join("applications"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join(".local/share/applications"));
+    }
+    if let Some(data_dirs) = std::env::var_os("XDG_DATA_DIRS") {
+        roots.extend(std::env::split_paths(&data_dirs).map(|path| path.join("applications")));
+    } else {
+        roots.push(PathBuf::from("/usr/local/share/applications"));
+        roots.push(PathBuf::from("/usr/share/applications"));
+    }
+
+    for root in roots {
+        let direct = root.join(desktop_id);
+        if direct.exists() {
+            return Some(direct);
+        }
+        let nested = root.join(desktop_id.replace('-', "/"));
+        if nested.exists() {
+            return Some(nested);
+        }
+    }
+    None
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn desktop_name(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|raw_line| {
+        let line = raw_line.trim();
+        line.strip_prefix("Name=")
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    })
 }

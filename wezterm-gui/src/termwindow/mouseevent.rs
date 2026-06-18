@@ -552,6 +552,32 @@ impl super::TermWindow {
     }
 
     fn mouse_wheel_right_sidebar(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
+        if self.right_sidebar_mode == super::RightSidebarMode::Chat {
+            if let Some(rect) = self.right_sidebar_file_preview_rect() {
+                let x = event.coords.x;
+                let y = event.coords.y;
+                if x >= rect.x as isize
+                    && x < rect.x.saturating_add(rect.width) as isize
+                    && y >= rect.y as isize
+                    && y < rect.y.saturating_add(rect.height) as isize
+                {
+                    let changed = match event.kind {
+                        WMEK::VertWheel(amount) if amount != 0 => {
+                            self.scroll_right_sidebar_file_preview(amount)
+                        }
+                        WMEK::HorzWheel(amount) if amount != 0 => {
+                            self.scroll_right_sidebar_file_preview_horizontal(amount)
+                        }
+                        WMEK::VertWheel(_) | WMEK::HorzWheel(_) => false,
+                        _ => return false,
+                    };
+                    let _ = changed;
+                    context.invalidate();
+                    return true;
+                }
+            }
+        }
+
         let Some(rect) = self.right_sidebar_rect() else {
             return false;
         };
@@ -575,8 +601,12 @@ impl super::TermWindow {
             return true;
         }
 
-        self.show_right_sidebar_snippet_scrollbar();
-        self.scroll_right_sidebar_snippets(amount);
+        if self.right_sidebar_mode == super::RightSidebarMode::Chat {
+            self.scroll_right_sidebar_files(amount);
+        } else {
+            self.show_right_sidebar_snippet_scrollbar();
+            self.scroll_right_sidebar_snippets(amount);
+        }
         context.invalidate();
         true
     }
@@ -620,6 +650,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarMode(_)
             | UIItemType::RightSidebarBackground
             | UIItemType::RightSidebarResize
+            | UIItemType::RightSidebarFilePreviewResize
             | UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -632,6 +663,18 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_)
             | UIItemType::RightSidebarSnippetScrollTrack
             | UIItemType::RightSidebarSnippetScrollThumb
+            | UIItemType::RightSidebarFilePreviewScrollTrack
+            | UIItemType::RightSidebarFilePreviewScrollThumb
+            | UIItemType::RightSidebarFilePreviewHorizontalScrollTrack
+            | UIItemType::RightSidebarFilePreviewHorizontalScrollThumb
+            | UIItemType::RightSidebarFilePreviewText
+            | UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarFileRow(_)
+            | UIItemType::RightSidebarFileBack
+            | UIItemType::RightSidebarFileOpen
+            | UIItemType::RightSidebarFileOpenMenu
+            | UIItemType::RightSidebarFileReveal
+            | UIItemType::RightSidebarFileCopyText
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::AboveScrollThumb
@@ -669,6 +712,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarMode(_)
             | UIItemType::RightSidebarBackground
             | UIItemType::RightSidebarResize
+            | UIItemType::RightSidebarFilePreviewResize
             | UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -681,6 +725,18 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_)
             | UIItemType::RightSidebarSnippetScrollTrack
             | UIItemType::RightSidebarSnippetScrollThumb
+            | UIItemType::RightSidebarFilePreviewScrollTrack
+            | UIItemType::RightSidebarFilePreviewScrollThumb
+            | UIItemType::RightSidebarFilePreviewHorizontalScrollTrack
+            | UIItemType::RightSidebarFilePreviewHorizontalScrollThumb
+            | UIItemType::RightSidebarFilePreviewText
+            | UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarFileRow(_)
+            | UIItemType::RightSidebarFileBack
+            | UIItemType::RightSidebarFileOpen
+            | UIItemType::RightSidebarFileOpenMenu
+            | UIItemType::RightSidebarFileReveal
+            | UIItemType::RightSidebarFileCopyText
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::AboveScrollThumb
@@ -866,17 +922,37 @@ impl super::TermWindow {
                     }) {
                         self.persist_workspace_sidebar_width();
                     }
-                    if completed_drag
-                        .as_ref()
-                        .is_some_and(|(item, _)| item.item_type == UIItemType::RightSidebarResize)
-                    {
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::RightSidebarResize
+                            && self.right_sidebar_file_preview_rect().is_none()
+                    }) {
                         self.persist_right_sidebar_width();
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::RightSidebarResize
+                            && self.right_sidebar_file_preview_rect().is_some()
+                    }) {
+                        self.persist_right_sidebar_file_preview_width();
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::RightSidebarFilePreviewResize
+                    }) {
+                        self.persist_right_sidebar_file_preview_width();
                     }
                     if completed_drag
                         .as_ref()
                         .is_some_and(|(item, _)| matches!(item.item_type, UIItemType::Split(_)))
                     {
                         self.persist_workspace_layout_after_mutation("split drag released");
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::RightSidebarFilePreviewText
+                    }) {
+                        self.update_right_sidebar_file_preview_selection(
+                            event.coords.x,
+                            event.coords.y,
+                        );
+                        context.invalidate();
                     }
                     if completed_drag.is_some() {
                         // Completed a drag
@@ -1004,7 +1080,7 @@ impl super::TermWindow {
                 return;
             };
             if event.kind == WMEK::Press(MousePress::Left) && self.right_sidebar_has_text_focus() {
-                self.right_sidebar_snippet_focus = None;
+                self.clear_right_sidebar_text_focus();
                 context.invalidate();
             }
             self.mouse_event_terminal(
@@ -1188,6 +1264,96 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
+    fn set_right_sidebar_file_preview_scroll_from_thumb_top(
+        &mut self,
+        thumb_top: f32,
+        context: &dyn WindowOps,
+    ) {
+        let Some(scroll) = self.right_sidebar_file_preview_scroll_geometry() else {
+            return;
+        };
+        let travel = (scroll.track_height as f32 - scroll.thumb_height).max(1.0);
+        let relative_top = (thumb_top - scroll.track_y as f32).clamp(0.0, travel);
+        let offset = (relative_top / travel * scroll.max_scroll).clamp(0.0, scroll.max_scroll);
+        if (offset - self.right_sidebar_file_preview_scroll_offset).abs() > f32::EPSILON {
+            self.right_sidebar_file_preview_scroll_offset = offset;
+        }
+        context.invalidate();
+    }
+
+    fn drag_right_sidebar_file_preview_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let from_top = start_event.coords.y.saturating_sub(item.y as isize) as f32;
+        let thumb_top = event.coords.y as f32 - from_top;
+        self.set_right_sidebar_file_preview_scroll_from_thumb_top(thumb_top, context);
+        context.set_cursor(Some(MouseCursor::Hand));
+        self.dragging.replace((item, start_event));
+    }
+
+    fn set_right_sidebar_file_preview_horizontal_scroll_from_thumb_left(
+        &mut self,
+        thumb_left: f32,
+        context: &dyn WindowOps,
+    ) {
+        let Some(scroll) = self.right_sidebar_file_preview_horizontal_scroll_geometry() else {
+            return;
+        };
+        let travel = (scroll.track_width as f32 - scroll.thumb_width).max(1.0);
+        let relative_left = (thumb_left - scroll.track_x as f32).clamp(0.0, travel);
+        let offset = (relative_left / travel * scroll.max_scroll as f32)
+            .round()
+            .clamp(0.0, scroll.max_scroll as f32) as usize;
+        if offset != self.right_sidebar_file_preview_horizontal_offset {
+            self.right_sidebar_file_preview_horizontal_offset = offset;
+        }
+        context.invalidate();
+    }
+
+    fn drag_right_sidebar_file_preview_horizontal_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let from_left = start_event.coords.x.saturating_sub(item.x as isize) as f32;
+        let thumb_left = event.coords.x as f32 - from_left;
+        self.set_right_sidebar_file_preview_horizontal_scroll_from_thumb_left(thumb_left, context);
+        context.set_cursor(Some(MouseCursor::Hand));
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drag_right_sidebar_file_preview_text_selection(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        self.update_right_sidebar_file_preview_selection(event.coords.x, event.coords.y);
+        context.set_cursor(Some(MouseCursor::Text));
+        context.invalidate();
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drag_right_sidebar_input_selection(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        self.position_right_sidebar_input_caret(&item.item_type, event.coords.x, true);
+        context.set_cursor(Some(MouseCursor::Text));
+        context.invalidate();
+        self.dragging.replace((item, start_event));
+    }
+
     fn drag_ui_item(
         &mut self,
         item: UIItem,
@@ -1210,8 +1376,40 @@ impl super::TermWindow {
             UIItemType::RightSidebarResize => {
                 self.drag_right_sidebar_resize(item, start_event, event, context);
             }
+            UIItemType::RightSidebarFilePreviewResize => {
+                self.drag_right_sidebar_file_preview_resize(item, start_event, event, context);
+            }
             UIItemType::RightSidebarSnippetScrollThumb => {
                 self.drag_right_sidebar_snippet_scroll_thumb(item, start_event, event, context);
+            }
+            UIItemType::RightSidebarFilePreviewScrollThumb => {
+                self.drag_right_sidebar_file_preview_scroll_thumb(
+                    item,
+                    start_event,
+                    event,
+                    context,
+                );
+            }
+            UIItemType::RightSidebarFilePreviewHorizontalScrollThumb => {
+                self.drag_right_sidebar_file_preview_horizontal_scroll_thumb(
+                    item,
+                    start_event,
+                    event,
+                    context,
+                );
+            }
+            UIItemType::RightSidebarFilePreviewText => {
+                self.drag_right_sidebar_file_preview_text_selection(
+                    item,
+                    start_event,
+                    event,
+                    context,
+                );
+            }
+            UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarSnippetSearch
+            | UIItemType::RightSidebarSnippetTitle => {
+                self.drag_right_sidebar_input_selection(item, start_event, event, context);
             }
             UIItemType::WorkspaceSidebarScrollThumb => {
                 self.drag_workspace_sidebar_scroll_thumb(item, start_event, event, context);
@@ -1253,8 +1451,26 @@ impl super::TermWindow {
                 .saturating_sub(self.get_os_border().right.get() as usize) as isize;
         let width = right_edge.saturating_sub(event.coords.x).max(0) as usize;
         self.expand_right_sidebar();
-        self.set_right_sidebar_width(width);
+        if self.right_sidebar_file_preview_rect().is_some() {
+            self.set_right_sidebar_file_preview_total_width(width);
+        } else {
+            self.set_right_sidebar_width(width);
+        }
         self.reflow_right_sidebar(context);
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drag_right_sidebar_file_preview_resize(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if self.set_right_sidebar_file_preview_split_x(event.coords.x) {
+            context.invalidate();
+        }
         context.set_cursor(Some(MouseCursor::SizeLeftRight));
         self.dragging.replace((item, start_event));
     }
@@ -1355,18 +1571,40 @@ impl super::TermWindow {
             UIItemType::RightSidebarBackground => {
                 context.set_cursor(Some(MouseCursor::Arrow));
                 if event.kind == WMEK::Press(MousePress::Left) {
-                    self.right_sidebar_snippet_focus = None;
+                    self.clear_right_sidebar_text_focus();
                     context.invalidate();
                 }
             }
             UIItemType::RightSidebarResize => {
                 self.mouse_event_right_sidebar_resize(item, event, context);
             }
+            UIItemType::RightSidebarFilePreviewResize => {
+                self.mouse_event_right_sidebar_file_preview_resize(item, event, context);
+            }
             UIItemType::RightSidebarSnippetScrollTrack => {
                 self.mouse_event_right_sidebar_snippet_scroll_track(item, event, context);
             }
             UIItemType::RightSidebarSnippetScrollThumb => {
                 self.mouse_event_right_sidebar_snippet_scroll_thumb(item, event, context);
+            }
+            UIItemType::RightSidebarFilePreviewScrollTrack => {
+                self.mouse_event_right_sidebar_file_preview_scroll_track(item, event, context);
+            }
+            UIItemType::RightSidebarFilePreviewScrollThumb => {
+                self.mouse_event_right_sidebar_file_preview_scroll_thumb(item, event, context);
+            }
+            UIItemType::RightSidebarFilePreviewHorizontalScrollTrack => {
+                self.mouse_event_right_sidebar_file_preview_horizontal_scroll_track(
+                    item, event, context,
+                );
+            }
+            UIItemType::RightSidebarFilePreviewHorizontalScrollThumb => {
+                self.mouse_event_right_sidebar_file_preview_horizontal_scroll_thumb(
+                    item, event, context,
+                );
+            }
+            UIItemType::RightSidebarFilePreviewText => {
+                self.mouse_event_right_sidebar_file_preview_text(item, event, context);
             }
             UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
@@ -1378,7 +1616,16 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetPaste(_)
             | UIItemType::RightSidebarSnippetRun(_)
             | UIItemType::RightSidebarSnippetDelete(_) => {
-                self.mouse_event_right_sidebar_snippet(item.item_type.clone(), event, context);
+                self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
+            }
+            UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarFileRow(_)
+            | UIItemType::RightSidebarFileBack
+            | UIItemType::RightSidebarFileOpen
+            | UIItemType::RightSidebarFileOpenMenu
+            | UIItemType::RightSidebarFileReveal
+            | UIItemType::RightSidebarFileCopyText => {
+                self.mouse_event_right_sidebar_file(item.clone(), event, context);
             }
             UIItemType::WorkspaceSidebarSettings => {
                 self.mouse_event_workspace_sidebar_settings(event, context);
@@ -1498,18 +1745,40 @@ impl super::TermWindow {
             UIItemType::RightSidebarBackground => {
                 context.set_cursor(Some(MouseCursor::Arrow));
                 if event.kind == WMEK::Press(MousePress::Left) {
-                    self.right_sidebar_snippet_focus = None;
+                    self.clear_right_sidebar_text_focus();
                     context.invalidate();
                 }
             }
             UIItemType::RightSidebarResize => {
                 self.mouse_event_right_sidebar_resize(item, event, context);
             }
+            UIItemType::RightSidebarFilePreviewResize => {
+                self.mouse_event_right_sidebar_file_preview_resize(item, event, context);
+            }
             UIItemType::RightSidebarSnippetScrollTrack => {
                 self.mouse_event_right_sidebar_snippet_scroll_track(item, event, context);
             }
             UIItemType::RightSidebarSnippetScrollThumb => {
                 self.mouse_event_right_sidebar_snippet_scroll_thumb(item, event, context);
+            }
+            UIItemType::RightSidebarFilePreviewScrollTrack => {
+                self.mouse_event_right_sidebar_file_preview_scroll_track(item, event, context);
+            }
+            UIItemType::RightSidebarFilePreviewScrollThumb => {
+                self.mouse_event_right_sidebar_file_preview_scroll_thumb(item, event, context);
+            }
+            UIItemType::RightSidebarFilePreviewHorizontalScrollTrack => {
+                self.mouse_event_right_sidebar_file_preview_horizontal_scroll_track(
+                    item, event, context,
+                );
+            }
+            UIItemType::RightSidebarFilePreviewHorizontalScrollThumb => {
+                self.mouse_event_right_sidebar_file_preview_horizontal_scroll_thumb(
+                    item, event, context,
+                );
+            }
+            UIItemType::RightSidebarFilePreviewText => {
+                self.mouse_event_right_sidebar_file_preview_text(item, event, context);
             }
             UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
@@ -1521,7 +1790,16 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetPaste(_)
             | UIItemType::RightSidebarSnippetRun(_)
             | UIItemType::RightSidebarSnippetDelete(_) => {
-                self.mouse_event_right_sidebar_snippet(item.item_type.clone(), event, context);
+                self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
+            }
+            UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarFileRow(_)
+            | UIItemType::RightSidebarFileBack
+            | UIItemType::RightSidebarFileOpen
+            | UIItemType::RightSidebarFileOpenMenu
+            | UIItemType::RightSidebarFileReveal
+            | UIItemType::RightSidebarFileCopyText => {
+                self.mouse_event_right_sidebar_file(item.clone(), event, context);
             }
             UIItemType::ContentViewClose(id) => {
                 context.set_cursor(Some(MouseCursor::Hand));
@@ -1559,6 +1837,18 @@ impl super::TermWindow {
             self.apply_dimensions(&dimensions, None, &window);
         }
         context.invalidate();
+    }
+
+    fn invalidate_or_reflow_right_sidebar(
+        &mut self,
+        previous_width: usize,
+        context: &dyn WindowOps,
+    ) {
+        if self.right_sidebar_width() != previous_width {
+            self.reflow_right_sidebar(context);
+        } else {
+            context.invalidate();
+        }
     }
 
     pub fn mouse_event_workspace_sidebar_resize(
@@ -1640,6 +1930,18 @@ impl super::TermWindow {
         }
     }
 
+    pub fn mouse_event_right_sidebar_file_preview_resize(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
     pub fn mouse_event_right_sidebar_snippet_scroll_thumb(
         &mut self,
         item: UIItem,
@@ -1671,6 +1973,88 @@ impl super::TermWindow {
         }
     }
 
+    pub fn mouse_event_right_sidebar_file_preview_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_file_preview_scroll_track(
+        &mut self,
+        _item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            if let Some(scroll) = self.right_sidebar_file_preview_scroll_geometry() {
+                let thumb_top = event.coords.y as f32 - scroll.thumb_height / 2.0;
+                self.set_right_sidebar_file_preview_scroll_from_thumb_top(thumb_top, context);
+            }
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_file_preview_horizontal_scroll_thumb(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_file_preview_horizontal_scroll_track(
+        &mut self,
+        _item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            if let Some(scroll) = self.right_sidebar_file_preview_horizontal_scroll_geometry() {
+                let thumb_left = event.coords.x as f32 - scroll.thumb_width / 2.0;
+                self.set_right_sidebar_file_preview_horizontal_scroll_from_thumb_left(
+                    thumb_left, context,
+                );
+            }
+            context.invalidate();
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_file_preview_text(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Text));
+        match event.kind {
+            WMEK::Press(MousePress::Left)
+                if self
+                    .begin_right_sidebar_file_preview_selection(event.coords.x, event.coords.y) =>
+            {
+                self.dragging.replace((item, event));
+                context.invalidate();
+            }
+            WMEK::Press(MousePress::Right) => {
+                self.show_right_sidebar_file_open_with_menu(context, event.coords);
+            }
+            _ => {}
+        }
+    }
+
     pub fn mouse_event_right_sidebar_toggle(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
@@ -1687,48 +2071,171 @@ impl super::TermWindow {
     ) {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
+            let previous_width = self.right_sidebar_width();
             self.right_sidebar_mode = mode;
-            context.invalidate();
+            self.invalidate_or_reflow_right_sidebar(previous_width, context);
         }
     }
 
     pub fn mouse_event_right_sidebar_snippet(
         &mut self,
-        item_type: UIItemType,
+        item: UIItem,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        context.set_cursor(Some(MouseCursor::Hand));
+        let item_type = item.item_type.clone();
+        let is_input = matches!(
+            item_type,
+            UIItemType::RightSidebarSnippetSearch
+                | UIItemType::RightSidebarSnippetTitle
+                | UIItemType::RightSidebarSnippetBody
+        );
+        context.set_cursor(Some(if is_input {
+            MouseCursor::Text
+        } else {
+            MouseCursor::Hand
+        }));
         if event.kind != WMEK::Press(MousePress::Left) {
             return;
         }
 
+        let double_click = self
+            .last_mouse_click
+            .as_ref()
+            .is_some_and(|c| c.streak >= 2);
         match item_type {
-            UIItemType::RightSidebarSnippetNew => self.open_new_snippet_editor(),
+            UIItemType::RightSidebarSnippetNew => {
+                self.clear_right_sidebar_text_focus();
+                self.open_new_snippet_editor();
+            }
             UIItemType::RightSidebarSnippetBack => self.close_snippet_editor(),
             UIItemType::RightSidebarSnippetSave => self.save_snippet_editor(),
             UIItemType::RightSidebarSnippetSearch => {
                 self.right_sidebar_snippet_focus = Some(super::RightSidebarSnippetField::Search);
+                if double_click {
+                    self.right_sidebar_snippet_search.caret_select_all();
+                } else {
+                    self.position_right_sidebar_input_caret(
+                        &UIItemType::RightSidebarSnippetSearch,
+                        event.coords.x,
+                        false,
+                    );
+                    self.dragging.replace((item, event));
+                }
             }
             UIItemType::RightSidebarSnippetTitle => {
                 self.right_sidebar_snippet_focus = Some(super::RightSidebarSnippetField::Title);
+                if double_click {
+                    self.right_sidebar_snippet_title.caret_select_all();
+                } else {
+                    self.position_right_sidebar_input_caret(
+                        &UIItemType::RightSidebarSnippetTitle,
+                        event.coords.x,
+                        false,
+                    );
+                    self.dragging.replace((item, event));
+                }
             }
             UIItemType::RightSidebarSnippetBody => {
                 self.right_sidebar_snippet_focus = Some(super::RightSidebarSnippetField::Body);
+                if double_click {
+                    self.right_sidebar_snippet_body.caret_select_all();
+                }
             }
-            UIItemType::RightSidebarSnippetEdit(id) => self.open_existing_snippet_editor(&id),
+            UIItemType::RightSidebarSnippetEdit(id) => {
+                self.clear_right_sidebar_text_focus();
+                self.open_existing_snippet_editor(&id);
+            }
             UIItemType::RightSidebarSnippetPaste(id) => {
-                self.right_sidebar_snippet_focus = None;
+                self.clear_right_sidebar_text_focus();
                 self.paste_snippet_to_active_pane(&id, false);
             }
             UIItemType::RightSidebarSnippetRun(id) => {
-                self.right_sidebar_snippet_focus = None;
+                self.clear_right_sidebar_text_focus();
                 self.paste_snippet_to_active_pane(&id, true);
             }
             UIItemType::RightSidebarSnippetDelete(id) => self.delete_snippet(&id),
             _ => {}
         }
         context.invalidate();
+    }
+
+    pub fn mouse_event_right_sidebar_file(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let item_type = item.item_type.clone();
+        let is_input = matches!(item_type, UIItemType::RightSidebarFileFilter);
+        context.set_cursor(Some(if is_input {
+            MouseCursor::Text
+        } else {
+            MouseCursor::Hand
+        }));
+        if !matches!(
+            event.kind,
+            WMEK::Press(MousePress::Left) | WMEK::Press(MousePress::Right)
+        ) {
+            return;
+        }
+
+        let previous_width = self.right_sidebar_width();
+        match (item_type, event.kind.clone()) {
+            (UIItemType::RightSidebarFileFilter, WMEK::Press(MousePress::Left)) => {
+                self.right_sidebar_file_focus = Some(super::RightSidebarFileField::Filter);
+                let double_click = self
+                    .last_mouse_click
+                    .as_ref()
+                    .is_some_and(|c| c.streak >= 2);
+                if double_click {
+                    self.right_sidebar_file_filter.caret_select_all();
+                } else {
+                    self.position_right_sidebar_input_caret(
+                        &UIItemType::RightSidebarFileFilter,
+                        event.coords.x,
+                        false,
+                    );
+                    self.dragging.replace((item, event));
+                }
+            }
+            (UIItemType::RightSidebarFileRow(path), WMEK::Press(MousePress::Left)) => {
+                self.clear_right_sidebar_text_focus();
+                self.open_right_sidebar_file_path(path);
+            }
+            (UIItemType::RightSidebarFileRow(path), WMEK::Press(MousePress::Right)) => {
+                self.clear_right_sidebar_text_focus();
+                self.right_sidebar_file_selected = Some(path);
+                self.show_right_sidebar_file_open_with_menu(context, event.coords);
+            }
+            (UIItemType::RightSidebarFileBack, WMEK::Press(MousePress::Left)) => {
+                self.clear_right_sidebar_text_focus();
+                self.close_right_sidebar_file_preview();
+            }
+            (UIItemType::RightSidebarFileOpen, WMEK::Press(MousePress::Left)) => {
+                self.clear_right_sidebar_text_focus();
+                self.open_right_sidebar_selected_file_with_current_app();
+            }
+            (UIItemType::RightSidebarFileOpenMenu, WMEK::Press(MousePress::Left))
+            | (UIItemType::RightSidebarFileOpenMenu, WMEK::Press(MousePress::Right)) => {
+                self.clear_right_sidebar_text_focus();
+                let coords = window::Point::new(
+                    item.x as isize,
+                    item.y.saturating_add(item.height) as isize,
+                );
+                self.show_right_sidebar_file_open_with_menu(context, coords);
+            }
+            (UIItemType::RightSidebarFileReveal, WMEK::Press(MousePress::Left)) => {
+                self.clear_right_sidebar_text_focus();
+                self.reveal_right_sidebar_selected_file();
+            }
+            (UIItemType::RightSidebarFileCopyText, WMEK::Press(MousePress::Left)) => {
+                self.clear_right_sidebar_text_focus();
+                self.copy_right_sidebar_selected_file_preview_text()
+            }
+            _ => {}
+        }
+        self.invalidate_or_reflow_right_sidebar(previous_width, context);
     }
 
     pub fn mouse_event_workspace_sidebar_settings(

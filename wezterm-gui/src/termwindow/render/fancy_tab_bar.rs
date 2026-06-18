@@ -1117,12 +1117,28 @@ impl crate::TermWindow {
         width: usize,
         foreground: LinearRgba,
     ) -> anyhow::Result<()> {
+        self.paint_ui_title_text_with_advance(layers, font, metrics, text, x, y, width, foreground)
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_ui_title_text_with_advance(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        text: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<f32> {
         if text.is_empty() || width == 0 {
-            return Ok(());
+            return Ok(0.0);
         }
 
         let Some(window) = self.window.as_ref().cloned() else {
-            return Ok(());
+            return Ok(0.0);
         };
         let gl_state = self.render_state.as_ref().unwrap();
         let infos = font.shape(
@@ -1205,6 +1221,139 @@ impl crate::TermWindow {
                 quad.set_texture(texture.texture_coords());
                 quad.set_fg_color(foreground);
                 quad.set_alt_color_and_mix_value(foreground, 0.0);
+                quad.set_has_color(glyph.has_color);
+                quad.set_hsv(None);
+            }
+
+            x_pos += advance;
+        }
+
+        Ok((x_pos - x as f32).max(0.0))
+    }
+
+    /// Like `paint_ui_title_text_with_advance`, but colours each glyph from a
+    /// per-character colour list. The whole string is shaped **once** instead of
+    /// once per coloured span; that is what keeps the file preview smooth while
+    /// scrolling syntax-highlighted code (the shaper does not cache results).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_ui_colored_text(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        text: &str,
+        char_colors: &[LinearRgba],
+        default_color: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+    ) -> anyhow::Result<()> {
+        if text.is_empty() || width == 0 {
+            return Ok(());
+        }
+
+        let Some(window) = self.window.as_ref().cloned() else {
+            return Ok(());
+        };
+        let gl_state = self.render_state.as_ref().unwrap();
+        let infos = font.shape(
+            text,
+            move || window.notify(TermWindowNotif::InvalidateShapeCache),
+            BlockKey::filter_out_synthetic,
+            None,
+            Direction::LeftToRight,
+            None,
+            None,
+        )?;
+
+        // Map each byte offset to its char index so a glyph's cluster can look
+        // up the colour of the character it came from.
+        let mut byte_to_char = vec![0usize; text.len() + 1];
+        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
+            for byte in byte_idx..byte_idx + ch.len_utf8() {
+                byte_to_char[byte] = char_idx;
+            }
+        }
+        if let Some(last) = byte_to_char.last_mut() {
+            *last = char_colors.len().saturating_sub(1);
+        }
+        let color_for = |cluster: usize| -> LinearRgba {
+            let char_idx = byte_to_char.get(cluster).copied().unwrap_or(0);
+            char_colors.get(char_idx).copied().unwrap_or(default_color)
+        };
+
+        let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
+        let left_offset = self.dimensions.pixel_width as f32 / -2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / -2.0;
+        let baseline = metrics.cell_size.height as f32 + metrics.descender.get() as f32;
+        let max_x = x as f32 + width as f32;
+        let mut x_pos = x as f32;
+        let y = y as f32;
+        let style = font.style();
+
+        for info in infos {
+            let cell_start = &text[info.cluster as usize..];
+            let mut iter = Graphemes::new(cell_start).peekable();
+            let Some(grapheme) = iter.next() else {
+                continue;
+            };
+            let color = color_for(info.cluster as usize);
+
+            if let Some(key) = BlockKey::from_str(grapheme) {
+                let advance = metrics.cell_size.width as f32;
+                if x_pos + advance > max_x {
+                    break;
+                }
+                let sprite = glyph_cache.cached_block(key, metrics)?;
+                let mut quad = layers.allocate(2)?;
+                quad.set_position(
+                    x_pos + left_offset,
+                    y + top_offset,
+                    x_pos + left_offset + advance,
+                    y + top_offset + metrics.cell_size.height as f32,
+                );
+                quad.set_texture(sprite.texture_coords());
+                quad.set_fg_color(color);
+                quad.set_alt_color_and_mix_value(color, 0.0);
+                quad.set_hsv(None);
+                x_pos += advance;
+                continue;
+            }
+
+            let next_grapheme = iter.peek().copied();
+            let followed_by_space = next_grapheme == Some(" ");
+            let num_cells = grapheme_column_width(grapheme, None).max(1) as u8;
+            let glyph = glyph_cache.cached_glyph(
+                &info,
+                &style,
+                followed_by_space,
+                font,
+                metrics,
+                num_cells,
+            )?;
+            let advance = glyph.x_advance.get() as f32;
+            if x_pos + advance > max_x {
+                break;
+            }
+
+            if let Some(texture) = glyph.texture.as_ref() {
+                let glyph_x = x_pos + (glyph.x_offset + glyph.bearing_x).get() as f32;
+                let glyph_y = y - (glyph.y_offset + glyph.bearing_y).get() as f32 + baseline;
+                let glyph_width = texture.coords.size.width as f32 * glyph.scale as f32;
+                let glyph_height = texture.coords.size.height as f32 * glyph.scale as f32;
+                if glyph_x + glyph_width > max_x {
+                    break;
+                }
+                let mut quad = layers.allocate(2)?;
+                quad.set_position(
+                    glyph_x + left_offset,
+                    glyph_y + top_offset,
+                    glyph_x + left_offset + glyph_width,
+                    glyph_y + top_offset + glyph_height,
+                );
+                quad.set_texture(texture.texture_coords());
+                quad.set_fg_color(color);
+                quad.set_alt_color_and_mix_value(color, 0.0);
                 quad.set_has_color(glyph.has_color);
                 quad.set_hsv(None);
             }

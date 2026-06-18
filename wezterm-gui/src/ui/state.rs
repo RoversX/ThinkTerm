@@ -70,7 +70,15 @@ impl<A: Copy + PartialEq> Default for InteractionState<A> {
 #[derive(Debug, Clone)]
 pub(crate) struct TextInputState {
     pub text: String,
+    /// Cached "whole text selected" flag. Kept in sync by every mutator so the
+    /// simple consumers (settings window, widgets) can keep reading it, while
+    /// the sidebar uses the richer caret/selection model below.
     pub selected_all: bool,
+    /// Caret position as a char index in `0..=char_len()`.
+    pub cursor: usize,
+    /// When `Some`, there is a selection spanning `selection_anchor..cursor`
+    /// (char indices, either order).
+    pub selection_anchor: Option<usize>,
 }
 
 impl TextInputState {
@@ -78,8 +86,15 @@ impl TextInputState {
         Self {
             text: String::new(),
             selected_all: false,
+            cursor: 0,
+            selection_anchor: None,
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Legacy append-at-end API. The settings window prefills `.text` directly
+    // and never moves a caret, so these must keep their original behaviour.
+    // -----------------------------------------------------------------------
 
     pub(crate) fn push_text(&mut self, text: &str) {
         if self.selected_all {
@@ -87,6 +102,8 @@ impl TextInputState {
             self.selected_all = false;
         }
         self.text.extend(text.chars().filter(|ch| !ch.is_control()));
+        self.cursor = self.char_len();
+        self.selection_anchor = None;
     }
 
     pub(crate) fn backspace(&mut self) {
@@ -96,16 +113,22 @@ impl TextInputState {
         } else {
             self.text.pop();
         }
+        self.cursor = self.char_len();
+        self.selection_anchor = None;
     }
 
     pub(crate) fn clear(&mut self) {
         self.text.clear();
         self.selected_all = false;
+        self.cursor = 0;
+        self.selection_anchor = None;
     }
 
     pub(crate) fn take_selected_text(&mut self) -> Option<String> {
         if self.selected_all && !self.text.is_empty() {
             self.selected_all = false;
+            self.cursor = 0;
+            self.selection_anchor = None;
             Some(std::mem::take(&mut self.text))
         } else {
             None
@@ -118,6 +141,258 @@ impl TextInputState {
 
     pub(crate) fn select_all(&mut self) {
         self.selected_all = !self.text.is_empty();
+        if self.selected_all {
+            self.selection_anchor = Some(0);
+            self.cursor = self.char_len();
+        } else {
+            self.selection_anchor = None;
+            self.cursor = 0;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Caret/selection editor API (single-line sidebar inputs).
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn char_len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    pub(crate) fn byte_idx_for(&self, char_idx: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(char_idx)
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| self.text.len())
+    }
+
+    /// Replace the text and place the caret at the end (used when an editor is
+    /// pre-populated with existing content).
+    pub(crate) fn set_text_end(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.char_len();
+        self.selection_anchor = None;
+        self.selected_all = false;
+    }
+
+    fn sync_selected_all(&mut self) {
+        self.selected_all =
+            !self.text.is_empty() && self.caret_selection_range() == Some((0, self.char_len()));
+    }
+
+    pub(crate) fn clear_selection(&mut self) {
+        self.selected_all = false;
+        self.selection_anchor = None;
+    }
+
+    pub(crate) fn caret_selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            None
+        } else if anchor < self.cursor {
+            Some((anchor, self.cursor))
+        } else {
+            Some((self.cursor, anchor))
+        }
+    }
+
+    pub(crate) fn caret_selected_text(&self) -> Option<String> {
+        let (start, end) = self.caret_selection_range()?;
+        Some(self.text.chars().skip(start).take(end - start).collect())
+    }
+
+    pub(crate) fn caret_delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.caret_selection_range() else {
+            return false;
+        };
+        let start_byte = self.byte_idx_for(start);
+        let end_byte = self.byte_idx_for(end);
+        self.text.replace_range(start_byte..end_byte, "");
+        self.cursor = start;
+        self.selection_anchor = None;
+        self.selected_all = false;
+        true
+    }
+
+    pub(crate) fn caret_insert(&mut self, text: &str, allow_newline: bool) {
+        self.caret_delete_selection();
+        let len = self.char_len();
+        if self.cursor > len {
+            self.cursor = len;
+        }
+        let mut byte = self.byte_idx_for(self.cursor);
+        let mut inserted = 0usize;
+        for ch in text.chars() {
+            let keep = if ch == '\n' || ch == '\t' {
+                allow_newline
+            } else {
+                !ch.is_control()
+            };
+            if !keep {
+                continue;
+            }
+            self.text.insert(byte, ch);
+            byte += ch.len_utf8();
+            inserted += 1;
+        }
+        self.cursor += inserted;
+        self.selection_anchor = None;
+        self.selected_all = false;
+    }
+
+    pub(crate) fn caret_backspace(&mut self) {
+        if self.caret_delete_selection() {
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        let remove = self.cursor - 1;
+        let start_byte = self.byte_idx_for(remove);
+        let end_byte = self.byte_idx_for(self.cursor);
+        self.text.replace_range(start_byte..end_byte, "");
+        self.cursor = remove;
+        self.selected_all = false;
+    }
+
+    pub(crate) fn caret_delete_forward(&mut self) {
+        if self.caret_delete_selection() {
+            return;
+        }
+        let len = self.char_len();
+        if self.cursor >= len {
+            return;
+        }
+        let start_byte = self.byte_idx_for(self.cursor);
+        let end_byte = self.byte_idx_for(self.cursor + 1);
+        self.text.replace_range(start_byte..end_byte, "");
+        self.selected_all = false;
+    }
+
+    pub(crate) fn caret_set(&mut self, char_idx: usize, extend: bool) {
+        let target = char_idx.min(self.char_len());
+        if extend {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor);
+            }
+        } else {
+            self.selection_anchor = None;
+        }
+        self.cursor = target;
+        self.sync_selected_all();
+    }
+
+    pub(crate) fn caret_move_left(&mut self, extend: bool) {
+        if !extend {
+            if let Some((start, _)) = self.caret_selection_range() {
+                self.cursor = start;
+                self.selection_anchor = None;
+                self.selected_all = false;
+                return;
+            }
+        }
+        let target = self.cursor.saturating_sub(1);
+        self.caret_set(target, extend);
+    }
+
+    pub(crate) fn caret_move_right(&mut self, extend: bool) {
+        if !extend {
+            if let Some((_, end)) = self.caret_selection_range() {
+                self.cursor = end;
+                self.selection_anchor = None;
+                self.selected_all = false;
+                return;
+            }
+        }
+        let target = self.cursor.saturating_add(1).min(self.char_len());
+        self.caret_set(target, extend);
+    }
+
+    pub(crate) fn caret_move_home(&mut self, extend: bool) {
+        self.caret_set(0, extend);
+    }
+
+    pub(crate) fn caret_move_end(&mut self, extend: bool) {
+        self.caret_set(self.char_len(), extend);
+    }
+
+    pub(crate) fn caret_select_all(&mut self) {
+        if self.text.is_empty() {
+            self.selection_anchor = None;
+            self.cursor = 0;
+            self.selected_all = false;
+            return;
+        }
+        self.selection_anchor = Some(0);
+        self.cursor = self.char_len();
+        self.selected_all = true;
+    }
+
+    pub(crate) fn caret_take_selected_text(&mut self) -> Option<String> {
+        let text = self.caret_selected_text()?;
+        self.caret_delete_selection();
+        Some(text)
+    }
+
+    fn prev_word_boundary(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut idx = self.cursor.min(chars.len());
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        while idx > 0 && !chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        idx
+    }
+
+    fn next_word_boundary(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let len = chars.len();
+        let mut idx = self.cursor.min(len);
+        while idx < len && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        while idx < len && !chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        idx
+    }
+
+    pub(crate) fn caret_word_left(&mut self, extend: bool) {
+        let target = self.prev_word_boundary();
+        self.caret_set(target, extend);
+    }
+
+    pub(crate) fn caret_word_right(&mut self, extend: bool) {
+        let target = self.next_word_boundary();
+        self.caret_set(target, extend);
+    }
+
+    pub(crate) fn caret_delete_word_back(&mut self) {
+        if self.caret_delete_selection() {
+            return;
+        }
+        let target = self.prev_word_boundary();
+        if target < self.cursor {
+            let start_byte = self.byte_idx_for(target);
+            let end_byte = self.byte_idx_for(self.cursor);
+            self.text.replace_range(start_byte..end_byte, "");
+            self.cursor = target;
+        }
+        self.selected_all = false;
+    }
+
+    pub(crate) fn caret_delete_to_start(&mut self) {
+        if self.caret_delete_selection() {
+            return;
+        }
+        if self.cursor > 0 {
+            let end_byte = self.byte_idx_for(self.cursor);
+            self.text.replace_range(0..end_byte, "");
+            self.cursor = 0;
+        }
+        self.selected_all = false;
     }
 }
 
@@ -259,5 +534,114 @@ impl ResizablePaneState {
 
     pub(crate) fn set_width(&mut self, width: f32) {
         self.width = width.clamp(self.min_width, self.max_width);
+    }
+}
+
+#[cfg(test)]
+mod text_input_tests {
+    use super::TextInputState;
+
+    fn input(text: &str) -> TextInputState {
+        let mut input = TextInputState::new();
+        input.set_text_end(text.to_string());
+        input
+    }
+
+    #[test]
+    fn inserts_at_the_caret() {
+        let mut i = input("helloworld");
+        i.caret_set(5, false);
+        i.caret_insert(", ", false);
+        assert_eq!(i.text, "hello, world");
+        assert_eq!(i.cursor, 7);
+    }
+
+    #[test]
+    fn backspace_and_delete_forward_at_caret() {
+        let mut i = input("abc");
+        i.caret_set(2, false);
+        i.caret_backspace();
+        assert_eq!(i.text, "ac");
+        assert_eq!(i.cursor, 1);
+        i.caret_delete_forward();
+        assert_eq!(i.text, "a");
+        assert_eq!(i.cursor, 1);
+    }
+
+    #[test]
+    fn selection_is_replaced_on_insert() {
+        let mut i = input("hello world");
+        i.caret_set(0, false);
+        i.caret_set(5, true);
+        assert_eq!(i.caret_selected_text().as_deref(), Some("hello"));
+        i.caret_insert("hi", false);
+        assert_eq!(i.text, "hi world");
+        assert_eq!(i.cursor, 2);
+        assert!(i.caret_selection_range().is_none());
+    }
+
+    #[test]
+    fn clear_selection_drops_caret_selection() {
+        let mut i = input("hello world");
+        i.caret_set(0, false);
+        i.caret_set(5, true);
+        assert_eq!(i.caret_selection_range(), Some((0, 5)));
+
+        i.clear_selection();
+        assert!(!i.selected_all);
+        assert!(i.caret_selection_range().is_none());
+
+        i.caret_insert("hi", false);
+        assert_eq!(i.text, "hellohi world");
+    }
+
+    #[test]
+    fn plain_move_collapses_selection_to_an_edge() {
+        let mut i = input("abcd");
+        i.caret_set(1, false);
+        i.caret_set(3, true);
+        i.caret_move_left(false);
+        assert_eq!(i.cursor, 1);
+        assert!(i.caret_selection_range().is_none());
+    }
+
+    #[test]
+    fn select_all_then_typing_replaces_everything() {
+        let mut i = input("replace me");
+        i.caret_select_all();
+        assert!(i.selected_all);
+        i.caret_insert("x", false);
+        assert_eq!(i.text, "x");
+        assert!(!i.selected_all);
+    }
+
+    #[test]
+    fn word_navigation_and_word_delete() {
+        let mut i = input("foo bar baz");
+        i.caret_move_end(false);
+        i.caret_word_left(false);
+        assert_eq!(i.cursor, 8);
+        i.caret_delete_word_back();
+        assert_eq!(i.text, "foo baz");
+        assert_eq!(i.cursor, 4);
+    }
+
+    #[test]
+    fn caret_respects_multibyte_chars() {
+        let mut i = input("aé中b");
+        i.caret_set(2, false);
+        i.caret_insert("X", false);
+        assert_eq!(i.text, "aéX中b");
+        assert_eq!(i.cursor, 3);
+        i.caret_backspace();
+        assert_eq!(i.text, "aé中b");
+        assert_eq!(i.cursor, 2);
+    }
+
+    #[test]
+    fn caret_set_clamps_to_text_length() {
+        let mut i = input("ab");
+        i.caret_set(99, false);
+        assert_eq!(i.cursor, 2);
     }
 }
