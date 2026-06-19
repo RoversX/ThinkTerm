@@ -1,4 +1,3 @@
-use crate::customglyph::BlockKey;
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
@@ -18,14 +17,12 @@ use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use anyhow::Context;
-use finl_unicode::grapheme_clusters::Graphemes;
 use mux::Mux;
 use std::borrow::Cow;
 use std::rc::Rc;
-use wezterm_bidi::Direction;
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
-use window::{MouseEventKind as WMEK, RectF, WindowOps};
+use window::{MouseEventKind as WMEK, RectF};
 
 const SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
 const SIDEBAR_SETTINGS_FOOTER_HEIGHT: usize = 72;
@@ -2245,7 +2242,8 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
+        self.paint_ui_title_text_cached(layers, font, &metrics, &text, x, y, width, foreground)?;
+        Ok(())
     }
 
     fn ellipsize_sidebar_text<'a>(
@@ -2259,33 +2257,46 @@ impl crate::TermWindow {
             return Ok(Cow::Borrowed(""));
         }
 
-        if self.sidebar_text_width(font, text)? <= max_width {
+        // Shape the whole string ONCE via the shared shape cache, then measure
+        // and cut from the cached glyph run. The previous implementation
+        // re-measured a growing prefix grapheme-by-grapheme, each re-shaping the
+        // string (`sidebar_text_width`), which was O(N^2) harfbuzz work per row
+        // every frame and made the search list (long `display_path` names) crawl.
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let (shaped, _) = self.cached_ui_shape(font, &metrics, text)?;
+        let total: f32 = shaped
+            .iter()
+            .map(|info| info.glyph.x_advance.get() as f32)
+            .sum();
+        if total <= max_width {
             return Ok(Cow::Borrowed(text));
         }
 
         const ELLIPSIS: &str = "...";
-        if self.sidebar_text_width(font, ELLIPSIS)? > max_width {
-            let mut fallback = String::new();
-            for dot_count in 1..=ELLIPSIS.len() {
-                let candidate = ".".repeat(dot_count);
-                if self.sidebar_text_width(font, &candidate)? > max_width {
-                    break;
-                }
-                fallback = candidate;
-            }
-            return Ok(Cow::Owned(fallback));
+        let ellipsis_w = self.sidebar_text_width(font, ELLIPSIS)?;
+        if ellipsis_w > max_width {
+            // Not even the ellipsis fits; emit as many dots as do (matches the
+            // previous degenerate fallback).
+            let dot_w = self.sidebar_text_width(font, ".")?;
+            let dots = if dot_w > 0.0 {
+                ((max_width / dot_w).floor() as usize).min(ELLIPSIS.len())
+            } else {
+                0
+            };
+            return Ok(Cow::Owned(".".repeat(dots)));
         }
 
-        let mut output = String::new();
-        for grapheme in Graphemes::new(text) {
-            let mut candidate = output.clone();
-            candidate.push_str(grapheme);
-            candidate.push_str(ELLIPSIS);
-            if self.sidebar_text_width(font, &candidate)? > max_width {
-                break;
-            }
-            output.push_str(grapheme);
-        }
+        // Keep the largest prefix (at a glyph-cluster boundary) that still
+        // leaves room for the ellipsis.
+        let budget = max_width - ellipsis_w;
+        let glyphs: Vec<(f32, usize)> = shaped
+            .iter()
+            .map(|info| (info.glyph.x_advance.get() as f32, info.cluster))
+            .collect();
+        let cut_byte = ellipsize_cut_byte(&glyphs, text.len(), budget).min(text.len());
+
+        let mut output = String::with_capacity(cut_byte + ELLIPSIS.len());
+        output.push_str(&text[..cut_byte]);
         output.push_str(ELLIPSIS);
         Ok(Cow::Owned(output))
     }
@@ -2295,19 +2306,13 @@ impl crate::TermWindow {
         font: &Rc<LoadedFont>,
         text: &str,
     ) -> anyhow::Result<f32> {
-        let Some(window) = self.window.as_ref().cloned() else {
-            return Ok(0.0);
-        };
-        let infos = font.shape(
-            text,
-            move || window.notify(crate::termwindow::TermWindowNotif::InvalidateShapeCache),
-            BlockKey::filter_out_synthetic,
-            None,
-            Direction::LeftToRight,
-            None,
-            None,
-        )?;
-        Ok(infos.iter().map(|info| info.x_advance.get() as f32).sum())
+        // Route through the shared shape cache so repeated width queries (the
+        // ellipsize fit-check, button sizing, etc.) become cache hits and stay
+        // consistent with the cached painters. Metrics are derived from the font
+        // exactly as the sidebar paint path does
+        // (`RenderMetrics::with_font_metrics(&ui_font.metrics())`).
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        self.cached_ui_text_advance(font, &metrics, text)
     }
 
     pub(crate) fn paint_sidebar_icon(
@@ -2408,5 +2413,72 @@ impl crate::TermWindow {
         quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
 
         Ok(())
+    }
+}
+
+/// Largest byte prefix (at a glyph-cluster boundary) whose cumulative advance
+/// fits in `budget`. `glyphs` are `(advance_px, cluster)` pairs in visual order,
+/// where `cluster` is the source byte offset of each glyph. Cutting at the
+/// *next* glyph's cluster guarantees we never split a multi-byte character or a
+/// shaped cluster. Used by `ellipsize_sidebar_text` to truncate in a single
+/// shaping pass instead of re-shaping a growing prefix per grapheme.
+fn ellipsize_cut_byte(glyphs: &[(f32, usize)], text_len: usize, budget: f32) -> usize {
+    let mut acc = 0.0f32;
+    let mut cut = 0usize;
+    for idx in 0..glyphs.len() {
+        let advance = glyphs[idx].0;
+        if acc + advance > budget {
+            break;
+        }
+        acc += advance;
+        cut = glyphs.get(idx + 1).map(|next| next.1).unwrap_or(text_len);
+    }
+    cut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ellipsize_cut_byte;
+
+    // Build (advance, cluster) pairs for an ASCII or per-char string where every
+    // char is one glyph of `advance` px and the cluster is its byte offset.
+    fn glyphs_per_char(text: &str, advance: f32) -> Vec<(f32, usize)> {
+        text.char_indices().map(|(byte, _)| (advance, byte)).collect()
+    }
+
+    #[test]
+    fn cut_keeps_whole_prefix_when_everything_fits() {
+        let text = "abcdef";
+        let glyphs = glyphs_per_char(text, 10.0);
+        // budget large enough for all 6 glyphs.
+        assert_eq!(ellipsize_cut_byte(&glyphs, text.len(), 1000.0), text.len());
+    }
+
+    #[test]
+    fn cut_stops_at_budget() {
+        let text = "abcdef";
+        let glyphs = glyphs_per_char(text, 10.0);
+        // budget for ~3.5 glyphs -> keep 3 (bytes 0..3).
+        assert_eq!(ellipsize_cut_byte(&glyphs, text.len(), 35.0), 3);
+    }
+
+    #[test]
+    fn cut_never_splits_multibyte_chars() {
+        // "ab你好cd": bytes a=0 b=1 你=2..5 好=5..8 c=8 d=9 (你/好 are 3 bytes each).
+        let text = "ab你好cd";
+        let glyphs = glyphs_per_char(text, 10.0);
+        // Budget for 3 glyphs (a, b, 你) -> cut at byte 5 (start of 好), the
+        // boundary AFTER the full multi-byte char, never inside it.
+        let cut = ellipsize_cut_byte(&glyphs, text.len(), 35.0);
+        assert_eq!(cut, 5);
+        assert!(text.is_char_boundary(cut));
+        assert_eq!(&text[..cut], "ab你");
+    }
+
+    #[test]
+    fn cut_is_zero_when_nothing_fits() {
+        let text = "abc";
+        let glyphs = glyphs_per_char(text, 10.0);
+        assert_eq!(ellipsize_cut_byte(&glyphs, text.len(), 5.0), 0);
     }
 }

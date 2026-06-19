@@ -186,13 +186,15 @@ impl TextInputState {
     }
 
     pub(crate) fn caret_selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.selection_anchor?;
-        if anchor == self.cursor {
+        let len = self.char_len();
+        let anchor = self.selection_anchor?.min(len);
+        let cursor = self.cursor.min(len);
+        if anchor == cursor {
             None
-        } else if anchor < self.cursor {
-            Some((anchor, self.cursor))
+        } else if anchor < cursor {
+            Some((anchor, cursor))
         } else {
-            Some((self.cursor, anchor))
+            Some((cursor, anchor))
         }
     }
 
@@ -593,6 +595,16 @@ mod text_input_tests {
 
         i.caret_insert("hi", false);
         assert_eq!(i.text, "hellohi world");
+    }
+
+    #[test]
+    fn stale_selection_range_is_clamped_to_current_text() {
+        let mut i = input("abc");
+        i.cursor = 0;
+        i.selection_anchor = Some(4);
+
+        assert_eq!(i.caret_selection_range(), Some((0, 3)));
+        assert_eq!(i.caret_selected_text().as_deref(), Some("abc"));
     }
 
     #[test]

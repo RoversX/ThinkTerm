@@ -11,10 +11,11 @@ use crate::termwindow::{
     RightSidebarFileCharBag, RightSidebarFileField, RightSidebarFileIndex,
     RightSidebarFileIndexEntry, RightSidebarFileIndexStatus, RightSidebarFilePreviewImage,
     RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
-    RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
+    RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSliceCacheKey,
+    RightSidebarFilePreviewSliceCacheValue, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
     RightSidebarFileView, RightSidebarInputLayout, RightSidebarMode,
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
-    TermWindowNotif, UIItem, UIItemType,
+    TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup,
 };
 use crate::ui::TextInputState;
 use crate::ui::UiPalette;
@@ -31,7 +32,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SyntectColor, Style as SyntectStyle, Theme, ThemeSet};
@@ -78,6 +79,12 @@ const FILE_PREVIEW_HEADER_HEIGHT: usize = 64;
 const FILE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 const FILE_PREVIEW_TRUNCATED_LABEL: &str = "Preview truncated to 256 KiB";
 const FILE_PREVIEW_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
+// The file-size cap above bounds the *encoded* bytes, but a small encoded image
+// can decode to an enormous RGBA bitmap (`width × height × 4`, ×frames for
+// animations) — a decompression bomb that has spiked RAM to >1 GiB. The preview
+// pane is only a few hundred px wide, so cap the decode at ~16 MP (≈64 MiB
+// RGBA), which still covers 4K/5K screenshots and typical photos.
+const FILE_PREVIEW_IMAGE_MAX_PIXELS: u64 = 16_000_000;
 const FILE_PREVIEW_PANE_MIN_WIDTH: usize = 360;
 const FILE_PREVIEW_PANE_DEFAULT_WIDTH: usize = 560;
 // Per-line we keep the *full* content (bounded only by FILE_PREVIEW_MAX_BYTES
@@ -86,10 +93,19 @@ const FILE_PREVIEW_PANE_DEFAULT_WIDTH: usize = 560;
 // point are rendered in the default colour instead of being dropped. This keeps
 // syntect cost bounded on pathological single-line files without losing data.
 const FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT: usize = 8192;
+const FILE_PREVIEW_SLICE_CACHE_CAPACITY: usize = 256;
+// Lines up to this many columns are shaped whole (once, cached) so horizontal
+// scrolling is pure translation of the cached glyph run instead of re-shaping a
+// new substring per step. Longer lines fall back to the per-window slice path to
+// keep the one-time shaping cost bounded.
+const FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS: usize = 4096;
 const FILE_PREVIEW_SCROLLBAR_THICKNESS: usize = 4;
 const FILE_PREVIEW_SCROLLBAR_HIT_SLOP: usize = 6;
 const FILE_TREE_ROW_LIMIT: usize = 2000;
 const FILE_INDEX_ENTRY_LIMIT: usize = 100_000;
+// How long the file panel must stay closed/idle before its in-memory index and
+// buffers are released. Reopening within this window keeps everything resident.
+const FILE_INDEX_IDLE_RELEASE_SECS: u64 = 30;
 const FILE_FILTER_DEBOUNCE_MS: u64 = 350;
 
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +147,78 @@ pub(crate) struct RightSidebarFilePreviewHorizontalScrollGeometry {
     pub thumb_x: f32,
     pub thumb_width: f32,
     pub max_scroll: usize,
+}
+
+struct FilePreviewPaintProfile {
+    enabled: bool,
+    start: Option<Instant>,
+    line_count: usize,
+    visible_lines: usize,
+    plain_lines: usize,
+    highlighted_lines: usize,
+    slice_requests: usize,
+    shape_requests: usize,
+    shape_cache_hits: usize,
+    shape_cache_misses: usize,
+}
+
+impl FilePreviewPaintProfile {
+    fn new() -> Self {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled =
+            *ENABLED.get_or_init(|| std::env::var_os("THINKTERM_PROFILE_FILE_PREVIEW").is_some());
+        Self {
+            enabled,
+            start: enabled.then(Instant::now),
+            line_count: 0,
+            visible_lines: 0,
+            plain_lines: 0,
+            highlighted_lines: 0,
+            slice_requests: 0,
+            shape_requests: 0,
+            shape_cache_hits: 0,
+            shape_cache_misses: 0,
+        }
+    }
+
+    fn record_shape_lookup(&mut self, lookup: UiShapeCacheLookup) {
+        if !self.enabled {
+            return;
+        }
+        self.shape_requests += 1;
+        match lookup {
+            UiShapeCacheLookup::Hit => self.shape_cache_hits += 1,
+            UiShapeCacheLookup::Miss => self.shape_cache_misses += 1,
+            UiShapeCacheLookup::Skipped => {}
+        }
+    }
+
+    fn finish(&self, scroll_offset: f32, horizontal_offset: usize) {
+        if !self.enabled {
+            return;
+        }
+        let Some(start) = self.start else {
+            return;
+        };
+        let elapsed = start.elapsed();
+        if elapsed < Duration::from_millis(8) {
+            return;
+        }
+        log::info!(
+            "file preview paint: {:?}, lines={}, visible={}, plain={}, highlighted={}, slices={}, shape_requests={}, shape_hits={}, shape_misses={}, scroll={:.1}, hscroll={}",
+            elapsed,
+            self.line_count,
+            self.visible_lines,
+            self.plain_lines,
+            self.highlighted_lines,
+            self.slice_requests,
+            self.shape_requests,
+            self.shape_cache_hits,
+            self.shape_cache_misses,
+            scroll_offset,
+            horizontal_offset
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -363,10 +451,70 @@ impl crate::TermWindow {
 
     pub fn toggle_right_sidebar(&mut self) {
         self.right_sidebar_collapsed = !self.right_sidebar_collapsed;
+        if self.right_sidebar_collapsed {
+            self.schedule_right_sidebar_file_memory_release();
+        }
     }
 
     pub fn expand_right_sidebar(&mut self) {
         self.right_sidebar_collapsed = false;
+    }
+
+    /// The file panel (and its in-memory index) is only relevant while the right
+    /// sidebar is open and in `Chat`/File mode.
+    pub(crate) fn right_sidebar_file_view_active(&self) -> bool {
+        !self.right_sidebar_collapsed && self.right_sidebar_mode == RightSidebarMode::Chat
+    }
+
+    /// Schedule a delayed check that frees the file index + buffers if the panel
+    /// stays closed/idle. Bumping the token makes any earlier pending check a
+    /// no-op, so reopening or re-toggling within the window keeps memory warm.
+    pub(crate) fn schedule_right_sidebar_file_memory_release(&mut self) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.right_sidebar_file_memory_release_token =
+            self.right_sidebar_file_memory_release_token.wrapping_add(1);
+        let token = self.right_sidebar_file_memory_release_token;
+        let target = Instant::now() + Duration::from_secs(FILE_INDEX_IDLE_RELEASE_SECS);
+        promise::spawn::spawn(async move {
+            smol::Timer::at(target).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.release_right_sidebar_file_memory_if_idle(token);
+            })));
+        })
+        .detach();
+    }
+
+    /// Free the in-memory file index, browse/search rows and preview buffers once
+    /// the panel has been idle long enough. No-op if it was reopened/re-toggled
+    /// since scheduling, or if an index build is still in flight. The root and
+    /// expanded-folder set are kept so reopening rebuilds the same view.
+    fn release_right_sidebar_file_memory_if_idle(&mut self, token: u64) {
+        if token != self.right_sidebar_file_memory_release_token
+            || self.right_sidebar_file_view_active()
+            || matches!(
+                self.right_sidebar_file_index_status,
+                RightSidebarFileIndexStatus::Indexing
+            )
+        {
+            return;
+        }
+
+        if let Some(cancel) = self.right_sidebar_file_index_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        self.clear_right_sidebar_file_search();
+        self.close_right_sidebar_file_preview();
+        // `close_right_sidebar_file_preview` only `.clear()`s the preview lines,
+        // which keeps the (potentially large) capacity; drop it outright.
+        self.right_sidebar_file_preview_lines = Vec::new();
+
+        self.right_sidebar_file_index = None;
+        self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Empty;
+        self.right_sidebar_file_browse_rows = Vec::new();
+        self.right_sidebar_file_browse_cache_key = None;
+        self.invalidate_window();
     }
 
     pub(crate) fn right_sidebar_toggle_icon(&self) -> SvgIcon {
@@ -583,6 +731,7 @@ impl crate::TermWindow {
         let generation = self.right_sidebar_file_preview_generation;
         self.right_sidebar_file_preview_lines.clear();
         self.right_sidebar_file_preview_max_columns = 0;
+        self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
         self.right_sidebar_file_preview_message = Some("Loading file preview...".to_string());
         self.right_sidebar_file_preview_truncated = false;
@@ -629,12 +778,101 @@ impl crate::TermWindow {
             self.right_sidebar_file_preview_generation.wrapping_add(1);
         self.right_sidebar_file_preview_lines.clear();
         self.right_sidebar_file_preview_max_columns = 0;
+        self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
         self.right_sidebar_file_preview_message = None;
         self.right_sidebar_file_preview_truncated = false;
         self.right_sidebar_file_preview_selection = None;
         self.right_sidebar_file_preview_scroll_offset = 0.0;
         self.right_sidebar_file_preview_horizontal_offset = 0;
+    }
+
+    fn clear_right_sidebar_file_preview_slice_cache(&self) {
+        self.right_sidebar_file_preview_slice_cache
+            .borrow_mut()
+            .clear();
+        self.right_sidebar_file_preview_slice_cache_order
+            .borrow_mut()
+            .clear();
+        self.right_sidebar_file_preview_line_color_cache
+            .borrow_mut()
+            .clear();
+        self.right_sidebar_file_preview_line_color_cache_order
+            .borrow_mut()
+            .clear();
+    }
+
+    /// Per-byte colours for a whole preview line, keyed by (generation, line
+    /// index) so horizontal scrolling reuses the same colour list. Indexed by
+    /// byte offset into `line.plain` so a glyph's `cluster` maps straight to its
+    /// colour without rebuilding a byte→char table every frame.
+    fn cached_full_line_colors(
+        &self,
+        line_index: usize,
+        line: &RightSidebarFilePreviewLine,
+    ) -> Rc<Vec<LinearRgba>> {
+        let key = (self.right_sidebar_file_preview_generation, line_index);
+        if let Some(value) = self
+            .right_sidebar_file_preview_line_color_cache
+            .borrow()
+            .get(&key)
+            .cloned()
+        {
+            return value;
+        }
+        let colors = Rc::new(full_line_colors_by_byte(line));
+        {
+            let mut cache = self.right_sidebar_file_preview_line_color_cache.borrow_mut();
+            let mut order = self
+                .right_sidebar_file_preview_line_color_cache_order
+                .borrow_mut();
+            if !cache.contains_key(&key) {
+                order.push_back(key);
+            }
+            cache.insert(key, Rc::clone(&colors));
+            while order.len() > FILE_PREVIEW_SLICE_CACHE_CAPACITY {
+                if let Some(old_key) = order.pop_front() {
+                    cache.remove(&old_key);
+                }
+            }
+        }
+        colors
+    }
+
+    fn cached_right_sidebar_file_preview_slice<F>(
+        &self,
+        key: RightSidebarFilePreviewSliceCacheKey,
+        build: F,
+    ) -> RightSidebarFilePreviewSliceCacheValue
+    where
+        F: FnOnce() -> RightSidebarFilePreviewSliceCacheValue,
+    {
+        if let Some(value) = self
+            .right_sidebar_file_preview_slice_cache
+            .borrow()
+            .get(&key)
+            .cloned()
+        {
+            return value;
+        }
+
+        let value = build();
+        {
+            let mut cache = self.right_sidebar_file_preview_slice_cache.borrow_mut();
+            let mut order = self
+                .right_sidebar_file_preview_slice_cache_order
+                .borrow_mut();
+            if !cache.contains_key(&key) {
+                order.push_back(key.clone());
+            }
+            cache.insert(key, value.clone());
+            while order.len() > FILE_PREVIEW_SLICE_CACHE_CAPACITY {
+                if let Some(old_key) = order.pop_front() {
+                    cache.remove(&old_key);
+                }
+            }
+        }
+        value
     }
 
     fn apply_right_sidebar_file_preview_result(
@@ -653,9 +891,10 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_max_columns = self
             .right_sidebar_file_preview_lines
             .iter()
-            .map(|line| line.plain.chars().count())
+            .map(|line| line.char_count)
             .max()
             .unwrap_or(0);
+        self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = result.image;
         self.right_sidebar_file_preview_message = result.message;
         self.right_sidebar_file_preview_truncated = result.truncated;
@@ -877,7 +1116,7 @@ impl crate::TermWindow {
             let line_end = if line_idx == end.line {
                 end.column
             } else {
-                line.plain.chars().count()
+                line.char_count
             };
             if line_end > line_start {
                 text.push_str(&preview_text_range(&line.plain, line_start, line_end));
@@ -937,7 +1176,7 @@ impl crate::TermWindow {
         let line_len = self
             .right_sidebar_file_preview_lines
             .get(line)
-            .map(|line| line.plain.chars().count())
+            .map(|line| line.char_count)
             .unwrap_or(0);
 
         let (_, _, text_x, text_width) =
@@ -1114,12 +1353,11 @@ impl crate::TermWindow {
         let worker_cancel = index_cancel.clone();
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
-                Ok(build_right_sidebar_file_index_with_cancel(
+                Ok(build_or_reuse_shared_file_index(
                     &index_root_path,
                     &index_project_name,
                     &worker_cancel,
-                )
-                .map(Arc::new))
+                ))
             })
             .await
             .unwrap_or_else(|err| Err(format!("Unable to index files: {err}")));
@@ -3534,6 +3772,9 @@ impl crate::TermWindow {
         let Some(path) = self.right_sidebar_file_selected.clone() else {
             return Ok(());
         };
+        let mut profile = FilePreviewPaintProfile::new();
+        let mut profile_scroll_offset = 0.0;
+        let mut profile_horizontal_offset = 0usize;
 
         let Some(metrics) = self.right_sidebar_file_preview_body_metrics(ui_metrics) else {
             self.paint_files_preview_header(
@@ -3572,11 +3813,13 @@ impl crate::TermWindow {
             let visible_height =
                 self.right_sidebar_file_preview_effective_visible_height(metrics, ui_metrics);
             let line_count = preview_line_count(&self.right_sidebar_file_preview_lines);
+            profile.line_count = line_count;
             let max_scroll = metrics.total_height.saturating_sub(visible_height) as f32;
             self.right_sidebar_file_preview_scroll_offset = self
                 .right_sidebar_file_preview_scroll_offset
                 .clamp(0.0, max_scroll);
             let scroll_offset = self.right_sidebar_file_preview_scroll_offset;
+            profile_scroll_offset = scroll_offset;
             show_top_fade = max_scroll > 0.0 && scroll_offset > 0.0;
             show_scrollbars = true;
 
@@ -3588,6 +3831,7 @@ impl crate::TermWindow {
                     self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(ui_metrics),
                 );
             let horizontal_offset = self.right_sidebar_file_preview_horizontal_offset;
+            profile_horizontal_offset = horizontal_offset;
             // Render only the visible horizontal window, never the whole line
             // (lines can be tens of thousands of columns wide). The preview font
             // is proportional, so `visible_columns` (text_width / cell_width)
@@ -3603,70 +3847,67 @@ impl crate::TermWindow {
             });
             let first_visible_line = (scroll_offset / line_height as f32).floor().max(0.0) as usize;
             let visible_line_count = visible_height / line_height + 3;
-            for (idx, line) in preview_visible_lines(
-                &self.right_sidebar_file_preview_lines,
+            let visible_range = preview_visible_line_range(
+                self.right_sidebar_file_preview_lines.len(),
                 first_visible_line,
                 visible_line_count,
-            ) {
-                let line_top = body_y as f32 + (idx * line_height) as f32 - scroll_offset;
-                let line_bottom = line_top + line_height as f32;
-                if line_bottom <= body_y as f32 {
-                    continue;
-                }
-                if line_top >= body_bottom as f32 {
-                    break;
-                }
-                let line_y = line_top.floor().max(0.0) as usize;
-                self.paint_right_sidebar_file_preview_selection_for_line(
-                    layers,
-                    chrome,
-                    line,
-                    idx,
-                    horizontal_offset,
-                    visible_columns,
-                    text_x,
-                    line_y,
-                    line_height,
-                    cell_width,
-                )?;
-                self.paint_ui_title_text(
+            );
+            if self.right_sidebar_file_preview_lines.is_empty() && first_visible_line == 0 {
+                let empty_line = preview_line_from_plain("");
+                self.paint_right_sidebar_file_preview_text_line(
                     layers,
                     ui_font,
-                    &ui_metrics,
-                    &(idx + 1).to_string(),
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    0,
+                    &empty_line,
                     body_x,
-                    line_y,
+                    body_y,
+                    body_bottom,
                     number_width,
-                    muted_fg.mul_alpha(0.72),
+                    text_x,
+                    text_width,
+                    line_height,
+                    scroll_offset,
+                    horizontal_offset,
+                    visible_columns,
+                    paint_columns,
+                    cell_width,
+                    Some(&mut profile),
                 )?;
-                if line.spans.is_empty() {
-                    let visible_text =
-                        preview_text_slice(&line.plain, horizontal_offset, paint_columns);
-                    // Clip at the edge (no "..."); the horizontal scrollbar
-                    // indicates there is more content off-screen.
-                    self.paint_ui_title_text(
-                        layers,
-                        ui_font,
-                        &ui_metrics,
-                        &visible_text,
-                        text_x,
-                        line_y,
-                        text_width,
-                        foreground,
-                    )?;
-                } else {
-                    self.paint_highlighted_preview_line(
+            } else {
+                for idx in visible_range {
+                    let Some(line) = self.right_sidebar_file_preview_lines.get(idx) else {
+                        continue;
+                    };
+                    let should_break = self.paint_right_sidebar_file_preview_text_line(
                         layers,
                         ui_font,
                         ui_metrics,
-                        line,
-                        horizontal_offset,
-                        paint_columns,
-                        text_x,
-                        line_y,
-                        text_width,
+                        chrome,
                         foreground,
+                        muted_fg,
+                        idx,
+                        line,
+                        body_x,
+                        body_y,
+                        body_bottom,
+                        number_width,
+                        text_x,
+                        text_width,
+                        line_height,
+                        scroll_offset,
+                        horizontal_offset,
+                        visible_columns,
+                        paint_columns,
+                        cell_width,
+                        Some(&mut profile),
                     )?;
+                    if should_break {
+                        break;
+                    }
                 }
             }
 
@@ -3726,7 +3967,131 @@ impl crate::TermWindow {
             self.paint_right_sidebar_file_preview_scrollbar(layers, chrome)?;
             self.paint_right_sidebar_file_preview_horizontal_scrollbar(layers, chrome)?;
         }
+        profile.finish(profile_scroll_offset, profile_horizontal_offset);
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_right_sidebar_file_preview_text_line(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        idx: usize,
+        line: &RightSidebarFilePreviewLine,
+        body_x: usize,
+        body_y: usize,
+        body_bottom: usize,
+        number_width: usize,
+        text_x: usize,
+        text_width: usize,
+        line_height: usize,
+        scroll_offset: f32,
+        horizontal_offset: usize,
+        visible_columns: usize,
+        paint_columns: usize,
+        cell_width: usize,
+        mut profile: Option<&mut FilePreviewPaintProfile>,
+    ) -> anyhow::Result<bool> {
+        let line_top = body_y as f32 + (idx * line_height) as f32 - scroll_offset;
+        let line_bottom = line_top + line_height as f32;
+        if line_bottom <= body_y as f32 {
+            return Ok(false);
+        }
+        if line_top >= body_bottom as f32 {
+            return Ok(true);
+        }
+        if let Some(profile) = profile.as_deref_mut().filter(|profile| profile.enabled) {
+            profile.visible_lines += 1;
+            profile.slice_requests += 1;
+            if line.spans.is_empty() {
+                profile.plain_lines += 1;
+            } else {
+                profile.highlighted_lines += 1;
+            }
+        }
+
+        let line_y = line_top.floor().max(0.0) as usize;
+        self.paint_right_sidebar_file_preview_selection_for_line(
+            layers,
+            chrome,
+            line,
+            idx,
+            horizontal_offset,
+            visible_columns,
+            text_x,
+            line_y,
+            line_height,
+            cell_width,
+        )?;
+        let line_number_lookup = self.paint_ui_title_text_cached(
+            layers,
+            ui_font,
+            &ui_metrics,
+            &(idx + 1).to_string(),
+            body_x,
+            line_y,
+            number_width,
+            muted_fg.mul_alpha(0.72),
+        )?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record_shape_lookup(line_number_lookup);
+        }
+
+        let text_lookup = if line.char_count <= FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS {
+            // Fast path: shape the whole line once (cached) and translate/clip it
+            // for the current horizontal offset, so panning never re-shapes.
+            self.paint_full_line_preview_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                idx,
+                line,
+                horizontal_offset,
+                text_x,
+                line_y,
+                text_width,
+                foreground,
+            )?
+        } else if line.spans.is_empty() {
+            // Fallback for pathological ultra-long lines: render only the visible
+            // window (horizontal scroll re-shapes, but such lines are rare). Clip
+            // at the edge (no "..."); the horizontal scrollbar shows there's more.
+            let visible_text =
+                self.cached_plain_preview_slice(idx, line, horizontal_offset, paint_columns);
+            self.paint_ui_title_text_cached(
+                layers,
+                ui_font,
+                &ui_metrics,
+                &visible_text,
+                text_x,
+                line_y,
+                text_width,
+                foreground,
+            )?
+        } else {
+            self.paint_highlighted_preview_line(
+                layers,
+                ui_font,
+                ui_metrics,
+                idx,
+                line,
+                horizontal_offset,
+                paint_columns,
+                text_x,
+                line_y,
+                text_width,
+                foreground,
+            )?
+        };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record_shape_lookup(text_lookup);
+        }
+
+        Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3750,7 +4115,7 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let line_len = line.plain.chars().count();
+        let line_len = line.char_count;
         let selection_start = if line_idx == start.line {
             start.column
         } else {
@@ -3965,6 +4330,7 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
         ui_metrics: RenderMetrics,
+        line_index: usize,
         line: &RightSidebarFilePreviewLine,
         horizontal_offset: usize,
         visible_columns: usize,
@@ -3972,30 +4338,151 @@ impl crate::TermWindow {
         y: usize,
         width: usize,
         fallback: LinearRgba,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<UiShapeCacheLookup> {
         if width == 0 || visible_columns == 0 {
-            return Ok(());
+            return Ok(UiShapeCacheLookup::Skipped);
         }
 
         // Build the visible window's text + a per-character colour list from the
         // spans, then shape it in a single call. Shaping once per line (instead
         // of once per coloured span) is what keeps scrolling smooth.
-        let (visible_text, colors) =
-            preview_visible_colored(line, horizontal_offset, visible_columns);
-        if visible_text.is_empty() {
-            return Ok(());
+        let visible =
+            self.cached_colored_preview_slice(line_index, line, horizontal_offset, visible_columns);
+        if visible.text.is_empty() {
+            return Ok(UiShapeCacheLookup::Skipped);
         }
-        self.paint_ui_colored_text(
+        self.paint_ui_colored_text_cached(
             layers,
             ui_font,
             &ui_metrics,
-            &visible_text,
-            &colors,
+            &visible.text,
+            &visible.colors,
             fallback,
             x,
             y,
             width,
         )
+    }
+
+    /// Horizontal-scroll fast path: shape the whole line once (shared shape
+    /// cache, keyed on the full line text so it is stable across every
+    /// horizontal offset), then translate the cached glyph run left by the pixel
+    /// width of the scrolled-past columns and clip it to the text column. Panning
+    /// only recomputes the translation; it never re-shapes or re-slices.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_full_line_preview_text(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        line_index: usize,
+        line: &RightSidebarFilePreviewLine,
+        horizontal_offset: usize,
+        text_x: usize,
+        line_y: usize,
+        text_width: usize,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<UiShapeCacheLookup> {
+        if line.plain.is_empty() || text_width == 0 {
+            return Ok(UiShapeCacheLookup::Skipped);
+        }
+        let (shaped, lookup) = self.cached_ui_shape(ui_font, &ui_metrics, &line.plain)?;
+        if shaped.is_empty() {
+            return Ok(lookup);
+        }
+
+        // Pixel offset of the first visible column within the cached run. The
+        // glyph at `horizontal_offset` lands exactly on `text_x`, so columns to
+        // its left are fully clipped (no partial glyph bleeds into the gutter).
+        let start_byte = line
+            .plain
+            .char_indices()
+            .nth(horizontal_offset)
+            .map(|(byte, _)| byte)
+            .unwrap_or(line.plain.len());
+        let mut start_px = 0.0f32;
+        for info in shaped.iter() {
+            if info.cluster >= start_byte {
+                break;
+            }
+            start_px += info.glyph.x_advance.get() as f32;
+        }
+
+        let start_x = text_x as f32 - start_px;
+        let clip_left = text_x as f32;
+        let clip_right = (text_x + text_width) as f32;
+        let y = line_y as f32;
+
+        if line.spans.is_empty() {
+            self.paint_cached_ui_shape_clipped(
+                layers,
+                &ui_metrics,
+                &shaped,
+                start_x,
+                y,
+                clip_left,
+                clip_right,
+                |_| foreground,
+            )?;
+        } else {
+            let colors = self.cached_full_line_colors(line_index, line);
+            self.paint_cached_ui_shape_clipped(
+                layers,
+                &ui_metrics,
+                &shaped,
+                start_x,
+                y,
+                clip_left,
+                clip_right,
+                |info| colors.get(info.cluster).copied().unwrap_or(foreground),
+            )?;
+        }
+
+        Ok(lookup)
+    }
+
+    fn cached_plain_preview_slice(
+        &self,
+        line_index: usize,
+        line: &RightSidebarFilePreviewLine,
+        horizontal_offset: usize,
+        paint_columns: usize,
+    ) -> String {
+        let key = RightSidebarFilePreviewSliceCacheKey {
+            generation: self.right_sidebar_file_preview_generation,
+            line_index,
+            horizontal_offset,
+            paint_columns,
+            highlighted: false,
+        };
+        self.cached_right_sidebar_file_preview_slice(key, || {
+            RightSidebarFilePreviewSliceCacheValue {
+                text: preview_text_slice(&line.plain, horizontal_offset, paint_columns)
+                    .into_owned(),
+                colors: Vec::new(),
+            }
+        })
+        .text
+    }
+
+    fn cached_colored_preview_slice(
+        &self,
+        line_index: usize,
+        line: &RightSidebarFilePreviewLine,
+        horizontal_offset: usize,
+        paint_columns: usize,
+    ) -> RightSidebarFilePreviewSliceCacheValue {
+        let key = RightSidebarFilePreviewSliceCacheKey {
+            generation: self.right_sidebar_file_preview_generation,
+            line_index,
+            horizontal_offset,
+            paint_columns,
+            highlighted: true,
+        };
+        self.cached_right_sidebar_file_preview_slice(key, || {
+            let (text, colors) = preview_visible_colored(line, horizontal_offset, paint_columns);
+            RightSidebarFilePreviewSliceCacheValue { text, colors }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4718,8 +5205,8 @@ impl crate::TermWindow {
 
                 // Selection highlight, behind the glyphs.
                 if let Some((sel_start, sel_end)) = input.caret_selection_range() {
-                    let vis_start = sel_start.max(first);
-                    let vis_end = sel_end.max(first);
+                    let vis_start = sel_start.max(first).min(chars.len());
+                    let vis_end = sel_end.max(first).min(chars.len());
                     if vis_end > vis_start {
                         let start_prefix: String = chars[first..vis_start].iter().collect();
                         let end_prefix: String = chars[first..vis_end].iter().collect();
@@ -5029,6 +5516,7 @@ fn preview_plain_lines_from_text(text: &str) -> Vec<RightSidebarFilePreviewLine>
 fn preview_line_from_plain(line: &str) -> RightSidebarFilePreviewLine {
     RightSidebarFilePreviewLine {
         plain: line.to_string(),
+        char_count: line.chars().count(),
         spans: Vec::new(),
     }
 }
@@ -5039,6 +5527,7 @@ fn preview_line_from_highlighted_ranges(
     default_color: LinearRgba,
 ) -> RightSidebarFilePreviewLine {
     let mut plain = String::new();
+    let mut char_count = 0usize;
     let mut spans = Vec::new();
 
     for (style, text) in ranges {
@@ -5046,9 +5535,12 @@ fn preview_line_from_highlighted_ranges(
             continue;
         }
         let color = syntect_color_to_linear(style.foreground);
+        let span_char_count = text.chars().count();
         plain.push_str(text);
+        char_count = char_count.saturating_add(span_char_count);
         spans.push(RightSidebarFilePreviewSpan {
             text: text.to_string(),
+            char_count: span_char_count,
             color,
         });
     }
@@ -5056,14 +5548,21 @@ fn preview_line_from_highlighted_ranges(
     // The un-highlighted remainder of a very long line is kept verbatim so no
     // content is dropped; it just renders in the editor's default colour.
     if !tail.is_empty() {
+        let span_char_count = tail.chars().count();
         plain.push_str(tail);
+        char_count = char_count.saturating_add(span_char_count);
         spans.push(RightSidebarFilePreviewSpan {
             text: tail.to_string(),
+            char_count: span_char_count,
             color: default_color,
         });
     }
 
-    RightSidebarFilePreviewLine { plain, spans }
+    RightSidebarFilePreviewLine {
+        plain,
+        char_count,
+        spans,
+    }
 }
 
 fn syntect_color_to_linear(color: SyntectColor) -> LinearRgba {
@@ -5103,6 +5602,23 @@ fn estimated_file_preview_visible_columns(text_width: usize, cell_width: usize) 
     text_width / cell_width.max(1)
 }
 
+/// Per-byte colours for a whole highlighted line: `colors[b]` is the colour of
+/// the character that byte `b` of `line.plain` belongs to. Spans concatenate to
+/// `line.plain`, so this aligns with a glyph's `cluster` (a byte offset) for the
+/// full-line horizontal-scroll fast path. Plain lines have no spans and use a
+/// uniform foreground instead.
+fn full_line_colors_by_byte(line: &RightSidebarFilePreviewLine) -> Vec<LinearRgba> {
+    let mut colors = Vec::with_capacity(line.plain.len());
+    for span in &line.spans {
+        for ch in span.text.chars() {
+            for _ in 0..ch.len_utf8() {
+                colors.push(span.color);
+            }
+        }
+    }
+    colors
+}
+
 /// Collect the visible horizontal window of a highlighted line into a single
 /// string plus a parallel per-character colour list, so the whole window can be
 /// shaped in one call. `start_column`/`max_columns` are in characters.
@@ -5119,7 +5635,7 @@ fn preview_visible_colored(
         if remaining == 0 {
             break;
         }
-        let span_columns = span.text.chars().count();
+        let span_columns = span.char_count;
         if skip >= span_columns {
             skip -= span_columns;
             continue;
@@ -5171,30 +5687,17 @@ fn preview_text_range(text: &str, start_column: usize, end_column: usize) -> Cow
     }
 }
 
-fn preview_visible_lines(
-    lines: &[RightSidebarFilePreviewLine],
+fn preview_visible_line_range(
+    line_count: usize,
     first_line: usize,
     max_lines: usize,
-) -> Vec<(usize, &RightSidebarFilePreviewLine)> {
-    if max_lines == 0 {
-        return vec![];
+) -> std::ops::Range<usize> {
+    if line_count == 0 || max_lines == 0 {
+        return 0..0;
     }
-    if lines.is_empty() {
-        return if first_line == 0 {
-            static EMPTY_LINE: std::sync::OnceLock<RightSidebarFilePreviewLine> =
-                std::sync::OnceLock::new();
-            vec![(0, EMPTY_LINE.get_or_init(|| preview_line_from_plain("")))]
-        } else {
-            vec![]
-        };
-    }
-
-    lines
-        .iter()
-        .enumerate()
-        .skip(first_line)
-        .take(max_lines)
-        .collect()
+    let start = first_line.min(line_count);
+    let end = start.saturating_add(max_lines).min(line_count);
+    start..end
 }
 
 fn right_sidebar_file_row_metrics(ui_metrics: RenderMetrics) -> RightSidebarFileRowMetrics {
@@ -5344,12 +5847,27 @@ fn load_file_preview_image(path: &Path) -> anyhow::Result<RightSidebarFilePrevie
 
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let image_data = ImageDataType::EncodedFile(bytes);
+    // `dimensions()` only reads the header, so this is cheap and lets us reject
+    // decompression bombs *before* `cached_image` decodes the full RGBA bitmap.
     let (width, height) = image_data.dimensions().context("decode image dimensions")?;
+    if !image_pixels_within_preview_budget(width, height) {
+        anyhow::bail!(
+            "image is too large to preview ({width}×{height}, over {} megapixels)",
+            FILE_PREVIEW_IMAGE_MAX_PIXELS / 1_000_000
+        );
+    }
     Ok(RightSidebarFilePreviewImage {
         data: Arc::new(ImageData::with_data(image_data)),
         width,
         height,
     })
+}
+
+/// Whether an image of `width × height` is small enough to decode for preview
+/// without risking a huge RGBA allocation. Uses `u64` so the product cannot
+/// overflow for pathological dimensions.
+fn image_pixels_within_preview_budget(width: u32, height: u32) -> bool {
+    (width as u64).saturating_mul(height as u64) <= FILE_PREVIEW_IMAGE_MAX_PIXELS
 }
 
 fn load_file_preview(path: &Path) -> (String, Option<String>, bool) {
@@ -5429,6 +5947,50 @@ impl RightSidebarFileCharBag {
     fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
+}
+
+/// Process-wide registry of weak references to file indexes, keyed by
+/// (root, project). Lets multiple windows on the same workspace share a single
+/// `Arc<RightSidebarFileIndex>` instead of each scanning and holding its own
+/// copy. Only weak refs live here, so an index is freed the moment the last
+/// window drops its strong ref (e.g. via the idle-release path).
+fn shared_file_index_registry(
+) -> &'static Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reuse a live shared index for `(root, project)` if one exists, otherwise scan
+/// and register it. The scan runs without holding the registry lock, so two
+/// windows racing on the same root may each scan once (harmless: both produce
+/// equivalent indexes and the last registration wins). A cancelled scan returns
+/// `Err` and is never registered.
+fn build_or_reuse_shared_file_index(
+    root: &Path,
+    project_name: &str,
+    cancel: &AtomicBool,
+) -> Result<Arc<RightSidebarFileIndex>, String> {
+    let key = (root.to_path_buf(), project_name.to_string());
+    if let Some(existing) = shared_file_index_registry()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(&key).and_then(Weak::upgrade))
+    {
+        return Ok(existing);
+    }
+
+    let index = Arc::new(build_right_sidebar_file_index_with_cancel(
+        root,
+        project_name,
+        cancel,
+    )?);
+
+    if let Ok(mut registry) = shared_file_index_registry().lock() {
+        registry.insert(key, Arc::downgrade(&index));
+        registry.retain(|_, weak| weak.strong_count() > 0);
+    }
+    Ok(index)
 }
 
 #[cfg(test)]
@@ -5979,20 +6541,23 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_right_sidebar_file_index, load_file_preview, load_file_preview_image, naturalish_cmp,
-        path_key, preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
-        preview_text_range, preview_visible_lines, right_sidebar_file_browse_rows_from_index,
-        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key,
-        search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
-        sorted_open_with_candidates, visible_file_row_range, wrap_snippet_text_for_width,
-        FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT, FILE_PREVIEW_MAX_BYTES,
+        build_right_sidebar_file_index, full_line_colors_by_byte, image_pixels_within_preview_budget,
+        load_file_preview, load_file_preview_image, naturalish_cmp, path_key, preview_line_count,
+        preview_lines_from_text, preview_plain_lines_from_text,
+        preview_text_range, preview_visible_colored, preview_visible_line_range,
+        right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
+        right_sidebar_open_with_cache_key, search_right_sidebar_file_index, snippet_cursor_visible,
+        snippet_run_buffer, sorted_open_with_candidates, visible_file_row_range,
+        wrap_snippet_text_for_width, FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT, FILE_PREVIEW_MAX_BYTES,
     };
+    use crate::termwindow::{RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan};
     use crate::utilsprites::RenderMetrics;
     use std::collections::HashSet;
     use std::fs;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use wezterm_font::units::PixelLength;
+    use window::color::LinearRgba;
     use window::Size;
 
     fn test_render_metrics(cell_height: isize, cell_width: isize) -> RenderMetrics {
@@ -6205,22 +6770,20 @@ mod tests {
     }
 
     #[test]
-    fn preview_visible_lines_only_returns_requested_window() {
+    fn preview_visible_line_range_only_returns_requested_window() {
         let cached_lines = preview_plain_lines_from_text("one\ntwo\nthree\nfour");
-        let lines = preview_visible_lines(&cached_lines, 1, 2);
+        let range = preview_visible_line_range(cached_lines.len(), 1, 2);
 
         assert_eq!(preview_line_count(&cached_lines), 4);
-        assert_eq!(lines[0].0, 1);
-        assert_eq!(lines[0].1.plain, "two");
-        assert_eq!(lines[1].0, 2);
-        assert_eq!(lines[1].1.plain, "three");
+        assert_eq!(range, 1..3);
+        assert_eq!(cached_lines[range.start].plain, "two");
+        assert_eq!(cached_lines[range.end - 1].plain, "three");
 
         let empty_lines = preview_plain_lines_from_text("");
         assert_eq!(preview_line_count(&empty_lines), 1);
-        let visible = preview_visible_lines(&empty_lines, 0, 2);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].0, 0);
-        assert_eq!(visible[0].1.plain, "");
+        assert_eq!(preview_visible_line_range(empty_lines.len(), 0, 2), 0..1);
+        assert_eq!(empty_lines[0].plain, "");
+        assert_eq!(preview_visible_line_range(0, 0, 2), 0..0);
     }
 
     #[test]
@@ -6257,6 +6820,18 @@ mod tests {
         assert_eq!(large.row_height, 58);
         assert_eq!(large.icon_size, 50);
         assert!(large.chevron_size <= 24);
+    }
+
+    #[test]
+    fn preview_image_pixel_budget_rejects_decompression_bombs() {
+        // Typical sizes are allowed.
+        assert!(image_pixels_within_preview_budget(1920, 1080)); // 2 MP
+        assert!(image_pixels_within_preview_budget(4096, 2160)); // ~8.8 MP (4K)
+        assert!(image_pixels_within_preview_budget(4000, 4000)); // 16 MP (== budget)
+        // Bombs are rejected, and the u64 product cannot overflow.
+        assert!(!image_pixels_within_preview_budget(8000, 8000)); // 64 MP
+        assert!(!image_pixels_within_preview_budget(100_000, 100_000));
+        assert!(!image_pixels_within_preview_budget(u32::MAX, u32::MAX));
     }
 
     #[test]
@@ -6337,6 +6912,86 @@ mod tests {
             colors.len() > 1,
             "python preview should render visibly different token colors"
         );
+    }
+
+    #[test]
+    fn preview_lines_store_character_counts() {
+        let plain = preview_plain_lines_from_text("ab你好cd");
+        assert_eq!(plain[0].char_count, 6);
+
+        let highlighted =
+            preview_lines_from_text(std::path::Path::new("script.py"), "def 你好():", true);
+        let line = &highlighted[0];
+        assert_eq!(line.char_count, line.plain.chars().count());
+        assert_eq!(
+            line.spans.iter().map(|span| span.char_count).sum::<usize>(),
+            line.char_count
+        );
+    }
+
+    #[test]
+    fn preview_visible_colored_slices_by_character_columns() {
+        let green = LinearRgba::with_components(0.0, 1.0, 0.0, 1.0);
+        let blue = LinearRgba::with_components(0.0, 0.0, 1.0, 1.0);
+        let line = RightSidebarFilePreviewLine {
+            plain: "ab你好cd".to_string(),
+            char_count: 6,
+            spans: vec![
+                RightSidebarFilePreviewSpan {
+                    text: "ab".to_string(),
+                    char_count: 2,
+                    color: green,
+                },
+                RightSidebarFilePreviewSpan {
+                    text: "你好cd".to_string(),
+                    char_count: 4,
+                    color: blue,
+                },
+            ],
+        };
+
+        let (text, colors) = preview_visible_colored(&line, 2, 2);
+        assert_eq!(text, "你好");
+        assert_eq!(colors, vec![blue, blue]);
+    }
+
+    #[test]
+    fn full_line_colors_map_each_byte_to_its_span_color() {
+        let green = LinearRgba::with_components(0.0, 1.0, 0.0, 1.0);
+        let blue = LinearRgba::with_components(0.0, 0.0, 1.0, 1.0);
+        // "ab你好cd": a=0 b=1 你=2..5 好=5..8 c=8 d=9 -> 10 bytes; 你/好 are 3
+        // bytes each. The full-line h-scroll painter indexes this by a glyph's
+        // `cluster` (a byte offset), so each byte must carry its span's colour.
+        let line = RightSidebarFilePreviewLine {
+            plain: "ab你好cd".to_string(),
+            char_count: 6,
+            spans: vec![
+                RightSidebarFilePreviewSpan {
+                    text: "ab你".to_string(),
+                    char_count: 3,
+                    color: green,
+                },
+                RightSidebarFilePreviewSpan {
+                    text: "好cd".to_string(),
+                    char_count: 3,
+                    color: blue,
+                },
+            ],
+        };
+
+        let colors = full_line_colors_by_byte(&line);
+        assert_eq!(colors.len(), line.plain.len());
+        // bytes 0..5 (a, b, 你) -> green; 5..10 (好, c, d) -> blue.
+        for b in 0..5 {
+            assert_eq!(colors[b], green, "byte {b} should be green");
+        }
+        for b in 5..10 {
+            assert_eq!(colors[b], blue, "byte {b} should be blue");
+        }
+        // A multi-byte glyph's cluster maps to the right colour: 你 at byte 2,
+        // 好 at byte 5.
+        assert_eq!(colors[2], green);
+        assert_eq!(colors[5], blue);
     }
 
     #[test]

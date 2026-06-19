@@ -571,8 +571,9 @@ impl super::TermWindow {
                         WMEK::VertWheel(_) | WMEK::HorzWheel(_) => false,
                         _ => return false,
                     };
-                    let _ = changed;
-                    context.invalidate();
+                    if changed {
+                        context.invalidate();
+                    }
                     return true;
                 }
             }
@@ -602,12 +603,18 @@ impl super::TermWindow {
         }
 
         if self.right_sidebar_mode == super::RightSidebarMode::Chat {
-            self.scroll_right_sidebar_files(amount);
+            if self.scroll_right_sidebar_files(amount) {
+                context.invalidate();
+            }
         } else {
+            let was_visible = self.right_sidebar_snippet_scrollbar_visible_until;
             self.show_right_sidebar_snippet_scrollbar();
-            self.scroll_right_sidebar_snippets(amount);
+            if self.scroll_right_sidebar_snippets(amount)
+                || was_visible != self.right_sidebar_snippet_scrollbar_visible_until
+            {
+                context.invalidate();
+            }
         }
-        context.invalidate();
         true
     }
 
@@ -2073,6 +2080,11 @@ impl super::TermWindow {
         if event.kind == WMEK::Press(MousePress::Left) {
             let previous_width = self.right_sidebar_width();
             self.right_sidebar_mode = mode;
+            // Leaving the file view (e.g. switching to Snippets/Tasks) makes the
+            // file index idle; schedule it for release if nothing reopens it.
+            if !self.right_sidebar_file_view_active() {
+                self.schedule_right_sidebar_file_memory_release();
+            }
             self.invalidate_or_reflow_right_sidebar(previous_width, context);
         }
     }

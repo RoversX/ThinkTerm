@@ -57,7 +57,7 @@ use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, HashSet, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::ops::Add;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -375,13 +375,37 @@ pub(crate) enum RightSidebarFileIndexStatus {
 #[derive(Clone)]
 pub(crate) struct RightSidebarFilePreviewSpan {
     pub text: String,
+    pub char_count: usize,
     pub color: LinearRgba,
 }
 
 #[derive(Clone)]
 pub(crate) struct RightSidebarFilePreviewLine {
     pub plain: String,
+    pub char_count: usize,
     pub spans: Vec<RightSidebarFilePreviewSpan>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RightSidebarFilePreviewSliceCacheKey {
+    pub generation: u64,
+    pub line_index: usize,
+    pub horizontal_offset: usize,
+    pub paint_columns: usize,
+    pub highlighted: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct RightSidebarFilePreviewSliceCacheValue {
+    pub text: String,
+    pub colors: Vec<LinearRgba>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UiShapeCacheLookup {
+    Hit,
+    Miss,
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -942,6 +966,10 @@ pub struct TermWindow {
     right_sidebar_file_index_status: RightSidebarFileIndexStatus,
     right_sidebar_file_index: Option<Arc<RightSidebarFileIndex>>,
     right_sidebar_file_index_cancel: Option<Arc<AtomicBool>>,
+    // Bumped each time the file panel goes idle; a delayed release task only
+    // frees the index/buffers if its captured token still matches (i.e. the
+    // panel was not reopened or re-toggled in the meantime).
+    right_sidebar_file_memory_release_token: u64,
     right_sidebar_file_search_generation: u64,
     right_sidebar_file_search_cancel: Option<Arc<AtomicBool>>,
     right_sidebar_file_search_query: String,
@@ -959,6 +987,16 @@ pub struct TermWindow {
     right_sidebar_file_preview_message: Option<String>,
     right_sidebar_file_preview_truncated: bool,
     right_sidebar_file_preview_selection: Option<RightSidebarFilePreviewSelection>,
+    right_sidebar_file_preview_slice_cache: RefCell<
+        HashMap<RightSidebarFilePreviewSliceCacheKey, RightSidebarFilePreviewSliceCacheValue>,
+    >,
+    right_sidebar_file_preview_slice_cache_order:
+        RefCell<VecDeque<RightSidebarFilePreviewSliceCacheKey>>,
+    // Full-line per-character colours for the horizontal-scroll fast path, keyed
+    // by (preview generation, line index). Built once per line and reused across
+    // every horizontal offset so panning never rebuilds the colour list.
+    right_sidebar_file_preview_line_color_cache: RefCell<HashMap<(u64, usize), Rc<Vec<LinearRgba>>>>,
+    right_sidebar_file_preview_line_color_cache_order: RefCell<VecDeque<(u64, usize)>>,
     right_sidebar_file_tree_scroll_offset: f32,
     right_sidebar_file_preview_scroll_offset: f32,
     right_sidebar_file_preview_horizontal_offset: usize,
@@ -1484,6 +1522,7 @@ impl TermWindow {
             right_sidebar_file_index_root: None,
             right_sidebar_file_index_project_name: String::new(),
             right_sidebar_file_index_status: RightSidebarFileIndexStatus::Empty,
+            right_sidebar_file_memory_release_token: 0,
             right_sidebar_file_index: None,
             right_sidebar_file_index_cancel: None,
             right_sidebar_file_search_generation: 0,
@@ -1503,6 +1542,10 @@ impl TermWindow {
             right_sidebar_file_preview_message: None,
             right_sidebar_file_preview_truncated: false,
             right_sidebar_file_preview_selection: None,
+            right_sidebar_file_preview_slice_cache: RefCell::new(HashMap::new()),
+            right_sidebar_file_preview_slice_cache_order: RefCell::new(VecDeque::new()),
+            right_sidebar_file_preview_line_color_cache: RefCell::new(HashMap::new()),
+            right_sidebar_file_preview_line_color_cache_order: RefCell::new(VecDeque::new()),
             right_sidebar_file_tree_scroll_offset: 0.0,
             right_sidebar_file_preview_scroll_offset: 0.0,
             right_sidebar_file_preview_horizontal_offset: 0,

@@ -25,6 +25,7 @@ pub struct GlyphPosition {
 pub struct ShapedInfo {
     pub glyph: Rc<CachedGlyph>,
     pub pos: GlyphPosition,
+    pub cluster: usize,
     pub block_key: Option<BlockKey>,
 }
 
@@ -47,6 +48,7 @@ impl ShapedInfo {
                     bearing_x: glyph.bearing_x.get() as f32,
                 },
                 glyph: Rc::clone(glyph),
+                cluster: info.cluster as usize,
                 block_key: info.only_char.and_then(BlockKey::from_char),
             });
         }
@@ -118,6 +120,7 @@ impl<'a> std::hash::Hash for dyn ShapeCacheKeyTrait + 'a {
 
 #[cfg(test)]
 mod test {
+    use crate::glyphcache::CachedGlyph;
     use crate::glyphcache::GlyphCache;
     use crate::shapecache::{GlyphPosition, ShapedInfo};
     use crate::utilsprites::RenderMetrics;
@@ -126,7 +129,8 @@ mod test {
     use termwiz::cell::CellAttributes;
     use termwiz::surface::{Line, SEQ_ZERO};
     use wezterm_bidi::Direction;
-    use wezterm_font::shaper::PresentationWidth;
+    use wezterm_font::shaper::{GlyphInfo, PresentationWidth};
+    use wezterm_font::units::PixelLength;
     use wezterm_font::{FontConfiguration, LoadedFont};
 
     fn cluster_and_shape(
@@ -188,6 +192,55 @@ mod test {
             .into_iter()
             .map(|p| p.pos)
             .collect()
+    }
+
+    #[test]
+    fn shaped_info_preserves_clusters() {
+        let glyph = Rc::new(CachedGlyph {
+            has_color: false,
+            brightness_adjust: 1.0,
+            x_offset: PixelLength::new(0.0),
+            y_offset: PixelLength::new(0.0),
+            x_advance: PixelLength::new(1.0),
+            bearing_x: PixelLength::new(0.0),
+            bearing_y: PixelLength::new(0.0),
+            texture: None,
+            scale: 1.0,
+        });
+        let infos = vec![
+            GlyphInfo {
+                text: "a".to_string(),
+                only_char: Some('a'),
+                is_space: false,
+                num_cells: 1,
+                cluster: 0,
+                font_idx: 0,
+                glyph_pos: 11,
+                x_advance: PixelLength::new(1.0),
+                y_advance: PixelLength::new(0.0),
+                x_offset: PixelLength::new(0.0),
+                y_offset: PixelLength::new(0.0),
+            },
+            GlyphInfo {
+                text: "你".to_string(),
+                only_char: Some('你'),
+                is_space: false,
+                num_cells: 2,
+                cluster: 3,
+                font_idx: 0,
+                glyph_pos: 12,
+                x_advance: PixelLength::new(2.0),
+                y_advance: PixelLength::new(0.0),
+                x_offset: PixelLength::new(0.0),
+                y_offset: PixelLength::new(0.0),
+            },
+        ];
+        let shaped = ShapedInfo::process(&infos, &[Rc::clone(&glyph), glyph]);
+
+        assert_eq!(
+            shaped.iter().map(|info| info.cluster).collect::<Vec<_>>(),
+            vec![0, 3]
+        );
     }
 
     #[test]

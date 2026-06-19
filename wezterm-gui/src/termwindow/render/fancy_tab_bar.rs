@@ -1,5 +1,6 @@
 use crate::customglyph::BlockKey;
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::shapecache::{BorrowedShapeCacheKey, ShapedInfo};
 use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::tokens::{
@@ -9,16 +10,16 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
     WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
 };
-use crate::termwindow::{TermWindowNotif, UIItem, UIItemType};
+use crate::termwindow::{TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup};
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use finl_unicode::grapheme_clusters::Graphemes;
 use std::rc::Rc;
 use termwiz::cell::grapheme_column_width;
 use termwiz::cell::CellAttributes;
 use wezterm_bidi::Direction;
-use wezterm_font::LoadedFont;
+use wezterm_font::{ClearShapeCache, LoadedFont};
 use wezterm_term::Line;
 use window::color::LinearRgba;
 use window::WindowOps;
@@ -27,6 +28,7 @@ use window::{IntegratedTitleButton, IntegratedTitleButtonStyle, WindowDecoration
 const WINDOW_TAB_INSET: usize = 8;
 const WINDOW_TAB_ICON_GAP: usize = 8;
 const WINDOW_TAB_MIN_TEXT_COLS: usize = 3;
+const UI_SHAPE_CACHE_FONT_IDENTITY_BIT: u64 = 1u64 << 63;
 
 impl crate::TermWindow {
     pub fn invalidate_fancy_tab_bar(&mut self) {
@@ -1235,7 +1237,7 @@ impl crate::TermWindow {
     /// per-character colour list. The whole string is shaped **once** instead of
     /// once per coloured span; that is what keeps the file preview smooth while
     /// scrolling syntax-highlighted code (the shaper does not cache results).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn paint_ui_colored_text(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -1362,6 +1364,284 @@ impl crate::TermWindow {
         }
 
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_ui_title_text_cached(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        text: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<UiShapeCacheLookup> {
+        self.paint_ui_title_text_cached_with_advance(
+            layers, font, metrics, text, x, y, width, foreground,
+        )
+        .map(|(_, lookup)| lookup)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_ui_title_text_cached_with_advance(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        text: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<(f32, UiShapeCacheLookup)> {
+        if text.is_empty() || width == 0 {
+            return Ok((0.0, UiShapeCacheLookup::Skipped));
+        }
+
+        let (shaped, lookup) = self.cached_ui_shape(font, metrics, text)?;
+        let advance =
+            self.paint_cached_ui_shape(layers, metrics, &shaped, x, y, width, |_| foreground)?;
+        Ok((advance, lookup))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_ui_colored_text_cached(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        text: &str,
+        char_colors: &[LinearRgba],
+        default_color: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+    ) -> anyhow::Result<UiShapeCacheLookup> {
+        if text.is_empty() || width == 0 {
+            return Ok(UiShapeCacheLookup::Skipped);
+        }
+
+        let (shaped, lookup) = self.cached_ui_shape(font, metrics, text)?;
+
+        // Map each byte offset to its char index so a glyph's cluster can look
+        // up the colour of the character it came from. This stays outside the
+        // shape cache because colours are applied at paint time.
+        let mut byte_to_char = vec![0usize; text.len() + 1];
+        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
+            for byte in byte_idx..byte_idx + ch.len_utf8() {
+                byte_to_char[byte] = char_idx;
+            }
+        }
+        if let Some(last) = byte_to_char.last_mut() {
+            *last = char_colors.len().saturating_sub(1);
+        }
+
+        self.paint_cached_ui_shape(layers, metrics, &shaped, x, y, width, |info| {
+            let char_idx = byte_to_char.get(info.cluster).copied().unwrap_or(0);
+            char_colors.get(char_idx).copied().unwrap_or(default_color)
+        })?;
+
+        Ok(lookup)
+    }
+
+    pub(crate) fn cached_ui_shape(
+        &self,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        text: &str,
+    ) -> anyhow::Result<(Rc<Vec<ShapedInfo>>, UiShapeCacheLookup)> {
+        let font_identity = UI_SHAPE_CACHE_FONT_IDENTITY_BIT | font.id() as u64;
+        let style = font.style();
+        let key = BorrowedShapeCacheKey {
+            font_identity,
+            style,
+            text,
+        };
+
+        if let Some(cached) = self.lookup_cached_shape(&key) {
+            return cached.map(|shaped| (shaped, UiShapeCacheLookup::Hit));
+        }
+
+        let Some(window) = self.window.as_ref().cloned() else {
+            return Ok((Rc::new(Vec::new()), UiShapeCacheLookup::Skipped));
+        };
+        let Some(gl_state) = self.render_state.as_ref() else {
+            return Ok((Rc::new(Vec::new()), UiShapeCacheLookup::Skipped));
+        };
+
+        let infos = match font.shape(
+            text,
+            move || window.notify(TermWindowNotif::InvalidateShapeCache),
+            BlockKey::filter_out_synthetic,
+            None,
+            Direction::LeftToRight,
+            None,
+            None,
+        ) {
+            Ok(infos) => infos,
+            Err(err) => {
+                if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
+                    return Err(err);
+                }
+
+                let res = anyhow!("shaper error: {}", err);
+                self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
+                return Err(res);
+            }
+        };
+
+        let glyphs = {
+            let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
+            self.glyph_infos_to_glyphs(style, &mut glyph_cache, &infos, font, metrics)?
+        };
+        let shaped = Rc::new(ShapedInfo::process(&infos, &glyphs));
+        self.shape_cache
+            .borrow_mut()
+            .put(key.to_owned(), Ok(Rc::clone(&shaped)));
+        Ok((shaped, UiShapeCacheLookup::Miss))
+    }
+
+    /// Total advance width (px) of `text` in `font`, via the shared shape cache.
+    /// Reuses the same cached glyph run as the cached painters, so width queries
+    /// (ellipsize, button sizing) become cache hits after the first shape and
+    /// stay consistent with what is painted.
+    pub(crate) fn cached_ui_text_advance(
+        &self,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        text: &str,
+    ) -> anyhow::Result<f32> {
+        if text.is_empty() {
+            return Ok(0.0);
+        }
+        let (shaped, _) = self.cached_ui_shape(font, metrics, text)?;
+        Ok(shaped
+            .iter()
+            .map(|info| info.glyph.x_advance.get() as f32)
+            .sum())
+    }
+
+    fn paint_cached_ui_shape<F>(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        metrics: &RenderMetrics,
+        shaped: &[ShapedInfo],
+        x: usize,
+        y: usize,
+        width: usize,
+        color_for: F,
+    ) -> anyhow::Result<f32>
+    where
+        F: FnMut(&ShapedInfo) -> LinearRgba,
+    {
+        self.paint_cached_ui_shape_clipped(
+            layers,
+            metrics,
+            shaped,
+            x as f32,
+            y as f32,
+            x as f32,
+            (x + width) as f32,
+            color_for,
+        )
+    }
+
+    /// Draw a cached glyph run starting at pixel `start_x` (which may be left of
+    /// `clip_left`, e.g. for a horizontally-scrolled line), clipping to
+    /// `[clip_left, clip_right]`: glyphs fully left of `clip_left` advance the
+    /// pen but draw nothing, and drawing stops at `clip_right`. With
+    /// `start_x == clip_left` this is identical to the previous fixed-origin
+    /// painter, so existing callers are unaffected.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_cached_ui_shape_clipped<F>(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        metrics: &RenderMetrics,
+        shaped: &[ShapedInfo],
+        start_x: f32,
+        y: f32,
+        clip_left: f32,
+        clip_right: f32,
+        mut color_for: F,
+    ) -> anyhow::Result<f32>
+    where
+        F: FnMut(&ShapedInfo) -> LinearRgba,
+    {
+        if shaped.is_empty() || clip_right <= clip_left {
+            return Ok(0.0);
+        }
+
+        let Some(gl_state) = self.render_state.as_ref() else {
+            return Ok(0.0);
+        };
+        let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
+        let left_offset = self.dimensions.pixel_width as f32 / -2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / -2.0;
+        let baseline = metrics.cell_size.height as f32 + metrics.descender.get() as f32;
+        let mut x_pos = start_x;
+
+        for info in shaped {
+            let advance = info.glyph.x_advance.get() as f32;
+            // Fully left of the viewport: advance the pen, draw nothing.
+            if x_pos + advance <= clip_left {
+                x_pos += advance;
+                continue;
+            }
+            let color = color_for(info);
+
+            if let Some(key) = info.block_key {
+                if x_pos + advance > clip_right {
+                    break;
+                }
+                let sprite = glyph_cache.cached_block(key, metrics)?;
+                let mut quad = layers.allocate(2)?;
+                quad.set_position(
+                    x_pos + left_offset,
+                    y + top_offset,
+                    x_pos + left_offset + advance,
+                    y + top_offset + metrics.cell_size.height as f32,
+                );
+                quad.set_texture(sprite.texture_coords());
+                quad.set_fg_color(color);
+                quad.set_alt_color_and_mix_value(color, 0.0);
+                quad.set_hsv(None);
+                x_pos += advance;
+                continue;
+            }
+
+            let glyph = &info.glyph;
+            if x_pos + advance > clip_right {
+                break;
+            }
+
+            if let Some(texture) = glyph.texture.as_ref() {
+                let glyph_x = x_pos + (glyph.x_offset + glyph.bearing_x).get() as f32;
+                let glyph_y = y - (glyph.y_offset + glyph.bearing_y).get() as f32 + baseline;
+                let glyph_width = texture.coords.size.width as f32 * glyph.scale as f32;
+                let glyph_height = texture.coords.size.height as f32 * glyph.scale as f32;
+                if glyph_x + glyph_width > clip_right {
+                    break;
+                }
+                let mut quad = layers.allocate(2)?;
+                quad.set_position(
+                    glyph_x + left_offset,
+                    glyph_y + top_offset,
+                    glyph_x + left_offset + glyph_width,
+                    glyph_y + top_offset + glyph_height,
+                );
+                quad.set_texture(texture.texture_coords());
+                quad.set_fg_color(color);
+                quad.set_alt_color_and_mix_value(color, 0.0);
+                quad.set_has_color(glyph.has_color);
+                quad.set_hsv(None);
+            }
+
+            x_pos += advance;
+        }
+
+        Ok((x_pos - start_x).max(0.0))
     }
 
     fn paint_fancy_tab_icon(
