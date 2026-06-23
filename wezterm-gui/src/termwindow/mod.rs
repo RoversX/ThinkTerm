@@ -168,6 +168,15 @@ pub(crate) struct RemoteConnectState {
     pub detect_os: Option<(String, String)>,
 }
 
+/// An in-flight Mosh connection started from a `RemoteThreadView`. Mosh does
+/// not expose an SSH domain status to poll, so the background bootstrap task
+/// uses this token to honor cancellation before adopting the workspace.
+pub(crate) struct MoshConnectState {
+    pub generation: u64,
+    pub workspace_name: String,
+    pub canceled: Arc<AtomicBool>,
+}
+
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
@@ -935,6 +944,9 @@ pub struct TermWindow {
     /// Tracks SSH connections kicked off by `RemoteThreadView`s.
     remote_connects: HashMap<ContentViewId, RemoteConnectState>,
     next_remote_connect_generation: u64,
+    /// Tracks Mosh bootstraps kicked off by `RemoteThreadView`s.
+    mosh_connects: HashMap<ContentViewId, MoshConnectState>,
+    next_mosh_connect_generation: u64,
     space_owner_id: u64,
     active_space_id: String,
     workspace_layout_structure_fingerprint: Option<u64>,
@@ -995,7 +1007,8 @@ pub struct TermWindow {
     // Full-line per-character colours for the horizontal-scroll fast path, keyed
     // by (preview generation, line index). Built once per line and reused across
     // every horizontal offset so panning never rebuilds the colour list.
-    right_sidebar_file_preview_line_color_cache: RefCell<HashMap<(u64, usize), Rc<Vec<LinearRgba>>>>,
+    right_sidebar_file_preview_line_color_cache:
+        RefCell<HashMap<(u64, usize), Rc<Vec<LinearRgba>>>>,
     right_sidebar_file_preview_line_color_cache_order: RefCell<VecDeque<(u64, usize)>>,
     right_sidebar_file_tree_scroll_offset: f32,
     right_sidebar_file_preview_scroll_offset: f32,
@@ -1493,6 +1506,8 @@ impl TermWindow {
             registered_content_view_surfaces: HashMap::new(),
             remote_connects: HashMap::new(),
             next_remote_connect_generation: 1,
+            mosh_connects: HashMap::new(),
+            next_mosh_connect_generation: 1,
             space_owner_id,
             active_space_id,
             workspace_layout_structure_fingerprint,

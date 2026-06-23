@@ -45,6 +45,7 @@ const SESSION_STATUS_DOT_SIZE: usize = 10;
 const SESSION_STATUS_ICON_SIZE: usize = 20;
 const SESSION_STATUS_ACTIVE_ICON_SIZE: usize = 26;
 const SESSION_STATUS_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
+const SESSION_STATUS_OPEN_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
 const SIDEBAR_SECTION_ACTION_SIZE: usize = 48;
 const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 6;
 
@@ -288,7 +289,7 @@ impl crate::TermWindow {
         } else if session.is_pinned {
             foreground.mul_alpha(0.68)
         } else if session.is_materialized {
-            foreground.mul_alpha(0.45)
+            SESSION_STATUS_OPEN_COLOR
         } else {
             foreground.mul_alpha(0.16)
         }

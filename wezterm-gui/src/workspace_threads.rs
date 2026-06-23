@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context, Result};
 use chrono::Utc;
-use config::keyassignment::SpawnTabDomain;
+use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use futures::future::LocalBoxFuture;
 use mux::domain::SplitSource;
 use mux::pane::PaneId;
@@ -8,6 +8,7 @@ use mux::tab::{PaneEntry, PaneNode, PaneStackEntry, SplitDirection, SplitRequest
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
 use parking_lot::Mutex;
+use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -977,6 +978,66 @@ pub async fn materialize_thread(
         let _ = src_window_id;
         Ok(())
     }
+}
+
+pub async fn materialize_thread_spawn(
+    workspace_name: String,
+    spawn: SpawnCommand,
+    size: TerminalSize,
+    term_config: Arc<dyn TerminalConfiguration>,
+) -> Result<()> {
+    let mux = Mux::get();
+    if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
+        return Ok(());
+    }
+
+    let cwd = if let Some(cwd) = spawn.cwd.as_ref() {
+        Some(
+            cwd.to_str()
+                .map(|s| s.to_string())
+                .with_context(|| format!("convert cwd {:?} to unicode", cwd))?,
+        )
+    } else {
+        None
+    };
+
+    let command = match (
+        spawn.args.as_ref(),
+        spawn.cwd.as_ref(),
+        spawn.set_environment_variables.is_empty(),
+    ) {
+        (None, None, true) => None,
+        _ => {
+            let mut builder = spawn
+                .args
+                .as_ref()
+                .map(|args| CommandBuilder::from_argv(args.iter().map(Into::into).collect()))
+                .unwrap_or_else(CommandBuilder::new_default_prog);
+            for (key, value) in spawn.set_environment_variables.iter() {
+                builder.env(key, value);
+            }
+            if let Some(cwd) = spawn.cwd.as_ref() {
+                builder.cwd(cwd);
+            }
+            Some(builder)
+        }
+    };
+
+    let (_tab, pane, _window_id) = mux
+        .spawn_tab_or_window(
+            None,
+            spawn.domain,
+            command,
+            cwd,
+            size,
+            None,
+            workspace_name,
+            spawn.position,
+        )
+        .await
+        .context("spawn command in thread workspace")?;
+    pane.set_config(term_config);
+    Ok(())
 }
 
 pub fn thread_layout(thread_id: &str) -> Option<WorkspaceThreadLayoutSnapshot> {

@@ -44,6 +44,7 @@ pub(crate) struct RemoteThreadView {
     state: ThreadConnectionState,
     endpoint: String,
     stale_message: Option<String>,
+    uses_mosh: bool,
     phase: ViewPhase,
     widgets: UiContext<RemoteThreadAction>,
     interaction: InteractionState<RemoteThreadAction>,
@@ -53,6 +54,7 @@ struct RemoteThreadSnapshot {
     state: ThreadConnectionState,
     endpoint: String,
     stale_message: Option<String>,
+    uses_mosh: bool,
 }
 
 impl RemoteThreadView {
@@ -63,6 +65,7 @@ impl RemoteThreadView {
             state: snapshot.state,
             endpoint: snapshot.endpoint,
             stale_message: snapshot.stale_message,
+            uses_mosh: snapshot.uses_mosh,
             phase: ViewPhase::Idle,
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
@@ -81,6 +84,15 @@ impl RemoteThreadView {
         self.state = snapshot.state;
         self.endpoint = snapshot.endpoint;
         self.stale_message = snapshot.stale_message;
+        self.uses_mosh = snapshot.uses_mosh;
+    }
+
+    fn transport_label(&self) -> &'static str {
+        if self.uses_mosh {
+            "Mosh"
+        } else {
+            "SSH"
+        }
     }
 
     fn paint_impl(
@@ -274,17 +286,31 @@ impl RemoteThreadView {
                     SPINNER_FRAMES[(elapsed.as_millis() / 120) as usize % SPINNER_FRAMES.len()];
                 (
                     format!("{frame}  Connecting…"),
-                    format!("Elapsed {}s", elapsed.as_secs()),
+                    format!(
+                        "Transport: {} · elapsed {}s",
+                        self.transport_label(),
+                        elapsed.as_secs()
+                    ),
                 )
             }
             ViewPhase::Failed { .. } => (
                 "The connection failed.".to_string(),
-                "Retry, or cancel to dismiss.".to_string(),
+                format!(
+                    "Transport: {} · retry, or cancel to dismiss.",
+                    self.transport_label()
+                ),
             ),
-            ViewPhase::Idle => (
-                "Connect opens SSH.".to_string(),
-                "Delete removes this thread.".to_string(),
-            ),
+            ViewPhase::Idle => {
+                let detail = if self.uses_mosh {
+                    "Starts mosh-server over SSH, then opens mosh-client."
+                } else {
+                    "Opens a ThinkTerm SSH session."
+                };
+                (
+                    format!("Transport: {}", self.transport_label()),
+                    detail.to_string(),
+                )
+            }
         };
         ctx.draw_text(
             layers,
@@ -628,11 +654,13 @@ fn remote_thread_snapshot(state: ThreadConnectionState) -> RemoteThreadSnapshot 
     } else {
         None
     };
+    let uses_mosh = spec.as_ref().is_some_and(|spec| spec.use_mosh);
 
     RemoteThreadSnapshot {
         state,
         endpoint,
         stale_message,
+        uses_mosh,
     }
 }
 

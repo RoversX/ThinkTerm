@@ -30,6 +30,7 @@ use mux_lua::MuxPane;
 use std::convert::TryInto;
 use std::ops::Sub;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
@@ -2891,6 +2892,7 @@ impl super::TermWindow {
         };
 
         self.snapshot_active_workspace_thread_layout();
+        let use_mosh = spec.use_mosh;
         let thread_id = crate::workspace_threads::create_disconnected_remote_host_thread(
             &self.active_space_id,
             &host_id,
@@ -2902,7 +2904,247 @@ impl super::TermWindow {
             context.invalidate();
             return false;
         }
+        if use_mosh {
+            let _ = self.begin_open_remote_thread_connection(thread_id, context, None);
+        }
         true
+    }
+
+    fn mosh_spec_for_project_id(project_id: &str) -> Option<crate::ssh_hosts::SshHostSpec> {
+        let host_id = crate::workspace_threads::remote_host_id_for_project_id(project_id);
+        crate::ssh_hosts::host_spec(host_id).filter(|spec| spec.use_mosh)
+    }
+
+    /// Bootstrap `mosh-server` over ThinkTerm's SSH stack, then launch the local
+    /// `mosh-client`. If the integrated bootstrap can't proceed (missing stored
+    /// password, host verification prompt, command failure, etc.), fall back to
+    /// the external `mosh` wrapper so the user can still interact manually.
+    fn begin_mosh_thread_connection_impl(
+        &mut self,
+        thread_id: String,
+        view_id: Option<ContentViewId>,
+        context: &dyn WindowOps,
+        orphan_candidate_window_id: Option<MuxWindowId>,
+        workspaces_to_kill_after_adopt: Vec<String>,
+    ) -> bool {
+        let mux = Mux::get();
+        let live_workspaces = mux.iter_workspaces();
+        let Some(plan) =
+            crate::workspace_threads::activation_plan_for_thread(&thread_id, &live_workspaces)
+        else {
+            if let Some(view_id) = view_id {
+                self.fail_remote_connect(view_id, "This thread could not be activated.");
+            } else {
+                context.invalidate();
+            }
+            return true;
+        };
+
+        if !plan.needs_materialize {
+            if let Some(view_id) = view_id {
+                self.remote_connects.remove(&view_id);
+                self.close_content_view_by_id(view_id);
+            }
+            self.activate_workspace_thread_impl(
+                thread_id,
+                context,
+                orphan_candidate_window_id,
+                workspaces_to_kill_after_adopt,
+            );
+            return true;
+        }
+
+        let remote_host_id =
+            crate::workspace_threads::remote_host_id_for_project_id(&plan.project_id).to_string();
+        let Some(spec) = crate::ssh_hosts::host_spec(&remote_host_id).filter(|spec| spec.use_mosh)
+        else {
+            return false;
+        };
+
+        self.snapshot_active_workspace_thread_layout();
+        if view_id.is_none() {
+            self.workspace_sidebar_pending_thread_selection = None;
+            self.set_content_view_active(false);
+        }
+        if let Some(view_id) = view_id {
+            if let Some(view) = self.content_view_mut_by_id(view_id) {
+                view.on_remote_connect_phase(
+                    crate::termwindow::content_view::RemoteConnectPhase::Connecting,
+                );
+            }
+        }
+
+        let workspace_name = plan.workspace_name.clone();
+        let (mosh_generation, cancel_token) = if let Some(view_id) = view_id {
+            let generation = self.next_mosh_connect_generation;
+            self.next_mosh_connect_generation =
+                self.next_mosh_connect_generation.saturating_add(1).max(1);
+            let token = Arc::new(AtomicBool::new(false));
+            if let Some(previous) = self.mosh_connects.insert(
+                view_id,
+                super::MoshConnectState {
+                    generation,
+                    workspace_name: workspace_name.clone(),
+                    canceled: Arc::clone(&token),
+                },
+            ) {
+                previous.canceled.store(true, Ordering::SeqCst);
+                self.kill_remote_connect_workspace(&previous.workspace_name);
+            }
+            (Some(generation), Some(token))
+        } else {
+            (None, None)
+        };
+        let size = self.config.initial_size(
+            self.dimensions.dpi as u32,
+            crate::cell_pixel_dims(&self.config, self.dimensions.dpi as f64).ok(),
+        );
+        let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
+            Arc::new(TermConfig::with_config(self.config.clone()));
+        let window = self.window.clone();
+        let thread_id_for_task = thread_id.clone();
+        let label = spec.label.clone();
+        let fallback_spawn = crate::ssh_hosts::build_mosh_fallback_spawn(&spec);
+        let bootstrap_spec = spec.clone();
+        let cancel_token_for_task = cancel_token.clone();
+
+        promise::spawn::spawn(async move {
+            let spawn_result = promise::spawn::spawn_into_new_thread(move || {
+                promise::spawn::block_on(crate::ssh_hosts::build_integrated_mosh_spawn(
+                    &bootstrap_spec,
+                ))
+            })
+            .await;
+            let spawn = match spawn_result {
+                Ok(spawn) => spawn,
+                Err(err) => {
+                    log::warn!(
+                        "integrated mosh bootstrap failed for {:?}: {err:#}; falling back to external mosh",
+                        label
+                    );
+                    fallback_spawn
+                }
+            };
+
+            if cancel_token_for_task
+                .as_ref()
+                .is_some_and(|token| token.load(Ordering::SeqCst))
+            {
+                return;
+            }
+
+            front_end().set_switching_workspaces(true);
+            let materialized = match crate::workspace_threads::materialize_thread_spawn(
+                workspace_name.clone(),
+                spawn,
+                size,
+                term_config,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(err) => {
+                    log::error!("failed to materialize Mosh thread: {err:#}");
+                    false
+                }
+            };
+
+            if let Some(window) = window {
+                window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                    tw.finish_mosh_thread_connection(
+                        thread_id_for_task,
+                        workspace_name,
+                        view_id,
+                        mosh_generation,
+                        cancel_token,
+                        materialized,
+                        orphan_candidate_window_id,
+                        workspaces_to_kill_after_adopt,
+                    );
+                })));
+            } else {
+                if cancel_token_for_task
+                    .as_ref()
+                    .is_some_and(|token| token.load(Ordering::SeqCst))
+                    && materialized
+                {
+                    kill_workspace_windows(&[workspace_name], None);
+                }
+                front_end().set_switching_workspaces(false);
+                reconcile_workspace_layout_after_materialize(None);
+            }
+        })
+        .detach();
+
+        context.invalidate();
+        true
+    }
+
+    fn finish_mosh_thread_connection(
+        &mut self,
+        thread_id: String,
+        workspace_name: String,
+        view_id: Option<ContentViewId>,
+        mosh_generation: Option<u64>,
+        cancel_token: Option<Arc<AtomicBool>>,
+        materialized: bool,
+        orphan_candidate_window_id: Option<MuxWindowId>,
+        workspaces_to_kill_after_adopt: Vec<String>,
+    ) {
+        let token_cancelled = cancel_token
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::SeqCst));
+        let mut cancelled = token_cancelled;
+        let mut reveal_now = view_id.is_none();
+        let mut close_view_after_success = None;
+
+        if let Some(view_id) = view_id {
+            let state_matches = self.mosh_connects.get(&view_id).is_some_and(|state| {
+                Some(state.generation) == mosh_generation
+                    && cancel_token
+                        .as_ref()
+                        .is_some_and(|token| Arc::ptr_eq(&state.canceled, token))
+            });
+
+            if !state_matches {
+                cancelled = true;
+            }
+
+            if cancelled {
+                if let Some(state) = self.mosh_connects.remove(&view_id) {
+                    state.canceled.store(true, Ordering::SeqCst);
+                }
+            } else if materialized {
+                self.mosh_connects.remove(&view_id);
+                reveal_now = self.active_content_view_id == Some(view_id);
+                self.workspace_sidebar_pending_thread_selection = None;
+                close_view_after_success = Some(view_id);
+            } else {
+                self.mosh_connects.remove(&view_id);
+                self.fail_remote_connect(view_id, "Failed to start Mosh.");
+            }
+        }
+
+        if materialized {
+            if cancelled {
+                self.kill_remote_connect_workspace(&workspace_name);
+            } else if reveal_now {
+                let live_workspaces = Mux::get().iter_workspaces();
+                let _ =
+                    crate::workspace_threads::activate_thread_record(&thread_id, &live_workspaces);
+                self.adopt_workspace_in_this_window(&workspace_name);
+                cleanup_orphaned_mux_window(orphan_candidate_window_id);
+                kill_workspace_windows(&workspaces_to_kill_after_adopt, Some(&workspace_name));
+            }
+        }
+
+        if let Some(view_id) = close_view_after_success {
+            self.close_content_view_by_id(view_id);
+        }
+
+        front_end().set_switching_workspaces(false);
+        reconcile_workspace_layout_after_materialize(self.window.clone());
+        self.invalidate_window();
     }
 
     pub(crate) fn activate_workspace_thread_for_new_window(
@@ -2940,12 +3182,29 @@ impl super::TermWindow {
             return;
         }
 
+        let mux = Mux::get();
+        let live_workspaces = mux.iter_workspaces();
+        if let Some(state) =
+            crate::workspace_threads::thread_connection_state(&thread_id, &live_workspaces)
+        {
+            if state.is_remote && !state.is_live {
+                if Self::mosh_spec_for_project_id(&state.project_id).is_some() {
+                    let _ = self.begin_mosh_thread_connection_impl(
+                        thread_id,
+                        None,
+                        context,
+                        orphan_candidate_window_id,
+                        workspaces_to_kill_after_adopt,
+                    );
+                    return;
+                }
+            }
+        }
+
         self.snapshot_active_workspace_thread_layout();
         self.workspace_sidebar_pending_thread_selection = None;
         self.set_content_view_active(false);
 
-        let mux = Mux::get();
-        let live_workspaces = mux.iter_workspaces();
         let Some(plan) =
             crate::workspace_threads::activate_thread_record(&thread_id, &live_workspaces)
         else {
@@ -3223,6 +3482,16 @@ impl super::TermWindow {
             self.fail_remote_connect(view_id, "The saved SSH host no longer exists.");
             return;
         };
+        if spec.use_mosh {
+            let _ = self.begin_mosh_thread_connection_impl(
+                thread_id,
+                Some(view_id),
+                context,
+                orphan_candidate_window_id,
+                Vec::new(),
+            );
+            return;
+        }
         let domain_name = match crate::ssh_hosts::ensure_ssh_domain_registered(&spec) {
             Ok(name) => name,
             Err(err) => {
@@ -3397,10 +3666,15 @@ impl super::TermWindow {
         self.invalidate_window();
     }
 
-    /// Cancel an in-flight connection started from `view_id` and tear down its
-    /// background SSH workspace. The view has already reset itself to Idle.
+    /// Cancel an in-flight connection started from `view_id` and tear down any
+    /// background workspace it already materialized. The view has already reset
+    /// itself to Idle.
     pub(crate) fn cancel_remote_thread_connection(&mut self, view_id: ContentViewId) {
         if let Some(state) = self.remote_connects.remove(&view_id) {
+            self.kill_remote_connect_workspace(&state.workspace_name);
+        }
+        if let Some(state) = self.mosh_connects.remove(&view_id) {
+            state.canceled.store(true, Ordering::SeqCst);
             self.kill_remote_connect_workspace(&state.workspace_name);
         }
         self.invalidate_window();

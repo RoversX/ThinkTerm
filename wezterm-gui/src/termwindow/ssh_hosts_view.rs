@@ -30,8 +30,10 @@ const FIELD_USER: usize = 3;
 const FIELD_PASSWORD: usize = 4;
 const FIELD_IDENTITY: usize = 5;
 const FIELD_WORKSPACE: usize = 6;
-const FIELD_COUNT: usize = 7;
-const FIELD_LABELS: [&str; FIELD_COUNT] = [
+const FIELD_MOSH_SERVER: usize = 7;
+const BASE_FIELD_COUNT: usize = 7;
+const FIELD_COUNT: usize = 8;
+const FIELD_LABELS: [&str; BASE_FIELD_COUNT] = [
     "Name",
     "Host",
     "Port",
@@ -69,6 +71,7 @@ enum SshViewAction {
     New,
     FocusField(usize),
     ToggleDetect,
+    ToggleMosh,
     Save,
     SaveAndConnect,
     Cancel,
@@ -88,6 +91,7 @@ struct HostForm {
     original: Option<SshHostSpec>,
     fields: [String; FIELD_COUNT],
     detect_os: bool,
+    use_mosh: bool,
     error: Option<String>,
 }
 
@@ -172,9 +176,18 @@ impl SshHostsView {
 
     // ---- form helpers -----------------------------------------------------
 
+    fn visible_field_count(form: &HostForm) -> usize {
+        if form.use_mosh {
+            FIELD_COUNT
+        } else {
+            BASE_FIELD_COUNT
+        }
+    }
+
     fn open_new_form(&mut self) {
         let mut form = HostForm::default();
         form.fields[FIELD_PORT] = "22".to_string();
+        form.fields[FIELD_MOSH_SERVER] = ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string();
         form.detect_os = true;
         self.form = Some(form);
         self.focus = Focus::Field(FIELD_HOST);
@@ -199,12 +212,15 @@ impl SshHostsView {
             .unwrap_or_default();
         fields[FIELD_IDENTITY] = spec.identity_file.clone().unwrap_or_default();
         fields[FIELD_WORKSPACE] = spec.default_workspace.clone().unwrap_or_default();
+        fields[FIELD_MOSH_SERVER] = spec.mosh_server_command.clone();
         let detect_os = spec.detect_os;
+        let use_mosh = spec.use_mosh;
         self.form = Some(HostForm {
             editing: Some(project_id.to_string()),
             original: Some(spec),
             fields,
             detect_os,
+            use_mosh,
             error: None,
         });
         self.focus = Focus::Field(FIELD_HOST);
@@ -252,6 +268,8 @@ impl SshHostsView {
             default_workspace: None,
             detect_os: true,
             detected_distro: None,
+            use_mosh: false,
+            mosh_server_command: ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string(),
         });
         spec.label = label;
         spec.host = host;
@@ -273,6 +291,17 @@ impl SshHostsView {
         spec.identity_file = opt(&form.fields[FIELD_IDENTITY]);
         spec.default_workspace = opt(&form.fields[FIELD_WORKSPACE]);
         spec.detect_os = form.detect_os;
+        spec.use_mosh = form.use_mosh;
+        let mosh_server_command = form.fields[FIELD_MOSH_SERVER].trim();
+        if spec.use_mosh && mosh_server_command.is_empty() {
+            form.error = Some("Mosh server command is required".to_string());
+            return None;
+        }
+        spec.mosh_server_command = if mosh_server_command.is_empty() {
+            ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string()
+        } else {
+            mosh_server_command.to_string()
+        };
 
         let project_id = match &form.editing {
             Some(id) => match ssh_hosts::try_update_host(id, spec) {
@@ -397,12 +426,30 @@ impl SshHostsView {
                 ContentViewResponse::Redraw
             }
             SshViewAction::FocusField(n) => {
-                self.focus = Focus::Field(n.min(FIELD_COUNT - 1));
+                let count = self
+                    .form
+                    .as_ref()
+                    .map(Self::visible_field_count)
+                    .unwrap_or(BASE_FIELD_COUNT);
+                self.focus = Focus::Field(n.min(count - 1));
                 ContentViewResponse::Redraw
             }
             SshViewAction::ToggleDetect => {
                 if let Some(form) = self.form.as_mut() {
                     form.detect_os = !form.detect_os;
+                }
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::ToggleMosh => {
+                if let Some(form) = self.form.as_mut() {
+                    form.use_mosh = !form.use_mosh;
+                    if form.use_mosh && form.fields[FIELD_MOSH_SERVER].trim().is_empty() {
+                        form.fields[FIELD_MOSH_SERVER] =
+                            ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string();
+                    }
+                    if !form.use_mosh && self.focus == Focus::Field(FIELD_MOSH_SERVER) {
+                        self.focus = Focus::Field(FIELD_WORKSPACE);
+                    }
                 }
                 ContentViewResponse::Redraw
             }
@@ -519,7 +566,12 @@ impl SshHostsView {
     fn step_field(&mut self, delta: isize) {
         self.select_all = false;
         if let Focus::Field(n) = self.focus {
-            let next = (n as isize + delta).rem_euclid(FIELD_COUNT as isize) as usize;
+            let count = self
+                .form
+                .as_ref()
+                .map(Self::visible_field_count)
+                .unwrap_or(BASE_FIELD_COUNT);
+            let next = (n.min(count - 1) as isize + delta).rem_euclid(count as isize) as usize;
             self.focus = Focus::Field(next);
         } else {
             self.focus = Focus::Field(FIELD_HOST);
@@ -531,6 +583,9 @@ impl SshHostsView {
             Focus::Search => f(&mut self.search),
             Focus::Field(n) => {
                 if let Some(form) = self.form.as_mut() {
+                    if n >= FIELD_COUNT {
+                        return;
+                    }
                     form.error = None;
                     f(&mut form.fields[n]);
                 }
@@ -551,6 +606,9 @@ impl SshHostsView {
             Focus::Search => std::mem::take(&mut self.search),
             Focus::Field(n) => {
                 let form = self.form.as_mut()?;
+                if n >= FIELD_COUNT {
+                    return None;
+                }
                 form.error = None;
                 std::mem::take(&mut form.fields[n])
             }
@@ -1168,9 +1226,13 @@ impl SshHostsView {
         )?;
         let subtitle = {
             let user = spec.username.as_deref().unwrap_or("");
-            let source = match entry.source {
-                SshHostSource::ThinkTerm => "ssh",
-                SshHostSource::System => "system ssh",
+            let source = if spec.use_mosh {
+                "mosh"
+            } else {
+                match entry.source {
+                    SshHostSource::ThinkTerm => "ssh",
+                    SshHostSource::System => "system ssh",
+                }
             };
             if user.is_empty() {
                 source.to_string()
@@ -1238,6 +1300,7 @@ impl SshHostsView {
         let form = self.form.as_ref().unwrap();
         let editing = form.editing.is_some();
         let detect_os = form.detect_os;
+        let use_mosh = form.use_mosh;
         let fields = form.fields.clone();
         let error = form.error.clone();
         let focus = self.focus;
@@ -1255,7 +1318,7 @@ impl SshHostsView {
         let line_h = ctx.metrics.cell_size.height as f32;
         let field_w = width.min(560.0);
         let mut cur_y = y + line_h + 18.0;
-        for i in 0..FIELD_COUNT {
+        for i in 0..BASE_FIELD_COUNT {
             ctx.draw_text(
                 layers,
                 font,
@@ -1321,6 +1384,51 @@ impl SshHostsView {
             SshViewAction::ToggleDetect,
         )?;
         cur_y += toggle_h + 24.0;
+
+        // Use-Mosh toggle: connect by launching the local `mosh` client instead
+        // of the SSH domain.
+        ctx.draw_text(
+            layers,
+            font,
+            x,
+            cur_y + (toggle_h - line_h) / 2.0,
+            "Connect with Mosh",
+            palette.text,
+            field_w - toggle_w - 12.0,
+        )?;
+        draw_toggle(
+            ctx,
+            layers,
+            &mut self.widgets,
+            palette,
+            rect(x + field_w - toggle_w, cur_y, toggle_w, toggle_h),
+            use_mosh,
+            SshViewAction::ToggleMosh,
+        )?;
+        cur_y += toggle_h + 24.0;
+
+        if use_mosh {
+            draw_text_input(
+                ctx,
+                layers,
+                font,
+                &mut self.widgets,
+                &self.interaction,
+                palette,
+                tokens,
+                12.0,
+                cursor_on,
+                TextInputSpec {
+                    placeholder: ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND,
+                    text: &fields[FIELD_MOSH_SERVER],
+                    rect: rect(x, cur_y, field_w, INPUT_H),
+                    focused: focus == Focus::Field(FIELD_MOSH_SERVER),
+                    selected_all: focus == Focus::Field(FIELD_MOSH_SERVER) && self.select_all,
+                    action: SshViewAction::FocusField(FIELD_MOSH_SERVER),
+                },
+            )?;
+            cur_y += INPUT_H + 24.0;
+        }
 
         if let Some(err) = &error {
             ctx.draw_text(

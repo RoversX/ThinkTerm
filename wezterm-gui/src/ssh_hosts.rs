@@ -5,8 +5,10 @@
 //! read-only entries. Runtime domains are still registered lazily with the mux
 //! via [`mux::Mux::add_domain`].
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{SshDomain, SshMultiplexing};
+use filedescriptor::FileDescriptor;
 use mux::domain::Domain;
 use mux::ssh::RemoteSshDomain;
 use mux::Mux;
@@ -14,11 +16,14 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use wezterm_ssh::{Session, SessionEvent};
 
 pub type SshHostId = String;
+
+pub const DEFAULT_MOSH_SERVER_COMMAND: &str = "mosh-server new -s -l LANG=en_US.UTF-8";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SshHostSpec {
@@ -56,10 +61,25 @@ pub struct SshHostSpec {
     /// `/etc/os-release` `ID` detected after connecting; drives the OS icon.
     #[serde(default)]
     pub detected_distro: Option<String>,
+    /// When true, connect with Mosh instead of WezTerm's SSH domain. ThinkTerm
+    /// first tries an integrated SSH bootstrap (`mosh-server new ...`) so the
+    /// stored password can be used; if that fails, it falls back to the
+    /// external `mosh` wrapper for manual interaction.
+    #[serde(default)]
+    pub use_mosh: bool,
+    /// Remote command used by an integrated mosh bootstrap path to start
+    /// `mosh-server`. Kept configurable because different servers may need
+    /// environment overrides or a non-default binary path.
+    #[serde(default = "default_mosh_server_command")]
+    pub mosh_server_command: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_mosh_server_command() -> String {
+    DEFAULT_MOSH_SERVER_COMMAND.to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +331,177 @@ pub fn host_project_path(spec: &SshHostSpec) -> PathBuf {
     PathBuf::from(format!("ssh://{}", endpoint(spec)))
 }
 
+/// Build the fallback command line for connecting to `spec` via the `mosh` wrapper:
+/// `mosh [--ssh="ssh -p <port> -i <identity>"] <user>@<host>`. mosh performs the
+/// SSH bootstrap itself, so port/identity go into its `--ssh` option and the
+/// target is a bare `user@host` (no `:port`). This fallback only carries port +
+/// identity; arbitrary `ssh_options` and stored passwords are not plumbed
+/// through because the wrapper's SSH bootstrap is interactive.
+pub fn build_mosh_args(spec: &SshHostSpec) -> Vec<String> {
+    let mut ssh = String::from("ssh");
+    if let Some(port) = spec.port {
+        if port != 22 {
+            ssh.push_str(&format!(" -p {port}"));
+        }
+    }
+    if let Some(identity) = spec.identity_file.as_deref().filter(|s| !s.is_empty()) {
+        let identity = shlex::try_quote(identity)
+            .unwrap_or_else(|_| identity.into())
+            .into_owned();
+        ssh.push_str(&format!(" -i {identity}"));
+    }
+
+    let mut args = vec!["mosh".to_string()];
+    if ssh != "ssh" {
+        args.push(format!("--ssh={ssh}"));
+    }
+
+    let target = match spec.username.as_deref().filter(|s| !s.is_empty()) {
+        Some(user) => format!("{user}@{}", spec.host),
+        None => spec.host.clone(),
+    };
+    args.push(target);
+    args
+}
+
+pub fn build_mosh_fallback_spawn(spec: &SshHostSpec) -> SpawnCommand {
+    SpawnCommand {
+        label: Some(format!("mosh {}", spec.label)),
+        args: Some(build_mosh_args(spec)),
+        domain: SpawnTabDomain::DomainName("local".to_string()),
+        ..Default::default()
+    }
+}
+
+fn parse_mosh_connect(output: &str) -> Option<(u16, String)> {
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("MOSH") || parts.next() != Some("CONNECT") {
+            continue;
+        }
+        let Some(port) = parts.next().and_then(|port| port.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(key) = parts.next().filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        let key = key.to_string();
+        if !key.is_empty() {
+            return Some((port, key));
+        }
+    }
+    None
+}
+
+fn build_mosh_client_spawn(
+    spec: &SshHostSpec,
+    host: String,
+    port: u16,
+    key: String,
+) -> SpawnCommand {
+    let mut env = HashMap::new();
+    env.insert("MOSH_KEY".to_string(), key);
+    SpawnCommand {
+        label: Some(format!("mosh {}", spec.label)),
+        args: Some(vec!["mosh-client".to_string(), host, port.to_string()]),
+        set_environment_variables: env,
+        domain: SpawnTabDomain::DomainName("local".to_string()),
+        ..Default::default()
+    }
+}
+
+fn read_fd_to_string(mut fd: FileDescriptor) -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    fd.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+async fn connect_mosh_bootstrap_session(spec: &SshHostSpec) -> Result<(Session, String)> {
+    let dom = build_ssh_domain(spec);
+    let ssh_config = mux::ssh::ssh_domain_to_ssh_config(&dom).context("build SSH config")?;
+    let mosh_client_host = ssh_config
+        .get("hostname")
+        .cloned()
+        .unwrap_or_else(|| spec.host.clone());
+    let (session, events) = Session::connect(ssh_config).context("connect to SSH server")?;
+    let mut password = spec
+        .password
+        .as_deref()
+        .map(crate::secret::reveal)
+        .filter(|p| !p.is_empty());
+
+    while let Ok(event) = events.recv().await {
+        match event {
+            SessionEvent::Banner(_) => {}
+            SessionEvent::HostVerify(verify) => {
+                bail!(
+                    "SSH host verification requires interactive confirmation: {}",
+                    verify.message
+                );
+            }
+            SessionEvent::Authenticate(auth) => {
+                let mut answers = vec![];
+                for prompt in &auth.prompts {
+                    if prompt.echo {
+                        bail!("SSH authentication requires an interactive prompt");
+                    }
+                    let Some(stored) = password.take() else {
+                        bail!("SSH authentication requires a saved password");
+                    };
+                    answers.push(stored);
+                }
+                auth.answer(answers)
+                    .await
+                    .context("answer SSH authentication prompt")?;
+            }
+            SessionEvent::HostVerificationFailed(failed) => {
+                bail!("SSH host verification failed: {}", failed);
+            }
+            SessionEvent::Error(err) => bail!("SSH error: {}", err),
+            SessionEvent::Authenticated => return Ok((session, mosh_client_host)),
+        }
+    }
+
+    bail!("SSH authentication did not complete")
+}
+
+pub async fn build_integrated_mosh_spawn(spec: &SshHostSpec) -> Result<SpawnCommand> {
+    let command = spec.mosh_server_command.trim();
+    if command.is_empty() {
+        bail!("Mosh server command is empty");
+    }
+
+    let (session, host) = connect_mosh_bootstrap_session(spec).await?;
+    let exec = session
+        .exec(command, None)
+        .await
+        .context("run mosh-server command")?;
+    let stdout = exec.stdout;
+    let stderr = exec.stderr;
+    let mut child = exec.child;
+    let stdout_reader = std::thread::spawn(move || read_fd_to_string(stdout));
+    let stderr_reader = std::thread::spawn(move || read_fd_to_string(stderr));
+    let status = child.async_wait().await.context("wait for mosh-server")?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("mosh-server stdout reader panicked"))?
+        .context("read mosh-server stdout")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("mosh-server stderr reader panicked"))?
+        .context("read mosh-server stderr")?;
+    let output = format!("{stdout}\n{stderr}");
+
+    let Some((port, key)) = parse_mosh_connect(&output) else {
+        if status.success() {
+            bail!("mosh-server output did not include MOSH CONNECT");
+        }
+        bail!("mosh-server exited with status {}", status.exit_code());
+    };
+
+    Ok(build_mosh_client_spawn(spec, host, port, key))
+}
+
 /// Deterministic mux domain name for a host. Stable across restarts so that a
 /// snapshotted SSH layout (which records the pane's domain name) can be
 /// re-materialized after [`register_saved_hosts`] re-registers the domain.
@@ -448,6 +639,8 @@ fn parse_system_ssh_config_str(content: &str) -> Vec<SshHostEntry> {
                 default_workspace: None,
                 detect_os: true,
                 detected_distro: None,
+                use_mosh: false,
+                mosh_server_command: default_mosh_server_command(),
             };
             out.push(SshHostEntry {
                 id: system_host_id(&alias),
@@ -593,6 +786,8 @@ Host prod *.internal
             default_workspace: None,
             detect_os: false,
             detected_distro: None,
+            use_mosh: false,
+            mosh_server_command: default_mosh_server_command(),
         }
     }
 
@@ -617,5 +812,130 @@ Host prod *.internal
             Some("3"),
             "an explicit connecttimeout override must win over the default"
         );
+    }
+
+    #[test]
+    fn build_mosh_args_plain_host() {
+        let spec = spec_with_options(HashMap::new());
+        // host-only (no user/port/identity): just `mosh host`.
+        assert_eq!(build_mosh_args(&spec), vec!["mosh", "example.com"]);
+    }
+
+    #[test]
+    fn build_mosh_args_includes_user() {
+        let mut spec = spec_with_options(HashMap::new());
+        spec.username = Some("deploy".to_string());
+        assert_eq!(build_mosh_args(&spec), vec!["mosh", "deploy@example.com"]);
+    }
+
+    #[test]
+    fn build_mosh_args_maps_port_and_identity_into_ssh() {
+        let mut spec = spec_with_options(HashMap::new());
+        spec.username = Some("deploy".to_string());
+        spec.port = Some(2222);
+        spec.identity_file = Some("/home/me/.ssh/prod".to_string());
+        assert_eq!(
+            build_mosh_args(&spec),
+            vec![
+                "mosh",
+                "--ssh=ssh -p 2222 -i /home/me/.ssh/prod",
+                "deploy@example.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_mosh_args_quotes_identity_with_spaces() {
+        let mut spec = spec_with_options(HashMap::new());
+        spec.identity_file = Some("/home/me/.ssh/prod key".to_string());
+        assert_eq!(
+            build_mosh_args(&spec),
+            vec![
+                "mosh",
+                "--ssh=ssh -i '/home/me/.ssh/prod key'",
+                "example.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_mosh_args_omits_default_port_22() {
+        let mut spec = spec_with_options(HashMap::new());
+        spec.port = Some(22);
+        // Port 22 is the default, so no `--ssh` is needed.
+        assert_eq!(build_mosh_args(&spec), vec!["mosh", "example.com"]);
+    }
+
+    #[test]
+    fn parse_mosh_connect_finds_line_in_noisy_output() {
+        assert_eq!(
+            parse_mosh_connect("banner\nMOSH CONNECT 60001 abc123\nready"),
+            Some((60001, "abc123".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_mosh_connect_rejects_invalid_output() {
+        assert_eq!(parse_mosh_connect("MOSH CONNECT nope abc123"), None);
+        assert_eq!(parse_mosh_connect("MOSH CONNECT 60001"), None);
+        assert_eq!(parse_mosh_connect("nothing useful"), None);
+    }
+
+    #[test]
+    fn parse_mosh_connect_skips_malformed_connect_lines() {
+        assert_eq!(
+            parse_mosh_connect("MOSH CONNECT nope abc123\nMOSH CONNECT 60001 good-key"),
+            Some((60001, "good-key".to_string()))
+        );
+        assert_eq!(
+            parse_mosh_connect("MOSH CONNECT 60001\nMOSH CONNECT 60002 better-key"),
+            Some((60002, "better-key".to_string()))
+        );
+    }
+
+    #[test]
+    fn build_mosh_client_spawn_puts_key_only_in_environment() {
+        let spec = spec_with_options(HashMap::new());
+        let spawn = build_mosh_client_spawn(
+            &spec,
+            "example.com".to_string(),
+            60001,
+            "abc123".to_string(),
+        );
+        assert_eq!(
+            spawn.args,
+            Some(vec![
+                "mosh-client".to_string(),
+                "example.com".to_string(),
+                "60001".to_string(),
+            ])
+        );
+        assert_eq!(
+            spawn
+                .set_environment_variables
+                .get("MOSH_KEY")
+                .map(String::as_str),
+            Some("abc123")
+        );
+        assert!(!spawn
+            .args
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|arg| arg.contains("abc123")));
+        assert_eq!(
+            spawn.domain,
+            SpawnTabDomain::DomainName("local".to_string())
+        );
+    }
+
+    #[test]
+    fn use_mosh_defaults_false_when_absent() {
+        // Existing saved hosts (serialized before `use_mosh` existed) must load
+        // with mosh off.
+        let spec: SshHostSpec =
+            serde_json::from_str(r#"{"label":"t","host":"example.com"}"#).unwrap();
+        assert!(!spec.use_mosh);
+        assert_eq!(spec.mosh_server_command, DEFAULT_MOSH_SERVER_COMMAND);
     }
 }
