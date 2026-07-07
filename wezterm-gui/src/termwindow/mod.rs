@@ -59,7 +59,7 @@ use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::ops::Add;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -296,6 +296,7 @@ pub enum UIItemType {
     RightSidebarFilePreviewHorizontalScrollThumb,
     RightSidebarFilePreviewText,
     RightSidebarFileFilter,
+    RightSidebarFileRefresh,
     RightSidebarFileRow(PathBuf),
     RightSidebarFileBack,
     RightSidebarFileOpen,
@@ -337,6 +338,20 @@ pub enum RightSidebarSnippetField {
 pub enum RightSidebarFileView {
     Tree,
     Preview,
+}
+
+/// Remembered Files-panel view state for one (root, project), so switching
+/// workspaces / idle-release / re-scan can restore where the user was. Holds
+/// only paths + scroll + the effective filter (a few KB) — never the index.
+#[derive(Clone, Debug)]
+pub(crate) struct RightSidebarFileViewState {
+    pub view: RightSidebarFileView,
+    pub selected: Option<PathBuf>,
+    pub expanded: HashSet<String>,
+    pub tree_scroll: f32,
+    pub preview_scroll: f32,
+    pub preview_horizontal: usize,
+    pub filter: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,12 +488,22 @@ pub(crate) enum TabWheelSurface {
 }
 
 #[derive(Clone, Debug)]
+struct FileDragState {
+    path: PathBuf,
+    start: ::window::Point,
+    current: ::window::Point,
+    active: bool,
+}
+
+#[derive(Clone, Debug)]
 enum InlineTabRenameTarget {
     WindowTab(TabId),
     PaneTab(PaneId),
     Space(String),
     Project(String),
     WorkspaceThread(String),
+    /// A file row in the right sidebar Files panel; commits via fs::rename.
+    File(PathBuf),
 }
 
 #[derive(Clone, Debug)]
@@ -935,6 +960,10 @@ pub struct TermWindow {
     context_menu: Option<ui::context_menu::ContextMenuState>,
     context_menu_suppressed_release: Option<MousePress>,
     dragging: Option<(UIItem, MouseEvent)>,
+    // In-flight drag of a Files-panel row toward the terminal; becomes
+    // active once the pointer moves past a small threshold so plain clicks
+    // still open the file.
+    right_sidebar_file_drag: Option<FileDragState>,
     /// Content views (e.g. SSH hosts) shown as synthetic tabs.
     content_views: Vec<ContentViewTab>,
     active_content_view_id: Option<ContentViewId>,
@@ -1013,6 +1042,20 @@ pub struct TermWindow {
     right_sidebar_file_tree_scroll_offset: f32,
     right_sidebar_file_preview_scroll_offset: f32,
     right_sidebar_file_preview_horizontal_offset: usize,
+    // When restoring a remembered preview, the async load result resets the
+    // scroll to 0; this carries the offsets to re-apply once the lines arrive.
+    right_sidebar_file_preview_restore_scroll: Option<(f32, usize)>,
+    // Per-(root, project) remembered Files-panel view state (expanded folders,
+    // selected/preview, scroll, filter) so switching workspaces / idle-release /
+    // re-scan don't lose where you were. Only a few KB of paths each; LRU-bounded.
+    right_sidebar_file_view_state_by_root:
+        HashMap<(PathBuf, String), RightSidebarFileViewState>,
+    right_sidebar_file_view_state_order: VecDeque<(PathBuf, String)>,
+    // Bumped to invalidate a pending periodic-rescan timer tick.
+    right_sidebar_file_rescan_token: u64,
+    // True while a keep-showing refresh build is in flight (drives the Refresh
+    // button spinner); the old tree stays visible meanwhile.
+    right_sidebar_file_refreshing: bool,
     right_sidebar_open_with_generation: u64,
     right_sidebar_open_with_cache: HashMap<String, RightSidebarOpenWithCacheEntry>,
     right_sidebar_open_with_app: Option<crate::native_settings::NativeOpenWithApp>,
@@ -1205,6 +1248,12 @@ impl TermWindow {
             for state in self.pane_state.borrow_mut().values_mut() {
                 state.mouse_terminal_coords.take();
             }
+
+            // Losing window focus commits a pending inline rename (same as
+            // clicking away) and abandons any in-flight file drag.
+            self.finish_inline_tab_rename(true);
+            self.right_sidebar_file_drag = None;
+            self.dragging = None;
         }
 
         // Reset the cursor blink phase
@@ -1219,6 +1268,12 @@ impl TermWindow {
 
         self.update_title();
         self.emit_window_event("window-focus-changed", None);
+
+        // On regaining focus, refresh the Files tree + (re)start its periodic
+        // re-scan; on blur the cycle lapses (its next tick gates on focus).
+        if focused {
+            self.kick_right_sidebar_file_rescan_cycle();
+        }
     }
 
     fn created(&mut self, ctx: RenderContext) -> anyhow::Result<()> {
@@ -1499,6 +1554,7 @@ impl TermWindow {
             context_menu: None,
             context_menu_suppressed_release: None,
             dragging: None,
+            right_sidebar_file_drag: None,
             content_views: vec![],
             active_content_view_id: None,
             content_view_response_tab_id: None,
@@ -1564,6 +1620,11 @@ impl TermWindow {
             right_sidebar_file_tree_scroll_offset: 0.0,
             right_sidebar_file_preview_scroll_offset: 0.0,
             right_sidebar_file_preview_horizontal_offset: 0,
+            right_sidebar_file_preview_restore_scroll: None,
+            right_sidebar_file_view_state_by_root: HashMap::new(),
+            right_sidebar_file_view_state_order: VecDeque::new(),
+            right_sidebar_file_rescan_token: 0,
+            right_sidebar_file_refreshing: false,
             right_sidebar_open_with_generation: 0,
             right_sidebar_open_with_cache: HashMap::new(),
             right_sidebar_open_with_app: crate::native_settings::right_sidebar_open_with_app(),
@@ -3894,6 +3955,41 @@ impl TermWindow {
         }
     }
 
+    /// Whether the given pressed UI item is the surface currently hosting the
+    /// inline rename editor; presses there must not auto-commit the rename.
+    fn ui_item_hosts_inline_rename(&self, item: Option<&UIItemType>) -> bool {
+        let Some(rename) = self.inline_tab_rename.as_ref() else {
+            return false;
+        };
+        let Some(item) = item else {
+            return false;
+        };
+        match (&rename.target, item) {
+            (
+                InlineTabRenameTarget::WindowTab(tab_id),
+                UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }),
+            ) => {
+                Mux::get()
+                    .get_window(self.mux_window_id)
+                    .and_then(|window| window.get_by_idx(*tab_idx).map(|tab| tab.tab_id()))
+                    == Some(*tab_id)
+            }
+            (InlineTabRenameTarget::PaneTab(pane_id), UIItemType::PaneNav { pane_id: p, .. }) => {
+                p == pane_id
+            }
+            (InlineTabRenameTarget::Space(_), UIItemType::SpaceMenu) => true,
+            (InlineTabRenameTarget::Project(id), UIItemType::Project(other)) => id == other,
+            (InlineTabRenameTarget::WorkspaceThread(id), UIItemType::WorkspaceThread(other)) => {
+                id == other
+            }
+            (
+                InlineTabRenameTarget::File(path),
+                UIItemType::RightSidebarFileRow(other),
+            ) => path == other,
+            _ => false,
+        }
+    }
+
     fn finish_inline_tab_rename(&mut self, commit: bool) {
         let rename = match self.inline_tab_rename.take() {
             Some(rename) => rename,
@@ -3924,10 +4020,69 @@ impl TermWindow {
                 InlineTabRenameTarget::WorkspaceThread(thread_id) => {
                     crate::workspace_threads::rename_thread(&thread_id, title);
                 }
+                InlineTabRenameTarget::File(path) => {
+                    self.commit_sidebar_file_rename(path, &title);
+                }
             }
         }
 
         self.update_title_impl();
+    }
+
+    pub(crate) fn start_sidebar_file_rename(&mut self, path: PathBuf) {
+        self.finish_inline_tab_rename(true);
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            return;
+        };
+        self.inline_tab_rename = Some(InlineTabRename::new(
+            InlineTabRenameTarget::File(path),
+            name,
+        ));
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    fn commit_sidebar_file_rename(&mut self, old_path: PathBuf, new_name: &str) {
+        if new_name.is_empty() || new_name.contains(std::path::is_separator) {
+            return;
+        }
+        if old_path.file_name().map(|n| n.to_string_lossy()) == Some(new_name.into()) {
+            return;
+        }
+        let Some(parent) = old_path.parent() else {
+            return;
+        };
+        let new_path = parent.join(new_name);
+        if new_path.exists() {
+            log::warn!(
+                "not renaming {} to {new_name}: target already exists",
+                old_path.display()
+            );
+            return;
+        }
+        if let Err(err) = std::fs::rename(&old_path, &new_path) {
+            log::error!("failed to rename {}: {err:#}", old_path.display());
+            return;
+        }
+        if self.right_sidebar_file_selected.as_ref() == Some(&old_path) {
+            self.right_sidebar_file_selected = Some(new_path);
+        }
+        self.force_right_sidebar_file_rescan();
+    }
+
+    pub(crate) fn is_renaming_sidebar_file(&self, path: &Path) -> bool {
+        self.inline_tab_rename.as_ref().is_some_and(
+            |rename| matches!(&rename.target, InlineTabRenameTarget::File(p) if p == path),
+        )
+    }
+
+    pub(crate) fn sidebar_file_row_title(&self, path: &Path, name: &str) -> String {
+        self.inline_tab_rename
+            .as_ref()
+            .filter(|rename| matches!(&rename.target, InlineTabRenameTarget::File(p) if p == path))
+            .map(|rename| rename.display_text())
+            .unwrap_or_else(|| name.to_string())
     }
 
     fn inline_window_tab_rename_title(&self, tab_id: TabId) -> Option<String> {
@@ -3945,7 +4100,8 @@ impl TermWindow {
                 InlineTabRenameTarget::PaneTab(_)
                 | InlineTabRenameTarget::Space(_)
                 | InlineTabRenameTarget::Project(_)
-                | InlineTabRenameTarget::WorkspaceThread(_) => None,
+                | InlineTabRenameTarget::WorkspaceThread(_)
+                | InlineTabRenameTarget::File(_) => None,
             })
     }
 
@@ -4530,8 +4686,36 @@ impl TermWindow {
             OpenFileWithSystemDefault(path) => {
                 wezterm_open_url::open_url(path);
             }
+            PickOpenFileWithApp(path) => {
+                let file_path = path.clone();
+                let Some(window) = self.window.as_ref().cloned() else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
+                let notify_window = window.clone();
+                window.pick_app_async(Box::new(move |app_path| {
+                    if let Some(app_path) = app_path {
+                        notify_window.notify(TermWindowNotif::Apply(Box::new(
+                            move |term_window| {
+                                term_window.finish_pick_open_with_app(&file_path, &app_path);
+                            },
+                        )));
+                    }
+                }));
+            }
             RevealFileInFolder(path) => {
                 wezterm_open_url::reveal_path(std::path::Path::new(path));
+            }
+            RenameSidebarFile(path) => {
+                self.start_sidebar_file_rename(PathBuf::from(path));
+            }
+            TrashSidebarFile(path) => {
+                self.trash_sidebar_file(Path::new(path));
+            }
+            CopyFilePathToClipboard(path) => {
+                self.copy_to_clipboard(
+                    config::keyassignment::ClipboardCopyDestination::Clipboard,
+                    path.clone(),
+                );
             }
             PromptRenameWorkspaceThread(thread_id) => {
                 self.prompt_rename_workspace_thread(thread_id.clone())

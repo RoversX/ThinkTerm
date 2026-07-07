@@ -13,7 +13,7 @@ use crate::termwindow::{
     RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
     RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSliceCacheKey,
     RightSidebarFilePreviewSliceCacheValue, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
-    RightSidebarFileView, RightSidebarInputLayout, RightSidebarMode,
+    RightSidebarFileView, RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
     TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup,
 };
@@ -106,6 +106,10 @@ const FILE_INDEX_ENTRY_LIMIT: usize = 100_000;
 // How long the file panel must stay closed/idle before its in-memory index and
 // buffers are released. Reopening within this window keeps everything resident.
 const FILE_INDEX_IDLE_RELEASE_SECS: u64 = 30;
+// How often the Files panel re-scans the tree while it's visible + focused.
+const FILE_INDEX_RESCAN_SECS: u64 = 90;
+// Max number of (root, project) view-state snapshots kept in memory.
+const FILE_VIEW_STATE_CACHE_CAP: usize = 32;
 const FILE_FILTER_DEBOUNCE_MS: u64 = 350;
 
 #[derive(Debug, Clone, Copy)]
@@ -453,11 +457,14 @@ impl crate::TermWindow {
         self.right_sidebar_collapsed = !self.right_sidebar_collapsed;
         if self.right_sidebar_collapsed {
             self.schedule_right_sidebar_file_memory_release();
+        } else {
+            self.kick_right_sidebar_file_rescan_cycle();
         }
     }
 
     pub fn expand_right_sidebar(&mut self) {
         self.right_sidebar_collapsed = false;
+        self.kick_right_sidebar_file_rescan_cycle();
     }
 
     /// The file panel (and its in-memory index) is only relevant while the right
@@ -501,6 +508,10 @@ impl crate::TermWindow {
             return;
         }
 
+        // Remember the view (paths/scroll/filter, a few KB) BEFORE the teardown
+        // wipes selected/preview, so reopening this root restores where we were.
+        self.save_right_sidebar_file_view_state();
+
         if let Some(cancel) = self.right_sidebar_file_index_cancel.take() {
             cancel.store(true, AtomicOrdering::Relaxed);
         }
@@ -515,6 +526,79 @@ impl crate::TermWindow {
         self.right_sidebar_file_browse_rows = Vec::new();
         self.right_sidebar_file_browse_cache_key = None;
         self.invalidate_window();
+    }
+
+    fn right_sidebar_file_view_state_key(&self) -> Option<(PathBuf, String)> {
+        self.right_sidebar_file_index_root
+            .clone()
+            .map(|root| (root, self.right_sidebar_file_index_project_name.clone()))
+    }
+
+    /// Snapshot the active (root, project)'s Files view (paths/scroll/effective
+    /// filter) so it survives idle-release / workspace switch / re-scan. KB-scale,
+    /// LRU-bounded; never holds the index.
+    fn save_right_sidebar_file_view_state(&mut self) {
+        let Some(key) = self.right_sidebar_file_view_state_key() else {
+            return;
+        };
+        let state = RightSidebarFileViewState {
+            view: self.right_sidebar_file_view.clone(),
+            selected: self.right_sidebar_file_selected.clone(),
+            expanded: self.right_sidebar_file_expanded.clone(),
+            tree_scroll: self.right_sidebar_file_tree_scroll_offset,
+            preview_scroll: self.right_sidebar_file_preview_scroll_offset,
+            preview_horizontal: self.right_sidebar_file_preview_horizontal_offset,
+            filter: self.right_sidebar_file_applied_filter.clone(),
+        };
+        if !self.right_sidebar_file_view_state_by_root.contains_key(&key) {
+            self.right_sidebar_file_view_state_order.push_back(key.clone());
+        }
+        self.right_sidebar_file_view_state_by_root.insert(key, state);
+        while self.right_sidebar_file_view_state_order.len() > FILE_VIEW_STATE_CACHE_CAP {
+            if let Some(old) = self.right_sidebar_file_view_state_order.pop_front() {
+                self.right_sidebar_file_view_state_by_root.remove(&old);
+            }
+        }
+    }
+
+    /// Restore the remembered view for `key`, or apply defaults (tree view, only
+    /// the project root expanded, no filter). Re-loads the preview asynchronously
+    /// when one was open (the lines were dropped on release), preserving scroll.
+    fn restore_right_sidebar_file_view_state(&mut self, key: &(PathBuf, String)) {
+        self.right_sidebar_file_expanded_version =
+            self.right_sidebar_file_expanded_version.wrapping_add(1);
+
+        let Some(state) = self.right_sidebar_file_view_state_by_root.get(key).cloned() else {
+            self.right_sidebar_file_view = RightSidebarFileView::Tree;
+            self.right_sidebar_file_selected = None;
+            self.right_sidebar_file_expanded.clear();
+            self.right_sidebar_file_expanded.insert(path_key(&key.0));
+            self.right_sidebar_file_tree_scroll_offset = 0.0;
+            self.right_sidebar_file_filter.set_text_end(String::new());
+            self.right_sidebar_file_applied_filter.clear();
+            self.right_sidebar_file_filter_debounce_until = None;
+            return;
+        };
+
+        self.right_sidebar_file_expanded = state.expanded;
+        self.right_sidebar_file_tree_scroll_offset = state.tree_scroll;
+        // Filter: set all three coupled fields so the first frame is consistent.
+        self.right_sidebar_file_filter.set_text_end(state.filter.clone());
+        self.right_sidebar_file_applied_filter = state.filter;
+        self.right_sidebar_file_filter_debounce_until = None;
+
+        match (state.view, state.selected) {
+            (RightSidebarFileView::Preview, Some(path)) if path.is_file() => {
+                self.open_right_sidebar_file_path_inner(
+                    path,
+                    Some((state.preview_scroll, state.preview_horizontal)),
+                );
+            }
+            _ => {
+                self.right_sidebar_file_view = RightSidebarFileView::Tree;
+                self.right_sidebar_file_selected = None;
+            }
+        }
     }
 
     pub(crate) fn right_sidebar_toggle_icon(&self) -> SvgIcon {
@@ -703,6 +787,18 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn open_right_sidebar_file_path(&mut self, path: PathBuf) {
+        self.open_right_sidebar_file_path_inner(path, None);
+    }
+
+    /// `restore_scroll` re-applies a remembered preview scroll once the async
+    /// load completes (consumed in `apply_right_sidebar_file_preview_result`);
+    /// `None` (a normal click) resets to the top.
+    fn open_right_sidebar_file_path_inner(
+        &mut self,
+        path: PathBuf,
+        restore_scroll: Option<(f32, usize)>,
+    ) {
+        self.right_sidebar_file_preview_restore_scroll = restore_scroll;
         self.right_sidebar_file_focus = None;
         if path.is_dir() {
             let key = path_key(&path);
@@ -769,6 +865,27 @@ impl crate::TermWindow {
             })));
         })
         .detach();
+    }
+
+    pub(crate) fn trash_sidebar_file(&mut self, path: &Path) {
+        if let Err(err) = trash::delete(path) {
+            log::error!("failed to move {} to trash: {err:#}", path.display());
+            return;
+        }
+        if self.right_sidebar_file_selected.as_deref() == Some(path) {
+            // Closing the preview narrows the sidebar, so the terminal must
+            // reflow or it keeps rendering under the old, wider sidebar.
+            let previous_width = self.right_sidebar_width();
+            self.close_right_sidebar_file_preview();
+            if let Some(window) = self.window.as_ref().cloned() {
+                if self.right_sidebar_width() != previous_width {
+                    let dimensions = self.dimensions;
+                    self.apply_dimensions(&dimensions, None, &window);
+                }
+                window.invalidate();
+            }
+        }
+        self.force_right_sidebar_file_rescan();
     }
 
     pub(crate) fn close_right_sidebar_file_preview(&mut self) {
@@ -899,8 +1016,14 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_message = result.message;
         self.right_sidebar_file_preview_truncated = result.truncated;
         self.right_sidebar_file_preview_selection = None;
-        self.right_sidebar_file_preview_scroll_offset = 0.0;
-        self.right_sidebar_file_preview_horizontal_offset = 0;
+        // When restoring a remembered preview, re-apply the saved scroll once the
+        // lines arrive (clamped on paint); otherwise reset to the top.
+        let (scroll, horizontal) = self
+            .right_sidebar_file_preview_restore_scroll
+            .take()
+            .unwrap_or((0.0, 0));
+        self.right_sidebar_file_preview_scroll_offset = scroll;
+        self.right_sidebar_file_preview_horizontal_offset = horizontal;
         self.invalidate_window();
     }
 
@@ -934,6 +1057,54 @@ impl crate::TermWindow {
         self.start_right_sidebar_open_with_load_if_needed(&key, &path);
         let items = self.right_sidebar_open_with_menu_items(&key, &path);
         self.show_term_context_menu(context, anchor, items);
+    }
+
+    pub(crate) fn show_right_sidebar_file_context_menu(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: window::Point,
+        path: PathBuf,
+    ) {
+        // Deliberately not touching right_sidebar_file_selected: that field
+        // tracks the open preview, and every action here carries its own path.
+        let items = self.right_sidebar_file_context_menu_items(&path);
+        self.show_term_context_menu(context, anchor, items);
+    }
+
+    /// File-operations menu for right-clicking a Files row. Open With lives
+    /// in the preview toolbar only, so this menu stays about the file itself.
+    fn right_sidebar_file_context_menu_items(&self, path: &Path) -> Vec<ContextMenuItem> {
+        let path_string = path.to_string_lossy().to_string();
+        let mut items = Vec::new();
+        if !path.is_dir() {
+            items.push(ContextMenuItem::item_with_icon(
+                "Open",
+                "arrow.up.forward.app",
+                KeyAssignment::OpenFileWithSystemDefault(path_string.clone()),
+            ));
+        }
+        items.push(ContextMenuItem::item_with_icon(
+            "Reveal in Folder",
+            "folder",
+            KeyAssignment::RevealFileInFolder(path_string.clone()),
+        ));
+        items.push(ContextMenuItem::item_with_icon(
+            "Copy Path",
+            "doc.on.doc",
+            KeyAssignment::CopyFilePathToClipboard(path_string.clone()),
+        ));
+        items.push(ContextMenuItem::Separator);
+        items.push(ContextMenuItem::item_with_icon(
+            "Rename...",
+            "pencil",
+            KeyAssignment::RenameSidebarFile(path_string.clone()),
+        ));
+        items.push(ContextMenuItem::item_with_icon(
+            "Move to Trash",
+            "trash",
+            KeyAssignment::TrashSidebarFile(path_string),
+        ));
+        items
     }
 
     fn start_right_sidebar_open_with_load_if_needed(&mut self, key: &str, path: &Path) {
@@ -1010,27 +1181,91 @@ impl crate::TermWindow {
         let current_id = self
             .current_right_sidebar_open_with_app(key)
             .map(|app| app.id);
-        let Some(RightSidebarOpenWithCacheEntry::Ready(candidates)) =
-            self.right_sidebar_open_with_cache.get(key)
-        else {
-            return Vec::new();
+        // Even with no platform candidates (Loading/Failed) the menu still
+        // offers the user's custom apps and the "Other…" picker.
+        let mut candidates = match self.right_sidebar_open_with_cache.get(key) {
+            Some(RightSidebarOpenWithCacheEntry::Ready(candidates)) => candidates.clone(),
+            _ => Vec::new(),
         };
 
-        sorted_open_with_candidates(candidates.clone(), current_id.as_deref())
-            .into_iter()
-            .filter(|candidate| current_id.as_deref() != Some(candidate.id.as_str()))
-            .map(|candidate| {
-                ContextMenuItem::item_with_icon(
-                    format!("Open With {}", candidate.label),
-                    "app",
-                    KeyAssignment::OpenFileWith {
-                        path: path_string.clone(),
-                        app: candidate.id,
-                        label: candidate.label,
-                    },
-                )
-            })
-            .collect()
+        let custom_apps = crate::native_settings::right_sidebar_custom_open_with_apps();
+        let custom_ids: std::collections::HashSet<String> =
+            custom_apps.iter().map(|app| app.id.clone()).collect();
+        for app in custom_apps {
+            if candidates.iter().any(|candidate| candidate.id == app.id) {
+                // Platform entry wins so is_default stays accurate
+                continue;
+            }
+            // Drop custom entries whose app was uninstalled; `desktop:` ids
+            // (Linux) aren't paths, so they skip the existence check.
+            if !app.id.starts_with("desktop:") && !Path::new(&app.id).exists() {
+                continue;
+            }
+            candidates.push(wezterm_open_url::OpenWithCandidate {
+                id: app.id,
+                label: app.label,
+                icon_path: None,
+                is_default: false,
+            });
+        }
+
+        let saved_id = self
+            .right_sidebar_open_with_app
+            .as_ref()
+            .map(|app| app.id.clone());
+        candidates
+            .retain(|candidate| open_with_candidate_allowed(candidate, &custom_ids, saved_id.as_deref()));
+
+        let mut items: Vec<ContextMenuItem> =
+            sorted_open_with_candidates(candidates, current_id.as_deref())
+                .into_iter()
+                .filter(|candidate| current_id.as_deref() != Some(candidate.id.as_str()))
+                .map(|candidate| {
+                    ContextMenuItem::item_with_icon(
+                        format!("Open With {}", candidate.label),
+                        "app",
+                        KeyAssignment::OpenFileWith {
+                            path: path_string.clone(),
+                            app: candidate.id,
+                            label: candidate.label,
+                        },
+                    )
+                })
+                .collect();
+
+        if !items.is_empty() {
+            items.push(ContextMenuItem::Separator);
+        }
+        items.push(ContextMenuItem::item_with_icon(
+            "Open With Other…",
+            "app",
+            KeyAssignment::PickOpenFileWithApp(path_string),
+        ));
+        items
+    }
+
+    /// Completion of the "Open With Other…" app picker: persist the picked
+    /// app as a custom entry + current preference, then open the file.
+    pub(crate) fn finish_pick_open_with_app(&mut self, file_path: &str, app_path: &Path) {
+        let (id, label) = wezterm_open_url::app_candidate_for_picked_path(app_path);
+        if id.is_empty() {
+            return;
+        }
+        let app = crate::native_settings::NativeOpenWithApp {
+            id: id.clone(),
+            label,
+        };
+        if let Err(err) =
+            crate::native_settings::add_right_sidebar_custom_open_with_app(app.clone())
+        {
+            log::error!("failed to save custom Open With app: {err:#}");
+        }
+        self.right_sidebar_open_with_app = Some(app.clone());
+        if let Err(err) = crate::native_settings::save_right_sidebar_open_with_app(app) {
+            log::error!("failed to save Open With app selection: {err:#}");
+        }
+        wezterm_open_url::open_path_with_candidate(Path::new(file_path), &id);
+        self.invalidate_window();
     }
 
     fn current_right_sidebar_open_with_app(
@@ -1302,21 +1537,86 @@ impl crate::TermWindow {
             return;
         }
 
+        let new_key = (root.path.clone(), root.project_name.clone());
+
         if !same_root {
             let previous_width = self.right_sidebar_width();
+            // Remember the outgoing root's view, then restore the incoming one
+            // (replaces the old blanket clear of expanded + preview).
+            self.save_right_sidebar_file_view_state();
             self.close_right_sidebar_file_preview();
             self.right_sidebar_file_browse_rows.clear();
             self.right_sidebar_file_browse_cache_key = None;
-            self.right_sidebar_file_expanded.clear();
-            self.right_sidebar_file_expanded
-                .insert(path_key(&root.path));
-            self.right_sidebar_file_expanded_version =
-                self.right_sidebar_file_expanded_version.wrapping_add(1);
+            self.right_sidebar_file_index_root = Some(root.path.clone());
+            self.right_sidebar_file_index_project_name = root.project_name.clone();
+            self.restore_right_sidebar_file_view_state(&new_key);
             if self.right_sidebar_width() != previous_width {
                 self.schedule_right_sidebar_reflow();
             }
+        } else {
+            // Same root, status Empty/Failed (e.g. after idle-release): restore
+            // the view the release tore down before rebuilding.
+            self.restore_right_sidebar_file_view_state(&new_key);
         }
 
+        self.spawn_right_sidebar_file_index_build(
+            root.path.clone(),
+            root.project_name.clone(),
+            false,
+            false,
+        );
+    }
+
+    fn clear_right_sidebar_file_root_for_unavailable_project(&mut self) {
+        if self.right_sidebar_file_index_root.is_some() {
+            self.save_right_sidebar_file_view_state();
+        }
+        let previous_width = self.right_sidebar_width();
+        if let Some(cancel) = self.right_sidebar_file_index_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        if let Some(cancel) = self.right_sidebar_file_search_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        self.close_right_sidebar_file_preview();
+        self.clear_right_sidebar_file_search();
+        self.right_sidebar_file_index_root = None;
+        self.right_sidebar_file_index_project_name.clear();
+        self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Empty;
+        self.right_sidebar_file_index = None;
+        self.right_sidebar_file_browse_rows.clear();
+        self.right_sidebar_file_browse_cache_key = None;
+        self.right_sidebar_file_refreshing = false;
+        if self.right_sidebar_width() != previous_width {
+            self.schedule_right_sidebar_reflow();
+        }
+    }
+
+    fn sync_right_sidebar_file_root_for_current_workspace(
+        &mut self,
+    ) -> Result<RightSidebarFileRoot, String> {
+        let root = match self.active_local_project_for_files() {
+            Ok(root) => root,
+            Err(err) => {
+                self.clear_right_sidebar_file_root_for_unavailable_project();
+                return Err(err);
+            }
+        };
+        self.start_right_sidebar_file_index_if_needed(&root);
+        Ok(root)
+    }
+
+    /// Build (or refresh) the file index on a background thread. `fresh` bypasses
+    /// the shared-registry reuse (forces a real disk scan); `keep_showing` leaves
+    /// the current tree + status on screen and only swaps the new `Arc` in on
+    /// apply (no "Indexing files…" flicker during a refresh).
+    fn spawn_right_sidebar_file_index_build(
+        &mut self,
+        root_path: PathBuf,
+        project_name: String,
+        fresh: bool,
+        keep_showing: bool,
+    ) {
         let Some(window) = self.window.as_ref().cloned() else {
             self.right_sidebar_file_index_status =
                 RightSidebarFileIndexStatus::Failed("Window is unavailable".to_string());
@@ -1326,38 +1626,52 @@ impl crate::TermWindow {
         if let Some(cancel) = self.right_sidebar_file_index_cancel.take() {
             cancel.store(true, AtomicOrdering::Relaxed);
         }
-        if let Some(cancel) = self.right_sidebar_file_search_cancel.take() {
-            cancel.store(true, AtomicOrdering::Relaxed);
-        }
         let index_cancel = Arc::new(AtomicBool::new(false));
         self.right_sidebar_file_index_cancel = Some(index_cancel.clone());
         self.right_sidebar_file_index_generation =
             self.right_sidebar_file_index_generation.wrapping_add(1);
         let generation = self.right_sidebar_file_index_generation;
-        let root_path = root.path.clone();
-        let project_name = root.project_name.clone();
 
         self.right_sidebar_file_index_root = Some(root_path.clone());
         self.right_sidebar_file_index_project_name = project_name.clone();
-        self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Indexing;
-        self.right_sidebar_file_index = None;
-        self.right_sidebar_file_search_generation =
-            self.right_sidebar_file_search_generation.wrapping_add(1);
-        self.right_sidebar_file_search_query.clear();
-        self.right_sidebar_file_search_rows.clear();
-        self.right_sidebar_file_searching = false;
-        self.right_sidebar_file_tree_scroll_offset = 0.0;
+
+        if keep_showing {
+            // Refresh: keep the current tree + Ready visible; `apply` swaps the
+            // new index in when it arrives. View state is left untouched.
+            self.right_sidebar_file_refreshing = true;
+        } else {
+            self.right_sidebar_file_refreshing = false;
+            self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Indexing;
+            self.right_sidebar_file_index = None;
+            if let Some(cancel) = self.right_sidebar_file_search_cancel.take() {
+                cancel.store(true, AtomicOrdering::Relaxed);
+            }
+            self.right_sidebar_file_search_generation =
+                self.right_sidebar_file_search_generation.wrapping_add(1);
+            self.right_sidebar_file_search_query.clear();
+            self.right_sidebar_file_search_rows.clear();
+            self.right_sidebar_file_searching = false;
+            // tree scroll is owned by restore_right_sidebar_file_view_state.
+        }
 
         let index_root_path = root_path.clone();
         let index_project_name = project_name.clone();
         let worker_cancel = index_cancel.clone();
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
-                Ok(build_or_reuse_shared_file_index(
-                    &index_root_path,
-                    &index_project_name,
-                    &worker_cancel,
-                ))
+                Ok(if fresh {
+                    build_fresh_shared_file_index(
+                        &index_root_path,
+                        &index_project_name,
+                        &worker_cancel,
+                    )
+                } else {
+                    build_or_reuse_shared_file_index(
+                        &index_root_path,
+                        &index_project_name,
+                        &worker_cancel,
+                    )
+                })
             })
             .await
             .unwrap_or_else(|err| Err(format!("Unable to index files: {err}")));
@@ -1371,6 +1685,84 @@ impl crate::TermWindow {
             })));
         })
         .detach();
+    }
+
+    /// Force a real (registry-bypassing) re-scan of the current root while
+    /// keeping the tree + view state on screen. Used by the periodic timer,
+    /// window/panel focus, and the manual Refresh button.
+    pub(crate) fn force_right_sidebar_file_rescan(&mut self) {
+        if !self.right_sidebar_file_view_active() || self.right_sidebar_file_refreshing {
+            return;
+        }
+        if self
+            .sync_right_sidebar_file_root_for_current_workspace()
+            .is_err()
+        {
+            return;
+        }
+        if !matches!(
+            self.right_sidebar_file_index_status,
+            RightSidebarFileIndexStatus::Ready
+        ) {
+            return;
+        }
+        let Some((root, project)) = self.right_sidebar_file_view_state_key() else {
+            return;
+        };
+        self.spawn_right_sidebar_file_index_build(root, project, true, true);
+    }
+
+    /// Refresh now (if a tree is already loaded) and (re)start the 90s periodic
+    /// re-scan cycle. Called on window focus and when entering the file view; a
+    /// fresh open builds via the normal index path, so we only force when Ready.
+    pub(crate) fn kick_right_sidebar_file_rescan_cycle(&mut self) {
+        if !(self.right_sidebar_file_view_active() && self.focused.is_some()) {
+            return;
+        }
+        if self
+            .sync_right_sidebar_file_root_for_current_workspace()
+            .is_err()
+        {
+            return;
+        }
+        if matches!(
+            self.right_sidebar_file_index_status,
+            RightSidebarFileIndexStatus::Ready
+        ) {
+            self.force_right_sidebar_file_rescan();
+        }
+        self.schedule_right_sidebar_file_rescan();
+    }
+
+    /// Schedule the next periodic re-scan tick (token-guarded so close / blur /
+    /// root change makes a pending tick a no-op and the cycle stops).
+    pub(crate) fn schedule_right_sidebar_file_rescan(&mut self) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.right_sidebar_file_rescan_token =
+            self.right_sidebar_file_rescan_token.wrapping_add(1);
+        let token = self.right_sidebar_file_rescan_token;
+        let target = Instant::now() + Duration::from_secs(FILE_INDEX_RESCAN_SECS);
+        promise::spawn::spawn(async move {
+            smol::Timer::at(target).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.run_right_sidebar_file_periodic_rescan(token);
+            })));
+        })
+        .detach();
+    }
+
+    fn run_right_sidebar_file_periodic_rescan(&mut self, token: u64) {
+        // Superseded, panel hidden, or window blurred → let the cycle lapse.
+        if token != self.right_sidebar_file_rescan_token
+            || !self.right_sidebar_file_view_active()
+            || self.focused.is_none()
+        {
+            return;
+        }
+        self.force_right_sidebar_file_rescan();
+        self.schedule_right_sidebar_file_rescan();
     }
 
     fn apply_right_sidebar_file_index_result(
@@ -1387,11 +1779,20 @@ impl crate::TermWindow {
             return;
         }
         self.right_sidebar_file_index_cancel = None;
+        let was_refreshing = self.right_sidebar_file_refreshing;
+        self.right_sidebar_file_refreshing = false;
 
         match result {
             Ok(index) => {
                 self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Ready;
                 self.right_sidebar_file_index = Some(index);
+                if was_refreshing {
+                    self.right_sidebar_file_browse_rows.clear();
+                    self.right_sidebar_file_browse_cache_key = None;
+                    if !self.right_sidebar_file_applied_filter.trim().is_empty() {
+                        self.clear_right_sidebar_file_search();
+                    }
+                }
             }
             Err(err) => {
                 self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Failed(err);
@@ -2421,6 +2822,10 @@ impl crate::TermWindow {
         let ui_cell_height = ui_metrics.cell_size.height as usize;
         let icon_size = (ui_cell_height + 6).clamp(20, 24);
 
+        if self.right_sidebar_mode == RightSidebarMode::Chat {
+            let _ = self.sync_right_sidebar_file_root_for_current_workspace();
+        }
+
         if let Some(preview_rect) = self.right_sidebar_file_preview_rect() {
             let file_font_size = self.right_sidebar_file_preview_font_size();
             let file_font = self
@@ -3066,6 +3471,14 @@ impl crate::TermWindow {
         content_bottom: usize,
         icon_size: usize,
     ) -> anyhow::Result<()> {
+        // Reserve room on the right for an icon-only Refresh button so it never
+        // eats into the filename/search width.
+        let refresh_size = (ui_metrics.cell_size.height as usize + 12).clamp(28, 38);
+        let refresh_gap = SIDEBAR_INSET;
+        let filter_width = content_width.saturating_sub(refresh_size + refresh_gap);
+        let refresh_x = content_x + content_width - refresh_size;
+        let refresh_y = content_top + FILE_FILTER_HEIGHT.saturating_sub(refresh_size) / 2;
+
         let filter_input = self.right_sidebar_file_filter.clone();
         self.paint_snippet_text_box(
             layers,
@@ -3076,7 +3489,7 @@ impl crate::TermWindow {
             muted_fg,
             content_x,
             content_top,
-            content_width,
+            filter_width,
             FILE_FILTER_HEIGHT,
             Some(SvgIcon::Search),
             "Filter files",
@@ -3085,9 +3498,20 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileFilter,
             false,
         )?;
+        self.paint_files_preview_header_icon_button(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            refresh_x,
+            refresh_y,
+            refresh_size,
+            SvgIcon::RotateCcw,
+            UIItemType::RightSidebarFileRefresh,
+        )?;
 
         let tree_top = content_top + FILE_FILTER_HEIGHT + FILE_TREE_TOP_GAP;
-        let root = match self.active_local_project_for_files() {
+        let root = match self.sync_right_sidebar_file_root_for_current_workspace() {
             Ok(root) => root,
             Err(message) => {
                 return self.paint_files_message(
@@ -3112,7 +3536,6 @@ impl crate::TermWindow {
             self.right_sidebar_file_expanded_version =
                 self.right_sidebar_file_expanded_version.wrapping_add(1);
         }
-        self.start_right_sidebar_file_index_if_needed(&root);
 
         let applied_filter = self.right_sidebar_file_filter_for_tree();
         let index = match self.right_sidebar_file_index_status.clone() {
@@ -3508,11 +3931,12 @@ impl crate::TermWindow {
             }
         }
         let text_x = file_icon_x + row_icon_size + row_metrics.icon_gap;
+        let row_title = self.sidebar_file_row_title(&row.path, &row.name);
         self.paint_sidebar_text(
             layers,
             ui_font,
             ui_metrics,
-            &row.name,
+            &row_title,
             text_x,
             y + (row_metrics
                 .row_height
@@ -5724,6 +6148,86 @@ fn right_sidebar_open_with_cache_key(path: &Path) -> String {
         .unwrap_or_else(|| format!("path:{}", path.to_string_lossy()))
 }
 
+const OPEN_WITH_DEV_TOOL_NEEDLES: &[&str] = &[
+    "zed",
+    "visual studio code",
+    "vscode",
+    "code",
+    "cursor",
+    "xcode",
+    "android studio",
+    "sublime",
+    "webstorm",
+    "intellij",
+    "pycharm",
+    "goland",
+    "rustrover",
+    "vim",
+    "neovim",
+    "emacs",
+];
+
+const OPEN_WITH_PRODUCTIVITY_NEEDLES: &[&str] = &[
+    "excel",
+    "numbers",
+    "pages",
+    "keynote",
+    "word",
+    "powerpoint",
+    "preview",
+    "textedit",
+    "typora",
+    "obsidian",
+    "libreoffice",
+    "onlyoffice",
+    "okular",
+    "evince",
+];
+
+/// Match allowlist needles against the app NAME only: matching the id/path
+/// lets junk through (e.g. Instruments.app matches "xcode" merely because it
+/// lives inside Xcode.app).
+fn open_with_candidate_text(candidate: &wezterm_open_url::OpenWithCandidate) -> String {
+    candidate.label.to_lowercase()
+}
+
+/// Candidates living in hidden directories (~/.cache tool runtimes and the
+/// like) or nested inside another bundle (Xcode's Instruments, calibre's
+/// viewer) are implementation details, not apps the user chose to install.
+fn open_with_candidate_in_junk_location(candidate: &wezterm_open_url::OpenWithCandidate) -> bool {
+    let id = &candidate.id;
+    if !id.starts_with('/') {
+        // Not an absolute path (e.g. Linux `desktop:` ids): no location info
+        return false;
+    }
+    id.contains(".app/") || id.split('/').any(|component| component.starts_with('.'))
+}
+
+/// The Open With menu is curated: the system default, well-known editors /
+/// office apps, the saved preference and the user's own additions. Every
+/// other registered handler is noise and stays hidden.
+fn open_with_candidate_allowed(
+    candidate: &wezterm_open_url::OpenWithCandidate,
+    custom_ids: &std::collections::HashSet<String>,
+    saved_id: Option<&str>,
+) -> bool {
+    // Explicit user choices bypass the location heuristics
+    if custom_ids.contains(&candidate.id) || saved_id == Some(candidate.id.as_str()) {
+        return true;
+    }
+    if open_with_candidate_in_junk_location(candidate) {
+        return false;
+    }
+    if candidate.is_default {
+        return true;
+    }
+    let text = open_with_candidate_text(candidate);
+    OPEN_WITH_DEV_TOOL_NEEDLES
+        .iter()
+        .chain(OPEN_WITH_PRODUCTIVITY_NEEDLES.iter())
+        .any(|needle| text.contains(needle))
+}
+
 fn sorted_open_with_candidates(
     mut candidates: Vec<wezterm_open_url::OpenWithCandidate>,
     preferred_candidate_id: Option<&str>,
@@ -5736,38 +6240,26 @@ fn sorted_open_with_candidates(
             .then_with(|| open_with_candidate_rank(a).cmp(&open_with_candidate_rank(b)))
             .then_with(|| a.id.cmp(&b.id))
     });
-    candidates.truncate(20);
+    candidates.truncate(10);
     candidates
 }
 
 fn open_with_candidate_rank(candidate: &wezterm_open_url::OpenWithCandidate) -> (u8, String) {
-    let text = format!("{} {}", candidate.label, candidate.id).to_lowercase();
-    let is_developer_tool = [
-        "zed",
-        "visual studio code",
-        "vscode",
-        "code",
-        "cursor",
-        "xcode",
-        "android studio",
-        "sublime",
-        "webstorm",
-        "intellij",
-        "pycharm",
-        "goland",
-        "rustrover",
-        "vim",
-        "neovim",
-        "emacs",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle));
-    let rank = if is_developer_tool {
+    let text = open_with_candidate_text(candidate);
+    let rank = if OPEN_WITH_DEV_TOOL_NEEDLES
+        .iter()
+        .any(|needle| text.contains(needle))
+    {
         0
     } else if candidate.is_default {
         1
-    } else {
+    } else if OPEN_WITH_PRODUCTIVITY_NEEDLES
+        .iter()
+        .any(|needle| text.contains(needle))
+    {
         2
+    } else {
+        3
     };
     (rank, candidate.label.to_lowercase())
 }
@@ -5988,6 +6480,29 @@ fn build_or_reuse_shared_file_index(
 
     if let Ok(mut registry) = shared_file_index_registry().lock() {
         registry.insert(key, Arc::downgrade(&index));
+        registry.retain(|_, weak| weak.strong_count() > 0);
+    }
+    Ok(index)
+}
+
+/// Always scan disk (never returns a cached `Arc`) and publish the fresh index to
+/// the shared registry. Used by the manual/periodic/focus **refresh** so it can't
+/// "succeed" by handing back a stale index another window still holds.
+fn build_fresh_shared_file_index(
+    root: &Path,
+    project_name: &str,
+    cancel: &AtomicBool,
+) -> Result<Arc<RightSidebarFileIndex>, String> {
+    let index = Arc::new(build_right_sidebar_file_index_with_cancel(
+        root,
+        project_name,
+        cancel,
+    )?);
+    if let Ok(mut registry) = shared_file_index_registry().lock() {
+        registry.insert(
+            (root.to_path_buf(), project_name.to_string()),
+            Arc::downgrade(&index),
+        );
         registry.retain(|_, weak| weak.strong_count() > 0);
     }
     Ok(index)
@@ -6546,7 +7061,8 @@ mod tests {
         preview_lines_from_text, preview_plain_lines_from_text,
         preview_text_range, preview_visible_colored, preview_visible_line_range,
         right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
-        right_sidebar_open_with_cache_key, search_right_sidebar_file_index, snippet_cursor_visible,
+        open_with_candidate_allowed, right_sidebar_open_with_cache_key,
+        search_right_sidebar_file_index, snippet_cursor_visible,
         snippet_run_buffer, sorted_open_with_candidates, visible_file_row_range,
         wrap_snippet_text_for_width, FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT, FILE_PREVIEW_MAX_BYTES,
     };
@@ -6875,6 +7391,68 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(labels, vec!["Zed", "VS Code", "TextEdit"]);
+    }
+
+    #[test]
+    fn open_with_filter_hides_junk_candidates() {
+        // Real-world LaunchServices output observed for a .md file
+        fn cand(id: &str, label: &str, is_default: bool) -> wezterm_open_url::OpenWithCandidate {
+            wezterm_open_url::OpenWithCandidate {
+                id: id.to_string(),
+                label: label.to_string(),
+                icon_path: None,
+                is_default,
+            }
+        }
+        let candidates = vec![
+            cand("/Applications/Typora.app", "Typora", true),
+            cand("/Applications/MinerU.app", "MinerU", false),
+            cand("/Applications/Xcode.app", "Xcode", false),
+            cand("/Applications/calibre.app", "calibre", false),
+            cand("/Applications/Cursor.app", "Cursor", false),
+            cand("/Applications/Zed.app", "Zed", false),
+            cand("/Applications/Visual Studio Code.app", "Visual Studio Code", false),
+            cand(
+                "/Applications/calibre.app/Contents/ebook-viewer.app",
+                "ebook-viewer",
+                false,
+            ),
+            cand("/System/Applications/TextEdit.app", "TextEdit", false),
+            cand("/Applications/Microsoft Word.app", "Microsoft Word", false),
+            cand(
+                "/Users/u/.cache/codex-runtimes/native/libreoffice/LibreOfficeDev.app",
+                "LibreOfficeDev",
+                false,
+            ),
+            cand(
+                "/Applications/Xcode.app/Contents/Applications/Instruments.app",
+                "Instruments",
+                false,
+            ),
+            cand("/Applications/Google Chrome.app", "Google Chrome", false),
+            cand("/System/Applications/Notes.app", "Notes", false),
+            cand("/Applications/010 Editor.app", "010 Editor", false),
+        ];
+
+        let custom_ids = HashSet::new();
+        let kept: Vec<&str> = candidates
+            .iter()
+            .filter(|candidate| open_with_candidate_allowed(candidate, &custom_ids, None))
+            .map(|candidate| candidate.label.as_str())
+            .collect();
+
+        assert_eq!(
+            kept,
+            vec![
+                "Typora",
+                "Xcode",
+                "Cursor",
+                "Zed",
+                "Visual Studio Code",
+                "TextEdit",
+                "Microsoft Word",
+            ]
+        );
     }
 
     #[test]

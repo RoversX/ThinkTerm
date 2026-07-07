@@ -235,6 +235,10 @@ lazy_static::lazy_static! {
     static ref WINDOW_SPACES: Mutex<HashMap<u64, SpaceId>> = Mutex::new(HashMap::new());
     static ref MATERIALIZING_LAYOUT_WORKSPACES: Mutex<HashMap<String, usize>> =
         Mutex::new(HashMap::new());
+    static ref WORK_RUNNING_LAST_SEEN: Mutex<HashMap<String, std::time::Instant>> =
+        Mutex::new(HashMap::new());
+    static ref WORK_STATUS_RECHECK_PENDING: Mutex<std::collections::HashSet<String>> =
+        Mutex::new(std::collections::HashSet::new());
 }
 
 static THREAD_STORE_PERSIST_SCHEDULED: AtomicBool = AtomicBool::new(false);
@@ -834,8 +838,67 @@ pub fn refresh_thread_work_for_pane(pane_id: PaneId) -> bool {
     refresh_thread_work_for_workspace(&workspace)
 }
 
+/// The Running signal derives from pane titles / progress escapes that can
+/// flicker off for a few frames while the user types, which used to strobe
+/// the sidebar spinner (and spuriously latch work_finished_unseen). Hold
+/// Running through short Idle observations; a deferred re-check settles the
+/// state to Idle once the grace period truly elapses.
+const WORK_RUNNING_FALL_DEBOUNCE: Duration = Duration::from_millis(800);
+
+fn debounce_work_status(
+    workspace: &str,
+    observed: WorkspaceThreadWorkStatus,
+) -> WorkspaceThreadWorkStatus {
+    let mut last_seen = WORK_RUNNING_LAST_SEEN.lock();
+    match observed {
+        WorkspaceThreadWorkStatus::Running => {
+            last_seen.insert(workspace.to_string(), std::time::Instant::now());
+            observed
+        }
+        WorkspaceThreadWorkStatus::Idle => {
+            let Some(last) = last_seen.get(workspace) else {
+                return observed;
+            };
+            let elapsed = last.elapsed();
+            if elapsed < WORK_RUNNING_FALL_DEBOUNCE {
+                schedule_work_status_recheck(
+                    workspace.to_string(),
+                    WORK_RUNNING_FALL_DEBOUNCE - elapsed,
+                );
+                WorkspaceThreadWorkStatus::Running
+            } else {
+                last_seen.remove(workspace);
+                observed
+            }
+        }
+        WorkspaceThreadWorkStatus::NeedsAttention | WorkspaceThreadWorkStatus::FinishedUnseen => {
+            last_seen.remove(workspace);
+            observed
+        }
+    }
+}
+
+fn schedule_work_status_recheck(workspace: String, delay: Duration) {
+    if !WORK_STATUS_RECHECK_PENDING.lock().insert(workspace.clone()) {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        WORK_STATUS_RECHECK_PENDING.lock().remove(&workspace);
+        promise::spawn::spawn_into_main_thread(async move {
+            if refresh_thread_work_for_workspace(&workspace) {
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+            }
+        })
+        .detach();
+    });
+}
+
 pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
     let observed = scan_workspace_work_status(workspace);
+    let observed = debounce_work_status(workspace, observed);
     let mut store = THREAD_STORE.lock();
     let Some(change) = store.observe_thread_work_for_workspace(workspace, observed) else {
         return false;

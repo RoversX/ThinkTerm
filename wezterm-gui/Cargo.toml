@@ -94,6 +94,7 @@ termwiz.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
+trash.workspace = true
 umask.workspace = true
 unicode-normalization.workspace = true
 unicode-segmentation.workspace = true

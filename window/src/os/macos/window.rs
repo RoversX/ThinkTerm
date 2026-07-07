@@ -48,7 +48,7 @@ use raw_window_handle::{
     HasWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle,
 };
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, CStr};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -603,8 +603,6 @@ impl Window {
                 window: None,
                 titlebar_sidebar_button_visible: false,
                 screen_changed: false,
-                paint_throttled: false,
-                invalidated: true,
                 gl_context_pair: None,
                 text_cursor_position: Rect::new(Point::new(0, 0), Size::new(0, 0)),
                 tracking_rect_tag: 0,
@@ -920,6 +918,58 @@ impl WindowOps for Window {
             let () = msg_send![*panel, setResolvesAliases: YES];
             let title = nsstring("Open Project");
             let prompt = nsstring("Open");
+            let () = msg_send![*panel, setTitle: *title];
+            let () = msg_send![*panel, setPrompt: *prompt];
+
+            const NS_MODAL_RESPONSE_OK: NSInteger = 1;
+            let callback = Arc::new(Mutex::new(Some(callback)));
+            let callback_for_block = callback.clone();
+            let panel_for_block = panel.clone();
+            let block = RcBlock::new(move |result: NSInteger| {
+                let selected_path = if result != NS_MODAL_RESPONSE_OK {
+                    None
+                } else {
+                    let url: id = msg_send![*panel_for_block, URL];
+                    if url == nil {
+                        None
+                    } else {
+                        let path: id = msg_send![url, path];
+                        if path == nil {
+                            None
+                        } else {
+                            Some(PathBuf::from(nsstring_to_str(path)))
+                        }
+                    }
+                };
+
+                if let Ok(mut callback) = callback_for_block.lock() {
+                    if let Some(callback) = callback.take() {
+                        callback(selected_path);
+                    }
+                }
+            });
+            let () = msg_send![*panel, beginWithCompletionHandler: &*block];
+        }
+    }
+
+    fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        unsafe {
+            let _pool = NSAutoreleasePool::new(nil);
+            let panel: id = msg_send![class!(NSOpenPanel), openPanel];
+            let panel = StrongPtr::retain(panel);
+            let () = msg_send![*panel, setCanChooseFiles: YES];
+            let () = msg_send![*panel, setCanChooseDirectories: NO];
+            let () = msg_send![*panel, setAllowsMultipleSelection: NO];
+            let () = msg_send![*panel, setResolvesAliases: YES];
+            let app_type = nsstring("app");
+            let types: id = msg_send![class!(NSArray), arrayWithObject: *app_type];
+            let () = msg_send![*panel, setAllowedFileTypes: types];
+            let applications_dir = nsstring("/Applications");
+            let dir_url: id =
+                msg_send![class!(NSURL), fileURLWithPath: *applications_dir isDirectory: YES];
+            let () = msg_send![*panel, setDirectoryURL: dir_url];
+            let title = nsstring("Choose Application");
+            let prompt = nsstring("Choose");
             let () = msg_send![*panel, setTitle: *title];
             let () = msg_send![*panel, setPrompt: *prompt];
 
@@ -1539,7 +1589,7 @@ impl WindowInner {
         unsafe {
             let () = msg_send![*self.view, setNeedsDisplay: YES];
             if let Some(window_view) = WindowView::get_this(&**self.view) {
-                window_view.inner.borrow_mut().invalidated = true;
+                window_view.invalidated.set(true);
             }
         }
     }
@@ -1970,9 +2020,7 @@ struct Inner {
     window: Option<WeakPtr>,
     titlebar_sidebar_button_visible: bool,
     screen_changed: bool,
-    paint_throttled: bool,
     window_id: usize,
-    invalidated: bool,
     gl_context_pair: Option<GlContextPair>,
     text_cursor_position: Rect,
     tracking_rect_tag: NSInteger,
@@ -2300,6 +2348,12 @@ fn code_to_cursor(code: i64) -> Option<MouseCursor> {
 
 struct WindowView {
     inner: Rc<RefCell<Inner>>,
+    // Repaint scheduling flags live outside the RefCell: they are touched
+    // from paths that can run while `inner` is borrowed (reentrant drawRect,
+    // the frame throttle timer, invalidate()), and losing an update here is
+    // what makes the window stop refreshing until the next user interaction.
+    paint_throttled: Cell<bool>,
+    invalidated: Cell<bool>,
 }
 
 pub fn superclass(this: &Object) -> &'static Class {
@@ -2746,6 +2800,32 @@ impl WindowView {
                 log::trace!("skipping focus lost notification while window is busy");
             }
             this.update_application_presentation(true);
+        }
+    }
+
+    extern "C" fn did_change_occlusion_state(view: &mut Object, _sel: Sel, _id: id) {
+        // AppKit suppresses drawRect for occluded windows (covered, or on
+        // another Space). If a frame was requested while we were hidden, the
+        // needsDisplay it set may have been consumed without a draw; re-arm
+        // when we become visible again so the window doesn't stay stale
+        // until the next input event.
+        const NS_WINDOW_OCCLUSION_STATE_VISIBLE: NSUInteger = 1 << 1;
+        let view_ptr: id = view as *mut Object;
+        if let Some(this) = Self::get_this(view) {
+            let visible = unsafe {
+                let window: id = msg_send![view_ptr, window];
+                if window.is_null() {
+                    false
+                } else {
+                    let state: NSUInteger = msg_send![window, occlusionState];
+                    (state & NS_WINDOW_OCCLUSION_STATE_VISIBLE) != 0
+                }
+            };
+            if visible && this.invalidated.get() {
+                unsafe {
+                    let () = msg_send![view_ptr, setNeedsDisplay: YES];
+                }
+            }
         }
     }
 
@@ -3656,7 +3736,20 @@ impl WindowView {
     extern "C" fn draw_rect(view: &mut Object, sel: Sel, _dirty_rect: NSRect) {
         if let Some(this) = Self::get_this(view) {
             let Ok(mut inner) = this.inner.try_borrow_mut() else {
-                log::trace!("skipping draw while window is busy");
+                // We're being asked to draw reentrantly while some other
+                // handler holds the window state. AppKit has already cleared
+                // needsDisplay for this pass, so if we simply return here the
+                // frame is lost and the window stays stale until the next
+                // interaction sets needsDisplay again. Re-arm it for the next
+                // runloop turn instead.
+                log::trace!("skipping draw while window is busy; re-arming");
+                this.invalidated.set(true);
+                let view_ptr: id = view as *mut Object;
+                unsafe {
+                    let () = msg_send![view_ptr, performSelector: sel!(thinktermRearmNeedsDisplay)
+                                       withObject: nil
+                                       afterDelay: 0.0];
+                }
                 return;
             };
 
@@ -3672,8 +3765,8 @@ impl WindowView {
                 return;
             }
 
-            if inner.paint_throttled {
-                inner.invalidated = true;
+            if this.paint_throttled.get() {
+                this.invalidated.set(true);
             } else {
                 let now = Instant::now();
                 if let Some(last) = inner.last_repaint_time.replace(now) {
@@ -3685,8 +3778,8 @@ impl WindowView {
                     }
                 }
                 inner.events.dispatch(WindowEvent::NeedRepaint);
-                inner.invalidated = false;
-                inner.paint_throttled = true;
+                this.invalidated.set(false);
+                this.paint_throttled.set(true);
 
                 let window_id = inner.window_id;
                 let max_fps = target_frame_fps(inner.config.max_fps);
@@ -3697,15 +3790,11 @@ impl WindowView {
                     async_io::Timer::after(std::time::Duration::from_secs_f64(1.0 / max_fps)).await;
                     Connection::with_window_inner(window_id, move |inner| {
                         if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                            if let Ok(mut state) = window_view.inner.try_borrow_mut() {
-                                state.paint_throttled = false;
-                                if state.invalidated {
-                                    unsafe {
-                                        let () = msg_send![*inner.view, setNeedsDisplay: YES];
-                                    }
+                            window_view.paint_throttled.set(false);
+                            if window_view.invalidated.get() {
+                                unsafe {
+                                    let () = msg_send![*inner.view, setNeedsDisplay: YES];
                                 }
-                            } else {
-                                log::trace!("skipping paint throttle update while window is busy");
                             }
                         }
                         Ok(())
@@ -3713,6 +3802,12 @@ impl WindowView {
                 })
                 .detach();
             }
+        }
+    }
+
+    extern "C" fn rearm_needs_display(this: &mut Object, _sel: Sel) {
+        unsafe {
+            let () = msg_send![this, setNeedsDisplay: YES];
         }
     }
 
@@ -3788,6 +3883,8 @@ impl WindowView {
 
         let view = Box::into_raw(Box::new(Self {
             inner: Rc::clone(&inner),
+            paint_throttled: Cell::new(false),
+            invalidated: Cell::new(true),
         }));
 
         unsafe {
@@ -3828,6 +3925,10 @@ impl WindowView {
             cls.add_method(
                 sel!(thinktermToggleWorkspaceSidebar:),
                 Self::thinkterm_toggle_workspace_sidebar as extern "C" fn(&mut Object, Sel, id),
+            );
+            cls.add_method(
+                sel!(thinktermRearmNeedsDisplay),
+                Self::rearm_needs_display as extern "C" fn(&mut Object, Sel),
             );
             cls.add_method(
                 sel!(windowWillClose:),
@@ -3914,6 +4015,10 @@ impl WindowView {
             cls.add_method(
                 sel!(windowDidResignKey:),
                 Self::did_resign_key as extern "C" fn(&mut Object, Sel, id),
+            );
+            cls.add_method(
+                sel!(windowDidChangeOcclusionState:),
+                Self::did_change_occlusion_state as extern "C" fn(&mut Object, Sel, id),
             );
 
             cls.add_method(

@@ -311,6 +311,10 @@ impl WindowOps for Window {
         crate::os::xdg_desktop_portal::pick_folder_async(callback);
     }
 
+    fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        crate::os::xdg_desktop_portal::pick_app_async(callback);
+    }
+
     fn invalidate(&self) {
         match self {
             Self::X11(x) => x.invalidate(),

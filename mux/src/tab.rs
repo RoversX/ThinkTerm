@@ -1604,11 +1604,25 @@ impl TabInner {
                 node.first.rows = pane_size.rows;
                 node.second.rows = pane_size.rows;
 
+                // Clamp the preserved first branch to what actually fits;
+                // collapse/expand can shrink a branch below its child's
+                // remembered size, and an unclamped first here makes this
+                // node wider than its parent (overlapping pane geometry).
+                node.first.cols = node
+                    .first
+                    .cols
+                    .min(pane_size.cols.saturating_sub(2))
+                    .max(1);
                 node.second.cols = pane_size.cols.saturating_sub(1 + node.first.cols);
             } else {
                 node.first.cols = pane_size.cols;
                 node.second.cols = pane_size.cols;
 
+                node.first.rows = node
+                    .first
+                    .rows
+                    .min(pane_size.rows.saturating_sub(2))
+                    .max(1);
                 node.second.rows = pane_size.rows.saturating_sub(1 + node.first.rows);
             }
             node.first.pixel_width = node.first.cols * cell_width;

@@ -677,6 +677,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFilePreviewHorizontalScrollThumb
             | UIItemType::RightSidebarFilePreviewText
             | UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarFileRefresh
             | UIItemType::RightSidebarFileRow(_)
             | UIItemType::RightSidebarFileBack
             | UIItemType::RightSidebarFileOpen
@@ -739,6 +740,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFilePreviewHorizontalScrollThumb
             | UIItemType::RightSidebarFilePreviewText
             | UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarFileRefresh
             | UIItemType::RightSidebarFileRow(_)
             | UIItemType::RightSidebarFileBack
             | UIItemType::RightSidebarFileOpen
@@ -962,6 +964,30 @@ impl super::TermWindow {
                         );
                         context.invalidate();
                     }
+                    if completed_drag
+                        .as_ref()
+                        .is_some_and(|(item, _)| {
+                            matches!(item.item_type, UIItemType::RightSidebarFileRow(_))
+                        })
+                    {
+                        if let Some(state) = self.right_sidebar_file_drag.take() {
+                            if state.active {
+                                self.drop_right_sidebar_file_drag(state, &event, x, y);
+                                context.invalidate();
+                            } else {
+                                // Never crossed the drag threshold: this was a
+                                // plain click, so open the file (moved here
+                                // from the press handler). Opening a preview
+                                // widens the sidebar, so reflow like the old
+                                // press path did or the preview overlaps the
+                                // terminal.
+                                let previous_width = self.right_sidebar_width();
+                                self.open_right_sidebar_file_path(state.path);
+                                self.invalidate_or_reflow_right_sidebar(previous_width, context);
+                            }
+                        }
+                        return;
+                    }
                     if completed_drag.is_some() {
                         // Completed a drag
                         return;
@@ -1051,6 +1077,17 @@ impl super::TermWindow {
         } else {
             None
         };
+
+        // A press anywhere other than the row being renamed commits a pending
+        // inline rename (Enter semantics); otherwise the editor stays armed
+        // and keeps swallowing keyboard input after the user clicked away.
+        if matches!(event.kind, WMEK::Press(_))
+            && self.inline_tab_rename.is_some()
+            && !self.ui_item_hosts_inline_rename(ui_item.as_ref().map(|item| &item.item_type))
+        {
+            self.finish_inline_tab_rename(true);
+            context.invalidate();
+        }
 
         if let Some(item) = ui_item.clone() {
             if capture_mouse {
@@ -1424,9 +1461,85 @@ impl super::TermWindow {
             }
             UIItemType::ContextMenuBackdrop | UIItemType::ContextMenuItem(_) => {}
             UIItemType::PaneNav { .. } => {}
+            UIItemType::RightSidebarFileRow(_) => {
+                self.drag_right_sidebar_file_row(item, start_event, event, context);
+            }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
             }
+        }
+    }
+
+    fn drag_right_sidebar_file_row(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if let Some(state) = self.right_sidebar_file_drag.as_mut() {
+            if !state.active {
+                let dx = event.coords.x - state.start.x;
+                let dy = event.coords.y - state.start.y;
+                // ~5px of travel turns the pending click into a drag
+                if dx * dx + dy * dy >= 25 {
+                    state.active = true;
+                }
+            }
+            state.current = event.coords;
+            if state.active {
+                context.set_cursor(Some(MouseCursor::Hand));
+                context.invalidate();
+            }
+        }
+        // drag_ui_item takes `dragging` on every move; keep the drag armed
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drop_right_sidebar_file_drag(
+        &mut self,
+        state: super::FileDragState,
+        event: &MouseEvent,
+        column: usize,
+        row: i64,
+    ) {
+        // Only a drop over bare terminal ground counts: any UI chrome under
+        // the pointer (sidebars, tab bar, splits) or an active content view
+        // cancels silently.
+        if self.resolve_ui_item(event).is_some() || self.content_view_foreground() {
+            return;
+        }
+        let px = event.coords.x as f32;
+        let py = event.coords.y as f32;
+        let area = self.content_view_area();
+        if px < area.min_x() || px >= area.max_x() || py < area.min_y() || py >= area.max_y() {
+            return;
+        }
+
+        // Paste into the pane under the drop point (splits!), falling back
+        // to the active pane. Focus is deliberately left unchanged.
+        let mut target = None;
+        for pos in self.get_panes_to_render() {
+            if row >= pos.top as i64
+                && row <= (pos.top + pos.height) as i64
+                && column >= pos.left
+                && column <= pos.left + pos.width
+            {
+                target = Some(pos.pane);
+                break;
+            }
+        }
+        let Some(pane) = target.or_else(|| self.get_active_pane_or_overlay()) else {
+            return;
+        };
+
+        let mut text = self
+            .config
+            .quote_dropped_files
+            .escape(&state.path.to_string_lossy());
+        text.push(' ');
+        if let Err(err) = pane.send_paste(&text) {
+            log::error!("failed to paste dropped file path: {err:#}");
         }
     }
 
@@ -1627,6 +1740,7 @@ impl super::TermWindow {
                 self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
             }
             UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarFileRefresh
             | UIItemType::RightSidebarFileRow(_)
             | UIItemType::RightSidebarFileBack
             | UIItemType::RightSidebarFileOpen
@@ -1801,6 +1915,7 @@ impl super::TermWindow {
                 self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
             }
             UIItemType::RightSidebarFileFilter
+            | UIItemType::RightSidebarFileRefresh
             | UIItemType::RightSidebarFileRow(_)
             | UIItemType::RightSidebarFileBack
             | UIItemType::RightSidebarFileOpen
@@ -2082,8 +2197,11 @@ impl super::TermWindow {
             let previous_width = self.right_sidebar_width();
             self.right_sidebar_mode = mode;
             // Leaving the file view (e.g. switching to Snippets/Tasks) makes the
-            // file index idle; schedule it for release if nothing reopens it.
-            if !self.right_sidebar_file_view_active() {
+            // file index idle; schedule it for release. Entering it refreshes +
+            // (re)starts the periodic re-scan.
+            if self.right_sidebar_file_view_active() {
+                self.kick_right_sidebar_file_rescan_cycle();
+            } else {
                 self.schedule_right_sidebar_file_memory_release();
             }
             self.invalidate_or_reflow_right_sidebar(previous_width, context);
@@ -2212,14 +2330,31 @@ impl super::TermWindow {
                     self.dragging.replace((item, event));
                 }
             }
-            (UIItemType::RightSidebarFileRow(path), WMEK::Press(MousePress::Left)) => {
+            (UIItemType::RightSidebarFileRefresh, WMEK::Press(MousePress::Left)) => {
                 self.clear_right_sidebar_text_focus();
-                self.open_right_sidebar_file_path(path);
+                self.force_right_sidebar_file_rescan();
+            }
+            (UIItemType::RightSidebarFileRow(path), WMEK::Press(MousePress::Left)) => {
+                if self.is_renaming_sidebar_file(&path) {
+                    // Clicking the row that hosts the inline rename editor
+                    // must not arm a drag or re-open the file.
+                    return;
+                }
+                self.clear_right_sidebar_text_focus();
+                // Don't open yet: arm a potential drag toward the terminal.
+                // If the pointer never crosses the threshold, the release
+                // handler treats it as a click and opens the file.
+                self.right_sidebar_file_drag = Some(super::FileDragState {
+                    path,
+                    start: event.coords,
+                    current: event.coords,
+                    active: false,
+                });
+                self.dragging.replace((item.clone(), event));
             }
             (UIItemType::RightSidebarFileRow(path), WMEK::Press(MousePress::Right)) => {
                 self.clear_right_sidebar_text_focus();
-                self.right_sidebar_file_selected = Some(path);
-                self.show_right_sidebar_file_open_with_menu(context, event.coords);
+                self.show_right_sidebar_file_context_menu(context, event.coords, path);
             }
             (UIItemType::RightSidebarFileBack, WMEK::Press(MousePress::Left)) => {
                 self.clear_right_sidebar_text_focus();

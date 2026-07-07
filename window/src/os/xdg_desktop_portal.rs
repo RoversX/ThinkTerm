@@ -246,6 +246,69 @@ pub fn pick_folder_async(callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
     .detach();
 }
 
+/// File picker used to choose an application (a .desktop entry or an
+/// executable); the caller normalizes the selection.
+pub async fn pick_app() -> anyhow::Result<Option<PathBuf>> {
+    let connection = zbus::ConnectionBuilder::session()?.build().await?;
+    let proxy = PortalFileChooserProxy::new(&connection)
+        .await
+        .context("make file chooser proxy")?;
+
+    let mut options = HashMap::new();
+    options.insert("modal", Value::from(true));
+
+    let handle = proxy
+        .OpenFile("", "Choose Application", options)
+        .or(async {
+            async_io::Timer::after(std::time::Duration::from_secs(1)).await;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timed out opening xdg-desktop-portal app picker",
+            )
+            .into())
+        })
+        .await
+        .context("Opening xdg-desktop-portal app picker")?;
+
+    let request = PortalRequestProxy::builder(&connection)
+        .path(handle)?
+        .build()
+        .await
+        .context("make portal request proxy")?;
+    let mut stream = request
+        .receive_Response()
+        .await
+        .context("subscribe to portal request response")?;
+    let signal = stream
+        .next()
+        .or(async {
+            async_io::Timer::after(std::time::Duration::from_secs(60)).await;
+            None
+        })
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Timed out waiting for app picker response"))?;
+    let args = signal.args().context("decode app picker response")?;
+    if args.response != 0 {
+        return Ok(None);
+    }
+
+    first_file_uri_to_path(&args.results)
+}
+
+pub fn pick_app_async(callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+    promise::spawn::spawn(async move {
+        let path = match pick_app().await {
+            Ok(path) => path,
+            Err(err) => {
+                log::warn!("failed to show xdg-desktop-portal app picker: {err:#}");
+                None
+            }
+        };
+        callback(path);
+    })
+    .detach();
+}
+
 pub async fn run_signal_loop(stream: &mut SettingChangedStream<'_>) -> Result<(), anyhow::Error> {
     // query appearance again as it might have changed without us knowing
     if let Ok(value) =

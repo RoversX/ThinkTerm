@@ -9,6 +9,9 @@ publish = false
 [dependencies]
 winapi = {workspace=true, features=["shellapi"]}
 
+[target.'cfg(windows)'.dependencies]
+winreg.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation.workspace = true
 core-foundation-sys = "0.8"

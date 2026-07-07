@@ -20,6 +20,31 @@ pub fn open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
     platform_open_with_candidates(path)
 }
 
+/// Normalize a path chosen in the OS app picker into an open-with candidate
+/// (id, label). Linux `.desktop` entries become `desktop:{id}` with the
+/// label taken from their `Name=`; everything else (mac .app bundles,
+/// executables) uses the path as id and the file stem as label.
+pub fn app_candidate_for_picked_path(path: &Path) -> (String, String) {
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "desktop")
+    {
+        let id = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let label = desktop_name(path).unwrap_or_else(|| id.clone());
+        return (format!("desktop:{id}"), label);
+    }
+
+    let label = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    (path.to_string_lossy().into_owned(), label)
+}
+
 #[cfg(target_os = "macos")]
 fn platform_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
     macos_open_with_candidates(path)
@@ -31,8 +56,148 @@ fn platform_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
 }
 
 #[cfg(windows)]
-fn platform_open_with_candidates(_path: &Path) -> Vec<OpenWithCandidate> {
-    Vec::new()
+fn platform_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
+    windows_open_with_candidates(path)
+}
+
+/// Discover candidate applications for a file on Windows: the association
+/// default (AssocQueryString) plus Explorer's per-user OpenWithList MRU and
+/// the OpenWithProgids registered for the extension.
+#[cfg(windows)]
+fn windows_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
+    use std::collections::HashSet;
+    use winreg::enums::{HKEY_CLASSES_ROOT, HKEY_CURRENT_USER};
+    use winreg::RegKey;
+
+    let Some(ext) = path.extension() else {
+        return Vec::new();
+    };
+    let ext = format!(".{}", ext.to_string_lossy().to_lowercase());
+
+    let mut out: Vec<OpenWithCandidate> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    fn push_candidate(
+        out: &mut Vec<OpenWithCandidate>,
+        seen: &mut HashSet<String>,
+        id: String,
+        is_default: bool,
+    ) {
+        let key = id.to_lowercase();
+        if id.is_empty() || seen.contains(&key) {
+            return;
+        }
+        seen.insert(key);
+        let label = Path::new(&id)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| id.clone());
+        out.push(OpenWithCandidate {
+            id,
+            label,
+            icon_path: None,
+            is_default,
+        });
+    }
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let hkcr = RegKey::predef(HKEY_CLASSES_ROOT);
+    let file_exts = format!(
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\{ext}"
+    );
+
+    if let Some(exe) = windows_default_executable(&hkcu, &hkcr, &file_exts, &ext) {
+        push_candidate(&mut out, &mut seen, exe, true);
+    }
+
+    // Explorer's MRU of "Open with" choices; values are exe names that
+    // ShellExecuteW resolves via PATH / App Paths.
+    if let Ok(key) = hkcu.open_subkey(format!(r"{file_exts}\OpenWithList")) {
+        for (name, value) in key.enum_values().flatten() {
+            if name.eq_ignore_ascii_case("MRUList") {
+                continue;
+            }
+            if let Ok(exe) = <String as winreg::types::FromRegValue>::from_reg_value(&value) {
+                if exe.to_lowercase().ends_with(".exe") {
+                    push_candidate(&mut out, &mut seen, exe, false);
+                }
+            }
+        }
+    }
+
+    // ProgIds registered for the extension (per-user and machine-wide),
+    // plus the extension's default progid.
+    let mut progids: Vec<String> = Vec::new();
+    if let Ok(key) = hkcu.open_subkey(format!(r"{file_exts}\OpenWithProgids")) {
+        progids.extend(key.enum_values().flatten().map(|(name, _)| name));
+    }
+    if let Ok(key) = hkcr.open_subkey(format!(r"{ext}\OpenWithProgids")) {
+        progids.extend(key.enum_values().flatten().map(|(name, _)| name));
+    }
+    if let Ok(key) = hkcr.open_subkey(&ext) {
+        if let Ok(progid) = key.get_value::<String, _>("") {
+            progids.push(progid);
+        }
+    }
+    for progid in progids {
+        if let Some(exe) = windows_progid_executable(&hkcr, &progid) {
+            push_candidate(&mut out, &mut seen, exe, false);
+        }
+    }
+
+    out.truncate(20);
+    out
+}
+
+/// Resolve a progid to the executable of its `shell\open\command`.
+#[cfg(windows)]
+fn windows_progid_executable(hkcr: &winreg::RegKey, progid: &str) -> Option<String> {
+    if progid.is_empty() {
+        return None;
+    }
+    let key = hkcr
+        .open_subkey(format!(r"{progid}\shell\open\command"))
+        .ok()?;
+    let command: String = key.get_value("").ok()?;
+    windows_command_line_executable(&command)
+}
+
+/// Extract the executable path from a registry `shell\open\command` value.
+#[cfg(windows)]
+fn windows_command_line_executable(command: &str) -> Option<String> {
+    let command = command.trim();
+    let exe = if let Some(rest) = command.strip_prefix('"') {
+        rest.split('"').next()?
+    } else {
+        command.split_whitespace().next()?
+    };
+    let exe = exe.trim();
+    if exe.is_empty() || !exe.to_lowercase().ends_with(".exe") {
+        return None;
+    }
+    Some(exe.to_string())
+}
+
+/// The user's default handler for an extension: Explorer's UserChoice progid
+/// first (what modern Windows actually honours), falling back to the
+/// extension's classic default progid under HKCR.
+#[cfg(windows)]
+fn windows_default_executable(
+    hkcu: &winreg::RegKey,
+    hkcr: &winreg::RegKey,
+    file_exts: &str,
+    ext: &str,
+) -> Option<String> {
+    if let Ok(key) = hkcu.open_subkey(format!(r"{file_exts}\UserChoice")) {
+        if let Ok(progid) = key.get_value::<String, _>("ProgId") {
+            if let Some(exe) = windows_progid_executable(hkcr, &progid) {
+                return Some(exe);
+            }
+        }
+    }
+    let key = hkcr.open_subkey(ext).ok()?;
+    let progid: String = key.get_value("").ok()?;
+    windows_progid_executable(hkcr, &progid)
 }
 
 #[cfg(not(windows))]

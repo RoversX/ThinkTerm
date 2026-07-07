@@ -6,7 +6,7 @@ use promise::spawn::{Runnable, SpawnFunc};
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(all(unix, not(target_os = "macos")))]
 use {
     filedescriptor::{FileDescriptor, Pipe},
@@ -33,7 +33,19 @@ pub(crate) struct SpawnQueue {
     write: Mutex<FileDescriptor>,
     #[cfg(all(unix, not(target_os = "macos")))]
     read: Mutex<FileDescriptor>,
+
+    #[cfg(target_os = "macos")]
+    runloop_source: RunLoopSourceHandle,
 }
+
+/// A CFRunLoopSourceRef is just a CFTypeRef; signalling it from any thread is
+/// documented as safe, and we never mutate through it after creation.
+#[cfg(target_os = "macos")]
+struct RunLoopSourceHandle(CFRunLoopSourceRef);
+#[cfg(target_os = "macos")]
+unsafe impl Send for RunLoopSourceHandle {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for RunLoopSourceHandle {}
 
 fn schedule_with_pri(runnable: Runnable, high_pri: bool) {
     SPAWN_QUEUE.spawn_impl(
@@ -207,6 +219,8 @@ impl SpawnQueue {
         let spawned_funcs = Mutex::new(VecDeque::new());
         let spawned_funcs_low_pri = Mutex::new(VecDeque::new());
 
+        // Safety-net drain on every runloop activity, in case the source
+        // below is somehow not serviced.
         let observer = unsafe {
             CFRunLoopObserverCreate(
                 std::ptr::null(),
@@ -221,9 +235,32 @@ impl SpawnQueue {
             CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
         }
 
+        // The primary wakeup is a version-0 runloop source: unlike a bare
+        // CFRunLoopWakeUp (which can be swallowed if it lands while the loop
+        // is between activities), a signalled source stays signalled until
+        // the loop services it, so queued work can never be stranded until
+        // the next user-input event.
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: SpawnQueue::perform,
+        };
+        let source = unsafe { CFRunLoopSourceCreate(std::ptr::null(), 0, &mut context) };
+        unsafe {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+        }
+
         Ok(Self {
             spawned_funcs,
             spawned_funcs_low_pri,
+            runloop_source: RunLoopSourceHandle(source),
         })
     }
 
@@ -233,24 +270,41 @@ impl SpawnQueue {
         _: *mut std::ffi::c_void,
     ) {
         if SPAWN_QUEUE.run() {
-            Self::queue_wakeup();
+            SPAWN_QUEUE.signal_and_wake();
         }
     }
 
-    fn queue_wakeup() {
+    extern "C" fn perform(_info: *const std::ffi::c_void) {
+        if SPAWN_QUEUE.run() {
+            SPAWN_QUEUE.signal_and_wake();
+        }
+    }
+
+    fn signal_and_wake(&self) {
         unsafe {
+            CFRunLoopSourceSignal(self.runloop_source.0);
             CFRunLoopWakeUp(CFRunLoopGetMain());
         }
     }
 
     fn spawn_impl(&self, f: SpawnFunc, high_pri: bool) {
         self.queue_func(f, high_pri);
-        Self::queue_wakeup();
+        self.signal_and_wake();
     }
 
     fn run_impl(&self) -> bool {
-        if let Some(func) = self.pop_func() {
+        // Drain with a small time budget rather than one task per runloop
+        // observer callback: under heavy load the one-at-a-time policy needs
+        // a full wakeup round-trip per task, and if any wakeup is coalesced
+        // the whole queue (paints, animations, output notifications) stalls
+        // until the next user input event. Keep the budget small so native
+        // event handling still interleaves.
+        let deadline = Instant::now() + Duration::from_millis(2);
+        while let Some(func) = self.pop_func() {
             Self::run_func(func);
+            if Instant::now() >= deadline {
+                break;
+            }
         }
         self.has_any_queued()
     }

@@ -473,8 +473,9 @@ impl SessionInner {
         let max_sleep_delay = Duration::from_secs(2);
         let immediate_wakeup = Duration::from_millis(10);
         let busy_loop_throttle = Duration::from_millis(50);
-        let busy_loop_disconnect_after = Duration::from_secs(30);
-        let mut busy_loop_started = None;
+        let busy_loop_warn_every = Duration::from_secs(30);
+        let mut busy_loop_started: Option<Instant> = None;
+        let mut busy_loop_last_warn: Option<Instant> = None;
 
         loop {
             self.do_keepalive(sess)?;
@@ -588,11 +589,26 @@ impl SessionInner {
 
             if made_progress || !saw_revents || poll_elapsed >= immediate_wakeup {
                 busy_loop_started = None;
+                busy_loop_last_warn = None;
             } else {
+                // Repeated immediate wakeups with no IO progress. The
+                // throttle below already caps this at ~20 iterations/sec,
+                // which is enough to keep CPU usage negligible; don't kill
+                // the session over it (protocol-only traffic such as
+                // keepalives can legitimately look like this), just make
+                // the condition visible in the logs.
                 let started = *busy_loop_started.get_or_insert_with(Instant::now);
-                if started.elapsed() >= busy_loop_disconnect_after {
-                    anyhow::bail!(
-                        "SSH session made no IO progress after repeated immediate wakeups; closing it to avoid a busy loop"
+                let should_warn = match busy_loop_last_warn {
+                    None => started.elapsed() >= busy_loop_warn_every,
+                    Some(last) => last.elapsed() >= busy_loop_warn_every,
+                };
+                if should_warn {
+                    busy_loop_last_warn = Some(Instant::now());
+                    log::warn!(
+                        "SSH session has made no IO progress despite repeated \
+                         immediate poll wakeups for {:.0?}; throttling the \
+                         session loop to avoid a busy loop",
+                        started.elapsed()
                     );
                 }
                 std::thread::sleep(busy_loop_throttle);

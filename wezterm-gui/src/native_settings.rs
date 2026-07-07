@@ -196,6 +196,7 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) right_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_file_preview_width: Option<usize>,
     pub(crate) right_sidebar_open_with_app: Option<NativeOpenWithApp>,
+    pub(crate) right_sidebar_custom_open_with_apps: Vec<NativeOpenWithApp>,
     pub(crate) tab_font_size: Option<f64>,
     pub(crate) pane_header_font_size: Option<f64>,
 }
@@ -482,6 +483,25 @@ pub(crate) fn save_right_sidebar_file_preview_width(width: usize) -> anyhow::Res
 pub(crate) fn save_right_sidebar_open_with_app(app: NativeOpenWithApp) -> anyhow::Result<()> {
     let mut settings = load();
     settings.chrome.right_sidebar_open_with_app = Some(app);
+    save(&settings)
+}
+
+pub(crate) fn right_sidebar_custom_open_with_apps() -> Vec<NativeOpenWithApp> {
+    load().chrome.right_sidebar_custom_open_with_apps
+}
+
+const MAX_CUSTOM_OPEN_WITH_APPS: usize = 20;
+
+pub(crate) fn add_right_sidebar_custom_open_with_app(
+    app: NativeOpenWithApp,
+) -> anyhow::Result<()> {
+    let mut settings = load();
+    let apps = &mut settings.chrome.right_sidebar_custom_open_with_apps;
+    apps.retain(|existing| existing.id != app.id);
+    apps.push(app);
+    while apps.len() > MAX_CUSTOM_OPEN_WITH_APPS {
+        apps.remove(0);
+    }
     save(&settings)
 }
 

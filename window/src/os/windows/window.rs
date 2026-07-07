@@ -46,9 +46,11 @@ use winapi::um::objbase::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use winapi::um::shellapi::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use winapi::um::shellscalingapi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use winapi::um::shobjidl::{
-    IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
+    IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST,
+    FOS_PICKFOLDERS,
 };
 use winapi::um::shobjidl_core::{CLSID_FileOpenDialog, IShellItem, SIGDN_FILESYSPATH};
+use winapi::um::shtypes::COMDLG_FILTERSPEC;
 use winapi::um::sysinfoapi::{GetTickCount, GetVersionExW};
 use winapi::um::uxtheme::{
     CloseThemeData, GetThemeFont, GetThemeSysFont, OpenThemeData, SetWindowTheme,
@@ -221,6 +223,101 @@ unsafe fn pick_folder_dialog(hwnd: HWND) -> anyhow::Result<Option<PathBuf>> {
             hresult_to_result((*dialog).SetTitle(title.as_ptr()), "IFileDialog::SetTitle")?;
             hresult_to_result(
                 (*dialog).SetOkButtonLabel(open.as_ptr()),
+                "IFileDialog::SetOkButtonLabel",
+            )?;
+
+            let show_result = (*dialog).Show(hwnd);
+            if show_result == HRESULT_FROM_WIN32(ERROR_CANCELLED) {
+                return Ok(());
+            }
+            hresult_to_result(show_result, "IFileDialog::Show")?;
+
+            hresult_to_result(
+                (*dialog).GetResult(&mut result_item),
+                "IFileDialog::GetResult",
+            )?;
+            hresult_to_result(
+                (*result_item).GetDisplayName(SIGDN_FILESYSPATH, &mut raw_path),
+                "IShellItem::GetDisplayName",
+            )?;
+            selected_path = pathbuf_from_shell_string(raw_path);
+            Ok(())
+        })();
+
+        if !raw_path.is_null() {
+            CoTaskMemFree(raw_path as *mut _);
+        }
+        if !result_item.is_null() {
+            (*result_item).Release();
+        }
+        (*dialog).Release();
+
+        dialog_result.map(|_| selected_path)
+    })();
+
+    if should_uninitialize {
+        CoUninitialize();
+    }
+
+    result
+}
+
+unsafe fn pick_app_dialog(hwnd: HWND) -> anyhow::Result<Option<PathBuf>> {
+    let coinit = CoInitializeEx(
+        null_mut(),
+        COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+    );
+    let should_uninitialize = coinit == S_OK || coinit == S_FALSE;
+    if FAILED(coinit) && coinit != RPC_E_CHANGED_MODE {
+        hresult_to_result(coinit, "CoInitializeEx")?;
+    }
+
+    let result = (|| {
+        let mut dialog: *mut IFileOpenDialog = null_mut();
+        hresult_to_result(
+            CoCreateInstance(
+                &CLSID_FileOpenDialog,
+                null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IFileOpenDialog::uuidof(),
+                &mut dialog as *mut _ as *mut _,
+            ),
+            "CoCreateInstance(FileOpenDialog)",
+        )?;
+
+        let title = wide_null("Choose Application");
+        let choose = wide_null("Choose");
+        let filter_name = wide_null("Applications (*.exe)");
+        let filter_spec = wide_null("*.exe");
+        let filters = [COMDLG_FILTERSPEC {
+            pszName: filter_name.as_ptr(),
+            pszSpec: filter_spec.as_ptr(),
+        }];
+        let mut selected_path = None;
+        let mut result_item: *mut IShellItem = null_mut();
+        let mut raw_path: LPWSTR = null_mut();
+
+        let dialog_result = (|| {
+            let mut options = std::mem::zeroed();
+            hresult_to_result(
+                (*dialog).GetOptions(&mut options),
+                "IFileDialog::GetOptions",
+            )?;
+            let options = std::mem::transmute(
+                options as u32
+                    | FOS_FORCEFILESYSTEM as u32
+                    | FOS_PATHMUSTEXIST as u32
+                    | FOS_FILEMUSTEXIST as u32
+                    | FOS_NOCHANGEDIR as u32,
+            );
+            hresult_to_result((*dialog).SetOptions(options), "IFileDialog::SetOptions")?;
+            hresult_to_result(
+                (*dialog).SetFileTypes(filters.len() as u32, filters.as_ptr()),
+                "IFileDialog::SetFileTypes",
+            )?;
+            hresult_to_result((*dialog).SetTitle(title.as_ptr()), "IFileDialog::SetTitle")?;
+            hresult_to_result(
+                (*dialog).SetOkButtonLabel(choose.as_ptr()),
                 "IFileDialog::SetOkButtonLabel",
             )?;
 
@@ -992,6 +1089,23 @@ impl WindowOps for Window {
                     Ok(path) => path,
                     Err(err) => {
                         log::warn!("failed to show folder picker: {err:#}");
+                        None
+                    }
+                }
+            };
+            callback(path);
+        })
+        .detach();
+    }
+
+    fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        let hwnd = self.0 .0;
+        promise::spawn::spawn(async move {
+            let path = unsafe {
+                match pick_app_dialog(hwnd) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        log::warn!("failed to show app picker: {err:#}");
                         None
                     }
                 }

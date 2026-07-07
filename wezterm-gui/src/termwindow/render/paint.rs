@@ -362,6 +362,92 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Floating label that follows the cursor while a Files-panel row is
+    /// being dragged toward the terminal. Painted after everything else so
+    /// it stays on top; deliberately registers no UIItem (hit-transparent).
+    fn paint_file_drag_ghost(&mut self) -> anyhow::Result<()> {
+        let Some(state) = self.right_sidebar_file_drag.as_ref() else {
+            return Ok(());
+        };
+        if !state.active {
+            return Ok(());
+        }
+        let label = state
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| state.path.to_string_lossy().into_owned());
+        if label.is_empty() {
+            return Ok(());
+        }
+        let anchor = state.current;
+
+        let settings = crate::native_settings::load();
+        let font_size = crate::native_settings::home_font_size(&settings);
+        let ui_font = self
+            .fonts
+            .title_font_with_size(font_size)
+            .context("file drag ghost font")?;
+        let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&ui_font.metrics());
+        let line_height = metrics.cell_size.height as f32;
+
+        let (bg, fg) = match crate::native_settings::effective_appearance() {
+            window::Appearance::Light | window::Appearance::LightHighContrast => (
+                LinearRgba::with_srgba(245, 245, 248, 235),
+                LinearRgba::with_srgba(40, 40, 48, 255),
+            ),
+            window::Appearance::Dark | window::Appearance::DarkHighContrast => (
+                LinearRgba::with_srgba(58, 58, 66, 235),
+                LinearRgba::with_srgba(235, 235, 240, 255),
+            ),
+        };
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(0)
+            .context("file drag ghost layer")?;
+        let mut layers = layer.quad_allocator();
+
+        let ctx = DrawContext::new(gl_state, self.dimensions, &metrics);
+        let max_width = (self.dimensions.pixel_width as f32 * 0.4).max(80.0);
+        let display_text = ctx.text_with_ellipsis(&ui_font, &label, max_width);
+        let text_width = ctx
+            .measure_text_width(&ui_font, &display_text)
+            .min(max_width);
+
+        let pad_x = 8.0;
+        let pad_y = 4.0;
+        let pill_w = text_width + pad_x * 2.0;
+        let pill_h = line_height + pad_y * 2.0;
+        let x = (anchor.x as f32 + 12.0)
+            .min(self.dimensions.pixel_width as f32 - pill_w)
+            .max(0.0);
+        let y = (anchor.y as f32 + 12.0)
+            .min(self.dimensions.pixel_height as f32 - pill_h)
+            .max(0.0);
+
+        self.filled_rectangle(
+            &mut layers,
+            0,
+            euclid::rect(x, y, pill_w, pill_h),
+            bg,
+        )
+        .context("file drag ghost background")?;
+        ctx.draw_text_on_layer(
+            &mut layers,
+            2,
+            &ui_font,
+            x + pad_x,
+            y + pad_y,
+            &display_text,
+            fg,
+            max_width,
+        )
+        .context("file drag ghost label")?;
+
+        Ok(())
+    }
+
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
         {
             let gl_state = self.render_state.as_ref().unwrap();
@@ -526,6 +612,8 @@ impl crate::TermWindow {
         drop(layers);
         self.paint_modal().context("paint_modal")?;
         self.paint_context_menu().context("paint_context_menu")?;
+        self.paint_file_drag_ghost()
+            .context("paint_file_drag_ghost")?;
 
         Ok(())
     }

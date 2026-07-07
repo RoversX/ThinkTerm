@@ -61,6 +61,7 @@ winapi = { workspace=true, features = [
     "shellscalingapi",
     "shobjidl",
     "shobjidl_core",
+    "shtypes",
     "synchapi",
     "sysinfoapi",
     "winerror",

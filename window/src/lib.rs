@@ -349,6 +349,12 @@ pub trait WindowOps {
         callback(None);
     }
 
+    /// Show a native picker for choosing an application (macOS: .app bundle,
+    /// Windows: .exe, Linux: .desktop entry or executable).
+    fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        callback(None);
+    }
+
     /// Invalidate the window so that the entire client area will
     /// be repainted shortly
     fn invalidate(&self);

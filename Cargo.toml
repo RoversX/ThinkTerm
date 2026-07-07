@@ -28,7 +28,7 @@ opt-level = 3
 # debug = 2
 
 [profile.dev]
-debug = 1
+debug = 0
 # https://jakedeichert.com/blog/reducing-rust-incremental-compilation-times-on-macos-by-70-percent/
 # Disabled because it breaks builds on Windows
 #split-debuginfo = "unpacked"
@@ -237,6 +237,7 @@ utf8parse = "0.2"
 uuid = "1.13"
 varbincode = "0.1"
 vtparse = { version="0.7", path="vtparse", default-features=false }
+trash = "5"
 walkdir = "2"
 wayland-backend = "0.3.5"
 wayland-client = "0.31"

@@ -39,6 +39,22 @@ impl Connection {
             let delegate = create_app_delegate();
             let () = msg_send![ns_app, setDelegate: delegate];
 
+            // Opt out of App Nap: it coalesces our timers when macOS decides
+            // the app looks idle (heavy output but no input), which stalls
+            // the paint throttle / animation wakeups until the next user
+            // event. NSActivityUserInitiatedAllowingIdleSystemSleep keeps us
+            // scheduled normally without blocking system sleep. The activity
+            // token must stay alive for the process lifetime, so retain it.
+            const NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 = 0x00EFFFFF;
+            let process_info: id = msg_send![class!(NSProcessInfo), processInfo];
+            let reason = nsstring("ThinkTerm renders terminal output continuously");
+            let activity: id = msg_send![
+                process_info,
+                beginActivityWithOptions: NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP
+                reason: *reason
+            ];
+            let _: id = msg_send![activity, retain];
+
             let conn = Self {
                 ns_app,
                 windows: RefCell::new(HashMap::new()),

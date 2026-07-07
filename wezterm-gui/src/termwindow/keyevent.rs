@@ -897,6 +897,19 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
+        // Esc aborts an in-flight file-row drag without reaching the pane
+        if window_key.key_is_down
+            && matches!(window_key.key, KeyCode::Char('\u{1b}'))
+            && self
+                .right_sidebar_file_drag
+                .as_ref()
+                .is_some_and(|state| state.active)
+        {
+            self.right_sidebar_file_drag = None;
+            self.dragging = None;
+            context.invalidate();
+            return;
+        }
         if self.handle_inline_tab_rename_key(&window_key, context) {
             return;
         }
