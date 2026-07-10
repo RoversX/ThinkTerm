@@ -1679,6 +1679,21 @@ impl WorkspaceThreadStore {
                 } else {
                     (project_id, false)
                 }
+            } else if self.is_client_domain_space(space_id) {
+                // A mux-domain Space's connect window lives in the default
+                // mux workspace, which is not bound to any thread. Resolve to
+                // the Space's mux project instead of manufacturing a local
+                // Home project.
+                let Some(project_id) = self
+                    .projects
+                    .iter()
+                    .find(|p| p.space_id == space_id && is_mux_domain_project_id(&p.id))
+                    .map(|p| p.id.clone())
+                else {
+                    return changed;
+                };
+                let set = self.set_active_project_for_space(space_id, project_id.clone());
+                (project_id, set)
             } else {
                 self.ensure_current_project(space_id, active_workspace)
             };
@@ -3333,9 +3348,6 @@ pub struct MuxDomainSpacePlan {
     pub space_id: SpaceId,
     pub project_id: ProjectId,
     pub thread_id: WorkspaceThreadId,
-    /// Deterministic canonical workspace name for the thread; the connect
-    /// window is renamed into this workspace once attach has completed.
-    pub workspace_name: String,
 }
 
 /// Find-or-create the dedicated Space for a mux client domain, along with its
@@ -3391,40 +3403,13 @@ pub fn ensure_mux_domain_space(domain_name: &str) -> MuxDomainSpacePlan {
         space.active_project_id = Some(project_id.clone());
     }
 
-    let workspace_name = workspace_name_for_thread(&project_id, &thread_id);
     persist_locked(&store);
 
     MuxDomainSpacePlan {
         space_id,
         project_id,
         thread_id,
-        workspace_name,
     }
-}
-
-/// Point a mux-domain thread at the mux workspace it is currently
-/// materialized in (or clear it with `None` when the connect fails).
-/// Only applies to mux-domain threads; returns whether a change was made.
-pub fn bind_mux_domain_thread_workspace(thread_id: &str, workspace: Option<String>) -> bool {
-    let mut store = THREAD_STORE.lock();
-    let mut changed = false;
-    for project in store.projects.iter_mut() {
-        if !is_mux_domain_project_id(&project.id) {
-            continue;
-        }
-        if let Some(thread) = project.threads.iter_mut().find(|t| t.id == thread_id) {
-            if thread.materialized_workspace_name != workspace {
-                thread.materialized_workspace_name = workspace;
-                thread.last_active_at = now_ts();
-                changed = true;
-            }
-            break;
-        }
-    }
-    if changed {
-        persist_locked(&store);
-    }
-    changed
 }
 
 pub fn remote_host_id_for_project_id(project_id: &str) -> &str {

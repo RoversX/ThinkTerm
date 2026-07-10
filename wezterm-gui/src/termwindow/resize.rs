@@ -263,6 +263,30 @@ impl super::TermWindow {
         }
     }
 
+    /// Per-pane navigation bar height. Panes that belong to a mux client
+    /// domain (remote wezterm mux) get NO nav bar: the mux protocol sizes a
+    /// leaf tab from its pane, so stealing nav-bar rows from a ClientPane
+    /// echoes back from the server as a smaller tab and produces a feedback
+    /// loop that shrinks the window a few rows per round-trip.
+    pub(crate) fn pane_nav_bar_height_for_pane(
+        &self,
+        pane: &std::sync::Arc<dyn mux::pane::Pane>,
+        render_metrics: RenderMetrics,
+    ) -> usize {
+        let is_client_pane = Mux::get()
+            .get_domain(pane.domain_id())
+            .map_or(false, |domain| {
+                domain
+                    .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                    .is_some()
+            });
+        if is_client_pane {
+            0
+        } else {
+            pane_nav_bar_height_for_metrics(render_metrics)
+        }
+    }
+
     pub(crate) fn terminal_size_for_positioned_pane(
         &self,
         pos: &PositionedPane,
@@ -270,7 +294,8 @@ impl super::TermWindow {
     ) -> TerminalSize {
         let cell_width = render_metrics.cell_size.width.max(1) as usize;
         let cell_height = render_metrics.cell_size.height.max(1) as usize;
-        let pane_nav_height = pane_nav_bar_height_for_metrics(render_metrics)
+        let pane_nav_height = self
+            .pane_nav_bar_height_for_pane(&pos.pane, render_metrics)
             .min(pos.pixel_height.saturating_sub(cell_height));
         let pixel_width = pos.pixel_width.max(cell_width);
         let pixel_height = pos

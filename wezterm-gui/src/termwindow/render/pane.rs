@@ -39,10 +39,11 @@ use window::MouseEventKind as WMEK;
 
 impl crate::TermWindow {
     fn pane_nav_bar_height(&self, pos: &PositionedPane) -> usize {
-        pane_nav_bar_height_for_metrics(self.render_metrics).min(
-            pos.pixel_height
-                .saturating_sub(self.render_metrics.cell_size.height.max(1) as usize),
-        )
+        self.pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics)
+            .min(
+                pos.pixel_height
+                    .saturating_sub(self.render_metrics.cell_size.height.max(1) as usize),
+            )
     }
 
     fn pane_content_origin(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {
@@ -80,7 +81,8 @@ impl crate::TermWindow {
         };
         let mut height = (pos.height as f32 * self.render_metrics.cell_size.height as f32).max(1.0);
         if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) && pos.top > 0 {
-            height = height.max(pane_nav_bar_height_for_metrics(self.render_metrics) as f32);
+            height =
+                height.max(self.pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics) as f32);
         }
 
         Ok(euclid::rect(
@@ -196,7 +198,13 @@ impl crate::TermWindow {
         let strip_left = pane_rect.origin.x.max(0.0) as usize;
         let strip_right = pane_rect.max_x().max(0.0) as usize;
         let strip_height = pane_rect.size.height.max(1.0) as usize;
-        let chrome_height = pane_nav_bar_height_for_metrics(self.render_metrics).min(strip_height);
+        let chrome_height = self
+            .pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics)
+            .min(strip_height);
+        if chrome_height == 0 {
+            // Remote mux panes have no nav bar; don't paint one.
+            return Ok(0);
+        }
         let icon_size = chrome_height
             .saturating_sub(PANE_NAV_INSET * 2)
             .clamp(20, 24);

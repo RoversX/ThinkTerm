@@ -255,7 +255,10 @@ impl super::TermWindow {
             return 0.0;
         }
 
-        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics);
+        let nav_height = self.pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics);
+        if nav_height == 0 {
+            return 0.0;
+        }
         let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
         let button_size = nav_height
             .saturating_sub(TAB_VERTICAL_PADDING * 2)
@@ -430,13 +433,17 @@ impl super::TermWindow {
             0.0
         };
         let (padding_left, _) = self.padding_left_top();
-        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics) as f32;
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
         let x = event.coords.x as f32;
         let y = event.coords.y as f32;
 
         for pos in tab.iter_panes_ignoring_zoom() {
+            let nav_height =
+                self.pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics) as f32;
+            if nav_height <= 0.0 {
+                continue;
+            }
             let content_pane_x =
                 padding_left + border.left.get() as f32 + pos.left as f32 * cell_width;
             let pane_x = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
@@ -785,7 +792,8 @@ impl super::TermWindow {
             + (pos.left as isize * global_cell_size.width);
         let pane_top =
             padding_top as isize + first_line_offset + (pos.top as isize * global_cell_size.height);
-        let pane_nav_height = pane_nav_bar_height_for_metrics(self.render_metrics) as isize;
+        let pane_nav_height =
+            self.pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics) as isize;
 
         let local_x = event.coords.x.sub(pane_left);
         let local_y = event.coords.y.sub(pane_top + pane_nav_height);

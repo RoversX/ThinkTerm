@@ -404,7 +404,13 @@ async fn connect_domain_into_space(
     // in-process window already occupies it, focus that window instead.
     let space_owner_id = workspace_threads::next_space_owner_id();
     if !workspace_threads::switch_window_space(space_owner_id, &plan.space_id) {
-        for window_id in mux.iter_windows_in_workspace(&plan.workspace_name) {
+        for window_id in mux.iter_windows() {
+            let owned = mux
+                .get_window(window_id)
+                .map_or(false, |w| w.origin_domain() == Some(domain.domain_id()));
+            if !owned {
+                continue;
+            }
             if let Some(gui_window) =
                 crate::frontend::front_end().gui_window_for_mux_window(window_id)
             {
@@ -429,14 +435,6 @@ async fn connect_domain_into_space(
         id
     };
 
-    // Transiently bind the thread to the window's current workspace so the
-    // sidebar's workspace->project sync resolves to the mux project instead
-    // of manufacturing a spurious local Home project.
-    let initial_workspace = mux
-        .get_window(window_id)
-        .map(|w| w.get_workspace().to_string());
-    workspace_threads::bind_mux_domain_thread_workspace(&plan.thread_id, initial_workspace);
-
     TermWindow::new_window_with_claimed_space(window_id, space_owner_id, plan.space_id.clone())
         .await?;
 
@@ -444,10 +442,7 @@ async fn connect_domain_into_space(
     config.update_ulimit()?;
 
     // The ConnectionUI (auth prompts) appears as a tab inside this window.
-    if let Err(err) = domain.attach(Some(window_id)).await {
-        workspace_threads::bind_mux_domain_thread_workspace(&plan.thread_id, None);
-        return Err(err);
-    }
+    domain.attach(Some(window_id)).await?;
 
     // Mirror spawn_tab_in_domain_if_mux_is_empty's empty-server handling.
     let no_workspace_filter = None;
@@ -474,22 +469,11 @@ async fn connect_domain_into_space(
     }
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
 
-    // Rename the window into the Space's canonical workspace. Order matters:
-    // bind the thread first so the WindowWorkspaceChanged-driven sync finds
-    // the binding and activates the mux project in the sidebar.
-    if mux.get_window(window_id).is_some() {
-        workspace_threads::bind_mux_domain_thread_workspace(
-            &plan.thread_id,
-            Some(plan.workspace_name.clone()),
-        );
-        if let Some(mut window) = mux.get_window_mut(window_id) {
-            window.set_workspace(&plan.workspace_name);
-        }
-    } else {
-        // The window died before we could populate it (e.g. empty server and
-        // the connui closed first); domain windows may still exist elsewhere.
-        workspace_threads::bind_mux_domain_thread_workspace(&plan.thread_id, None);
-    }
+    // Deliberately NO workspace rename here. The Space binding is carried by
+    // the claimed space on the TermWindow; renaming the mux window's
+    // workspace would be reconciled to the REMOTE mux server by the client
+    // domain (SetWindowWorkspace), polluting the server's workspace names and
+    // breaking the primary-window fold on every future attach.
     Ok(())
 }
 
