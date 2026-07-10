@@ -3358,21 +3358,23 @@ impl super::TermWindow {
             return;
         }
 
-        // Mux-client-domain threads (`wezterm connect` Spaces) cannot be
-        // materialized locally: their content lives on the remote mux server.
-        // The live case was handled by the adopt branch above; when the
-        // workspace isn't live, spawning a local shell here would fight the
-        // remote's ownership, so refuse.
-        if let Some(domain_name) =
-            crate::workspace_threads::client_domain_name_for_project_id(&plan.project_id)
-        {
-            log::info!(
-                "thread {:?} belongs to mux domain {domain_name:?}; \
-                 use `wezterm connect {domain_name}` to attach it",
-                plan.thread_id
-            );
-            context.invalidate();
-            return;
+        // In a mux-client-domain Space every thread targets the remote
+        // server: panes spawn into the client domain, never a local shell.
+        // That requires the domain to be attached first.
+        let space_client_domain =
+            crate::workspace_threads::client_domain_for_space(&self.active_space_id);
+        if let Some(domain_name) = space_client_domain.as_deref() {
+            let attached = mux.get_domain_by_name(domain_name).map_or(false, |d| {
+                d.state() == mux::domain::DomainState::Attached
+            });
+            if !attached {
+                log::info!(
+                    "Space is bound to mux domain {domain_name:?} which is not connected; \
+                     use `wezterm connect {domain_name}` first"
+                );
+                context.invalidate();
+                return;
+            }
         }
 
         let workspace_name = plan.workspace_name.clone();
@@ -3409,6 +3411,20 @@ impl super::TermWindow {
                     return;
                 }
             }
+        } else if let Some(domain_name) = space_client_domain {
+            // Thread in a mux-domain Space: spawn on the remote server, with
+            // the project path (a remote directory) as the starting cwd. The
+            // domain's own "main" project carries a wezterm-mux:// sentinel
+            // path, which is not a cwd.
+            let cwd = plan
+                .project_path
+                .to_str()
+                .filter(|path| !path.starts_with("wezterm-mux://"))
+                .map(|path| path.to_string());
+            (
+                cwd,
+                config::keyassignment::SpawnTabDomain::DomainName(domain_name),
+            )
         } else {
             (
                 plan.project_path.to_str().map(|path| path.to_string()),

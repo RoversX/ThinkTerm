@@ -1346,8 +1346,17 @@ impl TermWindow {
         let size = match mux.get_active_tab_for_window(mux_window_id) {
             Some(tab) => tab.get_size(),
             None => {
+                // Window created ahead of its content (e.g. the connect flow
+                // creates the window before the domain attach populates it).
+                // A zero Default here would open a degenerate one-row window
+                // and set off a resize tug-of-war; start at the configured
+                // initial size instead.
                 log::debug!("new_window has no tabs... yet?");
-                Default::default()
+                let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
+                config.initial_size(
+                    dpi as u32,
+                    crate::cell_pixel_dims(&config, dpi as f64).ok(),
+                )
             }
         };
         let physical_rows = size.rows as usize;
@@ -2245,10 +2254,24 @@ impl TermWindow {
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
-                match crate::workspace_threads::create_project_from_path(
+                // In a mux-domain Space the path names a directory on the
+                // remote server and must not be resolved locally.
+                let result = if crate::workspace_threads::client_domain_for_space(
                     &self.active_space_id,
-                    path.as_ref(),
-                ) {
+                )
+                .is_some()
+                {
+                    crate::workspace_threads::create_remote_project_from_path(
+                        &self.active_space_id,
+                        path.as_ref(),
+                    )
+                } else {
+                    crate::workspace_threads::create_project_from_path(
+                        &self.active_space_id,
+                        path.as_ref(),
+                    )
+                };
+                match result {
                     Ok(thread_id) => self.activate_workspace_thread(thread_id, window),
                     Err(err) => log::error!("failed to create ThinkTerm project: {err:#}"),
                 }
@@ -3950,6 +3973,36 @@ impl TermWindow {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
+
+        // In a mux-domain Space the project path lives on the remote server;
+        // a local folder picker is meaningless there, so prompt for the path
+        // as text instead.
+        if let Some(domain_name) =
+            crate::workspace_threads::client_domain_for_space(&self.active_space_id)
+        {
+            let mux = Mux::get();
+            let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+                return;
+            };
+            let description =
+                format!("Add a project on {domain_name}: enter a remote directory path");
+            let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+                let line = crate::overlay::prompt::read_line_prompt_overlay(
+                    term,
+                    &description,
+                    "path> ",
+                    Some("~/"),
+                )?;
+                if let Some(path) = line.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                    window.notify(TermWindowNotif::OpenProjectPath(PathBuf::from(path)));
+                }
+                Ok(())
+            });
+            self.assign_overlay(tab.tab_id(), overlay);
+            promise::spawn::spawn(future).detach();
+            return;
+        }
+
         context.pick_folder_async(Box::new(move |path| {
             if let Some(path) = path {
                 window.notify(TermWindowNotif::OpenProjectPath(path));

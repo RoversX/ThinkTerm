@@ -3298,8 +3298,32 @@ pub fn is_mux_domain_project_id(project_id: &str) -> bool {
     remote_host_id_for_project_id(project_id).starts_with(MUX_DOMAIN_HOST_PREFIX)
 }
 
-pub fn client_domain_name_for_project_id(project_id: &str) -> Option<&str> {
-    remote_host_id_for_project_id(project_id).strip_prefix(MUX_DOMAIN_HOST_PREFIX)
+/// The mux client domain a Space is dedicated to, if any. Every thread in
+/// such a Space targets the remote server: new panes spawn into this domain
+/// and project paths refer to the remote filesystem.
+pub fn client_domain_for_space(space_id: &str) -> Option<String> {
+    let store = THREAD_STORE.lock();
+    store
+        .spaces
+        .iter()
+        .find(|space| space.id == space_id)
+        .and_then(|space| space.client_domain.clone())
+}
+
+/// Create a project in a mux-domain Space. The path names a directory on the
+/// remote server, so it must not be resolved or canonicalized locally.
+pub fn create_remote_project_from_path(space_id: &str, path: &str) -> Result<WorkspaceThreadId> {
+    let trimmed = path.trim();
+    ensure!(!trimmed.is_empty(), "project path is empty");
+    ensure!(
+        trimmed == "~" || trimmed.starts_with("~/") || trimmed.starts_with('/'),
+        "remote project path must be absolute or start with ~: {trimmed}"
+    );
+    let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    let thread_id = store.create_project_from_path(space_id, PathBuf::from(trimmed));
+    persist_locked(&store);
+    Ok(thread_id)
 }
 
 /// Everything `wezterm connect` needs to route a client-domain attach into
