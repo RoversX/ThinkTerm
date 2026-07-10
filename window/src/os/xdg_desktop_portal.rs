@@ -7,6 +7,7 @@ use anyhow::Context;
 use futures_lite::future::FutureExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;

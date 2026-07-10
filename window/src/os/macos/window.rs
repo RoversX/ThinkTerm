@@ -1572,17 +1572,28 @@ impl WindowInner {
             return;
         }
 
-        unsafe {
-            let frame = NSView::frame(*self.view as *mut _);
-            let backing_frame = NSView::convertRectToBacking(*self.view as *mut _, frame);
-            let scale = if frame.size.width > 0.0 {
-                backing_frame.size.width / frame.size.width
-            } else {
-                1.0
-            };
+        // popUpMenuPositioningItem runs a nested event loop that continues
+        // to service the spawn queue.  We are called via with_window_inner,
+        // which holds the window RefCell borrow for the duration of the
+        // callback; popping the menu up while that borrow is held causes any
+        // other with_window_inner callback dispatched during menu tracking
+        // to panic with "RefCell already borrowed".  Defer the blocking
+        // pop-up until after our caller releases the borrow.
+        let view = self.view.clone();
+        promise::spawn::spawn(async move {
+            unsafe {
+                let frame = NSView::frame(*view as *mut _);
+                let backing_frame = NSView::convertRectToBacking(*view as *mut _, frame);
+                let scale = if frame.size.width > 0.0 {
+                    backing_frame.size.width / frame.size.width
+                } else {
+                    1.0
+                };
 
-            menu.pop_up_at(*self.view, coords.x as f64 / scale, coords.y as f64 / scale);
-        }
+                menu.pop_up_at(*view, coords.x as f64 / scale, coords.y as f64 / scale);
+            }
+        })
+        .detach();
     }
 
     fn invalidate(&mut self) {
