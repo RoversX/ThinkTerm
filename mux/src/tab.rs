@@ -1052,8 +1052,12 @@ impl TabInner {
         }
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
-        self.size = size;
 
+        // Let resize() decide whether anything actually changed (it updates
+        // self.size itself, with min-size clamping). Do NOT pre-assign
+        // self.size here: that would defeat resize()'s no-op guard and
+        // re-emit TabResized on every resync, feeding the resize/resync
+        // storm this sync is usually responding to.
         self.resize(size);
 
         log::debug!(
@@ -1539,6 +1543,15 @@ impl TabInner {
     fn resize(&mut self, size: TerminalSize) {
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
+            return;
+        }
+
+        // No-op resizes must not emit TabResized: for mux client tabs the
+        // notification round-trips through the server and triggers a resync
+        // (which itself calls resize), so an unconditional notify turns any
+        // transient client/server size disagreement into an endless
+        // resize/resync storm that visibly flickers the window contents.
+        if size == self.size {
             return;
         }
 
@@ -2470,8 +2483,12 @@ impl TabInner {
             .ok_or_else(|| anyhow::anyhow!("pane {} not found in tab", pane_id))?;
         self.active = pane_index;
         self.recency.tag(pane_index);
+        // Switching the visible pane of a stack is a focus event, not a size
+        // event: advise_focus_change already emits PaneFocused, which the GUI
+        // uses to repaint. Emitting TabResized here made every level-2 tab
+        // switch on a mux client tab round-trip through the server and kick
+        // off a resync (resize/resync storm).
         self.advise_focus_change(prior);
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
 
         Ok(pane_index)
     }
