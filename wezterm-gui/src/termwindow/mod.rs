@@ -1309,6 +1309,14 @@ impl TermWindow {
         Self::new_window_impl(mux_window_id, None, true).await
     }
 
+    /// For domain-owned mux windows (remote mux windows arriving via a
+    /// ClientDomain, tmux): create the GUI window as-is, without restoring
+    /// a saved workspace thread. Restoring would adopt this window onto a
+    /// different mux window, orphaning/killing the one the domain created.
+    pub async fn new_window_without_restore(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
+        Self::new_window_impl(mux_window_id, None, false).await
+    }
+
     pub async fn new_window_with_claimed_space(
         mux_window_id: MuxWindowId,
         space_owner_id: u64,

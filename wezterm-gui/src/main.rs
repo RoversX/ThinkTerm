@@ -292,6 +292,15 @@ fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<Stri
     }
 }
 
+/// Returns the domain id to tag domain-owned mux windows with, when the
+/// domain is a ClientDomain (remote mux). Tagged windows are exempt from
+/// the frontend's saved-thread restore/adoption and local layout snapshots.
+fn client_domain_origin(domain: &Arc<dyn Domain>) -> Option<mux::domain::DomainId> {
+    domain
+        .downcast_ref::<ClientDomain>()
+        .map(|_| domain.domain_id())
+}
+
 async fn spawn_tab_in_domain_if_mux_is_empty(
     cmd: Option<CommandBuilder>,
     is_connecting: bool,
@@ -317,7 +326,11 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
         // We use the TabAddedToWindow mux notification
         // to detect and adjust the size later on.
         let position = None;
-        let builder = mux.new_empty_window(workspace.clone(), position);
+        let builder = mux.new_empty_window_for_domain(
+            workspace.clone(),
+            position,
+            client_domain_origin(&domain),
+        );
         *builder
     };
 
@@ -351,6 +364,132 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
         )
         .await?;
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
+    Ok(())
+}
+
+/// `wezterm connect <domain>` routed through the ThinkTerm Space system:
+/// find-or-create the domain's dedicated Space; if already connected in this
+/// process, focus an existing window instead of duplicating; otherwise create
+/// the connect window with an explicit Space claim so the frontend's
+/// reconcile/restore can never hijack it away from the in-window ConnectionUI.
+async fn connect_domain_into_space(
+    cmd: Option<CommandBuilder>,
+    domain: Arc<dyn Domain>,
+) -> anyhow::Result<()> {
+    use mux::domain::DomainState;
+
+    let mux = Mux::get();
+    let domain_name = domain.domain_name().to_string();
+    let plan = workspace_threads::ensure_mux_domain_space(&domain_name);
+
+    // Already attached in this process: focus one of this domain's windows.
+    if domain.state() == DomainState::Attached {
+        for window_id in mux.iter_windows() {
+            let owned = mux
+                .get_window(window_id)
+                .map_or(false, |w| w.origin_domain() == Some(domain.domain_id()));
+            if !owned {
+                continue;
+            }
+            if let Some(gui_window) =
+                crate::frontend::front_end().gui_window_for_mux_window(window_id)
+            {
+                gui_window.window.focus();
+                return Ok(());
+            }
+        }
+    }
+
+    // Claim the Space for the window we are about to create. If another
+    // in-process window already occupies it, focus that window instead.
+    let space_owner_id = workspace_threads::next_space_owner_id();
+    if !workspace_threads::switch_window_space(space_owner_id, &plan.space_id) {
+        for window_id in mux.iter_windows_in_workspace(&plan.workspace_name) {
+            if let Some(gui_window) =
+                crate::frontend::front_end().gui_window_for_mux_window(window_id)
+            {
+                gui_window.window.focus();
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "Space for domain {domain_name} is occupied by another window; \
+             switch to it instead"
+        );
+    }
+
+    // Create the connect mux window in the default workspace (the remote's
+    // primary window folds into it only when workspace names match), and
+    // claim it before the builder drops so the WindowCreated notification
+    // can never race a reconcile-spawned duplicate.
+    let window_id = {
+        let builder = mux.new_empty_window_for_domain(None, None, Some(domain.domain_id()));
+        let id = *builder;
+        crate::frontend::front_end().claim_spawned_mux_window(id);
+        id
+    };
+
+    // Transiently bind the thread to the window's current workspace so the
+    // sidebar's workspace->project sync resolves to the mux project instead
+    // of manufacturing a spurious local Home project.
+    let initial_workspace = mux
+        .get_window(window_id)
+        .map(|w| w.get_workspace().to_string());
+    workspace_threads::bind_mux_domain_thread_workspace(&plan.thread_id, initial_workspace);
+
+    TermWindow::new_window_with_claimed_space(window_id, space_owner_id, plan.space_id.clone())
+        .await?;
+
+    let config = config::configuration();
+    config.update_ulimit()?;
+
+    // The ConnectionUI (auth prompts) appears as a tab inside this window.
+    if let Err(err) = domain.attach(Some(window_id)).await {
+        workspace_threads::bind_mux_domain_thread_workspace(&plan.thread_id, None);
+        return Err(err);
+    }
+
+    // Mirror spawn_tab_in_domain_if_mux_is_empty's empty-server handling.
+    let no_workspace_filter = None;
+    if !have_panes_in_domain_and_ws(&domain, &no_workspace_filter) {
+        let _config_subscription = config::subscribe_to_config_reload(move || {
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Err(err) = update_mux_domains(&config::configuration()) {
+                    log::error!("Error updating mux domains: {:#}", err);
+                }
+            })
+            .detach();
+            true
+        });
+
+        let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
+        let _tab = domain
+            .spawn(
+                config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
+                cmd,
+                None,
+                window_id,
+            )
+            .await?;
+    }
+    trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
+
+    // Rename the window into the Space's canonical workspace. Order matters:
+    // bind the thread first so the WindowWorkspaceChanged-driven sync finds
+    // the binding and activates the mux project in the sidebar.
+    if mux.get_window(window_id).is_some() {
+        workspace_threads::bind_mux_domain_thread_workspace(
+            &plan.thread_id,
+            Some(plan.workspace_name.clone()),
+        );
+        if let Some(mut window) = mux.get_window_mut(window_id) {
+            window.set_workspace(&plan.workspace_name);
+        }
+    } else {
+        // The window died before we could populate it (e.g. empty server and
+        // the connui closed first); domain windows may still exist elsewhere.
+        workspace_threads::bind_mux_domain_thread_workspace(&plan.thread_id, None);
+    }
     Ok(())
 }
 
@@ -479,7 +618,11 @@ async fn async_run_terminal_gui(
                 // so that the attach await below doesn't block it.
                 let workspace = None;
                 let position = None;
-                let builder = mux.new_empty_window(workspace, position);
+                let builder = mux.new_empty_window_for_domain(
+                    workspace,
+                    position,
+                    client_domain_origin(domain),
+                );
                 *builder
             };
 
@@ -501,6 +644,15 @@ async fn async_run_terminal_gui(
                 window.set_active_without_saving(tab_idx);
             }
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
+        }
+    }
+    // `wezterm connect` to a mux client domain goes through the Space system:
+    // dedicated find-or-create Space, explicit window claim, no restore.
+    if is_connecting {
+        if let Some(domain) = &domain {
+            if domain.downcast_ref::<ClientDomain>().is_some() {
+                return connect_domain_into_space(cmd, Arc::clone(domain)).await;
+            }
         }
     }
     spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await

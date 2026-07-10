@@ -663,7 +663,11 @@ impl ClientDomain {
                     workspace
                 );
                 let position = None;
-                let local_window_id = mux.new_empty_window(workspace.take(), position);
+                let local_window_id = mux.new_empty_window_for_domain(
+                    workspace.take(),
+                    position,
+                    Some(inner.local_domain_id),
+                );
                 inner.record_remote_to_local_window_mapping(remote_window_id, *local_window_id);
                 mux.add_tab_to_window(&tab, *local_window_id)?;
             }

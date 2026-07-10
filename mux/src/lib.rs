@@ -989,7 +989,20 @@ impl Mux {
         workspace: Option<String>,
         position: Option<GuiPosition>,
     ) -> MuxWindowBuilder {
-        let window = Window::new(workspace, position);
+        self.new_empty_window_for_domain(workspace, position, None)
+    }
+
+    /// Like `new_empty_window`, but tags the window with the domain that is
+    /// creating it. The tag is set before the window becomes observable via
+    /// mux notifications, so the GUI can reliably distinguish domain-owned
+    /// windows (remote mux windows, tmux) from user-initiated ones.
+    pub fn new_empty_window_for_domain(
+        &self,
+        workspace: Option<String>,
+        position: Option<GuiPosition>,
+        origin_domain: Option<DomainId>,
+    ) -> MuxWindowBuilder {
+        let window = Window::new(workspace, position, origin_domain);
         let window_id = window.window_id();
         self.windows.write().insert(window_id, window);
         MuxWindowBuilder {

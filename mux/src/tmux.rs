@@ -283,9 +283,10 @@ impl TmuxDomainState {
                         notified: false,
                     }
                 } else {
-                    mux.new_empty_window(
+                    mux.new_empty_window_for_domain(
                         None, /* TODO: pass session here */
                         None, /* position */
+                        Some(self.domain_id),
                     )
                 };
 

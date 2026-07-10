@@ -49,6 +49,12 @@ pub struct Space {
     pub active_project_id: Option<ProjectId>,
     #[serde(default)]
     pub is_default: bool,
+    /// When set, this Space is dedicated to a wezterm mux client domain
+    /// (`wezterm connect <name>`). Such Spaces are found-or-created by domain
+    /// name, are never claimed by startup/Dock windows, and never persist
+    /// layout locally (the remote mux server owns the layout truth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -986,6 +992,16 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
         return;
     }
 
+    // Domain-owned windows (remote mux windows, tmux) must never be
+    // snapshotted locally: the remote mux server owns the layout truth,
+    // and a local snapshot would fight it on restore.
+    if Mux::get()
+        .get_window(window_id)
+        .map_or(false, |w| w.origin_domain().is_some())
+    {
+        return;
+    }
+
     let Some(snapshot) = snapshot_window_layout(window_id, &pane_font_scale) else {
         return;
     };
@@ -1296,6 +1312,7 @@ impl WorkspaceThreadStore {
                 name: DEFAULT_SPACE_NAME.to_string(),
                 active_project_id: self.active_project_id.clone(),
                 is_default: true,
+                client_domain: None,
             });
             changed = true;
         }
@@ -1379,12 +1396,21 @@ impl WorkspaceThreadStore {
     }
 
     fn create_space_record(&mut self, name: String) -> SpaceId {
+        self.create_space_record_for_domain(name, None)
+    }
+
+    fn create_space_record_for_domain(
+        &mut self,
+        name: String,
+        client_domain: Option<String>,
+    ) -> SpaceId {
         let id = new_id("space");
         self.spaces.push(Space {
             id: id.clone(),
             name,
             active_project_id: None,
             is_default: false,
+            client_domain,
         });
         id
     }
@@ -1393,19 +1419,32 @@ impl WorkspaceThreadStore {
         &mut self,
         occupied: &std::collections::HashSet<SpaceId>,
     ) -> SpaceId {
+        // Mux-domain Spaces belong to `wezterm connect`; startup and Dock
+        // "New Window" must never claim them (they would materialize a local
+        // shell into a remote-owned workspace).
         self.last_active_space_id
             .clone()
-            .filter(|space_id| self.has_space(space_id) && !occupied.contains(space_id))
+            .filter(|space_id| {
+                self.has_space(space_id)
+                    && !occupied.contains(space_id)
+                    && !self.is_client_domain_space(space_id)
+            })
             .or_else(|| {
                 self.spaces
                     .iter()
-                    .find(|space| !occupied.contains(&space.id))
+                    .find(|space| !occupied.contains(&space.id) && space.client_domain.is_none())
                     .map(|space| space.id.clone())
             })
             .unwrap_or_else(|| {
                 let name = next_space_name(&self.spaces);
                 self.create_space_record(name)
             })
+    }
+
+    fn is_client_domain_space(&self, space_id: &str) -> bool {
+        self.spaces
+            .iter()
+            .any(|space| space.id == space_id && space.client_domain.is_some())
     }
 
     fn rename_space(&mut self, space_id: &str, name: String) -> bool {
@@ -2079,6 +2118,12 @@ impl WorkspaceThreadStore {
         let Some(project_id) = self.active_project_id_for_space(space_id) else {
             return false;
         };
+        // Never write a local layout for mux-domain threads; the remote mux
+        // server owns the layout truth (second layer under the window-origin
+        // tag guard in snapshot_active_space_thread_layout_with_font_scales).
+        if is_mux_domain_project_id(&project_id) {
+            return false;
+        }
         let Some(project) = self
             .projects
             .iter_mut()
@@ -3158,6 +3203,11 @@ fn is_remote_project(project: &Project) -> bool {
 }
 
 fn thread_has_restorable_workspace(thread: &WorkspaceThread) -> bool {
+    // Mux-domain threads have no local layout to restore: their content lives
+    // on the remote mux server and only materializes through `wezterm connect`.
+    if is_mux_domain_project_id(&thread.project_id) {
+        return false;
+    }
     thread.layout.is_some() || thread.materialized_workspace_name.is_some()
 }
 
@@ -3233,6 +3283,124 @@ fn workspace_name_for_remote_default(project_id: &str, thread_id: &str, workspac
 
 pub fn remote_project_id_for_space(space_id: &str, host_id: &str) -> ProjectId {
     format!("{host_id}{REMOTE_PROJECT_SPACE_SEPARATOR}{space_id}")
+}
+
+/// Prefix distinguishing mux-client-domain pseudo host ids from the ssh_hosts
+/// store's `ssh-`/`system-ssh-` ids, so none of the sidebar SSH machinery
+/// fires on them.
+const MUX_DOMAIN_HOST_PREFIX: &str = "muxdomain-";
+
+pub fn mux_domain_host_id(domain_name: &str) -> String {
+    format!("{MUX_DOMAIN_HOST_PREFIX}{domain_name}")
+}
+
+pub fn is_mux_domain_project_id(project_id: &str) -> bool {
+    remote_host_id_for_project_id(project_id).starts_with(MUX_DOMAIN_HOST_PREFIX)
+}
+
+pub fn client_domain_name_for_project_id(project_id: &str) -> Option<&str> {
+    remote_host_id_for_project_id(project_id).strip_prefix(MUX_DOMAIN_HOST_PREFIX)
+}
+
+/// Everything `wezterm connect` needs to route a client-domain attach into
+/// its dedicated Space.
+#[derive(Debug, Clone)]
+pub struct MuxDomainSpacePlan {
+    pub space_id: SpaceId,
+    pub project_id: ProjectId,
+    pub thread_id: WorkspaceThreadId,
+    /// Deterministic canonical workspace name for the thread; the connect
+    /// window is renamed into this workspace once attach has completed.
+    pub workspace_name: String,
+}
+
+/// Find-or-create the dedicated Space for a mux client domain, along with its
+/// single project and "main" thread. Idempotent: reconnecting converges on the
+/// same records.
+pub fn ensure_mux_domain_space(domain_name: &str) -> MuxDomainSpacePlan {
+    let mut store = THREAD_STORE.lock();
+
+    let space_id = store
+        .spaces
+        .iter()
+        .find(|space| space.client_domain.as_deref() == Some(domain_name))
+        .map(|space| space.id.clone())
+        .unwrap_or_else(|| {
+            store.create_space_record_for_domain(
+                domain_name.to_string(),
+                Some(domain_name.to_string()),
+            )
+        });
+
+    let host_id = mux_domain_host_id(domain_name);
+    let project_id = remote_project_id_for_space(&space_id, &host_id);
+    if !store.projects.iter().any(|p| p.id == project_id) {
+        store.projects.push(Project {
+            id: project_id.clone(),
+            space_id: space_id.clone(),
+            name: domain_name.to_string(),
+            path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
+            threads: vec![],
+            active_thread_id: None,
+            threads_collapsed: false,
+        });
+    }
+
+    let project = store
+        .projects
+        .iter_mut()
+        .find(|p| p.id == project_id)
+        .expect("mux domain project was just ensured");
+    if project.threads.is_empty() {
+        project
+            .threads
+            .push(WorkspaceThread::new(project_id.clone(), "main".to_string(), None));
+    }
+    let thread_id = project
+        .active_thread_id
+        .clone()
+        .filter(|id| project.threads.iter().any(|t| &t.id == id))
+        .unwrap_or_else(|| project.threads[0].id.clone());
+    project.active_thread_id = Some(thread_id.clone());
+
+    if let Some(space) = store.spaces.iter_mut().find(|space| space.id == space_id) {
+        space.active_project_id = Some(project_id.clone());
+    }
+
+    let workspace_name = workspace_name_for_thread(&project_id, &thread_id);
+    persist_locked(&store);
+
+    MuxDomainSpacePlan {
+        space_id,
+        project_id,
+        thread_id,
+        workspace_name,
+    }
+}
+
+/// Point a mux-domain thread at the mux workspace it is currently
+/// materialized in (or clear it with `None` when the connect fails).
+/// Only applies to mux-domain threads; returns whether a change was made.
+pub fn bind_mux_domain_thread_workspace(thread_id: &str, workspace: Option<String>) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let mut changed = false;
+    for project in store.projects.iter_mut() {
+        if !is_mux_domain_project_id(&project.id) {
+            continue;
+        }
+        if let Some(thread) = project.threads.iter_mut().find(|t| t.id == thread_id) {
+            if thread.materialized_workspace_name != workspace {
+                thread.materialized_workspace_name = workspace;
+                thread.last_active_at = now_ts();
+                changed = true;
+            }
+            break;
+        }
+    }
+    if changed {
+        persist_locked(&store);
+    }
+    changed
 }
 
 pub fn remote_host_id_for_project_id(project_id: &str) -> &str {

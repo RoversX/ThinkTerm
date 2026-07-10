@@ -1,3 +1,4 @@
+use crate::domain::DomainId;
 use crate::pane::CloseReason;
 use crate::{Mux, MuxNotification, Tab, TabId};
 use config::GuiPosition;
@@ -17,10 +18,19 @@ pub struct Window {
     workspace: String,
     title: String,
     initial_position: Option<GuiPosition>,
+    /// The domain that created this window on its own initiative (e.g. a
+    /// ClientDomain materializing a remote mux window, or tmux). Such windows
+    /// are owned by their domain: the GUI must not adopt them into saved
+    /// workspace threads or snapshot their layout locally.
+    origin_domain: Option<DomainId>,
 }
 
 impl Window {
-    pub fn new(workspace: Option<String>, initial_position: Option<GuiPosition>) -> Self {
+    pub fn new(
+        workspace: Option<String>,
+        initial_position: Option<GuiPosition>,
+        origin_domain: Option<DomainId>,
+    ) -> Self {
         Self {
             id: WIN_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed),
             tabs: vec![],
@@ -30,7 +40,12 @@ impl Window {
             title: String::new(),
             workspace: workspace.unwrap_or_else(|| Mux::get().active_workspace()),
             initial_position,
+            origin_domain,
         }
+    }
+
+    pub fn origin_domain(&self) -> Option<DomainId> {
+        self.origin_domain
     }
 
     pub fn get_initial_position(&self) -> &Option<GuiPosition> {

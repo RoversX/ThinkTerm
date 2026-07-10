@@ -435,7 +435,20 @@ impl GuiFrontEnd {
                     .borrow_mut()
                     .insert(mux_window_id);
                 log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
-                if let Err(err) = TermWindow::new_window(mux_window_id).await {
+                // Domain-owned windows (remote mux windows, tmux) must not be
+                // adopted into a saved workspace thread: the restore would
+                // re-point the GUI window at a different mux window and orphan
+                // the one the domain just created (killing e.g. the in-window
+                // ConnectionUI mid-authentication).
+                let is_domain_owned = Mux::get()
+                    .get_window(mux_window_id)
+                    .map_or(false, |w| w.origin_domain().is_some());
+                let created = if is_domain_owned {
+                    TermWindow::new_window_without_restore(mux_window_id).await
+                } else {
+                    TermWindow::new_window(mux_window_id).await
+                };
+                if let Err(err) = created {
                     log::error!("Failed to create window: {:#}", err);
                     let mux = Mux::get();
                     mux.kill_window(mux_window_id);
@@ -555,6 +568,13 @@ impl GuiFrontEnd {
             }
         }
         false
+    }
+
+    /// Pre-claim a mux window that the caller is about to create a GUI window
+    /// for explicitly (e.g. the `wezterm connect` flow), so that neither the
+    /// WindowCreated handler nor the additive reconcile spawns a duplicate.
+    pub fn claim_spawned_mux_window(&self, mux_window_id: MuxWindowId) {
+        self.spawned_mux_window.borrow_mut().insert(mux_window_id);
     }
 
     pub fn switch_workspace(&self, workspace: &str) {
