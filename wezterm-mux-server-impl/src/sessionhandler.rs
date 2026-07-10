@@ -725,6 +725,27 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::SpawnPaneInStack(request) => {
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    schedule_spawn_pane_in_stack(request, send_response, client_id);
+                })
+                .detach();
+            }
+
+            Pdu::ActivatePaneInStack(request) => {
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    let mux = Mux::get();
+                    let _identity = mux.with_identity(client_id);
+                    send_response(
+                        mux.activate_pane_in_stack(request.pane_id)
+                            .map(|()| Pdu::UnitResponse(UnitResponse {})),
+                    );
+                })
+                .detach();
+            }
+
             Pdu::MovePaneToNewTab(request) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
@@ -1038,6 +1059,62 @@ where
 {
     promise::spawn::spawn(async move { send_response(split_pane(split, client_id).await) })
         .detach();
+}
+
+fn schedule_spawn_pane_in_stack<SND>(
+    request: SpawnPaneInStack,
+    send_response: SND,
+    client_id: Option<Arc<ClientId>>,
+) where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+{
+    promise::spawn::spawn(async move {
+        send_response(spawn_pane_in_stack(request, client_id).await)
+    })
+    .detach();
+}
+
+async fn spawn_pane_in_stack(
+    request: SpawnPaneInStack,
+    client_id: Option<Arc<ClientId>>,
+) -> anyhow::Result<Pdu> {
+    let mux = Mux::get();
+    let _identity = mux.with_identity(client_id);
+
+    let (_pane_domain_id, window_id, tab_id) = mux
+        .resolve_pane_id(request.pane_id)
+        .ok_or_else(|| anyhow!("pane_id {} invalid", request.pane_id))?;
+
+    // The new pane joins the stack occupying the same rect as the base
+    // pane, so it inherits the base pane's current size.
+    let base = mux
+        .get_pane(request.pane_id)
+        .ok_or_else(|| anyhow!("pane_id {} invalid", request.pane_id))?;
+    let dims = base.get_dimensions();
+    let size = ::wezterm_term::TerminalSize {
+        rows: dims.viewport_rows,
+        cols: dims.cols,
+        pixel_width: dims.pixel_width,
+        pixel_height: dims.pixel_height,
+        dpi: dims.dpi,
+    };
+
+    let pane = mux
+        .spawn_pane_in_stack(
+            request.pane_id,
+            request.domain,
+            request.command,
+            request.command_dir,
+            size,
+        )
+        .await?;
+
+    Ok::<Pdu, anyhow::Error>(Pdu::SpawnResponse(SpawnResponse {
+        pane_id: pane.pane_id(),
+        tab_id,
+        window_id,
+        size,
+    }))
 }
 
 async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {

@@ -263,11 +263,14 @@ impl super::TermWindow {
         }
     }
 
-    /// Per-pane navigation bar height. Panes that belong to a mux client
-    /// domain (remote wezterm mux) get NO nav bar: the mux protocol sizes a
-    /// leaf tab from its pane, so stealing nav-bar rows from a ClientPane
-    /// echoes back from the server as a smaller tab and produces a feedback
-    /// loop that shrinks the window a few rows per round-trip.
+    /// Rows (in pixels) the per-pane navigation bar STEALS from the pane's
+    /// terminal viewport. Panes that belong to a mux client domain (remote
+    /// wezterm mux) steal nothing: the mux protocol sizes a leaf tab from
+    /// its pane, so shrinking a ClientPane's viewport echoes back from the
+    /// server as a smaller tab and produces a feedback loop that shrinks
+    /// the window a few rows per round-trip. For those panes the nav bar is
+    /// drawn as an overlay on top of the content instead (see render/pane.rs
+    /// which uses the plain metric height for drawing).
     pub(crate) fn pane_nav_bar_height_for_pane(
         &self,
         pane: &std::sync::Arc<dyn mux::pane::Pane>,

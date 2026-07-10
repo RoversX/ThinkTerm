@@ -3975,8 +3975,9 @@ impl TermWindow {
         };
 
         // In a mux-domain Space the project path lives on the remote server;
-        // a local folder picker is meaningless there, so prompt for the path
-        // as text instead.
+        // a local folder picker is meaningless there. Offer the remote
+        // directories we actually know about (live pane cwds via OSC7 and
+        // previously-added project paths) plus free-form entry.
         if let Some(domain_name) =
             crate::workspace_threads::client_domain_for_space(&self.active_space_id)
         {
@@ -3984,8 +3985,41 @@ impl TermWindow {
             let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
                 return;
             };
-            let description =
+
+            let mut candidates: Vec<String> = Vec::new();
+            if let Some(domain) = mux.get_domain_by_name(&domain_name) {
+                let domain_id = domain.domain_id();
+                for pane in mux.iter_panes() {
+                    if pane.domain_id() != domain_id {
+                        continue;
+                    }
+                    if let Some(url) = pane
+                        .get_current_working_dir(mux::pane::CachePolicy::AllowStale)
+                    {
+                        let path = url.path().to_string();
+                        if !path.is_empty() && !candidates.contains(&path) {
+                            candidates.push(path);
+                        }
+                    }
+                }
+            }
+            for path in crate::workspace_threads::project_paths_for_space(&self.active_space_id)
+            {
+                if !candidates.contains(&path) {
+                    candidates.push(path);
+                }
+            }
+
+            let mut description =
                 format!("Add a project on {domain_name}: enter a remote directory path");
+            if !candidates.is_empty() {
+                description.push_str("\nKnown remote directories:");
+                for (idx, path) in candidates.iter().enumerate() {
+                    description.push_str(&format!("\n  {}. {}", idx + 1, path));
+                }
+                description.push_str("\nType a number to pick one, or type a path.");
+            }
+
             let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
                 let line = crate::overlay::prompt::read_line_prompt_overlay(
                     term,
@@ -3993,7 +4027,13 @@ impl TermWindow {
                     "path> ",
                     Some("~/"),
                 )?;
-                if let Some(path) = line.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                if let Some(input) = line.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                {
+                    let path = input
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| candidates.get(n.checked_sub(1)?).cloned())
+                        .unwrap_or(input);
                     window.notify(TermWindowNotif::OpenProjectPath(PathBuf::from(path)));
                 }
                 Ok(())

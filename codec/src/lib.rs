@@ -441,7 +441,8 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 46;
+/// 47: PaneStackEntry gained pane_stack_id; stack operation PDUs.
+pub const CODEC_VERSION: usize = 47;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -502,6 +503,8 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    SpawnPaneInStack: 63,
+    ActivatePaneInStack: 64,
 }
 
 impl Pdu {
@@ -517,7 +520,9 @@ impl Pdu {
             | Self::Resize(_)
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
-            | Self::SpawnV2(_) => true,
+            | Self::SpawnV2(_)
+            | Self::SpawnPaneInStack(_)
+            | Self::ActivatePaneInStack(_) => true,
             _ => false,
         }
     }
@@ -659,6 +664,23 @@ pub struct SplitPane {
     /// Instead of spawning a command, move the specified
     /// pane into the new split target
     pub move_pane_id: Option<PaneId>,
+}
+
+/// Spawn a new pane as a level-2 tab in the pane stack that contains
+/// `pane_id`. Responds with SpawnResponse describing the new pane.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SpawnPaneInStack {
+    pub pane_id: PaneId,
+    pub command: Option<CommandBuilder>,
+    pub command_dir: Option<String>,
+    pub domain: config::keyassignment::SpawnTabDomain,
+}
+
+/// Make `pane_id` the visible pane of the stack that contains it.
+/// Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct ActivatePaneInStack {
+    pub pane_id: PaneId,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

@@ -240,6 +240,27 @@ impl ClientPane {
         self.remote_pane_id
     }
 
+    /// Ask the server to make this pane the visible (active) pane of the
+    /// stack that contains it, mirroring a local level-2 tab switch. Without
+    /// this, the next resync would flip the local stack back to the server's
+    /// stale active pane.
+    pub fn activate_in_stack_on_server(&self) {
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        promise::spawn::spawn(async move {
+            if let Err(err) = client
+                .client
+                .activate_pane_in_stack(codec::ActivatePaneInStack {
+                    pane_id: remote_pane_id,
+                })
+                .await
+            {
+                log::error!("remote stack activation failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
     /// Arrange to suppress the next Pane::kill call.
     /// This is a bit of a hack that we use when closing a window;
     /// our Domain::local_window_is_closing impl calls this for each

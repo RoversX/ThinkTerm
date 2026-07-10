@@ -1376,7 +1376,7 @@ impl Mux {
         );
 
         let pane = domain
-            .spawn_pane(size, command.clone(), cwd.clone())
+            .spawn_pane_in_stack(pane_id, size, command.clone(), cwd.clone())
             .await
             .with_context(|| {
                 format!(
@@ -1627,7 +1627,7 @@ mod tests {
     #[test]
     fn window_ui_surfaces_are_distinct_prune_anchors() {
         let mux = Mux::new(None);
-        let window = Window::new(Some("test-workspace".to_string()), None);
+        let window = Window::new(Some("test-workspace".to_string()), None, None);
         let window_id = window.window_id();
         mux.windows.write().insert(window_id, window);
 
@@ -1651,7 +1651,7 @@ mod tests {
     #[test]
     fn existing_window_spawn_context_allows_empty_window() {
         let mux = Mux::new(None);
-        let window = Window::new(Some("test-workspace".to_string()), None);
+        let window = Window::new(Some("test-workspace".to_string()), None, None);
         let window_id = window.window_id();
         mux.windows.write().insert(window_id, window);
 

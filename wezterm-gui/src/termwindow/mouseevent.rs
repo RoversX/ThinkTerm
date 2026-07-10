@@ -255,10 +255,7 @@ impl super::TermWindow {
             return 0.0;
         }
 
-        let nav_height = self.pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics);
-        if nav_height == 0 {
-            return 0.0;
-        }
+        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics);
         let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
         let button_size = nav_height
             .saturating_sub(TAB_VERTICAL_PADDING * 2)
@@ -438,12 +435,8 @@ impl super::TermWindow {
         let x = event.coords.x as f32;
         let y = event.coords.y as f32;
 
+        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics) as f32;
         for pos in tab.iter_panes_ignoring_zoom() {
-            let nav_height =
-                self.pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics) as f32;
-            if nav_height <= 0.0 {
-                continue;
-            }
             let content_pane_x =
                 padding_left + border.left.get() as f32 + pos.left as f32 * cell_width;
             let pane_x = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
@@ -3942,6 +3935,16 @@ impl super::TermWindow {
                 }
                 if let Err(err) = mux.activate_pane_in_stack(target_pane_id) {
                     log::error!("pane nav activate failed: {err:#}");
+                } else if let Some(pane) = mux.get_pane(target_pane_id) {
+                    // For a remote mux pane, mirror the activation on the
+                    // server so its notion of the stack's visible pane
+                    // matches ours; otherwise the next resync would flip
+                    // the local stack back to the server's stale value.
+                    if let Some(client_pane) =
+                        pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                    {
+                        client_pane.activate_in_stack_on_server();
+                    }
                 }
             }
             PaneNavAction::Close(target_pane_id) => {

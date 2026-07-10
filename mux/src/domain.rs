@@ -140,6 +140,21 @@ pub trait Domain: Downcast + Send + Sync {
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>>;
 
+    /// Spawn a pane destined for the pane stack containing `base_pane_id`
+    /// (a level-2 tab). The default just spawns a detached pane and leaves
+    /// the stack insertion to the caller (Mux::spawn_pane_in_stack); domains
+    /// that proxy to a remote mux (ClientDomain) override this so the remote
+    /// side performs the stack insertion too.
+    async fn spawn_pane_in_stack(
+        &self,
+        _base_pane_id: PaneId,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        self.spawn_pane(size, command, command_dir).await
+    }
+
     /// The mux will call this method on the domain of the pane that
     /// is being moved to give the domain a chance to handle the movement.
     /// If this method returns Ok(None), then the mux will handle the

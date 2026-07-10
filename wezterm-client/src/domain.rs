@@ -25,6 +25,11 @@ pub struct ClientInner {
     remote_to_local_window: Mutex<HashMap<WindowId, WindowId>>,
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
+    /// Remote pane-stack id -> stable local pane-stack id. Remote and local
+    /// stack ids live in different id spaces; translating (rather than
+    /// adopting) avoids collisions with locally-created stacks while keeping
+    /// each remote stack's local id stable across resyncs.
+    remote_to_local_stack: Mutex<HashMap<usize, usize>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
 }
 
@@ -147,6 +152,30 @@ impl ClientInner {
         pane_map.remove(&remote_pane_id);
     }
 
+    /// Rewrite the stack ids in a remote pane tree from the server's id
+    /// space into stable local ids (allocating on first sight). Keeping the
+    /// local id stable across resyncs is what lets stack-keyed GUI state
+    /// survive `sync_with_pane_tree` rebuilds.
+    pub fn translate_remote_stack_ids(&self, node: &mut mux::tab::PaneNode) {
+        use mux::tab::PaneNode;
+        match node {
+            PaneNode::Split { left, right, .. } => {
+                self.translate_remote_stack_ids(left);
+                self.translate_remote_stack_ids(right);
+            }
+            PaneNode::Stack(entry) => {
+                if let Some(remote_id) = entry.pane_stack_id {
+                    let mut map = self.remote_to_local_stack.lock().unwrap();
+                    let local_id = *map
+                        .entry(remote_id)
+                        .or_insert_with(mux::tab::alloc_pane_stack_id);
+                    entry.pane_stack_id = Some(local_id);
+                }
+            }
+            PaneNode::Leaf(_) | PaneNode::Empty => {}
+        }
+    }
+
     pub fn remove_old_tab_mapping(&self, remote_tab_id: TabId) {
         let mut tab_map = self.remote_to_local_tab.lock().unwrap();
         let old = tab_map.remove(&remote_tab_id);
@@ -245,6 +274,7 @@ impl ClientInner {
             remote_to_local_window: Mutex::new(HashMap::new()),
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
+            remote_to_local_stack: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
         }
     }
@@ -537,7 +567,12 @@ impl ClientDomain {
             .copied()
             .collect();
 
-        for (tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
+        for (mut tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
+            // Translate remote stack ids into stable local ids BEFORE the
+            // tree rebuild, so that GUI state keyed by pane_stack_id
+            // (collapse layouts, level-2 tab bar scroll) survives resyncs.
+            inner.translate_remote_stack_ids(&mut tabroot);
+
             let root_size = match tabroot.root_size() {
                 Some(size) => size,
                 None => continue,
@@ -762,6 +797,52 @@ impl Domain for ClientDomain {
         _command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         anyhow::bail!("spawn_pane not implemented for ClientDomain")
+    }
+
+    /// Level-2 tab in a remote pane's stack: ask the server to spawn the
+    /// pane and insert it into ITS stack, then mirror it locally as a
+    /// ClientPane. The caller (Mux::spawn_pane_in_stack) performs the local
+    /// stack insertion; the next resync converges both sides via the stable
+    /// translated stack id.
+    async fn spawn_pane_in_stack(
+        &self,
+        base_pane_id: PaneId,
+        _size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+
+        let mux = Mux::get();
+        let local_pane = mux
+            .get_pane(base_pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} is invalid", base_pane_id))?;
+        let pane = local_pane
+            .downcast_ref::<ClientPane>()
+            .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", base_pane_id))?;
+
+        let result = inner
+            .client
+            .spawn_pane_in_stack(codec::SpawnPaneInStack {
+                pane_id: pane.remote_pane_id,
+                command,
+                command_dir,
+                domain: SpawnTabDomain::CurrentPaneDomain,
+            })
+            .await?;
+
+        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+            &inner,
+            result.tab_id,
+            result.pane_id,
+            result.size,
+            "thinkterm",
+        ));
+        mux.add_pane(&pane)?;
+
+        Ok(pane)
     }
 
     /// Forward the request to the remote; we need to translate the local ids

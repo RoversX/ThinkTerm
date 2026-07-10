@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn ui_surfaces_keep_empty_window_alive_individually() {
-        let mut window = Window::new(Some("test-workspace".to_string()), None);
+        let mut window = Window::new(Some("test-workspace".to_string()), None, None);
         assert!(window.is_empty());
 
         assert!(window.add_ui_surface("remote-thread:a".to_string()));

@@ -20,6 +20,13 @@ pub type Cursor = bintree::Cursor<PaneStack, SplitDirectionAndSize>;
 
 static TAB_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 static PANE_STACK_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+
+/// Allocate a fresh local pane-stack id. Used by mux clients to mint stable
+/// local ids for stacks arriving from a remote server (whose ids live in a
+/// different id space and must not collide with locally-created stacks).
+pub fn alloc_pane_stack_id() -> PaneStackId {
+    PANE_STACK_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+}
 pub type TabId = usize;
 
 #[derive(Default)]
@@ -59,8 +66,22 @@ impl PaneStack {
     }
 
     fn from_panes(panes: Vec<Arc<dyn Pane>>, active: usize) -> Self {
+        Self::from_panes_with_id(panes, active, None)
+    }
+
+    /// Like `from_panes`, but reuses a previously-assigned stack id when one
+    /// is known (rebuilding a tab from a remote pane tree). Keeping the id
+    /// stable across rebuilds is what lets GUI state keyed by stack id
+    /// (collapse layouts, level-2 tab bar scroll) survive resyncs.
+    fn from_panes_with_id(
+        panes: Vec<Arc<dyn Pane>>,
+        active: usize,
+        id: Option<PaneStackId>,
+    ) -> Self {
         Self {
-            id: PANE_STACK_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed),
+            id: id.unwrap_or_else(|| {
+                PANE_STACK_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+            }),
             active: active.min(panes.len().saturating_sub(1)),
             panes,
         }
@@ -458,6 +479,7 @@ fn pane_tree(
                 PaneNode::Stack(PaneStackEntry {
                     active: stack.active_index(),
                     panes: entries,
+                    pane_stack_id: Some(stack.id()),
                 })
             }
         }
@@ -482,6 +504,7 @@ where
         },
         bintree::Tree::Leaf(entry) => {
             let active_index = entry.active.min(entry.panes.len().saturating_sub(1));
+            let stack_id = entry.pane_stack_id;
             let mut panes = vec![];
 
             for pane_entry in entry.panes {
@@ -500,7 +523,11 @@ where
             if panes.is_empty() {
                 Tree::Empty
             } else {
-                Tree::Leaf(PaneStack::from_panes(panes, active_index))
+                Tree::Leaf(PaneStack::from_panes_with_id(
+                    panes,
+                    active_index,
+                    stack_id,
+                ))
             }
         }
     }
@@ -2994,6 +3021,7 @@ impl PaneNode {
             PaneNode::Leaf(e) => bintree::Tree::Leaf(PaneStackEntry {
                 active: 0,
                 panes: vec![e],
+                pane_stack_id: None,
             }),
             PaneNode::Stack(stack) => bintree::Tree::Leaf(stack),
         }
@@ -3035,6 +3063,12 @@ impl PaneNode {
 pub struct PaneStackEntry {
     pub active: usize,
     pub panes: Vec<PaneEntry>,
+    /// Stable identity of the stack on the side that owns it (the mux
+    /// server). Clients translate this to a stable local id so that GUI
+    /// state keyed by stack id survives resyncs. Optional for backwards
+    /// compatibility with older layout snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_stack_id: Option<usize>,
 }
 
 /// This type is used directly by the codec, take care to bump
@@ -3528,6 +3562,7 @@ mod test {
             left: Box::new(PaneNode::Stack(PaneStackEntry {
                 active: 1,
                 panes: vec![pane_entry(200, size, false), pane_entry(201, size, true)],
+                pane_stack_id: None,
             })),
             right: Box::new(PaneNode::Leaf(pane_entry(202, size, false))),
             node: SplitDirectionAndSize {
@@ -3571,6 +3606,7 @@ mod test {
         let root = PaneNode::Stack(PaneStackEntry {
             active: 1,
             panes: vec![pane_entry(200, size, true), pane_entry(201, size, false)],
+            pane_stack_id: None,
         });
 
         tab.sync_with_pane_tree(size, root, |entry| FakePane::new(entry.pane_id, entry.size));
@@ -3586,6 +3622,43 @@ mod test {
         assert!(!tabs[0].is_active);
         assert_eq!(tabs[1].pane_id, 201);
         assert!(tabs[1].is_active);
+    }
+
+    #[test]
+    fn sync_with_pane_tree_keeps_stack_id_stable_across_resyncs() {
+        let size = test_size();
+        let tab = Tab::new(&size);
+
+        let make_root = || PaneNode::Stack(PaneStackEntry {
+            active: 0,
+            panes: vec![pane_entry(200, size, true), pane_entry(201, size, false)],
+            pane_stack_id: Some(7),
+        });
+
+        tab.sync_with_pane_tree(size, make_root(), |entry| {
+            FakePane::new(entry.pane_id, entry.size)
+        });
+        let first_id = tab.pane_stack_id(200).expect("stack id after first sync");
+        assert_eq!(first_id, 7, "sync honors the id carried by the entry");
+
+        // A resync with the same wire id must keep the same local id, so
+        // GUI state keyed by pane_stack_id survives.
+        tab.sync_with_pane_tree(size, make_root(), |entry| {
+            FakePane::new(entry.pane_id, entry.size)
+        });
+        let second_id = tab.pane_stack_id(200).expect("stack id after resync");
+        assert_eq!(first_id, second_id);
+
+        // Entries without an id (older snapshots) still mint fresh ids.
+        let unnamed = PaneNode::Stack(PaneStackEntry {
+            active: 0,
+            panes: vec![pane_entry(200, size, true), pane_entry(201, size, false)],
+            pane_stack_id: None,
+        });
+        tab.sync_with_pane_tree(size, unnamed, |entry| {
+            FakePane::new(entry.pane_id, entry.size)
+        });
+        assert!(tab.pane_stack_id(200).is_some());
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {

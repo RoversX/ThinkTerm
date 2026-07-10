@@ -3313,6 +3313,26 @@ pub fn is_mux_domain_project_id(project_id: &str) -> bool {
     remote_host_id_for_project_id(project_id).starts_with(MUX_DOMAIN_HOST_PREFIX)
 }
 
+/// Paths of existing projects in a Space (excluding the mux domain's own
+/// `wezterm-mux://` sentinel). Used to offer previously-added remote paths
+/// as picker candidates.
+pub fn project_paths_for_space(space_id: &str) -> Vec<String> {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .filter(|p| p.space_id == space_id)
+        .filter_map(|p| {
+            let path = p.path.to_string_lossy();
+            if path.starts_with("wezterm-mux://") {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .collect()
+}
+
 /// The mux client domain a Space is dedicated to, if any. Every thread in
 /// such a Space targets the remote server: new panes spawn into this domain
 /// and project paths refer to the remote filesystem.
