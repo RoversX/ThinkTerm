@@ -44,6 +44,7 @@ pub struct ClientPane {
     mouse: Arc<Mutex<MouseState>>,
     clipboard: Mutex<Option<Arc<dyn Clipboard>>>,
     mouse_grabbed: Mutex<bool>,
+    requested_size: Mutex<Option<TerminalSize>>,
     ignore_next_kill: Mutex<bool>,
     user_vars: Mutex<HashMap<String, String>>,
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
@@ -126,6 +127,7 @@ impl ClientPane {
             palette: Mutex::new(palette),
             clipboard: Mutex::new(None),
             mouse_grabbed: Mutex::new(false),
+            requested_size: Mutex::new(Some(size)),
             ignore_next_kill: Mutex::new(false),
             unseen_output: Mutex::new(false),
             user_vars: Mutex::new(HashMap::new()),
@@ -414,6 +416,21 @@ impl Pane for ClientPane {
     }
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+        {
+            // Dedupe against the last size WE requested, not against the
+            // server-advertised dimensions: mid-split (or any server-side
+            // relayout) the advertised dims legitimately disagree with the
+            // GUI's still-stale layout for a moment, and re-asserting the
+            // stale size would revert the server's pane resize and bake a
+            // corrupt geometry into its split tree via
+            // rebuild_splits_sizes_from_contained_panes. Only a real local
+            // layout change may produce a new request.
+            let mut requested = self.requested_size.lock();
+            if *requested == Some(size) {
+                return Ok(());
+            }
+            requested.replace(size);
+        }
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
 

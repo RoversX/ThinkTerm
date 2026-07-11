@@ -723,6 +723,65 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) -> anyhow::Result<(
     Ok(())
 }
 
+/// If `old` and `new` share the same split topology (node/leaf shape and
+/// split directions), copy old's node sizes into new and return true.
+/// sync_with_pane_tree uses this to keep locally-held cell geometry
+/// stable across mux resyncs: the wire carries the server's pane
+/// dimensions, which sit below the local cells by the per-pane GUI
+/// chrome (pane nav bar), and re-deriving cells from them redistributes
+/// the difference to one side of each split, visibly squeezing the other
+/// pane a bit further on every resync.
+fn copy_split_geometry_if_topology_matches(old: &Tree, new: &mut Tree) -> bool {
+    fn topology_matches(old: &Tree, new: &Tree) -> bool {
+        match (old, new) {
+            (Tree::Empty, Tree::Empty) => true,
+            (Tree::Leaf(_), Tree::Leaf(_)) => true,
+            (
+                Tree::Node {
+                    left: old_left,
+                    right: old_right,
+                    data: Some(old_data),
+                },
+                Tree::Node {
+                    left: new_left,
+                    right: new_right,
+                    data: Some(new_data),
+                },
+            ) => {
+                old_data.direction == new_data.direction
+                    && topology_matches(old_left, new_left)
+                    && topology_matches(old_right, new_right)
+            }
+            _ => false,
+        }
+    }
+    fn copy_sizes(old: &Tree, new: &mut Tree) {
+        if let (
+            Tree::Node {
+                left: old_left,
+                right: old_right,
+                data: Some(old_data),
+            },
+            Tree::Node {
+                left: new_left,
+                right: new_right,
+                data: new_data,
+            },
+        ) = (old, new)
+        {
+            *new_data = Some(*old_data);
+            copy_sizes(old_left, new_left);
+            copy_sizes(old_right, new_right);
+        }
+    }
+    if topology_matches(old, new) {
+        copy_sizes(old, new);
+        true
+    } else {
+        false
+    }
+}
+
 /// Recompute split node sizes bottom-up from the contained panes'
 /// current dimensions, returning the aggregate size of the tree.
 fn compute_tree_size_from_panes(node: &mut Tree) -> Option<TerminalSize> {
@@ -1090,7 +1149,21 @@ impl TabInner {
 
         log::debug!("sync_with_pane_tree with size {:?}", size);
 
-        let t = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane);
+        let mut t = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane);
+        // When the split topology is unchanged, keep the local cell
+        // geometry (and self.size): the local window is the geometry
+        // authority for client tabs, and the wire sizes are pane
+        // dimensions that sit below the cells by the per-pane chrome.
+        let geometry_preserved = self
+            .pane
+            .as_ref()
+            .map_or(false, |old| copy_split_geometry_if_topology_matches(old, &mut t));
+        log::debug!(
+            "sync_with_pane_tree tab {}: geometry_preserved={} old_size={:?}",
+            self.id,
+            geometry_preserved,
+            self.size
+        );
         let mut cursor = t.cursor();
 
         self.active = 0;
@@ -1120,18 +1193,21 @@ impl TabInner {
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
 
-        // The rebuilt tree carries the peer's cell geometry (derived from
-        // its pane dimensions, which for client tabs are smaller than the
-        // local cells because the GUI reserves per-pane chrome). Recompute
-        // self.size from that tree so that the resize below starts from an
-        // accurate value, then re-impose the target size: for client tabs
-        // the target is the locally (window-)derived size, which stays
-        // authoritative over whatever round-tripped through the server.
-        // resize() is a no-op (and emits no TabResized) when the sizes
-        // already agree.
-        if let Some(root) = self.pane.as_mut() {
-            if let Some(tree_size) = compute_tree_size_from_panes(root) {
-                self.size = tree_size;
+        // For a changed topology the rebuilt tree carries the peer's cell
+        // geometry (derived from its pane dimensions, which for client
+        // tabs are smaller than the local cells because the GUI reserves
+        // per-pane chrome). Recompute self.size from that tree so that
+        // the resize below starts from an accurate value, then re-impose
+        // the target size: for client tabs the target is the locally
+        // (window-)derived size, which stays authoritative over whatever
+        // round-tripped through the server. When the topology (and thus
+        // the geometry) was preserved above, skip the recompute so the
+        // resize sees agreeing sizes and no-ops without a TabResized.
+        if !geometry_preserved {
+            if let Some(root) = self.pane.as_mut() {
+                if let Some(tree_size) = compute_tree_size_from_panes(root) {
+                    self.size = tree_size;
+                }
             }
         }
         self.resize(size);
