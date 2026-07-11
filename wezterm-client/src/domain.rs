@@ -31,6 +31,10 @@ pub struct ClientInner {
     /// each remote stack's local id stable across resyncs.
     remote_to_local_stack: Mutex<HashMap<usize, usize>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    /// When we last advised the server of a focus change. Used to discard
+    /// stale PaneFocused echoes that would otherwise yank the active tab
+    /// and stack away from a newer local selection.
+    pub focus_advised_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl ClientInner {
@@ -276,6 +280,7 @@ impl ClientInner {
             remote_to_local_pane: Mutex::new(HashMap::new()),
             remote_to_local_stack: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
+            focus_advised_at: Mutex::new(None),
         }
     }
 }

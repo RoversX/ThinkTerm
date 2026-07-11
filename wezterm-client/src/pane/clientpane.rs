@@ -224,19 +224,41 @@ impl ClientPane {
             }
             Pdu::PaneFocused(PaneFocused { pane_id }) => {
                 // We get here whenever the pane focus is changed on the
-                // server. That might be due to the user here in the GUI
-                // doing things, or it may be due to a "remote"
-                // `wezterm cli activate-pane-direction` or similar call
-                // from some other actor.
-                // The latter case is the important one: it is desirable
-                // for the focus change to be reflected locally after it
-                // has been changed on the server, so we work to apply
-                // it here.
+                // server. That might be an echo of a focus change we
+                // advised ourselves, or a "remote" `wezterm cli
+                // activate-pane-direction` style call from some other
+                // actor. Applying it yanks both the window's active tab
+                // and the pane stack's active pane, so a STALE echo (of an
+                // advisory older than the user's latest selection) must be
+                // discarded or rapid tab/stack switching visibly flips
+                // between the old and new selections. An echo that matches
+                // our latest advisory is applied: it is normally a no-op,
+                // and it heals a resync that carried a pre-switch snapshot.
+                let advised = *self.client.focused_remote_pane_id.lock().unwrap();
+                let advised_recently = self
+                    .client
+                    .focus_advised_at
+                    .lock()
+                    .unwrap()
+                    .map_or(false, |at| at.elapsed() < std::time::Duration::from_secs(3));
+                if advised != Some(self.remote_pane_id) && advised_recently {
+                    log::trace!(
+                        "ignoring stale remote pane focus {pane_id}: \
+                         newer local advisory for {advised:?} is in flight"
+                    );
+                    return Ok(());
+                }
                 log::trace!("advised of remote pane focus: {pane_id}");
 
                 let mux = Mux::get();
                 if let Err(err) = mux.focus_pane_and_containing_tab(self.local_pane_id) {
                     log::error!("Error reconciling remote PaneFocused notification: {err:#}");
+                } else if let Some((_domain, window_id, _tab)) =
+                    mux.resolve_pane_id(self.local_pane_id)
+                {
+                    // The reconcile flips tab/stack selection silently (to
+                    // avoid focus advisory loops); nudge the GUI to repaint.
+                    mux.notify(MuxNotification::WindowInvalidated(window_id));
                 }
             }
             _ => bail!("unhandled unilateral pdu: {:?}", pdu),
@@ -628,6 +650,11 @@ impl Pane for ClientPane {
         let mut focused_pane = self.client.focused_remote_pane_id.lock().unwrap();
         if *focused_pane != Some(self.remote_pane_id) {
             focused_pane.replace(self.remote_pane_id);
+            self.client
+                .focus_advised_at
+                .lock()
+                .unwrap()
+                .replace(std::time::Instant::now());
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             promise::spawn::spawn(async move {

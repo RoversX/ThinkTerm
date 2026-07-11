@@ -1164,32 +1164,83 @@ impl TabInner {
             geometry_preserved,
             self.size
         );
-        let mut cursor = t.cursor();
-
-        self.active = 0;
-        if let Some(active) = active {
-            // Resolve the active pane to its index
-            let mut index = 0;
-            loop {
-                if let Some(stack) = cursor.leaf_mut() {
-                    if stack.contains_pane(active.pane_id()) {
-                        // Found it
-                        self.active = index;
-                        self.recency.tag(index);
-                        break;
+        // Capture the locally-selected state before adopting the rebuilt
+        // tree: which pane each surviving stack shows, and which stack
+        // holds the tab's focus. The wire's active markers describe the
+        // server's (possibly stale) snapshot; adopting them would flip a
+        // level-2 tab selection that the user changed while this resync
+        // was already in flight, with nothing left to switch it back.
+        // Genuinely external focus changes still arrive via PaneFocused,
+        // so preferring the local selection here does not hide them.
+        let mut prior_stack_actives: HashMap<PaneStackId, PaneId> = HashMap::new();
+        let mut prior_active_stack: Option<PaneStackId> = None;
+        if let Some(old) = self.pane.as_ref() {
+            fn walk(
+                tree: &Tree,
+                index: &mut usize,
+                active_index: usize,
+                actives: &mut HashMap<PaneStackId, PaneId>,
+                active_stack: &mut Option<PaneStackId>,
+            ) {
+                match tree {
+                    Tree::Empty => {}
+                    Tree::Leaf(stack) => {
+                        if let Some(pane) = stack.active_pane() {
+                            actives.insert(stack.id(), pane.pane_id());
+                        }
+                        if *index == active_index {
+                            active_stack.replace(stack.id());
+                        }
+                        *index += 1;
                     }
-                    index += 1;
-                }
-                match cursor.preorder_next() {
-                    Ok(c) => cursor = c,
-                    Err(c) => {
-                        // Didn't find it
-                        cursor = c;
-                        break;
+                    Tree::Node { left, right, .. } => {
+                        walk(left, index, active_index, actives, active_stack);
+                        walk(right, index, active_index, actives, active_stack);
                     }
                 }
             }
+            let mut index = 0;
+            walk(
+                old,
+                &mut index,
+                self.active,
+                &mut prior_stack_actives,
+                &mut prior_active_stack,
+            );
         }
+
+        let mut cursor = t.cursor();
+        let mut wire_active_index = None;
+        let mut prior_active_index = None;
+        let mut index = 0;
+        loop {
+            if let Some(stack) = cursor.leaf_mut() {
+                // Restore the locally-selected pane in stacks that survived
+                // the rebuild (set_active_pane leaves the wire selection in
+                // place when that pane is no longer a member).
+                if let Some(pane_id) = prior_stack_actives.get(&stack.id()) {
+                    stack.set_active_pane(*pane_id);
+                }
+                if let Some(active) = &active {
+                    if stack.contains_pane(active.pane_id()) {
+                        wire_active_index.get_or_insert(index);
+                    }
+                }
+                if prior_active_stack == Some(stack.id()) {
+                    prior_active_index.get_or_insert(index);
+                }
+                index += 1;
+            }
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(c) => {
+                    cursor = c;
+                    break;
+                }
+            }
+        }
+        self.active = prior_active_index.or(wire_active_index).unwrap_or(0);
+        self.recency.tag(self.active);
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
 
@@ -3755,6 +3806,44 @@ mod test {
             FakePane::new(entry.pane_id, entry.size)
         });
         assert!(tab.pane_stack_id(200).is_some());
+    }
+
+    #[test]
+    fn sync_with_pane_tree_keeps_local_selection_over_stale_wire_active() {
+        let size = test_size();
+        let tab = Tab::new(&size);
+
+        let make_root = |active: usize| {
+            PaneNode::Stack(PaneStackEntry {
+                active,
+                panes: vec![
+                    pane_entry(200, size, active == 0),
+                    pane_entry(201, size, active == 1),
+                ],
+                pane_stack_id: Some(7),
+            })
+        };
+
+        // The local selection is the second pane (e.g. the user clicked
+        // the second level-2 tab).
+        tab.sync_with_pane_tree(size, make_root(1), |entry| {
+            FakePane::new(entry.pane_id, entry.size)
+        });
+
+        // A resync whose snapshot predates the switch (wire still says the
+        // first pane is active) must not flip the selection back.
+        tab.sync_with_pane_tree(size, make_root(0), |entry| {
+            FakePane::new(entry.pane_id, entry.size)
+        });
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane.pane_id(), 201);
+
+        let tabs = tab.pane_stack_tabs(201);
+        assert_eq!(tabs.len(), 2);
+        assert!(!tabs[0].is_active);
+        assert!(tabs[1].is_active);
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
