@@ -424,12 +424,19 @@ async fn connect_domain_into_space(
         );
     }
 
-    // Create the connect mux window in the default workspace (the remote's
-    // primary window folds into it only when workspace names match), and
-    // claim it before the builder drops so the WindowCreated notification
-    // can never race a reconcile-spawned duplicate.
+    // Create the connect mux window directly in the Space's main-thread
+    // workspace so that thread switching can find it again by name (the
+    // fold of the remote's primary window into this window goes by the
+    // origin-domain claim, not by workspace name). Claim it before the
+    // builder drops so the WindowCreated notification can never race a
+    // reconcile-spawned duplicate.
+    let thread_workspace = workspace_threads::ensure_mux_thread_workspace(&plan);
     let window_id = {
-        let builder = mux.new_empty_window_for_domain(None, None, Some(domain.domain_id()));
+        let builder = mux.new_empty_window_for_domain(
+            Some(thread_workspace),
+            None,
+            Some(domain.domain_id()),
+        );
         let id = *builder;
         crate::frontend::front_end().claim_spawned_mux_window(id);
         id
@@ -469,11 +476,11 @@ async fn connect_domain_into_space(
     }
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
 
-    // Deliberately NO workspace rename here. The Space binding is carried by
-    // the claimed space on the TermWindow; renaming the mux window's
-    // workspace would be reconciled to the REMOTE mux server by the client
-    // domain (SetWindowWorkspace), polluting the server's workspace names and
-    // breaking the primary-window fold on every future attach.
+    // No explicit workspace rename AFTER attach: the window was created in
+    // the thread workspace up front, and the client domain aligns the
+    // server's workspace to it when the primary window folds in (see
+    // process_pane_list). Renaming post-attach used to race the fold and
+    // polluted the server's workspace names.
     Ok(())
 }
 

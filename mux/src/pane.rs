@@ -262,6 +262,16 @@ pub trait Pane: Downcast + Send + Sync {
         HashMap::new()
     }
 
+    /// True for panes that mirror a pane owned by another mux (a mux
+    /// client's local proxy for a server-side pane). The terminal size of
+    /// such a pane is driven by the GUI layer, which reserves per-pane
+    /// chrome (the pane nav bar) out of the cell size; resizing it to the
+    /// raw cell size from split layout code would undo that reservation
+    /// and ping-pong sizes across the wire.
+    fn is_remote_mirror(&self) -> bool {
+        false
+    }
+
     fn erase_scrollback(&self, _erase_mode: ScrollbackEraseMode) {}
 
     /// Called to advise on whether this tab has focus

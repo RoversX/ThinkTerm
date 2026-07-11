@@ -785,8 +785,7 @@ impl super::TermWindow {
             + (pos.left as isize * global_cell_size.width);
         let pane_top =
             padding_top as isize + first_line_offset + (pos.top as isize * global_cell_size.height);
-        let pane_nav_height =
-            self.pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics) as isize;
+        let pane_nav_height = pane_nav_bar_height_for_metrics(self.render_metrics) as isize;
 
         let local_x = event.coords.x.sub(pane_left);
         let local_y = event.coords.y.sub(pane_top + pane_nav_height);

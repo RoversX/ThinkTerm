@@ -169,15 +169,21 @@ impl ClientPane {
                 }
             },
             Pdu::SetPalette(SetPalette { palette, .. }) => {
-                *self.application_palette.lock() = palette != *self.configured_palette.lock();
+                // A redundant advisory must not invalidate the whole
+                // render surface (make_all_stale forces a refetch of every
+                // visible line, which flashes the pane contents).
+                if palette != *self.palette.lock() {
+                    *self.application_palette.lock() =
+                        palette != *self.configured_palette.lock();
 
-                *self.palette.lock() = palette;
-                let mux = Mux::get();
-                self.renderable.lock().inner.borrow_mut().make_all_stale();
-                mux.notify(MuxNotification::Alert {
-                    pane_id: self.local_pane_id,
-                    alert: Alert::PaletteChanged,
-                });
+                    *self.palette.lock() = palette;
+                    let mux = Mux::get();
+                    self.renderable.lock().inner.borrow_mut().make_all_stale();
+                    mux.notify(MuxNotification::Alert {
+                        pane_id: self.local_pane_id,
+                        alert: Alert::PaletteChanged,
+                    });
+                }
             }
             Pdu::NotifyAlert(NotifyAlert { alert, .. }) => {
                 let mux = Mux::get();
@@ -582,6 +588,10 @@ impl Pane for ClientPane {
         }
     }
 
+    fn is_remote_mirror(&self) -> bool {
+        true
+    }
+
     fn erase_scrollback(&self, erase_mode: ScrollbackEraseMode) {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
@@ -633,6 +643,14 @@ impl Pane for ClientPane {
 
     fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
         let palette = config.color_palette();
+        // Only propagate a palette that actually changed. set_config is
+        // invoked for every pane on every config generation bump (which
+        // can be frequent: any write near a watched config path reloads),
+        // and an unconditional send makes the server re-advise the palette
+        // to every attached client, which invalidates their entire render
+        // surface -- a visible full-window flicker.
+        let changed = *self.configured_palette.lock() != palette;
+
         // If the application running in the pane hasn't changed the
         // palette through escape sequences, speculatively adopt the
         // new palette so that it updates with the lowest latency.
@@ -641,19 +659,21 @@ impl Pane for ClientPane {
         }
         *self.configured_palette.lock() = palette.clone();
 
-        // and now send the color palette to the server
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .set_configured_palette_for_pane(SetPalette {
-                    pane_id: remote_pane_id,
-                    palette,
-                })
-                .await
-        })
-        .detach();
+        if changed {
+            // and now send the color palette to the server
+            let client = Arc::clone(&self.client);
+            let remote_pane_id = self.remote_pane_id;
+            promise::spawn::spawn(async move {
+                client
+                    .client
+                    .set_configured_palette_for_pane(SetPalette {
+                        pane_id: remote_pane_id,
+                        palette,
+                    })
+                    .await
+            })
+            .detach();
+        }
         self.config.lock().replace(config);
     }
 

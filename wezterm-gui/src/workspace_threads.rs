@@ -3432,6 +3432,37 @@ pub fn ensure_mux_domain_space(domain_name: &str) -> MuxDomainSpacePlan {
     }
 }
 
+/// Resolve (and record) the workspace that a mux-domain Space's thread
+/// lives in. The connect window is created directly in this workspace so
+/// that thread switching can find it again by name instead of
+/// materializing a duplicate; recording it as materialized keeps
+/// reconnects and switch-backs symmetric.
+pub fn ensure_mux_thread_workspace(plan: &MuxDomainSpacePlan) -> String {
+    let mut store = THREAD_STORE.lock();
+    let mut name = None;
+    if let Some(project) = store
+        .projects
+        .iter_mut()
+        .find(|project| project.id == plan.project_id)
+    {
+        if let Some(thread) = project
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == plan.thread_id)
+        {
+            let workspace = thread
+                .materialized_workspace_name
+                .clone()
+                .or_else(|| thread.planned_workspace_name.clone())
+                .unwrap_or_else(|| workspace_name_for_thread(&plan.project_id, &plan.thread_id));
+            thread.materialized_workspace_name = Some(workspace.clone());
+            name = Some(workspace);
+        }
+    }
+    persist_locked(&store);
+    name.unwrap_or_else(|| workspace_name_for_thread(&plan.project_id, &plan.thread_id))
+}
+
 pub fn remote_host_id_for_project_id(project_id: &str) -> &str {
     project_id
         .split_once(REMOTE_PROJECT_SPACE_SEPARATOR)

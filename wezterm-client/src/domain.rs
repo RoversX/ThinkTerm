@@ -580,13 +580,28 @@ impl ClientDomain {
 
             if let Some((remote_window_id, remote_tab_id)) = tabroot.window_and_tab_ids() {
                 let tab;
+                // For a tab we already track, the locally-held size (driven
+                // by the GUI window geometry) is authoritative; the wire
+                // size reflects the server's pane dimensions, which are
+                // smaller than the local cells whenever the GUI reserves
+                // per-pane chrome (pane nav bar). Adopting the wire size
+                // here would shrink the tab by the chrome height on every
+                // resync. Only brand-new tabs take the wire size, until a
+                // GUI window adopts and resizes them.
+                let mut sync_size = root_size;
 
                 remote_windows_to_forget.remove(&remote_window_id);
                 remote_tabs_to_forget.remove(&remote_tab_id);
 
                 if let Some(tab_id) = inner.remote_to_local_tab_id(remote_tab_id) {
                     match mux.get_tab(tab_id) {
-                        Some(t) => tab = t,
+                        Some(t) => {
+                            let local_size = t.get_size();
+                            if local_size.rows > 0 && local_size.cols > 0 {
+                                sync_size = local_size;
+                            }
+                            tab = t;
+                        }
                         None => {
                             // We likely decided that we hit EOF on the tab and
                             // removed it from the mux.  Let's add it back, but
@@ -612,7 +627,7 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
-                tab.sync_with_pane_tree(root_size, tabroot, |entry| {
+                tab.sync_with_pane_tree(sync_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
@@ -654,29 +669,46 @@ impl ClientDomain {
                 });
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                    let mut window = mux
-                        .get_window_mut(local_window_id)
-                        .expect("no such window!?");
                     log::debug!(
                         "domain: {} adding tab to existing local window {}",
                         inner.local_domain_id,
                         local_window_id
                     );
-                    if window.idx_by_id(tab.tab_id()).is_none() {
-                        window.push(&tab);
+                    let needs_add = mux
+                        .get_window(local_window_id)
+                        .expect("no such window!?")
+                        .idx_by_id(tab.tab_id())
+                        .is_none();
+                    if needs_add {
+                        // Use add_tab_to_window rather than window.push so
+                        // that MuxNotification::TabAddedToWindow reaches the
+                        // GUI: it relies on that event to impose the local
+                        // window geometry on tabs that arrive via resync
+                        // (their wire size is the server's, which sits below
+                        // the local size by the pane nav bar reservation).
+                        mux.add_tab_to_window(&tab, local_window_id)?;
                     }
                     continue;
                 }
 
                 if let Some(local_window_id) = primary_window_id {
-                    // Verify that the workspace is consistent between the local and remote
-                    // windows
-                    if Some(
-                        mux.get_window(local_window_id)
-                            .expect("primary window to be valid")
-                            .get_workspace(),
-                    ) == workspace.as_deref()
-                    {
+                    // Adopt the remote window into the local primary window
+                    // when the workspaces agree, or unconditionally when the
+                    // local window is claimed for this domain (a ThinkTerm
+                    // Space connect window): the claim carries the identity,
+                    // and the local workspace name (the Space thread) wins.
+                    let (workspace_matches, domain_owned, local_workspace) = {
+                        let window = mux
+                            .get_window(local_window_id)
+                            .expect("primary window to be valid");
+                        let local_workspace = window.get_workspace().to_string();
+                        (
+                            Some(local_workspace.as_str()) == workspace.as_deref(),
+                            window.origin_domain() == Some(inner.local_domain_id),
+                            local_workspace,
+                        )
+                    };
+                    if workspace_matches || domain_owned {
                         // Yes! We can use this window
                         log::debug!(
                             "adding remote window {} as tab to local window {}",
@@ -689,6 +721,27 @@ impl ClientDomain {
                         );
                         mux.add_tab_to_window(&tab, local_window_id)?;
                         primary_window_id.take();
+                        if !workspace_matches {
+                            // Bring the server's workspace in line with the
+                            // local window's so that future attaches fold
+                            // this window by name as well.
+                            let inner = Arc::clone(&inner);
+                            promise::spawn::spawn(async move {
+                                let request = codec::SetWindowWorkspace {
+                                    window_id: remote_window_id,
+                                    workspace: local_workspace,
+                                };
+                                if let Err(err) =
+                                    inner.client.set_window_workspace(request).await
+                                {
+                                    log::error!(
+                                        "failed to align remote window {remote_window_id} \
+                                         workspace: {err:#}"
+                                    );
+                                }
+                            })
+                            .detach();
+                        }
                         continue;
                     }
                 }

@@ -2197,8 +2197,14 @@ impl TermWindow {
                             || size.pixel_height != self.terminal_size.pixel_height
                         {
                             self.set_window_size(size, window)?;
-                        } else if tab_size.dpi == 0 {
-                            log::debug!("fixup dpi in newly added tab");
+                        } else if tab_size != self.terminal_size {
+                            // A tab that arrived via a mux resync carries the
+                            // server's size (its pane dims, which sit below the
+                            // window size by the pane nav bar reservation).
+                            // The window geometry is authoritative locally:
+                            // impose it so that the first activation doesn't
+                            // subtract the nav bar from an already-reduced
+                            // size. Tab::resize no-ops when sizes agree.
                             tab.resize(self.terminal_size);
                         }
                     }

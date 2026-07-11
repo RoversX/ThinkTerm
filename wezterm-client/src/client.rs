@@ -1304,6 +1304,7 @@ impl Client {
     }
 
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
+        log::trace!("send_pdu {}", pdu.pdu_name());
         let (promise, rx) = bounded(1);
         self.sender
             .send(ReaderMessage::SendPdu { pdu, promise })

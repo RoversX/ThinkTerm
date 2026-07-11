@@ -132,6 +132,13 @@ impl PaneStack {
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
         for pane in &self.panes {
+            // Remote mirror panes are sized by the GUI layer, which
+            // subtracts per-pane chrome (the pane nav bar) from the cell
+            // size; forcing them to the raw cell size here would undo that
+            // and bounce Resize PDUs back and forth with the server.
+            if pane.is_remote_mirror() {
+                continue;
+            }
             pane.resize(size)?;
         }
         Ok(())
@@ -716,6 +723,39 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) -> anyhow::Result<(
     Ok(())
 }
 
+/// Recompute split node sizes bottom-up from the contained panes'
+/// current dimensions, returning the aggregate size of the tree.
+fn compute_tree_size_from_panes(node: &mut Tree) -> Option<TerminalSize> {
+    match node {
+        Tree::Empty => None,
+        Tree::Leaf(stack) => {
+            let pane = stack.active_pane()?;
+            let dims = pane.get_dimensions();
+            let size = TerminalSize {
+                cols: dims.cols,
+                rows: dims.viewport_rows,
+                pixel_height: dims.pixel_height,
+                pixel_width: dims.pixel_width,
+                dpi: dims.dpi,
+            };
+            Some(size)
+        }
+        Tree::Node { left, right, data } => {
+            if let Some(data) = data {
+                if let Some(first) = compute_tree_size_from_panes(left) {
+                    data.first = first;
+                }
+                if let Some(second) = compute_tree_size_from_panes(right) {
+                    data.second = second;
+                }
+                Some(data.size())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
     TerminalSize {
         rows: 1,
@@ -1080,11 +1120,20 @@ impl TabInner {
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
 
-        // Let resize() decide whether anything actually changed (it updates
-        // self.size itself, with min-size clamping). Do NOT pre-assign
-        // self.size here: that would defeat resize()'s no-op guard and
-        // re-emit TabResized on every resync, feeding the resize/resync
-        // storm this sync is usually responding to.
+        // The rebuilt tree carries the peer's cell geometry (derived from
+        // its pane dimensions, which for client tabs are smaller than the
+        // local cells because the GUI reserves per-pane chrome). Recompute
+        // self.size from that tree so that the resize below starts from an
+        // accurate value, then re-impose the target size: for client tabs
+        // the target is the locally (window-)derived size, which stays
+        // authoritative over whatever round-tripped through the server.
+        // resize() is a no-op (and emits no TabResized) when the sizes
+        // already agree.
+        if let Some(root) = self.pane.as_mut() {
+            if let Some(tree_size) = compute_tree_size_from_panes(root) {
+                self.size = tree_size;
+            }
+        }
         self.resize(size);
 
         log::debug!(
@@ -1584,8 +1633,10 @@ impl TabInner {
 
         if let Some(zoomed) = &self.zoomed {
             self.size = size;
-            if let Err(err) = zoomed.resize(size) {
-                log::error!("failed to resize zoomed pane: {err:#}");
+            if !zoomed.is_remote_mirror() {
+                if let Err(err) = zoomed.resize(size) {
+                    log::error!("failed to resize zoomed pane: {err:#}");
+                }
             }
         } else {
             let dims = cell_dimensions(&size);
@@ -1678,39 +1729,8 @@ impl TabInner {
             return;
         }
 
-        fn compute_size(node: &mut Tree) -> Option<TerminalSize> {
-            match node {
-                Tree::Empty => None,
-                Tree::Leaf(stack) => {
-                    let pane = stack.active_pane()?;
-                    let dims = pane.get_dimensions();
-                    let size = TerminalSize {
-                        cols: dims.cols,
-                        rows: dims.viewport_rows,
-                        pixel_height: dims.pixel_height,
-                        pixel_width: dims.pixel_width,
-                        dpi: dims.dpi,
-                    };
-                    Some(size)
-                }
-                Tree::Node { left, right, data } => {
-                    if let Some(data) = data {
-                        if let Some(first) = compute_size(left) {
-                            data.first = first;
-                        }
-                        if let Some(second) = compute_size(right) {
-                            data.second = second;
-                        }
-                        Some(data.size())
-                    } else {
-                        None
-                    }
-                }
-            }
-        }
-
         if let Some(root) = self.pane.as_mut() {
-            if let Some(size) = compute_size(root) {
+            if let Some(size) = compute_tree_size_from_panes(root) {
                 self.size = size;
             }
         }

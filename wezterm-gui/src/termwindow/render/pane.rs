@@ -38,9 +38,8 @@ use window::color::LinearRgba;
 use window::MouseEventKind as WMEK;
 
 impl crate::TermWindow {
-    /// Draw height of the nav bar for this pane. Always the metric height:
-    /// for remote mux panes it overlays the content (no rows are stolen from
-    /// the viewport; see pane_nav_bar_height_for_pane in resize.rs).
+    /// Height of the nav bar for this pane: the metric height, clamped so
+    /// that at least one terminal row of the pane's cell remains visible.
     fn pane_nav_bar_height(&self, pos: &PositionedPane) -> usize {
         pane_nav_bar_height_for_metrics(self.render_metrics).min(
             pos.pixel_height
@@ -820,12 +819,7 @@ impl crate::TermWindow {
             }
         }
 
-        // Return the CONTENT OFFSET, not the drawn height: remote mux panes
-        // steal no viewport rows (the bar overlays the content), so their
-        // cells start at the pane's top edge.
-        Ok(self
-            .pane_nav_bar_height_for_pane(&pos.pane, self.render_metrics)
-            .min(nav_height))
+        Ok(nav_height)
     }
 
     fn paint_pane_nav_icon_button(

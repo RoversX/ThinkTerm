@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use termwiz::surface::SequenceNo;
 use url::Url;
+use wezterm_term::color::ColorPalette;
 use wezterm_term::terminal::Alert;
 use wezterm_term::StableRowIndex;
 
@@ -43,6 +44,7 @@ pub(crate) struct PerPane {
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
     sent_initial_palette: bool,
+    last_sent_palette: Option<ColorPalette>,
     seqno: SequenceNo,
     config_generation: usize,
     pub(crate) notifications: Vec<Alert>,
@@ -171,13 +173,23 @@ fn maybe_push_pane_changes(
         per_pane.notifications.push(Alert::PaletteChanged);
         per_pane.sent_initial_palette = true;
     }
-    for alert in per_pane.notifications.drain(..) {
+    let notifications: Vec<Alert> = per_pane.notifications.drain(..).collect();
+    for alert in notifications {
         match alert {
             Alert::PaletteChanged => {
+                let palette = pane.palette();
+                // Config generation bumps synthesize PaletteChanged even
+                // when the effective palette is unchanged; pushing those
+                // makes every attached client invalidate its entire render
+                // surface for this pane. Only push real changes.
+                if per_pane.last_sent_palette.as_ref() == Some(&palette) {
+                    continue;
+                }
+                per_pane.last_sent_palette = Some(palette.clone());
                 sender.send(DecodedPdu {
                     pdu: Pdu::SetPalette(SetPalette {
                         pane_id: pane.pane_id(),
-                        palette: pane.palette(),
+                        palette,
                     }),
                     serial: 0,
                 })?;
@@ -248,6 +260,7 @@ impl SessionHandler {
         let start = Instant::now();
         let sender = self.to_write_tx.clone();
         let serial = decoded.serial;
+        log::trace!("recv {} {}", serial, decoded.pdu.pdu_name());
 
         if let Some(client_id) = &self.client_id {
             if decoded.pdu.is_user_input() {
