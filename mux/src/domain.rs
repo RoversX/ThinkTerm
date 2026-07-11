@@ -481,6 +481,17 @@ impl LocalDomain {
             )?,
         };
         if let Some(dir) = command_dir {
+            // Paths entered in the UI (or relayed by a mux client) may use
+            // `~` for the home directory; the spawn cwd is used verbatim by
+            // the OS, so expand it here against this process's home.
+            let dir = if dir == "~" || dir.starts_with("~/") {
+                config::HOME_DIR
+                    .join(dir.strip_prefix("~/").unwrap_or(""))
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                dir
+            };
             cmd.cwd(dir);
         }
         if let Ok(sock) = std::env::var("WEZTERM_UNIX_SOCKET") {

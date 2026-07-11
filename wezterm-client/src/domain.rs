@@ -1072,8 +1072,45 @@ impl Domain for ClientDomain {
     }
 
     async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()> {
+        let ui = ConnectionUI::with_params(ConnectionUIParams {
+            window_id,
+            ..Default::default()
+        });
+        self.attach_with_ui(window_id, ui).await
+    }
+
+    fn detachable(&self) -> bool {
+        true
+    }
+
+    fn detach(&self) -> anyhow::Result<()> {
+        self.perform_detach();
+        Ok(())
+    }
+
+    fn state(&self) -> DomainState {
+        if self.inner.lock().unwrap().is_some() {
+            DomainState::Attached
+        } else {
+            DomainState::Detached
+        }
+    }
+}
+
+impl ClientDomain {
+    /// The body of Domain::attach, with a caller-supplied ConnectionUI so
+    /// that a retrying caller can funnel every attempt into one UI tab
+    /// instead of leaving a dead tab behind per attempt. On failure the UI
+    /// is left open (the caller either retries into it or lets it linger to
+    /// show the error); on success it is closed.
+    pub async fn attach_with_ui(
+        &self,
+        window_id: Option<WindowId>,
+        ui: ConnectionUI,
+    ) -> anyhow::Result<()> {
         if self.state() == DomainState::Attached {
             // Already attached
+            ui.close();
             return Ok(());
         }
 
@@ -1081,10 +1118,6 @@ impl Domain for ClientDomain {
         let config = self.config.clone();
 
         let activity = mux::activity::Activity::new();
-        let ui = ConnectionUI::with_params(ConnectionUIParams {
-            window_id,
-            ..Default::default()
-        });
         ui.title("ThinkTerm: Connecting...");
 
         ui.async_run_and_log_error({
@@ -1130,22 +1163,5 @@ impl Domain for ClientDomain {
         drop(activity);
         ui.close();
         Ok(())
-    }
-
-    fn detachable(&self) -> bool {
-        true
-    }
-
-    fn detach(&self) -> anyhow::Result<()> {
-        self.perform_detach();
-        Ok(())
-    }
-
-    fn state(&self) -> DomainState {
-        if self.inner.lock().unwrap().is_some() {
-            DomainState::Attached
-        } else {
-            DomainState::Detached
-        }
     }
 }

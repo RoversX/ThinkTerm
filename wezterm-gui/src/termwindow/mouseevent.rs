@@ -3368,10 +3368,33 @@ impl super::TermWindow {
                 d.state() == mux::domain::DomainState::Attached
             });
             if !attached {
-                log::info!(
-                    "Space is bound to mux domain {domain_name:?} which is not connected; \
-                     use `wezterm connect {domain_name}` first"
-                );
+                // Attach on demand (auth prompts go through the ConnectionUI),
+                // then re-run this activation once the domain is live.
+                let Some(window) = self.window.clone() else {
+                    context.invalidate();
+                    return;
+                };
+                let domain_name = domain_name.to_string();
+                let mux_window_id = self.mux_window_id;
+                promise::spawn::spawn(async move {
+                    let mux = Mux::get();
+                    let domain = mux
+                        .get_domain_by_name(&domain_name)
+                        .ok_or_else(|| anyhow::anyhow!("domain {domain_name} not found"))?;
+                    domain.attach(Some(mux_window_id)).await?;
+                    window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        if let Some(win) = term_window.window.clone() {
+                            term_window.activate_workspace_thread_impl(
+                                thread_id,
+                                &win,
+                                orphan_candidate_window_id,
+                                workspaces_to_kill_after_adopt,
+                            );
+                        }
+                    })));
+                    anyhow::Ok(())
+                })
+                .detach();
                 context.invalidate();
                 return;
             }

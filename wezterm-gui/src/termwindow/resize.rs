@@ -72,6 +72,7 @@ impl super::TermWindow {
             return;
         };
 
+        let mut changed = false;
         for tab in mux_window.iter() {
             for pos in tab.iter_panes_ignoring_zoom() {
                 let pane_id = pos.pane.pane_id();
@@ -81,8 +82,14 @@ impl super::TermWindow {
                 let mut state = self.pane_state(pos.pane.pane_id());
                 if state.font_scale != font_scale {
                     state.font_scale = font_scale;
+                    changed = true;
                 }
             }
+        }
+        if !changed {
+            // Called per TabAddedToWindow during resyncs; skip the cache
+            // flush when nothing actually changed.
+            return;
         }
 
         self.sync_pane_font_sizes();

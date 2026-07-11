@@ -27,7 +27,7 @@ use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
-use wezterm_client::domain::ClientDomain;
+use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 use wezterm_font::shaper::PresentationWidth;
 use wezterm_font::FontConfiguration;
 use wezterm_gui_subcommands::*;
@@ -372,6 +372,32 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 /// process, focus an existing window instead of duplicating; otherwise create
 /// the connect window with an explicit Space claim so the frontend's
 /// reconcile/restore can never hijack it away from the in-window ConnectionUI.
+/// `connect <name>` fallback when the name is not a lua-configured domain:
+/// resolve it against the ThinkTerm SSH host store and register a
+/// multiplexing client domain built from that host, including its stored
+/// credentials, so hosts added in the UI are connectable (and reconnect
+/// silently) without a lua ssh_domains entry.
+fn connect_domain_from_ssh_host(name: &str) -> anyhow::Result<Arc<dyn Domain>> {
+    let entry = crate::ssh_hosts::list_all_hosts()
+        .into_iter()
+        .find(|entry| entry.spec.label == name || entry.id == name)
+        .ok_or_else(|| {
+            anyhow!("invalid domain {name}: not in ssh_domains and not a saved SSH host")
+        })?;
+    let mut dom = crate::ssh_hosts::build_ssh_domain(&entry.spec);
+    dom.name = name.to_string();
+    dom.multiplexing = SshMultiplexing::WezTerm;
+    dom.stored_password = entry
+        .spec
+        .password
+        .as_deref()
+        .map(crate::secret::reveal)
+        .filter(|p| !p.is_empty());
+    let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(ClientDomainConfig::Ssh(dom)));
+    Mux::get().add_domain(&domain);
+    Ok(domain)
+}
+
 async fn connect_domain_into_space(
     cmd: Option<CommandBuilder>,
     domain: Arc<dyn Domain>,
@@ -449,7 +475,38 @@ async fn connect_domain_into_space(
     config.update_ulimit()?;
 
     // The ConnectionUI (auth prompts) appears as a tab inside this window.
-    domain.attach(Some(window_id)).await?;
+    // Transient network failures (VPN egress rotation, sleepy wifi) are
+    // common on the way to a remote mux; keep retrying with backoff instead
+    // of terminating the process on the first failed attempt. The user can
+    // bail out by closing the window.
+    {
+        let mut backoff = std::time::Duration::from_secs(1);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+        // One ConnectionUI tab hosts every attempt; per-attempt UIs would
+        // pile up as dead tabs because the startup Activity token blocks
+        // pruning for as long as we are still retrying.
+        let ui = mux::connui::ConnectionUI::with_params(mux::connui::ConnectionUIParams {
+            window_id: Some(window_id),
+            ..Default::default()
+        });
+        loop {
+            let attempt = match domain.downcast_ref::<ClientDomain>() {
+                Some(client) => client.attach_with_ui(Some(window_id), ui.clone()).await,
+                None => domain.attach(Some(window_id)).await,
+            };
+            match attempt {
+                Ok(()) => break,
+                Err(err) => {
+                    log::error!(
+                        "attaching {domain_name} failed: {err:#}; retrying in {backoff:?}"
+                    );
+                    ui.output_str(&format!("Will retry in {backoff:?}...\n"));
+                    smol::Timer::after(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
 
     // Mirror spawn_tab_in_domain_if_mux_is_empty's empty-server handling.
     let no_workspace_filter = None;
@@ -588,9 +645,10 @@ async fn async_run_terminal_gui(
     let mux = Mux::get();
 
     let domain = if let Some(name) = &opts.domain {
-        let domain = mux
-            .get_domain_by_name(name)
-            .ok_or_else(|| anyhow!("invalid domain {name}"))?;
+        let domain = match mux.get_domain_by_name(name) {
+            Some(domain) => domain,
+            None => connect_domain_from_ssh_host(name)?,
+        };
         Some(domain)
     } else {
         None
@@ -860,12 +918,15 @@ fn setup_mux(
     let default_name =
         default_domain_name.unwrap_or(config.default_domain.as_deref().unwrap_or("local"));
 
-    let domain = mux.get_domain_by_name(default_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "desired default domain '{}' was not found in mux!?",
-            default_name
-        )
-    })?;
+    let domain = match mux.get_domain_by_name(default_name) {
+        Some(domain) => domain,
+        // Not a lua-configured domain: try the ThinkTerm SSH host store
+        // (register_saved_hosts above only registers direct-ssh domains;
+        // this builds a multiplexing client domain for `connect`).
+        None => connect_domain_from_ssh_host(default_name).with_context(|| {
+            format!("desired default domain '{default_name}' was not found in mux")
+        })?,
+    };
     mux.set_default_domain(&domain);
 
     Ok(mux)

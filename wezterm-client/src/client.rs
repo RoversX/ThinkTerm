@@ -11,7 +11,7 @@ use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
 use mux::pane::PaneId;
-use mux::ssh::ssh_connect_with_ui;
+use mux::ssh::ssh_connect_with_ui_and_password;
 use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
@@ -30,6 +30,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -49,6 +50,9 @@ enum ReaderMessage {
         promise: Sender<anyhow::Result<Pdu>>,
     },
     Readable,
+    /// The connection has been idle for a while: send a keepalive ping,
+    /// or declare the transport dead if the previous ping went unanswered.
+    KeepaliveTick,
 }
 
 #[derive(Clone)]
@@ -376,13 +380,24 @@ async fn client_thread_async(
 
     let mut stream = reconnectable.take_stream().unwrap();
 
+    // Application-level keepalive: a transport that died without an RST
+    // (VPN egress rotation, sleepy NAT) otherwise hangs silently until the
+    // next write. Ping after this much idle time and require the pong to
+    // arrive before the following tick.
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+    let mut pending_ping: Option<(u64, std::time::Instant)> = None;
+
     loop {
         let rx_msg = rx.recv();
         let wait_for_read = stream
             .wait_for_readable()
             .map(|_| Ok(ReaderMessage::Readable));
+        let keepalive = async {
+            smol::Timer::after(KEEPALIVE_INTERVAL).await;
+            Ok(ReaderMessage::KeepaliveTick)
+        };
 
-        match smol::future::or(rx_msg, wait_for_read).await {
+        match smol::future::or(smol::future::or(rx_msg, wait_for_read), keepalive).await {
             Ok(ReaderMessage::SendPdu { pdu, promise }) => {
                 let serial = next_serial;
                 next_serial += 1;
@@ -393,6 +408,25 @@ async fn client_thread_async(
                     .context("encoding a PDU to send to the server")?;
                 stream.flush().await.context("flushing PDU to server")?;
             }
+            Ok(ReaderMessage::KeepaliveTick) => {
+                if let Some((serial, sent)) = pending_ping.take() {
+                    let reason = format!(
+                        "keepalive: no response to ping serial {serial} after {:?}; \
+                         transport presumed dead",
+                        sent.elapsed()
+                    );
+                    promises.fail_all(&reason);
+                    anyhow::bail!("{reason}");
+                }
+                let serial = next_serial;
+                next_serial += 1;
+                pending_ping = Some((serial, std::time::Instant::now()));
+                Pdu::Ping(Ping {})
+                    .encode_async(&mut stream, serial)
+                    .await
+                    .context("encoding keepalive ping")?;
+                stream.flush().await.context("flushing keepalive ping")?;
+            }
             Ok(ReaderMessage::Readable) => {
                 match Pdu::decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
@@ -401,7 +435,11 @@ async fn client_thread_async(
                             decoded.serial,
                             decoded.pdu.pdu_name()
                         );
-                        if decoded.serial == 0 {
+                        if pending_ping
+                            .map_or(false, |(serial, _)| serial == decoded.serial)
+                        {
+                            pending_ping = None;
+                        } else if decoded.serial == 0 {
                             process_unilateral(local_domain_id, decoded)
                                 .context("processing unilateral PDU from server")
                                 .map_err(|e| {
@@ -636,13 +674,23 @@ impl Reconnectable {
             // the set of tabs and we'd have confusing and inconsistent state
             ClientDomainConfig::Unix(_) => false,
             ClientDomainConfig::Tls(_) => true,
-            // It *does* make sense to reconnect with an ssh session, but we
-            // need to grow some smarts about whether the disconnect was because
-            // we sent CTRL-D to close the last session, or whether it was a network
-            // level disconnect, because we will otherwise throw up authentication
-            // dialogs that would be annoying
-            ClientDomainConfig::Ssh(_) => false,
+            // An ssh transport dies whenever the network path changes
+            // (VPN egress rotation, sleep/wake, flaky wifi); the remote mux
+            // server is typically still alive, so reconnect and reattach.
+            // A user-initiated detach surfaces as ClientWasDestroyed rather
+            // than an IO error, so it never reaches the reconnect loop, and
+            // any auth prompts are handled by the ConnectionUI just like the
+            // initial connect.
+            ClientDomainConfig::Ssh(_) => true,
         }
+    }
+
+    /// A dropped ssh transport surfaces as a plain EOF on the channel, which
+    /// is indistinguishable from a deliberate server-side close; since the
+    /// common case by far is a network-level drop, we still reconnect. The
+    /// reconnect UI is cancellable for the rare deliberate-shutdown case.
+    fn reconnect_on_eof(&self) -> bool {
+        matches!(&self.config, ClientDomainConfig::Ssh(_))
     }
 
     fn connect(
@@ -673,7 +721,12 @@ impl Reconnectable {
     fn remote_mux_command(path: &Option<String>, args: &str) -> String {
         match path {
             Some(path) => format!("{path} {args}"),
-            None => format!("wezterm {args}"),
+            // The command runs via the remote user's shell: prefer a
+            // thinkterm binary, fall back to a wezterm one.
+            None => format!(
+                "if command -v thinkterm >/dev/null 2>&1; \
+                 then exec thinkterm {args}; else exec wezterm {args}; fi"
+            ),
         }
     }
 
@@ -685,7 +738,8 @@ impl Reconnectable {
     ) -> anyhow::Result<()> {
         let ssh_config = mux::ssh::ssh_domain_to_ssh_config(&ssh_dom)?;
 
-        let sess = ssh_connect_with_ui(ssh_config, ui)?;
+        let sess =
+            ssh_connect_with_ui_and_password(ssh_config, ui, ssh_dom.stored_password.clone())?;
         let cmd = if let Some(cmd) = ssh_dom.override_proxy_command.clone() {
             cmd
         } else if initial {
@@ -881,7 +935,7 @@ impl Reconnectable {
                     ssh_config.insert("port".to_string(), port.to_string());
                 }
 
-                let sess = ssh_connect_with_ui(ssh_config, ui)?;
+                let sess = ssh_connect_with_ui_and_password(ssh_config, ui, None)?;
 
                 let creds = ui.run_and_log_error(|| {
                     // The `tlscreds` command will start the server if needed and then
@@ -1052,7 +1106,7 @@ impl Client {
             const MAX_INTERVAL: Duration = Duration::from_secs(10);
 
             let mut backoff = BASE_INTERVAL;
-            loop {
+            'client: loop {
                 if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
                     if !reconnectable.reconnectable() || local_domain_id.is_none() {
                         log::debug!("client thread ended: {}", e);
@@ -1063,9 +1117,11 @@ impl Client {
 
                     if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
                         if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
-                            // Don't reconnect for a simple EOF
-                            log::error!("server closed connection ({})", e);
-                            break;
+                            if !reconnectable.reconnect_on_eof() {
+                                // Don't reconnect for a simple EOF
+                                log::error!("server closed connection ({})", e);
+                                break;
+                            }
                         }
                     }
 
@@ -1074,15 +1130,69 @@ impl Client {
                         break;
                     }
 
-                    let mut ui = ConnectionUI::new();
-                    ui.title("ThinkTerm: Reconnecting...");
+                    // The first couple of attempts run headless: with key
+                    // auth or a stored password the reconnect is completely
+                    // silent and the user just sees the pane resume. Only
+                    // if we still can't get back (interactive auth needed,
+                    // or a longer outage) do we escalate to a visible UI
+                    // tab hosted in a window of this domain.
+                    let mut windowed_ui: Option<ConnectionUI> = None;
+                    let mut attempt = 0usize;
 
                     loop {
-                        ui.sleep_with_reason(
-                            &format!("client disconnected {}; will reconnect", e),
-                            backoff,
-                        )
-                        .ok();
+                        attempt += 1;
+                        let mut ui = if attempt <= 2 {
+                            ConnectionUI::new_headless()
+                        } else if let Some(ui) = windowed_ui.clone() {
+                            ui
+                        } else {
+                            // Host the reconnect UI (and any auth prompts)
+                            // as a tab inside a window that already shows
+                            // this domain's panes; a standalone UI window
+                            // would materialize a whole new ThinkTerm
+                            // window over the frozen session.
+                            let (window_tx, window_rx) = channel();
+                            promise::spawn::spawn_into_main_thread(async move {
+                                let window_id = Mux::try_get().and_then(|mux| {
+                                    mux.iter_windows().into_iter().find(|window_id| {
+                                        mux.get_window(*window_id).map_or(false, |w| {
+                                            w.iter().any(|tab| {
+                                                tab.iter_panes_ignoring_zoom().iter().any(|p| {
+                                                    p.pane.domain_id() == local_domain_id
+                                                })
+                                            })
+                                        })
+                                    })
+                                });
+                                window_tx.send(window_id).ok();
+                            })
+                            .detach();
+                            let ui_window_id = window_rx
+                                .recv_timeout(Duration::from_secs(2))
+                                .ok()
+                                .flatten();
+
+                            let ui = ConnectionUI::with_params(mux::connui::ConnectionUIParams {
+                                window_id: ui_window_id,
+                                ..Default::default()
+                            });
+                            ui.title("ThinkTerm: Reconnecting...");
+                            windowed_ui = Some(ui.clone());
+                            ui
+                        };
+
+                        if ui
+                            .sleep_with_reason(
+                                &format!("client disconnected {}; will reconnect", e),
+                                backoff,
+                            )
+                            .is_err()
+                        {
+                            // The user closed the reconnect window: stop
+                            // trying and detach.
+                            log::error!("reconnect cancelled by user");
+                            break 'client;
+                        }
                         let initial = false;
                         let no_auto_start = true; // Don't auto-start on a reconnect
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {
@@ -1412,10 +1522,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_mux_command_defaults_to_wezterm_without_shell_fallback() {
-        assert_eq!(
-            Reconnectable::remote_mux_command(&None, "cli --prefer-mux proxy"),
-            "wezterm cli --prefer-mux proxy"
-        );
+    fn remote_mux_command_defaults_to_thinkterm_with_wezterm_fallback() {
+        let cmd = Reconnectable::remote_mux_command(&None, "cli --prefer-mux proxy");
+        assert!(cmd.contains("thinkterm cli --prefer-mux proxy"), "{cmd}");
+        assert!(cmd.contains("wezterm cli --prefer-mux proxy"), "{cmd}");
     }
 }

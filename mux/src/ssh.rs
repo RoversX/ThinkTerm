@@ -61,6 +61,17 @@ pub fn ssh_connect_with_ui(
     ssh_config: wezterm_ssh::ConfigMap,
     ui: &mut ConnectionUI,
 ) -> anyhow::Result<Session> {
+    ssh_connect_with_ui_and_password(ssh_config, ui, None)
+}
+
+/// Like [`ssh_connect_with_ui`], but auto-answers the first password
+/// (non-echo) auth prompt with a stored password, if any. Only once: a
+/// wrong stored password then falls back to interactive entry.
+pub fn ssh_connect_with_ui_and_password(
+    ssh_config: wezterm_ssh::ConfigMap,
+    ui: &mut ConnectionUI,
+    mut password: Option<String>,
+) -> anyhow::Result<Session> {
     let cloned_ui = ui.clone();
     cloned_ui.run_and_log_error(move || {
         let remote_address = ssh_config
@@ -104,6 +115,9 @@ pub fn ssh_connect_with_ui(
                         }
                         let res = if prompt.echo {
                             ui.input(editor_prompt)
+                        } else if let Some(stored) = password.take() {
+                            ui.output_str(&format!("{editor_prompt} (using stored password)\n"));
+                            Ok(stored)
                         } else {
                             ui.password(editor_prompt)
                         };

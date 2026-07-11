@@ -2208,6 +2208,11 @@ impl TermWindow {
                             tab.resize(self.terminal_size);
                         }
                     }
+                    // Tabs arriving via a mux resync (switch-back re-fold,
+                    // reattach) get their persisted per-pane font scales
+                    // re-applied; the adopt-time application ran before
+                    // these panes existed.
+                    self.apply_workspace_thread_font_scales();
                     self.persist_workspace_layout_after_mutation("tab added");
                 }
                 MuxNotification::PaneOutput(pane_id) => {

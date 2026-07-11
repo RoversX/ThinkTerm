@@ -77,6 +77,13 @@ pub struct WorkspaceThread {
     pub name: String,
     pub project_id: ProjectId,
     pub layout: Option<WorkspaceThreadLayoutSnapshot>,
+    /// Per-pane font scales for mux-domain threads, keyed by the REMOTE
+    /// pane id (stable across resyncs for the life of the server). Local
+    /// threads keep font scales inside `layout`; mux threads must never
+    /// persist layout (the server owns it), but font scale is client-side
+    /// presentation state, so it is persisted separately here.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub remote_font_scales: HashMap<PaneId, f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_workspace_name: Option<String>,
     pub materialized_workspace_name: Option<String>,
@@ -992,13 +999,43 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
         return;
     }
 
-    // Domain-owned windows (remote mux windows, tmux) must never be
-    // snapshotted locally: the remote mux server owns the layout truth,
-    // and a local snapshot would fight it on restore.
+    // Domain-owned windows (remote mux windows, tmux) must never have
+    // their LAYOUT snapshotted locally: the remote mux server owns the
+    // layout truth, and a local snapshot would fight it on restore. Font
+    // scale however is client-side presentation state, so persist that
+    // part keyed by the remote pane id: the local pane ids die with the
+    // mirror window on switch-away and are reissued by the resync on
+    // switch-back.
     if Mux::get()
         .get_window(window_id)
         .map_or(false, |w| w.origin_domain().is_some())
     {
+        let mut scales: HashMap<PaneId, f64> = HashMap::new();
+        let mut remote_panes = 0usize;
+        if let Some(window) = Mux::get().get_window(window_id) {
+            for tab in window.iter() {
+                for pos in tab.iter_panes_ignoring_zoom() {
+                    if let Some(client_pane) =
+                        pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                    {
+                        remote_panes += 1;
+                        if let Some(scale) = pane_font_scale(pos.pane.pane_id()) {
+                            scales.insert(client_pane.remote_pane_id, scale);
+                        }
+                    }
+                }
+            }
+        }
+        if remote_panes == 0 {
+            // The mirror panes may simply not have folded in yet (attach
+            // or resync still in flight); saving now would clobber the
+            // stored scales with an empty map before restore ever ran.
+            return;
+        }
+        let mut store = THREAD_STORE.lock();
+        if store.snapshot_remote_thread_font_scales(space_id, workspace, scales) {
+            persist_locked(&store);
+        }
         return;
     }
 
@@ -1167,8 +1204,45 @@ pub fn workspace_pane_font_scales(
     workspace: &str,
     window_id: MuxWindowId,
 ) -> Option<HashMap<PaneId, Option<f64>>> {
-    let store = THREAD_STORE.lock();
-    store.workspace_pane_font_scales(workspace, window_id)
+    let (local, remote) = {
+        let store = THREAD_STORE.lock();
+        (
+            store.workspace_pane_font_scales(workspace, window_id),
+            store.remote_thread_font_scales(workspace),
+        )
+    };
+    log::debug!(
+        "workspace_pane_font_scales: ws={workspace} window={window_id} local={:?} remote={:?}",
+        local,
+        remote
+    );
+    if local.is_some() {
+        return local;
+    }
+    // Mux-domain threads store scales keyed by remote pane id; translate
+    // through the live panes of the window (their local ids are reissued
+    // by every re-fold, the remote ids are stable).
+    let remote = remote?;
+    let mux = Mux::get();
+    let window = mux.get_window(window_id)?;
+    let mut scales: HashMap<PaneId, Option<f64>> = HashMap::new();
+    for tab in window.iter() {
+        for pos in tab.iter_panes_ignoring_zoom() {
+            if let Some(client_pane) =
+                pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+            {
+                scales.insert(
+                    pos.pane.pane_id(),
+                    remote.get(&client_pane.remote_pane_id).copied(),
+                );
+            }
+        }
+    }
+    if scales.is_empty() {
+        None
+    } else {
+        Some(scales)
+    }
 }
 
 pub fn rename_project(project_id: &str, name: String) -> bool {
@@ -2189,6 +2263,65 @@ impl WorkspaceThreadStore {
             .and_then(|layout| pane_font_scales_for_window(layout, window_id))
     }
 
+    /// Store remote-pane-id-keyed font scales for the active thread of the
+    /// given mux-domain Space. Counterpart of snapshot_active_space_thread_layout
+    /// for the one piece of state that IS client-owned on remote threads.
+    fn snapshot_remote_thread_font_scales(
+        &mut self,
+        space_id: &str,
+        workspace: &str,
+        scales: HashMap<PaneId, f64>,
+    ) -> bool {
+        let Some(project_id) = self.active_project_id_for_space(space_id) else {
+            return false;
+        };
+        let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.space_id == space_id && project.id == project_id)
+        else {
+            return false;
+        };
+        let project_id = project.id.clone();
+        let active_thread_id = project
+            .active_thread_id
+            .clone()
+            .or_else(|| project.threads.first().map(|session| session.id.clone()));
+        let Some(active_thread_id) = active_thread_id else {
+            return false;
+        };
+        let Some(session) = project
+            .threads
+            .iter_mut()
+            .find(|session| session.id == active_thread_id)
+        else {
+            return false;
+        };
+
+        let expected_workspace = session
+            .materialized_workspace_name
+            .clone()
+            .unwrap_or_else(|| workspace_name_for_thread(&project_id, &session.id));
+        if expected_workspace != workspace {
+            return false;
+        }
+
+        if session.remote_font_scales == scales {
+            return false;
+        }
+        session.remote_font_scales = scales;
+        true
+    }
+
+    fn remote_thread_font_scales(&self, workspace: &str) -> Option<HashMap<PaneId, f64>> {
+        self.projects
+            .iter()
+            .flat_map(|project| project.threads.iter())
+            .find(|session| session.materialized_workspace_name.as_deref() == Some(workspace))
+            .map(|session| session.remote_font_scales.clone())
+            .filter(|scales| !scales.is_empty())
+    }
+
     fn rename_project(&mut self, project_id: &str, name: String) -> bool {
         let name = name.trim();
         if name.is_empty() {
@@ -2589,6 +2722,7 @@ impl WorkspaceThread {
             name,
             project_id,
             layout: None,
+            remote_font_scales: HashMap::new(),
             planned_workspace_name: None,
             materialized_workspace_name: workspace,
             last_active_at: now_ts(),
@@ -2610,6 +2744,7 @@ impl WorkspaceThread {
             name,
             project_id,
             layout: None,
+            remote_font_scales: HashMap::new(),
             planned_workspace_name: None,
             materialized_workspace_name: workspace,
             last_active_at: now_ts(),

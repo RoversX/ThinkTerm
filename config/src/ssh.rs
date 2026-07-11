@@ -100,6 +100,13 @@ pub struct SshDomain {
     #[dynamic(default)]
     pub ssh_option: HashMap<String, String>,
 
+    /// Optional stored password used to auto-answer the first password
+    /// (non-echo) auth prompt. Populated at runtime when the domain is
+    /// built from a ThinkTerm SSH host entry; not intended for lua config
+    /// (prefer key auth there).
+    #[dynamic(default)]
+    pub stored_password: Option<String>,
+
     pub default_prog: Option<Vec<String>>,
 
     #[dynamic(default)]
