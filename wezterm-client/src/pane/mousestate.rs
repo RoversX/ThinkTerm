@@ -24,7 +24,19 @@ impl MouseState {
         }
     }
 
-    pub fn append(&mut self, event: MouseEvent) {
+    pub fn append(&mut self, mut event: MouseEvent) {
+        // The GUI passes through the raw OS wheel amount (lines per notch),
+        // but a local terminal emits exactly one report per wheel event no
+        // matter the amount. Normalize each event to a single notch so that
+        // the coalescing below accumulates a notch count; the mux server
+        // replays one report per notch, matching local behavior.
+        event.button = match event.button {
+            MouseButton::WheelUp(n) if n > 1 => MouseButton::WheelUp(1),
+            MouseButton::WheelDown(n) if n > 1 => MouseButton::WheelDown(1),
+            MouseButton::WheelLeft(n) if n > 1 => MouseButton::WheelLeft(1),
+            MouseButton::WheelRight(n) if n > 1 => MouseButton::WheelRight(1),
+            b => b,
+        };
         if let Some(last) = self.queue.back_mut() {
             if last.modifiers == event.modifiers {
                 if last.kind == MouseEventKind::Move

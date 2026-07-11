@@ -712,7 +712,29 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.mouse_event(event)?;
+                            // The client coalesces rapid wheel motion into a single
+                            // event with an accumulated amount, but the terminal
+                            // emits one report per event regardless of the amount;
+                            // replay it per notch so mouse-mode apps scroll the
+                            // full distance.
+                            use wezterm_term::MouseButton as MB;
+                            let notches = match event.button {
+                                MB::WheelUp(n) if n > 1 => Some((MB::WheelUp(1), n)),
+                                MB::WheelDown(n) if n > 1 => Some((MB::WheelDown(1), n)),
+                                MB::WheelLeft(n) if n > 1 => Some((MB::WheelLeft(1), n)),
+                                MB::WheelRight(n) if n > 1 => Some((MB::WheelRight(1), n)),
+                                _ => None,
+                            };
+                            match notches {
+                                Some((notch, n)) => {
+                                    let mut single = event;
+                                    single.button = notch;
+                                    for _ in 0..n {
+                                        pane.mouse_event(single.clone())?;
+                                    }
+                                }
+                                None => pane.mouse_event(event)?,
+                            }
                             maybe_push_pane_changes(&pane, sender, per_pane)?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
