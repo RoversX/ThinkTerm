@@ -541,6 +541,13 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
             SshMultiplexing::None
         },
         ssh_option,
+        // The derived Default is all-zero here: the documented Some(100ms)
+        // predictive-echo threshold (and the read timeout) only apply when
+        // the domain is deserialized from lua config. Without them, mux
+        // sessions built from the host store never show local-echo
+        // predictions, no matter how laggy the link.
+        local_echo_threshold_ms: config::default_local_echo_threshold_ms(),
+        timeout: config::default_read_timeout(),
         ..Default::default()
     }
 }
