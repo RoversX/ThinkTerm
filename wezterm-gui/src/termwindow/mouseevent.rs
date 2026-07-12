@@ -2772,7 +2772,9 @@ impl super::TermWindow {
                 if space.is_default {
                     "house"
                 } else if space.is_remote {
-                    "server"
+                    // Must be a valid SF Symbol name: macOS renders these
+                    // through the native menu's imageWithSystemSymbolName.
+                    "server.rack"
                 } else {
                     "square.stack"
                 },
@@ -3413,22 +3415,38 @@ impl super::TermWindow {
                 let domain_name = domain_name.to_string();
                 let mux_window_id = self.mux_window_id;
                 promise::spawn::spawn(async move {
-                    let mux = Mux::get();
-                    let domain = mux
-                        .get_domain_by_name(&domain_name)
-                        .ok_or_else(|| anyhow::anyhow!("domain {domain_name} not found"))?;
-                    domain.attach(Some(mux_window_id)).await?;
-                    window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                        if let Some(win) = term_window.window.clone() {
-                            term_window.activate_workspace_thread_impl(
-                                thread_id,
-                                &win,
-                                orphan_candidate_window_id,
-                                workspaces_to_kill_after_adopt,
-                            );
+                    let result = async {
+                        let mux = Mux::get();
+                        // Host-store mux domains are only registered on
+                        // demand (sshhost connect / CLI `connect`); build
+                        // one from the SSH host store when switching into
+                        // the Space cold, instead of failing the whole
+                        // activation.
+                        let domain = match mux.get_domain_by_name(&domain_name) {
+                            Some(domain) => domain,
+                            None => crate::connect_domain_from_ssh_host(&domain_name)?,
+                        };
+                        domain.attach(Some(mux_window_id)).await?;
+                        anyhow::Ok(())
+                    }
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                                if let Some(win) = term_window.window.clone() {
+                                    term_window.activate_workspace_thread_impl(
+                                        thread_id,
+                                        &win,
+                                        orphan_candidate_window_id,
+                                        workspaces_to_kill_after_adopt,
+                                    );
+                                }
+                            })));
                         }
-                    })));
-                    anyhow::Ok(())
+                        Err(err) => {
+                            log::error!("attaching {domain_name} for thread switch: {err:#}");
+                        }
+                    }
                 })
                 .detach();
                 context.invalidate();
