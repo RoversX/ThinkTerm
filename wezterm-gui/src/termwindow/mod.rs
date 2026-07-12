@@ -950,6 +950,10 @@ pub struct TermWindow {
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
 
     last_status_call: Instant,
+    /// Whether the last status tick found a lagging client pane (the
+    /// "Reconnecting…" badge was drawn); used to repaint once more after
+    /// recovery so a stale badge doesn't linger on an idle pane.
+    connection_badge_was_visible: bool,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -1540,6 +1544,7 @@ impl TermWindow {
                 &config,
             )),
             last_status_call: Instant::now(),
+            connection_badge_was_visible: false,
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
                 config.cursor_blink_ease_in,
@@ -2272,6 +2277,20 @@ impl TermWindow {
             TermWindowNotif::EmitStatusUpdate => {
                 self.emit_status_event();
                 self.refresh_all_thread_work();
+                // Drive the per-pane "Reconnecting…" badge: a lagging
+                // session produces no output, so nothing else would
+                // repaint it (or clear a stale badge after recovery).
+                let lagging = self
+                    .get_panes_to_render()
+                    .iter()
+                    .any(|pos| {
+                        crate::termwindow::render::pane::client_pane_lag_ms(pos.pane.as_ref())
+                            .is_some()
+                    });
+                if lagging || self.connection_badge_was_visible {
+                    window.invalidate();
+                }
+                self.connection_badge_was_visible = lagging;
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
@@ -2653,6 +2672,45 @@ impl TermWindow {
         } else {
             window.invalidate();
         }
+    }
+
+    /// Delete a remote Space AND end its sessions on the server: send a
+    /// remote kill for every pane of the Space's client domain, then delete
+    /// the Space (which detaches). The deletion is deferred a moment so the
+    /// KillPane PDUs can flush before the detach tears the transport down.
+    fn delete_space_and_remote_sessions(&mut self, space_id: &str) {
+        let attached_domain = crate::workspace_threads::client_domain_for_space(space_id)
+            .and_then(|name| Mux::get().get_domain_by_name(&name))
+            .filter(|domain| domain.state() == mux::domain::DomainState::Attached);
+
+        let Some(domain) = attached_domain else {
+            let window = self.window.clone();
+            self.delete_space(space_id, window.as_ref());
+            return;
+        };
+
+        let domain_id = domain.domain_id();
+        for pane in Mux::get().iter_panes() {
+            if pane.domain_id() == domain_id {
+                pane.kill();
+            }
+        }
+
+        let space_id = space_id.to_string();
+        let gui_window = self.window.clone();
+        promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(400)).await;
+            if let Some(gui_window) = gui_window {
+                gui_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let window = term_window.window.clone();
+                    term_window.delete_space(&space_id, window.as_ref());
+                    if let Some(window) = window {
+                        window.invalidate();
+                    }
+                })));
+            }
+        })
+        .detach();
     }
 
     fn delete_space(&mut self, space_id: &str, window: Option<&Window>) {
@@ -4858,6 +4916,12 @@ impl TermWindow {
             }
             DeleteSpace(space_id) => {
                 self.delete_space(space_id, window.as_ref());
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            DeleteSpaceAndRemoteSessions(space_id) => {
+                self.delete_space_and_remote_sessions(space_id);
                 if let Some(window) = window.as_ref() {
                     window.invalidate();
                 }

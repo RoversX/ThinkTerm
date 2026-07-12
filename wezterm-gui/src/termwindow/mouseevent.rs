@@ -2812,7 +2812,7 @@ impl super::TermWindow {
             // are untouched. Label it accordingly.
             ContextMenuItem::item_with_icon(
                 if space.is_remote {
-                    format!("Disconnect & Remove \"{}\" (Local Only)", space.name)
+                    format!("Disconnect \"{}\" (Server Keeps Running)", space.name)
                 } else {
                     format!("Delete \"{}\"", space.name)
                 },
@@ -2830,7 +2830,23 @@ impl super::TermWindow {
             .find(|space| active_space_id.as_deref() == Some(space.id.as_str()))
             .cloned();
         if let Some(space) = active_delete {
+            // For a currently-connected remote Space, also offer really
+            // ending the sessions on the server before removing it.
+            let offer_remote_kill = space.is_remote
+                && crate::workspace_threads::client_domain_for_space(&space.id)
+                    .and_then(|name| Mux::get().get_domain_by_name(&name))
+                    .map_or(false, |domain| {
+                        domain.state() == mux::domain::DomainState::Attached
+                    });
+            let (name, id) = (space.name.clone(), space.id.clone());
             items.push(delete_item(space));
+            if offer_remote_kill {
+                items.push(ContextMenuItem::item_with_icon(
+                    format!("Delete \"{name}\" & End Remote Sessions"),
+                    "trash",
+                    KeyAssignment::DeleteSpaceAndRemoteSessions(id),
+                ));
+            }
         }
 
         let other_delete_candidates = delete_candidates

@@ -960,6 +960,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_delete"),
         },
+        DeleteSpaceAndRemoteSessions(_) => CommandDef {
+            brief: "Delete Space & End Remote Sessions".into(),
+            doc: "Kills the Space's sessions on the remote mux server, then \
+                  deletes the local records"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_delete"),
+        },
         CreateWorkspaceThread(_) => CommandDef {
             brief: "New Thread".into(),
             doc: "Creates a new ThinkTerm thread for the workspace".into(),

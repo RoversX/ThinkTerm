@@ -593,6 +593,9 @@ pub enum KeyAssignment {
     CreateSpace,
     SwitchSpace(String),
     DeleteSpace(String),
+    /// Like DeleteSpace, but for a remote (mux-domain) Space also kill its
+    /// sessions on the remote mux server before detaching.
+    DeleteSpaceAndRemoteSessions(String),
     CreateWorkspaceThread(String),
     ToggleWorkspaceThreadsCollapsed(String),
     RemoveProject(String),
