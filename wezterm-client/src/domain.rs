@@ -451,6 +451,28 @@ impl ClientDomain {
         self.config.connect_automatically()
     }
 
+    /// The transport died and the background reconnect loop is trying to
+    /// get back; authoritative connection-health signal for indicators
+    /// (pane tardiness only trips after something is sent on the pane).
+    pub fn is_reconnecting(&self) -> bool {
+        self.inner()
+            .map_or(false, |inner| inner.client.is_reconnecting())
+    }
+
+    /// Automatic reconnection failed for long enough that the retry loop
+    /// parked itself; nothing is torn down, and resume_reconnect() starts
+    /// another round.
+    pub fn is_reconnect_suspended(&self) -> bool {
+        self.inner()
+            .map_or(false, |inner| inner.client.reconnect_is_suspended())
+    }
+
+    pub fn resume_reconnect(&self) {
+        if let Some(inner) = self.inner() {
+            inner.client.resume_reconnect();
+        }
+    }
+
     pub fn perform_detach(&self) {
         log::info!("detached domain {}", self.local_domain_id);
         self.inner.lock().unwrap().take();

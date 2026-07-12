@@ -53,6 +53,7 @@ use mux::tab::{
 };
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
+use wezterm_client::domain::ClientDomain;
 use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
@@ -257,6 +258,10 @@ pub enum UIItemType {
     },
     ProjectNew,
     SpaceMenu,
+    /// "Reconnect" row under the Space menu, shown while the Space's mux
+    /// domain is disconnected (retry loop parked, detached, or never
+    /// connected this session).
+    SpaceReconnect,
     ProjectToggleThreads(String),
     Project(String),
     WorkspaceThread(String),
@@ -982,6 +987,10 @@ pub struct TermWindow {
     /// windows spawned by the reconcile, e.g. reconnect/auth prompts): they
     /// close when their mux window dies instead of falling back to a thread.
     dies_with_mux_window: bool,
+    /// Domains with a user-requested reconnect currently in flight (the
+    /// sidebar Reconnect button); suppresses double-clicks and drives the
+    /// row's "Connecting…" label.
+    space_reconnects_in_flight: HashSet<String>,
     workspace_layout_structure_fingerprint: Option<u64>,
     workspace_sidebar_width: usize,
     workspace_sidebar_pending_thread_selection: Option<String>,
@@ -1596,6 +1605,7 @@ impl TermWindow {
             space_owner_id,
             active_space_id,
             dies_with_mux_window,
+            space_reconnects_in_flight: HashSet::new(),
             workspace_layout_structure_fingerprint,
             workspace_sidebar_width,
             workspace_sidebar_pending_thread_selection: None,
@@ -2415,6 +2425,62 @@ impl TermWindow {
         // removed; re-establish it for the window we are about to adopt.
         self.subscribe_to_pane_updates();
         self.activate_workspace_thread(thread_id, &window);
+    }
+
+    /// The sidebar Reconnect button: bring the active Space's mux domain
+    /// back. A parked retry loop (gave up after continuous failure) is
+    /// resumed in place; a detached or never-connected domain is attached
+    /// fresh, registering it from the SSH host store when needed.
+    pub(crate) fn reconnect_space_domain(&mut self) {
+        let Some(domain_name) =
+            crate::workspace_threads::client_domain_for_space(&self.active_space_id)
+        else {
+            return;
+        };
+        if !self.space_reconnects_in_flight.insert(domain_name.clone()) {
+            return;
+        }
+        let Some(window) = self.window.clone() else {
+            self.space_reconnects_in_flight.remove(&domain_name);
+            return;
+        };
+        let mux_window_id = self.mux_window_id;
+        promise::spawn::spawn(async move {
+            let result = async {
+                let mux = Mux::get();
+                let domain = match mux.get_domain_by_name(&domain_name) {
+                    Some(domain) => domain,
+                    None => crate::connect_domain_from_ssh_host(&domain_name)?,
+                };
+                if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                    if client.is_reconnect_suspended() {
+                        client.resume_reconnect();
+                        return anyhow::Ok(());
+                    }
+                }
+                if domain.state() != mux::domain::DomainState::Attached {
+                    domain.attach(Some(mux_window_id)).await?;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            let domain_name_for_cleanup = domain_name.clone();
+            if let Err(err) = result {
+                log::error!("reconnect {domain_name}: {err:#}");
+            }
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window
+                    .space_reconnects_in_flight
+                    .remove(&domain_name_for_cleanup);
+                if let Some(window) = term_window.window.as_ref() {
+                    window.invalidate();
+                }
+            })));
+        })
+        .detach();
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
     }
 
     /// Switch THIS window to display the (already-live) workspace `workspace`,

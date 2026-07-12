@@ -50,6 +50,19 @@ const SPACE_DISCONNECTED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0
 const SIDEBAR_SECTION_ACTION_SIZE: usize = 48;
 const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 6;
 
+/// Connection health of the active Space's mux client domain, as shown by
+/// the sidebar indicator. Local Spaces are always Connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpaceConnectionState {
+    Connected,
+    /// Transport lost; the automatic retry loop is running.
+    Reconnecting,
+    /// Not connected and nothing is retrying (retry loop parked after
+    /// sustained failure, domain detached, or never connected); the
+    /// sidebar offers a Reconnect button.
+    Disconnected,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceSidebarRect {
     pub x: usize,
@@ -82,6 +95,10 @@ struct WorkspaceSidebarLayout {
     show_sidebar_toolbar: bool,
     space_menu_y: usize,
     space_menu_height: usize,
+    /// Height of the "Reconnect" row below the Space menu; non-zero only
+    /// while the Space's mux domain is Disconnected (a stable state — the
+    /// row never flickers in and out on transient lag).
+    reconnect_row_height: usize,
     top_action_y_offset: usize,
     top_action_height: usize,
     list_top: usize,
@@ -266,34 +283,53 @@ impl crate::TermWindow {
         }
     }
 
-    /// Whether the mux server behind a client-domain Space has stopped
-    /// responding (a reconnect is pending or running). While the Space is
+    /// Connection health of a client-domain Space. While the Space is
     /// remote we keep a slow self-driven repaint tick going: a dead
     /// connection produces no output, so nothing else would repaint the
-    /// indicator when the state flips. Panes report tardy after ~3s of an
-    /// unanswered request, which ordinary latency spikes trip all the
-    /// time; require a longer sustained silence before alarming the user.
-    fn space_connection_lost(&self, space_id: &str) -> bool {
+    /// indicator when the state flips.
+    fn space_connection_state(&self, space_id: &str) -> SpaceConnectionState {
         const SUSTAINED_LAG_MS: u64 = 5000;
         let Some(domain_name) = workspace_threads::client_domain_for_space(space_id) else {
-            return false;
+            return SpaceConnectionState::Connected;
         };
         self.update_next_frame_time(Some(
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         ));
         let mux = Mux::get();
         let Some(domain) = mux.get_domain_by_name(&domain_name) else {
-            return false;
+            // Not even registered: never connected in this session.
+            return SpaceConnectionState::Disconnected;
         };
-        if domain.state() != mux::domain::DomainState::Attached {
-            return false;
+        if let Some(client) = domain.downcast_ref::<wezterm_client::domain::ClientDomain>() {
+            // The retry loop parked itself after two minutes of failures;
+            // it waits for the sidebar Reconnect button.
+            if client.is_reconnect_suspended() {
+                return SpaceConnectionState::Disconnected;
+            }
+            // The reconnect loop knows immediately when the transport died
+            // — pane tardiness below only trips after something is SENT on
+            // a pane, so on its own it misses idle disconnects entirely.
+            if client.is_reconnecting() {
+                return SpaceConnectionState::Reconnecting;
+            }
         }
+        if domain.state() != mux::domain::DomainState::Attached {
+            return SpaceConnectionState::Disconnected;
+        }
+        // Attached but silent despite outstanding requests: transport not
+        // (yet) declared dead. Panes report tardy after ~3s, which ordinary
+        // latency spikes trip all the time; require a longer sustained
+        // silence before alarming the user.
         let domain_id = domain.domain_id();
-        mux.iter_panes().iter().any(|pane| {
+        if mux.iter_panes().iter().any(|pane| {
             pane.domain_id() == domain_id
                 && crate::termwindow::render::pane::client_pane_lag_ms(pane.as_ref())
                     .map_or(false, |ms| ms >= SUSTAINED_LAG_MS)
-        })
+        }) {
+            SpaceConnectionState::Reconnecting
+        } else {
+            SpaceConnectionState::Connected
+        }
     }
 
     fn is_workspace_sidebar_thread_selected(
@@ -440,6 +476,16 @@ impl crate::TermWindow {
         let space_menu_y = y;
         let space_menu_height = top_action_height + 6;
         y += space_menu_height + SIDEBAR_INSET;
+        let reconnect_row_height = if self.space_connection_state(&self.active_space_id)
+            == SpaceConnectionState::Disconnected
+        {
+            ui_cell_height + SIDEBAR_INSET
+        } else {
+            0
+        };
+        if reconnect_row_height > 0 {
+            y += reconnect_row_height + SIDEBAR_INSET;
+        }
         let list_top = y + top_action_y_offset + top_action_height + SIDEBAR_INSET;
 
         WorkspaceSidebarLayout {
@@ -454,6 +500,7 @@ impl crate::TermWindow {
             show_sidebar_toolbar,
             space_menu_y,
             space_menu_height,
+            reconnect_row_height,
             top_action_y_offset,
             top_action_height,
             list_top,
@@ -858,10 +905,12 @@ impl crate::TermWindow {
             &space_title,
             space_text_right.saturating_sub(space_text_x),
         )?;
-        let (space_icon, space_icon_color) = if self.space_connection_lost(&self.active_space_id) {
-            // Swap the icon in place rather than adding text or a banner:
-            // the indicator must not change the row's width or height, so
-            // transient lag spikes can't make the sidebar layout jump.
+        let connection_state = self.space_connection_state(&self.active_space_id);
+        let (space_icon, space_icon_color) = if connection_state != SpaceConnectionState::Connected
+        {
+            // Swap the icon in place rather than adding text: the indicator
+            // must not change the row's width or height, so transient lag
+            // spikes can't make the sidebar layout jump.
             (SvgIcon::CircleAlert, SPACE_DISCONNECTED_COLOR)
         } else {
             (
@@ -903,7 +952,71 @@ impl crate::TermWindow {
                 muted_fg
             },
         )?;
-        let y = space_menu_y + space_menu_height + SIDEBAR_INSET;
+        let mut y = space_menu_y + space_menu_height + SIDEBAR_INSET;
+        if layout.reconnect_row_height > 0 {
+            let row_x = item_x + SIDEBAR_INSET;
+            let row_width = item_width.saturating_sub(SIDEBAR_INSET * 2);
+            let row_height = layout.reconnect_row_height;
+            let reconnect_in_flight =
+                workspace_threads::client_domain_for_space(&self.active_space_id)
+                    .map_or(false, |name| self.space_reconnects_in_flight.contains(&name));
+            let hovered =
+                !reconnect_in_flight && self.is_pointer_over_ui_rect(row_x, y, row_width, row_height);
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(row_x as f32, y as f32, row_width as f32, row_height as f32),
+                SPACE_DISCONNECTED_COLOR.mul_alpha(if hovered { 0.30 } else { 0.18 }),
+                SIDEBAR_ROW_RADIUS,
+            )
+            .context("sidebar reconnect row")?;
+            let row_icon_size = ui_cell_height.min(row_height.saturating_sub(6));
+            let row_icon_x = row_x + SIDEBAR_INSET;
+            let row_icon_y = y + ((row_height.saturating_sub(row_icon_size)) / 2);
+            self.paint_sidebar_icon(
+                layers,
+                if reconnect_in_flight {
+                    SvgIcon::LoaderCircle
+                } else {
+                    SvgIcon::RotateCcw
+                },
+                row_icon_x,
+                row_icon_y,
+                row_icon_size,
+                SPACE_DISCONNECTED_COLOR,
+            )?;
+            let row_text_x = row_icon_x + row_icon_size + SIDEBAR_ICON_GAP;
+            let row_text_max = (row_x + row_width).saturating_sub(row_text_x + SIDEBAR_INSET);
+            let row_label = self.ellipsize_sidebar_text(
+                &ui_font,
+                if reconnect_in_flight {
+                    "Connecting…"
+                } else {
+                    "Disconnected — Reconnect"
+                },
+                row_text_max,
+            )?;
+            self.paint_sidebar_text(
+                layers,
+                &ui_font,
+                ui_metrics,
+                row_label.as_ref(),
+                row_text_x,
+                y + ((row_height.saturating_sub(ui_cell_height)) / 2),
+                row_text_max,
+                SPACE_DISCONNECTED_COLOR,
+            )?;
+            if !reconnect_in_flight {
+                self.ui_items.push(UIItem {
+                    x: row_x,
+                    y,
+                    width: row_width,
+                    height: row_height,
+                    item_type: UIItemType::SpaceReconnect,
+                });
+            }
+            y += row_height + SIDEBAR_INSET;
+        }
         let top_action_x = item_x + SIDEBAR_INSET;
         let top_action_y = y + top_action_y_offset;
         let notification_action_size = top_action_height;

@@ -30,7 +30,9 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -63,6 +65,32 @@ pub struct Client {
     client_domain_config: ClientDomainConfig,
     pub is_reconnectable: bool,
     pub is_local: bool,
+    /// True from the moment the transport dies until a reconnect succeeds
+    /// (or retries are suspended). Pane-level tardiness only trips after
+    /// something is SENT on the pane, so it misses idle disconnects; this
+    /// is the authoritative connection-health signal for GUI indicators.
+    is_reconnecting: Arc<AtomicBool>,
+    /// True once automatic reconnection has failed continuously for the
+    /// give-up window: the retry loop is parked (nothing is torn down)
+    /// until resume_reconnect() is called, e.g. from a GUI Reconnect
+    /// button.
+    reconnect_suspended: Arc<AtomicBool>,
+    resume_reconnect_tx: std::sync::mpsc::Sender<()>,
+}
+
+impl Client {
+    pub fn is_reconnecting(&self) -> bool {
+        self.is_reconnecting.load(Ordering::Relaxed)
+    }
+
+    pub fn reconnect_is_suspended(&self) -> bool {
+        self.reconnect_suspended.load(Ordering::Relaxed)
+    }
+
+    /// Wake a parked reconnect loop for another round of retries.
+    pub fn resume_reconnect(&self) {
+        let _ = self.resume_reconnect_tx.send(());
+    }
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -1101,6 +1129,11 @@ impl Client {
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
         let client_id = ClientId::new();
+        let is_reconnecting = Arc::new(AtomicBool::new(false));
+        let reconnecting_flag = Arc::clone(&is_reconnecting);
+        let reconnect_suspended = Arc::new(AtomicBool::new(false));
+        let suspended_flag = Arc::clone(&reconnect_suspended);
+        let (resume_reconnect_tx, resume_reconnect_rx) = channel::<()>();
 
         thread::spawn(move || {
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
@@ -1151,6 +1184,8 @@ impl Client {
                         break;
                     }
 
+                    reconnecting_flag.store(true, Ordering::Relaxed);
+
                     if session_started.elapsed() >= SHORT_SESSION {
                         // The previous connection genuinely worked; restart
                         // the retry schedule from scratch.
@@ -1176,6 +1211,13 @@ impl Client {
                     // or a longer outage) do we escalate to a visible UI
                     // tab hosted in a window of this domain.
                     let mut attempt = 0usize;
+                    // After this much continuous failure, stop hammering
+                    // the network and park until the user asks for another
+                    // round (the sidebar Reconnect button). Nothing is torn
+                    // down: the domain stays attached and every window and
+                    // pane survives, ready for the next attempt.
+                    const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
+                    let mut outage_started = std::time::Instant::now();
 
                     loop {
                         attempt += 1;
@@ -1278,6 +1320,7 @@ impl Client {
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {
                             Ok(_) => {
                                 log::error!("Reconnected!");
+                                reconnecting_flag.store(false, Ordering::Relaxed);
                                 let reattach_ui = ui.clone();
                                 promise::spawn::spawn_into_main_thread(async move {
                                     ClientDomain::reattach(local_domain_id, reattach_ui)
@@ -1293,6 +1336,34 @@ impl Client {
                                     "problem reconnecting: {}; will reconnect in {:?}\n",
                                     err, backoff
                                 ));
+                                if outage_started.elapsed() >= GIVE_UP_AFTER {
+                                    log::error!(
+                                        "unable to reconnect for {GIVE_UP_AFTER:?}; \
+                                         suspending retries until requested"
+                                    );
+                                    if let Some((ui, _)) = windowed_ui.take() {
+                                        ui.close();
+                                    }
+                                    reconnecting_flag.store(false, Ordering::Relaxed);
+                                    suspended_flag.store(true, Ordering::Relaxed);
+                                    match resume_reconnect_rx.recv() {
+                                        Ok(()) => {
+                                            suspended_flag.store(false, Ordering::Relaxed);
+                                            reconnecting_flag.store(true, Ordering::Relaxed);
+                                            outage_started = std::time::Instant::now();
+                                            backoff = BASE_INTERVAL;
+                                            short_sessions = 0;
+                                        }
+                                        Err(_) => {
+                                            // Every Client handle is gone;
+                                            // nobody can ever resume us.
+                                            log::error!(
+                                                "reconnect suspended and client dropped; detaching"
+                                            );
+                                            break 'client;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1303,7 +1374,10 @@ impl Client {
             }
 
             // Whatever ended the loop (cancelled by user, not
-            // reconnectable), don't leave the reconnect tab behind.
+            // reconnectable), don't leave the reconnect tab behind. The
+            // domain detaches below, so we are no longer "reconnecting".
+            reconnecting_flag.store(false, Ordering::Relaxed);
+            suspended_flag.store(false, Ordering::Relaxed);
             if let Some((ui, _)) = windowed_ui.take() {
                 ui.close();
             }
@@ -1338,6 +1412,9 @@ impl Client {
             is_local,
             client_id,
             client_domain_config,
+            is_reconnecting,
+            reconnect_suspended,
+            resume_reconnect_tx,
         }
     }
 

@@ -638,6 +638,7 @@ impl super::TermWindow {
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
             | UIItemType::SpaceMenu
+            | UIItemType::SpaceReconnect
             | UIItemType::ProjectToggleThreads(_)
             | UIItemType::Project(_)
             | UIItemType::WorkspaceThread(_)
@@ -701,6 +702,7 @@ impl super::TermWindow {
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
             | UIItemType::SpaceMenu
+            | UIItemType::SpaceReconnect
             | UIItemType::ProjectToggleThreads(_)
             | UIItemType::Project(_)
             | UIItemType::WorkspaceThread(_)
@@ -1647,6 +1649,12 @@ impl super::TermWindow {
             UIItemType::SpaceMenu => {
                 self.mouse_event_space_menu(item, event, context);
             }
+            UIItemType::SpaceReconnect => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    self.reconnect_space_domain();
+                }
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
@@ -1806,6 +1814,12 @@ impl super::TermWindow {
             }
             UIItemType::SpaceMenu => {
                 self.mouse_event_space_menu(item, event, context);
+            }
+            UIItemType::SpaceReconnect => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    self.reconnect_space_domain();
+                }
+                context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
