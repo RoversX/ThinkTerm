@@ -2253,8 +2253,18 @@ impl TermWindow {
                 }
                 MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
-                | MuxNotification::ActiveWorkspaceChanged(_)
-                | MuxNotification::WindowCreated(_) => {
+                | MuxNotification::ActiveWorkspaceChanged(_) => {
+                    self.sync_current_workspace_thread();
+                }
+                MuxNotification::WindowCreated(_) => {
+                    // Remote windows folded in by an attach/resync may
+                    // reference sidebar records this client lost; rebuild
+                    // them so running remote terminals stay reachable.
+                    if crate::workspace_threads::adopt_orphan_remote_thread_windows(
+                        &self.active_space_id,
+                    ) {
+                        window.invalidate();
+                    }
                     self.sync_current_workspace_thread();
                 }
                 MuxNotification::Empty => {}

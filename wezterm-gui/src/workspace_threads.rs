@@ -237,6 +237,10 @@ pub struct SpaceView {
     pub is_active: bool,
     pub is_default: bool,
     pub is_occupied_by_other_window: bool,
+    /// True for a Space dedicated to a remote mux client domain
+    /// (`thinkterm connect`); the UI labels these distinctly and their
+    /// "delete" is local-only (the remote server keeps running).
+    pub is_remote: bool,
 }
 
 lazy_static::lazy_static! {
@@ -526,6 +530,7 @@ pub fn spaces_for_window(owner_id: u64) -> Vec<SpaceView> {
             is_occupied_by_other_window: occupied
                 .iter()
                 .any(|(owner, active_space)| *owner != owner_id && active_space == &space.id),
+            is_remote: space.client_domain.is_some(),
         })
         .collect()
 }
@@ -3478,6 +3483,131 @@ pub fn client_domain_for_space(space_id: &str) -> Option<String> {
         .iter()
         .find(|space| space.id == space_id)
         .and_then(|space| space.client_domain.clone())
+}
+
+/// Parse a thread workspace name (`thinkterm:<project-id>:<thread-id>`,
+/// optionally with a `:<remote-workspace>` suffix) back into its identity.
+/// Thread ids never contain `:`, project ids may (`::space::`).
+fn parse_thread_workspace_name(workspace: &str) -> Option<(String, String)> {
+    let rest = workspace.strip_prefix("thinkterm:")?;
+    let idx = rest.find(":thread-")?;
+    let project_id = &rest[..idx];
+    let thread_id = rest[idx + 1..].split(':').next()?;
+    if project_id.is_empty() {
+        return None;
+    }
+    Some((project_id.to_string(), thread_id.to_string()))
+}
+
+/// Rebuild sidebar records for live mux windows of this Space's client
+/// domain whose thread workspace has no local record. The remote mux server
+/// is the source of truth for a mux-domain Space: when the local store lost
+/// (or never had) the project/thread entries — a different Space identity
+/// for the same server, a reinstalled client, a lost store — the running
+/// remote terminals would otherwise be invisible and unreachable from the
+/// sidebar. Workspace names embed their identity, so the records can be
+/// reconstructed exactly. A project that exists in ANOTHER Space is left
+/// alone: its own Space already shows it.
+pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
+    let Some(domain_name) = client_domain_for_space(space_id) else {
+        return false;
+    };
+    let mux = Mux::get();
+    let Some(domain) = mux.get_domain_by_name(&domain_name) else {
+        return false;
+    };
+    let domain_id = domain.domain_id();
+
+    // Gather candidates outside the store lock.
+    let mut candidates: Vec<(String, String, String, Option<String>)> = Vec::new();
+    for window_id in mux.iter_windows() {
+        let Some(window) = mux.get_window(window_id) else {
+            continue;
+        };
+        if window.origin_domain() != Some(domain_id) {
+            continue;
+        }
+        let workspace = window.get_workspace().to_string();
+        let Some((project_id, thread_id)) = parse_thread_workspace_name(&workspace) else {
+            continue;
+        };
+        // Mux-domain "main" projects embed a Space id and are ensured by
+        // ensure_mux_domain_space; never duplicate them here.
+        if project_id.contains(REMOTE_PROJECT_SPACE_SEPARATOR) {
+            continue;
+        }
+        if candidates.iter().any(|(_, _, ws, _)| ws == &workspace) {
+            continue;
+        }
+        let cwd = window.iter().next().and_then(|tab| {
+            tab.iter_panes_ignoring_zoom().first().and_then(|pos| {
+                pos.pane
+                    .get_current_working_dir(mux::pane::CachePolicy::AllowStale)
+                    .map(|url| url.path().to_string())
+            })
+        });
+        candidates.push((project_id, thread_id, workspace, cwd));
+    }
+    if candidates.is_empty() {
+        return false;
+    }
+
+    let mut store = THREAD_STORE.lock();
+    let mut changed = false;
+    for (project_id, thread_id, workspace, cwd) in candidates {
+        let workspace_known = store.projects.iter().any(|project| {
+            project.threads.iter().any(|thread| {
+                thread.materialized_workspace_name.as_deref() == Some(workspace.as_str())
+                    || workspace_name_for_thread(&project.id, &thread.id) == workspace
+            })
+        });
+        if workspace_known {
+            continue;
+        }
+        match store
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        {
+            Some(project) => {
+                if project.space_id != space_id {
+                    continue;
+                }
+                let mut thread =
+                    WorkspaceThread::new(project_id, "main".to_string(), Some(workspace));
+                thread.id = thread_id;
+                project.threads.push(thread);
+                changed = true;
+            }
+            None => {
+                let path = cwd.filter(|p| !p.is_empty()).unwrap_or_else(|| "~".to_string());
+                let name = Path::new(&path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or("Recovered")
+                    .to_string();
+                let mut thread =
+                    WorkspaceThread::new(project_id.clone(), "main".to_string(), Some(workspace));
+                thread.id = thread_id.clone();
+                store.projects.push(Project {
+                    id: project_id,
+                    space_id: space_id.to_string(),
+                    name,
+                    path: PathBuf::from(path),
+                    threads: vec![thread],
+                    active_thread_id: Some(thread_id),
+                    threads_collapsed: false,
+                });
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        store.ensure_unique_thread_names();
+        persist_locked(&store);
+    }
+    changed
 }
 
 /// Create a project in a mux-domain Space. The path names a directory on the

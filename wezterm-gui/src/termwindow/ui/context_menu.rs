@@ -778,6 +778,7 @@ fn menu_icon(icon: &str) -> Option<SvgIcon> {
         "rectangle.split.2x1" => Some(SvgIcon::SplitHorizontal),
         "sidebar.leading" => Some(SvgIcon::PanelLeft),
         "square.and.pencil" => Some(SvgIcon::NotebookTabs),
+        "server" => Some(SvgIcon::Server),
         "square.stack" => Some(SvgIcon::SquareStack),
         "terminal" => Some(SvgIcon::Terminal),
         "trash" => Some(SvgIcon::Trash2),

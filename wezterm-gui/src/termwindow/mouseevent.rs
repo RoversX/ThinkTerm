@@ -2760,14 +2760,19 @@ impl super::TermWindow {
         let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
         let mut items = vec![];
         for space in &spaces {
+            let label = if space.is_occupied_by_other_window {
+                format!("{} (occupied)", space.name)
+            } else if space.is_remote {
+                format!("{} (Remote)", space.name)
+            } else {
+                space.name.clone()
+            };
             let mut item = ContextMenuItem::item_with_icon(
-                if space.is_occupied_by_other_window {
-                    format!("{} (occupied)", space.name)
-                } else {
-                    space.name.clone()
-                },
+                label,
                 if space.is_default {
                     "house"
+                } else if space.is_remote {
+                    "server"
                 } else {
                     "square.stack"
                 },
@@ -2800,8 +2805,15 @@ impl super::TermWindow {
             .find(|space| space.is_active)
             .map(|space| space.id.clone());
         let delete_item = |space: crate::workspace_threads::SpaceView| {
+            // Deleting a remote Space only detaches and removes the local
+            // records; the remote mux server and everything running in it
+            // are untouched. Label it accordingly.
             ContextMenuItem::item_with_icon(
-                format!("Delete \"{}\"", space.name),
+                if space.is_remote {
+                    format!("Disconnect & Remove \"{}\" (Local Only)", space.name)
+                } else {
+                    format!("Delete \"{}\"", space.name)
+                },
                 "trash",
                 KeyAssignment::DeleteSpace(space.id),
             )
