@@ -535,7 +535,14 @@ pub async fn run<
         let window_id = match window_id {
             Some(id) => id,
             None => {
-                window_builder = mux.new_empty_window(None, None);
+                // Mark the window as owned by this domain so that the GUI
+                // treats it like other domain-created windows (no saved
+                // workspace-thread restore may adopt it away): this window
+                // hosts things like auth prompts and reconnect progress,
+                // and re-pointing its GUI window elsewhere would leave the
+                // prompt invisible and block the connection forever.
+                window_builder =
+                    mux.new_empty_window_for_domain(None, None, Some(domain.domain_id()));
                 *window_builder
             }
         };

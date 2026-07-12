@@ -965,68 +965,6 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// GUI-level connection-health badge for mux client panes: while the
-    /// server has stopped responding (a reconnect is pending or running),
-    /// draw a pill at the pane's top-right, below the nav bar, instead of
-    /// writing into the terminal content. The periodic status update keeps
-    /// invalidating the window while any pane lags, so the counter is live.
-    fn paint_pane_connection_badge(
-        &mut self,
-        pos: &PositionedPane,
-        layers: &mut TripleLayerQuadAllocator,
-        nav_height: usize,
-    ) -> anyhow::Result<()> {
-        let Some(lag_ms) = client_pane_lag_ms(pos.pane.as_ref()) else {
-            return Ok(());
-        };
-
-        let (pane_x, pane_y) = self.pane_content_origin(pos)?;
-        let pane_width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
-
-        let ui_font = self
-            .fonts
-            .title_font_with_size(crate::native_settings::pane_header_font_size())
-            .context("connection badge font")?;
-        let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
-
-        let text = format!("Reconnecting… {}s", lag_ms / 1000);
-        let text_cell_w = ui_metrics.cell_size.width as usize;
-        let text_h = ui_metrics.cell_size.height as usize;
-        let text_w = wezterm_term::unicode_column_width(&text, None) * text_cell_w;
-
-        const PAD_X: usize = 10;
-        const PAD_Y: usize = 5;
-        const MARGIN: usize = 10;
-        let badge_w = (text_w + PAD_X * 2) as f32;
-        let badge_h = (text_h + PAD_Y * 2) as f32;
-        let badge_x = pane_x + pane_width - badge_w - MARGIN as f32;
-        let badge_y = pane_y + nav_height as f32 + MARGIN as f32;
-        if badge_x < pane_x {
-            // Pane too narrow for the badge; don't overdraw the neighbour.
-            return Ok(());
-        }
-
-        self.fill_rounded_rectangle(
-            layers,
-            1,
-            euclid::rect(badge_x, badge_y, badge_w, badge_h),
-            LinearRgba::with_srgba(0xc2, 0x6a, 0x1d, 0xe8),
-            (badge_h / 2.0).min(10.0),
-        )
-        .context("connection badge background")?;
-        self.paint_pane_nav_text(
-            layers,
-            &ui_font,
-            ui_metrics,
-            &text,
-            (badge_x as usize) + PAD_X,
-            (badge_y as usize) + PAD_Y,
-            text_w + text_cell_w,
-            LinearRgba::with_srgba(0xff, 0xff, 0xff, 0xff),
-        )?;
-        Ok(())
-    }
-
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
         let computed = self.build_pane(pos)?;
         let mut ui_items = computed.ui_items();
@@ -1245,8 +1183,6 @@ impl crate::TermWindow {
         let pane_nav_height = self
             .paint_pane_nav_bar(pos, layers, &palette)
             .context("paint_pane_nav_bar")?;
-        self.paint_pane_connection_badge(pos, layers, pane_nav_height)
-            .context("paint_pane_connection_badge")?;
         if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
             return Ok(());
         }

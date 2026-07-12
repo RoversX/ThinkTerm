@@ -487,6 +487,30 @@ pub fn claim_space_for_new_window(owner_id: u64) -> SpaceId {
     claim_initial_space_for_window(owner_id)
 }
 
+/// Claim a Space for a window the user did not explicitly open (domain-owned
+/// windows spawned by the reconcile, e.g. a reconnect/auth prompt window).
+/// Picks a free Space like [`claim_initial_space_for_window`] but never
+/// records it as the user's last active Space: these windows are incidental
+/// and must not affect which Space the next startup or Dock window restores.
+pub fn claim_space_for_incidental_window(owner_id: u64) -> SpaceId {
+    let occupied = WINDOW_SPACES
+        .lock()
+        .iter()
+        .filter_map(|(owner, space)| (*owner != owner_id).then(|| space.clone()))
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut store = THREAD_STORE.lock();
+    let changed = store.normalize_after_load();
+    let space_id = store.claim_available_space_id(&occupied);
+    if changed {
+        persist_locked(&store);
+    }
+    drop(store);
+
+    WINDOW_SPACES.lock().insert(owner_id, space_id.clone());
+    space_id
+}
+
 pub fn release_window_space(owner_id: u64) {
     WINDOW_SPACES.lock().remove(&owner_id);
 }

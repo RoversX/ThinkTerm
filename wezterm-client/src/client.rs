@@ -1122,7 +1122,9 @@ impl Client {
             // reused across reconnect cycles. It is closed by a successful
             // reattach or when we give up; creating one per cycle piles up
             // dead "Reconnecting..." tabs while the remote is unhealthy.
-            let mut windowed_ui: Option<ConnectionUI> = None;
+            // Paired with the workspace it was hosted in, so a Space switch
+            // that moves it off screen rebuilds it where the user is now.
+            let mut windowed_ui: Option<(ConnectionUI, String)> = None;
 
             'client: loop {
                 let session_started = std::time::Instant::now();
@@ -1162,7 +1164,7 @@ impl Client {
                     // back; detect that so we build a fresh one when needed.
                     if windowed_ui
                         .as_ref()
-                        .map_or(false, |ui| !ui.test_alive())
+                        .map_or(false, |(ui, _)| !ui.test_alive())
                     {
                         windowed_ui = None;
                     }
@@ -1177,9 +1179,7 @@ impl Client {
 
                     loop {
                         attempt += 1;
-                        let mut ui = if let Some(ui) = windowed_ui.clone() {
-                            ui
-                        } else if attempt <= 2 {
+                        let mut ui = if attempt <= 2 && windowed_ui.is_none() {
                             ConnectionUI::new_headless()
                         } else {
                             // Host the reconnect UI (and any auth prompts)
@@ -1195,9 +1195,10 @@ impl Client {
                                 // window would block the reconnect invisibly
                                 // forever. If this domain has no on-screen
                                 // window, fall back to a standalone window.
-                                let window_id = Mux::try_get().and_then(|mux| {
+                                let placement = Mux::try_get().map(|mux| {
                                     let workspace = mux.active_workspace();
-                                    mux.iter_windows_in_workspace(&workspace)
+                                    let window_id = mux
+                                        .iter_windows_in_workspace(&workspace)
                                         .into_iter()
                                         .find(|window_id| {
                                             mux.get_window(*window_id).map_or(false, |w| {
@@ -1210,23 +1211,44 @@ impl Client {
                                                     )
                                                 })
                                             })
-                                        })
+                                        });
+                                    (workspace, window_id)
                                 });
-                                window_tx.send(window_id).ok();
+                                window_tx.send(placement).ok();
                             })
                             .detach();
-                            let ui_window_id = window_rx
+                            let (active_workspace, ui_window_id) = window_rx
                                 .recv_timeout(Duration::from_secs(2))
                                 .ok()
-                                .flatten();
+                                .flatten()
+                                .unwrap_or_else(|| (String::new(), None));
 
-                            let ui = ConnectionUI::with_params(mux::connui::ConnectionUIParams {
-                                window_id: ui_window_id,
-                                ..Default::default()
-                            });
-                            ui.title("ThinkTerm: Reconnecting...");
-                            windowed_ui = Some(ui.clone());
-                            ui
+                            // The user may have switched Spaces since the
+                            // visible UI was created; a UI hosted in a
+                            // background workspace is off screen and its
+                            // prompts can never be answered. Rebuild it
+                            // where the user is now.
+                            if let Some((ui, hosted_ws)) = &windowed_ui {
+                                if !active_workspace.is_empty()
+                                    && hosted_ws != &active_workspace
+                                {
+                                    ui.close();
+                                    windowed_ui = None;
+                                }
+                            }
+
+                            if let Some((ui, _)) = &windowed_ui {
+                                ui.clone()
+                            } else {
+                                let ui =
+                                    ConnectionUI::with_params(mux::connui::ConnectionUIParams {
+                                        window_id: ui_window_id,
+                                        ..Default::default()
+                                    });
+                                ui.title("ThinkTerm: Reconnecting...");
+                                windowed_ui = Some((ui.clone(), active_workspace));
+                                ui
+                            }
                         };
 
                         if ui
@@ -1282,7 +1304,7 @@ impl Client {
 
             // Whatever ended the loop (cancelled by user, not
             // reconnectable), don't leave the reconnect tab behind.
-            if let Some(ui) = windowed_ui.take() {
+            if let Some((ui, _)) = windowed_ui.take() {
                 ui.close();
             }
 

@@ -46,6 +46,7 @@ const SESSION_STATUS_ICON_SIZE: usize = 20;
 const SESSION_STATUS_ACTIVE_ICON_SIZE: usize = 26;
 const SESSION_STATUS_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
 const SESSION_STATUS_OPEN_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
+const SPACE_DISCONNECTED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
 const SIDEBAR_SECTION_ACTION_SIZE: usize = 48;
 const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 6;
 
@@ -81,6 +82,10 @@ struct WorkspaceSidebarLayout {
     show_sidebar_toolbar: bool,
     space_menu_y: usize,
     space_menu_height: usize,
+    /// Height of the "Server disconnected" banner row shown below the Space
+    /// menu while a client-domain Space's server is unresponsive; 0 when
+    /// connected (the banner is absent and everything below moves up).
+    connection_banner_height: usize,
     top_action_y_offset: usize,
     top_action_height: usize,
     list_top: usize,
@@ -265,6 +270,32 @@ impl crate::TermWindow {
         }
     }
 
+    /// Whether the mux server behind a client-domain Space has stopped
+    /// responding (a reconnect is pending or running). While the Space is
+    /// remote we keep a slow self-driven repaint tick going: a dead
+    /// connection produces no output, so nothing else would repaint the
+    /// indicator when the state flips.
+    fn space_connection_lost(&self, space_id: &str) -> bool {
+        let Some(domain_name) = workspace_threads::client_domain_for_space(space_id) else {
+            return false;
+        };
+        self.update_next_frame_time(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ));
+        let mux = Mux::get();
+        let Some(domain) = mux.get_domain_by_name(&domain_name) else {
+            return false;
+        };
+        if domain.state() != mux::domain::DomainState::Attached {
+            return false;
+        }
+        let domain_id = domain.domain_id();
+        mux.iter_panes().iter().any(|pane| {
+            pane.domain_id() == domain_id
+                && crate::termwindow::render::pane::client_pane_lag_ms(pane.as_ref()).is_some()
+        })
+    }
+
     fn is_workspace_sidebar_thread_selected(
         &self,
         session: &workspace_threads::WorkspaceThreadView,
@@ -409,6 +440,14 @@ impl crate::TermWindow {
         let space_menu_y = y;
         let space_menu_height = top_action_height + 6;
         y += space_menu_height + SIDEBAR_INSET;
+        let connection_banner_height = if self.space_connection_lost(&self.active_space_id) {
+            ui_cell_height + SIDEBAR_INSET
+        } else {
+            0
+        };
+        if connection_banner_height > 0 {
+            y += connection_banner_height + SIDEBAR_INSET;
+        }
         let list_top = y + top_action_y_offset + top_action_height + SIDEBAR_INSET;
 
         WorkspaceSidebarLayout {
@@ -423,6 +462,7 @@ impl crate::TermWindow {
             show_sidebar_toolbar,
             space_menu_y,
             space_menu_height,
+            connection_banner_height,
             top_action_y_offset,
             top_action_height,
             list_top,
@@ -861,7 +901,52 @@ impl crate::TermWindow {
                 muted_fg
             },
         )?;
-        let y = space_menu_y + space_menu_height + SIDEBAR_INSET;
+        let mut y = space_menu_y + space_menu_height + SIDEBAR_INSET;
+        if layout.connection_banner_height > 0 {
+            let banner_x = item_x + SIDEBAR_INSET;
+            let banner_width = item_width.saturating_sub(SIDEBAR_INSET * 2);
+            let banner_height = layout.connection_banner_height;
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    banner_x as f32,
+                    y as f32,
+                    banner_width as f32,
+                    banner_height as f32,
+                ),
+                SPACE_DISCONNECTED_COLOR.mul_alpha(0.18),
+                SIDEBAR_ROW_RADIUS,
+            )
+            .context("sidebar connection banner")?;
+            let banner_icon_size = ui_cell_height.min(banner_height.saturating_sub(6));
+            let banner_icon_x = banner_x + SIDEBAR_INSET;
+            let banner_icon_y = y + ((banner_height.saturating_sub(banner_icon_size)) / 2);
+            self.paint_sidebar_icon(
+                layers,
+                SvgIcon::CircleAlert,
+                banner_icon_x,
+                banner_icon_y,
+                banner_icon_size,
+                SPACE_DISCONNECTED_COLOR,
+            )?;
+            let banner_text_x = banner_icon_x + banner_icon_size + SIDEBAR_ICON_GAP;
+            let banner_text_max =
+                (banner_x + banner_width).saturating_sub(banner_text_x + SIDEBAR_INSET);
+            let banner_label =
+                self.ellipsize_sidebar_text(&ui_font, "Server disconnected", banner_text_max)?;
+            self.paint_sidebar_text(
+                layers,
+                &ui_font,
+                ui_metrics,
+                banner_label.as_ref(),
+                banner_text_x,
+                y + ((banner_height.saturating_sub(ui_cell_height)) / 2),
+                banner_text_max,
+                SPACE_DISCONNECTED_COLOR,
+            )?;
+            y += banner_height + SIDEBAR_INSET;
+        }
         let top_action_x = item_x + SIDEBAR_INSET;
         let top_action_y = y + top_action_y_offset;
         let notification_action_size = top_action_height;

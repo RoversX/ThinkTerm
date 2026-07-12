@@ -950,10 +950,6 @@ pub struct TermWindow {
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
 
     last_status_call: Instant,
-    /// Whether the last status tick found a lagging client pane (the
-    /// "Reconnecting…" badge was drawn); used to repaint once more after
-    /// recovery so a stale badge doesn't linger on an idle pane.
-    connection_badge_was_visible: bool,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -1450,8 +1446,15 @@ impl TermWindow {
         let connection_name = Connection::get().unwrap().name();
         let (space_owner_id, active_space_id) = claimed_space.unwrap_or_else(|| {
             let space_owner_id = crate::workspace_threads::next_space_owner_id();
-            let active_space_id =
-                crate::workspace_threads::claim_initial_space_for_window(space_owner_id);
+            // Windows created without a saved-thread restore are incidental
+            // (domain-owned windows spawned by the reconcile, e.g. reconnect
+            // or auth prompt windows); claiming a Space for them must not
+            // overwrite the user's last-active-Space record.
+            let active_space_id = if restore_saved_thread {
+                crate::workspace_threads::claim_initial_space_for_window(space_owner_id)
+            } else {
+                crate::workspace_threads::claim_space_for_incidental_window(space_owner_id)
+            };
             (space_owner_id, active_space_id)
         });
         let workspace_layout_structure_fingerprint =
@@ -1544,7 +1547,6 @@ impl TermWindow {
                 &config,
             )),
             last_status_call: Instant::now(),
-            connection_badge_was_visible: false,
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
                 config.cursor_blink_ease_in,
@@ -2277,20 +2279,6 @@ impl TermWindow {
             TermWindowNotif::EmitStatusUpdate => {
                 self.emit_status_event();
                 self.refresh_all_thread_work();
-                // Drive the per-pane "Reconnecting…" badge: a lagging
-                // session produces no output, so nothing else would
-                // repaint it (or clear a stale badge after recovery).
-                let lagging = self
-                    .get_panes_to_render()
-                    .iter()
-                    .any(|pos| {
-                        crate::termwindow::render::pane::client_pane_lag_ms(pos.pane.as_ref())
-                            .is_some()
-                    });
-                if lagging || self.connection_badge_was_visible {
-                    window.invalidate();
-                }
-                self.connection_badge_was_visible = lagging;
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
