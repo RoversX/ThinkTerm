@@ -978,6 +978,10 @@ pub struct TermWindow {
     next_mosh_connect_generation: u64,
     space_owner_id: u64,
     active_space_id: String,
+    /// True for windows the user did not explicitly open (domain-owned
+    /// windows spawned by the reconcile, e.g. reconnect/auth prompts): they
+    /// close when their mux window dies instead of falling back to a thread.
+    dies_with_mux_window: bool,
     workspace_layout_structure_fingerprint: Option<u64>,
     workspace_sidebar_width: usize,
     workspace_sidebar_pending_thread_selection: Option<String>,
@@ -1444,6 +1448,7 @@ impl TermWindow {
         let render_state = None;
 
         let connection_name = Connection::get().unwrap().name();
+        let dies_with_mux_window = claimed_space.is_none() && !restore_saved_thread;
         let (space_owner_id, active_space_id) = claimed_space.unwrap_or_else(|| {
             let space_owner_id = crate::workspace_threads::next_space_owner_id();
             // Windows created without a saved-thread restore are incidental
@@ -1590,6 +1595,7 @@ impl TermWindow {
             next_mosh_connect_generation: 1,
             space_owner_id,
             active_space_id,
+            dies_with_mux_window,
             workspace_layout_structure_fingerprint,
             workspace_sidebar_width,
             workspace_sidebar_pending_thread_selection: None,
@@ -2375,6 +2381,40 @@ impl TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+    }
+
+    /// The mux window this GUI window displayed is gone (its last pane
+    /// exited, e.g. `exit` in a thread's only shell). Fall back to another
+    /// thread of the Space — or a fresh one — instead of dying with it,
+    /// which used to take the whole app down when this was the last window.
+    /// Incidental windows (reconnect/auth prompts) and remote mux Spaces
+    /// keep the close-with-the-mux-window behavior.
+    pub(crate) fn recover_from_dead_mux_window(&mut self) {
+        let mux = Mux::get();
+        if mux.get_window(self.mux_window_id).is_some() {
+            // Already re-pointed at a live mux window (a thread switch or
+            // Space delete raced the reconcile); nothing to recover.
+            return;
+        }
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let recovery_thread = if self.dies_with_mux_window
+            || crate::workspace_threads::client_domain_for_space(&self.active_space_id).is_some()
+        {
+            None
+        } else {
+            crate::workspace_threads::thread_to_recover_after_window_death(&self.active_space_id)
+        };
+        let Some(thread_id) = recovery_thread else {
+            window.close();
+            front_end().forget_known_window(&window);
+            return;
+        };
+        // The mux subscription cancelled itself when our mux window was
+        // removed; re-establish it for the window we are about to adopt.
+        self.subscribe_to_pane_updates();
+        self.activate_workspace_thread(thread_id, &window);
     }
 
     /// Switch THIS window to display the (already-live) workspace `workspace`,

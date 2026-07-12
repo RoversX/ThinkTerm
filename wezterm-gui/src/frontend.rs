@@ -1,5 +1,6 @@
 use crate::scripting::guiwin::GuiWin;
 use crate::spawn::SpawnWhere;
+use crate::termwindow::TermWindowNotif;
 use crate::TermWindow;
 use ::window::*;
 use anyhow::{anyhow, Context, Error};
@@ -387,15 +388,23 @@ impl GuiFrontEnd {
         //      workspace). Windows pinned to live mux windows in *other*
         //      workspaces are never touched.
 
-        // 1. Drop GUI windows whose mux window no longer exists.
+        // 1. Handle GUI windows whose mux window no longer exists: give the
+        //    TermWindow a chance to fall back to another thread of its Space
+        //    first. Closing it outright meant an `exit` in a thread's only
+        //    pane took the whole window down — and the app with it, when it
+        //    was the last window. The TermWindow either adopts a new mux
+        //    window (updating known_windows via rebind) or closes itself.
         let known_windows = std::mem::take(&mut *self.known_windows.borrow_mut());
         let mut windows = BTreeMap::new();
         for (window, window_id) in known_windows.into_iter() {
             if mux.get_window(window_id).is_some() {
                 windows.insert(window, window_id);
             } else {
-                window.close();
                 self.spawned_mux_window.borrow_mut().remove(&window_id);
+                window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                    term_window.recover_from_dead_mux_window();
+                })));
+                windows.insert(window, window_id);
             }
         }
         *self.known_windows.borrow_mut() = windows;

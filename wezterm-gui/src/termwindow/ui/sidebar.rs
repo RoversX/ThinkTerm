@@ -82,10 +82,6 @@ struct WorkspaceSidebarLayout {
     show_sidebar_toolbar: bool,
     space_menu_y: usize,
     space_menu_height: usize,
-    /// Height of the "Server disconnected" banner row shown below the Space
-    /// menu while a client-domain Space's server is unresponsive; 0 when
-    /// connected (the banner is absent and everything below moves up).
-    connection_banner_height: usize,
     top_action_y_offset: usize,
     top_action_height: usize,
     list_top: usize,
@@ -274,8 +270,11 @@ impl crate::TermWindow {
     /// responding (a reconnect is pending or running). While the Space is
     /// remote we keep a slow self-driven repaint tick going: a dead
     /// connection produces no output, so nothing else would repaint the
-    /// indicator when the state flips.
+    /// indicator when the state flips. Panes report tardy after ~3s of an
+    /// unanswered request, which ordinary latency spikes trip all the
+    /// time; require a longer sustained silence before alarming the user.
     fn space_connection_lost(&self, space_id: &str) -> bool {
+        const SUSTAINED_LAG_MS: u64 = 5000;
         let Some(domain_name) = workspace_threads::client_domain_for_space(space_id) else {
             return false;
         };
@@ -292,7 +291,8 @@ impl crate::TermWindow {
         let domain_id = domain.domain_id();
         mux.iter_panes().iter().any(|pane| {
             pane.domain_id() == domain_id
-                && crate::termwindow::render::pane::client_pane_lag_ms(pane.as_ref()).is_some()
+                && crate::termwindow::render::pane::client_pane_lag_ms(pane.as_ref())
+                    .map_or(false, |ms| ms >= SUSTAINED_LAG_MS)
         })
     }
 
@@ -440,14 +440,6 @@ impl crate::TermWindow {
         let space_menu_y = y;
         let space_menu_height = top_action_height + 6;
         y += space_menu_height + SIDEBAR_INSET;
-        let connection_banner_height = if self.space_connection_lost(&self.active_space_id) {
-            ui_cell_height + SIDEBAR_INSET
-        } else {
-            0
-        };
-        if connection_banner_height > 0 {
-            y += connection_banner_height + SIDEBAR_INSET;
-        }
         let list_top = y + top_action_y_offset + top_action_height + SIDEBAR_INSET;
 
         WorkspaceSidebarLayout {
@@ -462,7 +454,6 @@ impl crate::TermWindow {
             show_sidebar_toolbar,
             space_menu_y,
             space_menu_height,
-            connection_banner_height,
             top_action_y_offset,
             top_action_height,
             list_top,
@@ -867,17 +858,28 @@ impl crate::TermWindow {
             &space_title,
             space_text_right.saturating_sub(space_text_x),
         )?;
+        let (space_icon, space_icon_color) = if self.space_connection_lost(&self.active_space_id) {
+            // Swap the icon in place rather than adding text or a banner:
+            // the indicator must not change the row's width or height, so
+            // transient lag spikes can't make the sidebar layout jump.
+            (SvgIcon::CircleAlert, SPACE_DISCONNECTED_COLOR)
+        } else {
+            (
+                SvgIcon::Layers,
+                if space_menu_hovered {
+                    foreground
+                } else {
+                    muted_fg
+                },
+            )
+        };
         self.paint_sidebar_icon(
             layers,
-            SvgIcon::Layers,
+            space_icon,
             space_icon_x,
             space_icon_y,
             space_icon_size,
-            if space_menu_hovered {
-                foreground
-            } else {
-                muted_fg
-            },
+            space_icon_color,
         )?;
         self.paint_sidebar_text(
             layers,
@@ -901,52 +903,7 @@ impl crate::TermWindow {
                 muted_fg
             },
         )?;
-        let mut y = space_menu_y + space_menu_height + SIDEBAR_INSET;
-        if layout.connection_banner_height > 0 {
-            let banner_x = item_x + SIDEBAR_INSET;
-            let banner_width = item_width.saturating_sub(SIDEBAR_INSET * 2);
-            let banner_height = layout.connection_banner_height;
-            self.fill_rounded_rectangle(
-                layers,
-                1,
-                euclid::rect(
-                    banner_x as f32,
-                    y as f32,
-                    banner_width as f32,
-                    banner_height as f32,
-                ),
-                SPACE_DISCONNECTED_COLOR.mul_alpha(0.18),
-                SIDEBAR_ROW_RADIUS,
-            )
-            .context("sidebar connection banner")?;
-            let banner_icon_size = ui_cell_height.min(banner_height.saturating_sub(6));
-            let banner_icon_x = banner_x + SIDEBAR_INSET;
-            let banner_icon_y = y + ((banner_height.saturating_sub(banner_icon_size)) / 2);
-            self.paint_sidebar_icon(
-                layers,
-                SvgIcon::CircleAlert,
-                banner_icon_x,
-                banner_icon_y,
-                banner_icon_size,
-                SPACE_DISCONNECTED_COLOR,
-            )?;
-            let banner_text_x = banner_icon_x + banner_icon_size + SIDEBAR_ICON_GAP;
-            let banner_text_max =
-                (banner_x + banner_width).saturating_sub(banner_text_x + SIDEBAR_INSET);
-            let banner_label =
-                self.ellipsize_sidebar_text(&ui_font, "Server disconnected", banner_text_max)?;
-            self.paint_sidebar_text(
-                layers,
-                &ui_font,
-                ui_metrics,
-                banner_label.as_ref(),
-                banner_text_x,
-                y + ((banner_height.saturating_sub(ui_cell_height)) / 2),
-                banner_text_max,
-                SPACE_DISCONNECTED_COLOR,
-            )?;
-            y += banner_height + SIDEBAR_INSET;
-        }
+        let y = space_menu_y + space_menu_height + SIDEBAR_INSET;
         let top_action_x = item_x + SIDEBAR_INSET;
         let top_action_y = y + top_action_y_offset;
         let notification_action_size = top_action_height;

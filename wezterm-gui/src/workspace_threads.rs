@@ -798,6 +798,60 @@ pub fn create_thread(project_id: &str, name: Option<String>) -> WorkspaceThreadI
     thread_id
 }
 
+/// Pick the thread a GUI window should fall back to after the mux window
+/// showing its active thread died (e.g. `exit` in the thread's only pane):
+/// the most recently used OTHER thread of the Space, or a brand-new thread
+/// in the active project when no other thread is left. Returns None when
+/// the Space (or any project to create a thread in) no longer exists.
+pub fn thread_to_recover_after_window_death(space_id: &str) -> Option<WorkspaceThreadId> {
+    let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    if !store.has_space(space_id) {
+        return None;
+    }
+    let active_project_id = store.active_project_id_for_space(space_id);
+    let dead_thread_id = active_project_id
+        .as_ref()
+        .and_then(|project_id| store.projects.iter().find(|p| &p.id == project_id))
+        .and_then(|project| project.active_thread_id.clone());
+
+    let mut best: Option<(i64, WorkspaceThreadId)> = None;
+    for project in store.projects.iter().filter(|p| p.space_id == space_id) {
+        for thread in &project.threads {
+            if dead_thread_id.as_deref() == Some(thread.id.as_str()) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .map_or(true, |(ts, _)| thread.last_active_at > *ts)
+            {
+                best = Some((thread.last_active_at, thread.id.clone()));
+            }
+        }
+    }
+    if let Some((_, thread_id)) = best {
+        return Some(thread_id);
+    }
+
+    let project_id = active_project_id
+        .filter(|project_id| {
+            store
+                .projects
+                .iter()
+                .any(|p| p.space_id == space_id && &p.id == project_id)
+        })
+        .or_else(|| {
+            store
+                .projects
+                .iter()
+                .find(|p| p.space_id == space_id)
+                .map(|p| p.id.clone())
+        })?;
+    let thread_id = store.create_thread(&project_id, None);
+    persist_locked(&store);
+    Some(thread_id)
+}
+
 pub fn create_project_from_path(space_id: &str, path: &str) -> Result<WorkspaceThreadId> {
     let path = normalize_project_path(path)?;
     let mut store = THREAD_STORE.lock();

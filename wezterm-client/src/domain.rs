@@ -698,22 +698,20 @@ impl ClientDomain {
 
                 if let Some(local_window_id) = primary_window_id {
                     // Adopt the remote window into the local primary window
-                    // when the workspaces agree, or unconditionally when the
-                    // local window is claimed for this domain (a ThinkTerm
-                    // Space connect window): the claim carries the identity,
-                    // and the local workspace name (the Space thread) wins.
-                    let (workspace_matches, domain_owned, local_workspace) = {
+                    // only when the workspaces agree. Adopting on the
+                    // origin-domain claim alone used to grab whichever
+                    // remote window the server listed FIRST — typically the
+                    // server's own startup window, or another thread's
+                    // window — surfacing an unrelated old terminal as a tab
+                    // and renaming its workspace on the server, merging it
+                    // into the wrong thread for good.
+                    let workspace_matches = {
                         let window = mux
                             .get_window(local_window_id)
                             .expect("primary window to be valid");
-                        let local_workspace = window.get_workspace().to_string();
-                        (
-                            Some(local_workspace.as_str()) == workspace.as_deref(),
-                            window.origin_domain() == Some(inner.local_domain_id),
-                            local_workspace,
-                        )
+                        Some(window.get_workspace()) == workspace.as_deref()
                     };
-                    if workspace_matches || domain_owned {
+                    if workspace_matches {
                         // Yes! We can use this window
                         log::debug!(
                             "adding remote window {} as tab to local window {}",
@@ -726,27 +724,6 @@ impl ClientDomain {
                         );
                         mux.add_tab_to_window(&tab, local_window_id)?;
                         primary_window_id.take();
-                        if !workspace_matches {
-                            // Bring the server's workspace in line with the
-                            // local window's so that future attaches fold
-                            // this window by name as well.
-                            let inner = Arc::clone(&inner);
-                            promise::spawn::spawn(async move {
-                                let request = codec::SetWindowWorkspace {
-                                    window_id: remote_window_id,
-                                    workspace: local_workspace,
-                                };
-                                if let Err(err) =
-                                    inner.client.set_window_workspace(request).await
-                                {
-                                    log::error!(
-                                        "failed to align remote window {remote_window_id} \
-                                         workspace: {err:#}"
-                                    );
-                                }
-                            })
-                            .detach();
-                        }
                         continue;
                     }
                 }
@@ -968,7 +945,15 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let workspace = Mux::get().active_workspace();
+        // File the remote window under the workspace of the local window we
+        // are spawning into, NOT the globally active workspace: with several
+        // Spaces open the active workspace routinely belongs to a different
+        // (even local) thread, and a remote window misfiled under that name
+        // folds into the wrong window on every later attach.
+        let workspace = Mux::get()
+            .get_window(window)
+            .map(|w| w.get_workspace().to_string())
+            .unwrap_or_else(|| Mux::get().active_workspace());
 
         let result = inner
             .client

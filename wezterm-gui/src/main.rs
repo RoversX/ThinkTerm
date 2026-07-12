@@ -459,7 +459,7 @@ pub(crate) async fn connect_domain_into_space(
     let thread_workspace = workspace_threads::ensure_mux_thread_workspace(&plan);
     let window_id = {
         let builder = mux.new_empty_window_for_domain(
-            Some(thread_workspace),
+            Some(thread_workspace.clone()),
             None,
             Some(domain.domain_id()),
         );
@@ -508,9 +508,13 @@ pub(crate) async fn connect_domain_into_space(
         }
     }
 
-    // Mirror spawn_tab_in_domain_if_mux_is_empty's empty-server handling.
-    let no_workspace_filter = None;
-    if !have_panes_in_domain_and_ws(&domain, &no_workspace_filter) {
+    // Spawn the thread's first shell when its workspace has no panes on the
+    // server. Keying this off "does the domain have any panes at all" left
+    // the connect window empty whenever the server had unrelated windows
+    // (its own startup window, other threads) — the old blind window
+    // adoption papered over that by grabbing one of them as a tab.
+    let thread_workspace_filter = Some(thread_workspace);
+    if !have_panes_in_domain_and_ws(&domain, &thread_workspace_filter) {
         let _config_subscription = config::subscribe_to_config_reload(move || {
             promise::spawn::spawn_into_main_thread(async move {
                 if let Err(err) = update_mux_domains(&config::configuration()) {
