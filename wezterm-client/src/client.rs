@@ -1189,16 +1189,28 @@ impl Client {
                             // window over the frozen session.
                             let (window_tx, window_rx) = channel();
                             promise::spawn::spawn_into_main_thread(async move {
+                                // Only windows of the ACTIVE workspace are on
+                                // screen; hosting the reconnect UI (and its
+                                // auth prompts) in a background-workspace
+                                // window would block the reconnect invisibly
+                                // forever. If this domain has no on-screen
+                                // window, fall back to a standalone window.
                                 let window_id = Mux::try_get().and_then(|mux| {
-                                    mux.iter_windows().into_iter().find(|window_id| {
-                                        mux.get_window(*window_id).map_or(false, |w| {
-                                            w.iter().any(|tab| {
-                                                tab.iter_panes_ignoring_zoom().iter().any(|p| {
-                                                    p.pane.domain_id() == local_domain_id
+                                    let workspace = mux.active_workspace();
+                                    mux.iter_windows_in_workspace(&workspace)
+                                        .into_iter()
+                                        .find(|window_id| {
+                                            mux.get_window(*window_id).map_or(false, |w| {
+                                                w.iter().any(|tab| {
+                                                    tab.iter_panes_ignoring_zoom().iter().any(
+                                                        |p| {
+                                                            p.pane.domain_id()
+                                                                == local_domain_id
+                                                        },
+                                                    )
                                                 })
                                             })
                                         })
-                                    })
                                 });
                                 window_tx.send(window_id).ok();
                             })
