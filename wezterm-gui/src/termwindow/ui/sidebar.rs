@@ -628,6 +628,87 @@ impl crate::TermWindow {
         })
     }
 
+    /// The "Disconnected — Reconnect" row under the Space menu. Painted
+    /// twice per frame like the rest of the header: once in the normal
+    /// header pass, and once in the post-list header repaint that covers
+    /// scrolled content (which would otherwise mask it — everything in the
+    /// first pass sits below the header scroll mask).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_space_reconnect_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer: usize,
+        row_x: usize,
+        y: usize,
+        row_width: usize,
+        row_height: usize,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        ui_cell_height: usize,
+        register_ui_item: bool,
+    ) -> anyhow::Result<()> {
+        let reconnect_in_flight =
+            workspace_threads::client_domain_for_space(&self.active_space_id)
+                .map_or(false, |name| self.space_reconnects_in_flight.contains(&name));
+        let hovered = !reconnect_in_flight
+            && self.is_pointer_over_ui_rect(row_x, y, row_width, row_height);
+        self.fill_rounded_rectangle(
+            layers,
+            layer,
+            euclid::rect(row_x as f32, y as f32, row_width as f32, row_height as f32),
+            SPACE_DISCONNECTED_COLOR.mul_alpha(if hovered { 0.30 } else { 0.18 }),
+            SIDEBAR_ROW_RADIUS,
+        )
+        .context("sidebar reconnect row")?;
+        let row_icon_size = ui_cell_height.min(row_height.saturating_sub(6));
+        let row_icon_x = row_x + SIDEBAR_INSET;
+        let row_icon_y = y + ((row_height.saturating_sub(row_icon_size)) / 2);
+        self.paint_sidebar_icon(
+            layers,
+            if reconnect_in_flight {
+                SvgIcon::LoaderCircle
+            } else {
+                SvgIcon::RotateCcw
+            },
+            row_icon_x,
+            row_icon_y,
+            row_icon_size,
+            SPACE_DISCONNECTED_COLOR,
+        )?;
+        let row_text_x = row_icon_x + row_icon_size + SIDEBAR_ICON_GAP;
+        let row_text_max = (row_x + row_width).saturating_sub(row_text_x + SIDEBAR_INSET);
+        let row_label = self.ellipsize_sidebar_text(
+            ui_font,
+            if reconnect_in_flight {
+                "Connecting…"
+            } else {
+                "Disconnected — Reconnect"
+            },
+            row_text_max,
+        )?;
+        let row_label = row_label.into_owned();
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            &row_label,
+            row_text_x,
+            y + ((row_height.saturating_sub(ui_cell_height)) / 2),
+            row_text_max,
+            SPACE_DISCONNECTED_COLOR,
+        )?;
+        if register_ui_item && !reconnect_in_flight {
+            self.ui_items.push(UIItem {
+                x: row_x,
+                y,
+                width: row_width,
+                height: row_height,
+                item_type: UIItemType::SpaceReconnect,
+            });
+        }
+        Ok(())
+    }
+
     pub fn paint_workspace_sidebar(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -954,68 +1035,19 @@ impl crate::TermWindow {
         )?;
         let mut y = space_menu_y + space_menu_height + SIDEBAR_INSET;
         if layout.reconnect_row_height > 0 {
-            let row_x = item_x + SIDEBAR_INSET;
-            let row_width = item_width.saturating_sub(SIDEBAR_INSET * 2);
-            let row_height = layout.reconnect_row_height;
-            let reconnect_in_flight =
-                workspace_threads::client_domain_for_space(&self.active_space_id)
-                    .map_or(false, |name| self.space_reconnects_in_flight.contains(&name));
-            let hovered =
-                !reconnect_in_flight && self.is_pointer_over_ui_rect(row_x, y, row_width, row_height);
-            self.fill_rounded_rectangle(
+            self.paint_space_reconnect_row(
                 layers,
                 1,
-                euclid::rect(row_x as f32, y as f32, row_width as f32, row_height as f32),
-                SPACE_DISCONNECTED_COLOR.mul_alpha(if hovered { 0.30 } else { 0.18 }),
-                SIDEBAR_ROW_RADIUS,
-            )
-            .context("sidebar reconnect row")?;
-            let row_icon_size = ui_cell_height.min(row_height.saturating_sub(6));
-            let row_icon_x = row_x + SIDEBAR_INSET;
-            let row_icon_y = y + ((row_height.saturating_sub(row_icon_size)) / 2);
-            self.paint_sidebar_icon(
-                layers,
-                if reconnect_in_flight {
-                    SvgIcon::LoaderCircle
-                } else {
-                    SvgIcon::RotateCcw
-                },
-                row_icon_x,
-                row_icon_y,
-                row_icon_size,
-                SPACE_DISCONNECTED_COLOR,
-            )?;
-            let row_text_x = row_icon_x + row_icon_size + SIDEBAR_ICON_GAP;
-            let row_text_max = (row_x + row_width).saturating_sub(row_text_x + SIDEBAR_INSET);
-            let row_label = self.ellipsize_sidebar_text(
-                &ui_font,
-                if reconnect_in_flight {
-                    "Connecting…"
-                } else {
-                    "Disconnected — Reconnect"
-                },
-                row_text_max,
-            )?;
-            self.paint_sidebar_text(
-                layers,
+                item_x + SIDEBAR_INSET,
+                y,
+                item_width.saturating_sub(SIDEBAR_INSET * 2),
+                layout.reconnect_row_height,
                 &ui_font,
                 ui_metrics,
-                row_label.as_ref(),
-                row_text_x,
-                y + ((row_height.saturating_sub(ui_cell_height)) / 2),
-                row_text_max,
-                SPACE_DISCONNECTED_COLOR,
+                ui_cell_height,
+                true,
             )?;
-            if !reconnect_in_flight {
-                self.ui_items.push(UIItem {
-                    x: row_x,
-                    y,
-                    width: row_width,
-                    height: row_height,
-                    item_type: UIItemType::SpaceReconnect,
-                });
-            }
-            y += row_height + SIDEBAR_INSET;
+            y += layout.reconnect_row_height + SIDEBAR_INSET;
         }
         let top_action_x = item_x + SIDEBAR_INSET;
         let top_action_y = y + top_action_y_offset;
@@ -1805,15 +1837,11 @@ impl crate::TermWindow {
             }
             self.paint_sidebar_icon(
                 layers,
-                SvgIcon::Layers,
+                space_icon,
                 space_icon_x,
                 space_icon_y,
                 space_icon_size,
-                if space_menu_hovered {
-                    foreground
-                } else {
-                    muted_fg
-                },
+                space_icon_color,
             )?;
             self.paint_sidebar_text(
                 layers,
@@ -1837,6 +1865,20 @@ impl crate::TermWindow {
                     muted_fg
                 },
             )?;
+            if layout.reconnect_row_height > 0 {
+                self.paint_space_reconnect_row(
+                    layers,
+                    2,
+                    item_x + SIDEBAR_INSET,
+                    space_menu_y + space_menu_height + SIDEBAR_INSET,
+                    item_width.saturating_sub(SIDEBAR_INSET * 2),
+                    layout.reconnect_row_height,
+                    &ui_font,
+                    ui_metrics,
+                    ui_cell_height,
+                    false,
+                )?;
+            }
             let top_action_hovered = active_project_id.is_some()
                 && self.is_pointer_over_ui_rect(
                     top_action_x,
