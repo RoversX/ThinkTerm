@@ -38,7 +38,7 @@ case $OSTYPE in
     cp -r assets/shell-completion $zipdir/ThinkTerm.app/Contents/Resources
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
 
-    for bin in wezterm wezterm-mux-server wezterm-gui strip-ansi-escapes ; do
+    for bin in wezterm thinkterm wezterm-mux-server wezterm-gui strip-ansi-escapes ; do
       # If the user ran a simple `cargo build --release`, then we want to allow
       # a single-arch package to be built
       if [[ -f $TARGET_DIR/release/$bin ]] ; then

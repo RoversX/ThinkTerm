@@ -3026,6 +3026,30 @@ impl super::TermWindow {
             return false;
         };
 
+        // A ThinkTerm Connect host attaches the persistent remote mux domain
+        // in its dedicated Space — the same flow as `thinkterm connect
+        // <name>` — rather than opening a direct-ssh remote thread.
+        if spec.multiplexing && !spec.use_mosh {
+            let name = spec.label.clone();
+            promise::spawn::spawn(async move {
+                let domain = match Mux::get().get_domain_by_name(&name) {
+                    Some(domain) => domain,
+                    None => match crate::connect_domain_from_ssh_host(&name) {
+                        Ok(domain) => domain,
+                        Err(err) => {
+                            log::error!("connect {name}: {err:#}");
+                            return;
+                        }
+                    },
+                };
+                if let Err(err) = crate::connect_domain_into_space(None, domain).await {
+                    log::error!("connect {name}: {err:#}");
+                }
+            })
+            .detach();
+            return true;
+        }
+
         self.snapshot_active_workspace_thread_layout();
         let use_mosh = spec.use_mosh;
         let thread_id = crate::workspace_threads::create_disconnected_remote_host_thread(

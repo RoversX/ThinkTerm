@@ -33,3 +33,9 @@ Why: I can't afford Apple's developer certificate ($99/year), so macOS may block
 - The package script uses the binaries from `target/release/`.
 - The macOS app template lives in `assets/macos/ThinkTerm.app`.
 - Change `TAG_NAME` for each release version.
+- The `thinkterm` CLI ships inside the app bundle. To use it from a shell,
+  symlink it onto your PATH:
+
+  ```bash
+  sudo ln -s /Applications/ThinkTerm.app/Contents/MacOS/thinkterm /usr/local/bin/thinkterm
+  ```

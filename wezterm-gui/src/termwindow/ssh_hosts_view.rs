@@ -72,6 +72,7 @@ enum SshViewAction {
     FocusField(usize),
     ToggleDetect,
     ToggleMosh,
+    ToggleMux,
     Save,
     SaveAndConnect,
     Cancel,
@@ -92,6 +93,7 @@ struct HostForm {
     fields: [String; FIELD_COUNT],
     detect_os: bool,
     use_mosh: bool,
+    multiplexing: bool,
     error: Option<String>,
 }
 
@@ -215,12 +217,14 @@ impl SshHostsView {
         fields[FIELD_MOSH_SERVER] = spec.mosh_server_command.clone();
         let detect_os = spec.detect_os;
         let use_mosh = spec.use_mosh;
+        let multiplexing = spec.multiplexing;
         self.form = Some(HostForm {
             editing: Some(project_id.to_string()),
             original: Some(spec),
             fields,
             detect_os,
             use_mosh,
+            multiplexing,
             error: None,
         });
         self.focus = Focus::Field(FIELD_HOST);
@@ -292,6 +296,7 @@ impl SshHostsView {
         spec.default_workspace = opt(&form.fields[FIELD_WORKSPACE]);
         spec.detect_os = form.detect_os;
         spec.use_mosh = form.use_mosh;
+        spec.multiplexing = form.multiplexing;
         let mosh_server_command = form.fields[FIELD_MOSH_SERVER].trim();
         if spec.use_mosh && mosh_server_command.is_empty() {
             form.error = Some("Mosh server command is required".to_string());
@@ -443,12 +448,29 @@ impl SshHostsView {
             SshViewAction::ToggleMosh => {
                 if let Some(form) = self.form.as_mut() {
                     form.use_mosh = !form.use_mosh;
+                    if form.use_mosh {
+                        // Mosh and ThinkTerm Connect are alternative
+                        // transports; only one can drive the connection.
+                        form.multiplexing = false;
+                    }
                     if form.use_mosh && form.fields[FIELD_MOSH_SERVER].trim().is_empty() {
                         form.fields[FIELD_MOSH_SERVER] =
                             ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string();
                     }
                     if !form.use_mosh && self.focus == Focus::Field(FIELD_MOSH_SERVER) {
                         self.focus = Focus::Field(FIELD_WORKSPACE);
+                    }
+                }
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::ToggleMux => {
+                if let Some(form) = self.form.as_mut() {
+                    form.multiplexing = !form.multiplexing;
+                    if form.multiplexing {
+                        form.use_mosh = false;
+                        if self.focus == Focus::Field(FIELD_MOSH_SERVER) {
+                            self.focus = Focus::Field(FIELD_WORKSPACE);
+                        }
                     }
                 }
                 ContentViewResponse::Redraw
@@ -1228,6 +1250,8 @@ impl SshHostsView {
             let user = spec.username.as_deref().unwrap_or("");
             let source = if spec.use_mosh {
                 "mosh"
+            } else if spec.multiplexing {
+                "thinkterm connect"
             } else {
                 match entry.source {
                     SshHostSource::ThinkTerm => "ssh",
@@ -1301,6 +1325,7 @@ impl SshHostsView {
         let editing = form.editing.is_some();
         let detect_os = form.detect_os;
         let use_mosh = form.use_mosh;
+        let multiplexing = form.multiplexing;
         let fields = form.fields.clone();
         let error = form.error.clone();
         let focus = self.focus;
@@ -1429,6 +1454,29 @@ impl SshHostsView {
             )?;
             cur_y += INPUT_H + 24.0;
         }
+
+        // ThinkTerm-Connect toggle: attach the persistent remote mux domain
+        // (`thinkterm connect`) instead of a direct SSH session. Requires a
+        // thinkterm/wezterm binary on the remote host.
+        ctx.draw_text(
+            layers,
+            font,
+            x,
+            cur_y + (toggle_h - line_h) / 2.0,
+            "ThinkTerm Connect (persistent mux)",
+            palette.text,
+            field_w - toggle_w - 12.0,
+        )?;
+        draw_toggle(
+            ctx,
+            layers,
+            &mut self.widgets,
+            palette,
+            rect(x + field_w - toggle_w, cur_y, toggle_w, toggle_h),
+            multiplexing,
+            SshViewAction::ToggleMux,
+        )?;
+        cur_y += toggle_h + 24.0;
 
         if let Some(err) = &error {
             ctx.draw_text(

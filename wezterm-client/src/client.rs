@@ -704,7 +704,7 @@ impl Reconnectable {
                 self.unix_connect(unix_dom, initial, ui, no_auto_start)
             }
             ClientDomainConfig::Tls(tls) => self.tls_connect(tls, initial, ui),
-            ClientDomainConfig::Ssh(ssh) => self.ssh_connect(ssh, initial, ui),
+            ClientDomainConfig::Ssh(ssh) => self.ssh_connect(ssh, initial, ui, no_auto_start),
         }
     }
 
@@ -735,6 +735,7 @@ impl Reconnectable {
         ssh_dom: SshDomain,
         initial: bool,
         ui: &mut ConnectionUI,
+        no_auto_start: bool,
     ) -> anyhow::Result<()> {
         let ssh_config = mux::ssh::ssh_domain_to_ssh_config(&ssh_dom)?;
 
@@ -742,7 +743,7 @@ impl Reconnectable {
             ssh_connect_with_ui_and_password(ssh_config, ui, ssh_dom.stored_password.clone())?;
         let cmd = if let Some(cmd) = ssh_dom.override_proxy_command.clone() {
             cmd
-        } else if initial {
+        } else if initial || !no_auto_start {
             Self::remote_mux_command(&ssh_dom.remote_wezterm_path, "cli --prefer-mux proxy")
         } else {
             Self::remote_mux_command(
@@ -1104,9 +1105,27 @@ impl Client {
         thread::spawn(move || {
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
             const MAX_INTERVAL: Duration = Duration::from_secs(10);
+            // A connection that dies this quickly after a "successful"
+            // connect never really worked. The classic shape is the ssh hop
+            // coming up while the remote mux server is gone (the host
+            // rebooted): the proxy spawns fine and then exits on its first
+            // read, so connect() reports success and the session dies within
+            // a second.
+            const SHORT_SESSION: Duration = Duration::from_secs(15);
 
             let mut backoff = BASE_INTERVAL;
+            // Consecutive sessions that died within SHORT_SESSION of
+            // connecting. Only established-then-dead sessions count; a
+            // connect() that fails outright (network still down) does not.
+            let mut short_sessions = 0usize;
+            // One visible reconnect tab for the lifetime of this client,
+            // reused across reconnect cycles. It is closed by a successful
+            // reattach or when we give up; creating one per cycle piles up
+            // dead "Reconnecting..." tabs while the remote is unhealthy.
+            let mut windowed_ui: Option<ConnectionUI> = None;
+
             'client: loop {
+                let session_started = std::time::Instant::now();
                 if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
                     if !reconnectable.reconnectable() || local_domain_id.is_none() {
                         log::debug!("client thread ended: {}", e);
@@ -1130,21 +1149,38 @@ impl Client {
                         break;
                     }
 
+                    if session_started.elapsed() >= SHORT_SESSION {
+                        // The previous connection genuinely worked; restart
+                        // the retry schedule from scratch.
+                        short_sessions = 0;
+                        backoff = BASE_INTERVAL;
+                    } else {
+                        short_sessions += 1;
+                    }
+
+                    // A successful reattach closes the shared tab behind our
+                    // back; detect that so we build a fresh one when needed.
+                    if windowed_ui
+                        .as_ref()
+                        .map_or(false, |ui| !ui.test_alive())
+                    {
+                        windowed_ui = None;
+                    }
+
                     // The first couple of attempts run headless: with key
                     // auth or a stored password the reconnect is completely
                     // silent and the user just sees the pane resume. Only
                     // if we still can't get back (interactive auth needed,
                     // or a longer outage) do we escalate to a visible UI
                     // tab hosted in a window of this domain.
-                    let mut windowed_ui: Option<ConnectionUI> = None;
                     let mut attempt = 0usize;
 
                     loop {
                         attempt += 1;
-                        let mut ui = if attempt <= 2 {
-                            ConnectionUI::new_headless()
-                        } else if let Some(ui) = windowed_ui.clone() {
+                        let mut ui = if let Some(ui) = windowed_ui.clone() {
                             ui
+                        } else if attempt <= 2 {
+                            ConnectionUI::new_headless()
                         } else {
                             // Host the reconnect UI (and any auth prompts)
                             // as a tab inside a window that already shows
@@ -1194,13 +1230,25 @@ impl Client {
                             break 'client;
                         }
                         let initial = false;
-                        let no_auto_start = true; // Don't auto-start on a reconnect
+                        // Normally a reconnect must not auto-start a server:
+                        // during a network blip the server is alive and would
+                        // be fought by a second instance. But when freshly
+                        // established sessions keep dying instantly, the ssh
+                        // hop is fine and it is the remote mux server that is
+                        // gone (e.g. the host rebooted); refusing auto-start
+                        // then loops forever without ever converging. Let the
+                        // proxy revive the server after a couple of instant
+                        // deaths — it still only spawns one if connecting to
+                        // the existing socket fails.
+                        let no_auto_start = short_sessions < 2;
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {
                             Ok(_) => {
-                                backoff = BASE_INTERVAL;
                                 log::error!("Reconnected!");
+                                let reattach_ui = ui.clone();
                                 promise::spawn::spawn_into_main_thread(async move {
-                                    ClientDomain::reattach(local_domain_id, ui).await.ok();
+                                    ClientDomain::reattach(local_domain_id, reattach_ui)
+                                        .await
+                                        .ok();
                                 })
                                 .detach();
                                 break;
@@ -1218,6 +1266,12 @@ impl Client {
                     log::error!("client_thread returned without any error condition");
                     break;
                 }
+            }
+
+            // Whatever ended the loop (cancelled by user, not
+            // reconnectable), don't leave the reconnect tab behind.
+            if let Some(ui) = windowed_ui.take() {
+                ui.close();
             }
 
             async fn detach(local_domain_id: DomainId) -> anyhow::Result<()> {

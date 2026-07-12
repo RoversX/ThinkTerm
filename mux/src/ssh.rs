@@ -64,16 +64,20 @@ pub fn ssh_connect_with_ui(
     ssh_connect_with_ui_and_password(ssh_config, ui, None)
 }
 
-/// Like [`ssh_connect_with_ui`], but auto-answers the first password
-/// (non-echo) auth prompt with a stored password, if any. Only once: a
-/// wrong stored password then falls back to interactive entry.
+/// Like [`ssh_connect_with_ui`], but auto-answers password (non-echo) auth
+/// prompts with a stored password, if any. At most twice: servers commonly
+/// issue a second prompt (e.g. `password` then `keyboard-interactive`, or a
+/// retry), and a single-shot answer left the second one to an interactive
+/// prompt that a headless reconnect cannot serve. A wrong stored password
+/// still falls back to interactive entry after those attempts.
 pub fn ssh_connect_with_ui_and_password(
     ssh_config: wezterm_ssh::ConfigMap,
     ui: &mut ConnectionUI,
-    mut password: Option<String>,
+    password: Option<String>,
 ) -> anyhow::Result<Session> {
     let cloned_ui = ui.clone();
     cloned_ui.run_and_log_error(move || {
+        let mut password_answers_left = if password.is_some() { 2usize } else { 0 };
         let remote_address = ssh_config
             .get("hostname")
             .expect("ssh config to always set hostname");
@@ -115,9 +119,10 @@ pub fn ssh_connect_with_ui_and_password(
                         }
                         let res = if prompt.echo {
                             ui.input(editor_prompt)
-                        } else if let Some(stored) = password.take() {
+                        } else if password_answers_left > 0 {
+                            password_answers_left -= 1;
                             ui.output_str(&format!("{editor_prompt} (using stored password)\n"));
-                            Ok(stored)
+                            Ok(password.clone().expect("password present when answers remain"))
                         } else {
                             ui.password(editor_prompt)
                         };

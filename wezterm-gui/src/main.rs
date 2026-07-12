@@ -377,7 +377,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 /// multiplexing client domain built from that host, including its stored
 /// credentials, so hosts added in the UI are connectable (and reconnect
 /// silently) without a lua ssh_domains entry.
-fn connect_domain_from_ssh_host(name: &str) -> anyhow::Result<Arc<dyn Domain>> {
+pub(crate) fn connect_domain_from_ssh_host(name: &str) -> anyhow::Result<Arc<dyn Domain>> {
     let entry = crate::ssh_hosts::list_all_hosts()
         .into_iter()
         .find(|entry| entry.spec.label == name || entry.id == name)
@@ -398,7 +398,7 @@ fn connect_domain_from_ssh_host(name: &str) -> anyhow::Result<Arc<dyn Domain>> {
     Ok(domain)
 }
 
-async fn connect_domain_into_space(
+pub(crate) async fn connect_domain_into_space(
     cmd: Option<CommandBuilder>,
     domain: Arc<dyn Domain>,
 ) -> anyhow::Result<()> {
