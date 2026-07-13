@@ -4183,30 +4183,23 @@ impl TermWindow {
                 }
             }
 
-            let mut description =
-                format!("Add a project on {domain_name}: enter a remote directory path");
-            if !candidates.is_empty() {
-                description.push_str("\nKnown remote directories:");
-                for (idx, path) in candidates.iter().enumerate() {
-                    description.push_str(&format!("\n  {}. {}", idx + 1, path));
-                }
-                description.push_str("\nType a number to pick one, or type a path.");
+            if !candidates.iter().any(|c| c == "~") {
+                candidates.push("~".to_string());
             }
 
+            let description = format!(
+                "Add a project on {domain_name}: pick a remote directory below,\n\
+                 type to filter, or type a path (~/dir or /dir)."
+            );
+
             let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
-                let line = crate::overlay::prompt::read_line_prompt_overlay(
+                let picked = crate::overlay::prompt::pick_path_prompt_overlay(
                     term,
                     &description,
                     "path> ",
-                    Some("~/"),
+                    candidates,
                 )?;
-                if let Some(input) = line.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-                {
-                    let path = input
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|n| candidates.get(n.checked_sub(1)?).cloned())
-                        .unwrap_or(input);
+                if let Some(path) = picked.filter(|path| !path.is_empty()) {
                     window.notify(TermWindowNotif::OpenProjectPath(PathBuf::from(path)));
                 }
                 Ok(())
