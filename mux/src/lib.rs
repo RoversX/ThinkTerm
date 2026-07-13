@@ -1345,9 +1345,6 @@ impl Mux {
             .get_tab(tab_id)
             .ok_or_else(|| anyhow!("tab_id {} invalid", tab_id))?;
 
-        if tab.get_zoomed_pane().is_some() {
-            anyhow::bail!("cannot create pane tab while zoomed");
-        }
         if tab.pane_index_for_pane(pane_id).is_none() {
             anyhow::bail!("pane_id {} is not in tab {}", pane_id, tab_id);
         }

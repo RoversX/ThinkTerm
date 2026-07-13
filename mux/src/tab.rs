@@ -2786,10 +2786,6 @@ impl TabInner {
         base_pane_id: PaneId,
         pane: Arc<dyn Pane>,
     ) -> anyhow::Result<usize> {
-        if self.zoomed.is_some() {
-            anyhow::bail!("cannot create pane tab while zoomed");
-        }
-
         let prior = self.get_active_pane();
         let mut cursor = self.pane.take().unwrap().cursor();
         let mut pane_index = 0;
@@ -2832,6 +2828,19 @@ impl TabInner {
 
         self.active = pane_index;
         self.recency.tag(pane_index);
+
+        // If the stack is zoomed, hand the zoom to the newly added pane so
+        // it becomes the fullscreen level-2 tab, mirroring what
+        // activate_zoomed_pane_in_stack does for tab switches.
+        if let Some(prior_zoomed) = self.zoomed.take() {
+            prior_zoomed.set_zoomed(false);
+            pane.set_zoomed(true);
+            if let Err(err) = pane.resize(self.size) {
+                log::error!("failed to resize zoomed pane: {err:#}");
+            }
+            self.zoomed.replace(pane);
+        }
+
         self.advise_focus_change(prior);
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
 
@@ -3669,9 +3678,11 @@ mod test {
 
         tab.set_zoomed(true);
         assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 103);
-        assert!(tab
-            .add_pane_to_stack(100, FakePane::new(104, size))
-            .is_err());
+        // Adding a level-2 tab while zoomed hands the zoom to the new pane
+        tab.add_pane_to_stack(100, FakePane::new(104, size))
+            .unwrap();
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 104);
+        assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 104);
         tab.activate_pane_in_stack(100).unwrap();
         assert_eq!(tab.get_active_pane().unwrap().pane_id(), 100);
         assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 100);

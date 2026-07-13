@@ -3609,11 +3609,6 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
         let Some((project_id, thread_id)) = parse_thread_workspace_name(&workspace) else {
             continue;
         };
-        // Mux-domain "main" projects embed a Space id and are ensured by
-        // ensure_mux_domain_space; never duplicate them here.
-        if project_id.contains(REMOTE_PROJECT_SPACE_SEPARATOR) {
-            continue;
-        }
         if candidates.iter().any(|(_, _, ws, _)| ws == &workspace) {
             continue;
         }
@@ -3629,6 +3624,8 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
     if candidates.is_empty() {
         return false;
     }
+
+    let mux_project_id = remote_project_id_for_space(space_id, &mux_domain_host_id(&domain_name));
 
     let mut store = THREAD_STORE.lock();
     let mut changed = false;
@@ -3654,6 +3651,45 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                 let mut thread =
                     WorkspaceThread::new(project_id, "main".to_string(), Some(workspace));
                 thread.id = thread_id;
+                project.threads.push(thread);
+                changed = true;
+            }
+            // Mux-domain workspace names embed a Space id. When that identity
+            // no longer matches any local project (the Space was recreated,
+            // the store was lost, the domain was relabelled), the session
+            // would otherwise keep running invisibly on the server forever.
+            // Re-home it as a thread of THIS Space's mux-domain project; the
+            // materialized workspace name keeps routing to the live remote
+            // workspace.
+            None if project_id.contains(REMOTE_PROJECT_SPACE_SEPARATOR) => {
+                let thread_id_taken = store
+                    .projects
+                    .iter()
+                    .any(|project| project.threads.iter().any(|thread| thread.id == thread_id));
+                if !store.projects.iter().any(|project| project.id == mux_project_id) {
+                    store.projects.push(Project {
+                        id: mux_project_id.clone(),
+                        space_id: space_id.to_string(),
+                        name: domain_name.clone(),
+                        path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
+                        threads: vec![],
+                        active_thread_id: None,
+                        threads_collapsed: false,
+                    });
+                }
+                let project = store
+                    .projects
+                    .iter_mut()
+                    .find(|project| project.id == mux_project_id)
+                    .expect("mux domain project was just ensured");
+                let mut thread = WorkspaceThread::new(
+                    mux_project_id.clone(),
+                    "main".to_string(),
+                    Some(workspace),
+                );
+                if !thread_id_taken {
+                    thread.id = thread_id;
+                }
                 project.threads.push(thread);
                 changed = true;
             }

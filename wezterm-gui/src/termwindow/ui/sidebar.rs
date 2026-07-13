@@ -682,7 +682,7 @@ impl crate::TermWindow {
             if reconnect_in_flight {
                 "Connecting…"
             } else {
-                "Disconnected — Reconnect"
+                "Reconnect"
             },
             row_text_max,
         )?;
