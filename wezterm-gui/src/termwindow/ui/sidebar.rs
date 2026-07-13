@@ -55,6 +55,9 @@ const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpaceConnectionState {
     Connected,
+    /// An attach is in flight (initial connect or manual re-attach); not an
+    /// error state, so no alert icon and no Reconnect button.
+    Connecting,
     /// Transport lost; the automatic retry loop is running.
     Reconnecting,
     /// Not connected and nothing is retrying (retry loop parked after
@@ -301,6 +304,13 @@ impl crate::TermWindow {
             return SpaceConnectionState::Disconnected;
         };
         if let Some(client) = domain.downcast_ref::<wezterm_client::domain::ClientDomain>() {
+            // First connect (or manual re-attach) in progress: state() reads
+            // Detached until finish_attach, which used to surface as
+            // "Disconnected" with a Reconnect button while actively
+            // connecting.
+            if client.is_attaching() {
+                return SpaceConnectionState::Connecting;
+            }
             // The retry loop parked itself after two minutes of failures;
             // it waits for the sidebar Reconnect button.
             if client.is_reconnect_suspended() {
@@ -987,21 +997,29 @@ impl crate::TermWindow {
             space_text_right.saturating_sub(space_text_x),
         )?;
         let connection_state = self.space_connection_state(&self.active_space_id);
-        let (space_icon, space_icon_color) = if connection_state != SpaceConnectionState::Connected
-        {
-            // Swap the icon in place rather than adding text: the indicator
-            // must not change the row's width or height, so transient lag
-            // spikes can't make the sidebar layout jump.
-            (SvgIcon::CircleAlert, SPACE_DISCONNECTED_COLOR)
-        } else {
-            (
+        // Swap the icon in place rather than adding text: the indicator
+        // must not change the row's width or height, so transient lag
+        // spikes can't make the sidebar layout jump.
+        let (space_icon, space_icon_color) = match connection_state {
+            SpaceConnectionState::Reconnecting | SpaceConnectionState::Disconnected => {
+                (SvgIcon::CircleAlert, SPACE_DISCONNECTED_COLOR)
+            }
+            SpaceConnectionState::Connecting => (
+                SvgIcon::LoaderCircle,
+                if space_menu_hovered {
+                    foreground
+                } else {
+                    muted_fg
+                },
+            ),
+            SpaceConnectionState::Connected => (
                 SvgIcon::Layers,
                 if space_menu_hovered {
                     foreground
                 } else {
                     muted_fg
                 },
-            )
+            ),
         };
         self.paint_sidebar_icon(
             layers,

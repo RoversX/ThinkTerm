@@ -477,6 +477,12 @@ impl ClientDomain {
         }
     }
 
+    /// An attach is in flight (initial connect or a manual re-attach);
+    /// state() still reads Detached until it completes.
+    pub fn is_attaching(&self) -> bool {
+        self.attaching.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn perform_detach(&self) {
         log::info!("detached domain {}", self.local_domain_id);
         self.inner.lock().unwrap().take();
