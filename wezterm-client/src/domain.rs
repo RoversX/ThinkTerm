@@ -35,6 +35,47 @@ pub struct ClientInner {
     /// stale PaneFocused echoes that would otherwise yank the active tab
     /// and stack away from a newer local selection.
     pub focus_advised_at: Mutex<Option<std::time::Instant>>,
+    /// Number of structure-mutating RPCs (spawn/split/stack-tab/move) in
+    /// flight. Their responses install the remote<->local mappings; a resync
+    /// racing them (the server broadcasts TabAddedToWindow/TabResized while
+    /// handling the request) sees the new remote window/tab/pane as unmapped
+    /// and materializes a duplicate local mirror of the same remote pane.
+    mutations_in_flight: std::sync::atomic::AtomicUsize,
+    /// A resync arrived while a mutation was in flight; run one when the
+    /// last mutation completes.
+    resync_deferred: std::sync::atomic::AtomicBool,
+}
+
+/// RAII scope for a structure-mutating RPC; defers resyncs for its lifetime
+/// and schedules the catch-up resync when the last in-flight mutation ends.
+pub(crate) struct StructureMutationGuard {
+    inner: Arc<ClientInner>,
+}
+
+impl Drop for StructureMutationGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.inner.mutations_in_flight.fetch_sub(1, Ordering::SeqCst) == 1
+            && self.inner.resync_deferred.swap(false, Ordering::SeqCst)
+        {
+            let domain_id = self.inner.local_domain_id;
+            promise::spawn::spawn_into_main_thread(async move {
+                let Some(mux) = Mux::try_get() else {
+                    return;
+                };
+                let Some(domain) = mux.get_domain(domain_id) else {
+                    return;
+                };
+                let Some(domain) = domain.downcast_ref::<ClientDomain>() else {
+                    return;
+                };
+                if let Err(err) = domain.resync().await {
+                    log::error!("deferred resync for domain {domain_id}: {err:#}");
+                }
+            })
+            .detach();
+        }
+    }
 }
 
 impl ClientInner {
@@ -281,7 +322,30 @@ impl ClientInner {
             remote_to_local_stack: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
             focus_advised_at: Mutex::new(None),
+            mutations_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            resync_deferred: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+}
+
+impl ClientInner {
+    fn begin_structure_mutation(self: &Arc<Self>) -> StructureMutationGuard {
+        self.mutations_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        StructureMutationGuard {
+            inner: Arc::clone(self),
+        }
+    }
+
+    fn structure_mutation_in_flight(&self) -> bool {
+        self.mutations_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+    }
+
+    fn defer_resync(&self) {
+        self.resync_deferred
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -542,7 +606,21 @@ impl ClientDomain {
 
     pub async fn resync(&self) -> anyhow::Result<()> {
         if let Some(inner) = self.inner() {
+            // A spawn/split response is about to install the mappings for
+            // the very structures this resync would otherwise see as
+            // unmapped (and duplicate). Defer; the mutation's guard runs a
+            // catch-up resync when it completes. Checked again after the
+            // round-trip because a mutation may have started while the
+            // ListPanes request was in flight.
+            if inner.structure_mutation_in_flight() {
+                inner.defer_resync();
+                return Ok(());
+            }
             let panes = inner.client.list_panes().await?;
+            if inner.structure_mutation_in_flight() {
+                inner.defer_resync();
+                return Ok(());
+            }
             Self::process_pane_list(inner, panes, None)?;
         }
         Ok(())
@@ -894,6 +972,7 @@ impl Domain for ClientDomain {
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let _mutation = inner.begin_structure_mutation();
 
         let mux = Mux::get();
         let local_pane = mux
@@ -937,6 +1016,7 @@ impl Domain for ClientDomain {
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let _mutation = inner.begin_structure_mutation();
 
         let local_pane = Mux::get()
             .get_pane(pane_id)
@@ -989,6 +1069,7 @@ impl Domain for ClientDomain {
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let _mutation = inner.begin_structure_mutation();
 
         // File the remote window under the workspace of the local window we
         // are spawning into, NOT the globally active workspace: with several
@@ -1043,6 +1124,7 @@ impl Domain for ClientDomain {
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let _mutation = inner.begin_structure_mutation();
 
         let mux = Mux::get();
 
