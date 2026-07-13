@@ -289,6 +289,9 @@ pub struct ClientDomain {
     config: ClientDomainConfig,
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
+    /// True while an attach is in flight (state() stays Detached until
+    /// finish_attach installs the inner, so state alone can't dedupe).
+    attaching: std::sync::atomic::AtomicBool,
     local_domain_id: DomainId,
 }
 
@@ -439,6 +442,7 @@ impl ClientDomain {
             config,
             label,
             inner: Mutex::new(None),
+            attaching: std::sync::atomic::AtomicBool::new(false),
             local_domain_id,
         }
     }
@@ -825,7 +829,20 @@ impl ClientDomain {
             threshold,
             overlay_lag_indicator,
         ));
-        *domain.inner.lock().unwrap() = Some(Arc::clone(&inner));
+        {
+            let mut guard = domain.inner.lock().unwrap();
+            if guard.is_some() {
+                // A concurrent attach already installed an inner. Replacing
+                // it would orphan every existing local window/pane while the
+                // fresh (empty) remote<->local maps re-materialize duplicates
+                // of all remote windows.
+                log::warn!(
+                    "domain {domain_id} is already attached; dropping duplicate attach result"
+                );
+                return Ok(());
+            }
+            guard.replace(Arc::clone(&inner));
+        }
 
         Self::process_pane_list(inner, panes, primary_window_id)?;
 
@@ -1115,12 +1132,41 @@ impl ClientDomain {
         window_id: Option<WindowId>,
         ui: ConnectionUI,
     ) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
         if self.state() == DomainState::Attached {
             // Already attached
             ui.close();
             return Ok(());
         }
 
+        // Connecting takes seconds (ssh handshake, auth, pane list) while
+        // state() still reads Detached. A second attach started in that
+        // window would run to finish_attach and replace the first one's
+        // ClientInner with a fresh one whose remote<->local maps are empty,
+        // duplicating every remote window as a second local mirror. Only one
+        // attach may run; latecomers wait for its outcome.
+        if self.attaching.swap(true, Ordering::SeqCst) {
+            while self.attaching.load(Ordering::SeqCst) {
+                smol::Timer::after(std::time::Duration::from_millis(100)).await;
+            }
+            if self.state() == DomainState::Attached {
+                ui.close();
+                return Ok(());
+            }
+            anyhow::bail!("a concurrent attach attempt for this domain failed");
+        }
+
+        let result = self.attach_with_ui_impl(window_id, ui).await;
+        self.attaching.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn attach_with_ui_impl(
+        &self,
+        window_id: Option<WindowId>,
+        ui: ConnectionUI,
+    ) -> anyhow::Result<()> {
         let domain_id = self.local_domain_id;
         let config = self.config.clone();
 
