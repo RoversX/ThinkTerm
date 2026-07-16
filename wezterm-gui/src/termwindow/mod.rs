@@ -2236,6 +2236,10 @@ impl TermWindow {
                     // re-applied; the adopt-time application ran before
                     // these panes existed.
                     self.apply_workspace_thread_font_scales();
+                    // Remote panes are skipped by Tab::resize. A tab can arrive
+                    // while the connection content view suppresses paint-time
+                    // pane sync, so impose the actual GUI geometry immediately.
+                    self.force_sync_active_mux_tab_pane_sizes();
                     self.persist_workspace_layout_after_mutation("tab added");
                 }
                 MuxNotification::PaneOutput(pane_id) => {
@@ -2376,16 +2380,14 @@ impl TermWindow {
         self.sync_content_view_surfaces_with_mux();
         self.clear_all_overlays();
         self.current_highlight.take();
-        self.apply_workspace_thread_font_scales();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
 
-        let mux = Mux::get();
-        if let Some(window) = mux.get_window(self.mux_window_id) {
-            for tab in window.iter() {
-                tab.resize(self.terminal_size);
-            }
-        };
+        // Tab::resize updates the local split tree but deliberately skips
+        // remote mirror panes. Force the per-pane GUI-sized resize now rather
+        // than waiting for a later paint (a connection view may still be up).
+        self.resize_mux_tabs_to_current_terminal_size();
+        self.apply_workspace_thread_font_scales();
         self.sync_current_workspace_thread();
         self.update_title();
         if let Some(window) = self.window.as_ref() {

@@ -711,7 +711,7 @@ impl crate::TermWindow {
         let row_text_x = row_icon_x + row_icon_size + self.ui_px(SIDEBAR_ICON_GAP);
         let row_text_max =
             (row_x + row_width).saturating_sub(row_text_x + self.ui_px(SIDEBAR_INSET));
-        let row_label = self.ellipsize_sidebar_text(
+        let row_label = self.ellipsize_ui_text(
             ui_font,
             if reconnect_in_flight {
                 "Connecting…"
@@ -1019,7 +1019,7 @@ impl crate::TermWindow {
         let space_name = crate::workspace_threads::active_space_name(&self.active_space_id)
             .unwrap_or_else(|| "Default".to_string());
         let space_title = self.sidebar_space_title(&self.active_space_id, &space_name);
-        let space_label = self.ellipsize_sidebar_text(
+        let space_label = self.ellipsize_ui_text(
             &ui_font,
             &space_title,
             space_text_right.saturating_sub(space_text_x),
@@ -1171,7 +1171,7 @@ impl crate::TermWindow {
         let top_action_text_max_width = top_action_width
             .saturating_sub(top_action_icon_size + top_action_gap + self.ui_px(SIDEBAR_INSET) * 2);
         let top_action_label =
-            self.ellipsize_sidebar_text(&ui_font, "New Thread", top_action_text_max_width)?;
+            self.ellipsize_ui_text(&ui_font, "New Thread", top_action_text_max_width)?;
         let top_action_text_width = self
             .sidebar_text_width(&ui_font, top_action_label.as_ref())?
             .ceil()
@@ -2500,7 +2500,7 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let text = self.ellipsize_sidebar_text(font, text, width)?;
+        let text = self.ellipsize_ui_text(font, text, width)?;
         if text.is_empty() {
             return Ok(());
         }
@@ -2509,7 +2509,7 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    fn ellipsize_sidebar_text<'a>(
+    pub(crate) fn ellipsize_ui_text<'a>(
         &self,
         font: &Rc<LoadedFont>,
         text: &'a str,
@@ -2683,7 +2683,7 @@ impl crate::TermWindow {
 /// fits in `budget`. `glyphs` are `(advance_px, cluster)` pairs in visual order,
 /// where `cluster` is the source byte offset of each glyph. Cutting at the
 /// *next* glyph's cluster guarantees we never split a multi-byte character or a
-/// shaped cluster. Used by `ellipsize_sidebar_text` to truncate in a single
+/// shaped cluster. Used by `ellipsize_ui_text` to truncate in a single
 /// shaping pass instead of re-shaping a growing prefix per grapheme.
 fn ellipsize_cut_byte(glyphs: &[(f32, usize)], text_len: usize, budget: f32) -> usize {
     let mut acc = 0.0f32;

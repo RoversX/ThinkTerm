@@ -320,11 +320,7 @@ impl super::TermWindow {
         Ok(())
     }
 
-    pub fn sync_pane_font_sizes(&self) {
-        if self.content_view_foreground() {
-            return;
-        }
-
+    fn sync_active_mux_tab_pane_sizes(&self) {
         for pos in self.get_panes_to_render() {
             if let Err(err) = self.sync_positioned_pane_font_size(&pos) {
                 log::error!(
@@ -336,6 +332,20 @@ impl super::TermWindow {
         }
     }
 
+    pub fn sync_pane_font_sizes(&self) {
+        if self.content_view_foreground() {
+            return;
+        }
+        self.sync_active_mux_tab_pane_sizes();
+    }
+
+    /// Synchronize the newly adopted mux window even if a connection content
+    /// view is still foreground. Remote mirror panes are intentionally skipped
+    /// by Tab::resize, so attach/switch paths must explicitly size each pane.
+    pub(crate) fn force_sync_active_mux_tab_pane_sizes(&self) {
+        self.sync_active_mux_tab_pane_sizes();
+    }
+
     pub(crate) fn resize_mux_tabs_to_current_terminal_size(&mut self) {
         let mux = Mux::get();
         if let Some(window) = mux.get_window(self.mux_window_id) {
@@ -344,7 +354,7 @@ impl super::TermWindow {
             }
         }
         self.reapply_collapsed_panes_for_window();
-        self.sync_pane_font_sizes();
+        self.force_sync_active_mux_tab_pane_sizes();
     }
 
     pub fn resize(
@@ -519,7 +529,10 @@ impl super::TermWindow {
                 self.resize_mux_tabs_to_current_terminal_size();
             }
         } else {
-            log::trace!("terminal size unchanged; skipping mux tab resize");
+            log::trace!("terminal size unchanged; syncing active pane geometry");
+            if !self.content_view_foreground() {
+                self.sync_pane_font_sizes();
+            }
         }
 
         self.resize_overlays();

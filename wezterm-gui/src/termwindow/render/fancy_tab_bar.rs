@@ -47,7 +47,8 @@ impl crate::TermWindow {
             .fonts
             .title_font_with_size(crate::native_settings::tab_font_size())?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
-        let tab_width = self.window_tab_width_pixels().ceil() as usize;
+        let tab_count = self.window_tab_count_for_layout();
+        let tab_width = self.adaptive_window_tab_width_pixels(tab_count) as usize;
 
         let background = chrome.sidebar_bg;
         let foreground = chrome.text;
@@ -889,8 +890,9 @@ impl crate::TermWindow {
             .saturating_add(tab_width)
             .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
         let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
-        let show_close =
+        let close_slot_visible =
             close_x >= viewport_left && close_x.saturating_add(button_size) <= viewport_right;
+        let show_close = close_slot_visible && (active || is_hovered);
         if show_close {
             let close_hovered =
                 self.is_pointer_over_ui_rect(close_x, close_y, button_size, button_size);
@@ -916,7 +918,7 @@ impl crate::TermWindow {
         }
 
         let text_x = icon_x + icon_size + self.ui_px(WINDOW_TAB_ICON_GAP);
-        let text_right = if show_close {
+        let text_right = if close_slot_visible {
             close_x.saturating_sub(self.ui_px(WINDOW_TAB_ICON_GAP))
         } else {
             tab_left
@@ -1103,6 +1105,7 @@ impl crate::TermWindow {
             }
             text.push_str(value);
         }
+        let text = self.ellipsize_ui_text(font, &text, width)?;
         self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
     }
 
