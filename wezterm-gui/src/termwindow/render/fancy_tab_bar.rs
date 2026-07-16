@@ -246,6 +246,24 @@ impl crate::TermWindow {
             }
         }
 
+        // Establish a hard paint boundary before the trailing actions. Tab
+        // surfaces and glyphs are already geometrically clipped, but this mask
+        // also protects the action area from shader and texture overhang.
+        if viewport_right < row_right {
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(
+                    viewport_right as f32,
+                    row_y as f32,
+                    row_right.saturating_sub(viewport_right) as f32,
+                    row_height as f32,
+                ),
+                background,
+            )
+            .context("fancy tab bar trailing action mask")?;
+        }
+
         let mut action_right = row_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
         if self.fancy_tab_bar_shows_window_buttons() {
             let window_button_right = if self.right_sidebar_width() > 0 {

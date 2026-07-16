@@ -6,7 +6,7 @@ use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::tokens::{
     PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_ROW_START_PADDING,
     TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
-    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
+    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{
     GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TabWheelSurface,
@@ -41,6 +41,46 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
+
+fn trailing_action_reserved_width(
+    fixed_clearance: usize,
+    action_button_count: usize,
+    action_button_size: usize,
+    action_button_gap: usize,
+    window_button_count: usize,
+) -> usize {
+    fixed_clearance
+        .saturating_add(action_button_count.saturating_mul(action_button_size))
+        .saturating_add(
+            action_button_count
+                .saturating_sub(1)
+                .saturating_mul(action_button_gap),
+        )
+        .saturating_add(if window_button_count > 0 {
+            window_button_count
+                .saturating_mul(action_button_size + action_button_gap / 2)
+                .saturating_add(action_button_gap)
+        } else {
+            0
+        })
+}
+
+#[cfg(test)]
+mod window_tab_layout_tests {
+    use super::trailing_action_reserved_width;
+
+    #[test]
+    fn trailing_actions_keep_tabs_before_the_new_tab_button() {
+        assert_eq!(trailing_action_reserved_width(26, 2, 34, 8, 0), 102);
+        assert_eq!(trailing_action_reserved_width(26, 2, 64, 8, 0), 162);
+    }
+
+    #[test]
+    fn trailing_actions_include_integrated_window_buttons() {
+        assert_eq!(trailing_action_reserved_width(26, 2, 34, 8, 3), 224);
+    }
+}
+
 /// Overall ceiling on the "Connecting…" phase, as a backstop for the case where
 /// the TCP connect succeeds but the SSH banner/handshake then stalls (the
 /// per-connect `connecttimeout` only bounds the TCP connect itself).
@@ -127,36 +167,54 @@ impl super::TermWindow {
     }
 
     pub(super) fn window_tab_trailing_action_reserved_width(&self) -> usize {
-        let sidebar_actions_width = if self.right_sidebar_width() > 0 {
-            self.ui_px(WINDOW_TAB_ACTION_RESERVED_WIDTH)
-                + if !cfg!(target_os = "macos") {
-                    self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
-                        + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP)
-                } else {
-                    0
-                }
-        } else {
-            self.ui_px(WINDOW_TAB_ACTION_RESERVED_WIDTH)
-                + self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
-                + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP)
-        };
-
-        sidebar_actions_width
-            + if self.right_sidebar_width() == 0
-                && self
-                    .config
-                    .window_decorations
-                    .contains(WindowDecorations::INTEGRATED_BUTTONS)
-                && self.config.integrated_title_button_style
-                    != IntegratedTitleButtonStyle::MacOsNative
-            {
-                self.config.integrated_title_buttons.len()
-                    * (self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
-                        + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) / 2)
-                    + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP)
-            } else {
+        let configured_button_size = self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE);
+        let action_button_size = if self.config.use_fancy_tab_bar {
+            let row_height = self
+                .tab_bar_pixel_height()
+                .unwrap_or(configured_button_size as f32)
+                .ceil() as usize;
+            let content_top_spacer = if self.config.tab_bar_at_bottom {
                 0
-            }
+            } else {
+                self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height)
+            };
+            let content_height = row_height.saturating_sub(content_top_spacer);
+            let tab_font_cell_height_upper_bound = content_height.div_ceil(2);
+            content_height
+                .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
+                .max(tab_font_cell_height_upper_bound)
+                .max(1)
+                .max(configured_button_size)
+        } else {
+            configured_button_size
+        };
+        let action_button_count = if self.right_sidebar_width() > 0 && cfg!(target_os = "macos") {
+            1
+        } else {
+            2
+        };
+        let window_button_count = if self.right_sidebar_width() == 0
+            && self
+                .config
+                .window_decorations
+                .contains(WindowDecorations::INTEGRATED_BUTTONS)
+            && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
+        {
+            self.config.integrated_title_buttons.len()
+        } else {
+            0
+        };
+        let fixed_clearance = self
+            .ui_px(WINDOW_TAB_ACTION_RESERVED_WIDTH)
+            .saturating_sub(configured_button_size);
+
+        trailing_action_reserved_width(
+            fixed_clearance,
+            action_button_count,
+            action_button_size,
+            self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP),
+            window_button_count,
+        )
     }
 
     pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize) -> usize {
