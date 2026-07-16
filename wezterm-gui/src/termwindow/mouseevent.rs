@@ -12,7 +12,6 @@ use crate::termwindow::{
     GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TabWheelSurface,
     TermWindowNotif, UIItem, UIItemType, TMB,
 };
-use crate::utilsprites::RenderMetrics;
 use ::window::{
     ContextMenuItem, IntegratedTitleButtonStyle, MouseButtons as WMB, MouseCursor, MouseEvent,
     MouseEventKind as WMEK, MousePress, WindowDecorations, WindowOps, WindowState,
@@ -42,61 +41,6 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
-const WINDOW_TAB_FEW_COUNT_WIDTH_FACTOR: f32 = 1.16;
-const WINDOW_TAB_MANY_COUNT_WIDTH_FACTOR: f32 = 0.86;
-const WINDOW_TAB_MIN_WIDTH_FACTOR: f32 = 0.78;
-
-fn adaptive_window_tab_width(
-    preferred: f32,
-    minimum: f32,
-    viewport: f32,
-    tab_count: usize,
-    gap: f32,
-) -> f32 {
-    if tab_count == 0 {
-        return preferred.max(1.0);
-    }
-
-    // One or two tabs get a little more breathing room. As the row fills, the
-    // target contracts smoothly rather than jumping at a single threshold.
-    let density_factor = if tab_count <= 2 {
-        WINDOW_TAB_FEW_COUNT_WIDTH_FACTOR
-    } else {
-        (1.10 - (tab_count.saturating_sub(2) as f32 * 0.04)).max(WINDOW_TAB_MANY_COUNT_WIDTH_FACTOR)
-    };
-    let target = preferred.max(1.0) * density_factor;
-    let gaps = gap.max(0.0) * tab_count.saturating_sub(1) as f32;
-    let fitting_width = (viewport.max(0.0) - gaps).max(0.0) / tab_count as f32;
-    fitting_width.min(target).max(minimum.min(target).max(1.0))
-}
-
-#[cfg(test)]
-mod adaptive_window_tab_width_tests {
-    use super::adaptive_window_tab_width;
-
-    #[test]
-    fn few_tabs_are_roomier_and_many_tabs_are_compact() {
-        let one = adaptive_window_tab_width(200.0, 150.0, 2400.0, 1, 18.0);
-        let four = adaptive_window_tab_width(200.0, 150.0, 2400.0, 4, 18.0);
-        let eight = adaptive_window_tab_width(200.0, 150.0, 2400.0, 8, 18.0);
-        assert!(one > four);
-        assert!(four > eight);
-        assert!((one - 232.0).abs() < 0.001);
-        assert!((eight - 172.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn narrow_viewport_uses_minimum_then_scrolls() {
-        let width = adaptive_window_tab_width(200.0, 150.0, 300.0, 6, 18.0);
-        assert!((width - 150.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn available_space_can_shrink_tabs_between_target_and_minimum() {
-        let width = adaptive_window_tab_width(200.0, 150.0, 700.0, 4, 18.0);
-        assert!((width - 161.5).abs() < 0.001);
-    }
-}
 /// Overall ceiling on the "Connecting…" phase, as a backstop for the case where
 /// the TCP connect succeeds but the SSH banner/handshake then stalls (the
 /// per-connect `connecttimeout` only bounds the TCP connect itself).
@@ -136,44 +80,6 @@ impl super::TermWindow {
             .max(cell_width * 15.0)
             .max(self.ui_f32(176.0))
             .ceil()
-    }
-
-    pub(super) fn window_tab_count_for_layout(&self) -> usize {
-        let window_tab_count = if self.active_content_view_is_remote_thread() {
-            0
-        } else {
-            Mux::get()
-                .get_window(self.mux_window_id)
-                .map_or(0, |window| window.len())
-        };
-        window_tab_count + self.content_view_count()
-    }
-
-    pub(super) fn adaptive_window_tab_width_pixels(&self, tab_count: usize) -> f32 {
-        let fallback_cell_width = self.render_metrics.cell_size.width.max(1) as f32;
-        let cell_width = self
-            .fonts
-            .title_font_with_size(crate::native_settings::tab_font_size())
-            .map(|font| {
-                RenderMetrics::with_font_metrics(&font.metrics())
-                    .cell_size
-                    .width
-                    .max(1) as f32
-            })
-            .unwrap_or(fallback_cell_width);
-        let preferred = (self.config.tab_max_width as f32 * cell_width)
-            .max(cell_width * 15.0)
-            .max(self.ui_f32(176.0))
-            .ceil();
-        let minimum = (preferred * WINDOW_TAB_MIN_WIDTH_FACTOR).max(self.ui_f32(136.0));
-        adaptive_window_tab_width(
-            preferred,
-            minimum,
-            self.window_tab_viewport_width(),
-            tab_count,
-            self.ui_f32(WINDOW_TAB_GAP as f32),
-        )
-        .ceil()
     }
 
     fn window_tab_chrome_params(&self) -> WindowTabChromeParams {
@@ -280,16 +186,21 @@ impl super::TermWindow {
     }
 
     pub(super) fn max_window_tab_scroll_offset(&self) -> f32 {
-        let tab_count = self.window_tab_count_for_layout();
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return 0.0;
+        };
+        let window_tab_count = if self.active_content_view_is_remote_thread() {
+            0
+        } else {
+            window.len()
+        };
+        let tab_count = window_tab_count + self.content_view_count();
         if tab_count <= 1 {
             return 0.0;
         }
 
-        let tab_width = if self.config.use_fancy_tab_bar {
-            self.adaptive_window_tab_width_pixels(tab_count)
-        } else {
-            self.window_tab_width_pixels()
-        };
+        let tab_width = self.window_tab_width_pixels();
         let tab_gap = if self.config.use_fancy_tab_bar {
             self.ui_px(WINDOW_TAB_GAP) as f32
         } else {

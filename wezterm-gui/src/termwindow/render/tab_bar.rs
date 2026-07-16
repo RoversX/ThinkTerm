@@ -11,9 +11,9 @@ use window::color::LinearRgba;
 
 fn fancy_tab_bar_pixel_height(cell_height: usize, dpi: usize) -> usize {
     let cell_height = cell_height.max(1);
-    // Keep the original roomy capsule proportion while deriving it from the
-    // tab UI font, not from the independently configurable terminal font.
-    (cell_height * 11 / 5).max(cell_height) + scale_ui_usize(WINDOW_TAB_TOP_SPACER, dpi)
+    // Keep a comfortable capsule while trimming a small amount of the
+    // vertical whitespace around the tab text.
+    cell_height * 2 + scale_ui_usize(WINDOW_TAB_TOP_SPACER, dpi)
 }
 
 #[cfg(test)]
@@ -29,12 +29,12 @@ mod tests {
     }
 
     #[test]
-    fn fancy_height_keeps_roomy_tab_font_proportion() {
+    fn fancy_height_keeps_compact_comfortable_proportion() {
         let dpi = if cfg!(target_os = "macos") { 144 } else { 96 };
-        assert_eq!(fancy_tab_bar_pixel_height(20, dpi), 48);
+        assert_eq!(fancy_tab_bar_pixel_height(20, dpi), 44);
         assert_eq!(
             fancy_tab_bar_pixel_height(30, dpi) - fancy_tab_bar_pixel_height(20, dpi),
-            22
+            20
         );
     }
 }

@@ -47,8 +47,7 @@ impl crate::TermWindow {
             .fonts
             .title_font_with_size(crate::native_settings::tab_font_size())?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
-        let tab_count = self.window_tab_count_for_layout();
-        let tab_width = self.adaptive_window_tab_width_pixels(tab_count) as usize;
+        let tab_width = self.window_tab_width_pixels().ceil() as usize;
 
         let background = chrome.sidebar_bg;
         let foreground = chrome.text;
