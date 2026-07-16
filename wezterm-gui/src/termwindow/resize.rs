@@ -1,5 +1,4 @@
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
-use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::ui::rescale_ui_usize;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
@@ -278,7 +277,8 @@ impl super::TermWindow {
     ) -> TerminalSize {
         let cell_width = render_metrics.cell_size.width.max(1) as usize;
         let cell_height = render_metrics.cell_size.height.max(1) as usize;
-        let pane_nav_height = pane_nav_bar_height_for_metrics(render_metrics)
+        let pane_nav_height = self
+            .pane_nav_bar_height()
             .min(pos.pixel_height.saturating_sub(cell_height));
         let pixel_width = pos.pixel_width.max(cell_width);
         let pixel_height = pos

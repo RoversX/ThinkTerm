@@ -8,7 +8,6 @@ use crate::termwindow::render::{
     RenderScreenLineParams,
 };
 use crate::termwindow::ui::icons::SvgIcon;
-use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::termwindow::ui::status_icon::{split_leading_legacy_progress_marker, UiStatusKind};
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, PANE_NAV_ACTION_BUTTON_RADIUS,
@@ -57,8 +56,8 @@ pub(crate) fn client_pane_lag_ms(pane: &dyn mux::pane::Pane) -> Option<u64> {
 impl crate::TermWindow {
     /// Height of the nav bar for this pane: the metric height, clamped so
     /// that at least one terminal row of the pane's cell remains visible.
-    fn pane_nav_bar_height(&self, pos: &PositionedPane) -> usize {
-        pane_nav_bar_height_for_metrics(self.render_metrics).min(
+    fn pane_nav_bar_height_for_pane(&self, pos: &PositionedPane) -> usize {
+        self.pane_nav_bar_height().min(
             pos.pixel_height
                 .saturating_sub(self.render_metrics.cell_size.height.max(1) as usize),
         )
@@ -99,7 +98,7 @@ impl crate::TermWindow {
         };
         let mut height = (pos.height as f32 * self.render_metrics.cell_size.height as f32).max(1.0);
         if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) && pos.top > 0 {
-            height = height.max(pane_nav_bar_height_for_metrics(self.render_metrics) as f32);
+            height = height.max(self.pane_nav_bar_height() as f32);
         }
 
         Ok(euclid::rect(
@@ -218,7 +217,7 @@ impl crate::TermWindow {
         // Draw height is always the metric height: for remote mux panes the
         // bar overlays the content (it steals no viewport rows), for local
         // panes the viewport was already shrunk to make room.
-        let chrome_height = pane_nav_bar_height_for_metrics(self.render_metrics).min(strip_height);
+        let chrome_height = self.pane_nav_bar_height().min(strip_height);
         let icon_size = chrome_height
             .saturating_sub(self.ui_px(PANE_NAV_INSET) * 2)
             .clamp(self.ui_px(20), self.ui_px(24));
@@ -520,7 +519,7 @@ impl crate::TermWindow {
             return self.paint_collapsed_pane_nav_bar(pos, layers, layout);
         }
 
-        let nav_height = self.pane_nav_bar_height(pos);
+        let nav_height = self.pane_nav_bar_height_for_pane(pos);
         if nav_height == 0 {
             return Ok(0);
         }
@@ -938,7 +937,8 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        self.paint_ui_title_text(layers, font, &metrics, text, x, y, width, foreground)
+        let text = self.ellipsize_ui_text(font, text, width)?;
+        self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
     }
 
     fn paint_pane_nav_icon(

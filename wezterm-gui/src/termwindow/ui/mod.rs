@@ -18,6 +18,17 @@ pub fn pane_nav_bar_height_for_metrics(render_metrics: RenderMetrics) -> usize {
     cell_height * 2
 }
 
+impl crate::TermWindow {
+    pub(crate) fn pane_nav_bar_height(&self) -> usize {
+        let metrics = self
+            .fonts
+            .title_font_with_size(crate::native_settings::pane_header_font_size())
+            .map(|font| RenderMetrics::with_font_metrics(&font.metrics()))
+            .unwrap_or(self.render_metrics);
+        pane_nav_bar_height_for_metrics(metrics)
+    }
+}
+
 pub fn terminal_title_for_display(title: &str) -> &str {
     let title = title.trim();
     if title.is_empty() || is_default_shell_title(title) {

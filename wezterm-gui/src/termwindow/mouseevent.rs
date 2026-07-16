@@ -1,7 +1,6 @@
 use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::content_view::ContentViewId;
-use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::tokens::{
     PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_ROW_START_PADDING,
@@ -88,7 +87,7 @@ const REMOTE_CONNECT_OVERALL_TIMEOUT_SECS: u64 = 20;
 
 impl super::TermWindow {
     pub(crate) fn collapsed_pane_min_cells(&self) -> usize {
-        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics);
+        let nav_height = self.pane_nav_bar_height();
         let cell_height = self.render_metrics.cell_size.height.max(1) as usize;
 
         nav_height.div_ceil(cell_height).max(2)
@@ -316,7 +315,7 @@ impl super::TermWindow {
             return 0.0;
         }
 
-        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics);
+        let nav_height = self.pane_nav_bar_height();
         let icon_size = nav_height
             .saturating_sub(self.ui_px(PANE_NAV_INSET) * 2)
             .clamp(self.ui_px(20), self.ui_px(24));
@@ -498,7 +497,7 @@ impl super::TermWindow {
         let x = event.coords.x as f32;
         let y = event.coords.y as f32;
 
-        let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics) as f32;
+        let nav_height = self.pane_nav_bar_height() as f32;
         for pos in tab.iter_panes_ignoring_zoom() {
             let content_pane_x =
                 padding_left + border.left.get() as f32 + pos.left as f32 * cell_width;
@@ -850,7 +849,7 @@ impl super::TermWindow {
             + (pos.left as isize * global_cell_size.width);
         let pane_top =
             padding_top as isize + first_line_offset + (pos.top as isize * global_cell_size.height);
-        let pane_nav_height = pane_nav_bar_height_for_metrics(self.render_metrics) as isize;
+        let pane_nav_height = self.pane_nav_bar_height() as isize;
 
         let local_x = event.coords.x.sub(pane_left);
         let local_y = event.coords.y.sub(pane_top + pane_nav_height);
