@@ -1,7 +1,7 @@
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::termwindow::theme_aligned_tab_bar_colors_from_palette;
-use crate::termwindow::ui::tokens::{TAB_VERTICAL_PADDING, WINDOW_TAB_TOP_SPACER};
+use crate::termwindow::ui::tokens::WINDOW_TAB_TOP_SPACER;
 use crate::ui::scale_ui_usize;
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
@@ -10,9 +10,10 @@ use wezterm_term::color::ColorAttribute;
 use window::color::LinearRgba;
 
 fn fancy_tab_bar_pixel_height(cell_height: usize, dpi: usize) -> usize {
-    cell_height.max(1)
-        + scale_ui_usize(TAB_VERTICAL_PADDING, dpi) * 2
-        + scale_ui_usize(WINDOW_TAB_TOP_SPACER, dpi)
+    let cell_height = cell_height.max(1);
+    // Keep the original roomy capsule proportion while deriving it from the
+    // tab UI font, not from the independently configurable terminal font.
+    (cell_height * 11 / 5).max(cell_height) + scale_ui_usize(WINDOW_TAB_TOP_SPACER, dpi)
 }
 
 #[cfg(test)]
@@ -28,11 +29,12 @@ mod tests {
     }
 
     #[test]
-    fn fancy_height_tracks_its_own_font_cell() {
+    fn fancy_height_keeps_roomy_tab_font_proportion() {
         let dpi = if cfg!(target_os = "macos") { 144 } else { 96 };
+        assert_eq!(fancy_tab_bar_pixel_height(20, dpi), 48);
         assert_eq!(
             fancy_tab_bar_pixel_height(30, dpi) - fancy_tab_bar_pixel_height(20, dpi),
-            10
+            22
         );
     }
 }
