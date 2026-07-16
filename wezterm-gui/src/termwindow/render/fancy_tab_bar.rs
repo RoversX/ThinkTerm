@@ -65,13 +65,13 @@ impl crate::TermWindow {
         let content_top_spacer = if self.config.tab_bar_at_bottom {
             0
         } else {
-            WINDOW_TAB_TOP_SPACER.min(row_height)
+            self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height)
         };
         let content_row_y = row_y + content_top_spacer;
         let content_row_height = row_height.saturating_sub(content_top_spacer);
         let icon_size = fancy_tab_icon_size(&metrics, content_row_height as f32) as usize;
         let button_size = content_row_height
-            .saturating_sub(TAB_VERTICAL_PADDING * 2)
+            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(icon_size);
         let row_width = self
             .dimensions
@@ -81,7 +81,7 @@ impl crate::TermWindow {
             .max(1);
         let row_right = row_x + row_width;
         let viewport_left = (row_x as f32 + self.window_tab_left_padding_pixels()).ceil() as usize
-            + TAB_ROW_START_PADDING;
+            + self.ui_px(TAB_ROW_START_PADDING);
         let viewport_right =
             row_right.saturating_sub(self.window_tab_trailing_action_reserved_width());
         let viewport_width = viewport_right.saturating_sub(viewport_left);
@@ -154,7 +154,7 @@ impl crate::TermWindow {
         let cv_active = self.active_content_view_shown_in_tab_bar();
         let show_mux_tabs = !self.active_content_view_is_remote_thread();
 
-        let tab_step = tab_width + WINDOW_TAB_GAP;
+        let tab_step = tab_width + self.ui_px(WINDOW_TAB_GAP);
         let mut tab_sequence_idx = 0usize;
         if show_mux_tabs {
             for item in self.tab_bar.items() {
@@ -246,13 +246,13 @@ impl crate::TermWindow {
             }
         }
 
-        let mut action_right = row_right.saturating_sub(WINDOW_TAB_INSET + 2);
+        let mut action_right = row_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
         if self.fancy_tab_bar_shows_window_buttons() {
             let window_button_right = if self.right_sidebar_width() > 0 {
                 self.dimensions
                     .pixel_width
                     .saturating_sub(border.right.get() as usize)
-                    .saturating_sub(WINDOW_TAB_INSET + 2)
+                    .saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2)
             } else {
                 action_right
             };
@@ -289,7 +289,7 @@ impl crate::TermWindow {
             } else {
                 let right_sidebar_toggle_x = action_button_x;
                 let new_button_x = right_sidebar_toggle_x
-                    .saturating_sub(WINDOW_TAB_LEADING_ACTION_GAP + button_size);
+                    .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size);
                 self.paint_window_tab_new_button(
                     layers,
                     &mut ui_items,
@@ -315,8 +315,8 @@ impl crate::TermWindow {
             }
         } else {
             let right_sidebar_toggle_x = action_right.saturating_sub(button_size);
-            let new_button_x =
-                right_sidebar_toggle_x.saturating_sub(WINDOW_TAB_LEADING_ACTION_GAP + button_size);
+            let new_button_x = right_sidebar_toggle_x
+                .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size);
             self.paint_window_tab_new_button(
                 layers,
                 &mut ui_items,
@@ -377,12 +377,12 @@ impl crate::TermWindow {
             let action_button_size = if is_sidebar_toggle {
                 self.window_tab_sidebar_toggle_button_size()
             } else {
-                WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
+                self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
             };
             let action_icon_size = if is_sidebar_toggle {
                 self.window_tab_sidebar_toggle_icon_size()
             } else {
-                WINDOW_TAB_LEADING_ACTION_ICON_SIZE
+                self.ui_px(WINDOW_TAB_LEADING_ACTION_ICON_SIZE)
             };
             let button_size = if is_fullscreen_sidebar_toggle {
                 action_button_size
@@ -395,11 +395,12 @@ impl crate::TermWindow {
                 let button_y = if self.config.tab_bar_at_bottom {
                     row_y + (row_height.saturating_sub(button_size) / 2)
                 } else if is_fullscreen_sidebar_toggle {
-                    row_y.saturating_sub(WINDOW_TAB_TOP_SPACER)
-                        + SIDEBAR_INSET
-                        + WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET
+                    row_y.saturating_sub(self.ui_px(WINDOW_TAB_TOP_SPACER))
+                        + self.ui_px(SIDEBAR_INSET)
+                        + self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET)
                 } else if !cfg!(target_os = "macos") {
-                    row_y.saturating_sub(WINDOW_TAB_TOP_SPACER) + SIDEBAR_INSET
+                    row_y.saturating_sub(self.ui_px(WINDOW_TAB_TOP_SPACER))
+                        + self.ui_px(SIDEBAR_INSET)
                 } else {
                     row_y + (row_height.saturating_sub(button_size) / 2)
                 };
@@ -414,7 +415,7 @@ impl crate::TermWindow {
                     muted_fg,
                 )?;
             }
-            button_x += action_button_size + WINDOW_TAB_LEADING_ACTION_GAP;
+            button_x += action_button_size + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP);
         }
 
         Ok(())
@@ -455,7 +456,7 @@ impl crate::TermWindow {
                         0.12
                     },
                 ),
-                SIDEBAR_INSET as f32,
+                self.ui_px(SIDEBAR_INSET) as f32,
             )
             .context("window sidebar toggle hover")?;
         }
@@ -492,7 +493,7 @@ impl crate::TermWindow {
         foreground: LinearRgba,
         muted_fg: LinearRgba,
     ) -> anyhow::Result<usize> {
-        let gap = WINDOW_TAB_LEADING_ACTION_GAP / 2;
+        let gap = self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) / 2;
         for button in self.config.integrated_title_buttons.iter().rev() {
             action_right = action_right.saturating_sub(button_size);
             self.paint_window_tab_window_button(
@@ -510,7 +511,7 @@ impl crate::TermWindow {
             action_right = action_right.saturating_sub(gap);
         }
 
-        Ok(action_right.saturating_sub(WINDOW_TAB_LEADING_ACTION_GAP / 2))
+        Ok(action_right.saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) / 2))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -668,7 +669,7 @@ impl crate::TermWindow {
             } else {
                 LinearRgba::TRANSPARENT
             },
-            WINDOW_TAB_RADIUS,
+            self.ui_f32(WINDOW_TAB_RADIUS),
             CAPSULE_BORDER_WIDTH,
         )
         .context("window tab surface")?;
@@ -682,7 +683,7 @@ impl crate::TermWindow {
         });
 
         let tab_left = tab_left.max(0.0) as usize;
-        let icon_x = tab_left + WINDOW_TAB_INSET;
+        let icon_x = tab_left + self.ui_px(WINDOW_TAB_INSET);
         let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
         if icon_x >= viewport_left && icon_x.saturating_add(icon_size) <= viewport_right {
             self.paint_fancy_tab_icon(
@@ -697,7 +698,7 @@ impl crate::TermWindow {
 
         let close_x = tab_left
             .saturating_add(tab_width)
-            .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
+            .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
         let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
         let close_slot_reserved = self.config.show_close_tab_button_in_tabs && !is_renaming;
         let show_close = close_slot_reserved && (active || is_hovered);
@@ -715,7 +716,7 @@ impl crate::TermWindow {
                     } else {
                         0.12
                     };
-                let hover_inset = TAB_CLOSE_HOVER_INSET.min(button_size / 2);
+                let hover_inset = self.ui_px(TAB_CLOSE_HOVER_INSET).min(button_size / 2);
                 let hover_size = button_size.saturating_sub(hover_inset * 2);
                 self.fill_rounded_rectangle(
                     layers,
@@ -753,21 +754,21 @@ impl crate::TermWindow {
             )?;
         }
 
-        let mut text_x = icon_x + icon_size + WINDOW_TAB_ICON_GAP;
+        let mut text_x = icon_x + icon_size + self.ui_px(WINDOW_TAB_ICON_GAP);
         if let Some(status) = item.status {
             let status_x = text_x;
             if status_x >= viewport_left && status_x.saturating_add(icon_size) <= viewport_right {
                 self.paint_status_icon(layers, 2, status, status_x, icon_y, icon_size, foreground)
                     .context("window tab status icon")?;
             }
-            text_x = status_x + icon_size + WINDOW_TAB_ICON_GAP;
+            text_x = status_x + icon_size + self.ui_px(WINDOW_TAB_ICON_GAP);
         }
         let text_right = if close_slot_reserved {
-            close_x.saturating_sub(WINDOW_TAB_ICON_GAP)
+            close_x.saturating_sub(self.ui_px(WINDOW_TAB_ICON_GAP))
         } else {
             tab_left
                 .saturating_add(tab_width)
-                .saturating_sub(WINDOW_TAB_INSET)
+                .saturating_sub(self.ui_px(WINDOW_TAB_INSET))
         }
         .min(viewport_right);
         let text_width = text_right.saturating_sub(text_x);
@@ -857,7 +858,7 @@ impl crate::TermWindow {
             } else {
                 LinearRgba::TRANSPARENT
             },
-            WINDOW_TAB_RADIUS,
+            self.ui_f32(WINDOW_TAB_RADIUS),
             CAPSULE_BORDER_WIDTH,
         )
         .context("content view tab surface")?;
@@ -871,7 +872,7 @@ impl crate::TermWindow {
         });
 
         let tab_left = tab_left.max(0.0) as usize;
-        let icon_x = tab_left + WINDOW_TAB_INSET;
+        let icon_x = tab_left + self.ui_px(WINDOW_TAB_INSET);
         let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
         if icon_x >= viewport_left && icon_x.saturating_add(icon_size) <= viewport_right {
             self.paint_fancy_tab_icon(
@@ -886,7 +887,7 @@ impl crate::TermWindow {
 
         let close_x = tab_left
             .saturating_add(tab_width)
-            .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
+            .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
         let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
         let show_close =
             close_x >= viewport_left && close_x.saturating_add(button_size) <= viewport_right;
@@ -914,13 +915,13 @@ impl crate::TermWindow {
             )?;
         }
 
-        let text_x = icon_x + icon_size + WINDOW_TAB_ICON_GAP;
+        let text_x = icon_x + icon_size + self.ui_px(WINDOW_TAB_ICON_GAP);
         let text_right = if show_close {
-            close_x.saturating_sub(WINDOW_TAB_ICON_GAP)
+            close_x.saturating_sub(self.ui_px(WINDOW_TAB_ICON_GAP))
         } else {
             tab_left
                 .saturating_add(tab_width)
-                .saturating_sub(WINDOW_TAB_INSET)
+                .saturating_sub(self.ui_px(WINDOW_TAB_INSET))
         }
         .min(viewport_right);
         let text_width = text_right.saturating_sub(text_x);
@@ -1457,9 +1458,10 @@ impl crate::TermWindow {
 }
 
 fn fancy_tab_icon_size(metrics: &RenderMetrics, tab_bar_height: f32) -> f32 {
-    let from_bar = (tab_bar_height - 14.0).max(1.0);
+    let cell_height = metrics.cell_size.height.max(1) as f32;
+    let from_bar = (tab_bar_height - cell_height * 0.45).max(1.0);
     let from_font = metrics.cell_size.height as f32 * 0.95;
-    from_bar.min(from_font).clamp(18.0, 24.0).floor()
+    from_bar.min(from_font).max(1.0).floor()
 }
 
 fn is_legacy_progress_marker(value: &str) -> bool {

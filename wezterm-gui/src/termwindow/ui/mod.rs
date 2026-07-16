@@ -12,8 +12,10 @@ pub use right_sidebar::{right_sidebar_file_preview_width, right_sidebar_width_fo
 pub use sidebar::workspace_sidebar_width_for_metrics;
 
 pub fn pane_nav_bar_height_for_metrics(render_metrics: RenderMetrics) -> usize {
-    (render_metrics.cell_size.height as usize + tokens::PANE_NAV_EXTRA_HEIGHT)
-        .clamp(tokens::PANE_NAV_MIN_HEIGHT, tokens::PANE_NAV_MAX_HEIGHT)
+    // Keep the bar proportional to the DPI-scaled UI font. Fixed physical
+    // pixel clamps made it twice as tall in points on non-Retina displays.
+    let cell_height = render_metrics.cell_size.height.max(1) as usize;
+    (cell_height * 11 / 5).max(cell_height)
 }
 
 pub fn terminal_title_for_display(title: &str) -> &str {

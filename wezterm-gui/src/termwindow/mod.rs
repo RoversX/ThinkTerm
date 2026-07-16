@@ -1418,7 +1418,7 @@ impl TermWindow {
             pixel_cell: render_metrics.cell_size.width as f32,
         };
         let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
-        let workspace_sidebar_width = ui::workspace_sidebar_width_for_metrics(&render_metrics);
+        let workspace_sidebar_width = ui::workspace_sidebar_width_for_metrics(&render_metrics, dpi as usize);
         let padding_right = resize::effective_right_padding(&config, h_context) as usize;
         let v_context = DimensionContext {
             dpi: dpi as f32,
@@ -1612,7 +1612,7 @@ impl TermWindow {
             workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
             workspace_sidebar_scrollbar_visible_until: None,
-            right_sidebar_width: ui::right_sidebar_width_for_metrics(&render_metrics),
+            right_sidebar_width: ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize),
             right_sidebar_collapsed: true,
             right_sidebar_mode: RightSidebarMode::Snippets,
             right_sidebar_snippet_view: RightSidebarSnippetView::List,
@@ -1644,8 +1644,8 @@ impl TermWindow {
             right_sidebar_file_browse_rows: Vec::new(),
             right_sidebar_file_browse_cache_key: None,
             right_sidebar_file_selected: None,
-            right_sidebar_file_tree_width: ui::right_sidebar_width_for_metrics(&render_metrics),
-            right_sidebar_file_preview_width: ui::right_sidebar_file_preview_width(),
+            right_sidebar_file_tree_width: ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize),
+            right_sidebar_file_preview_width: ui::right_sidebar_file_preview_width(dpi as usize),
             right_sidebar_file_preview_generation: 0,
             right_sidebar_file_preview_lines: Vec::new(),
             right_sidebar_file_preview_max_columns: 0,

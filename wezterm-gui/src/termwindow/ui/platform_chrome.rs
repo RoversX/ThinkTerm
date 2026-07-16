@@ -5,6 +5,7 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
     WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_LEADING_ACTION_ICON_SIZE,
 };
+use crate::ui::{scale_ui_f32, scale_ui_usize};
 use window::{
     IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle, WindowDecorations, WindowState,
 };
@@ -18,9 +19,18 @@ pub struct WindowTabChromeParams {
     pub integrated_title_button_alignment: IntegratedTitleButtonAlignment,
     pub integrated_title_button_style: IntegratedTitleButtonStyle,
     pub cell_width: f32,
+    pub dpi: usize,
 }
 
 impl WindowTabChromeParams {
+    fn px(self, value: usize) -> usize {
+        scale_ui_usize(value, self.dpi)
+    }
+
+    fn px_f32(self, value: f32) -> f32 {
+        scale_ui_f32(value, self.dpi)
+    }
+
     pub fn leading_action_slot_count(self) -> usize {
         if !self.use_fancy_tab_bar || self.workspace_sidebar_width > 0 {
             return 0;
@@ -47,11 +57,11 @@ impl WindowTabChromeParams {
         if self.leading_action_slot_count() == 0 {
             0.0
         } else if self.window_state.contains(WindowState::FULL_SCREEN) {
-            WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X as f32
+            self.px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X) as f32
         } else if cfg!(target_os = "macos") {
-            MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH as f32
+            self.px(MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH) as f32
         } else {
-            SIDEBAR_INSET as f32
+            self.px(SIDEBAR_INSET) as f32
         }
     }
 
@@ -64,9 +74,9 @@ impl WindowTabChromeParams {
         let button_size = if self.shows_sidebar_toggle_action() {
             self.sidebar_toggle_button_size()
         } else {
-            WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
+            self.px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
         };
-        (count * (button_size + WINDOW_TAB_LEADING_ACTION_GAP)) as f32
+        (count * (button_size + self.px(WINDOW_TAB_LEADING_ACTION_GAP))) as f32
     }
 
     pub fn sidebar_toggle_uses_fullscreen_style(self) -> bool {
@@ -74,11 +84,11 @@ impl WindowTabChromeParams {
     }
 
     pub fn sidebar_toggle_button_size(self) -> usize {
-        workspace_sidebar_toolbar_button_size(self.window_state)
+        self.px(workspace_sidebar_toolbar_button_size(self.window_state))
     }
 
     pub fn sidebar_toggle_icon_size(self) -> usize {
-        workspace_sidebar_toolbar_icon_size(self.window_state)
+        self.px(workspace_sidebar_toolbar_icon_size(self.window_state))
     }
 
     pub fn left_padding_pixels(self) -> f32 {
@@ -93,7 +103,7 @@ impl WindowTabChromeParams {
         };
 
         if cfg!(target_os = "macos") && !self.window_state.contains(WindowState::FULL_SCREEN) {
-            return leading_action_padding.max(MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH as f32);
+            return leading_action_padding.max(self.px(MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH) as f32);
         }
 
         if self
@@ -106,7 +116,7 @@ impl WindowTabChromeParams {
                 if self.window_state.contains(WindowState::FULL_SCREEN) {
                     leading_action_padding + self.cell_width * 0.5
                 } else {
-                    70.0
+                    self.px_f32(70.0)
                 }
             } else {
                 leading_action_padding
@@ -122,9 +132,10 @@ pub fn workspace_sidebar_content_top(
     sidebar_inset: usize,
     tab_row_height: usize,
     window_state: WindowState,
+    dpi: usize,
 ) -> usize {
     if cfg!(target_os = "macos") && !window_state.contains(WindowState::FULL_SCREEN) {
-        panel_y + MACOS_TITLEBAR_CONTENT_TOP_INSET.max(tab_row_height)
+        panel_y + scale_ui_usize(MACOS_TITLEBAR_CONTENT_TOP_INSET, dpi).max(tab_row_height)
     } else {
         panel_y + sidebar_inset
     }

@@ -164,7 +164,7 @@ impl crate::TermWindow {
                         euclid::rect(x as f32, y as f32, button_size as f32, button_size as f32),
                         chrome.control_bg,
                         chrome.control_border,
-                        PANE_NAV_TAB_RADIUS,
+                        self.ui_f32(PANE_NAV_TAB_RADIUS),
                         CAPSULE_BORDER_WIDTH,
                     )
                     .context("collapsed vertical pane tab chip")?;
@@ -220,11 +220,13 @@ impl crate::TermWindow {
         // panes the viewport was already shrunk to make room.
         let chrome_height = pane_nav_bar_height_for_metrics(self.render_metrics).min(strip_height);
         let icon_size = chrome_height
-            .saturating_sub(PANE_NAV_INSET * 2)
-            .clamp(20, 24);
-        let action_icon_size = icon_size.saturating_add(2).clamp(icon_size, 26);
+            .saturating_sub(self.ui_px(PANE_NAV_INSET) * 2)
+            .clamp(self.ui_px(20), self.ui_px(24));
+        let action_icon_size = icon_size
+            .saturating_add(self.ui_px(2))
+            .clamp(icon_size, self.ui_px(26));
         let button_size = chrome_height
-            .saturating_sub(TAB_VERTICAL_PADDING * 2)
+            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(action_icon_size);
         let button_y =
             pane_rect.origin.y.max(0.0) as usize + (chrome_height.saturating_sub(button_size) / 2);
@@ -252,11 +254,11 @@ impl crate::TermWindow {
 
         let tab_start = strip_left + COLLAPSED_EDGE_PADDING;
         let tab_width = self.window_tab_width_pixels().ceil() as usize;
-        let tab_step = tab_width + PANE_NAV_TAB_GAP;
+        let tab_step = tab_width + self.ui_px(PANE_NAV_TAB_GAP);
         let total_tab_width = tabs.len().saturating_mul(tab_width).saturating_add(
             tabs.len()
                 .saturating_sub(1)
-                .saturating_mul(PANE_NAV_TAB_GAP),
+                .saturating_mul(self.ui_px(PANE_NAV_TAB_GAP)),
         );
         let max_tab_right = button_x.saturating_sub(COLLAPSED_SECTION_GAP);
         let viewport_width = max_tab_right.saturating_sub(tab_start);
@@ -276,7 +278,9 @@ impl crate::TermWindow {
         let tab_y = button_y;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
         for (idx, tab) in tabs.into_iter().enumerate() {
-            if tab_width <= icon_size + PANE_NAV_ICON_GAP + button_size || viewport_width == 0 {
+            if tab_width <= icon_size + self.ui_px(PANE_NAV_ICON_GAP) + button_size
+                || viewport_width == 0
+            {
                 break;
             }
 
@@ -319,7 +323,7 @@ impl crate::TermWindow {
                 euclid::rect(visible_left, tab_y as f32, visible_width, tab_height as f32),
                 tab_surface_color,
                 tab_border_color,
-                PANE_NAV_TAB_RADIUS,
+                self.ui_f32(PANE_NAV_TAB_RADIUS),
                 CAPSULE_BORDER_WIDTH,
             )
             .context("collapsed pane nav tab surface")?;
@@ -337,7 +341,7 @@ impl crate::TermWindow {
             });
 
             let draw_tab_x = tab_left.max(0.0) as usize;
-            let title_icon_x = draw_tab_x + PANE_NAV_INSET;
+            let title_icon_x = draw_tab_x + self.ui_px(PANE_NAV_INSET);
             let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
             let raw_title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
             let (title, status) =
@@ -375,7 +379,7 @@ impl crate::TermWindow {
 
             let raw_close_x = draw_tab_x
                 .saturating_add(tab_width)
-                .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
+                .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
             let close_slot_reserved = !is_renaming_tab;
             let close_view_left = draw_tab_x.max(tab_start);
             let close_view_right = draw_tab_x.saturating_add(tab_width).min(max_tab_right);
@@ -399,7 +403,7 @@ impl crate::TermWindow {
                     } else {
                         0.12
                     };
-                    let hover_inset = TAB_CLOSE_HOVER_INSET.min(button_size / 2);
+                    let hover_inset = self.ui_px(TAB_CLOSE_HOVER_INSET).min(button_size / 2);
                     let hover_size = button_size.saturating_sub(hover_inset * 2);
                     self.fill_rounded_rectangle(
                         layers,
@@ -441,7 +445,7 @@ impl crate::TermWindow {
                 .title_font_with_size(crate::native_settings::pane_header_font_size())
                 .context("collapsed pane nav title font")?;
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
-            let text_x = title_icon_x + icon_size + PANE_NAV_ICON_GAP;
+            let text_x = title_icon_x + icon_size + self.ui_px(PANE_NAV_ICON_GAP);
             let text_right = if close_slot_reserved {
                 if show_close {
                     close_x
@@ -449,11 +453,11 @@ impl crate::TermWindow {
                     raw_close_x
                 }
             } else {
-                draw_tab_x + tab_width - PANE_NAV_INSET
+                draw_tab_x + tab_width - self.ui_px(PANE_NAV_INSET)
             };
             let text_width = text_right
                 .min(max_tab_right)
-                .saturating_sub(text_x + PANE_NAV_ICON_GAP);
+                .saturating_sub(text_x + self.ui_px(PANE_NAV_ICON_GAP));
             let text_y =
                 tab_y + ((tab_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2);
             if text_x >= tab_start && text_x < max_tab_right && text_width > 0 {
@@ -560,13 +564,17 @@ impl crate::TermWindow {
             },
         });
 
-        let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
-        let action_icon_size = icon_size.saturating_add(2).clamp(icon_size, 26);
+        let icon_size = nav_height
+            .saturating_sub(self.ui_px(PANE_NAV_INSET) * 2)
+            .clamp(self.ui_px(20), self.ui_px(24));
+        let action_icon_size = icon_size
+            .saturating_add(self.ui_px(2))
+            .clamp(icon_size, self.ui_px(26));
         let button_size = nav_height
-            .saturating_sub(TAB_VERTICAL_PADDING * 2)
+            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(action_icon_size);
         let button_y = pane_y as usize
-            + (nav_height.saturating_sub(button_size) / 2 + PANE_NAV_TAB_TOP_OFFSET)
+            + (nav_height.saturating_sub(button_size) / 2 + self.ui_px(PANE_NAV_TAB_TOP_OFFSET))
                 .min(nav_height.saturating_sub(button_size));
         let mut button_x = (pane_x + pane_width) as usize;
         let mut actions = vec![
@@ -586,7 +594,7 @@ impl crate::TermWindow {
             PaneNavAction::ToggleZoom,
         ));
         for (icon, action) in actions {
-            button_x = button_x.saturating_sub(button_size + PANE_NAV_BUTTON_GAP);
+            button_x = button_x.saturating_sub(button_size + self.ui_px(PANE_NAV_BUTTON_GAP));
             // Stop once a button would spill past the pane's left edge (happens
             // when the pane is too narrow to hold all the action buttons).
             if (button_x as f32) < pane_x {
@@ -609,13 +617,13 @@ impl crate::TermWindow {
         let tabs = Mux::get().pane_stack_tabs(pos.pane.pane_id());
         let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos.left);
         let tab_width = self.window_tab_width_pixels().ceil() as usize;
-        let tab_step = tab_width + PANE_NAV_TAB_GAP;
+        let tab_step = tab_width + self.ui_px(PANE_NAV_TAB_GAP);
         let total_tab_width = tabs.len().saturating_mul(tab_width).saturating_add(
             tabs.len()
                 .saturating_sub(1)
-                .saturating_mul(PANE_NAV_TAB_GAP),
+                .saturating_mul(self.ui_px(PANE_NAV_TAB_GAP)),
         );
-        let max_tab_right = button_x.saturating_sub(PANE_NAV_INSET);
+        let max_tab_right = button_x.saturating_sub(self.ui_px(PANE_NAV_INSET));
         let viewport_width = max_tab_right.saturating_sub(tab_start);
         let max_scroll = total_tab_width.saturating_sub(viewport_width) as f32;
         let scroll_offset = self
@@ -632,7 +640,9 @@ impl crate::TermWindow {
         let tab_height = button_size;
         let tab_y = button_y;
         for (idx, tab) in tabs.into_iter().enumerate() {
-            if tab_width <= icon_size + PANE_NAV_ICON_GAP + button_size || viewport_width == 0 {
+            if tab_width <= icon_size + self.ui_px(PANE_NAV_ICON_GAP) + button_size
+                || viewport_width == 0
+            {
                 break;
             }
 
@@ -675,7 +685,7 @@ impl crate::TermWindow {
                 euclid::rect(visible_left, tab_y as f32, visible_width, tab_height as f32),
                 tab_surface_color,
                 tab_border_color,
-                PANE_NAV_TAB_RADIUS,
+                self.ui_f32(PANE_NAV_TAB_RADIUS),
                 CAPSULE_BORDER_WIDTH,
             )
             .context("pane nav tab surface")?;
@@ -692,7 +702,7 @@ impl crate::TermWindow {
             });
 
             let draw_tab_x = tab_left.max(0.0) as usize;
-            let title_icon_x = draw_tab_x + PANE_NAV_INSET;
+            let title_icon_x = draw_tab_x + self.ui_px(PANE_NAV_INSET);
             let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
             let raw_title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
             let (title, status) =
@@ -730,7 +740,7 @@ impl crate::TermWindow {
 
             let raw_close_x = draw_tab_x
                 .saturating_add(tab_width)
-                .saturating_sub(button_size + TAB_CLOSE_RIGHT_GAP);
+                .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
             let close_slot_reserved = !is_renaming_tab;
             let close_view_left = draw_tab_x.max(tab_start);
             let close_view_right = draw_tab_x.saturating_add(tab_width).min(max_tab_right);
@@ -754,7 +764,7 @@ impl crate::TermWindow {
                     } else {
                         0.12
                     };
-                    let hover_inset = TAB_CLOSE_HOVER_INSET.min(button_size / 2);
+                    let hover_inset = self.ui_px(TAB_CLOSE_HOVER_INSET).min(button_size / 2);
                     let hover_size = button_size.saturating_sub(hover_inset * 2);
                     self.fill_rounded_rectangle(
                         layers,
@@ -796,7 +806,7 @@ impl crate::TermWindow {
                 .title_font_with_size(crate::native_settings::pane_header_font_size())
                 .context("pane nav title font")?;
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
-            let text_x = title_icon_x + icon_size + PANE_NAV_ICON_GAP;
+            let text_x = title_icon_x + icon_size + self.ui_px(PANE_NAV_ICON_GAP);
             let text_right = if close_slot_reserved {
                 if show_close {
                     close_x
@@ -804,11 +814,11 @@ impl crate::TermWindow {
                     raw_close_x
                 }
             } else {
-                draw_tab_x + tab_width - PANE_NAV_INSET
+                draw_tab_x + tab_width - self.ui_px(PANE_NAV_INSET)
             };
             let text_width = text_right
                 .min(max_tab_right)
-                .saturating_sub(text_x + PANE_NAV_ICON_GAP);
+                .saturating_sub(text_x + self.ui_px(PANE_NAV_ICON_GAP));
             let text_y =
                 tab_y + ((tab_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2);
             if text_x >= tab_start && text_x < max_tab_right && text_width > 0 {

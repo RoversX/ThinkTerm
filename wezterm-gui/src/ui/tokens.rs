@@ -111,6 +111,73 @@ impl Default for UiTokens {
     }
 }
 
+impl UiTokens {
+    /// Scale ThinkTerm's custom chrome from its original Retina pixel grid to
+    /// the current window's backing scale. Text already follows the window
+    /// DPI; applying the same ratio to controls keeps their size in points
+    /// stable when a macOS window moves between Retina and non-Retina screens.
+    pub(crate) fn for_dpi(dpi: usize) -> Self {
+        let scale = ui_scale_for_dpi(dpi);
+        let base = Self::default();
+        Self {
+            sidebar_min_width: base.sidebar_min_width * scale,
+            sidebar_max_width: base.sidebar_max_width * scale,
+            sidebar_default_width: base.sidebar_default_width * scale,
+            sidebar_padding: base.sidebar_padding * scale,
+            row_height: base.row_height * scale,
+            row_gap: base.row_gap * scale,
+            control_height: base.control_height * scale,
+            control_radius: base.control_radius * scale,
+            row_radius: base.row_radius * scale,
+            icon_size: base.icon_size * scale,
+            resize_handle_width: base.resize_handle_width * scale,
+            scrollbar_width: base.scrollbar_width * scale,
+        }
+    }
+}
+
+/// ThinkTerm's custom chrome is expressed in design pixels: Retina pixels on
+/// macOS and logical pixels elsewhere. Convert those values to the current
+/// monitor's backing-pixel grid.
+pub(crate) fn ui_scale_for_dpi(dpi: usize) -> f32 {
+    let design_dpi = if cfg!(target_os = "macos") {
+        // The custom chrome was authored on a 2x macOS backing surface.
+        144.0
+    } else {
+        96.0
+    };
+    (dpi.max(1) as f32 / design_dpi).clamp(0.5, 4.0)
+}
+
+pub(crate) fn scale_ui_usize(value: usize, dpi: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        ((value as f32 * ui_scale_for_dpi(dpi)).round() as usize).max(1)
+    }
+}
+
+pub(crate) fn scale_ui_f32(value: f32, dpi: usize) -> f32 {
+    value * ui_scale_for_dpi(dpi)
+}
+
+pub(crate) fn unscale_ui_usize(value: usize, dpi: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        ((value as f32 / ui_scale_for_dpi(dpi)).round() as usize).max(1)
+    }
+}
+
+pub(crate) fn rescale_ui_usize(value: usize, old_dpi: usize, new_dpi: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        ((value as f32 * ui_scale_for_dpi(new_dpi) / ui_scale_for_dpi(old_dpi)).round() as usize)
+            .max(1)
+    }
+}
+
 fn rgb(red: u8, green: u8, blue: u8) -> LinearRgba {
     rgba(red, green, blue, 1.0)
 }
@@ -119,4 +186,34 @@ fn rgba(red: u8, green: u8, blue: u8, alpha: f32) -> LinearRgba {
     let mut color = LinearRgba::with_srgba(red, green, blue, 255);
     color.3 = alpha;
     color
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn design_dpi() -> usize {
+        if cfg!(target_os = "macos") {
+            144
+        } else {
+            96
+        }
+    }
+
+    #[test]
+    fn ui_pixels_follow_monitor_dpi() {
+        let design_dpi = design_dpi();
+        assert_eq!(ui_scale_for_dpi(design_dpi), 1.0);
+        assert_eq!(scale_ui_usize(40, design_dpi / 2), 20);
+        assert_eq!(scale_ui_usize(40, design_dpi * 2), 80);
+    }
+
+    #[test]
+    fn ui_widths_round_trip_through_design_pixels() {
+        let design_dpi = design_dpi();
+        let monitor_dpi = design_dpi / 2;
+        let scaled = scale_ui_usize(380, monitor_dpi);
+        assert_eq!(unscale_ui_usize(scaled, monitor_dpi), 380);
+        assert_eq!(rescale_ui_usize(80, design_dpi, monitor_dpi), 40);
+    }
 }

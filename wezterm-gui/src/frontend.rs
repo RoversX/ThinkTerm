@@ -17,6 +17,10 @@ use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
 
+fn should_spawn_reconciled_gui_window(is_domain_owned: bool, workspace: &str) -> bool {
+    !is_domain_owned || crate::workspace_threads::is_thread_workspace_name(workspace)
+}
+
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
     // Depth counter: > 0 means at least one window is mid-switch (materializing
@@ -439,6 +443,31 @@ impl GuiFrontEnd {
                 {
                     continue;
                 }
+
+                let mux = Mux::get();
+                let Some(mux_window) = mux.get_window(mux_window_id) else {
+                    continue;
+                };
+                let is_domain_owned = mux_window.origin_domain().is_some();
+                let window_workspace = mux_window.get_workspace();
+
+                // Client domains mirror every remote mux window locally when
+                // they attach. That includes the server's own startup
+                // `default` window and other background workspaces that do not
+                // belong to a ThinkTerm Space/thread. They must stay available
+                // in the mux for protocol bookkeeping, but automatically
+                // giving them a GUI window creates the stray "local Space with
+                // a remote terminal" window and tangles its lifecycle with the
+                // real thread window.
+                if !should_spawn_reconciled_gui_window(is_domain_owned, window_workspace) {
+                    log::debug!(
+                        "reconcile: leaving background domain window {} in workspace {:?} hidden",
+                        mux_window_id,
+                        window_workspace,
+                    );
+                    continue;
+                }
+
                 front_end()
                     .spawned_mux_window
                     .borrow_mut()
@@ -449,9 +478,6 @@ impl GuiFrontEnd {
                 // re-point the GUI window at a different mux window and orphan
                 // the one the domain just created (killing e.g. the in-window
                 // ConnectionUI mid-authentication).
-                let is_domain_owned = Mux::get()
-                    .get_window(mux_window_id)
-                    .map_or(false, |w| w.origin_domain().is_some());
                 let created = if is_domain_owned {
                     TermWindow::new_window_without_restore(mux_window_id).await
                 } else {
@@ -724,4 +750,43 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
         .replace(config_subscription);
 
     Ok(front_end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_spawn_reconciled_gui_window;
+
+    #[test]
+    fn reconcile_keeps_local_windows_visible() {
+        assert!(should_spawn_reconciled_gui_window(false, "default"));
+        assert!(should_spawn_reconciled_gui_window(
+            false,
+            "user-created-workspace"
+        ));
+    }
+
+    #[test]
+    fn reconcile_hides_background_domain_windows() {
+        assert!(!should_spawn_reconciled_gui_window(true, "default"));
+        assert!(!should_spawn_reconciled_gui_window(
+            true,
+            "unmanaged-remote-workspace"
+        ));
+        assert!(!should_spawn_reconciled_gui_window(
+            true,
+            "thinkterm:not-a-thread-workspace"
+        ));
+    }
+
+    #[test]
+    fn reconcile_shows_thinkterm_domain_thread_windows() {
+        assert!(should_spawn_reconciled_gui_window(
+            true,
+            "thinkterm:muxdomain-host::space::space-1:thread-2"
+        ));
+        assert!(should_spawn_reconciled_gui_window(
+            true,
+            "thinkterm:muxdomain-host::space::space-1:thread-2:remote-default"
+        ));
+    }
 }

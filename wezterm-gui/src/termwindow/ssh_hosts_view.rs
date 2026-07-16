@@ -660,7 +660,7 @@ impl SshHostsView {
         font: &Rc<LoadedFont>,
         cursor_on: bool,
     ) -> anyhow::Result<()> {
-        let tokens = UiTokens::default();
+        let tokens = UiTokens::for_dpi(ctx.dimensions.dpi);
         self.refresh();
         self.widgets.clear();
 

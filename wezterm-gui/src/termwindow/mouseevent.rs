@@ -78,7 +78,7 @@ impl super::TermWindow {
         let cell_width = self.render_metrics.cell_size.width.max(1) as f32;
         (self.config.tab_max_width as f32 * cell_width)
             .max(cell_width * 15.0)
-            .max(176.0)
+            .max(self.ui_f32(176.0))
             .ceil()
     }
 
@@ -91,6 +91,7 @@ impl super::TermWindow {
             integrated_title_button_alignment: self.config.integrated_title_button_alignment,
             integrated_title_button_style: self.config.integrated_title_button_style,
             cell_width: self.render_metrics.cell_size.width.max(1) as f32,
+            dpi: self.dimensions.dpi,
         }
     }
 
@@ -127,16 +128,17 @@ impl super::TermWindow {
 
     pub(super) fn window_tab_trailing_action_reserved_width(&self) -> usize {
         let sidebar_actions_width = if self.right_sidebar_width() > 0 {
-            WINDOW_TAB_ACTION_RESERVED_WIDTH
+            self.ui_px(WINDOW_TAB_ACTION_RESERVED_WIDTH)
                 + if !cfg!(target_os = "macos") {
-                    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE + WINDOW_TAB_LEADING_ACTION_GAP
+                    self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
+                        + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP)
                 } else {
                     0
                 }
         } else {
-            WINDOW_TAB_ACTION_RESERVED_WIDTH
-                + WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
-                + WINDOW_TAB_LEADING_ACTION_GAP
+            self.ui_px(WINDOW_TAB_ACTION_RESERVED_WIDTH)
+                + self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
+                + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP)
         };
 
         sidebar_actions_width
@@ -149,8 +151,9 @@ impl super::TermWindow {
                     != IntegratedTitleButtonStyle::MacOsNative
             {
                 self.config.integrated_title_buttons.len()
-                    * (WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE + WINDOW_TAB_LEADING_ACTION_GAP / 2)
-                    + WINDOW_TAB_LEADING_ACTION_GAP
+                    * (self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
+                        + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) / 2)
+                    + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP)
             } else {
                 0
             }
@@ -158,9 +161,9 @@ impl super::TermWindow {
 
     pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize) -> usize {
         if pane_left == 0 && self.workspace_sidebar_width() > 0 {
-            TAB_ROW_START_PADDING
+            self.ui_px(TAB_ROW_START_PADDING)
         } else {
-            PANE_NAV_INSET
+            self.ui_px(PANE_NAV_INSET)
         }
     }
 
@@ -175,7 +178,7 @@ impl super::TermWindow {
             .saturating_sub(border.right.get() as usize)
             .saturating_sub(left_padding.max(0.0) as usize)
             .saturating_sub(if self.config.use_fancy_tab_bar {
-                TAB_ROW_START_PADDING + self.window_tab_trailing_action_reserved_width()
+                self.ui_px(TAB_ROW_START_PADDING) + self.window_tab_trailing_action_reserved_width()
             } else {
                 0
             })
@@ -199,7 +202,7 @@ impl super::TermWindow {
 
         let tab_width = self.window_tab_width_pixels();
         let tab_gap = if self.config.use_fancy_tab_bar {
-            WINDOW_TAB_GAP as f32
+            self.ui_px(WINDOW_TAB_GAP) as f32
         } else {
             0.0
         };
@@ -256,18 +259,20 @@ impl super::TermWindow {
         }
 
         let nav_height = pane_nav_bar_height_for_metrics(self.render_metrics);
-        let icon_size = nav_height.saturating_sub(PANE_NAV_INSET * 2).clamp(20, 24);
+        let icon_size = nav_height
+            .saturating_sub(self.ui_px(PANE_NAV_INSET) * 2)
+            .clamp(self.ui_px(20), self.ui_px(24));
         let button_size = nav_height
-            .saturating_sub(TAB_VERTICAL_PADDING * 2)
+            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(icon_size);
-        let controls_width = (button_size + PANE_NAV_BUTTON_GAP)
+        let controls_width = (button_size + self.ui_px(PANE_NAV_BUTTON_GAP))
             .saturating_mul(2)
-            .saturating_add(PANE_NAV_INSET)
+            .saturating_add(self.ui_px(PANE_NAV_INSET))
             .saturating_add(self.pane_nav_tab_left_inset(pane_left));
         let viewport_width = (pane_width as usize).saturating_sub(controls_width).max(1) as f32;
         let tab_width = self.window_tab_width_pixels();
         let total_width = tab_count as f32 * tab_width
-            + tab_count.saturating_sub(1) as f32 * PANE_NAV_TAB_GAP as f32;
+            + tab_count.saturating_sub(1) as f32 * self.ui_px(PANE_NAV_TAB_GAP) as f32;
 
         (total_width - viewport_width).max(0.0)
     }
@@ -966,12 +971,9 @@ impl super::TermWindow {
                         );
                         context.invalidate();
                     }
-                    if completed_drag
-                        .as_ref()
-                        .is_some_and(|(item, _)| {
-                            matches!(item.item_type, UIItemType::RightSidebarFileRow(_))
-                        })
-                    {
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        matches!(item.item_type, UIItemType::RightSidebarFileRow(_))
+                    }) {
                         if let Some(state) = self.right_sidebar_file_drag.take() {
                             if state.active {
                                 self.drop_right_sidebar_file_drag(state, &event, x, y);
@@ -3432,9 +3434,9 @@ impl super::TermWindow {
         let space_client_domain =
             crate::workspace_threads::client_domain_for_space(&self.active_space_id);
         if let Some(domain_name) = space_client_domain.as_deref() {
-            let attached = mux.get_domain_by_name(domain_name).map_or(false, |d| {
-                d.state() == mux::domain::DomainState::Attached
-            });
+            let attached = mux
+                .get_domain_by_name(domain_name)
+                .map_or(false, |d| d.state() == mux::domain::DomainState::Attached);
             if !attached {
                 // Attach on demand (auth prompts go through the ConnectionUI),
                 // then re-run this activation once the domain is live.

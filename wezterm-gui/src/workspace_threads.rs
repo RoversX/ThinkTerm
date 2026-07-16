@@ -3577,6 +3577,17 @@ fn parse_thread_workspace_name(workspace: &str) -> Option<(String, String)> {
     Some((project_id.to_string(), thread_id.to_string()))
 }
 
+/// Whether the workspace is managed by ThinkTerm's Space/thread store.
+///
+/// Client domains mirror every server-side workspace into the local mux,
+/// including implementation-detail workspaces such as the mux server's
+/// startup default window. Keep the recognition rule in one place so GUI
+/// reconciliation cannot mistake one of those background mirrors for a
+/// ThinkTerm thread window.
+pub(crate) fn is_thread_workspace_name(workspace: &str) -> bool {
+    parse_thread_workspace_name(workspace).is_some()
+}
+
 /// Rebuild sidebar records for live mux windows of this Space's client
 /// domain whose thread workspace has no local record. The remote mux server
 /// is the source of truth for a mux-domain Space: when the local store lost

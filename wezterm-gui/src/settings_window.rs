@@ -8,9 +8,9 @@ use crate::termwindow::render::corners::{
 use crate::termwindow::render::draw::draw_webgpu_layers;
 use crate::termwindow::webgpu::WebGpuState;
 use crate::ui::{
-    rect, ButtonSpec, ControlState, InteractionState, ResizablePaneState, ScrollState,
-    ScrollbarSpec, SettingsIcon, SvgIcon, TextInputSpec, TextInputState, UiContext, UiPalette,
-    UiTokens, WidgetKind,
+    rect, scale_ui_f32, scale_ui_usize, ButtonSpec, ControlState, InteractionState,
+    ResizablePaneState, ScrollState, ScrollbarSpec, SettingsIcon, SvgIcon, TextInputSpec,
+    TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
@@ -685,8 +685,8 @@ struct SettingsUiState {
 }
 
 impl SettingsUiState {
-    fn new() -> Self {
-        let tokens = UiTokens::default();
+    fn new(dpi: usize) -> Self {
+        let tokens = UiTokens::for_dpi(dpi);
         Self {
             sidebar: ResizablePaneState::new(
                 tokens.sidebar_default_width,
@@ -1126,6 +1126,14 @@ struct SettingsWindow {
 }
 
 impl SettingsWindow {
+    fn ui_px(&self, value: f32) -> f32 {
+        scale_ui_f32(value, self.dimensions.dpi)
+    }
+
+    fn ui_usize(&self, value: usize) -> usize {
+        scale_ui_usize(value, self.dimensions.dpi)
+    }
+
     async fn open() -> anyhow::Result<()> {
         let config = configuration();
         let dpi = window::default_dpi() as usize;
@@ -1148,12 +1156,12 @@ impl SettingsWindow {
             .map(|conn| conn.get_appearance())
             .unwrap_or(Appearance::Dark);
         let dimensions = Dimensions {
-            pixel_width: DEFAULT_WIDTH,
-            pixel_height: DEFAULT_HEIGHT,
+            pixel_width: scale_ui_usize(DEFAULT_WIDTH, dpi),
+            pixel_height: scale_ui_usize(DEFAULT_HEIGHT, dpi),
             dpi,
         };
 
-        let mut ui = SettingsUiState::new();
+        let mut ui = SettingsUiState::new(dpi);
         ui.font_size_input.text = native_settings
             .terminal
             .font_size
@@ -1188,8 +1196,8 @@ impl SettingsWindow {
 
         let event_settings = Rc::clone(&settings);
         let geometry = RequestedWindowGeometry {
-            width: Dimension::Pixels(DEFAULT_WIDTH as f32),
-            height: Dimension::Pixels(DEFAULT_HEIGHT as f32),
+            width: Dimension::Pixels(dimensions.pixel_width as f32),
+            height: Dimension::Pixels(dimensions.pixel_height as f32),
             x: None,
             y: None,
             macos_frame_autosave_name: None,
@@ -1261,8 +1269,26 @@ impl SettingsWindow {
                 window_state,
                 ..
             } => {
+                let dpi_changed = self.dimensions.dpi != dimensions.dpi;
                 self.dimensions = dimensions;
                 self.window_state = window_state;
+                if dpi_changed {
+                    let old_default_width = self.ui.tokens.sidebar_default_width.max(1.0);
+                    let tokens = UiTokens::for_dpi(dimensions.dpi);
+                    let width_ratio = tokens.sidebar_default_width / old_default_width;
+                    self.ui.sidebar = ResizablePaneState::new(
+                        self.ui.sidebar.width * width_ratio,
+                        tokens.sidebar_min_width,
+                        tokens.sidebar_max_width,
+                    );
+                    self.ui.tokens = tokens;
+                    self.fonts
+                        .change_scaling(self.fonts.get_font_scale(), dimensions.dpi);
+                    self.reload_settings_fonts()?;
+                    if let Some(render_state) = self.render_state.as_mut() {
+                        render_state.recreate_texture_atlas(&self.fonts, &self.metrics, None)?;
+                    }
+                }
                 if let Some(webgpu) = self.webgpu.as_ref() {
                     webgpu.resize(dimensions);
                 }
@@ -1420,7 +1446,12 @@ impl SettingsWindow {
 
     fn scroll_event(&mut self, event: &MouseEvent, window: &Window) -> bool {
         let sidebar_width = self.ui.sidebar.width;
-        let sidebar_area = rect(0.0, HEADER_HEIGHT, sidebar_width, self.content_bottom());
+        let sidebar_area = rect(
+            0.0,
+            self.ui_px(HEADER_HEIGHT),
+            sidebar_width,
+            self.content_bottom(),
+        );
         let content_top = self.content_scroll_area_top();
         let content_area = rect(
             sidebar_width + 1.0,
@@ -2005,6 +2036,10 @@ impl SettingsWindow {
         self.title_font = self
             .fonts
             .title_font_with_size_and_weight(settings_font_size + 4.0, settings_font_weight)?;
+        self.sidebar_title_font = self.fonts.title_font_with_size_and_weight(
+            Self::sidebar_brand_font_size_for_config(&configuration()),
+            SIDEBAR_BRAND_FONT_WEIGHT,
+        )?;
         self.metrics = RenderMetrics::with_font_metrics(&self.ui_font.metrics());
         Ok(())
     }
@@ -2124,27 +2159,35 @@ impl SettingsWindow {
 
     fn settings_row_step(&self) -> f32 {
         let cell_height = self.metrics.cell_size.height as f32;
-        (cell_height * 2.15 + 42.0).max(116.0).ceil()
+        (cell_height * 2.15 + self.ui_px(42.0))
+            .max(self.ui_px(116.0))
+            .ceil()
     }
 
     fn settings_card_top_padding(&self) -> f32 {
         let cell_height = self.metrics.cell_size.height as f32;
-        (cell_height * 0.62).clamp(22.0, 30.0).ceil()
+        (cell_height * 0.62)
+            .clamp(self.ui_px(22.0), self.ui_px(30.0))
+            .ceil()
     }
 
     fn settings_card_bottom_padding(&self) -> f32 {
         let cell_height = self.metrics.cell_size.height as f32;
-        (cell_height * 0.72).clamp(26.0, 36.0).ceil()
+        (cell_height * 0.72)
+            .clamp(self.ui_px(26.0), self.ui_px(36.0))
+            .ceil()
     }
 
     fn settings_row_visual_height(&self) -> f32 {
         let cell_height = self.metrics.cell_size.height as f32;
-        (cell_height + 46.0).max(CONTROL_HEIGHT + 10.0).ceil()
+        (cell_height + self.ui_px(46.0))
+            .max(self.ui_px(CONTROL_HEIGHT) + self.ui_px(10.0))
+            .ceil()
     }
 
     fn settings_row_description_y(&self, y: f32) -> f32 {
         let cell_height = self.metrics.cell_size.height as f32;
-        y + (cell_height + 8.0).max(34.0)
+        y + (cell_height + self.ui_px(8.0)).max(self.ui_px(34.0))
     }
 
     fn settings_section_card_gap(&self) -> f32 {
@@ -2785,7 +2828,7 @@ impl SettingsWindow {
         self.settings_window_shows_window_buttons()
             && x >= 0.0
             && x <= self.dimensions.pixel_width as f32
-            && (0.0..=SETTINGS_WINDOW_CHROME_HEIGHT).contains(&y)
+            && (0.0..=self.ui_px(SETTINGS_WINDOW_CHROME_HEIGHT)).contains(&y)
     }
 
     fn paint_window_chrome(
@@ -2797,12 +2840,13 @@ impl SettingsWindow {
         }
 
         let config = configuration();
-        let mut right = self.dimensions.pixel_width as f32 - SETTINGS_WINDOW_BUTTON_RIGHT_INSET;
-        let y = SETTINGS_WINDOW_BUTTON_TOP_INSET;
+        let mut right =
+            self.dimensions.pixel_width as f32 - self.ui_px(SETTINGS_WINDOW_BUTTON_RIGHT_INSET);
+        let y = self.ui_px(SETTINGS_WINDOW_BUTTON_TOP_INSET);
         for button in config.integrated_title_buttons.iter().rev() {
-            right -= SETTINGS_WINDOW_BUTTON_SIZE;
+            right -= self.ui_px(SETTINGS_WINDOW_BUTTON_SIZE);
             self.paint_window_chrome_button(layers, *button, right, y)?;
-            right -= SETTINGS_WINDOW_BUTTON_GAP;
+            right -= self.ui_px(SETTINGS_WINDOW_BUTTON_GAP);
         }
 
         Ok(())
@@ -2824,8 +2868,8 @@ impl SettingsWindow {
         let button_rect = rect(
             x,
             y,
-            SETTINGS_WINDOW_BUTTON_SIZE,
-            SETTINGS_WINDOW_BUTTON_SIZE,
+            self.ui_px(SETTINGS_WINDOW_BUTTON_SIZE),
+            self.ui_px(SETTINGS_WINDOW_BUTTON_SIZE),
         );
         self.ui_context
             .push(button_rect, WidgetKind::Button, action);
@@ -2834,7 +2878,7 @@ impl SettingsWindow {
         let pressed = self.ui.interaction.pressed == Some(action);
         let close_button = button == IntegratedTitleButton::Close;
         let press_inset = if pressed { 1.0 } else { 0.0 };
-        let visual_size = SETTINGS_WINDOW_BUTTON_SIZE - press_inset * 2.0;
+        let visual_size = self.ui_px(SETTINGS_WINDOW_BUTTON_SIZE) - press_inset * 2.0;
 
         if hovered {
             let fill = if close_button {
@@ -2876,9 +2920,9 @@ impl SettingsWindow {
             IntegratedTitleButton::Close => SvgIcon::X,
         };
         let icon_size = if pressed {
-            SETTINGS_WINDOW_BUTTON_ICON_SIZE - 1.0
+            self.ui_px(SETTINGS_WINDOW_BUTTON_ICON_SIZE) - 1.0
         } else {
-            SETTINGS_WINDOW_BUTTON_ICON_SIZE
+            self.ui_px(SETTINGS_WINDOW_BUTTON_ICON_SIZE)
         };
         let icon_color = if close_button && hovered {
             LinearRgba(1.0, 1.0, 1.0, 1.0)
@@ -2914,12 +2958,13 @@ impl SettingsWindow {
             x,
             0.0,
             width,
-            SETTINGS_WINDOW_CHROME_HEIGHT,
+            self.ui_px(SETTINGS_WINDOW_CHROME_HEIGHT),
             palette.window_bg,
         )?;
 
-        let fade_height = SETTINGS_WINDOW_CHROME_FADE_HEIGHT
-            .min((self.content_bottom() - SETTINGS_WINDOW_CHROME_HEIGHT).max(0.0) as usize);
+        let fade_height = self.ui_usize(SETTINGS_WINDOW_CHROME_FADE_HEIGHT).min(
+            (self.content_bottom() - self.ui_px(SETTINGS_WINDOW_CHROME_HEIGHT)).max(0.0) as usize,
+        );
         if self.ui.content_scroll.offset > 0.0 && fade_height > 0 {
             for step in 0..fade_height {
                 let progress = (step + 1) as f32 / fade_height as f32;
@@ -2928,7 +2973,7 @@ impl SettingsWindow {
                     layers,
                     2,
                     x,
-                    SETTINGS_WINDOW_CHROME_HEIGHT + step as f32,
+                    self.ui_px(SETTINGS_WINDOW_CHROME_HEIGHT) + step as f32,
                     width,
                     1.0,
                     palette.window_bg.mul_alpha(alpha),
@@ -2974,7 +3019,7 @@ impl SettingsWindow {
         let tokens = self.ui.tokens;
         let sidebar_width = self.ui.sidebar.width;
         let sidebar_icon_size = ((self.metrics.cell_size.height as f32 + 8.0)
-            .clamp(24.0, 34.0)
+            .clamp(self.ui_px(24.0), self.ui_px(34.0))
             .round()) as usize;
 
         self.draw_text(
@@ -2989,7 +3034,7 @@ impl SettingsWindow {
 
         let search_rect = rect(
             tokens.sidebar_padding,
-            SIDEBAR_SEARCH_Y,
+            self.ui_px(SIDEBAR_SEARCH_Y),
             sidebar_width - tokens.sidebar_padding * 2.0,
             tokens.control_height,
         );
@@ -3015,7 +3060,7 @@ impl SettingsWindow {
         )?;
         if !self.ui.search.is_empty() {
             let clear_size = 34.0;
-            let clear_icon_size = 24.0;
+            let clear_icon_size = self.ui_px(24.0);
             let clear_rect = rect(
                 search_rect.origin.x + search_rect.size.width - clear_size - 10.0,
                 search_rect.origin.y + (search_rect.size.height - clear_size) / 2.0,
@@ -3077,10 +3122,10 @@ impl SettingsWindow {
         )?;
 
         let sections = self.filtered_sections();
-        let list_top = SIDEBAR_LIST_TOP;
+        let list_top = self.ui_px(SIDEBAR_LIST_TOP);
         let list_bottom = (self.dimensions.pixel_height as f32 - 16.0).max(list_top);
         let list_height = list_bottom - list_top;
-        let content_extent = sections.len() as f32 * NAV_ROW_STEP + 8.0;
+        let content_extent = sections.len() as f32 * self.ui_px(NAV_ROW_STEP) + 8.0;
         self.ui
             .sidebar_scroll
             .set_extents(list_height, content_extent.max(list_height));
@@ -3105,8 +3150,8 @@ impl SettingsWindow {
         }
 
         for section in sections {
-            if y + NAV_ROW_HEIGHT < list_top || y > list_bottom {
-                y += NAV_ROW_STEP;
+            if y + self.ui_px(NAV_ROW_HEIGHT) < list_top || y > list_bottom {
+                y += self.ui_px(NAV_ROW_STEP);
                 continue;
             }
             let action = SettingsAction::Select(section);
@@ -3132,14 +3177,14 @@ impl SettingsWindow {
                     row_x,
                     row_y,
                     row_width,
-                    NAV_ROW_HEIGHT,
+                    self.ui_px(NAV_ROW_HEIGHT),
                     row_bg,
-                    NAV_ROW_RADIUS,
+                    self.ui_px(NAV_ROW_RADIUS),
                 )?;
             }
 
             self.ui_context.push(
-                rect(row_x, row_y, row_width, NAV_ROW_HEIGHT),
+                rect(row_x, row_y, row_width, self.ui_px(NAV_ROW_HEIGHT)),
                 WidgetKind::SidebarRow,
                 action,
             );
@@ -3152,7 +3197,7 @@ impl SettingsWindow {
                 layers,
                 section.icon().svg(),
                 row_x + 14.0,
-                row_y + (NAV_ROW_HEIGHT - sidebar_icon_size as f32) / 2.0,
+                row_y + (self.ui_px(NAV_ROW_HEIGHT) - sidebar_icon_size as f32) / 2.0,
                 sidebar_icon_size as f32,
                 text_color,
             )?;
@@ -3160,12 +3205,12 @@ impl SettingsWindow {
                 layers,
                 &nav_font,
                 row_x + 56.0,
-                self.control_text_y(row_y, NAV_ROW_HEIGHT),
+                self.control_text_y(row_y, self.ui_px(NAV_ROW_HEIGHT)),
                 section.label(),
                 text_color,
                 row_width - 76.0,
             )?;
-            y += NAV_ROW_STEP;
+            y += self.ui_px(NAV_ROW_STEP);
         }
 
         self.paint_scrollbar(
@@ -3206,7 +3251,7 @@ impl SettingsWindow {
             layers,
             &title_font,
             x,
-            CONTENT_TITLE_Y - scroll,
+            self.ui_px(CONTENT_TITLE_Y) - scroll,
             self.selected.label(),
             palette.title,
             max_width,
@@ -3263,7 +3308,7 @@ impl SettingsWindow {
         let ui_font = Rc::clone(&self.ui_font);
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
-        let section_y = CONTENT_SECTION_Y - scroll;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Each settings card owns its row count because rows are painted manually.
         // General currently paints seven rows below; the count drives card height and scroll extent.
         let row_count = 7;
@@ -3366,7 +3411,7 @@ impl SettingsWindow {
         let config = configuration();
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
-        let section_y = CONTENT_SECTION_Y - scroll;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let theme_row_count = 4;
         let typography_row_count = 6;
         let app_icon_note_space = self.metrics.cell_size.height as f32 + 10.0;
@@ -3511,7 +3556,7 @@ impl SettingsWindow {
         let config = configuration();
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
-        let section_y = CONTENT_SECTION_Y - scroll;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Each settings card owns its row count because rows are painted manually.
         // Terminal currently paints eight rows below; the count drives card height and scroll extent.
         let row_count = 8;
@@ -3525,11 +3570,11 @@ impl SettingsWindow {
         let reset_button_y = if open_quotes_width + button_gap + reset_quotes_width <= max_width {
             button_y
         } else {
-            button_y + CONTROL_HEIGHT + 14.0
+            button_y + self.ui_px(CONTROL_HEIGHT) + 14.0
         };
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
-            self.settings_content_extent(reset_button_y + scroll + CONTROL_HEIGHT),
+            self.settings_content_extent(reset_button_y + scroll + self.ui_px(CONTROL_HEIGHT)),
         );
         let font_size = format!("{:.1} pt", config.font_size);
         let font_family = Self::effective_font_family(&config);
@@ -3681,13 +3726,13 @@ impl SettingsWindow {
         let ui_font = Rc::clone(&self.ui_font);
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
-        let section_y = CONTENT_SECTION_Y - scroll;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, 4);
         let card_height = self.settings_card_height(4);
         let button_y = card_y + card_height + self.settings_section_card_gap();
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
-            self.settings_content_extent(button_y + scroll + CONTROL_HEIGHT),
+            self.settings_content_extent(button_y + scroll + self.ui_px(CONTROL_HEIGHT)),
         );
 
         self.draw_text(
@@ -3800,7 +3845,7 @@ impl SettingsWindow {
             layers,
             &ui_font,
             x,
-            CONTENT_SECTION_Y - scroll,
+            self.ui_px(CONTENT_SECTION_Y) - scroll,
             "Live settings UI components. The left side is rendered with the same primitives as the real window.",
             palette.secondary_text,
             max_width,
@@ -3809,7 +3854,7 @@ impl SettingsWindow {
             layers,
             0,
             x,
-            CONTENT_RULE_Y - scroll,
+            self.ui_px(CONTENT_RULE_Y) - scroll,
             max_width,
             1.0,
             palette.rule,
@@ -4033,7 +4078,7 @@ impl SettingsWindow {
         let ui_font = Rc::clone(&self.ui_font);
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
-        let section_y = CONTENT_SECTION_Y - scroll;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let row_count = 15;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
@@ -4119,8 +4164,9 @@ impl SettingsWindow {
             })
             .unwrap_or_else(|| "No stage samples".to_string());
         let resource_lines = self.memory_resource_lines();
-        let input_button_y = button_y + CONTROL_HEIGHT + 16.0;
-        let resource_card_y = input_button_y + CONTROL_HEIGHT + self.settings_section_card_gap();
+        let input_button_y = button_y + self.ui_px(CONTROL_HEIGHT) + 16.0;
+        let resource_card_y =
+            input_button_y + self.ui_px(CONTROL_HEIGHT) + self.settings_section_card_gap();
         let resource_line_height = 30.0;
         let resource_card_height = 88.0 + resource_line_height * resource_lines.len() as f32;
         self.ui.content_scroll.set_extents(
@@ -4407,16 +4453,16 @@ impl SettingsWindow {
             x,
             y + 28.0,
             width.min(420.0),
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             palette.search_bg,
             palette.search_border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &ui_font,
             x + 18.0,
-            self.control_text_y(y + 28.0, CONTROL_HEIGHT),
+            self.control_text_y(y + 28.0, self.ui_px(CONTROL_HEIGHT)),
             "Search settings...",
             palette.muted_text,
             width.min(420.0) - 36.0,
@@ -4443,9 +4489,9 @@ impl SettingsWindow {
                 x,
                 y,
                 row_width,
-                NAV_ROW_HEIGHT,
+                self.ui_px(NAV_ROW_HEIGHT),
                 palette.nav_selected_bg,
-                NAV_ROW_RADIUS,
+                self.ui_px(NAV_ROW_RADIUS),
             )?;
         } else {
             self.draw_rounded_rect(
@@ -4454,16 +4500,16 @@ impl SettingsWindow {
                 x,
                 y,
                 row_width,
-                NAV_ROW_HEIGHT,
+                self.ui_px(NAV_ROW_HEIGHT),
                 palette.nav_hover_bg,
-                NAV_ROW_RADIUS,
+                self.ui_px(NAV_ROW_RADIUS),
             )?;
         }
         self.draw_text(
             layers,
             &ui_font,
             x + 16.0,
-            self.control_text_y(y, NAV_ROW_HEIGHT),
+            self.control_text_y(y, self.ui_px(NAV_ROW_HEIGHT)),
             label,
             if selected {
                 palette.selected_text
@@ -4497,16 +4543,16 @@ impl SettingsWindow {
             x,
             y,
             width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             bg,
             palette.control_border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &Rc::clone(&self.ui_font),
             x + 18.0,
-            self.control_text_y(y, CONTROL_HEIGHT),
+            self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             label,
             if accent {
                 palette.selected_text
@@ -4533,16 +4579,16 @@ impl SettingsWindow {
             x,
             y,
             width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             palette.control_bg,
             palette.control_border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &Rc::clone(&self.ui_font),
             x + 14.0,
-            self.control_text_y(y, CONTROL_HEIGHT),
+            self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             value,
             palette.text,
             width - 42.0,
@@ -4551,7 +4597,7 @@ impl SettingsWindow {
             layers,
             &Rc::clone(&self.ui_font),
             x + width - 28.0,
-            self.control_text_y(y, CONTROL_HEIGHT),
+            self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             "v",
             palette.muted_text,
             14.0,
@@ -4647,7 +4693,7 @@ impl SettingsWindow {
         let ui_font = Rc::clone(&self.ui_font);
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
-        let section_y = CONTENT_SECTION_Y - scroll;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let field_count = self.compatibility_import.fields.len();
         let row_count = 4 + field_count.max(1);
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
@@ -4655,7 +4701,9 @@ impl SettingsWindow {
         let buttons_y = card_y + card_height + self.settings_section_card_gap();
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
-            self.settings_content_extent(buttons_y + scroll + CONTROL_HEIGHT * 2.0 + 14.0),
+            self.settings_content_extent(
+                buttons_y + scroll + self.ui_px(CONTROL_HEIGHT) * 2.0 + 14.0,
+            ),
         );
         let thinkterm_path = Self::thinkterm_compatible_config_path();
         let thinkterm_source = if thinkterm_path.exists() {
@@ -4829,7 +4877,7 @@ impl SettingsWindow {
             "Import Selected",
             SettingsAction::ImportSelectedFields,
         )?;
-        let open_buttons_y = buttons_y + CONTROL_HEIGHT + 14.0;
+        let open_buttons_y = buttons_y + self.ui_px(CONTROL_HEIGHT) + 14.0;
         self.draw_button(
             layers,
             x,
@@ -4868,7 +4916,7 @@ impl SettingsWindow {
             layers,
             font,
             x,
-            CONTENT_SECTION_Y - scroll,
+            self.ui_px(CONTENT_SECTION_Y) - scroll,
             body,
             palette.secondary_text,
             max_width,
@@ -4877,7 +4925,7 @@ impl SettingsWindow {
             layers,
             0,
             x,
-            CONTENT_RULE_Y - scroll,
+            self.ui_px(CONTENT_RULE_Y) - scroll,
             max_width,
             1.0,
             palette.rule,
@@ -4925,16 +4973,16 @@ impl SettingsWindow {
             control_x,
             control_y,
             control_width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             palette.control_bg,
             palette.control_border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &ui_font,
             control_x + 14.0,
-            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             value,
             palette.text,
             control_width - 26.0,
@@ -4967,7 +5015,12 @@ impl SettingsWindow {
         let control_x = x + width - control_width;
         let control_y = y + 4.0;
         let text_width = (control_x - x - 24.0).max(width * 0.45);
-        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
         self.ui_context
             .push(control_rect, WidgetKind::Button, action);
 
@@ -5002,16 +5055,16 @@ impl SettingsWindow {
             control_x,
             control_y,
             control_width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             bg,
             border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &ui_font,
             control_x + 14.0,
-            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             if enabled { "On" } else { "Off" },
             palette.text,
             control_width - 26.0,
@@ -5044,7 +5097,12 @@ impl SettingsWindow {
         let control_x = x + width - control_width;
         let control_y = y + 4.0;
         let text_width = (control_x - x - 24.0).max(width * 0.45);
-        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
         self.ui_context
             .push(control_rect, WidgetKind::Button, action);
 
@@ -5079,16 +5137,16 @@ impl SettingsWindow {
             control_x,
             control_y,
             control_width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             bg,
             border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &ui_font,
             control_x + 14.0,
-            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             value,
             palette.text,
             control_width - 26.0,
@@ -5224,17 +5282,17 @@ impl SettingsWindow {
             value_x,
             preview_y,
             value_width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             palette.control_bg,
             palette.control_border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         let preview = self.text_with_ellipsis(&ui_font, &field.preview, value_width - 28.0);
         self.draw_text(
             layers,
             &ui_font,
             value_x + 14.0,
-            self.control_text_y(preview_y, CONTROL_HEIGHT),
+            self.control_text_y(preview_y, self.ui_px(CONTROL_HEIGHT)),
             &preview,
             palette.text,
             value_width - 28.0,
@@ -5303,8 +5361,9 @@ impl SettingsWindow {
         };
         let control_x = x + width - control_width;
         let control_y = y + 4.0;
-        let dynamic_icon_size = (self.metrics.cell_size.height as f32 + 4.0).clamp(24.0, 34.0);
-        let reset_size = CONTROL_HEIGHT;
+        let dynamic_icon_size =
+            (self.metrics.cell_size.height as f32 + 4.0).clamp(self.ui_px(24.0), self.ui_px(34.0));
+        let reset_size = self.ui_px(CONTROL_HEIGHT);
         let reset_gap = 14.0;
         let reset_x = (control_x - reset_gap - reset_size).max(x + width * 0.62);
         let text_width = (reset_x - x - 24.0).max(width * 0.40);
@@ -5335,19 +5394,24 @@ impl SettingsWindow {
             control_x,
             control_y,
             control_width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             palette.control_bg,
             palette.control_border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
 
         let button_width = 62.0_f32.min(control_width * 0.28);
-        let minus_rect = rect(control_x, control_y, button_width, CONTROL_HEIGHT);
+        let minus_rect = rect(
+            control_x,
+            control_y,
+            button_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
         let plus_rect = rect(
             control_x + control_width - button_width,
             control_y,
             button_width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
         );
         self.ui_context
             .push(minus_rect, WidgetKind::Button, decrease_action);
@@ -5369,7 +5433,7 @@ impl SettingsWindow {
                     button_rect.size.width - 8.0,
                     button_rect.size.height - 8.0,
                     palette.control_hover_bg,
-                    CONTROL_RADIUS - 4.0,
+                    self.ui_px(CONTROL_RADIUS) - 4.0,
                 )?;
             }
             self.draw_svg_icon(
@@ -5395,7 +5459,7 @@ impl SettingsWindow {
             layers,
             &ui_font,
             value_x + 8.0,
-            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             &value_label,
             palette.text,
             value_width - 16.0,
@@ -5448,7 +5512,12 @@ impl SettingsWindow {
         } else {
             palette.control_border
         };
-        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
 
         self.ui_context
             .push(control_rect, WidgetKind::TextInput, action);
@@ -5468,10 +5537,10 @@ impl SettingsWindow {
             control_x,
             control_y,
             control_width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             bg,
             border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
 
         let display = if value.trim().is_empty() {
@@ -5498,16 +5567,16 @@ impl SettingsWindow {
                 control_x + 12.0,
                 control_y + 6.0,
                 selection_width + 8.0,
-                CONTROL_HEIGHT - 12.0,
+                self.ui_px(CONTROL_HEIGHT) - 12.0,
                 palette.nav_selected_bg.mul_alpha(0.56),
-                CONTROL_RADIUS - 4.0,
+                self.ui_px(CONTROL_RADIUS) - 4.0,
             )?;
         }
         self.draw_text(
             layers,
             &ui_font,
             control_x + 16.0,
-            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             display,
             text_color,
             control_width - 32.0,
@@ -5525,7 +5594,7 @@ impl SettingsWindow {
                 caret_x - 1.0,
                 control_y + 8.0,
                 3.0,
-                CONTROL_HEIGHT - 16.0,
+                self.ui_px(CONTROL_HEIGHT) - 16.0,
                 palette.nav_selected_bg,
             )?;
         }
@@ -5550,7 +5619,12 @@ impl SettingsWindow {
         let (control_x, control_y, control_width) = self.theme_mode_control_geometry(x, y, width);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
         let action = SettingsAction::ToggleThemeModeMenu;
-        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
         let open = self.ui.open_dropdown == Some(SettingsDropdown::ThemeMode);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -5596,13 +5670,13 @@ impl SettingsWindow {
             control_rect.size.height,
             bg,
             border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &ui_font,
             control_x + 16.0,
-            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             self.native_settings.appearance.theme_mode.label(),
             palette.text,
             control_width - 60.0,
@@ -5611,7 +5685,7 @@ impl SettingsWindow {
             layers,
             SvgIcon::ChevronDown,
             control_x + control_width - 38.0,
-            control_y + (CONTROL_HEIGHT - 22.0) / 2.0,
+            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
             22.0,
             palette.secondary_text,
         )?;
@@ -5638,7 +5712,12 @@ impl SettingsWindow {
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
         let action = SettingsAction::ToggleAppIconMenu;
-        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
         let open = self.ui.open_dropdown == Some(SettingsDropdown::AppIcon);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -5685,13 +5764,13 @@ impl SettingsWindow {
             control_rect.size.height,
             bg,
             border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &ui_font,
             control_x + 16.0,
-            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             self.native_settings.appearance.app_icon.label(),
             palette.text,
             control_width - 60.0,
@@ -5700,7 +5779,7 @@ impl SettingsWindow {
             layers,
             SvgIcon::ChevronDown,
             control_x + control_width - 38.0,
-            control_y + (CONTROL_HEIGHT - 22.0) / 2.0,
+            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
             22.0,
             palette.secondary_text,
         )?;
@@ -5725,7 +5804,12 @@ impl SettingsWindow {
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
         let action = SettingsAction::ToggleMainRendererMenu;
-        let control_rect = rect(control_x, control_y, control_width, CONTROL_HEIGHT);
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
         let open = self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -5771,13 +5855,13 @@ impl SettingsWindow {
             control_rect.size.height,
             bg,
             border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &ui_font,
             control_x + 16.0,
-            self.control_text_y(control_y, CONTROL_HEIGHT),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             self.current_main_renderer().label(),
             palette.text,
             control_width - 60.0,
@@ -5786,7 +5870,7 @@ impl SettingsWindow {
             layers,
             SvgIcon::ChevronDown,
             control_x + control_width - 38.0,
-            control_y + (CONTROL_HEIGHT - 22.0) / 2.0,
+            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
             22.0,
             palette.secondary_text,
         )?;
@@ -5868,7 +5952,7 @@ impl SettingsWindow {
 
         let scroll = self.ui.content_scroll.offset;
         let card_padding = 36.0;
-        let section_y = CONTENT_SECTION_Y - scroll;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let row_count = match self.selected {
             SettingsSection::General => 7,
             SettingsSection::Appearance => 4,
@@ -5900,19 +5984,19 @@ impl SettingsWindow {
             SettingsDropdown::ThemeMode => self.paint_theme_mode_menu(
                 layers,
                 control_x,
-                control_y + CONTROL_HEIGHT + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
                 control_width,
             ),
             SettingsDropdown::AppIcon => self.paint_app_icon_menu(
                 layers,
                 control_x,
-                control_y + CONTROL_HEIGHT + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
                 control_width,
             ),
             SettingsDropdown::MainRenderer => self.paint_main_renderer_menu(
                 layers,
                 control_x,
-                control_y + CONTROL_HEIGHT + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
                 control_width,
             ),
         }
@@ -6020,7 +6104,7 @@ impl SettingsWindow {
             menu_height,
             menu_bg,
             palette.control_border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
 
         let mut row_y = y + menu_padding;
@@ -6075,7 +6159,7 @@ impl SettingsWindow {
 
     fn content_scroll_area_top(&self) -> f32 {
         if self.settings_window_shows_window_buttons() {
-            SETTINGS_WINDOW_CHROME_HEIGHT
+            self.ui_px(SETTINGS_WINDOW_CHROME_HEIGHT)
         } else {
             0.0
         }
@@ -6087,9 +6171,9 @@ impl SettingsWindow {
 
     fn sidebar_title_y(&self) -> f32 {
         if self.settings_window_shows_window_buttons() {
-            SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME
+            self.ui_px(SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME)
         } else {
-            SIDEBAR_TITLE_Y
+            self.ui_px(SIDEBAR_TITLE_Y)
         }
     }
 
@@ -6256,7 +6340,7 @@ impl SettingsWindow {
         let button = ButtonSpec {
             label,
             action,
-            rect: rect(x, y, width, CONTROL_HEIGHT),
+            rect: rect(x, y, width, self.ui_px(CONTROL_HEIGHT)),
             state: if self.ui.interaction.pressed == Some(action) {
                 ControlState::Pressed
             } else if self.ui.interaction.hovered == Some(action) {
@@ -6278,16 +6362,16 @@ impl SettingsWindow {
             x,
             y,
             width,
-            CONTROL_HEIGHT,
+            self.ui_px(CONTROL_HEIGHT),
             background,
             border,
-            CONTROL_RADIUS,
+            self.ui_px(CONTROL_RADIUS),
         )?;
         self.draw_text(
             layers,
             &Rc::clone(&self.ui_font),
             x + 14.0,
-            self.control_text_y(y, CONTROL_HEIGHT),
+            self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             button.label,
             palette.text,
             width - 36.0,
@@ -6317,9 +6401,10 @@ impl SettingsWindow {
             LinearRgba::TRANSPARENT
         };
         if bg.3 > 0.0 {
-            self.draw_rounded_rect(layers, 0, x, y, size, size, bg, CONTROL_RADIUS)?;
+            self.draw_rounded_rect(layers, 0, x, y, size, size, bg, self.ui_px(CONTROL_RADIUS))?;
         }
-        let icon_size = (self.metrics.cell_size.height as f32 + 4.0).clamp(24.0, 34.0);
+        let icon_size =
+            (self.metrics.cell_size.height as f32 + 4.0).clamp(self.ui_px(24.0), self.ui_px(34.0));
         self.draw_svg_icon(
             layers,
             icon,

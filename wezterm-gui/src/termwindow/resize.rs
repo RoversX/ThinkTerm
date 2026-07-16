@@ -1,5 +1,6 @@
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::termwindow::ui::pane_nav_bar_height_for_metrics;
+use crate::ui::rescale_ui_usize;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
@@ -631,6 +632,18 @@ impl super::TermWindow {
         );
 
         let cell_dims = self.current_cell_dimensions();
+
+        if dpi_changed {
+            let old_dpi = self.dimensions.dpi;
+            let new_dpi = dimensions.dpi;
+            self.workspace_sidebar_width =
+                rescale_ui_usize(self.workspace_sidebar_width, old_dpi, new_dpi);
+            self.right_sidebar_width = rescale_ui_usize(self.right_sidebar_width, old_dpi, new_dpi);
+            self.right_sidebar_file_tree_width =
+                rescale_ui_usize(self.right_sidebar_file_tree_width, old_dpi, new_dpi);
+            self.right_sidebar_file_preview_width =
+                rescale_ui_usize(self.right_sidebar_file_preview_width, old_dpi, new_dpi);
+        }
 
         if scale_changed {
             self.apply_scale_change(&dimensions, font_scale);

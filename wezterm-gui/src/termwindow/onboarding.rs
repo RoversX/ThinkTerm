@@ -612,7 +612,7 @@ impl OnboardingView {
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
         self.widgets.clear();
-        let tokens = UiTokens::default();
+        let tokens = UiTokens::for_dpi(ctx.dimensions.dpi);
         ctx.draw_rect(
             layers,
             0,

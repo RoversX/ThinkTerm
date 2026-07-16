@@ -17,8 +17,7 @@ use crate::termwindow::{
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
     TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup,
 };
-use crate::ui::TextInputState;
-use crate::ui::UiPalette;
+use crate::ui::{scale_ui_usize, unscale_ui_usize, TextInputState, UiPalette};
 use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use anyhow::Context;
@@ -284,18 +283,23 @@ impl RightSidebarMode {
     }
 }
 
-pub fn right_sidebar_width_for_metrics(render_metrics: &RenderMetrics) -> usize {
-    let default_width = (render_metrics.cell_size.width as usize * RIGHT_SIDEBAR_WIDTH_CELLS)
-        .max(RIGHT_SIDEBAR_MIN_WIDTH);
+pub fn right_sidebar_width_for_metrics(render_metrics: &RenderMetrics, dpi: usize) -> usize {
+    let min_width = scale_ui_usize(RIGHT_SIDEBAR_MIN_WIDTH, dpi);
+    let max_width = scale_ui_usize(RIGHT_SIDEBAR_MAX_WIDTH, dpi);
+    let default_width =
+        (render_metrics.cell_size.width as usize * RIGHT_SIDEBAR_WIDTH_CELLS).max(min_width);
     crate::native_settings::right_sidebar_width()
+        .map(|width| scale_ui_usize(width, dpi))
         .unwrap_or(default_width)
-        .clamp(RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH)
+        .clamp(min_width, max_width)
 }
 
-pub fn right_sidebar_file_preview_width() -> usize {
+pub fn right_sidebar_file_preview_width(dpi: usize) -> usize {
+    let min_width = scale_ui_usize(FILE_PREVIEW_PANE_MIN_WIDTH, dpi);
     crate::native_settings::right_sidebar_file_preview_width()
-        .unwrap_or(FILE_PREVIEW_PANE_DEFAULT_WIDTH)
-        .max(FILE_PREVIEW_PANE_MIN_WIDTH)
+        .map(|width| scale_ui_usize(width, dpi))
+        .unwrap_or_else(|| scale_ui_usize(FILE_PREVIEW_PANE_DEFAULT_WIDTH, dpi))
+        .max(min_width)
 }
 
 impl crate::TermWindow {
@@ -312,7 +316,10 @@ impl crate::TermWindow {
         } else {
             self.right_sidebar_width
         };
-        width.clamp(RIGHT_SIDEBAR_MIN_WIDTH, self.right_sidebar_max_width())
+        width.clamp(
+            self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH),
+            self.right_sidebar_max_width(),
+        )
     }
 
     fn right_sidebar_available_width(&self) -> usize {
@@ -325,7 +332,8 @@ impl crate::TermWindow {
     fn right_sidebar_file_preview_total_max_width(&self) -> usize {
         let available_width = self.right_sidebar_available_width();
         let content_width = available_width.saturating_sub(self.workspace_sidebar_width());
-        let min_preview_total = RIGHT_SIDEBAR_MIN_WIDTH + FILE_PREVIEW_PANE_MIN_WIDTH;
+        let min_preview_total =
+            self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH) + self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH);
         let terminal_reserve = content_width / 5;
         content_width
             .saturating_sub(terminal_reserve)
@@ -345,16 +353,17 @@ impl crate::TermWindow {
         let max_preview_width = self
             .right_sidebar_file_preview_total_max_width()
             .saturating_sub(self.right_sidebar_tree_width());
-        if max_preview_width < FILE_PREVIEW_PANE_MIN_WIDTH {
+        if max_preview_width < self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH) {
             return None;
         }
 
         let configured_width = if self.right_sidebar_file_preview_width == 0 {
-            FILE_PREVIEW_PANE_DEFAULT_WIDTH
+            self.ui_px(FILE_PREVIEW_PANE_DEFAULT_WIDTH)
         } else {
             self.right_sidebar_file_preview_width
         };
-        let width = configured_width.clamp(FILE_PREVIEW_PANE_MIN_WIDTH, max_preview_width);
+        let width =
+            configured_width.clamp(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH), max_preview_width);
         Some(width)
     }
 
@@ -374,8 +383,8 @@ impl crate::TermWindow {
 
     pub fn right_sidebar_max_width(&self) -> usize {
         let available_width = self.right_sidebar_available_width();
-        let proportional_max = (available_width * 2 / 3).max(RIGHT_SIDEBAR_MIN_WIDTH);
-        RIGHT_SIDEBAR_MAX_WIDTH.min(proportional_max)
+        let proportional_max = (available_width * 2 / 3).max(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
+        self.ui_px(RIGHT_SIDEBAR_MAX_WIDTH).min(proportional_max)
     }
 
     fn right_sidebar_window_button_reserved_width(&self) -> usize {
@@ -390,19 +399,24 @@ impl crate::TermWindow {
         }
 
         self.config.integrated_title_buttons.len()
-            * (WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE + WINDOW_TAB_LEADING_ACTION_GAP / 2)
-            + WINDOW_TAB_LEADING_ACTION_GAP
+            * (self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE)
+                + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) / 2)
+            + self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP)
     }
 
     pub fn set_right_sidebar_width(&mut self, width: usize) {
-        self.right_sidebar_width =
-            width.clamp(RIGHT_SIDEBAR_MIN_WIDTH, self.right_sidebar_max_width());
+        self.right_sidebar_width = width.clamp(
+            self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH),
+            self.right_sidebar_max_width(),
+        );
     }
 
     fn set_right_sidebar_file_tree_width(&mut self, width: usize) -> bool {
         let old_width = self.right_sidebar_file_tree_width;
-        self.right_sidebar_file_tree_width =
-            width.clamp(RIGHT_SIDEBAR_MIN_WIDTH, self.right_sidebar_max_width());
+        self.right_sidebar_file_tree_width = width.clamp(
+            self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH),
+            self.right_sidebar_max_width(),
+        );
         old_width != self.right_sidebar_file_tree_width
     }
 
@@ -424,20 +438,22 @@ impl crate::TermWindow {
         let max_preview_width = self
             .right_sidebar_file_preview_total_max_width()
             .saturating_sub(self.right_sidebar_tree_width());
-        if max_preview_width < FILE_PREVIEW_PANE_MIN_WIDTH {
+        if max_preview_width < self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH) {
             return false;
         }
 
         let old_width = self.right_sidebar_file_preview_width;
         self.right_sidebar_file_preview_width =
-            width.clamp(FILE_PREVIEW_PANE_MIN_WIDTH, max_preview_width);
+            width.clamp(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH), max_preview_width);
         old_width != self.right_sidebar_file_preview_width
     }
 
     pub fn persist_right_sidebar_width(&self) {
-        let width = self
-            .right_sidebar_width
-            .clamp(RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH);
+        let width = self.right_sidebar_width.clamp(
+            self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH),
+            self.ui_px(RIGHT_SIDEBAR_MAX_WIDTH),
+        );
+        let width = unscale_ui_usize(width, self.dimensions.dpi);
         if let Err(err) = crate::native_settings::save_right_sidebar_width(width) {
             log::warn!("failed to save right sidebar width: {err:#}");
         }
@@ -447,7 +463,8 @@ impl crate::TermWindow {
         let width = self
             .right_sidebar_file_preview_width()
             .unwrap_or(self.right_sidebar_file_preview_width)
-            .max(FILE_PREVIEW_PANE_MIN_WIDTH);
+            .max(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH));
+        let width = unscale_ui_usize(width, self.dimensions.dpi);
         if let Err(err) = crate::native_settings::save_right_sidebar_file_preview_width(width) {
             log::warn!("failed to save right sidebar file preview width: {err:#}");
         }
@@ -550,10 +567,15 @@ impl crate::TermWindow {
             preview_horizontal: self.right_sidebar_file_preview_horizontal_offset,
             filter: self.right_sidebar_file_applied_filter.clone(),
         };
-        if !self.right_sidebar_file_view_state_by_root.contains_key(&key) {
-            self.right_sidebar_file_view_state_order.push_back(key.clone());
+        if !self
+            .right_sidebar_file_view_state_by_root
+            .contains_key(&key)
+        {
+            self.right_sidebar_file_view_state_order
+                .push_back(key.clone());
         }
-        self.right_sidebar_file_view_state_by_root.insert(key, state);
+        self.right_sidebar_file_view_state_by_root
+            .insert(key, state);
         while self.right_sidebar_file_view_state_order.len() > FILE_VIEW_STATE_CACHE_CAP {
             if let Some(old) = self.right_sidebar_file_view_state_order.pop_front() {
                 self.right_sidebar_file_view_state_by_root.remove(&old);
@@ -583,7 +605,8 @@ impl crate::TermWindow {
         self.right_sidebar_file_expanded = state.expanded;
         self.right_sidebar_file_tree_scroll_offset = state.tree_scroll;
         // Filter: set all three coupled fields so the first frame is consistent.
-        self.right_sidebar_file_filter.set_text_end(state.filter.clone());
+        self.right_sidebar_file_filter
+            .set_text_end(state.filter.clone());
         self.right_sidebar_file_applied_filter = state.filter;
         self.right_sidebar_file_filter_debounce_until = None;
 
@@ -815,11 +838,11 @@ impl crate::TermWindow {
         if !self.right_sidebar_file_preview_active() {
             let max_tree_for_preview = self
                 .right_sidebar_file_preview_total_max_width()
-                .saturating_sub(FILE_PREVIEW_PANE_MIN_WIDTH)
-                .max(RIGHT_SIDEBAR_MIN_WIDTH);
+                .saturating_sub(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH))
+                .max(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
             self.right_sidebar_file_tree_width = self
                 .right_sidebar_width
-                .clamp(RIGHT_SIDEBAR_MIN_WIDTH, max_tree_for_preview);
+                .clamp(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH), max_tree_for_preview);
         }
         self.right_sidebar_file_selected = Some(path.clone());
         self.right_sidebar_file_preview_generation =
@@ -939,7 +962,9 @@ impl crate::TermWindow {
         }
         let colors = Rc::new(full_line_colors_by_byte(line));
         {
-            let mut cache = self.right_sidebar_file_preview_line_color_cache.borrow_mut();
+            let mut cache = self
+                .right_sidebar_file_preview_line_color_cache
+                .borrow_mut();
             let mut order = self
                 .right_sidebar_file_preview_line_color_cache_order
                 .borrow_mut();
@@ -1213,8 +1238,9 @@ impl crate::TermWindow {
             .right_sidebar_open_with_app
             .as_ref()
             .map(|app| app.id.clone());
-        candidates
-            .retain(|candidate| open_with_candidate_allowed(candidate, &custom_ids, saved_id.as_deref()));
+        candidates.retain(|candidate| {
+            open_with_candidate_allowed(candidate, &custom_ids, saved_id.as_deref())
+        });
 
         let mut items: Vec<ContextMenuItem> =
             sorted_open_with_candidates(candidates, current_id.as_deref())
@@ -1740,8 +1766,7 @@ impl crate::TermWindow {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
-        self.right_sidebar_file_rescan_token =
-            self.right_sidebar_file_rescan_token.wrapping_add(1);
+        self.right_sidebar_file_rescan_token = self.right_sidebar_file_rescan_token.wrapping_add(1);
         let token = self.right_sidebar_file_rescan_token;
         let target = Instant::now() + Duration::from_secs(FILE_INDEX_RESCAN_SECS);
         promise::spawn::spawn(async move {
@@ -2390,9 +2415,11 @@ impl crate::TermWindow {
 
         let total_left = total_rect.x;
         let total_right = total_rect.x.saturating_add(total_rect.width);
-        let min_preview = FILE_PREVIEW_PANE_MIN_WIDTH;
-        let max_preview = total_rect.width.saturating_sub(RIGHT_SIDEBAR_MIN_WIDTH);
-        let min_tree = RIGHT_SIDEBAR_MIN_WIDTH;
+        let min_preview = self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH);
+        let max_preview = total_rect
+            .width
+            .saturating_sub(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
+        let min_tree = self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH);
         let max_tree = self.right_sidebar_max_width().min(total_rect.width);
         let min_split = total_left
             .saturating_add(min_preview)
@@ -2437,18 +2464,18 @@ impl crate::TermWindow {
         }
 
         let rect = self.right_sidebar_file_preview_rect()?;
-        let content_x = rect.x + SIDEBAR_INSET * 2;
-        let content_width = rect.width.saturating_sub(SIDEBAR_INSET * 4);
-        let content_top = rect.y + SIDEBAR_INSET * 2;
+        let content_x = rect.x + self.ui_px(SIDEBAR_INSET) * 2;
+        let content_width = rect.width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 4);
+        let content_top = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
         let content_bottom = rect.y.saturating_add(rect.height);
-        let y = content_top + FILE_PREVIEW_HEADER_HEIGHT;
-        let bottom = content_bottom.saturating_sub(SIDEBAR_INSET);
+        let y = content_top + self.ui_px(FILE_PREVIEW_HEADER_HEIGHT);
+        let bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
         let visible_height = bottom.saturating_sub(y);
         if visible_height == 0 || content_width == 0 {
             return None;
         }
 
-        let line_height = preview_metrics.cell_size.height as usize + 4;
+        let line_height = preview_metrics.cell_size.height as usize + self.ui_px(4);
         let total_height = if self.right_sidebar_file_preview_image.is_some() {
             visible_height
         } else {
@@ -2482,7 +2509,7 @@ impl crate::TermWindow {
     ) -> (usize, usize, usize, usize) {
         let scrollbar_reserve =
             if self.right_sidebar_file_preview_vertical_scrollbar_active(metrics) {
-                SIDEBAR_INSET + 4
+                self.ui_px(SIDEBAR_INSET) + 4
             } else {
                 0
             };
@@ -2493,11 +2520,12 @@ impl crate::TermWindow {
             number_digits,
             preview_metrics.cell_size.width.max(1) as usize,
             body_width,
+            self.ui_px(SIDEBAR_ICON_GAP),
         );
         let text_x = metrics
             .x
             .saturating_add(number_width)
-            .saturating_add(SIDEBAR_ICON_GAP);
+            .saturating_add(self.ui_px(SIDEBAR_ICON_GAP));
         let text_width = metrics.x.saturating_add(body_width).saturating_sub(text_x);
         (body_width, number_width, text_x, text_width)
     }
@@ -2560,7 +2588,7 @@ impl crate::TermWindow {
     ) -> usize {
         let horizontal_reserve =
             if self.right_sidebar_file_preview_horizontal_scroll_active(preview_metrics) {
-                SIDEBAR_INSET + FILE_PREVIEW_SCROLLBAR_THICKNESS
+                self.ui_px(SIDEBAR_INSET) + self.ui_px(FILE_PREVIEW_SCROLLBAR_THICKNESS)
             } else {
                 0
             };
@@ -2596,7 +2624,7 @@ impl crate::TermWindow {
             return None;
         }
 
-        let track_width = FILE_PREVIEW_SCROLLBAR_THICKNESS;
+        let track_width = self.ui_px(FILE_PREVIEW_SCROLLBAR_THICKNESS);
         let track_height = visible_height.max(1);
         let thumb_height = ((visible_height as f32 / metrics.total_height as f32)
             * track_height as f32)
@@ -2644,7 +2672,7 @@ impl crate::TermWindow {
             .right_sidebar_file_preview_visible_columns(preview_metrics)
             .max(1);
         let track_width = text_width.max(1);
-        let track_height = FILE_PREVIEW_SCROLLBAR_THICKNESS;
+        let track_height = self.ui_px(FILE_PREVIEW_SCROLLBAR_THICKNESS);
         let thumb_width = ((visible_columns as f32 / max_columns as f32) * track_width as f32)
             .clamp(28.0, track_width as f32);
         let travel = (track_width as f32 - thumb_width).max(1.0);
@@ -2665,13 +2693,17 @@ impl crate::TermWindow {
         })
     }
 
-    fn right_sidebar_snippet_scroll_height(snippet_count: usize, viewport_height: usize) -> usize {
-        let row_height = SNIPPET_CARD_HEIGHT + SNIPPET_ROW_GAP;
+    fn right_sidebar_snippet_scroll_height(
+        &self,
+        snippet_count: usize,
+        viewport_height: usize,
+    ) -> usize {
+        let row_height = self.ui_px(SNIPPET_CARD_HEIGHT) + self.ui_px(SNIPPET_ROW_GAP);
         let height = snippet_count
             .saturating_mul(row_height)
-            .saturating_sub(SNIPPET_ROW_GAP);
+            .saturating_sub(self.ui_px(SNIPPET_ROW_GAP));
         if height > viewport_height {
-            height.saturating_add(SNIPPET_LIST_BOTTOM_PADDING)
+            height.saturating_add(self.ui_px(SNIPPET_LIST_BOTTOM_PADDING))
         } else {
             height
         }
@@ -2688,23 +2720,28 @@ impl crate::TermWindow {
             return None;
         }
 
-        let top_bar_y = rect.y + SIDEBAR_INSET * 2;
-        let top_bar_height = RIGHT_SIDEBAR_TOP_BAR_HEIGHT.min(
+        let top_bar_y = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
+        let top_bar_height = self.ui_px(RIGHT_SIDEBAR_TOP_BAR_HEIGHT).min(
             rect.y
                 .saturating_add(rect.height)
-                .saturating_sub(top_bar_y + SIDEBAR_INSET),
+                .saturating_sub(top_bar_y + self.ui_px(SIDEBAR_INSET)),
         );
-        let content_top =
-            top_bar_y + top_bar_height + RIGHT_SIDEBAR_MODE_HEIGHT + RIGHT_SIDEBAR_SECTION_GAP;
-        let list_top =
-            content_top + SNIPPET_TOOLBAR_HEIGHT.max(SNIPPET_SEARCH_HEIGHT) + SNIPPET_LIST_TOP_GAP;
+        let content_top = top_bar_y
+            + top_bar_height
+            + self.ui_px(RIGHT_SIDEBAR_MODE_HEIGHT)
+            + self.ui_px(RIGHT_SIDEBAR_SECTION_GAP);
+        let list_top = content_top
+            + self
+                .ui_px(SNIPPET_TOOLBAR_HEIGHT)
+                .max(self.ui_px(SNIPPET_SEARCH_HEIGHT))
+            + self.ui_px(SNIPPET_LIST_TOP_GAP);
         let content_bottom = rect.y.saturating_add(rect.height);
-        let visible_height = content_bottom.saturating_sub(list_top + SIDEBAR_INSET);
+        let visible_height = content_bottom.saturating_sub(list_top + self.ui_px(SIDEBAR_INSET));
         if visible_height == 0 {
             return None;
         }
         let snippet_count = self.filtered_snippet_count();
-        let total_height = Self::right_sidebar_snippet_scroll_height(snippet_count, visible_height);
+        let total_height = self.right_sidebar_snippet_scroll_height(snippet_count, visible_height);
         Some((list_top, visible_height, total_height))
     }
 
@@ -2739,7 +2776,7 @@ impl crate::TermWindow {
         let track_x = rect
             .x
             .saturating_add(rect.width)
-            .saturating_sub(SIDEBAR_INSET / 2 + track_width);
+            .saturating_sub(self.ui_px(SIDEBAR_INSET) / 2 + track_width);
 
         Some(RightSidebarSnippetScrollGeometry {
             track_x,
@@ -2820,7 +2857,7 @@ impl crate::TermWindow {
             .context("right sidebar ui font")?;
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let ui_cell_height = ui_metrics.cell_size.height as usize;
-        let icon_size = (ui_cell_height + 6).clamp(20, 24);
+        let icon_size = (ui_cell_height + self.ui_px(6)).clamp(self.ui_px(20), self.ui_px(24));
 
         if self.right_sidebar_mode == RightSidebarMode::Chat {
             let _ = self.sync_right_sidebar_file_root_for_current_workspace();
@@ -2880,36 +2917,41 @@ impl crate::TermWindow {
         )
         .context("right sidebar separator")?;
         self.ui_items.push(UIItem {
-            x: total_rect.x.saturating_sub(SIDEBAR_RESIZE_HANDLE_WIDTH / 2),
+            x: total_rect
+                .x
+                .saturating_sub(self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH) / 2),
             y: total_rect.y,
-            width: SIDEBAR_RESIZE_HANDLE_WIDTH,
+            width: self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH),
             height: total_rect.height,
             item_type: UIItemType::RightSidebarResize,
         });
         if self.right_sidebar_file_preview_rect().is_some() {
             self.ui_items.push(UIItem {
-                x: rect.x.saturating_sub(SIDEBAR_RESIZE_HANDLE_WIDTH / 2),
+                x: rect
+                    .x
+                    .saturating_sub(self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH) / 2),
                 y: rect.y,
-                width: SIDEBAR_RESIZE_HANDLE_WIDTH,
+                width: self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH),
                 height: rect.height,
                 item_type: UIItemType::RightSidebarFilePreviewResize,
             });
         }
 
-        let content_x = rect.x + SIDEBAR_INSET * 2;
-        let content_width = rect.width.saturating_sub(SIDEBAR_INSET * 4);
-        let top_bar_y = rect.y + SIDEBAR_INSET * 2;
-        let top_bar_height = RIGHT_SIDEBAR_TOP_BAR_HEIGHT.min(
+        let content_x = rect.x + self.ui_px(SIDEBAR_INSET) * 2;
+        let content_width = rect.width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 4);
+        let top_bar_y = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
+        let top_bar_height = self.ui_px(RIGHT_SIDEBAR_TOP_BAR_HEIGHT).min(
             rect.y
                 .saturating_add(rect.height)
-                .saturating_sub(top_bar_y + SIDEBAR_INSET),
+                .saturating_sub(top_bar_y + self.ui_px(SIDEBAR_INSET)),
         );
         if top_bar_height == 0 {
             return Ok(());
         }
 
         if cfg!(target_os = "macos") {
-            let close_button_size = RIGHT_SIDEBAR_CLOSE_BUTTON_SIZE
+            let close_button_size = self
+                .ui_px(RIGHT_SIDEBAR_CLOSE_BUTTON_SIZE)
                 .min(top_bar_height)
                 .min(content_width)
                 .max(1);
@@ -2917,17 +2959,17 @@ impl crate::TermWindow {
             let close_button_right_limit = rect
                 .x
                 .saturating_add(rect.width)
-                .saturating_sub(SIDEBAR_INSET)
+                .saturating_sub(self.ui_px(SIDEBAR_INSET))
                 .saturating_sub(close_button_size)
                 .saturating_sub(window_button_reserve);
             let close_button_x = content_x
                 .saturating_add(content_width)
                 .saturating_sub(close_button_size)
-                .saturating_add(RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST)
+                .saturating_add(self.ui_px(RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST))
                 .min(close_button_right_limit);
             let close_button_y = (top_bar_y
                 + (top_bar_height.saturating_sub(close_button_size)) / 2)
-                .saturating_sub(RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST);
+                .saturating_sub(self.ui_px(RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST));
             let close_hovered = self.is_pointer_over_ui_rect(
                 close_button_x,
                 close_button_y,
@@ -2972,7 +3014,8 @@ impl crate::TermWindow {
                 height: close_button_size,
                 item_type: UIItemType::RightSidebarToggle,
             });
-            let close_icon_size = RIGHT_SIDEBAR_CLOSE_ICON_SIZE
+            let close_icon_size = self
+                .ui_px(RIGHT_SIDEBAR_CLOSE_ICON_SIZE)
                 .min(close_visual_size.saturating_sub(4))
                 .max(1);
             self.paint_sidebar_icon(
@@ -2989,11 +3032,11 @@ impl crate::TermWindow {
             )?;
         }
 
-        let mode_y = top_bar_y + top_bar_height + RIGHT_SIDEBAR_SECTION_GAP;
-        let mode_height = RIGHT_SIDEBAR_MODE_HEIGHT.min(
+        let mode_y = top_bar_y + top_bar_height + self.ui_px(RIGHT_SIDEBAR_SECTION_GAP);
+        let mode_height = self.ui_px(RIGHT_SIDEBAR_MODE_HEIGHT).min(
             rect.y
                 .saturating_add(rect.height)
-                .saturating_sub(mode_y + SIDEBAR_INSET),
+                .saturating_sub(mode_y + self.ui_px(SIDEBAR_INSET)),
         );
         if mode_height == 0 {
             return Ok(());
@@ -3020,28 +3063,30 @@ impl crate::TermWindow {
             RightSidebarMode::Snippets,
         ];
         const MODE_LABEL_CLIP_SLOP: usize = 4;
-        let mode_icon_size = (ui_cell_height + 12)
-            .clamp(24, 30)
-            .min(mode_height.saturating_sub(22))
+        let mode_icon_size = (ui_cell_height + self.ui_px(12))
+            .clamp(self.ui_px(24), self.ui_px(30))
+            .min(mode_height.saturating_sub(self.ui_px(22)))
             .max(1);
         let active_label_target_width = self
             .sidebar_text_width(&ui_font, self.right_sidebar_mode.label())?
             .ceil() as usize
             + MODE_LABEL_CLIP_SLOP;
-        let inactive_segment_min_width = (mode_icon_size + SIDEBAR_INSET * 4)
-            .max(70)
+        let inactive_segment_min_width = (mode_icon_size + self.ui_px(SIDEBAR_INSET) * 4)
+            .max(self.ui_px(70))
             .min((content_width / modes.len()).max(1));
         let inactive_segment_count = modes.len().saturating_sub(1);
         let inactive_segments_min_width =
             inactive_segment_min_width.saturating_mul(inactive_segment_count);
-        let active_segment_width =
-            (mode_icon_size + SIDEBAR_ICON_GAP + active_label_target_width + SIDEBAR_INSET * 6)
-                .min(
-                    content_width
-                        .saturating_sub(inactive_segments_min_width)
-                        .max(1),
-                )
-                .max(1);
+        let active_segment_width = (mode_icon_size
+            + self.ui_px(SIDEBAR_ICON_GAP)
+            + active_label_target_width
+            + self.ui_px(SIDEBAR_INSET) * 6)
+            .min(
+                content_width
+                    .saturating_sub(inactive_segments_min_width)
+                    .max(1),
+            )
+            .max(1);
         let inactive_segments_width = content_width.saturating_sub(active_segment_width);
         let inactive_segment_width = if inactive_segment_count > 0 {
             inactive_segments_width / inactive_segment_count
@@ -3118,13 +3163,17 @@ impl crate::TermWindow {
 
             let label_width = if active {
                 segment_width
-                    .saturating_sub(mode_icon_size + SIDEBAR_ICON_GAP + SIDEBAR_INSET * 2)
+                    .saturating_sub(
+                        mode_icon_size
+                            + self.ui_px(SIDEBAR_ICON_GAP)
+                            + self.ui_px(SIDEBAR_INSET) * 2,
+                    )
                     .min(active_label_target_width)
             } else {
                 0
             };
             let total_width = if active {
-                mode_icon_size + SIDEBAR_ICON_GAP + label_width
+                mode_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + label_width
             } else {
                 mode_icon_size
             };
@@ -3149,7 +3198,7 @@ impl crate::TermWindow {
                     &ui_font,
                     ui_metrics,
                     mode.label(),
-                    icon_x + mode_icon_size + SIDEBAR_ICON_GAP,
+                    icon_x + mode_icon_size + self.ui_px(SIDEBAR_ICON_GAP),
                     mode_y + (mode_height.saturating_sub(ui_cell_height)) / 2,
                     label_width,
                     foreground,
@@ -3158,7 +3207,7 @@ impl crate::TermWindow {
             segment_x = segment_right;
         }
 
-        let content_top = mode_y + mode_height + RIGHT_SIDEBAR_SECTION_GAP;
+        let content_top = mode_y + mode_height + self.ui_px(RIGHT_SIDEBAR_SECTION_GAP);
         match self.right_sidebar_mode {
             RightSidebarMode::Chat => {
                 let file_font_size = self.right_sidebar_file_preview_font_size();
@@ -3167,7 +3216,8 @@ impl crate::TermWindow {
                     .title_font_with_size(file_font_size)
                     .context("right sidebar file font")?;
                 let file_metrics = RenderMetrics::with_font_metrics(&file_font.metrics());
-                let file_icon_size = (file_metrics.cell_size.height as usize + 6).clamp(22, 28);
+                let file_icon_size = (file_metrics.cell_size.height as usize + self.ui_px(6))
+                    .clamp(self.ui_px(22), self.ui_px(28));
                 self.paint_files_sidebar(
                     layers,
                     &file_font,
@@ -3203,10 +3253,10 @@ impl crate::TermWindow {
         }
 
         let empty_top = content_top;
-        let empty_height = RIGHT_SIDEBAR_EMPTY_HEIGHT.min(
+        let empty_height = self.ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT).min(
             rect.y
                 .saturating_add(rect.height)
-                .saturating_sub(empty_top + SIDEBAR_INSET),
+                .saturating_sub(empty_top + self.ui_px(SIDEBAR_INSET)),
         );
         if empty_height == 0 {
             return Ok(());
@@ -3222,15 +3272,15 @@ impl crate::TermWindow {
             ),
             chrome.sidebar_button_bg,
             chrome.control_border,
-            SIDEBAR_ROW_RADIUS + 6.0,
+            self.ui_f32(SIDEBAR_ROW_RADIUS) + 6.0,
             CAPSULE_BORDER_WIDTH,
         )
         .context("right sidebar empty state")?;
         let empty_icon_size = icon_size
-            .min(22)
+            .min(self.ui_px(22))
             .min(empty_height.saturating_sub(20))
             .max(1);
-        let empty_icon_x = content_x + SIDEBAR_INSET + 2;
+        let empty_icon_x = content_x + self.ui_px(SIDEBAR_INSET) + 2;
         let empty_icon_y = empty_top + (empty_height.saturating_sub(empty_icon_size)) / 2;
         self.paint_sidebar_icon(
             layers,
@@ -3245,9 +3295,11 @@ impl crate::TermWindow {
             &ui_font,
             ui_metrics,
             self.right_sidebar_mode.empty_label(),
-            empty_icon_x + empty_icon_size + SIDEBAR_ICON_GAP + 2,
+            empty_icon_x + empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + 2,
             empty_top + (empty_height.saturating_sub(ui_cell_height)) / 2,
-            content_width.saturating_sub(empty_icon_size + SIDEBAR_ICON_GAP + SIDEBAR_INSET * 3),
+            content_width.saturating_sub(
+                empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + self.ui_px(SIDEBAR_INSET) * 3,
+            ),
             muted_fg,
         )?;
 
@@ -3315,9 +3367,9 @@ impl crate::TermWindow {
         )
         .context("right sidebar file preview right separator")?;
 
-        let content_x = rect.x + SIDEBAR_INSET * 2;
-        let content_width = rect.width.saturating_sub(SIDEBAR_INSET * 4);
-        let content_top = rect.y + SIDEBAR_INSET * 2;
+        let content_x = rect.x + self.ui_px(SIDEBAR_INSET) * 2;
+        let content_width = rect.width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 4);
+        let content_top = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
         let content_bottom = rect.y.saturating_add(rect.height);
         self.paint_files_preview(
             layers,
@@ -3473,11 +3525,13 @@ impl crate::TermWindow {
     ) -> anyhow::Result<()> {
         // Reserve room on the right for an icon-only Refresh button so it never
         // eats into the filename/search width.
-        let refresh_size = (ui_metrics.cell_size.height as usize + 12).clamp(28, 38);
-        let refresh_gap = SIDEBAR_INSET;
+        let refresh_size = (ui_metrics.cell_size.height as usize + self.ui_px(12))
+            .clamp(self.ui_px(28), self.ui_px(38));
+        let refresh_gap = self.ui_px(SIDEBAR_INSET);
         let filter_width = content_width.saturating_sub(refresh_size + refresh_gap);
         let refresh_x = content_x + content_width - refresh_size;
-        let refresh_y = content_top + FILE_FILTER_HEIGHT.saturating_sub(refresh_size) / 2;
+        let refresh_y =
+            content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
 
         let filter_input = self.right_sidebar_file_filter.clone();
         self.paint_snippet_text_box(
@@ -3490,7 +3544,7 @@ impl crate::TermWindow {
             content_x,
             content_top,
             filter_width,
-            FILE_FILTER_HEIGHT,
+            self.ui_px(FILE_FILTER_HEIGHT),
             Some(SvgIcon::Search),
             "Filter files",
             &filter_input,
@@ -3510,7 +3564,7 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileRefresh,
         )?;
 
-        let tree_top = content_top + FILE_FILTER_HEIGHT + FILE_TREE_TOP_GAP;
+        let tree_top = content_top + self.ui_px(FILE_FILTER_HEIGHT) + self.ui_px(FILE_TREE_TOP_GAP);
         let root = match self.sync_right_sidebar_file_root_for_current_workspace() {
             Ok(root) => root,
             Err(message) => {
@@ -3631,7 +3685,7 @@ impl crate::TermWindow {
         }
 
         let row_metrics = right_sidebar_file_row_metrics(ui_metrics);
-        let viewport_bottom = content_bottom.saturating_sub(SIDEBAR_INSET);
+        let viewport_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
         let visible_height = viewport_bottom.saturating_sub(tree_top);
         let total_height = row_count.saturating_mul(row_metrics.row_height);
         let max_scroll = total_height.saturating_sub(visible_height) as f32;
@@ -3689,9 +3743,10 @@ impl crate::TermWindow {
         }
 
         if max_scroll > 0.0 && scroll_offset > 0.0 {
-            let fade_top = content_top + FILE_FILTER_HEIGHT;
-            let fade_height = FILE_TREE_TOP_GAP
-                .saturating_add(FILE_SCROLL_FADE_HEIGHT)
+            let fade_top = content_top + self.ui_px(FILE_FILTER_HEIGHT);
+            let fade_height = self
+                .ui_px(FILE_TREE_TOP_GAP)
+                .saturating_add(self.ui_px(FILE_SCROLL_FADE_HEIGHT))
                 .min(viewport_bottom.saturating_sub(fade_top));
             self.paint_right_sidebar_file_mask(
                 layers,
@@ -3711,7 +3766,7 @@ impl crate::TermWindow {
                 content_x,
                 content_top,
                 content_width,
-                FILE_FILTER_HEIGHT,
+                self.ui_px(FILE_FILTER_HEIGHT),
                 Some(SvgIcon::Search),
                 "Filter files",
                 &filter_input,
@@ -3747,8 +3802,9 @@ impl crate::TermWindow {
         icon_size: usize,
         message: &str,
     ) -> anyhow::Result<()> {
-        let height =
-            RIGHT_SIDEBAR_EMPTY_HEIGHT.min(content_bottom.saturating_sub(y + SIDEBAR_INSET));
+        let height = self
+            .ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT)
+            .min(content_bottom.saturating_sub(y + self.ui_px(SIDEBAR_INSET)));
         if height == 0 {
             return Ok(());
         }
@@ -3758,12 +3814,15 @@ impl crate::TermWindow {
             euclid::rect(x as f32, y as f32, width as f32, height as f32),
             chrome.sidebar_button_bg,
             chrome.control_border,
-            SIDEBAR_ROW_RADIUS + 6.0,
+            self.ui_f32(SIDEBAR_ROW_RADIUS) + 6.0,
             CAPSULE_BORDER_WIDTH,
         )
         .context("right sidebar files message")?;
-        let empty_icon_size = icon_size.min(22).min(height.saturating_sub(20)).max(1);
-        let icon_x = x + SIDEBAR_INSET + 2;
+        let empty_icon_size = icon_size
+            .min(self.ui_px(22))
+            .min(height.saturating_sub(20))
+            .max(1);
+        let icon_x = x + self.ui_px(SIDEBAR_INSET) + 2;
         let icon_y = y + (height.saturating_sub(empty_icon_size)) / 2;
         self.paint_sidebar_icon(
             layers,
@@ -3778,9 +3837,11 @@ impl crate::TermWindow {
             ui_font,
             ui_metrics,
             message,
-            icon_x + empty_icon_size + SIDEBAR_ICON_GAP + 2,
+            icon_x + empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + 2,
             y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
-            width.saturating_sub(empty_icon_size + SIDEBAR_ICON_GAP + SIDEBAR_INSET * 3),
+            width.saturating_sub(
+                empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + self.ui_px(SIDEBAR_INSET) * 3,
+            ),
             muted_fg,
         )
     }
@@ -3878,7 +3939,7 @@ impl crate::TermWindow {
                 } else {
                     chrome.sidebar_button_hover_bg
                 },
-                SIDEBAR_ROW_RADIUS,
+                self.ui_f32(SIDEBAR_ROW_RADIUS),
             )
             .context("right sidebar file row hover")?;
         }
@@ -3896,7 +3957,7 @@ impl crate::TermWindow {
             .depth
             .saturating_mul(row_metrics.indent_step)
             .min(width.saturating_sub(24));
-        let chevron_x = x + SIDEBAR_INSET + indent;
+        let chevron_x = x + self.ui_px(SIDEBAR_INSET) + indent;
         let icon_y = y + (row_metrics.row_height.saturating_sub(row_icon_size)) / 2;
         let chevron_y = y + (row_metrics.row_height.saturating_sub(chevron_size)) / 2;
         if row.is_dir {
@@ -3943,7 +4004,7 @@ impl crate::TermWindow {
                 .saturating_sub(ui_metrics.cell_size.height as usize))
                 / 2,
             x.saturating_add(width)
-                .saturating_sub(text_x + SIDEBAR_INSET),
+                .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET)),
             if row.is_dir || is_selected {
                 foreground
             } else {
@@ -3981,7 +4042,8 @@ impl crate::TermWindow {
         )?;
 
         let action_gap = 6;
-        let available_after_back = content_width.saturating_sub(button_size + SIDEBAR_INSET);
+        let available_after_back =
+            content_width.saturating_sub(button_size + self.ui_px(SIDEBAR_INSET));
         // The label is always shown in full. Size the button to fit it, limited
         // only by the room left after the two icon buttons, the gaps and a small
         // reserved minimum for the filename — no fixed cap, so a wide pane is
@@ -3999,7 +4061,7 @@ impl crate::TermWindow {
         let max_open_width =
             available_after_back.saturating_sub((button_size * 2) + action_gap * 3 + 72);
         let open_button_width = if max_open_width >= 80 {
-            desired_open_width.min(max_open_width).max(80)
+            desired_open_width.min(max_open_width).max(self.ui_px(80))
         } else {
             button_size
         };
@@ -4042,8 +4104,8 @@ impl crate::TermWindow {
             action_x += button_size + action_gap;
         }
 
-        let title_x = content_x + button_size + SIDEBAR_INSET;
-        let title_right = actions_x.saturating_sub(SIDEBAR_INSET);
+        let title_x = content_x + button_size + self.ui_px(SIDEBAR_INSET);
+        let title_right = actions_x.saturating_sub(self.ui_px(SIDEBAR_INSET));
         let title_width = title_right.saturating_sub(title_x);
         let title = file_name_for_path(path);
         self.paint_sidebar_text(
@@ -4123,7 +4185,7 @@ impl crate::TermWindow {
         }
 
         if arrow_width > 0 {
-            let chevron_size = (height * 40 / 100).clamp(14, 18);
+            let chevron_size = (height * 40 / 100).clamp(self.ui_px(14), self.ui_px(18));
             self.paint_sidebar_icon(
                 layers,
                 SvgIcon::ChevronDown,
@@ -4168,7 +4230,7 @@ impl crate::TermWindow {
             height: size,
             item_type,
         });
-        let icon_size = (size * 58 / 100).max(16);
+        let icon_size = (size * 58 / 100).max(self.ui_px(16));
         self.paint_sidebar_icon(
             layers,
             icon,
@@ -4372,7 +4434,8 @@ impl crate::TermWindow {
                 metrics.x,
                 metrics.y,
                 metrics.width,
-                FILE_SCROLL_FADE_HEIGHT.min(body_bottom.saturating_sub(metrics.y)),
+                self.ui_px(FILE_SCROLL_FADE_HEIGHT)
+                    .min(body_bottom.saturating_sub(metrics.y)),
             )?;
         }
         self.paint_files_preview_header(
@@ -4669,7 +4732,7 @@ impl crate::TermWindow {
         )
         .context("right sidebar file preview scroll thumb")?;
 
-        let hit_slop = FILE_PREVIEW_SCROLLBAR_HIT_SLOP;
+        let hit_slop = self.ui_px(FILE_PREVIEW_SCROLLBAR_HIT_SLOP);
         self.ui_items.push(UIItem {
             x: scroll.track_x.saturating_sub(hit_slop),
             y: scroll.track_y,
@@ -4730,18 +4793,18 @@ impl crate::TermWindow {
             x: scroll.track_x,
             y: scroll
                 .track_y
-                .saturating_sub(FILE_PREVIEW_SCROLLBAR_HIT_SLOP),
+                .saturating_sub(self.ui_px(FILE_PREVIEW_SCROLLBAR_HIT_SLOP)),
             width: scroll.track_width,
-            height: scroll.track_height + FILE_PREVIEW_SCROLLBAR_HIT_SLOP * 2,
+            height: scroll.track_height + self.ui_px(FILE_PREVIEW_SCROLLBAR_HIT_SLOP) * 2,
             item_type: UIItemType::RightSidebarFilePreviewHorizontalScrollTrack,
         });
         self.ui_items.push(UIItem {
             x: scroll.thumb_x.round().max(0.0) as usize,
             y: scroll
                 .track_y
-                .saturating_sub(FILE_PREVIEW_SCROLLBAR_HIT_SLOP),
+                .saturating_sub(self.ui_px(FILE_PREVIEW_SCROLLBAR_HIT_SLOP)),
             width: scroll.thumb_width.round().max(1.0) as usize,
-            height: scroll.track_height + FILE_PREVIEW_SCROLLBAR_HIT_SLOP * 2,
+            height: scroll.track_height + self.ui_px(FILE_PREVIEW_SCROLLBAR_HIT_SLOP) * 2,
             item_type: UIItemType::RightSidebarFilePreviewHorizontalScrollThumb,
         });
 
@@ -4925,20 +4988,23 @@ impl crate::TermWindow {
         icon_size: usize,
     ) -> anyhow::Result<()> {
         let toolbar_y = content_top;
-        let new_button_icon_size = (ui_metrics.cell_size.height as usize + 2).clamp(18, 22);
+        let new_button_icon_size = (ui_metrics.cell_size.height as usize + self.ui_px(2))
+            .clamp(self.ui_px(18), self.ui_px(22));
         let new_button_label_width =
             self.sidebar_text_width(ui_font, "New Snippet")?.ceil() as usize;
-        let toolbar_gap = SNIPPET_ROW_GAP;
+        let toolbar_gap = self.ui_px(SNIPPET_ROW_GAP);
         let search_is_active = self.right_sidebar_snippet_focus
             == Some(RightSidebarSnippetField::Search)
             || !self.right_sidebar_snippet_search.text.is_empty();
-        let full_new_button_width =
-            new_button_icon_size + SIDEBAR_ICON_GAP + new_button_label_width + SIDEBAR_INSET * 4;
+        let full_new_button_width = new_button_icon_size
+            + self.ui_px(SIDEBAR_ICON_GAP)
+            + new_button_label_width
+            + self.ui_px(SIDEBAR_INSET) * 4;
         let min_search_width = 160.min(content_width);
         let collapse_new_button = search_is_active
             || content_width < full_new_button_width + toolbar_gap + min_search_width;
         let new_button_width = if collapse_new_button {
-            SNIPPET_TOOLBAR_HEIGHT.min(content_width)
+            self.ui_px(SNIPPET_TOOLBAR_HEIGHT).min(content_width)
         } else {
             full_new_button_width.min(content_width)
         };
@@ -4957,7 +5023,7 @@ impl crate::TermWindow {
             content_x,
             toolbar_y,
             new_button_width,
-            SNIPPET_TOOLBAR_HEIGHT,
+            self.ui_px(SNIPPET_TOOLBAR_HEIGHT),
             Some(SvgIcon::CodeXml),
             new_button_label,
             UIItemType::RightSidebarSnippetNew,
@@ -4981,7 +5047,7 @@ impl crate::TermWindow {
                 search_x,
                 search_y,
                 search_width,
-                SNIPPET_SEARCH_HEIGHT,
+                self.ui_px(SNIPPET_SEARCH_HEIGHT),
                 Some(SvgIcon::Search),
                 "Search",
                 &search_input,
@@ -4991,8 +5057,11 @@ impl crate::TermWindow {
             )?;
         }
 
-        let list_top =
-            toolbar_y + SNIPPET_TOOLBAR_HEIGHT.max(SNIPPET_SEARCH_HEIGHT) + SNIPPET_LIST_TOP_GAP;
+        let list_top = toolbar_y
+            + self
+                .ui_px(SNIPPET_TOOLBAR_HEIGHT)
+                .max(self.ui_px(SNIPPET_SEARCH_HEIGHT))
+            + self.ui_px(SNIPPET_LIST_TOP_GAP);
         let needle = self
             .right_sidebar_snippet_search
             .text
@@ -5006,10 +5075,9 @@ impl crate::TermWindow {
                     || snippet.body.to_ascii_lowercase().contains(&needle)
             })
             .collect();
-        let row_height = SNIPPET_CARD_HEIGHT + SNIPPET_ROW_GAP;
-        let visible_height = content_bottom.saturating_sub(list_top + SIDEBAR_INSET);
-        let total_height =
-            Self::right_sidebar_snippet_scroll_height(snippets.len(), visible_height);
+        let row_height = self.ui_px(SNIPPET_CARD_HEIGHT) + self.ui_px(SNIPPET_ROW_GAP);
+        let visible_height = content_bottom.saturating_sub(list_top + self.ui_px(SIDEBAR_INSET));
+        let total_height = self.right_sidebar_snippet_scroll_height(snippets.len(), visible_height);
         let max_scroll = total_height.saturating_sub(visible_height) as f32;
         self.right_sidebar_snippet_scroll_offset = self
             .right_sidebar_snippet_scroll_offset
@@ -5017,8 +5085,9 @@ impl crate::TermWindow {
         let scroll_offset = self.right_sidebar_snippet_scroll_offset;
 
         if snippets.is_empty() {
-            let empty_height = RIGHT_SIDEBAR_EMPTY_HEIGHT
-                .min(content_bottom.saturating_sub(list_top + SIDEBAR_INSET));
+            let empty_height = self
+                .ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT)
+                .min(content_bottom.saturating_sub(list_top + self.ui_px(SIDEBAR_INSET)));
             if empty_height == 0 {
                 return Ok(());
             }
@@ -5033,15 +5102,15 @@ impl crate::TermWindow {
                 ),
                 chrome.sidebar_button_bg,
                 chrome.control_border,
-                SIDEBAR_ROW_RADIUS + 6.0,
+                self.ui_f32(SIDEBAR_ROW_RADIUS) + 6.0,
                 CAPSULE_BORDER_WIDTH,
             )
             .context("right sidebar snippets empty state")?;
             let empty_icon_size = icon_size
-                .min(22)
+                .min(self.ui_px(22))
                 .min(empty_height.saturating_sub(20))
                 .max(1);
-            let empty_icon_x = content_x + SIDEBAR_INSET + 2;
+            let empty_icon_x = content_x + self.ui_px(SIDEBAR_INSET) + 2;
             let empty_icon_y = list_top + (empty_height.saturating_sub(empty_icon_size)) / 2;
             self.paint_sidebar_icon(
                 layers,
@@ -5060,21 +5129,22 @@ impl crate::TermWindow {
                 } else {
                     "No matching snippets"
                 },
-                empty_icon_x + empty_icon_size + SIDEBAR_ICON_GAP + 2,
+                empty_icon_x + empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + 2,
                 list_top + (empty_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
-                content_width
-                    .saturating_sub(empty_icon_size + SIDEBAR_ICON_GAP + SIDEBAR_INSET * 3),
+                content_width.saturating_sub(
+                    empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + self.ui_px(SIDEBAR_INSET) * 3,
+                ),
                 muted_fg,
             )?;
             return Ok(());
         }
 
         let list_top_f = list_top as f32;
-        let content_bottom = content_bottom.saturating_sub(SIDEBAR_INSET);
+        let content_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
         let content_bottom_f = content_bottom as f32;
         for (idx, snippet) in snippets.into_iter().enumerate() {
             let row_top = list_top_f + (idx * row_height) as f32 - scroll_offset;
-            let row_bottom = row_top + SNIPPET_CARD_HEIGHT as f32;
+            let row_bottom = row_top + self.ui_px(SNIPPET_CARD_HEIGHT) as f32;
             if row_bottom <= list_top_f {
                 continue;
             }
@@ -5196,13 +5266,13 @@ impl crate::TermWindow {
             UIItemType::RightSidebarSnippetBack,
         )?;
 
-        let title_x = content_x + back_size + SIDEBAR_INSET;
+        let title_x = content_x + back_size + self.ui_px(SIDEBAR_INSET);
         let save_label_width = self.sidebar_text_width(ui_font, "Save")?.ceil() as usize;
-        let save_width = (save_label_width + SIDEBAR_INSET * 6)
-            .clamp(110, 136)
-            .min(content_width.saturating_sub(back_size + SIDEBAR_INSET * 2));
+        let save_width = (save_label_width + self.ui_px(SIDEBAR_INSET) * 6)
+            .clamp(self.ui_px(110), self.ui_px(136))
+            .min(content_width.saturating_sub(back_size + self.ui_px(SIDEBAR_INSET) * 2));
         let save_x = content_x + content_width.saturating_sub(save_width);
-        let title_width = save_x.saturating_sub(title_x + SIDEBAR_INSET * 2);
+        let title_width = save_x.saturating_sub(title_x + self.ui_px(SIDEBAR_INSET) * 2);
         let title_label = match self.right_sidebar_snippet_view {
             RightSidebarSnippetView::EditNew => "New Snippet",
             RightSidebarSnippetView::EditExisting(_) => "Edit Snippet",
@@ -5239,7 +5309,8 @@ impl crate::TermWindow {
             save_x,
             header_top,
             save_width,
-            SNIPPET_SAVE_BUTTON_HEIGHT.min(SNIPPET_EDITOR_HEADER_HEIGHT - 12),
+            self.ui_px(SNIPPET_SAVE_BUTTON_HEIGHT)
+                .min(self.ui_px(SNIPPET_EDITOR_HEADER_HEIGHT) - 12),
             None,
             "Save",
             UIItemType::RightSidebarSnippetSave,
@@ -5247,7 +5318,7 @@ impl crate::TermWindow {
         )?;
 
         let field_label_height = ui_metrics.cell_size.height as usize;
-        let title_label_y = header_y + SNIPPET_EDITOR_HEADER_HEIGHT;
+        let title_label_y = header_y + self.ui_px(SNIPPET_EDITOR_HEADER_HEIGHT);
         self.paint_sidebar_text(
             layers,
             ui_font,
@@ -5270,7 +5341,7 @@ impl crate::TermWindow {
             content_x,
             title_y,
             content_width,
-            SNIPPET_FIELD_HEIGHT,
+            self.ui_px(SNIPPET_FIELD_HEIGHT),
             None,
             "Describe this action",
             &title_input,
@@ -5279,7 +5350,8 @@ impl crate::TermWindow {
             false,
         )?;
 
-        let body_label_y = title_y + SNIPPET_FIELD_HEIGHT + RIGHT_SIDEBAR_SECTION_GAP + 4;
+        let body_label_y =
+            title_y + self.ui_px(SNIPPET_FIELD_HEIGHT) + self.ui_px(RIGHT_SIDEBAR_SECTION_GAP) + 4;
         self.paint_sidebar_text(
             layers,
             ui_font,
@@ -5291,7 +5363,9 @@ impl crate::TermWindow {
             muted_fg,
         )?;
         let body_y = body_label_y + field_label_height + 8;
-        let body_height = SNIPPET_BODY_FIELD_HEIGHT.min(content_bottom.saturating_sub(body_y));
+        let body_height = self
+            .ui_px(SNIPPET_BODY_FIELD_HEIGHT)
+            .min(content_bottom.saturating_sub(body_y));
         let body_input = self.right_sidebar_snippet_body.clone();
         self.paint_snippet_text_box(
             layers,
@@ -5333,7 +5407,7 @@ impl crate::TermWindow {
         clip_top: usize,
         clip_bottom: usize,
     ) -> anyhow::Result<()> {
-        let card_bottom = y.saturating_add(SNIPPET_CARD_HEIGHT);
+        let card_bottom = y.saturating_add(self.ui_px(SNIPPET_CARD_HEIGHT));
         let visible_y = y.max(clip_top);
         let visible_bottom = card_bottom.min(clip_bottom);
         let visible_height = visible_bottom.saturating_sub(visible_y);
@@ -5361,7 +5435,7 @@ impl crate::TermWindow {
             } else {
                 chrome.control_border.mul_alpha(0.72)
             },
-            SIDEBAR_ROW_RADIUS + 10.0,
+            self.ui_f32(SIDEBAR_ROW_RADIUS) + 10.0,
             CAPSULE_BORDER_WIDTH,
         )
         .context("right sidebar snippet card")?;
@@ -5373,21 +5447,24 @@ impl crate::TermWindow {
             item_type: UIItemType::RightSidebarSnippetEdit(snippet.id.clone()),
         });
 
-        let card_pad = SIDEBAR_INSET * 2;
+        let card_pad = self.ui_px(SIDEBAR_INSET) * 2;
         let text_x = x + card_pad;
         let run_button_width = (self.sidebar_text_width(ui_font, "Run")?.ceil() as usize
-            + SIDEBAR_INSET * 4)
-            .max(SNIPPET_ACTION_BUTTON_MIN_WIDTH);
+            + self.ui_px(SIDEBAR_INSET) * 4)
+            .max(self.ui_px(SNIPPET_ACTION_BUTTON_MIN_WIDTH));
         let paste_button_width = (self.sidebar_text_width(ui_font, "Paste")?.ceil() as usize
-            + SIDEBAR_INSET * 4)
-            .max(SNIPPET_ACTION_BUTTON_MIN_WIDTH);
-        let delete_button_size = SNIPPET_ACTION_BUTTON_HEIGHT;
+            + self.ui_px(SIDEBAR_INSET) * 4)
+            .max(self.ui_px(SNIPPET_ACTION_BUTTON_MIN_WIDTH));
+        let delete_button_size = self.ui_px(SNIPPET_ACTION_BUTTON_HEIGHT);
         let action_area_width = if hovered {
-            run_button_width + paste_button_width + delete_button_size + SIDEBAR_INSET * 2
+            run_button_width
+                + paste_button_width
+                + delete_button_size
+                + self.ui_px(SIDEBAR_INSET) * 2
         } else {
             0
         };
-        let title_y = y + SIDEBAR_INSET * 2;
+        let title_y = y + self.ui_px(SIDEBAR_INSET) * 2;
         if title_y >= clip_top && title_y < clip_bottom {
             self.paint_sidebar_text(
                 layers,
@@ -5401,7 +5478,8 @@ impl crate::TermWindow {
             )?;
         }
         let preview = snippet_preview(&snippet.body);
-        let preview_y = y + SIDEBAR_INSET * 2 + ui_metrics.cell_size.height as usize + 8;
+        let preview_y =
+            y + self.ui_px(SIDEBAR_INSET) * 2 + ui_metrics.cell_size.height as usize + 8;
         if preview_y >= clip_top && preview_y < clip_bottom {
             self.paint_sidebar_text(
                 layers,
@@ -5418,9 +5496,9 @@ impl crate::TermWindow {
         let fully_visible = y >= clip_top && card_bottom <= clip_bottom;
         if hovered && fully_visible {
             let delete_x = x + width.saturating_sub(card_pad + delete_button_size);
-            let paste_x = delete_x.saturating_sub(SIDEBAR_INSET + paste_button_width);
-            let run_x = paste_x.saturating_sub(SIDEBAR_INSET + run_button_width);
-            let action_y = y + SIDEBAR_INSET * 2 - 4;
+            let paste_x = delete_x.saturating_sub(self.ui_px(SIDEBAR_INSET) + paste_button_width);
+            let run_x = paste_x.saturating_sub(self.ui_px(SIDEBAR_INSET) + run_button_width);
+            let action_y = y + self.ui_px(SIDEBAR_INSET) * 2 - 4;
             self.paint_snippet_button(
                 layers,
                 ui_font,
@@ -5431,7 +5509,7 @@ impl crate::TermWindow {
                 run_x,
                 action_y,
                 run_button_width,
-                SNIPPET_ACTION_BUTTON_HEIGHT,
+                self.ui_px(SNIPPET_ACTION_BUTTON_HEIGHT),
                 None,
                 "Run",
                 UIItemType::RightSidebarSnippetRun(snippet.id.clone()),
@@ -5447,7 +5525,7 @@ impl crate::TermWindow {
                 paste_x,
                 action_y,
                 paste_button_width,
-                SNIPPET_ACTION_BUTTON_HEIGHT,
+                self.ui_px(SNIPPET_ACTION_BUTTON_HEIGHT),
                 None,
                 "Paste",
                 UIItemType::RightSidebarSnippetPaste(snippet.id.clone()),
@@ -5512,7 +5590,7 @@ impl crate::TermWindow {
             if is_search_field {
                 WINDOW_TAB_ADD_BUTTON_RADIUS
             } else {
-                SIDEBAR_ROW_RADIUS + 4.0
+                self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0
             },
             CAPSULE_BORDER_WIDTH,
         )
@@ -5525,10 +5603,11 @@ impl crate::TermWindow {
             item_type: item_type.clone(),
         });
 
-        let text_pad = SIDEBAR_INSET + 2;
+        let text_pad = self.ui_px(SIDEBAR_INSET) + 2;
         let mut text_x = x + text_pad;
         if let Some(icon) = icon {
-            let icon_size = (ui_metrics.cell_size.height as usize + 2).clamp(18, 22);
+            let icon_size = (ui_metrics.cell_size.height as usize + self.ui_px(2))
+                .clamp(self.ui_px(18), self.ui_px(22));
             self.paint_sidebar_icon(
                 layers,
                 icon,
@@ -5537,7 +5616,7 @@ impl crate::TermWindow {
                 icon_size,
                 muted_fg,
             )?;
-            text_x += icon_size + SIDEBAR_ICON_GAP;
+            text_x += icon_size + self.ui_px(SIDEBAR_ICON_GAP);
         }
 
         let text_color = if input.text.is_empty() && !focused {
@@ -5552,8 +5631,9 @@ impl crate::TermWindow {
         };
         if multiline {
             let line_height = ui_metrics.cell_size.height as usize + 4;
-            let max_lines = height.saturating_sub(SIDEBAR_INSET * 2).max(1) / line_height.max(1);
-            let mut line_y = y + SIDEBAR_INSET + 2;
+            let max_lines =
+                height.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2).max(1) / line_height.max(1);
+            let mut line_y = y + self.ui_px(SIDEBAR_INSET) + 2;
             let text_width = width.saturating_sub((text_x - x) + text_pad);
             let visible_lines = wrap_snippet_text_for_width(text, max_lines.max(1), focused, |s| {
                 self.sidebar_text_width(ui_font, s).unwrap_or(f32::MAX) / text_width.max(1) as f32
@@ -5585,7 +5665,7 @@ impl crate::TermWindow {
                     euclid::rect(
                         caret_x as f32,
                         last_line_y as f32,
-                        SNIPPET_CARET_WIDTH,
+                        self.ui_f32(SNIPPET_CARET_WIDTH),
                         (ui_metrics.cell_size.height as f32).max(1.0),
                     ),
                     chrome.text,
@@ -5611,7 +5691,7 @@ impl crate::TermWindow {
                 let chars: Vec<char> = input.text.chars().collect();
                 let cursor = input.cursor.min(chars.len());
                 let avail = text_area_width as f32;
-                let caret_margin = SNIPPET_CARET_WIDTH + 2.0;
+                let caret_margin = self.ui_f32(SNIPPET_CARET_WIDTH) + 2.0;
 
                 // Horizontal scroll: push the first visible char forward until
                 // the caret is back inside the field.
@@ -5680,7 +5760,7 @@ impl crate::TermWindow {
                         euclid::rect(
                             text_x as f32 + caret_offset,
                             baseline_y as f32,
-                            SNIPPET_CARET_WIDTH,
+                            self.ui_f32(SNIPPET_CARET_WIDTH),
                             (ui_metrics.cell_size.height as f32).max(1.0),
                         ),
                         chrome.text,
@@ -5756,14 +5836,17 @@ impl crate::TermWindow {
         }
 
         let icon_size = icon
-            .map(|_| (ui_metrics.cell_size.height as usize + 2).clamp(18, 22))
+            .map(|_| {
+                (ui_metrics.cell_size.height as usize + self.ui_px(2))
+                    .clamp(self.ui_px(18), self.ui_px(22))
+            })
             .unwrap_or(0);
-        let horizontal_pad = SIDEBAR_INSET * 2;
+        let horizontal_pad = self.ui_px(SIDEBAR_INSET) * 2;
         let available_label_width = width.saturating_sub(horizontal_pad * 2 + icon_size);
         let text_width =
             (self.sidebar_text_width(ui_font, label)?.ceil() as usize).min(available_label_width);
         let icon_label_gap = if icon.is_some() && text_width > 0 {
-            SIDEBAR_ICON_GAP
+            self.ui_px(SIDEBAR_ICON_GAP)
         } else {
             0
         };
@@ -5790,7 +5873,7 @@ impl crate::TermWindow {
             label,
             text_x,
             y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
-            width.saturating_sub(text_x.saturating_sub(x) + SIDEBAR_INSET),
+            width.saturating_sub(text_x.saturating_sub(x) + self.ui_px(SIDEBAR_INSET)),
             color,
         )
     }
@@ -5825,7 +5908,7 @@ impl crate::TermWindow {
             height: size,
             item_type,
         });
-        let icon_size = (size * 58 / 100).max(16);
+        let icon_size = (size * 58 / 100).max(self.ui_px(16));
         self.paint_sidebar_icon(
             layers,
             icon,
@@ -6014,10 +6097,11 @@ fn file_preview_line_number_width(
     number_digits: usize,
     cell_width: usize,
     body_width: usize,
+    icon_gap: usize,
 ) -> usize {
     number_digits
         .saturating_mul(cell_width.max(1))
-        .saturating_add(SIDEBAR_ICON_GAP * 2)
+        .saturating_add(icon_gap * 2)
         .max(36)
         .min(body_width / 2)
 }
@@ -6125,14 +6209,17 @@ fn preview_visible_line_range(
 }
 
 fn right_sidebar_file_row_metrics(ui_metrics: RenderMetrics) -> RightSidebarFileRowMetrics {
-    let cell_height = ui_metrics.cell_size.height as usize;
-    let row_height = cell_height.saturating_add(18).clamp(38, 58);
-    let icon_size = cell_height
-        .saturating_add(8)
-        .clamp(22, row_height.saturating_sub(8));
-    let chevron_size = (icon_size * 72 / 100).clamp(14, 24);
-    let indent_step = (icon_size * 58 / 100).clamp(14, 22);
-    let icon_gap = (icon_size / 3).clamp(8, 14);
+    // Font metrics already follow the window DPI. Derive the row chrome from
+    // those metrics so the file tree keeps the same logical size across
+    // displays instead of being pinned by physical-pixel clamps.
+    let cell_height = (ui_metrics.cell_size.height as usize).max(1);
+    let row_height = (cell_height * 17 / 10).max(cell_height);
+    let icon_size = (cell_height * 13 / 10)
+        .min(row_height.saturating_sub(1))
+        .max(1);
+    let chevron_size = (icon_size * 72 / 100).max(1);
+    let indent_step = (icon_size * 58 / 100).max(1);
+    let icon_gap = (icon_size / 3).max(1);
     RightSidebarFileRowMetrics {
         row_height,
         icon_size,
@@ -7056,13 +7143,13 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_right_sidebar_file_index, full_line_colors_by_byte, image_pixels_within_preview_budget,
-        load_file_preview, load_file_preview_image, naturalish_cmp, path_key, preview_line_count,
-        preview_lines_from_text, preview_plain_lines_from_text,
-        preview_text_range, preview_visible_colored, preview_visible_line_range,
+        build_right_sidebar_file_index, full_line_colors_by_byte,
+        image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
+        naturalish_cmp, open_with_candidate_allowed, path_key, preview_line_count,
+        preview_lines_from_text, preview_plain_lines_from_text, preview_text_range,
+        preview_visible_colored, preview_visible_line_range,
         right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
-        open_with_candidate_allowed, right_sidebar_open_with_cache_key,
-        search_right_sidebar_file_index, snippet_cursor_visible,
+        right_sidebar_open_with_cache_key, search_right_sidebar_file_index, snippet_cursor_visible,
         snippet_run_buffer, sorted_open_with_candidates, visible_file_row_range,
         wrap_snippet_text_for_width, FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT, FILE_PREVIEW_MAX_BYTES,
     };
@@ -7327,15 +7414,17 @@ mod tests {
         let normal = right_sidebar_file_row_metrics(test_render_metrics(26, 13));
         let large = right_sidebar_file_row_metrics(test_render_metrics(48, 24));
 
-        assert_eq!(small.row_height, 38);
-        assert_eq!(small.icon_size, 26);
+        assert_eq!(small.row_height, 30);
+        assert_eq!(small.icon_size, 23);
         assert!(normal.row_height > small.row_height);
         assert!(normal.icon_size > small.icon_size);
         assert!(normal.indent_step >= small.indent_step);
         assert!(normal.icon_gap >= small.icon_gap);
-        assert_eq!(large.row_height, 58);
-        assert_eq!(large.icon_size, 50);
-        assert!(large.chevron_size <= 24);
+        assert_eq!(large.row_height, 81);
+        assert_eq!(large.icon_size, 62);
+        assert!(large.row_height > normal.row_height);
+        assert!(large.icon_size > normal.icon_size);
+        assert!(large.chevron_size > normal.chevron_size);
     }
 
     #[test]
@@ -7344,7 +7433,7 @@ mod tests {
         assert!(image_pixels_within_preview_budget(1920, 1080)); // 2 MP
         assert!(image_pixels_within_preview_budget(4096, 2160)); // ~8.8 MP (4K)
         assert!(image_pixels_within_preview_budget(4000, 4000)); // 16 MP (== budget)
-        // Bombs are rejected, and the u64 product cannot overflow.
+                                                                 // Bombs are rejected, and the u64 product cannot overflow.
         assert!(!image_pixels_within_preview_budget(8000, 8000)); // 64 MP
         assert!(!image_pixels_within_preview_budget(100_000, 100_000));
         assert!(!image_pixels_within_preview_budget(u32::MAX, u32::MAX));
@@ -7411,7 +7500,11 @@ mod tests {
             cand("/Applications/calibre.app", "calibre", false),
             cand("/Applications/Cursor.app", "Cursor", false),
             cand("/Applications/Zed.app", "Zed", false),
-            cand("/Applications/Visual Studio Code.app", "Visual Studio Code", false),
+            cand(
+                "/Applications/Visual Studio Code.app",
+                "Visual Studio Code",
+                false,
+            ),
             cand(
                 "/Applications/calibre.app/Contents/ebook-viewer.app",
                 "ebook-viewer",

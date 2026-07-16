@@ -35,9 +35,6 @@ pub const PANE_NAV_ICON_GAP: usize = 8;
 pub const PANE_NAV_BUTTON_GAP: usize = 4;
 pub const PANE_NAV_TAB_GAP: usize = 18;
 pub const PANE_NAV_TAB_TOP_OFFSET: usize = 4;
-pub const PANE_NAV_EXTRA_HEIGHT: usize = 32;
-pub const PANE_NAV_MIN_HEIGHT: usize = 62;
-pub const PANE_NAV_MAX_HEIGHT: usize = 72;
 pub const PANE_NAV_TAB_RADIUS: f32 = 12.0;
 pub const PANE_NAV_ACTION_BUTTON_RADIUS: f32 = 999.0;
 
