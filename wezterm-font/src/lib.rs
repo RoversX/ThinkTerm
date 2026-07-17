@@ -1031,6 +1031,12 @@ impl FontConfigInner {
             self.pane_select_font.borrow_mut().take();
             self.char_select_font.borrow_mut().take();
             self.command_palette_font.borrow_mut().take();
+            // Sized entity fonts are rasterized for the DPI that was active
+            // when they were cached. Reusing them after moving a window
+            // between Retina and non-Retina displays leaves the custom UI
+            // text at the old backing scale while its controls use the new
+            // scale.
+            self.entity_font_overrides.borrow_mut().clear();
         }
 
         (prior_font, prior_dpi)
@@ -1237,5 +1243,33 @@ impl FontConfiguration {
         attrs: &CellAttributes,
     ) -> &'a TextStyle {
         self.inner.match_style(config, attrs)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dpi_change_invalidates_sized_entity_font_cache() -> anyhow::Result<()> {
+        let fonts = FontConfiguration::new(Some(ConfigHandle::default_config()), 144)?;
+
+        let retina = fonts.title_font_with_size(15.0)?;
+        assert_eq!(retina.dpi, 144);
+        let retina_id = retina.id();
+        assert!(Rc::ptr_eq(&retina, &fonts.title_font_with_size(15.0)?));
+
+        fonts.change_scaling(1.0, 72);
+        let standard = fonts.title_font_with_size(15.0)?;
+        assert_eq!(standard.dpi, 72);
+        assert_ne!(standard.id(), retina_id);
+        assert!(Rc::ptr_eq(&standard, &fonts.title_font_with_size(15.0)?));
+
+        fonts.change_scaling(1.0, 144);
+        let retina_again = fonts.title_font_with_size(15.0)?;
+        assert_eq!(retina_again.dpi, 144);
+        assert_ne!(retina_again.id(), standard.id());
+
+        Ok(())
     }
 }

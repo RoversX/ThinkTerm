@@ -2149,6 +2149,18 @@ impl Default for WindowDecorations {
     }
 }
 
+impl WindowDecorations {
+    /// Whether the platform should render a title bar separate from the
+    /// application-provided integrated title buttons.
+    ///
+    /// Treat integrated buttons as authoritative when both flags are present
+    /// so that an imported or legacy configuration cannot produce two title
+    /// bars.
+    pub fn shows_separate_title_bar(self) -> bool {
+        self.contains(Self::TITLE) && !self.contains(Self::INTEGRATED_BUTTONS)
+    }
+}
+
 #[derive(Debug, FromDynamic, ToDynamic, PartialEq, Eq, Clone, Copy)]
 pub enum IntegratedTitleButton {
     Hide,
@@ -2329,6 +2341,19 @@ impl Default for UIKeyCapRendering {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn integrated_window_buttons_suppress_a_separate_title_bar() {
+        assert!((WindowDecorations::TITLE | WindowDecorations::RESIZE).shows_separate_title_bar());
+        assert!(
+            !(WindowDecorations::RESIZE | WindowDecorations::INTEGRATED_BUTTONS)
+                .shows_separate_title_bar()
+        );
+        assert!(!(WindowDecorations::TITLE
+            | WindowDecorations::RESIZE
+            | WindowDecorations::INTEGRATED_BUTTONS)
+            .shows_separate_title_bar());
+    }
 
     #[test]
     fn encode_issue_3220() {

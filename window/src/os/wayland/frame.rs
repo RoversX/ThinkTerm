@@ -23,7 +23,6 @@ use wayland_client::protocol::{
 use wayland_client::{Attached, DispatchData, Main};
 use wezterm_color_types::SrgbaTuple;
 use wezterm_font::{FontConfiguration, FontMetrics, GlyphInfo, RasterizedGlyph};
-use wezterm_input_types::WindowDecorations;
 
 fn color_to_paint(c: RgbaColor) -> Paint<'static> {
     let mut paint = Paint::default();
@@ -520,7 +519,7 @@ impl ConceptFrame {
             self.config
                 .config
                 .window_decorations
-                .contains(WindowDecorations::TITLE)
+                .shows_separate_title_bar()
         }
     }
 }

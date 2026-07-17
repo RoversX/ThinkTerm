@@ -3765,7 +3765,7 @@ impl crate::TermWindow {
                 muted_fg,
                 content_x,
                 content_top,
-                content_width,
+                filter_width,
                 self.ui_px(FILE_FILTER_HEIGHT),
                 Some(SvgIcon::Search),
                 "Filter files",
@@ -3773,6 +3773,17 @@ impl crate::TermWindow {
                 self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter),
                 UIItemType::RightSidebarFileFilter,
                 false,
+            )?;
+            self.paint_files_preview_header_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                refresh_x,
+                refresh_y,
+                refresh_size,
+                SvgIcon::RotateCcw,
+                UIItemType::RightSidebarFileRefresh,
             )?;
             self.paint_right_sidebar_file_top_fade(
                 layers,

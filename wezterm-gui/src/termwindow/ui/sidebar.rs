@@ -2365,7 +2365,7 @@ impl crate::TermWindow {
         color: LinearRgba,
         radius: f32,
     ) -> anyhow::Result<()> {
-        let radius = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
+        let radius = snapped_rounded_corner_radius(rect, radius);
         // Sub-pixel radii round down to a 0px corner sprite (which panics when
         // building its pixmap), so fall back to a plain rectangle below ~1px.
         if !(radius >= 1.0) {
@@ -2699,9 +2699,19 @@ fn ellipsize_cut_byte(glyphs: &[(f32, usize)], text_len: usize, budget: f32) -> 
     cut
 }
 
+/// Corner sprites are cached at integral physical-pixel sizes. Keep the quad
+/// geometry on that same grid so fractional radii cannot expose the joins
+/// between the four corners and the center rectangles on 1x displays.
+fn snapped_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
+    radius
+        .min(rect.width() / 2.0)
+        .min(rect.height() / 2.0)
+        .floor()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ellipsize_cut_byte;
+    use super::{ellipsize_cut_byte, snapped_rounded_corner_radius};
 
     // Build (advance, cluster) pairs for an ASCII or per-char string where every
     // char is one glyph of `advance` px and the cluster is its byte offset.
@@ -2745,5 +2755,15 @@ mod tests {
         let text = "abc";
         let glyphs = glyphs_per_char(text, 10.0);
         assert_eq!(ellipsize_cut_byte(&glyphs, text.len(), 5.0), 0);
+    }
+
+    #[test]
+    fn rounded_corner_radius_matches_integral_corner_sprite_size() {
+        let odd_height = euclid::rect(0.0, 0.0, 215.0, 33.0);
+        let even_height = euclid::rect(0.0, 0.0, 215.0, 34.0);
+
+        assert_eq!(snapped_rounded_corner_radius(odd_height, 999.0), 16.0);
+        assert_eq!(snapped_rounded_corner_radius(even_height, 999.0), 17.0);
+        assert_eq!(snapped_rounded_corner_radius(even_height, 10.75), 10.0);
     }
 }

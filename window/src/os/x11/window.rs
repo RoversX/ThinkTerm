@@ -1294,12 +1294,14 @@ impl XWindowInner {
         const FUNC_MAXIMIZE: u32 = 1 << 4;
         const FUNC_CLOSE: u32 = 1 << 5;
 
-        let decorations = if decorations == WindowDecorations::TITLE | WindowDecorations::RESIZE {
+        let decorations = if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS) {
+            // Integrated title buttons live in ThinkTerm's own header.  Never
+            // ask the window manager for another title bar, even if a legacy
+            // configuration also contains TITLE.
+            FUNC_RESIZE
+        } else if decorations == WindowDecorations::TITLE | WindowDecorations::RESIZE {
             FUNC_ALL
-        } else if decorations == WindowDecorations::RESIZE
-            || decorations == WindowDecorations::INTEGRATED_BUTTONS
-            || decorations == WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE
-        {
+        } else if decorations == WindowDecorations::RESIZE {
             FUNC_RESIZE
         } else if decorations == WindowDecorations::TITLE {
             FUNC_MOVE | FUNC_MINIMIZE | FUNC_MAXIMIZE | FUNC_CLOSE
