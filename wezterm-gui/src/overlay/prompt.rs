@@ -169,9 +169,7 @@ pub fn pick_path_prompt_overlay(
                 y: Position::Absolute(0),
             },
             Change::Text(format!("{}\r\n", description.replace('\n', "\r\n"))),
-            Change::Attribute(AttributeChange::Intensity(
-                termwiz::cell::Intensity::Half,
-            )),
+            Change::Attribute(AttributeChange::Intensity(termwiz::cell::Intensity::Half)),
             Change::Text(format!("{hint}\r\n")),
             Change::AllAttributes(CellAttributes::default()),
             Change::Text(format!("{prompt}{input}\r\n")),
@@ -193,7 +191,9 @@ pub fn pick_path_prompt_overlay(
             }
         }
         changes.push(Change::CursorPosition {
-            x: Position::Absolute(unicode_column_width(prompt, None) + unicode_column_width(&input, None)),
+            x: Position::Absolute(
+                unicode_column_width(prompt, None) + unicode_column_width(&input, None),
+            ),
             y: Position::Absolute(description_rows + 1),
         });
         term.render(&changes)?;
@@ -204,8 +204,9 @@ pub fn pick_path_prompt_overlay(
         match event {
             InputEvent::Key(KeyEvent { key, modifiers }) => match (key, modifiers) {
                 (KeyCode::Escape, _) => return Ok(None),
-                (KeyCode::Char('c'), Modifiers::CTRL)
-                | (KeyCode::Char('g'), Modifiers::CTRL) => return Ok(None),
+                (KeyCode::Char('c'), Modifiers::CTRL) | (KeyCode::Char('g'), Modifiers::CTRL) => {
+                    return Ok(None)
+                }
                 (KeyCode::UpArrow, _) | (KeyCode::Char('p'), Modifiers::CTRL) => {
                     active = active.saturating_sub(1);
                 }
@@ -235,9 +236,7 @@ pub fn pick_path_prompt_overlay(
                     top_row = 0;
                 }
                 (KeyCode::Char(c), mods)
-                    if !mods.intersects(
-                        Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
-                    ) =>
+                    if !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER) =>
                 {
                     input.push(c);
                     active = 0;
@@ -245,9 +244,9 @@ pub fn pick_path_prompt_overlay(
                 }
                 _ => {}
             },
-            InputEvent::Mouse(MouseEvent {
-                mouse_buttons, ..
-            }) if mouse_buttons.contains(MouseButtons::VERT_WHEEL) => {
+            InputEvent::Mouse(MouseEvent { mouse_buttons, .. })
+                if mouse_buttons.contains(MouseButtons::VERT_WHEEL) =>
+            {
                 if mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
                     top_row = top_row.saturating_sub(1);
                 } else {

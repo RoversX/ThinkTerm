@@ -43,6 +43,7 @@ mod frontend;
 mod glyphcache;
 mod input_diagnostics;
 mod inputmap;
+mod markdown_editor;
 mod native_paths;
 mod native_settings;
 mod overlay;
@@ -497,9 +498,7 @@ pub(crate) async fn connect_domain_into_space(
             match attempt {
                 Ok(()) => break,
                 Err(err) => {
-                    log::error!(
-                        "attaching {domain_name} failed: {err:#}; retrying in {backoff:?}"
-                    );
+                    log::error!("attaching {domain_name} failed: {err:#}; retrying in {backoff:?}");
                     ui.output_str(&format!("Will retry in {backoff:?}...\n"));
                     smol::Timer::after(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);

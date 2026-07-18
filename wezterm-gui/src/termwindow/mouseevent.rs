@@ -41,6 +41,25 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
 
+fn note_drag_scroll_delta(
+    pointer_y: f32,
+    top: f32,
+    bottom: f32,
+    edge: f32,
+    max_step: f32,
+) -> Option<f32> {
+    let edge = edge.min((bottom - top).max(0.0) / 3.0).max(1.0);
+    if pointer_y < top + edge {
+        let intensity = ((top + edge - pointer_y) / edge).clamp(0.2, 1.0);
+        Some(-max_step * intensity)
+    } else if pointer_y > bottom - edge {
+        let intensity = ((pointer_y - (bottom - edge)) / edge).clamp(0.2, 1.0);
+        Some(max_step * intensity)
+    } else {
+        None
+    }
+}
+
 fn trailing_action_reserved_width(
     fixed_clearance: usize,
     action_button_count: usize,
@@ -66,7 +85,7 @@ fn trailing_action_reserved_width(
 
 #[cfg(test)]
 mod window_tab_layout_tests {
-    use super::trailing_action_reserved_width;
+    use super::{note_drag_scroll_delta, trailing_action_reserved_width};
 
     #[test]
     fn trailing_actions_keep_tabs_before_the_new_tab_button() {
@@ -77,6 +96,22 @@ mod window_tab_layout_tests {
     #[test]
     fn trailing_actions_include_integrated_window_buttons() {
         assert_eq!(trailing_action_reserved_width(26, 2, 34, 8, 3), 224);
+    }
+
+    #[test]
+    fn note_drag_edge_scroll_has_direction_and_safe_zone() {
+        assert_eq!(note_drag_scroll_delta(50.0, 0.0, 200.0, 40.0, 28.0), None);
+        assert_eq!(
+            note_drag_scroll_delta(0.0, 0.0, 200.0, 40.0, 28.0),
+            Some(-28.0)
+        );
+        assert_eq!(
+            note_drag_scroll_delta(200.0, 0.0, 200.0, 40.0, 28.0),
+            Some(28.0)
+        );
+        assert!(
+            note_drag_scroll_delta(30.0, 0.0, 200.0, 40.0, 28.0).expect("top edge delta") < 0.0
+        );
     }
 }
 
@@ -656,6 +691,21 @@ impl super::TermWindow {
             return false;
         }
 
+        if self.right_sidebar_mode == super::RightSidebarMode::Tasks {
+            if let WMEK::HorzWheel(amount) = event.kind {
+                if amount != 0
+                    && self.right_sidebar_note.scroll_code_block_at(
+                        event.coords.x as f32,
+                        event.coords.y as f32,
+                        Self::sidebar_scroll_pixels(amount) * 2.0,
+                    )
+                {
+                    context.invalidate();
+                }
+                return true;
+            }
+        }
+
         let amount = match event.kind {
             WMEK::VertWheel(amount) => amount,
             WMEK::HorzWheel(_) => return true,
@@ -665,17 +715,29 @@ impl super::TermWindow {
             return true;
         }
 
-        if self.right_sidebar_mode == super::RightSidebarMode::Chat {
-            if self.scroll_right_sidebar_files(amount) {
-                context.invalidate();
+        match self.right_sidebar_mode {
+            super::RightSidebarMode::Chat => {
+                if self.scroll_right_sidebar_files(amount) {
+                    context.invalidate();
+                }
             }
-        } else {
-            let was_visible = self.right_sidebar_snippet_scrollbar_visible_until;
-            self.show_right_sidebar_snippet_scrollbar();
-            if self.scroll_right_sidebar_snippets(amount)
-                || was_visible != self.right_sidebar_snippet_scrollbar_visible_until
-            {
-                context.invalidate();
+            super::RightSidebarMode::Tasks => {
+                self.right_sidebar_note.reveal_caret = false;
+                if self
+                    .right_sidebar_note
+                    .scroll_by(Self::sidebar_scroll_pixels(amount))
+                {
+                    context.invalidate();
+                }
+            }
+            super::RightSidebarMode::Snippets => {
+                let was_visible = self.right_sidebar_snippet_scrollbar_visible_until;
+                self.show_right_sidebar_snippet_scrollbar();
+                if self.scroll_right_sidebar_snippets(amount)
+                    || was_visible != self.right_sidebar_snippet_scrollbar_visible_until
+                {
+                    context.invalidate();
+                }
             }
         }
         true
@@ -734,6 +796,11 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_)
             | UIItemType::RightSidebarSnippetScrollTrack
             | UIItemType::RightSidebarSnippetScrollThumb
+            | UIItemType::RightSidebarNoteModeToggle
+            | UIItemType::RightSidebarNoteSave
+            | UIItemType::RightSidebarNoteCodeToggle(_)
+            | UIItemType::RightSidebarNoteCodeCopy(_)
+            | UIItemType::RightSidebarNoteBody
             | UIItemType::RightSidebarFilePreviewScrollTrack
             | UIItemType::RightSidebarFilePreviewScrollThumb
             | UIItemType::RightSidebarFilePreviewHorizontalScrollTrack
@@ -798,6 +865,11 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_)
             | UIItemType::RightSidebarSnippetScrollTrack
             | UIItemType::RightSidebarSnippetScrollThumb
+            | UIItemType::RightSidebarNoteModeToggle
+            | UIItemType::RightSidebarNoteSave
+            | UIItemType::RightSidebarNoteCodeToggle(_)
+            | UIItemType::RightSidebarNoteCodeCopy(_)
+            | UIItemType::RightSidebarNoteBody
             | UIItemType::RightSidebarFilePreviewScrollTrack
             | UIItemType::RightSidebarFilePreviewScrollThumb
             | UIItemType::RightSidebarFilePreviewHorizontalScrollTrack
@@ -1026,6 +1098,19 @@ impl super::TermWindow {
                             event.coords.x,
                             event.coords.y,
                         );
+                        context.invalidate();
+                    }
+                    if completed_drag
+                        .as_ref()
+                        .is_some_and(|(item, _)| item.item_type == UIItemType::RightSidebarNoteBody)
+                    {
+                        if self.right_sidebar_note.drag_selection_active {
+                            self.update_right_sidebar_note_drag_selection(
+                                event.coords.x,
+                                event.coords.y,
+                            );
+                        }
+                        self.right_sidebar_note.drag_selection_active = false;
                         context.invalidate();
                     }
                     if completed_drag.as_ref().is_some_and(|(item, _)| {
@@ -1460,6 +1545,96 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
+    fn drag_right_sidebar_note_selection(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        self.right_sidebar_note.drag_selection_active = true;
+        self.update_right_sidebar_note_drag_selection(event.coords.x, event.coords.y);
+        if self
+            .right_sidebar_note_drag_scroll_delta(&item, &event)
+            .is_some()
+        {
+            self.schedule_right_sidebar_note_drag_autoscroll();
+        }
+        context.set_cursor(Some(MouseCursor::Text));
+        context.invalidate();
+        self.dragging.replace((item, start_event));
+    }
+
+    fn update_right_sidebar_note_drag_selection(&mut self, x: isize, y: isize) {
+        let position = self
+            .right_sidebar_note
+            .source_position_for_point(x as f32, y as f32);
+        self.right_sidebar_note.view.selection.focus = position;
+        self.right_sidebar_note.view.preferred_column = None;
+        self.right_sidebar_note.reveal_caret = false;
+        self.right_sidebar_note.refresh_projection();
+    }
+
+    fn right_sidebar_note_drag_scroll_delta(
+        &self,
+        item: &UIItem,
+        event: &MouseEvent,
+    ) -> Option<f32> {
+        let top = item.y as f32;
+        let bottom = item.y.saturating_add(item.height) as f32;
+        note_drag_scroll_delta(
+            event.coords.y as f32,
+            top,
+            bottom,
+            self.ui_f32(40.0),
+            self.ui_f32(28.0),
+        )
+    }
+
+    fn schedule_right_sidebar_note_drag_autoscroll(&mut self) {
+        if self.right_sidebar_note.drag_autoscroll_scheduled {
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.right_sidebar_note.drag_autoscroll_scheduled = true;
+        promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(32)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                term_window.right_sidebar_note.drag_autoscroll_scheduled = false;
+                if term_window.step_right_sidebar_note_drag_autoscroll() {
+                    term_window.invalidate_window();
+                    term_window.schedule_right_sidebar_note_drag_autoscroll();
+                }
+            })));
+        })
+        .detach();
+    }
+
+    fn step_right_sidebar_note_drag_autoscroll(&mut self) -> bool {
+        if !self.right_sidebar_note.drag_selection_active {
+            return false;
+        }
+        let Some((item, _)) = self.dragging.as_ref() else {
+            return false;
+        };
+        if item.item_type != UIItemType::RightSidebarNoteBody {
+            return false;
+        }
+        let Some(event) = self.current_mouse_event.clone() else {
+            return false;
+        };
+        let Some(delta) = self.right_sidebar_note_drag_scroll_delta(item, &event) else {
+            return false;
+        };
+        let changed = self.right_sidebar_note.scroll_by(delta);
+        if changed {
+            self.update_right_sidebar_note_drag_selection(event.coords.x, event.coords.y);
+        }
+        changed
+    }
+
     fn drag_ui_item(
         &mut self,
         item: UIItem,
@@ -1511,6 +1686,9 @@ impl super::TermWindow {
                     event,
                     context,
                 );
+            }
+            UIItemType::RightSidebarNoteBody => {
+                self.drag_right_sidebar_note_selection(item, start_event, event, context);
             }
             UIItemType::RightSidebarFileFilter
             | UIItemType::RightSidebarSnippetSearch
@@ -1806,6 +1984,13 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_) => {
                 self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
             }
+            UIItemType::RightSidebarNoteModeToggle
+            | UIItemType::RightSidebarNoteSave
+            | UIItemType::RightSidebarNoteCodeToggle(_)
+            | UIItemType::RightSidebarNoteCodeCopy(_)
+            | UIItemType::RightSidebarNoteBody => {
+                self.mouse_event_right_sidebar_note(item.clone(), event, context);
+            }
             UIItemType::RightSidebarFileFilter
             | UIItemType::RightSidebarFileRefresh
             | UIItemType::RightSidebarFileRow(_)
@@ -1843,6 +2028,151 @@ impl super::TermWindow {
             UIItemType::ContextMenuItem(_) => {
                 context.set_cursor(Some(MouseCursor::Hand));
             }
+        }
+    }
+
+    fn mouse_event_right_sidebar_note(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        match item.item_type.clone() {
+            UIItemType::RightSidebarNoteModeToggle => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_right_sidebar_note_mode();
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarNoteSave => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.save_right_sidebar_note_now();
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarNoteCodeToggle(source_start) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    let code =
+                        self.right_sidebar_note
+                            .projection
+                            .objects
+                            .iter()
+                            .find_map(|object| match object {
+                                crate::markdown_editor::ProjectedObject::CodeBlock(code)
+                                    if code.source.start == source_start =>
+                                {
+                                    Some(code.clone())
+                                }
+                                _ => None,
+                            });
+                    let collapsed = self.right_sidebar_note.toggle_code_block(source_start);
+                    if collapsed {
+                        if let Some(code) = code {
+                            let caret = self.right_sidebar_note.view.selection.focus.byte;
+                            if code.content.start <= caret && caret <= code.content.end {
+                                if let Some(session) = self.right_sidebar_note.session.clone() {
+                                    let target = {
+                                        let session = session.lock();
+                                        let source = session.source();
+                                        let end = code.source.end.min(source.len());
+                                        if source[end..].starts_with('\n') {
+                                            (end + 1).min(source.len())
+                                        } else {
+                                            end
+                                        }
+                                    };
+                                    session.lock().set_caret(
+                                        &mut self.right_sidebar_note.view,
+                                        target,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    self.right_sidebar_note.reveal_caret = true;
+                    self.right_sidebar_note.refresh_projection();
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarNoteCodeCopy(source_start) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    if let Some(text) =
+                        self.right_sidebar_note
+                            .projection
+                            .objects
+                            .iter()
+                            .find_map(|object| match object {
+                                crate::markdown_editor::ProjectedObject::CodeBlock(code)
+                                    if code.source.start == source_start =>
+                                {
+                                    Some(code.text.clone())
+                                }
+                                _ => None,
+                            })
+                    {
+                        self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+                    }
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarNoteBody => {
+                context.set_cursor(Some(MouseCursor::Text));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    if let Some(range) = self
+                        .right_sidebar_note
+                        .atomic_source_for_point(event.coords.x as f32, event.coords.y as f32)
+                    {
+                        let replacement =
+                            self.right_sidebar_note
+                                .session
+                                .as_ref()
+                                .and_then(|session| {
+                                    let session = session.lock();
+                                    session.source().get(range.clone()).and_then(|source| {
+                                        let trimmed = source.trim();
+                                        if trimmed.eq_ignore_ascii_case("[x]") {
+                                            Some("[ ]")
+                                        } else if trimmed == "[ ]" {
+                                            Some("[x]")
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                });
+                        if let Some(replacement) = replacement {
+                            self.right_sidebar_note.view.focused = true;
+                            self.right_sidebar_note.view.selection =
+                                crate::markdown_editor::SourceSelection {
+                                    anchor: crate::markdown_editor::SourcePosition::new(
+                                        range.start,
+                                    ),
+                                    focus: crate::markdown_editor::SourcePosition::new(range.end),
+                                };
+                            self.push_right_sidebar_text(replacement);
+                            context.invalidate();
+                            return;
+                        }
+                    }
+                    let position = self
+                        .right_sidebar_note
+                        .source_position_for_point(event.coords.x as f32, event.coords.y as f32);
+                    self.right_sidebar_note.view.focused = true;
+                    self.right_sidebar_note.view.selection =
+                        crate::markdown_editor::SourceSelection::caret(position.byte);
+                    self.right_sidebar_note.view.preferred_column = None;
+                    self.right_sidebar_note.reveal_caret = true;
+                    self.right_sidebar_note.drag_selection_active = false;
+                    self.right_sidebar_note.refresh_projection();
+                    self.dragging.replace((item, event));
+                    context.invalidate();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1986,6 +2316,13 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetRun(_)
             | UIItemType::RightSidebarSnippetDelete(_) => {
                 self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
+            }
+            UIItemType::RightSidebarNoteModeToggle
+            | UIItemType::RightSidebarNoteSave
+            | UIItemType::RightSidebarNoteCodeToggle(_)
+            | UIItemType::RightSidebarNoteCodeCopy(_)
+            | UIItemType::RightSidebarNoteBody => {
+                self.mouse_event_right_sidebar_note(item.clone(), event, context);
             }
             UIItemType::RightSidebarFileFilter
             | UIItemType::RightSidebarFileRefresh
@@ -2268,6 +2605,12 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
             let previous_width = self.right_sidebar_width();
+            let previous_mode = self.right_sidebar_mode;
+            if previous_mode == super::RightSidebarMode::Tasks
+                && mode != super::RightSidebarMode::Tasks
+            {
+                self.clear_right_sidebar_text_focus();
+            }
             self.right_sidebar_mode = mode;
             // Leaving the file view (e.g. switching to Snippets/Tasks) makes the
             // file index idle; schedule it for release. Entering it refreshes +

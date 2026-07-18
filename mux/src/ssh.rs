@@ -122,7 +122,9 @@ pub fn ssh_connect_with_ui_and_password(
                         } else if password_answers_left > 0 {
                             password_answers_left -= 1;
                             ui.output_str(&format!("{editor_prompt} (using stored password)\n"));
-                            Ok(password.clone().expect("password present when answers remain"))
+                            Ok(password
+                                .clone()
+                                .expect("password present when answers remain"))
                         } else {
                             ui.password(editor_prompt)
                         };

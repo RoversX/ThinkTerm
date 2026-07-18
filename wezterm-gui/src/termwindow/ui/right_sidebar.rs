@@ -1,3 +1,9 @@
+use crate::markdown_editor::{
+    default_notebook, fit_table_columns, resolve_local_image, save_document_revision,
+    wrap_visual_document_by_width, BlockKind, EditorMode, NoteCodeBlockLayout, NoteLineLayout,
+    NoteRunLayout, ProjectedCodeBlock, ProjectedObject, SaveState, SourceSelection, TableAlignment,
+    VisualLineKind,
+};
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::ui::icons::{
     material_file_icon_for_name, material_folder_icon_for_name, MaterialIcon, SvgIcon,
@@ -27,22 +33,22 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Color as SyntectColor, Style as SyntectStyle, Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
 use termwiz::image::{ImageData, ImageDataType};
 use termwiz::input::{KeyCode as TermKeyCode, Modifiers as TermModifiers};
+use thinkterm_syntax::{HighlightKind, HighlightResult, HighlightSpan};
 use walkdir::{DirEntry as WalkDirEntry, WalkDir};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{
-    Clipboard, ContextMenuItem, IntegratedTitleButtonStyle, WindowDecorations, WindowOps,
+    Clipboard, ContextMenuItem, DeadKeyStatus, IntegratedTitleButtonStyle, Point, Rect,
+    WindowDecorations, WindowOps,
 };
 
 const RIGHT_SIDEBAR_SECTION_GAP: usize = 12;
@@ -70,6 +76,22 @@ const SNIPPET_LIST_TOP_GAP: usize = 18;
 const SNIPPET_LIST_BOTTOM_PADDING: usize = 40;
 const RIGHT_SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
 const SNIPPET_CARET_WIDTH: f32 = 3.0;
+const NOTE_TOOLBAR_HEIGHT: usize = 54;
+const NOTE_BODY_TOP_GAP: usize = 12;
+const NOTE_BODY_PADDING: usize = 16;
+const NOTE_LINE_GAP: usize = 5;
+const NOTE_CARET_WIDTH: f32 = 2.0;
+const NOTE_TABLE_CELL_HORIZONTAL_PADDING: usize = 10;
+const NOTE_TABLE_CELL_VERTICAL_PADDING: usize = 7;
+const NOTE_TABLE_MIN_COLUMN_WIDTH: usize = 64;
+const NOTE_CODE_HEADER_HEIGHT: usize = 38;
+const NOTE_CODE_HORIZONTAL_PADDING: usize = 12;
+const NOTE_CODE_VERTICAL_PADDING: usize = 9;
+const NOTE_CODE_CONTROL_SIZE: usize = 28;
+const NOTE_CODE_BLOCK_RADIUS: f32 = SIDEBAR_ROW_RADIUS;
+const NOTE_CODE_HIGHLIGHT_CACHE_CAPACITY: usize = 64;
+const NOTE_AUTOSAVE_MS: u64 = 300;
+const NOTE_IMAGE_CACHE_CAPACITY: usize = 32;
 const FILE_FONT_MIN_SIZE: f64 = 14.0;
 const FILE_FILTER_HEIGHT: usize = 66;
 const FILE_TREE_TOP_GAP: usize = 14;
@@ -86,12 +108,6 @@ const FILE_PREVIEW_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const FILE_PREVIEW_IMAGE_MAX_PIXELS: u64 = 16_000_000;
 const FILE_PREVIEW_PANE_MIN_WIDTH: usize = 360;
 const FILE_PREVIEW_PANE_DEFAULT_WIDTH: usize = 560;
-// Per-line we keep the *full* content (bounded only by FILE_PREVIEW_MAX_BYTES
-// for the whole file) so minified CSS/JS, lockfiles and JSON aren't truncated.
-// We only bound the *syntax-highlighting* work per line: characters past this
-// point are rendered in the default colour instead of being dropped. This keeps
-// syntect cost bounded on pathological single-line files without losing data.
-const FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT: usize = 8192;
 const FILE_PREVIEW_SLICE_CACHE_CAPACITY: usize = 256;
 // Lines up to this many columns are shaped whole (once, cached) so horizontal
 // scrolling is pure translation of the cached glyph run instead of re-shaping a
@@ -110,6 +126,61 @@ const FILE_INDEX_RESCAN_SECS: u64 = 90;
 // Max number of (root, project) view-state snapshots kept in memory.
 const FILE_VIEW_STATE_CACHE_CAP: usize = 32;
 const FILE_FILTER_DEBOUNCE_MS: u64 = 350;
+
+fn note_boundary_x(boundaries: &[(f32, usize)], byte: usize) -> f32 {
+    boundaries
+        .iter()
+        .filter(|(_, source)| *source <= byte)
+        .next_back()
+        .or_else(|| boundaries.first())
+        .map(|(x, _)| *x)
+        .unwrap_or(0.0)
+}
+
+fn note_code_row_height(
+    row_index: usize,
+    row_count: usize,
+    collapsed: bool,
+    line_height: f32,
+    header_height: f32,
+    vertical_padding: f32,
+) -> f32 {
+    if collapsed {
+        return if row_index == 0 { header_height } else { 0.0 };
+    }
+    line_height
+        + if row_index == 0 {
+            header_height + vertical_padding
+        } else {
+            0.0
+        }
+        + if row_index + 1 == row_count {
+            vertical_padding
+        } else {
+            0.0
+        }
+}
+
+#[derive(Debug, Clone)]
+struct NoteTableRowPaintLayout {
+    column_widths: Rc<Vec<f32>>,
+    alignments: Rc<Vec<TableAlignment>>,
+    row_index: usize,
+    row_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NoteCodeRowPaintLayout {
+    block_start: usize,
+    language: String,
+    row_index: usize,
+    row_count: usize,
+    collapsed: bool,
+    colors: Arc<Vec<Vec<LinearRgba>>>,
+    horizontal_offset: f32,
+    block_height: f32,
+    max_horizontal_scroll: f32,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RightSidebarRect {
@@ -271,14 +342,6 @@ impl RightSidebarMode {
             Self::Chat => "File",
             Self::Tasks => "Note",
             Self::Snippets => "Snippets",
-        }
-    }
-
-    fn empty_label(self) -> &'static str {
-        match self {
-            Self::Chat => "Coming soon",
-            Self::Tasks => "Coming soon",
-            Self::Snippets => "No snippets",
         }
     }
 }
@@ -473,6 +536,9 @@ impl crate::TermWindow {
     pub fn toggle_right_sidebar(&mut self) {
         self.right_sidebar_collapsed = !self.right_sidebar_collapsed;
         if self.right_sidebar_collapsed {
+            if self.right_sidebar_mode == RightSidebarMode::Tasks {
+                self.clear_right_sidebar_text_focus();
+            }
             self.schedule_right_sidebar_file_memory_release();
         } else {
             self.kick_right_sidebar_file_rescan_cycle();
@@ -636,13 +702,18 @@ impl crate::TermWindow {
         match self.right_sidebar_mode {
             RightSidebarMode::Chat => self.right_sidebar_file_focus.is_some(),
             RightSidebarMode::Snippets => self.right_sidebar_snippet_focus.is_some(),
-            RightSidebarMode::Tasks => false,
+            RightSidebarMode::Tasks => self.right_sidebar_note.view.focused,
         }
     }
 
     pub(crate) fn clear_right_sidebar_text_focus(&mut self) {
+        let note_was_focused = self.right_sidebar_note.view.focused;
         self.right_sidebar_snippet_focus = None;
         self.right_sidebar_file_focus = None;
+        self.right_sidebar_note.view.focused = false;
+        if note_was_focused {
+            self.save_right_sidebar_note_now();
+        }
     }
 
     pub(crate) fn open_new_snippet_editor(&mut self) {
@@ -848,6 +919,10 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_generation =
             self.right_sidebar_file_preview_generation.wrapping_add(1);
         let generation = self.right_sidebar_file_preview_generation;
+        self.right_sidebar_file_preview_highlight_cancel
+            .store(1, AtomicOrdering::Relaxed);
+        self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
+        let highlight_cancel = Arc::clone(&self.right_sidebar_file_preview_highlight_cancel);
         self.right_sidebar_file_preview_lines.clear();
         self.right_sidebar_file_preview_max_columns = 0;
         self.clear_right_sidebar_file_preview_slice_cache();
@@ -871,9 +946,10 @@ impl crate::TermWindow {
         let load_path = path.clone();
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
-                Ok(load_right_sidebar_file_preview(
+                Ok(load_right_sidebar_file_preview_with_cancellation(
                     &load_path,
                     use_dark_syntax_theme,
+                    Some(highlight_cancel.as_ref()),
                 ))
             })
             .await
@@ -916,6 +992,9 @@ impl crate::TermWindow {
         self.right_sidebar_file_selected = None;
         self.right_sidebar_file_preview_generation =
             self.right_sidebar_file_preview_generation.wrapping_add(1);
+        self.right_sidebar_file_preview_highlight_cancel
+            .store(1, AtomicOrdering::Relaxed);
+        self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
         self.right_sidebar_file_preview_lines.clear();
         self.right_sidebar_file_preview_max_columns = 0;
         self.clear_right_sidebar_file_preview_slice_cache();
@@ -940,6 +1019,97 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_line_color_cache_order
             .borrow_mut()
             .clear();
+    }
+
+    fn cached_note_code_highlights(
+        &mut self,
+        code: &ProjectedCodeBlock,
+        use_dark_theme: bool,
+    ) -> Arc<Vec<Vec<LinearRgba>>> {
+        let revision = self.right_sidebar_note.projection_revision.unwrap_or(0);
+        if self.right_sidebar_note_code_highlight_revision != revision {
+            self.right_sidebar_note_code_highlight_cancel
+                .store(1, AtomicOrdering::Relaxed);
+            self.right_sidebar_note_code_highlight_cancel = Arc::new(AtomicUsize::new(0));
+            self.right_sidebar_note_code_highlight_revision = revision;
+            self.right_sidebar_note_code_highlights_pending.clear();
+        }
+
+        let key = (revision, code.source.start, use_dark_theme);
+        if let Some(lines) = self.right_sidebar_note_code_highlights.get(&key).cloned() {
+            return lines;
+        }
+
+        let lines = Arc::new(vec![vec![]; note_code_line_count(&code.text)]);
+        self.insert_note_code_highlight_cache(key, Arc::clone(&lines));
+
+        let supported = code.text.len() <= thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT
+            && code
+                .language
+                .as_deref()
+                .and_then(thinkterm_syntax::detect_fence)
+                .is_some();
+        let pending_key = (revision, code.source.start);
+        if supported
+            && self
+                .right_sidebar_note_code_highlights_pending
+                .insert(pending_key)
+        {
+            if let Some(window) = self.window.as_ref().cloned() {
+                let code = code.clone();
+                let cancellation = Arc::clone(&self.right_sidebar_note_code_highlight_cancel);
+                syntax_highlight_pool().spawn(move || {
+                    let result = note_code_highlight_pair(&code, Some(cancellation.as_ref()));
+                    window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        term_window.apply_note_code_highlight_result(pending_key, result);
+                    })));
+                });
+            } else {
+                self.right_sidebar_note_code_highlights_pending
+                    .remove(&pending_key);
+            }
+        }
+
+        lines
+    }
+
+    fn insert_note_code_highlight_cache(
+        &mut self,
+        key: (u64, usize, bool),
+        lines: Arc<Vec<Vec<LinearRgba>>>,
+    ) {
+        if !self.right_sidebar_note_code_highlights.contains_key(&key) {
+            self.right_sidebar_note_code_highlight_order.push_back(key);
+        }
+        self.right_sidebar_note_code_highlights.insert(key, lines);
+        while self.right_sidebar_note_code_highlight_order.len()
+            > NOTE_CODE_HIGHLIGHT_CACHE_CAPACITY
+        {
+            if let Some(expired) = self.right_sidebar_note_code_highlight_order.pop_front() {
+                self.right_sidebar_note_code_highlights.remove(&expired);
+            }
+        }
+    }
+
+    fn apply_note_code_highlight_result(
+        &mut self,
+        pending_key: (u64, usize),
+        result: Option<(Vec<Vec<LinearRgba>>, Vec<Vec<LinearRgba>>)>,
+    ) {
+        self.right_sidebar_note_code_highlights_pending
+            .remove(&pending_key);
+        if self.right_sidebar_note.projection_revision.unwrap_or(0) != pending_key.0 {
+            return;
+        }
+        let Some((light, dark)) = result else {
+            return;
+        };
+        self.insert_note_code_highlight_cache(
+            (pending_key.0, pending_key.1, false),
+            Arc::new(light),
+        );
+        self.insert_note_code_highlight_cache((pending_key.0, pending_key.1, true), Arc::new(dark));
+        self.invalidate_window();
     }
 
     /// Per-byte colours for a whole preview line, keyed by (generation, line
@@ -1934,6 +2104,18 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn copy_right_sidebar_focused_input(&self, destination: ClipboardCopyDestination) {
+        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            let Some(session) = self.right_sidebar_note.session.as_ref() else {
+                return;
+            };
+            let session = session.lock();
+            if let Some(text) = session.selected_text(&self.right_sidebar_note.view) {
+                if !text.is_empty() {
+                    self.copy_to_clipboard(destination, text.to_string());
+                }
+            }
+            return;
+        }
         let Some(input) = self.right_sidebar_focused_input() else {
             return;
         };
@@ -1946,6 +2128,22 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn cut_right_sidebar_focused_input(&mut self) {
+        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            let Some(session) = self.right_sidebar_note.session.clone() else {
+                return;
+            };
+            let selected = session
+                .lock()
+                .selected_text(&self.right_sidebar_note.view)
+                .map(str::to_string);
+            if let Some(text) = selected {
+                if session.lock().backspace(&mut self.right_sidebar_note.view) {
+                    self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+                    self.note_did_edit();
+                }
+            }
+            return;
+        }
         let Some(input) = self.right_sidebar_focused_input_mut() else {
             return;
         };
@@ -1984,6 +2182,15 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn clear_right_sidebar_focused_input_selection(&mut self) {
+        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            let focus = self.right_sidebar_note.view.selection.focus;
+            self.right_sidebar_note.view.selection = SourceSelection {
+                anchor: focus,
+                focus,
+            };
+            self.right_sidebar_note.refresh_projection();
+            return;
+        }
         if let Some(input) = self.right_sidebar_focused_input_mut() {
             input.clear_selection();
         }
@@ -2003,6 +2210,10 @@ impl crate::TermWindow {
         let alt = mods.contains(TermModifiers::ALT);
         let ctrl = mods.contains(TermModifiers::CTRL);
         let multiline = self.right_sidebar_focused_is_multiline();
+
+        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            return self.handle_right_sidebar_note_key(key, mods);
+        }
 
         // Cmd shortcuts (macOS): clipboard, select-all, jump to line start/end.
         if super_ && !alt && !ctrl {
@@ -2209,6 +2420,18 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn push_right_sidebar_text(&mut self, text: &str) -> bool {
+        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            let Some(session) = self.right_sidebar_note.session.clone() else {
+                return false;
+            };
+            let changed = session
+                .lock()
+                .insert_text(&mut self.right_sidebar_note.view, text);
+            if changed {
+                self.note_did_edit();
+            }
+            return changed;
+        }
         let multiline = self.right_sidebar_focused_is_multiline();
         let Some(input) = self.right_sidebar_focused_input_mut() else {
             return false;
@@ -2216,6 +2439,353 @@ impl crate::TermWindow {
         input.caret_insert(text, multiline);
         self.after_right_sidebar_text_edit();
         true
+    }
+
+    fn handle_right_sidebar_note_key(&mut self, key: TermKeyCode, mods: TermModifiers) -> bool {
+        let shift = mods.contains(TermModifiers::SHIFT);
+        let super_ = mods.contains(TermModifiers::SUPER);
+        let ctrl = mods.contains(TermModifiers::CTRL);
+        let alt = mods.contains(TermModifiers::ALT);
+        let command = super_ || (ctrl && !cfg!(target_os = "macos"));
+        let word_modifier = if cfg!(target_os = "macos") {
+            alt && !super_ && !ctrl
+        } else {
+            ctrl && !super_ && !alt
+        };
+
+        if word_modifier {
+            let Some(session) = self.right_sidebar_note.session.clone() else {
+                return false;
+            };
+            match key {
+                TermKeyCode::LeftArrow => {
+                    session
+                        .lock()
+                        .move_word_left(&mut self.right_sidebar_note.view, shift);
+                    self.right_sidebar_note.reveal_caret = true;
+                    self.right_sidebar_note.refresh_projection();
+                    return true;
+                }
+                TermKeyCode::RightArrow => {
+                    session
+                        .lock()
+                        .move_word_right(&mut self.right_sidebar_note.view, shift);
+                    self.right_sidebar_note.reveal_caret = true;
+                    self.right_sidebar_note.refresh_projection();
+                    return true;
+                }
+                TermKeyCode::Backspace => {
+                    if session
+                        .lock()
+                        .delete_word_back(&mut self.right_sidebar_note.view)
+                    {
+                        self.note_did_edit();
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if command && !alt {
+            match key {
+                TermKeyCode::LeftArrow if super_ => {
+                    if let Some(session) = self.right_sidebar_note.session.clone() {
+                        session
+                            .lock()
+                            .move_line_start(&mut self.right_sidebar_note.view, shift);
+                        self.right_sidebar_note.reveal_caret = true;
+                        self.right_sidebar_note.refresh_projection();
+                    }
+                    return true;
+                }
+                TermKeyCode::RightArrow if super_ => {
+                    if let Some(session) = self.right_sidebar_note.session.clone() {
+                        session
+                            .lock()
+                            .move_line_end(&mut self.right_sidebar_note.view, shift);
+                        self.right_sidebar_note.reveal_caret = true;
+                        self.right_sidebar_note.refresh_projection();
+                    }
+                    return true;
+                }
+                TermKeyCode::Char('a') | TermKeyCode::Char('A') => {
+                    if let Some(session) = self.right_sidebar_note.session.clone() {
+                        session.lock().select_all(&mut self.right_sidebar_note.view);
+                        self.right_sidebar_note.refresh_projection();
+                    }
+                    return true;
+                }
+                TermKeyCode::Char('c') | TermKeyCode::Char('C') => {
+                    self.copy_right_sidebar_focused_input(ClipboardCopyDestination::Clipboard);
+                    return true;
+                }
+                TermKeyCode::Char('x') | TermKeyCode::Char('X') => {
+                    self.cut_right_sidebar_focused_input();
+                    return true;
+                }
+                TermKeyCode::Char('v') | TermKeyCode::Char('V') => {
+                    self.paste_into_right_sidebar_from_clipboard(ClipboardPasteSource::Clipboard);
+                    return true;
+                }
+                TermKeyCode::Char('z') | TermKeyCode::Char('Z') => {
+                    let Some(session) = self.right_sidebar_note.session.clone() else {
+                        return true;
+                    };
+                    let changed = if shift {
+                        session.lock().redo(&mut self.right_sidebar_note.view)
+                    } else {
+                        session.lock().undo(&mut self.right_sidebar_note.view)
+                    };
+                    if changed {
+                        self.note_did_edit();
+                    }
+                    return true;
+                }
+                TermKeyCode::Char('s') | TermKeyCode::Char('S') => {
+                    self.save_right_sidebar_note_now();
+                    return true;
+                }
+                TermKeyCode::Char('e') | TermKeyCode::Char('E') => {
+                    self.toggle_right_sidebar_note_mode();
+                    return true;
+                }
+                TermKeyCode::Char('b') | TermKeyCode::Char('B') => {
+                    if let Some(session) = self.right_sidebar_note.session.clone() {
+                        if session.lock().surround_selection(
+                            &mut self.right_sidebar_note.view,
+                            "**",
+                            "**",
+                        ) {
+                            self.note_did_edit();
+                        }
+                    }
+                    return true;
+                }
+                TermKeyCode::Char('i') | TermKeyCode::Char('I') => {
+                    if let Some(session) = self.right_sidebar_note.session.clone() {
+                        if session.lock().surround_selection(
+                            &mut self.right_sidebar_note.view,
+                            "*",
+                            "*",
+                        ) {
+                            self.note_did_edit();
+                        }
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if command || ctrl || alt {
+            return false;
+        }
+
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return false;
+        };
+        let mut changed = false;
+        let handled = match key {
+            TermKeyCode::Escape => {
+                self.right_sidebar_note.view.focused = false;
+                true
+            }
+            TermKeyCode::LeftArrow => {
+                session
+                    .lock()
+                    .move_left(&mut self.right_sidebar_note.view, shift);
+                true
+            }
+            TermKeyCode::RightArrow => {
+                session
+                    .lock()
+                    .move_right(&mut self.right_sidebar_note.view, shift);
+                true
+            }
+            TermKeyCode::UpArrow => {
+                if let Some((position, preferred)) =
+                    self.right_sidebar_note.visual_vertical_target(-1)
+                {
+                    if shift {
+                        self.right_sidebar_note.view.selection.focus = position;
+                    } else {
+                        self.right_sidebar_note.view.selection =
+                            SourceSelection::caret(position.byte);
+                    }
+                    self.right_sidebar_note.view.preferred_column = Some(preferred);
+                } else {
+                    session
+                        .lock()
+                        .move_vertical(&mut self.right_sidebar_note.view, -1, shift);
+                }
+                true
+            }
+            TermKeyCode::DownArrow => {
+                if let Some((position, preferred)) =
+                    self.right_sidebar_note.visual_vertical_target(1)
+                {
+                    if shift {
+                        self.right_sidebar_note.view.selection.focus = position;
+                    } else {
+                        self.right_sidebar_note.view.selection =
+                            SourceSelection::caret(position.byte);
+                    }
+                    self.right_sidebar_note.view.preferred_column = Some(preferred);
+                } else {
+                    session
+                        .lock()
+                        .move_vertical(&mut self.right_sidebar_note.view, 1, shift);
+                }
+                true
+            }
+            TermKeyCode::Home => {
+                session
+                    .lock()
+                    .move_line_start(&mut self.right_sidebar_note.view, shift);
+                true
+            }
+            TermKeyCode::End => {
+                session
+                    .lock()
+                    .move_line_end(&mut self.right_sidebar_note.view, shift);
+                true
+            }
+            TermKeyCode::Backspace => {
+                changed = session.lock().backspace(&mut self.right_sidebar_note.view);
+                true
+            }
+            TermKeyCode::Delete => {
+                changed = session
+                    .lock()
+                    .delete_forward(&mut self.right_sidebar_note.view);
+                true
+            }
+            TermKeyCode::Enter => {
+                changed = session
+                    .lock()
+                    .insert_newline(&mut self.right_sidebar_note.view);
+                true
+            }
+            TermKeyCode::Tab => {
+                if let Some(target) =
+                    self.right_sidebar_note
+                        .table_cell_target(if shift { -1 } else { 1 })
+                {
+                    session
+                        .lock()
+                        .set_caret(&mut self.right_sidebar_note.view, target, false);
+                    self.right_sidebar_note.reveal_caret = true;
+                } else {
+                    changed = session
+                        .lock()
+                        .insert_text(&mut self.right_sidebar_note.view, "    ");
+                }
+                true
+            }
+            TermKeyCode::Char(ch) if !ch.is_control() => {
+                changed = session
+                    .lock()
+                    .insert_text(&mut self.right_sidebar_note.view, &ch.to_string());
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.note_did_edit();
+        } else if handled {
+            self.right_sidebar_note.reveal_caret = true;
+            self.right_sidebar_note.refresh_projection();
+        }
+        handled
+    }
+
+    pub(crate) fn toggle_right_sidebar_note_mode(&mut self) {
+        self.right_sidebar_note.view.mode = match self.right_sidebar_note.view.mode {
+            EditorMode::LivePreview => EditorMode::Source,
+            EditorMode::Source | EditorMode::ReadOnly => EditorMode::LivePreview,
+        };
+        self.right_sidebar_note.refresh_projection();
+        self.invalidate_window();
+    }
+
+    pub(crate) fn save_right_sidebar_note_now(&mut self) {
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return;
+        };
+        if !session.lock().is_dirty() {
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let result =
+                promise::spawn::spawn_into_new_thread(move || save_document_revision(&session))
+                    .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                if let Err(err) = result {
+                    log::error!("failed to save Note: {err:#}");
+                }
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    for gui_window in front_end.gui_windows() {
+                        gui_window.window.invalidate();
+                    }
+                } else {
+                    term_window.invalidate_window();
+                }
+            })));
+        })
+        .detach();
+    }
+
+    pub(crate) fn flush_right_sidebar_note_blocking(&mut self) {
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return;
+        };
+        if session.lock().is_dirty() {
+            if let Err(err) = save_document_revision(&session) {
+                log::error!("failed to flush Note before window lifecycle change: {err:#}");
+            }
+        }
+    }
+
+    fn note_did_edit(&mut self) {
+        self.right_sidebar_note.refresh_projection();
+        self.right_sidebar_note.reveal_caret = true;
+        self.right_sidebar_note.save_generation =
+            self.right_sidebar_note.save_generation.wrapping_add(1);
+        let generation = self.right_sidebar_note.save_generation;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(NOTE_AUTOSAVE_MS)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                if term_window.right_sidebar_note.save_generation != generation {
+                    return;
+                }
+                term_window.save_right_sidebar_note_now();
+            })));
+        })
+        .detach();
+        if let Some(front_end) = crate::frontend::try_front_end() {
+            for gui_window in front_end.gui_windows() {
+                gui_window
+                    .window
+                    .notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                        if let Some(session) = term_window.right_sidebar_note.session.clone() {
+                            session
+                                .lock()
+                                .clamp_view(&mut term_window.right_sidebar_note.view);
+                            term_window.right_sidebar_note.refresh_projection();
+                            term_window.invalidate_window();
+                        }
+                    })));
+            }
+        } else {
+            self.invalidate_window();
+        }
     }
 
     /// Map a sidebar text-input `UIItemType` to its `TextInputState`.
@@ -3249,60 +3819,1179 @@ impl crate::TermWindow {
                 )?;
                 return Ok(());
             }
-            RightSidebarMode::Tasks => {}
+            RightSidebarMode::Tasks => {
+                self.paint_note_sidebar(
+                    layers,
+                    &ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    content_top,
+                    content_width,
+                    rect.y.saturating_add(rect.height),
+                    base_font_size,
+                )?;
+                return Ok(());
+            }
         }
+    }
 
-        let empty_top = content_top;
-        let empty_height = self.ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT).min(
-            rect.y
-                .saturating_add(rect.height)
-                .saturating_sub(empty_top + self.ui_px(SIDEBAR_INSET)),
-        );
-        if empty_height == 0 {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_note_sidebar(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        base_font_size: f64,
+    ) -> anyhow::Result<()> {
+        if !self.right_sidebar_note.ensure_loaded() {
+            let message = self
+                .right_sidebar_note
+                .load_error
+                .clone()
+                .unwrap_or_else(|| "Unable to open Notes".to_string());
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                &message,
+                content_x,
+                content_top,
+                content_width,
+                muted_fg,
+            )?;
             return Ok(());
         }
-        self.fill_rounded_rectangle_with_border(
+        self.right_sidebar_note.refresh_projection();
+
+        let toolbar_height = self.ui_px(NOTE_TOOLBAR_HEIGHT);
+        let button_gap = self.ui_px(8);
+        let mode_label = match self.right_sidebar_note.view.mode {
+            EditorMode::LivePreview => "Preview",
+            EditorMode::Source => "Source",
+            EditorMode::ReadOnly => "Read only",
+        };
+        let save_state = self
+            .right_sidebar_note
+            .session
+            .as_ref()
+            .map(|session| session.lock().save_state().clone())
+            .unwrap_or(SaveState::Saved);
+        let save_label = match &save_state {
+            SaveState::Saved => "Saved",
+            SaveState::Dirty => "Save",
+            SaveState::Saving(_) => "Saving…",
+            SaveState::Failed(_) => "Retry",
+        };
+        let compact_button_padding = self.ui_px(SIDEBAR_INSET) * 2;
+        let desired_mode_width = (self.sidebar_text_width(ui_font, mode_label)?.ceil() as usize
+            + compact_button_padding)
+            .max(self.ui_px(64));
+        let desired_save_width = (self.sidebar_text_width(ui_font, save_label)?.ceil() as usize
+            + compact_button_padding)
+            .max(self.ui_px(64));
+        let desired_actions_width = desired_mode_width + button_gap + desired_save_width;
+        let title_label = "Inbox.md";
+        let title_label_width = self.sidebar_text_width(ui_font, title_label)?.ceil() as usize;
+        let show_title = content_width >= title_label_width + button_gap + desired_actions_width;
+        let (title_width, mode_x, mode_width, save_width) = if show_title {
+            let title_width = content_width.saturating_sub(desired_actions_width + button_gap);
+            (
+                title_width,
+                content_x + title_width + button_gap,
+                desired_mode_width,
+                desired_save_width,
+            )
+        } else {
+            let action_width = content_width.saturating_sub(button_gap);
+            let mode_width = action_width / 2;
+            (
+                0,
+                content_x,
+                mode_width,
+                action_width.saturating_sub(mode_width),
+            )
+        };
+        if show_title {
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                title_label,
+                content_x,
+                content_top
+                    + (toolbar_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
+                title_width,
+                foreground,
+            )?;
+        }
+        self.paint_snippet_button(
             layers,
-            1,
-            euclid::rect(
-                content_x as f32,
-                empty_top as f32,
-                content_width as f32,
-                empty_height as f32,
-            ),
-            chrome.sidebar_button_bg,
-            chrome.control_border,
-            self.ui_f32(SIDEBAR_ROW_RADIUS) + 6.0,
-            CAPSULE_BORDER_WIDTH,
-        )
-        .context("right sidebar empty state")?;
-        let empty_icon_size = icon_size
-            .min(self.ui_px(22))
-            .min(empty_height.saturating_sub(20))
-            .max(1);
-        let empty_icon_x = content_x + self.ui_px(SIDEBAR_INSET) + 2;
-        let empty_icon_y = empty_top + (empty_height.saturating_sub(empty_icon_size)) / 2;
-        self.paint_sidebar_icon(
-            layers,
-            self.right_sidebar_mode.icon(),
-            empty_icon_x,
-            empty_icon_y,
-            empty_icon_size,
-            muted_fg,
-        )?;
-        self.paint_sidebar_text(
-            layers,
-            &ui_font,
+            ui_font,
             ui_metrics,
-            self.right_sidebar_mode.empty_label(),
-            empty_icon_x + empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + 2,
-            empty_top + (empty_height.saturating_sub(ui_cell_height)) / 2,
-            content_width.saturating_sub(
-                empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + self.ui_px(SIDEBAR_INSET) * 3,
-            ),
+            chrome,
+            foreground,
             muted_fg,
+            mode_x,
+            content_top,
+            mode_width,
+            toolbar_height,
+            None,
+            mode_label,
+            UIItemType::RightSidebarNoteModeToggle,
+            true,
+        )?;
+        let save_x = mode_x + mode_width + button_gap;
+        self.paint_snippet_button(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            save_x,
+            content_top,
+            save_width,
+            toolbar_height,
+            None,
+            save_label,
+            UIItemType::RightSidebarNoteSave,
+            !matches!(save_state, SaveState::Saving(_)),
         )?;
 
+        let body_y = content_top + toolbar_height + self.ui_px(NOTE_BODY_TOP_GAP);
+        let body_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
+        let body_height = body_bottom.saturating_sub(body_y);
+        if body_height == 0 || content_width == 0 {
+            return Ok(());
+        }
+        self.ui_items.push(UIItem {
+            x: content_x,
+            y: body_y,
+            width: content_width,
+            height: body_height,
+            item_type: UIItemType::RightSidebarNoteBody,
+        });
+
+        let settings = crate::native_settings::load();
+        let normal_weight = crate::native_settings::settings_font_weight(&settings);
+        let bold_font = self
+            .fonts
+            .title_font_with_size_and_weight(base_font_size, normal_weight.max(700))?;
+        let italic_font = self
+            .fonts
+            .title_font_with_size_weight_and_italic(base_font_size, normal_weight)?;
+        let bold_italic_font = self
+            .fonts
+            .title_font_with_size_weight_and_italic(base_font_size, normal_weight.max(700))?;
+        let h1_font = self
+            .fonts
+            .title_font_with_size_and_weight(base_font_size + 7.0, normal_weight.max(760))?;
+        let h2_font = self
+            .fonts
+            .title_font_with_size_and_weight(base_font_size + 4.0, normal_weight.max(730))?;
+        let h3_font = self
+            .fonts
+            .title_font_with_size_and_weight(base_font_size + 2.0, normal_weight.max(700))?;
+        let h1_italic_font = self
+            .fonts
+            .title_font_with_size_weight_and_italic(base_font_size + 7.0, normal_weight.max(760))?;
+        let h2_italic_font = self
+            .fonts
+            .title_font_with_size_weight_and_italic(base_font_size + 4.0, normal_weight.max(730))?;
+        let h3_italic_font = self
+            .fonts
+            .title_font_with_size_weight_and_italic(base_font_size + 2.0, normal_weight.max(700))?;
+        let code_font = self
+            .fonts
+            .resolve_font(&self.config.font)
+            .context("Note code font")?;
+        let h1_metrics = RenderMetrics::with_font_metrics(&h1_font.metrics());
+        let h2_metrics = RenderMetrics::with_font_metrics(&h2_font.metrics());
+        let h3_metrics = RenderMetrics::with_font_metrics(&h3_font.metrics());
+        let bold_metrics = RenderMetrics::with_font_metrics(&bold_font.metrics());
+        let italic_metrics = RenderMetrics::with_font_metrics(&italic_font.metrics());
+        let bold_italic_metrics = RenderMetrics::with_font_metrics(&bold_italic_font.metrics());
+        let h1_italic_metrics = RenderMetrics::with_font_metrics(&h1_italic_font.metrics());
+        let h2_italic_metrics = RenderMetrics::with_font_metrics(&h2_italic_font.metrics());
+        let h3_italic_metrics = RenderMetrics::with_font_metrics(&h3_italic_font.metrics());
+        let code_metrics = RenderMetrics::with_font_metrics(&code_font.metrics());
+        let selection = self.right_sidebar_note.view.selection;
+        let focused = self.right_sidebar_note.view.focused;
+        self.right_sidebar_note.view.preedit = if focused {
+            match &self.dead_key_status {
+                DeadKeyStatus::Composing(text) => Some(text.clone()),
+                DeadKeyStatus::None => None,
+            }
+        } else {
+            None
+        };
+        let preedit = self.right_sidebar_note.view.preedit.clone();
+        let padding = self.ui_px(NOTE_BODY_PADDING) as f32;
+        let text_left = content_x as f32 + padding;
+        let clip_left = text_left;
+        let clip_right = (content_x + content_width) as f32 - padding;
+        let wrap_width = (clip_right - clip_left).max(1.0);
+        let mut wrap_hasher = DefaultHasher::new();
+        (wrap_width.floor() as usize).hash(&mut wrap_hasher);
+        self.dimensions.dpi.hash(&mut wrap_hasher);
+        for font_id in [
+            ui_font.id(),
+            bold_font.id(),
+            italic_font.id(),
+            bold_italic_font.id(),
+            h1_font.id(),
+            h2_font.id(),
+            h3_font.id(),
+            h1_italic_font.id(),
+            h2_italic_font.id(),
+            h3_italic_font.id(),
+            code_font.id(),
+        ] {
+            font_id.hash(&mut wrap_hasher);
+        }
+        let wrap_key = wrap_hasher.finish() as usize;
+        let visual = if let Some(visual) = self.right_sidebar_note.cached_wrapped_visual(wrap_key) {
+            visual
+        } else {
+            let wrapped = wrap_visual_document_by_width(
+                &self.right_sidebar_note.visual,
+                wrap_width,
+                |block, run| {
+                    let (font, metrics) = match block {
+                        BlockKind::Heading(1) if run.style.emphasis => {
+                            (&h1_italic_font, h1_italic_metrics)
+                        }
+                        BlockKind::Heading(2) if run.style.emphasis => {
+                            (&h2_italic_font, h2_italic_metrics)
+                        }
+                        BlockKind::Heading(_) if run.style.emphasis => {
+                            (&h3_italic_font, h3_italic_metrics)
+                        }
+                        BlockKind::Heading(1) => (&h1_font, h1_metrics),
+                        BlockKind::Heading(2) => (&h2_font, h2_metrics),
+                        BlockKind::Heading(_) => (&h3_font, h3_metrics),
+                        BlockKind::CodeBlock => (&code_font, code_metrics),
+                        _ if run.style.strong && run.style.emphasis => {
+                            (&bold_italic_font, bold_italic_metrics)
+                        }
+                        _ if run.style.strong => (&bold_font, bold_metrics),
+                        _ if run.style.emphasis => (&italic_font, italic_metrics),
+                        _ => (ui_font, ui_metrics),
+                    };
+                    self.cached_ui_text_advance(font, &metrics, &run.text)
+                },
+            )?;
+            self.right_sidebar_note
+                .cache_wrapped_visual(wrap_key, wrapped)
+        };
+        let projected_objects = self.right_sidebar_note.projection.objects.clone();
+        let table_horizontal_padding = self.ui_f32(NOTE_TABLE_CELL_HORIZONTAL_PADDING as f32);
+        let table_vertical_padding = self.ui_f32(NOTE_TABLE_CELL_VERTICAL_PADDING as f32);
+        let table_row_height = ui_metrics.cell_size.height as f32 + table_vertical_padding * 2.0;
+        let mut table_rows = vec![None; visual.lines.len()];
+        for object in &projected_objects {
+            let ProjectedObject::Table(table) = object else {
+                continue;
+            };
+            let row_indices = visual
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    (line.block == BlockKind::Table
+                        && line.runs.iter().any(|run| {
+                            table.source.start <= run.source.start
+                                && run.source.end <= table.source.end
+                        }))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let column_count = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+            if row_indices.is_empty() || column_count == 0 {
+                continue;
+            }
+            let mut desired_widths = vec![0.0f32; column_count];
+            for (row_index, row) in table.rows.iter().enumerate() {
+                let (font, metrics) = if row_index == 0 {
+                    (&bold_font, bold_metrics)
+                } else {
+                    (ui_font, ui_metrics)
+                };
+                for (column_index, cell) in row.iter().enumerate() {
+                    let width = self.cached_ui_text_advance(font, &metrics, &cell.text)?
+                        + table_horizontal_padding * 2.0;
+                    desired_widths[column_index] = desired_widths[column_index].max(width);
+                }
+            }
+            let column_widths = Rc::new(fit_table_columns(
+                &desired_widths,
+                wrap_width,
+                self.ui_f32(NOTE_TABLE_MIN_COLUMN_WIDTH as f32),
+            ));
+            let mut alignments = table.alignments.clone();
+            alignments.resize(column_count, TableAlignment::None);
+            let alignments = Rc::new(alignments);
+            let row_count = row_indices.len();
+            for (row_index, visual_index) in row_indices.into_iter().enumerate() {
+                table_rows[visual_index] = Some(NoteTableRowPaintLayout {
+                    column_widths: Rc::clone(&column_widths),
+                    alignments: Rc::clone(&alignments),
+                    row_index,
+                    row_count,
+                });
+            }
+        }
+        let use_dark_syntax_theme = matches!(
+            crate::native_settings::effective_appearance(),
+            window::Appearance::Dark | window::Appearance::DarkHighContrast
+        );
+        let code_horizontal_padding = self.ui_f32(NOTE_CODE_HORIZONTAL_PADDING as f32);
+        let code_vertical_padding = self.ui_f32(NOTE_CODE_VERTICAL_PADDING as f32);
+        let code_header_height = self.ui_f32(NOTE_CODE_HEADER_HEIGHT as f32);
+        let code_line_height = code_metrics.cell_size.height as f32;
+        let code_inner_width = (wrap_width - code_horizontal_padding * 2.0).max(1.0);
+        let mut code_rows = vec![None; visual.lines.len()];
+        for object in &projected_objects {
+            let ProjectedObject::CodeBlock(code) = object else {
+                continue;
+            };
+            let row_indices = visual
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    (line.block == BlockKind::CodeBlock
+                        && code.content.start <= line.source.start
+                        && line.source.end <= code.content.end)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if row_indices.is_empty() {
+                continue;
+            }
+            let highlights = self.cached_note_code_highlights(code, use_dark_syntax_theme);
+            let collapsed = self
+                .right_sidebar_note
+                .collapsed_code_blocks
+                .contains(&code.source.start);
+            let max_content_width = code
+                .text
+                .split_inclusive('\n')
+                .map(|raw_line| raw_line.strip_suffix('\n').unwrap_or(raw_line))
+                .map(|line| self.cached_ui_text_advance(&code_font, &code_metrics, line))
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .into_iter()
+                .fold(0.0f32, f32::max);
+            let max_horizontal_scroll = (max_content_width - code_inner_width).max(0.0);
+            let horizontal_offset = self
+                .right_sidebar_note
+                .code_horizontal_offsets
+                .entry(code.source.start)
+                .or_default();
+            *horizontal_offset = horizontal_offset.clamp(0.0, max_horizontal_scroll);
+            let horizontal_offset = *horizontal_offset;
+            let row_count = row_indices.len();
+            let block_height = code_header_height
+                + if collapsed {
+                    0.0
+                } else {
+                    code_vertical_padding * 2.0 + code_line_height * row_count as f32
+                };
+            let language = code
+                .language
+                .as_deref()
+                .unwrap_or("code")
+                .to_ascii_uppercase();
+            for (row_index, visual_index) in row_indices.into_iter().enumerate() {
+                code_rows[visual_index] = Some(NoteCodeRowPaintLayout {
+                    block_start: code.source.start,
+                    language: language.clone(),
+                    row_index,
+                    row_count,
+                    collapsed,
+                    colors: Arc::clone(&highlights),
+                    horizontal_offset,
+                    block_height,
+                    max_horizontal_scroll,
+                });
+            }
+        }
+        let notebook = default_notebook().ok();
+        let viewport_top = body_y as f32;
+        let viewport_bottom = body_bottom as f32;
+        let image_line_height = self.ui_f32(180.0);
+        let line_gap = self.ui_px(NOTE_LINE_GAP) as f32;
+        let mut measured_y = padding;
+        let mut caret_row = None;
+        for (line_index, line) in visual.lines.iter().enumerate() {
+            let metrics = match line.block {
+                BlockKind::Heading(1) => h1_metrics,
+                BlockKind::Heading(2) => h2_metrics,
+                BlockKind::Heading(_) => h3_metrics,
+                BlockKind::CodeBlock => code_metrics,
+                _ => ui_metrics,
+            };
+            let mut height = metrics.cell_size.height as f32;
+            if line.kind == VisualLineKind::Image {
+                height = height.max(image_line_height);
+            }
+            if table_rows[line_index].is_some() {
+                height = table_row_height;
+            }
+            if let Some(code_row) = code_rows[line_index].as_ref() {
+                height = note_code_row_height(
+                    code_row.row_index,
+                    code_row.row_count,
+                    code_row.collapsed,
+                    code_line_height,
+                    code_header_height,
+                    code_vertical_padding,
+                );
+            }
+            if selection.is_caret()
+                && (line.runs.iter().any(|run| {
+                    run.source.start <= selection.focus.byte
+                        && selection.focus.byte <= run.source.end
+                }) || (line.runs.is_empty() && line.source.start == selection.focus.byte)
+                    || selection.focus.byte == line.source.end)
+            {
+                caret_row = Some((measured_y, height));
+            }
+            let row_gap = if let Some(code_row) = code_rows[line_index].as_ref() {
+                if code_row.row_index + 1 < code_row.row_count {
+                    0.0
+                } else {
+                    line_gap
+                }
+            } else {
+                table_rows[line_index]
+                    .as_ref()
+                    .filter(|row| row.row_index + 1 < row.row_count)
+                    .map(|_| 0.0)
+                    .unwrap_or(line_gap)
+            };
+            measured_y += height + row_gap;
+        }
+        let measured_content_height = measured_y + padding;
+        let max_scroll = (measured_content_height - body_height as f32).max(0.0);
+        let mut scroll = self
+            .right_sidebar_note
+            .view
+            .scroll_offset
+            .clamp(0.0, max_scroll);
+        if focused && self.right_sidebar_note.reveal_caret {
+            if let Some((caret_top, caret_height)) = caret_row {
+                let safe_top = scroll + padding;
+                let safe_bottom = scroll + body_height as f32 - padding;
+                if caret_top < safe_top {
+                    scroll = (caret_top - padding).max(0.0);
+                } else if caret_top + caret_height > safe_bottom {
+                    scroll =
+                        (caret_top + caret_height + padding - body_height as f32).min(max_scroll);
+                }
+            }
+            self.right_sidebar_note.reveal_caret = false;
+        }
+        self.right_sidebar_note.view.scroll_offset = scroll;
+        let mut logical_y = padding;
+        let mut layouts = Vec::new();
+        let mut code_block_layouts = Vec::new();
+        let mut caret_rect: Option<(f32, f32, f32)> = None;
+        let selected = selection.range();
+
+        for (line_index, line) in visual.lines.iter().enumerate() {
+            let table_row = table_rows[line_index].as_ref();
+            let code_row = code_rows[line_index].as_ref();
+            let (line_font, line_metrics) = match line.block {
+                BlockKind::Heading(1) => (&h1_font, h1_metrics),
+                BlockKind::Heading(2) => (&h2_font, h2_metrics),
+                BlockKind::Heading(_) => (&h3_font, h3_metrics),
+                BlockKind::CodeBlock => (&code_font, code_metrics),
+                _ => (ui_font, ui_metrics),
+            };
+            let mut line_height = line_metrics.cell_size.height as f32;
+            if line.kind == VisualLineKind::Image {
+                line_height = line_height.max(image_line_height);
+            }
+            if table_row.is_some() {
+                line_height = table_row_height;
+            }
+            if let Some(code_row) = code_row {
+                line_height = note_code_row_height(
+                    code_row.row_index,
+                    code_row.row_count,
+                    code_row.collapsed,
+                    code_line_height,
+                    code_header_height,
+                    code_vertical_padding,
+                );
+            }
+            let line_y = body_y as f32 + logical_y - scroll;
+            let line_bottom = line_y + line_height;
+            let visible = line_bottom >= viewport_top && line_y <= viewport_bottom;
+            let row_gap = if let Some(code_row) = code_row {
+                if code_row.row_index + 1 < code_row.row_count {
+                    0.0
+                } else {
+                    line_gap
+                }
+            } else {
+                table_row
+                    .filter(|row| row.row_index + 1 < row.row_count)
+                    .map(|_| 0.0)
+                    .unwrap_or(line_gap)
+            };
+            let code_text_y = code_row.map(|row| {
+                if row.row_index == 0 {
+                    line_y + code_header_height + code_vertical_padding
+                } else {
+                    line_y
+                }
+            });
+            let mut x = if let Some(code_row) = code_row {
+                text_left + code_horizontal_padding - code_row.horizontal_offset
+            } else {
+                text_left
+            };
+            let mut run_layouts = Vec::new();
+
+            if let Some(code_row) = code_row.filter(|row| row.row_index == 0) {
+                let block_bottom = line_y + code_row.block_height;
+                let draw_top = line_y.max(viewport_top);
+                let draw_bottom = block_bottom.min(viewport_bottom);
+                if draw_bottom > draw_top {
+                    let block_rect =
+                        euclid::rect(text_left, draw_top, wrap_width, draw_bottom - draw_top);
+                    if line_y >= viewport_top && block_bottom <= viewport_bottom {
+                        self.fill_rounded_rectangle(
+                            layers,
+                            1,
+                            block_rect,
+                            chrome.sidebar_button_bg,
+                            self.ui_f32(NOTE_CODE_BLOCK_RADIUS),
+                        )?;
+                    } else {
+                        self.filled_rectangle(layers, 1, block_rect, chrome.sidebar_button_bg)?;
+                    }
+                }
+                let content_y = line_y + code_header_height;
+                let content_height = (code_row.block_height - code_header_height).max(0.0);
+                code_block_layouts.push(NoteCodeBlockLayout {
+                    source_start: code_row.block_start,
+                    x: text_left,
+                    y: content_y,
+                    width: wrap_width,
+                    height: content_height,
+                    max_horizontal_scroll: code_row.max_horizontal_scroll,
+                });
+                if line_y >= viewport_top
+                    && line_y + code_header_height <= viewport_bottom
+                    && code_header_height >= 1.0
+                {
+                    let header_y = line_y.max(0.0) as usize;
+                    let header_height = code_header_height as usize;
+                    self.ui_items.push(UIItem {
+                        x: text_left as usize,
+                        y: header_y,
+                        width: wrap_width as usize,
+                        height: header_height,
+                        item_type: UIItemType::RightSidebarNoteCodeToggle(code_row.block_start),
+                    });
+                    let control_size = self.ui_px(NOTE_CODE_CONTROL_SIZE);
+                    let control_y = header_y + header_height.saturating_sub(control_size) / 2;
+                    let leading_x = text_left as usize + self.ui_px(4);
+                    self.paint_snippet_icon_button(
+                        layers,
+                        chrome,
+                        foreground,
+                        muted_fg,
+                        leading_x,
+                        control_y,
+                        control_size,
+                        if code_row.collapsed {
+                            SvgIcon::ChevronRight
+                        } else {
+                            SvgIcon::ChevronDown
+                        },
+                        UIItemType::RightSidebarNoteCodeToggle(code_row.block_start),
+                    )?;
+                    let copy_x = clip_right.max(text_left) as usize - control_size - self.ui_px(4);
+                    self.paint_snippet_icon_button(
+                        layers,
+                        chrome,
+                        foreground,
+                        muted_fg,
+                        copy_x,
+                        control_y,
+                        control_size,
+                        SvgIcon::Copy,
+                        UIItemType::RightSidebarNoteCodeCopy(code_row.block_start),
+                    )?;
+                    let language_x = leading_x + control_size + self.ui_px(4);
+                    self.paint_sidebar_text(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        &code_row.language,
+                        language_x,
+                        header_y
+                            + header_height.saturating_sub(ui_metrics.cell_size.height as usize)
+                                / 2,
+                        copy_x.saturating_sub(language_x + self.ui_px(4)),
+                        muted_fg,
+                    )?;
+                    self.filled_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            text_left,
+                            line_y + code_header_height - 1.0,
+                            wrap_width,
+                            1.0,
+                        ),
+                        chrome.separator.mul_alpha(0.72),
+                    )?;
+                }
+            }
+
+            if line_height <= 0.0 {
+                logical_y += row_gap;
+                continue;
+            }
+
+            let note_image_path = if visible && line.kind == VisualLineKind::Image {
+                projected_objects.iter().find_map(|object| match object {
+                    ProjectedObject::Image { source, target, .. } if *source == line.source => {
+                        notebook.as_ref().and_then(|notebook| {
+                            resolve_local_image(
+                                &notebook.content_root,
+                                &notebook.document_path,
+                                target,
+                            )
+                            .ok()
+                        })
+                    }
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            let note_image = note_image_path
+                .as_ref()
+                .and_then(|path| self.right_sidebar_note_images.get(path))
+                .cloned();
+            if note_image.is_none() {
+                if let Some(path) = note_image_path.clone() {
+                    self.schedule_right_sidebar_note_image(path);
+                }
+            }
+
+            if visible {
+                if let Some(table_row) = table_row {
+                    if table_row.row_index == 0 {
+                        self.filled_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(text_left, line_y, wrap_width, line_height),
+                            chrome.sidebar_row_active_bg,
+                        )?;
+                    }
+                    self.filled_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(text_left, line_y, wrap_width, 1.0),
+                        chrome.separator,
+                    )?;
+                    if table_row.row_index + 1 == table_row.row_count {
+                        self.filled_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(text_left, line_y + line_height - 1.0, wrap_width, 1.0),
+                            chrome.separator,
+                        )?;
+                    }
+                    let mut boundary_x = text_left;
+                    self.filled_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(boundary_x, line_y, 1.0, line_height),
+                        chrome.separator,
+                    )?;
+                    for column_width in table_row.column_widths.iter() {
+                        boundary_x += *column_width;
+                        self.filled_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(boundary_x - 1.0, line_y, 1.0, line_height),
+                            chrome.separator,
+                        )?;
+                    }
+                }
+                match line.kind {
+                    VisualLineKind::Rule => {
+                        self.filled_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(
+                                text_left,
+                                line_y + line_height / 2.0,
+                                (clip_right - text_left).max(0.0),
+                                1.0,
+                            ),
+                            chrome.separator,
+                        )?;
+                    }
+                    VisualLineKind::TableHeader => {}
+                    VisualLineKind::Image => {
+                        if let Some(image) = note_image.as_ref() {
+                            self.paint_right_sidebar_note_image(
+                                layers,
+                                image,
+                                text_left,
+                                line_y,
+                                (clip_right - text_left).max(0.0),
+                                line_height,
+                            )?;
+                        }
+                    }
+                    _ => {}
+                }
+                if line.block == BlockKind::Quote {
+                    self.filled_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            text_left - self.ui_f32(8.0),
+                            line_y,
+                            self.ui_f32(3.0),
+                            line_height,
+                        ),
+                        muted_fg,
+                    )?;
+                }
+            }
+
+            if !visible {
+                logical_y += line_height + row_gap;
+                continue;
+            }
+
+            for (run_index, run) in line.runs.iter().enumerate() {
+                let (font, metrics) = match line.block {
+                    BlockKind::Heading(1) if run.style.emphasis => {
+                        (&h1_italic_font, h1_italic_metrics)
+                    }
+                    BlockKind::Heading(2) if run.style.emphasis => {
+                        (&h2_italic_font, h2_italic_metrics)
+                    }
+                    BlockKind::Heading(_) if run.style.emphasis => {
+                        (&h3_italic_font, h3_italic_metrics)
+                    }
+                    BlockKind::Heading(_) => (line_font, line_metrics),
+                    _ if run.style.strong && run.style.emphasis => {
+                        (&bold_italic_font, bold_italic_metrics)
+                    }
+                    _ if run.style.strong => (&bold_font, bold_metrics),
+                    _ if run.style.emphasis => (&italic_font, italic_metrics),
+                    _ => (line_font, line_metrics),
+                };
+                let (shaped, _) = self.cached_ui_shape(font, &metrics, &run.text)?;
+                let advance = shaped
+                    .iter()
+                    .map(|info| info.glyph.x_advance.get() as f32)
+                    .sum::<f32>();
+                let (run_x, run_y, run_clip_left, run_clip_right, hit_x, hit_width) =
+                    if let Some(table_row) = table_row {
+                        let cell_width = table_row
+                            .column_widths
+                            .get(run_index)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let cell_left = x;
+                        let cell_right = (cell_left + cell_width).min(clip_right);
+                        let cell_clip_left = (cell_left + table_horizontal_padding).min(cell_right);
+                        let cell_clip_right = (cell_right - table_horizontal_padding)
+                            .max(cell_clip_left)
+                            .min(clip_right);
+                        let available = (cell_clip_right - cell_clip_left).max(0.0);
+                        let alignment = table_row
+                            .alignments
+                            .get(run_index)
+                            .copied()
+                            .unwrap_or(TableAlignment::None);
+                        let aligned_x = match alignment {
+                            TableAlignment::Center if advance < available => {
+                                cell_clip_left + (available - advance) / 2.0
+                            }
+                            TableAlignment::Right if advance < available => {
+                                cell_clip_right - advance
+                            }
+                            TableAlignment::None
+                            | TableAlignment::Left
+                            | TableAlignment::Center
+                            | TableAlignment::Right => cell_clip_left,
+                        };
+                        (
+                            aligned_x,
+                            line_y + table_vertical_padding,
+                            cell_clip_left,
+                            cell_clip_right,
+                            cell_left,
+                            cell_width,
+                        )
+                    } else if code_row.is_some() {
+                        let content_left = text_left + code_horizontal_padding;
+                        let content_right =
+                            (clip_right - code_horizontal_padding).max(content_left);
+                        (
+                            x,
+                            code_text_y.unwrap_or(line_y),
+                            content_left,
+                            content_right,
+                            content_left,
+                            (content_right - content_left).max(0.0),
+                        )
+                    } else {
+                        (x, line_y, clip_left, clip_right, x, advance)
+                    };
+                let run_height = metrics.cell_size.height as f32;
+                let mut boundaries = Vec::with_capacity(shaped.len() + 2);
+                if run.atomic {
+                    boundaries.push((run_x, run.source.start));
+                } else {
+                    let mut boundary_advance = 0.0f32;
+                    for info in shaped.iter() {
+                        boundaries.push((
+                            run_x + boundary_advance,
+                            (run.source.start + info.cluster).min(run.source.end),
+                        ));
+                        boundary_advance += info.glyph.x_advance.get() as f32;
+                    }
+                }
+                boundaries.push((run_x + advance, run.source.end));
+
+                if selected.start < selected.end {
+                    let start = selected.start.max(run.source.start);
+                    let end = selected.end.min(run.source.end);
+                    if start < end
+                        || (run.atomic
+                            && selected.start <= run.source.start
+                            && selected.end >= run.source.end)
+                    {
+                        let left = note_boundary_x(&boundaries, start).max(run_clip_left);
+                        let right = note_boundary_x(&boundaries, end).min(run_clip_right);
+                        if right > left {
+                            self.filled_rectangle(
+                                layers,
+                                1,
+                                euclid::rect(left, run_y, right - left, run_height),
+                                chrome.selected_bg.mul_alpha(0.72),
+                            )?;
+                        }
+                    }
+                }
+                if run.style.code && line.block != BlockKind::CodeBlock && advance > 0.0 {
+                    self.filled_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            run_x,
+                            run_y,
+                            advance.min((run_clip_right - run_x).max(0.0)),
+                            run_height,
+                        ),
+                        chrome.sidebar_button_bg,
+                    )?;
+                }
+                if !(line.kind == VisualLineKind::Image && note_image.is_some()) {
+                    let color = if run.style.link {
+                        chrome.secondary_text
+                    } else {
+                        foreground
+                    };
+                    let code_colors = code_row.and_then(|row| row.colors.get(row.row_index));
+                    self.paint_cached_ui_shape_clipped(
+                        layers,
+                        &metrics,
+                        &shaped,
+                        run_x,
+                        run_y,
+                        run_clip_left,
+                        run_clip_right,
+                        |info| {
+                            code_colors
+                                .and_then(|colors| colors.get(info.cluster))
+                                .copied()
+                                .unwrap_or(color)
+                        },
+                    )?;
+                    if run.style.strikethrough && advance > 0.0 {
+                        self.filled_rectangle(
+                            layers,
+                            2,
+                            euclid::rect(
+                                run_x.max(run_clip_left),
+                                run_y + run_height * 0.52,
+                                advance.min((run_clip_right - run_x).max(0.0)),
+                                1.0,
+                            ),
+                            color,
+                        )?;
+                    }
+                }
+                if focused
+                    && selection.is_caret()
+                    && selection.focus.byte >= run.source.start
+                    && selection.focus.byte <= run.source.end
+                {
+                    caret_rect = Some((
+                        note_boundary_x(&boundaries, selection.focus.byte),
+                        run_y,
+                        run_height,
+                    ));
+                }
+                run_layouts.push(NoteRunLayout {
+                    source: run.source.clone(),
+                    x: run_x,
+                    width: advance,
+                    hit_x,
+                    hit_width,
+                    boundaries,
+                    atomic: run.atomic,
+                });
+                x = if let Some(table_row) = table_row {
+                    x + table_row
+                        .column_widths
+                        .get(run_index)
+                        .copied()
+                        .unwrap_or(0.0)
+                } else {
+                    run_x + advance
+                };
+                if table_row.is_none() && x >= clip_right {
+                    break;
+                }
+            }
+            if focused
+                && selection.is_caret()
+                && line.runs.is_empty()
+                && line.source.start == selection.focus.byte
+            {
+                caret_rect = Some((
+                    if code_row.is_some() {
+                        text_left + code_horizontal_padding
+                    } else {
+                        text_left
+                    },
+                    code_text_y.unwrap_or(line_y),
+                    if code_row.is_some() {
+                        code_line_height
+                    } else {
+                        line_height
+                    },
+                ));
+            } else if focused
+                && selection.is_caret()
+                && selection.focus.byte == line.source.end
+                && caret_rect.is_none()
+            {
+                caret_rect = Some((x, line_y, line_height));
+            }
+            layouts.push(NoteLineLayout {
+                source: line.source.clone(),
+                y: code_text_y.unwrap_or(line_y),
+                height: if code_row.is_some() {
+                    code_line_height
+                } else {
+                    line_height
+                },
+                runs: run_layouts,
+            });
+            logical_y += line_height + row_gap;
+        }
+
+        self.right_sidebar_note.line_layouts = layouts;
+        self.right_sidebar_note.code_block_layouts = code_block_layouts;
+        self.right_sidebar_note.viewport_height = body_height as f32;
+        self.right_sidebar_note.content_height = measured_content_height;
+        self.right_sidebar_note.clamp_scroll();
+
+        if let Some((caret_x, caret_y, caret_height)) = caret_rect {
+            if caret_y + caret_height >= viewport_top && caret_y <= viewport_bottom {
+                if self.right_sidebar_snippet_cursor_on() {
+                    self.filled_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(
+                            caret_x.clamp(clip_left, clip_right),
+                            caret_y,
+                            NOTE_CARET_WIDTH.max(1.0),
+                            caret_height,
+                        ),
+                        foreground,
+                    )?;
+                }
+                if let Some(composing) = preedit.as_ref() {
+                    self.paint_ui_title_text_cached(
+                        layers,
+                        ui_font,
+                        &ui_metrics,
+                        composing,
+                        caret_x.max(clip_left) as usize,
+                        caret_y.max(viewport_top) as usize,
+                        (clip_right - caret_x).max(0.0) as usize,
+                        foreground,
+                    )?;
+                    let preedit_width = self
+                        .cached_ui_text_advance(ui_font, &ui_metrics, composing)?
+                        .min((clip_right - caret_x).max(0.0));
+                    if preedit_width > 0.0 {
+                        self.filled_rectangle(
+                            layers,
+                            2,
+                            euclid::rect(
+                                caret_x.max(clip_left),
+                                caret_y + caret_height - 1.0,
+                                preedit_width,
+                                1.0,
+                            ),
+                            foreground,
+                        )?;
+                    }
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.set_text_cursor_position(Rect::new(
+                        Point::new(caret_x as isize, caret_y as isize),
+                        ui_metrics.cell_size,
+                    ));
+                }
+            }
+        }
+
+        if self.right_sidebar_note.content_height > self.right_sidebar_note.viewport_height {
+            let track_height = body_height as f32;
+            let thumb_height = (track_height * self.right_sidebar_note.viewport_height
+                / self.right_sidebar_note.content_height)
+                .max(self.ui_f32(24.0));
+            let max_scroll = (self.right_sidebar_note.content_height
+                - self.right_sidebar_note.viewport_height)
+                .max(1.0);
+            let thumb_y = body_y as f32
+                + (track_height - thumb_height)
+                    * (self.right_sidebar_note.view.scroll_offset / max_scroll);
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(
+                    (content_x + content_width).saturating_sub(self.ui_px(4)) as f32,
+                    thumb_y,
+                    self.ui_f32(3.0),
+                    thumb_height,
+                ),
+                chrome.scrollbar_thumb,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn schedule_right_sidebar_note_image(&mut self, path: PathBuf) {
+        if self.right_sidebar_note_images.contains_key(&path)
+            || !self.right_sidebar_note_images_loading.insert(path.clone())
+        {
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.right_sidebar_note_images_loading.remove(&path);
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let load_path = path.clone();
+            let result =
+                promise::spawn::spawn_into_new_thread(move || load_file_preview_image(&load_path))
+                    .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.right_sidebar_note_images_loading.remove(&path);
+                match result {
+                    Ok(image) => {
+                        term_window
+                            .right_sidebar_note_image_order
+                            .retain(|cached| cached != &path);
+                        term_window
+                            .right_sidebar_note_image_order
+                            .push_back(path.clone());
+                        term_window.right_sidebar_note_images.insert(path, image);
+                        while term_window.right_sidebar_note_image_order.len()
+                            > NOTE_IMAGE_CACHE_CAPACITY
+                        {
+                            if let Some(expired) =
+                                term_window.right_sidebar_note_image_order.pop_front()
+                            {
+                                term_window.right_sidebar_note_images.remove(&expired);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("unable to render Note image {}: {err:#}", path.display());
+                    }
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_right_sidebar_note_image(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        image: &RightSidebarFilePreviewImage,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> anyhow::Result<()> {
+        if image.width == 0 || image.height == 0 || width <= 0.0 || height <= 0.0 {
+            return Ok(());
+        }
+        let scale = (width / image.width as f32)
+            .min(height / image.height as f32)
+            .min(1.0);
+        let draw_width = (image.width as f32 * scale).max(1.0);
+        let draw_height = (image.height as f32 * scale).max(1.0);
+        let draw_x = x + (width - draw_width) / 2.0;
+        let draw_y = y + (height - draw_height) / 2.0;
+        let Some(gl_state) = self.render_state.as_ref() else {
+            return Ok(());
+        };
+        let (sprite, next_due, _load_state) = gl_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_image(&image.data, None, self.allow_images)
+            .context("right sidebar Note image")?;
+        self.update_next_frame_time(next_due);
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        let mut quad = layers.allocate(2)?;
+        quad.set_position(
+            draw_x - left_offset,
+            draw_y - top_offset,
+            draw_x + draw_width - left_offset,
+            draw_y + draw_height - top_offset,
+        );
+        quad.set_texture(sprite.texture_coords());
+        quad.set_hsv(None);
+        quad.set_has_color(true);
+        quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
         Ok(())
     }
 
@@ -5852,18 +7541,20 @@ impl crate::TermWindow {
                     .clamp(self.ui_px(18), self.ui_px(22))
             })
             .unwrap_or(0);
-        let horizontal_pad = self.ui_px(SIDEBAR_INSET) * 2;
-        let available_label_width = width.saturating_sub(horizontal_pad * 2 + icon_size);
-        let text_width =
-            (self.sidebar_text_width(ui_font, label)?.ceil() as usize).min(available_label_width);
-        let icon_label_gap = if icon.is_some() && text_width > 0 {
+        let measured_text_width = self.sidebar_text_width(ui_font, label)?.ceil() as usize;
+        let icon_label_gap = if icon.is_some() && measured_text_width > 0 {
             self.ui_px(SIDEBAR_ICON_GAP)
         } else {
             0
         };
+        let intrinsic_width = icon_size + icon_label_gap + measured_text_width;
+        let horizontal_pad =
+            (self.ui_px(SIDEBAR_INSET) * 2).min(width.saturating_sub(intrinsic_width) / 2);
+        let available_label_width =
+            width.saturating_sub(horizontal_pad * 2 + icon_size + icon_label_gap);
+        let text_width = measured_text_width.min(available_label_width);
         let total_width = icon_size + icon_label_gap + text_width;
-        let start_x =
-            x + horizontal_pad + width.saturating_sub(horizontal_pad * 2 + total_width) / 2;
+        let start_x = x + width.saturating_sub(total_width) / 2;
         let color = if enabled { foreground } else { muted_fg };
         let mut text_x = start_x;
         if let Some(icon) = icon {
@@ -5884,7 +7575,7 @@ impl crate::TermWindow {
             label,
             text_x,
             y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
-            width.saturating_sub(text_x.saturating_sub(x) + self.ui_px(SIDEBAR_INSET)),
+            text_width,
             color,
         )
     }
@@ -5943,84 +7634,175 @@ fn file_name_for_path(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
-lazy_static::lazy_static! {
-    static ref FILE_PREVIEW_SYNTAX_SET: SyntaxSet = SyntaxSet::load_defaults_newlines();
-    static ref FILE_PREVIEW_THEME_SET: ThemeSet = ThemeSet::load_defaults();
-}
-
+#[cfg(test)]
 fn preview_lines_from_text(
     path: &Path,
     text: &str,
     use_dark_theme: bool,
 ) -> Vec<RightSidebarFilePreviewLine> {
-    let Some(syntax) = FILE_PREVIEW_SYNTAX_SET
-        .find_syntax_for_file(path)
-        .ok()
-        .flatten()
-    else {
-        return preview_plain_lines_from_text(text);
-    };
-    let Some(theme) = preview_syntax_theme(use_dark_theme) else {
-        return preview_plain_lines_from_text(text);
-    };
-
-    let default_color = theme
-        .settings
-        .foreground
-        .map(syntect_color_to_linear)
-        .unwrap_or_else(|| LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
-
-    let mut highlighter = HighlightLines::new(syntax, theme);
-    let raw_lines: Vec<&str> = if text.is_empty() {
-        vec![""]
-    } else {
-        text.lines().collect()
-    };
-    let mut lines = Vec::with_capacity(raw_lines.len());
-    for line in raw_lines {
-        // Highlight only the head of very long lines to bound syntect cost, but
-        // keep the tail verbatim (rendered in the default colour) so no content
-        // is lost.
-        let (head, tail) = match line
-            .char_indices()
-            .nth(FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT)
-            .map(|(idx, _)| idx)
-        {
-            Some(split) => (&line[..split], &line[split..]),
-            None => (line, ""),
-        };
-        let ranges = match highlighter.highlight_line(head, &FILE_PREVIEW_SYNTAX_SET) {
-            Ok(ranges) => ranges,
-            Err(err) => {
-                log::warn!("failed to highlight file preview line: {err:#}");
-                return preview_plain_lines_from_text(text);
-            }
-        };
-        lines.push(preview_line_from_highlighted_ranges(
-            ranges,
-            tail,
-            default_color,
-        ));
-    }
-    lines
+    preview_lines_from_text_with_cancellation(path, text, use_dark_theme, None)
 }
 
-fn preview_syntax_theme(use_dark_theme: bool) -> Option<&'static Theme> {
-    let dark_theme_names = [
-        "base16-eighties.dark",
-        "Solarized (dark)",
-        "base16-ocean.dark",
-    ];
-    let light_theme_names = ["base16-ocean.light", "Solarized (light)", "InspiredGitHub"];
-    let names = if use_dark_theme {
-        &dark_theme_names[..]
-    } else {
-        &light_theme_names[..]
+fn preview_lines_from_text_with_cancellation(
+    path: &Path,
+    text: &str,
+    use_dark_theme: bool,
+    cancellation: Option<&std::sync::atomic::AtomicUsize>,
+) -> Vec<RightSidebarFilePreviewLine> {
+    if cancellation
+        .map(|token| token.load(AtomicOrdering::Relaxed) != 0)
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+    let mut highlight_end = text
+        .len()
+        .min(thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT);
+    while !text.is_char_boundary(highlight_end) {
+        highlight_end = highlight_end.saturating_sub(1);
+    }
+    let highlight_source = &text[..highlight_end];
+    let highlighted = match syntax_highlight_pool()
+        .install(|| thinkterm_syntax::highlight_path(path, highlight_source, cancellation))
+    {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            if cancellation
+                .map(|token| token.load(AtomicOrdering::Relaxed) != 0)
+                .unwrap_or(false)
+            {
+                return Vec::new();
+            }
+            return preview_plain_lines_from_text(text);
+        }
+        Err(err) => {
+            let was_cancelled = cancellation
+                .map(|token| token.load(AtomicOrdering::Relaxed) != 0)
+                .unwrap_or(false);
+            if !was_cancelled {
+                log::warn!("failed to highlight file preview: {err:#}");
+            } else {
+                return Vec::new();
+            }
+            return preview_plain_lines_from_text(text);
+        }
     };
-    names
-        .iter()
-        .find_map(|name| FILE_PREVIEW_THEME_SET.themes.get(*name))
-        .or_else(|| FILE_PREVIEW_THEME_SET.themes.values().next())
+
+    highlighted_preview_lines(text, &highlighted.spans, use_dark_theme)
+}
+
+fn syntax_highlight_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|index| format!("thinkterm-syntax-{index}"))
+            .build()
+            .expect("build ThinkTerm syntax highlighting pool")
+    })
+}
+
+fn note_code_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        1
+    } else {
+        text.split_inclusive('\n').count()
+    }
+}
+
+fn note_code_syntax_result(
+    code: &ProjectedCodeBlock,
+    cancellation: Option<&AtomicUsize>,
+) -> Option<HighlightResult> {
+    let Some(language) = code.language.as_deref() else {
+        return None;
+    };
+    let Some(language) = thinkterm_syntax::detect_fence(language) else {
+        return None;
+    };
+    if code.text.len() > thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT {
+        return None;
+    }
+    match thinkterm_syntax::highlight(language, &code.text, cancellation) {
+        Ok(result) => Some(result),
+        Err(err) => {
+            let was_cancelled = cancellation
+                .map(|token| token.load(AtomicOrdering::Relaxed) != 0)
+                .unwrap_or(false);
+            if !was_cancelled {
+                log::warn!("failed to highlight Note code block: {err:#}");
+            }
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+fn note_code_highlight_lines(
+    code: &ProjectedCodeBlock,
+    use_dark_theme: bool,
+) -> Vec<Vec<LinearRgba>> {
+    let Some(syntax_result) = note_code_syntax_result(code, None) else {
+        return vec![vec![]; note_code_line_count(&code.text)];
+    };
+    note_code_colors(code, &syntax_result, use_dark_theme)
+}
+
+fn note_code_highlight_pair(
+    code: &ProjectedCodeBlock,
+    cancellation: Option<&AtomicUsize>,
+) -> Option<(Vec<Vec<LinearRgba>>, Vec<Vec<LinearRgba>>)> {
+    let syntax_result = note_code_syntax_result(code, cancellation)?;
+    Some((
+        note_code_colors(code, &syntax_result, false),
+        note_code_colors(code, &syntax_result, true),
+    ))
+}
+
+fn note_code_colors(
+    code: &ProjectedCodeBlock,
+    syntax_result: &HighlightResult,
+    use_dark_theme: bool,
+) -> Vec<Vec<LinearRgba>> {
+    let raw_lines = if code.text.is_empty() {
+        vec![""]
+    } else {
+        code.text.split_inclusive('\n').collect::<Vec<_>>()
+    };
+
+    let default_color = syntax_default_color(use_dark_theme);
+    let mut lines = Vec::with_capacity(raw_lines.len());
+    let mut source_offset = 0usize;
+    let mut span_index = 0usize;
+    for raw_line in raw_lines {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line_end = source_offset.saturating_add(line.len());
+        let mut colors = vec![default_color; line.len()];
+        while span_index < syntax_result.spans.len()
+            && syntax_result.spans[span_index].range.end <= source_offset
+        {
+            span_index += 1;
+        }
+        let mut index = span_index;
+        while let Some(span) = syntax_result.spans.get(index) {
+            if span.range.start >= line_end {
+                break;
+            }
+            let start = span
+                .range
+                .start
+                .max(source_offset)
+                .saturating_sub(source_offset);
+            let end = span.range.end.min(line_end).saturating_sub(source_offset);
+            if start < end && end <= colors.len() {
+                colors[start..end].fill(syntax_color(span.kind, use_dark_theme));
+            }
+            index += 1;
+        }
+        lines.push(colors);
+        source_offset = source_offset.saturating_add(raw_line.len());
+    }
+    lines
 }
 
 fn preview_plain_lines_from_text(text: &str) -> Vec<RightSidebarFilePreviewLine> {
@@ -6039,52 +7821,132 @@ fn preview_line_from_plain(line: &str) -> RightSidebarFilePreviewLine {
     }
 }
 
-fn preview_line_from_highlighted_ranges(
-    ranges: Vec<(SyntectStyle, &str)>,
-    tail: &str,
-    default_color: LinearRgba,
-) -> RightSidebarFilePreviewLine {
-    let mut plain = String::new();
-    let mut char_count = 0usize;
-    let mut spans = Vec::new();
+fn highlighted_preview_lines(
+    text: &str,
+    highlights: &[HighlightSpan],
+    use_dark_theme: bool,
+) -> Vec<RightSidebarFilePreviewLine> {
+    if text.is_empty() {
+        return vec![preview_line_from_plain("")];
+    }
 
-    for (style, text) in ranges {
-        if text.is_empty() {
-            continue;
+    let default_color = syntax_default_color(use_dark_theme);
+    let mut lines = Vec::new();
+    let mut source_offset = 0usize;
+    let mut span_index = 0usize;
+    for raw_line in text.split_inclusive('\n') {
+        let without_newline = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        let line_end = source_offset.saturating_add(line.len());
+        while span_index < highlights.len() && highlights[span_index].range.end <= source_offset {
+            span_index += 1;
         }
-        let color = syntect_color_to_linear(style.foreground);
-        let span_char_count = text.chars().count();
-        plain.push_str(text);
-        char_count = char_count.saturating_add(span_char_count);
-        spans.push(RightSidebarFilePreviewSpan {
-            text: text.to_string(),
-            char_count: span_char_count,
-            color,
-        });
-    }
 
-    // The un-highlighted remainder of a very long line is kept verbatim so no
-    // content is dropped; it just renders in the editor's default colour.
-    if !tail.is_empty() {
-        let span_char_count = tail.chars().count();
-        plain.push_str(tail);
-        char_count = char_count.saturating_add(span_char_count);
-        spans.push(RightSidebarFilePreviewSpan {
-            text: tail.to_string(),
-            char_count: span_char_count,
-            color: default_color,
-        });
-    }
+        let mut cursor = source_offset;
+        let mut spans = Vec::new();
+        let mut index = span_index;
+        while let Some(span) = highlights.get(index) {
+            if span.range.start >= line_end {
+                break;
+            }
+            let start = span
+                .range
+                .start
+                .max(cursor)
+                .max(source_offset)
+                .min(line_end);
+            let end = span.range.end.min(line_end);
+            if cursor < start {
+                push_preview_span(&mut spans, &text[cursor..start], default_color);
+            }
+            if start < end {
+                push_preview_span(
+                    &mut spans,
+                    &text[start..end],
+                    syntax_color(span.kind, use_dark_theme),
+                );
+                cursor = end;
+            }
+            index += 1;
+        }
+        if cursor < line_end {
+            push_preview_span(&mut spans, &text[cursor..line_end], default_color);
+        }
 
-    RightSidebarFilePreviewLine {
-        plain,
+        lines.push(RightSidebarFilePreviewLine {
+            plain: line.to_string(),
+            char_count: line.chars().count(),
+            spans,
+        });
+        source_offset = source_offset.saturating_add(raw_line.len());
+    }
+    lines
+}
+
+fn push_preview_span(spans: &mut Vec<RightSidebarFilePreviewSpan>, text: &str, color: LinearRgba) {
+    if text.is_empty() {
+        return;
+    }
+    let char_count = text.chars().count();
+    if let Some(previous) = spans.last_mut() {
+        if previous.color == color {
+            previous.text.push_str(text);
+            previous.char_count = previous.char_count.saturating_add(char_count);
+            return;
+        }
+    }
+    spans.push(RightSidebarFilePreviewSpan {
+        text: text.to_string(),
         char_count,
-        spans,
+        color,
+    });
+}
+
+fn syntax_default_color(use_dark_theme: bool) -> LinearRgba {
+    if use_dark_theme {
+        LinearRgba::with_srgba(0xab, 0xb2, 0xbf, 0xff)
+    } else {
+        LinearRgba::with_srgba(0x38, 0x3a, 0x42, 0xff)
     }
 }
 
-fn syntect_color_to_linear(color: SyntectColor) -> LinearRgba {
-    LinearRgba::with_srgba(color.r, color.g, color.b, color.a)
+fn syntax_color(kind: HighlightKind, use_dark_theme: bool) -> LinearRgba {
+    let (red, green, blue) = if use_dark_theme {
+        match kind {
+            HighlightKind::Comment => (0x7f, 0x84, 0x8e),
+            HighlightKind::Keyword | HighlightKind::Label => (0xc6, 0x78, 0xdd),
+            HighlightKind::String => (0x98, 0xc3, 0x79),
+            HighlightKind::Number | HighlightKind::Constant => (0xd1, 0x9a, 0x66),
+            HighlightKind::Type | HighlightKind::Module => (0xe5, 0xc0, 0x7b),
+            HighlightKind::Function | HighlightKind::Constructor => (0x61, 0xaf, 0xef),
+            HighlightKind::Property | HighlightKind::Attribute | HighlightKind::Tag => {
+                (0xe0, 0x6c, 0x75)
+            }
+            HighlightKind::Variable
+            | HighlightKind::Embedded
+            | HighlightKind::Operator
+            | HighlightKind::Punctuation => (0xab, 0xb2, 0xbf),
+        }
+    } else {
+        match kind {
+            HighlightKind::Comment => (0x6a, 0x73, 0x7d),
+            HighlightKind::Keyword | HighlightKind::Label => (0xa6, 0x26, 0xa4),
+            HighlightKind::String => (0x50, 0xa1, 0x4f),
+            HighlightKind::Number | HighlightKind::Constant => (0x98, 0x68, 0x01),
+            HighlightKind::Type | HighlightKind::Module => (0xc1, 0x84, 0x01),
+            HighlightKind::Function | HighlightKind::Constructor => (0x40, 0x78, 0xf2),
+            HighlightKind::Property | HighlightKind::Attribute | HighlightKind::Tag => {
+                (0xe4, 0x56, 0x49)
+            }
+            HighlightKind::Variable
+            | HighlightKind::Embedded
+            | HighlightKind::Operator
+            | HighlightKind::Punctuation => (0x38, 0x3a, 0x42),
+        }
+    };
+    LinearRgba::with_srgba(red, green, blue, 0xff)
 }
 
 fn preview_line_count(lines: &[RightSidebarFilePreviewLine]) -> usize {
@@ -6381,9 +8243,10 @@ fn visible_file_row_range(
     start.min(row_count)..end.min(row_count)
 }
 
-fn load_right_sidebar_file_preview(
+fn load_right_sidebar_file_preview_with_cancellation(
     path: &Path,
     use_dark_syntax_theme: bool,
+    cancellation: Option<&AtomicUsize>,
 ) -> RightSidebarLoadedFilePreview {
     if is_preview_image_path(path) {
         return match load_file_preview_image(path) {
@@ -6404,7 +8267,7 @@ fn load_right_sidebar_file_preview(
 
     let (text, message, truncated) = load_file_preview(path);
     let lines = if message.is_none() {
-        preview_lines_from_text(path, &text, use_dark_syntax_theme)
+        preview_lines_from_text_with_cancellation(path, &text, use_dark_syntax_theme, cancellation)
     } else {
         Vec::new()
     };
@@ -6468,7 +8331,7 @@ fn load_file_preview(path: &Path) -> (String, Option<String>, bool) {
                 String::new(),
                 Some(format!("Unable to open file: {err}")),
                 false,
-            )
+            );
         }
     };
     let mut bytes = Vec::with_capacity(FILE_PREVIEW_MAX_BYTES + 1);
@@ -7156,14 +9019,16 @@ mod tests {
     use super::{
         build_right_sidebar_file_index, full_line_colors_by_byte,
         image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
-        naturalish_cmp, open_with_candidate_allowed, path_key, preview_line_count,
-        preview_lines_from_text, preview_plain_lines_from_text, preview_text_range,
-        preview_visible_colored, preview_visible_line_range,
-        right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
-        right_sidebar_open_with_cache_key, search_right_sidebar_file_index, snippet_cursor_visible,
-        snippet_run_buffer, sorted_open_with_candidates, visible_file_row_range,
-        wrap_snippet_text_for_width, FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT, FILE_PREVIEW_MAX_BYTES,
+        naturalish_cmp, note_code_highlight_lines, note_code_row_height,
+        open_with_candidate_allowed, path_key, preview_line_count, preview_lines_from_text,
+        preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
+        preview_visible_line_range, right_sidebar_file_browse_rows_from_index,
+        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key,
+        search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
+        sorted_open_with_candidates, visible_file_row_range, wrap_snippet_text_for_width,
+        FILE_PREVIEW_MAX_BYTES, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
     };
+    use crate::markdown_editor::ProjectedCodeBlock;
     use crate::termwindow::{RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan};
     use crate::utilsprites::RenderMetrics;
     use std::collections::HashSet;
@@ -7183,6 +9048,44 @@ mod tests {
             strike_row: 0,
             cell_size: Size::new(cell_width, cell_height),
         }
+    }
+
+    #[test]
+    fn note_code_highlighting_resolves_aliases_and_utf8_byte_colors() {
+        assert!(thinkterm_syntax::detect_fence("python").is_some());
+        assert!(thinkterm_syntax::detect_fence("rust").is_some());
+        assert!(thinkterm_syntax::detect_fence("definitely-not-a-language").is_none());
+
+        let text = "def 你好(name):\n    return name\n";
+        let code = ProjectedCodeBlock {
+            source: 0..text.len() + 12,
+            content: 6..6 + text.len(),
+            text: text.to_string(),
+            language: Some("python".to_string()),
+        };
+        let colors = note_code_highlight_lines(&code, true);
+        assert_eq!(colors.len(), 2);
+        assert_eq!(colors[0].len(), "def 你好(name):".len());
+        assert_eq!(colors[1].len(), "    return name".len());
+        let first = colors.iter().flatten().next().copied().unwrap();
+        assert!(
+            colors.iter().flatten().any(|color| *color != first),
+            "Python should produce multiple token colors"
+        );
+    }
+
+    #[test]
+    fn note_code_row_heights_form_one_continuous_block() {
+        assert_eq!(note_code_row_height(0, 3, false, 20.0, 38.0, 9.0), 67.0);
+        assert_eq!(note_code_row_height(1, 3, false, 20.0, 38.0, 9.0), 20.0);
+        assert_eq!(note_code_row_height(2, 3, false, 20.0, 38.0, 9.0), 29.0);
+        assert_eq!(note_code_row_height(0, 3, true, 20.0, 38.0, 9.0), 38.0);
+        assert_eq!(note_code_row_height(1, 3, true, 20.0, 38.0, 9.0), 0.0);
+    }
+
+    #[test]
+    fn note_code_block_uses_panel_radius_not_capsule_radius() {
+        assert!(NOTE_CODE_BLOCK_RADIUS < NOTE_CODE_HEADER_HEIGHT as f32 / 2.0);
     }
 
     #[test]
@@ -7681,7 +9584,7 @@ mod tests {
         // A line far longer than the highlight cap must be preserved verbatim
         // (no 640-char truncation, no "...") on both the plain and highlighted
         // paths.
-        let line = "a".repeat(FILE_PREVIEW_HIGHLIGHT_CHAR_LIMIT * 2);
+        let line = "a".repeat(16_384);
 
         let plain = preview_plain_lines_from_text(&line);
         assert_eq!(plain.len(), 1);
@@ -7692,6 +9595,18 @@ mod tests {
         assert_eq!(highlighted.len(), 1);
         assert_eq!(highlighted[0].plain.chars().count(), line.chars().count());
         assert!(!highlighted[0].plain.contains("..."));
+    }
+
+    #[test]
+    fn preview_highlight_limit_never_splits_utf8_or_truncates_text() {
+        let mut text = "a".repeat(thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT - 1);
+        text.push('你');
+        text.push_str("tail");
+
+        let lines = preview_lines_from_text(std::path::Path::new("large.py"), &text, true);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].plain, text);
+        assert_eq!(lines[0].char_count, text.chars().count());
     }
 
     #[test]

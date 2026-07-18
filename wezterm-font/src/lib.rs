@@ -473,7 +473,7 @@ struct FontConfigInner {
     pane_select_font: RefCell<Option<Rc<LoadedFont>>>,
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
-    entity_font_overrides: RefCell<HashMap<(Entity, u64, u16), Rc<LoadedFont>>>,
+    entity_font_overrides: RefCell<HashMap<(Entity, u64, u16, bool), Rc<LoadedFont>>>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
 }
 
@@ -627,6 +627,7 @@ impl FontConfigInner {
         entity: Entity,
         override_font_size: Option<f64>,
         override_weight: Option<config::FontWeight>,
+        override_italic: bool,
     ) -> anyhow::Result<Rc<LoadedFont>> {
         let config = self.config.borrow();
         let make_bold = entity != Entity::CommandPalette;
@@ -652,11 +653,16 @@ impl FontConfigInner {
         let text_style =
             text_style.unwrap_or(config.window_frame.font.as_ref().unwrap_or(&sys_font));
         let override_style;
-        let text_style = if let Some(weight) = override_weight {
+        let text_style = if override_weight.is_some() || override_italic {
             override_style = {
                 let mut style = text_style.clone();
                 for attr in &mut style.font {
-                    attr.weight = weight;
+                    if let Some(weight) = override_weight {
+                        attr.weight = weight;
+                    }
+                    if override_italic {
+                        attr.style = config::FontStyle::Italic;
+                    }
                 }
                 style
             };
@@ -705,7 +711,7 @@ impl FontConfigInner {
             return Ok(Rc::clone(entry));
         }
 
-        let loaded = self.make_entity_font_impl(myself, Entity::Title, None, None)?;
+        let loaded = self.make_entity_font_impl(myself, Entity::Title, None, None, false)?;
 
         title_font.replace(Rc::clone(&loaded));
 
@@ -719,7 +725,8 @@ impl FontConfigInner {
             return Ok(Rc::clone(entry));
         }
 
-        let loaded = self.make_entity_font_impl(myself, Entity::CommandPalette, None, None)?;
+        let loaded =
+            self.make_entity_font_impl(myself, Entity::CommandPalette, None, None, false)?;
 
         command_palette_font.replace(Rc::clone(&loaded));
 
@@ -733,7 +740,7 @@ impl FontConfigInner {
             return Ok(Rc::clone(entry));
         }
 
-        let loaded = self.make_entity_font_impl(myself, Entity::CharSelect, None, None)?;
+        let loaded = self.make_entity_font_impl(myself, Entity::CharSelect, None, None, false)?;
 
         char_select_font.replace(Rc::clone(&loaded));
 
@@ -747,7 +754,7 @@ impl FontConfigInner {
             return Ok(Rc::clone(entry));
         }
 
-        let loaded = self.make_entity_font_impl(myself, Entity::PaneSelect, None, None)?;
+        let loaded = self.make_entity_font_impl(myself, Entity::PaneSelect, None, None, false)?;
 
         pane_select_font.replace(Rc::clone(&loaded));
 
@@ -760,10 +767,11 @@ impl FontConfigInner {
         entity: Entity,
         font_size: f64,
         font_weight: Option<u16>,
+        italic: bool,
     ) -> anyhow::Result<Rc<LoadedFont>> {
         let font_size = font_size.clamp(6.0, 72.0);
         let font_weight = font_weight.unwrap_or(0);
-        let key = (entity, font_size.to_bits(), font_weight);
+        let key = (entity, font_size.to_bits(), font_weight, italic);
         if let Some(entry) = self.entity_font_overrides.borrow().get(&key) {
             return Ok(Rc::clone(entry));
         }
@@ -772,6 +780,7 @@ impl FontConfigInner {
             entity,
             Some(font_size),
             (font_weight > 0).then(|| config::FontWeight::from_opentype_weight(font_weight)),
+            italic,
         )?;
         self.entity_font_overrides
             .borrow_mut()
@@ -1152,7 +1161,7 @@ impl FontConfiguration {
 
     pub fn title_font_with_size(&self, font_size: f64) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner
-            .entity_font_with_size(&self.inner, Entity::Title, font_size, None)
+            .entity_font_with_size(&self.inner, Entity::Title, font_size, None, false)
     }
 
     pub fn title_font_with_size_and_weight(
@@ -1160,8 +1169,27 @@ impl FontConfiguration {
         font_size: f64,
         font_weight: u16,
     ) -> anyhow::Result<Rc<LoadedFont>> {
-        self.inner
-            .entity_font_with_size(&self.inner, Entity::Title, font_size, Some(font_weight))
+        self.inner.entity_font_with_size(
+            &self.inner,
+            Entity::Title,
+            font_size,
+            Some(font_weight),
+            false,
+        )
+    }
+
+    pub fn title_font_with_size_weight_and_italic(
+        &self,
+        font_size: f64,
+        font_weight: u16,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.entity_font_with_size(
+            &self.inner,
+            Entity::Title,
+            font_size,
+            Some(font_weight),
+            true,
+        )
     }
 
     pub fn command_palette_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
@@ -1169,8 +1197,13 @@ impl FontConfiguration {
     }
 
     pub fn command_palette_font_with_size(&self, font_size: f64) -> anyhow::Result<Rc<LoadedFont>> {
-        self.inner
-            .entity_font_with_size(&self.inner, Entity::CommandPalette, font_size, None)
+        self.inner.entity_font_with_size(
+            &self.inner,
+            Entity::CommandPalette,
+            font_size,
+            None,
+            false,
+        )
     }
 
     pub fn command_palette_font_with_size_and_weight(
@@ -1183,6 +1216,7 @@ impl FontConfiguration {
             Entity::CommandPalette,
             font_size,
             Some(font_weight),
+            false,
         )
     }
 

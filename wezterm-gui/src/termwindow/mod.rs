@@ -53,7 +53,6 @@ use mux::tab::{
 };
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
-use wezterm_client::domain::ClientDomain;
 use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
@@ -62,12 +61,13 @@ use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::ops::Add;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::image::ImageData;
 use termwiz::surface::SequenceNo;
+use wezterm_client::domain::ClientDomain;
 use wezterm_dynamic::Value;
 use wezterm_font::FontConfiguration;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
@@ -295,6 +295,11 @@ pub enum UIItemType {
     RightSidebarSnippetDelete(String),
     RightSidebarSnippetScrollTrack,
     RightSidebarSnippetScrollThumb,
+    RightSidebarNoteModeToggle,
+    RightSidebarNoteSave,
+    RightSidebarNoteCodeToggle(usize),
+    RightSidebarNoteCodeCopy(usize),
+    RightSidebarNoteBody,
     RightSidebarFilePreviewScrollTrack,
     RightSidebarFilePreviewScrollThumb,
     RightSidebarFilePreviewHorizontalScrollTrack,
@@ -1007,6 +1012,16 @@ pub struct TermWindow {
     right_sidebar_snippet_body: TextInputState,
     right_sidebar_snippet_scroll_offset: f32,
     right_sidebar_snippet_scrollbar_visible_until: Option<Instant>,
+    right_sidebar_note: crate::markdown_editor::NoteHostState,
+    right_sidebar_note_images: HashMap<PathBuf, RightSidebarFilePreviewImage>,
+    right_sidebar_note_images_loading: HashSet<PathBuf>,
+    right_sidebar_note_image_order: VecDeque<PathBuf>,
+    right_sidebar_note_code_highlights:
+        HashMap<(u64, usize, bool), Arc<Vec<Vec<::window::color::LinearRgba>>>>,
+    right_sidebar_note_code_highlight_order: VecDeque<(u64, usize, bool)>,
+    right_sidebar_note_code_highlights_pending: HashSet<(u64, usize)>,
+    right_sidebar_note_code_highlight_revision: u64,
+    right_sidebar_note_code_highlight_cancel: Arc<AtomicUsize>,
     right_sidebar_file_view: RightSidebarFileView,
     right_sidebar_file_focus: Option<RightSidebarFileField>,
     right_sidebar_file_filter: TextInputState,
@@ -1035,6 +1050,7 @@ pub struct TermWindow {
     right_sidebar_file_tree_width: usize,
     right_sidebar_file_preview_width: usize,
     right_sidebar_file_preview_generation: u64,
+    right_sidebar_file_preview_highlight_cancel: Arc<AtomicUsize>,
     right_sidebar_file_preview_lines: Vec<RightSidebarFilePreviewLine>,
     right_sidebar_file_preview_max_columns: usize,
     right_sidebar_file_preview_image: Option<RightSidebarFilePreviewImage>,
@@ -1061,8 +1077,7 @@ pub struct TermWindow {
     // Per-(root, project) remembered Files-panel view state (expanded folders,
     // selected/preview, scroll, filter) so switching workspaces / idle-release /
     // re-scan don't lose where you were. Only a few KB of paths each; LRU-bounded.
-    right_sidebar_file_view_state_by_root:
-        HashMap<(PathBuf, String), RightSidebarFileViewState>,
+    right_sidebar_file_view_state_by_root: HashMap<(PathBuf, String), RightSidebarFileViewState>,
     right_sidebar_file_view_state_order: VecDeque<(PathBuf, String)>,
     // Bumped to invalidate a pending periodic-rescan timer tick.
     right_sidebar_file_rescan_token: u64,
@@ -1185,6 +1200,7 @@ impl TermWindow {
     }
 
     fn close_requested(&mut self, window: &Window) {
+        self.flush_right_sidebar_note_blocking();
         self.persist_workspace_layout_after_mutation("window close requested");
 
         let mux = Mux::get();
@@ -1253,6 +1269,7 @@ impl TermWindow {
         }
 
         if self.focused.is_none() {
+            self.save_right_sidebar_note_now();
             self.last_mouse_click = None;
             self.current_mouse_buttons.clear();
             self.current_mouse_capture = None;
@@ -1366,10 +1383,7 @@ impl TermWindow {
                 // initial size instead.
                 log::debug!("new_window has no tabs... yet?");
                 let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
-                config.initial_size(
-                    dpi as u32,
-                    crate::cell_pixel_dims(&config, dpi as f64).ok(),
-                )
+                config.initial_size(dpi as u32, crate::cell_pixel_dims(&config, dpi as f64).ok())
             }
         };
         let physical_rows = size.rows as usize;
@@ -1418,7 +1432,8 @@ impl TermWindow {
             pixel_cell: render_metrics.cell_size.width as f32,
         };
         let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
-        let workspace_sidebar_width = ui::workspace_sidebar_width_for_metrics(&render_metrics, dpi as usize);
+        let workspace_sidebar_width =
+            ui::workspace_sidebar_width_for_metrics(&render_metrics, dpi as usize);
         let padding_right = resize::effective_right_padding(&config, h_context) as usize;
         let v_context = DimensionContext {
             dpi: dpi as f32,
@@ -1622,6 +1637,15 @@ impl TermWindow {
             right_sidebar_snippet_body: TextInputState::new(),
             right_sidebar_snippet_scroll_offset: 0.0,
             right_sidebar_snippet_scrollbar_visible_until: None,
+            right_sidebar_note: crate::markdown_editor::NoteHostState::default(),
+            right_sidebar_note_images: HashMap::new(),
+            right_sidebar_note_images_loading: HashSet::new(),
+            right_sidebar_note_image_order: VecDeque::new(),
+            right_sidebar_note_code_highlights: HashMap::new(),
+            right_sidebar_note_code_highlight_order: VecDeque::new(),
+            right_sidebar_note_code_highlights_pending: HashSet::new(),
+            right_sidebar_note_code_highlight_revision: 0,
+            right_sidebar_note_code_highlight_cancel: Arc::new(AtomicUsize::new(0)),
             right_sidebar_file_view: RightSidebarFileView::Tree,
             right_sidebar_file_focus: None,
             right_sidebar_file_filter: TextInputState::new(),
@@ -1644,9 +1668,13 @@ impl TermWindow {
             right_sidebar_file_browse_rows: Vec::new(),
             right_sidebar_file_browse_cache_key: None,
             right_sidebar_file_selected: None,
-            right_sidebar_file_tree_width: ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize),
+            right_sidebar_file_tree_width: ui::right_sidebar_width_for_metrics(
+                &render_metrics,
+                dpi as usize,
+            ),
             right_sidebar_file_preview_width: ui::right_sidebar_file_preview_width(dpi as usize),
             right_sidebar_file_preview_generation: 0,
+            right_sidebar_file_preview_highlight_cancel: Arc::new(AtomicUsize::new(0)),
             right_sidebar_file_preview_lines: Vec::new(),
             right_sidebar_file_preview_max_columns: 0,
             right_sidebar_file_preview_image: None,
@@ -1834,6 +1862,7 @@ impl TermWindow {
         log::debug!("{event:?}");
         match event {
             WindowEvent::Destroyed => {
+                self.flush_right_sidebar_note_blocking();
                 // Ensure that we cancel any overlays we had running, so
                 // that the mux can empty out, otherwise the mux keeps
                 // the TermWindow alive via the frontend even though
@@ -1977,6 +2006,61 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::DroppedFile(paths) => {
+                if self.right_sidebar_mode == RightSidebarMode::Tasks
+                    && self.right_sidebar_note.view.focused
+                {
+                    let notebook = match crate::markdown_editor::default_notebook() {
+                        Ok(notebook) => notebook,
+                        Err(err) => {
+                            log::error!("failed to open Note attachment store: {err:#}");
+                            return Ok(true);
+                        }
+                    };
+                    let paths = paths.clone();
+                    let notify_window = window.clone();
+                    promise::spawn::spawn(async move {
+                        let markdown = promise::spawn::spawn_into_new_thread(move || {
+                            let mut inserted = Vec::new();
+                            for path in paths {
+                                match crate::markdown_editor::import_attachment(&notebook, &path) {
+                                    Ok(relative) => {
+                                        let alt = path
+                                            .file_stem()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("image")
+                                            .replace('\\', "\\\\")
+                                            .replace('[', "\\[")
+                                            .replace(']', "\\]")
+                                            .replace(['\r', '\n'], " ");
+                                        inserted.push(format!("![{alt}]({relative})"));
+                                    }
+                                    Err(err) => {
+                                        log::warn!(
+                                            "unable to import Note attachment {}: {err:#}",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                            }
+                            anyhow::Ok(inserted.join("\n"))
+                        })
+                        .await;
+                        if let Ok(markdown) = markdown {
+                            if markdown.is_empty() {
+                                return;
+                            }
+                            notify_window.notify(TermWindowNotif::Apply(Box::new(
+                                move |term_window| {
+                                    if term_window.push_right_sidebar_text(&markdown) {
+                                        term_window.invalidate_window();
+                                    }
+                                },
+                            )));
+                        }
+                    })
+                    .detach();
+                    return Ok(true);
+                }
                 let pane = match self.get_active_pane_or_overlay() {
                     Some(pane) => pane,
                     None => return Ok(true),
@@ -2304,21 +2388,20 @@ impl TermWindow {
                 let path = path.to_string_lossy();
                 // In a mux-domain Space the path names a directory on the
                 // remote server and must not be resolved locally.
-                let result = if crate::workspace_threads::client_domain_for_space(
-                    &self.active_space_id,
-                )
-                .is_some()
-                {
-                    crate::workspace_threads::create_remote_project_from_path(
-                        &self.active_space_id,
-                        path.as_ref(),
-                    )
-                } else {
-                    crate::workspace_threads::create_project_from_path(
-                        &self.active_space_id,
-                        path.as_ref(),
-                    )
-                };
+                let result =
+                    if crate::workspace_threads::client_domain_for_space(&self.active_space_id)
+                        .is_some()
+                    {
+                        crate::workspace_threads::create_remote_project_from_path(
+                            &self.active_space_id,
+                            path.as_ref(),
+                        )
+                    } else {
+                        crate::workspace_threads::create_project_from_path(
+                            &self.active_space_id,
+                            path.as_ref(),
+                        )
+                    };
                 match result {
                     Ok(thread_id) => self.activate_workspace_thread(thread_id, window),
                     Err(err) => log::error!("failed to create ThinkTerm project: {err:#}"),
@@ -4168,8 +4251,8 @@ impl TermWindow {
                     if pane.domain_id() != domain_id {
                         continue;
                     }
-                    if let Some(url) = pane
-                        .get_current_working_dir(mux::pane::CachePolicy::AllowStale)
+                    if let Some(url) =
+                        pane.get_current_working_dir(mux::pane::CachePolicy::AllowStale)
                     {
                         let path = url.path().to_string();
                         if !path.is_empty() && !candidates.contains(&path) {
@@ -4178,8 +4261,7 @@ impl TermWindow {
                     }
                 }
             }
-            for path in crate::workspace_threads::project_paths_for_space(&self.active_space_id)
-            {
+            for path in crate::workspace_threads::project_paths_for_space(&self.active_space_id) {
                 if !candidates.contains(&path) {
                     candidates.push(path);
                 }
@@ -4251,10 +4333,9 @@ impl TermWindow {
             (InlineTabRenameTarget::WorkspaceThread(id), UIItemType::WorkspaceThread(other)) => {
                 id == other
             }
-            (
-                InlineTabRenameTarget::File(path),
-                UIItemType::RightSidebarFileRow(other),
-            ) => path == other,
+            (InlineTabRenameTarget::File(path), UIItemType::RightSidebarFileRow(other)) => {
+                path == other
+            }
             _ => false,
         }
     }

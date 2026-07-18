@@ -1103,9 +1103,9 @@ fn schedule_spawn_pane_in_stack<SND>(
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move {
-        send_response(spawn_pane_in_stack(request, client_id).await)
-    })
+    promise::spawn::spawn(
+        async move { send_response(spawn_pane_in_stack(request, client_id).await) },
+    )
     .detach();
 }
 

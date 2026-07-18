@@ -1311,9 +1311,7 @@ pub fn workspace_pane_font_scales(
     let mut scales: HashMap<PaneId, Option<f64>> = HashMap::new();
     for tab in window.iter() {
         for pos in tab.iter_panes_ignoring_zoom() {
-            if let Some(client_pane) =
-                pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>()
-            {
+            if let Some(client_pane) = pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
                 scales.insert(
                     pos.pane.pane_id(),
                     remote.get(&client_pane.remote_pane_id).copied(),
@@ -3677,7 +3675,11 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                     .projects
                     .iter()
                     .any(|project| project.threads.iter().any(|thread| thread.id == thread_id));
-                if !store.projects.iter().any(|project| project.id == mux_project_id) {
+                if !store
+                    .projects
+                    .iter()
+                    .any(|project| project.id == mux_project_id)
+                {
                     store.projects.push(Project {
                         id: mux_project_id.clone(),
                         space_id: space_id.to_string(),
@@ -3705,7 +3707,9 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                 changed = true;
             }
             None => {
-                let path = cwd.filter(|p| !p.is_empty()).unwrap_or_else(|| "~".to_string());
+                let path = cwd
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| "~".to_string());
                 let name = Path::new(&path)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -3798,9 +3802,11 @@ pub fn ensure_mux_domain_space(domain_name: &str) -> MuxDomainSpacePlan {
         .find(|p| p.id == project_id)
         .expect("mux domain project was just ensured");
     if project.threads.is_empty() {
-        project
-            .threads
-            .push(WorkspaceThread::new(project_id.clone(), "main".to_string(), None));
+        project.threads.push(WorkspaceThread::new(
+            project_id.clone(),
+            "main".to_string(),
+            None,
+        ));
     }
     let thread_id = project
         .active_thread_id

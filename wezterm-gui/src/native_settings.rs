@@ -492,9 +492,7 @@ pub(crate) fn right_sidebar_custom_open_with_apps() -> Vec<NativeOpenWithApp> {
 
 const MAX_CUSTOM_OPEN_WITH_APPS: usize = 20;
 
-pub(crate) fn add_right_sidebar_custom_open_with_app(
-    app: NativeOpenWithApp,
-) -> anyhow::Result<()> {
+pub(crate) fn add_right_sidebar_custom_open_with_app(app: NativeOpenWithApp) -> anyhow::Result<()> {
     let mut settings = load();
     let apps = &mut settings.chrome.right_sidebar_custom_open_with_apps;
     apps.retain(|existing| existing.id != app.id);

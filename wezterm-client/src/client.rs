@@ -463,9 +463,7 @@ async fn client_thread_async(
                             decoded.serial,
                             decoded.pdu.pdu_name()
                         );
-                        if pending_ping
-                            .map_or(false, |(serial, _)| serial == decoded.serial)
-                        {
+                        if pending_ping.map_or(false, |(serial, _)| serial == decoded.serial) {
                             pending_ping = None;
                         } else if decoded.serial == 0 {
                             process_unilateral(local_domain_id, decoded)
@@ -1245,12 +1243,9 @@ impl Client {
                                         .find(|window_id| {
                                             mux.get_window(*window_id).map_or(false, |w| {
                                                 w.iter().any(|tab| {
-                                                    tab.iter_panes_ignoring_zoom().iter().any(
-                                                        |p| {
-                                                            p.pane.domain_id()
-                                                                == local_domain_id
-                                                        },
-                                                    )
+                                                    tab.iter_panes_ignoring_zoom().iter().any(|p| {
+                                                        p.pane.domain_id() == local_domain_id
+                                                    })
                                                 })
                                             })
                                         });
@@ -1271,9 +1266,7 @@ impl Client {
                             // prompts can never be answered. Rebuild it
                             // where the user is now.
                             if let Some((ui, hosted_ws)) = &windowed_ui {
-                                if !active_workspace.is_empty()
-                                    && hosted_ws != &active_workspace
-                                {
+                                if !active_workspace.is_empty() && hosted_ws != &active_workspace {
                                     ui.close();
                                     windowed_ui = None;
                                 }

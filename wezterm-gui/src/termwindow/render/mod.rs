@@ -587,6 +587,9 @@ impl crate::TermWindow {
     }
 
     pub fn compute_cell_fg_bg(&self, params: ComputeCellFgBgParams) -> ComputeCellFgBgResult {
+        let focused_and_active =
+            self.focused.is_some() && params.is_active_pane && !self.right_sidebar_has_text_focus();
+
         if params.cursor.is_some() {
             if let Some(bg_color_mix) = self.get_intensity_if_bell_target_ringing(
                 params.pane.expect("cursor only set if pane present"),
@@ -627,7 +630,7 @@ impl crate::TermWindow {
             let dead_key_or_leader =
                 self.dead_key_status != DeadKeyStatus::None || self.leader_is_active();
 
-            if dead_key_or_leader && params.is_active_pane {
+            if dead_key_or_leader && focused_and_active {
                 let (fg_color, bg_color) = if self.use_reverse_video_cursor(&params) {
                     (params.bg_color, params.fg_color)
                 } else {
@@ -668,8 +671,6 @@ impl crate::TermWindow {
             ),
             _ => (CursorShape::default(), CursorVisibility::Hidden),
         };
-
-        let focused_and_active = self.focused.is_some() && params.is_active_pane;
 
         let (fg_color, bg_color, cursor_bg) = match (
             params.selected,
@@ -722,10 +723,9 @@ impl crate::TermWindow {
         let fg_color = self.ensure_min_contrast(fg_color, bg_color);
 
         let blinking = params.cursor.is_some()
-            && params.is_active_pane
+            && focused_and_active
             && cursor_shape.is_blinking()
-            && params.config.cursor_blink_rate != 0
-            && self.focused.is_some();
+            && params.config.cursor_blink_rate != 0;
 
         let mut fg_color_alt = fg_color;
         let bg_color_alt = bg_color;

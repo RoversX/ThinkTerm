@@ -55,7 +55,11 @@ pub(crate) struct StructureMutationGuard {
 impl Drop for StructureMutationGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        if self.inner.mutations_in_flight.fetch_sub(1, Ordering::SeqCst) == 1
+        if self
+            .inner
+            .mutations_in_flight
+            .fetch_sub(1, Ordering::SeqCst)
+            == 1
             && self.inner.resync_deferred.swap(false, Ordering::SeqCst)
         {
             let domain_id = self.inner.local_domain_id;

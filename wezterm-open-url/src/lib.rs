@@ -102,9 +102,7 @@ fn windows_open_with_candidates(path: &Path) -> Vec<OpenWithCandidate> {
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let hkcr = RegKey::predef(HKEY_CLASSES_ROOT);
-    let file_exts = format!(
-        r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\{ext}"
-    );
+    let file_exts = format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\{ext}");
 
     if let Some(exe) = windows_default_executable(&hkcu, &hkcr, &file_exts, &ext) {
         push_candidate(&mut out, &mut seen, exe, true);

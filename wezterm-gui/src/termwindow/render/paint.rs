@@ -426,13 +426,8 @@ impl crate::TermWindow {
             .min(self.dimensions.pixel_height as f32 - pill_h)
             .max(0.0);
 
-        self.filled_rectangle(
-            &mut layers,
-            0,
-            euclid::rect(x, y, pill_w, pill_h),
-            bg,
-        )
-        .context("file drag ghost background")?;
+        self.filled_rectangle(&mut layers, 0, euclid::rect(x, y, pill_w, pill_h), bg)
+            .context("file drag ghost background")?;
         ctx.draw_text_on_layer(
             &mut layers,
             2,

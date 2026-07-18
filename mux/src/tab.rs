@@ -530,11 +530,7 @@ where
             if panes.is_empty() {
                 Tree::Empty
             } else {
-                Tree::Leaf(PaneStack::from_panes_with_id(
-                    panes,
-                    active_index,
-                    stack_id,
-                ))
+                Tree::Leaf(PaneStack::from_panes_with_id(panes, active_index, stack_id))
             }
         }
     }
@@ -1149,15 +1145,15 @@ impl TabInner {
 
         log::debug!("sync_with_pane_tree with size {:?}", size);
 
-        let mut t = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane);
+        let mut t =
+            build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane);
         // When the split topology is unchanged, keep the local cell
         // geometry (and self.size): the local window is the geometry
         // authority for client tabs, and the wire sizes are pane
         // dimensions that sit below the cells by the per-pane chrome.
-        let geometry_preserved = self
-            .pane
-            .as_ref()
-            .map_or(false, |old| copy_split_geometry_if_topology_matches(old, &mut t));
+        let geometry_preserved = self.pane.as_ref().map_or(false, |old| {
+            copy_split_geometry_if_topology_matches(old, &mut t)
+        });
         log::debug!(
             "sync_with_pane_tree tab {}: geometry_preserved={} old_size={:?}",
             self.id,
@@ -1826,21 +1822,13 @@ impl TabInner {
                 // collapse/expand can shrink a branch below its child's
                 // remembered size, and an unclamped first here makes this
                 // node wider than its parent (overlapping pane geometry).
-                node.first.cols = node
-                    .first
-                    .cols
-                    .min(pane_size.cols.saturating_sub(2))
-                    .max(1);
+                node.first.cols = node.first.cols.min(pane_size.cols.saturating_sub(2)).max(1);
                 node.second.cols = pane_size.cols.saturating_sub(1 + node.first.cols);
             } else {
                 node.first.cols = pane_size.cols;
                 node.second.cols = pane_size.cols;
 
-                node.first.rows = node
-                    .first
-                    .rows
-                    .min(pane_size.rows.saturating_sub(2))
-                    .max(1);
+                node.first.rows = node.first.rows.min(pane_size.rows.saturating_sub(2)).max(1);
                 node.second.rows = pane_size.rows.saturating_sub(1 + node.first.rows);
             }
             node.first.pixel_width = node.first.cols * cell_width;
@@ -3787,11 +3775,13 @@ mod test {
         let size = test_size();
         let tab = Tab::new(&size);
 
-        let make_root = || PaneNode::Stack(PaneStackEntry {
-            active: 0,
-            panes: vec![pane_entry(200, size, true), pane_entry(201, size, false)],
-            pane_stack_id: Some(7),
-        });
+        let make_root = || {
+            PaneNode::Stack(PaneStackEntry {
+                active: 0,
+                panes: vec![pane_entry(200, size, true), pane_entry(201, size, false)],
+                pane_stack_id: Some(7),
+            })
+        };
 
         tab.sync_with_pane_tree(size, make_root(), |entry| {
             FakePane::new(entry.pane_id, entry.size)

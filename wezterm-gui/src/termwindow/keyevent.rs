@@ -562,6 +562,15 @@ impl super::TermWindow {
             }
         }
 
+        // A focused sidebar editor owns keyboard input.  Give application-level
+        // key bindings above a chance to run, but never let an unhandled press or
+        // release fall through to the terminal pane.  In particular, enhanced
+        // keyboard protocols can report key releases, which made the terminal
+        // appear to retain focus while typing in Notes.
+        if only_key_bindings == OnlyKeyBindings::No && self.right_sidebar_has_text_focus() {
+            return true;
+        }
+
         // While the leader modifier is active, only registered
         // keybindings are recognized.
         let only_key_bindings = match (only_key_bindings, leader_active) {

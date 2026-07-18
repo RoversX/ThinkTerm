@@ -75,6 +75,7 @@ ordered-float.workspace = true
 parking_lot.workspace = true
 phf.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
+pulldown-cmark.workspace = true
 promise.workspace = true
 rangeset.workspace = true
 ratelim.workspace = true
@@ -85,7 +86,6 @@ serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
 shlex.workspace = true
 smol.workspace = true
-syntect.workspace = true
 tabout.workspace = true
 tempfile.workspace = true
 terminfo.workspace = true
@@ -94,10 +94,13 @@ termwiz.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
+thinkterm-syntax = { path = "../thinkterm-syntax" }
 trash.workspace = true
 umask.workspace = true
 unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
+unicode-width.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 url-funcs.workspace = true
 url.workspace = true
 walkdir.workspace = true

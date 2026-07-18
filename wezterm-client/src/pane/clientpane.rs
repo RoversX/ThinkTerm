@@ -175,8 +175,7 @@ impl ClientPane {
                 // render surface (make_all_stale forces a refetch of every
                 // visible line, which flashes the pane contents).
                 if palette != *self.palette.lock() {
-                    *self.application_palette.lock() =
-                        palette != *self.configured_palette.lock();
+                    *self.application_palette.lock() = palette != *self.configured_palette.lock();
 
                     *self.palette.lock() = palette;
                     let mux = Mux::get();
