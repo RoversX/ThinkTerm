@@ -47,7 +47,7 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwi
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::{
     KeyboardLedStatus, Modifiers, MouseButtons, MouseEvent, MouseEventKind, MousePress,
-    ScreenPoint, WindowDecorations,
+    PreciseScrollDelta, ScreenPoint, WindowDecorations,
 };
 
 use crate::wayland::WaylandConnection;
@@ -772,7 +772,7 @@ impl WaylandWindowInner {
             let scaled_x = (value_x * factor) + self.hscroll_remainder;
             let discrete_x = scaled_x.trunc();
             self.hscroll_remainder = scaled_x - discrete_x;
-            if discrete_x != 0. {
+            if scaled_x.abs() > f64::EPSILON {
                 let event = MouseEvent {
                     kind: MouseEventKind::HorzWheel(-discrete_x as i16),
                     coords: self.last_mouse_coords,
@@ -782,7 +782,10 @@ impl WaylandWindowInner {
                     ),
                     mouse_buttons: self.mouse_buttons,
                     modifiers: self.modifiers,
-                    precise_scroll_delta: None,
+                    precise_scroll_delta: Some(PreciseScrollDelta {
+                        x: -scaled_x as f32,
+                        y: 0.0,
+                    }),
                     scroll_phase: None,
                     momentum_phase: None,
                 };
@@ -795,7 +798,7 @@ impl WaylandWindowInner {
             let scaled_y = (value_y * factor) + self.vscroll_remainder;
             let discrete_y = scaled_y.trunc();
             self.vscroll_remainder = scaled_y - discrete_y;
-            if discrete_y != 0. {
+            if scaled_y.abs() > f64::EPSILON {
                 let event = MouseEvent {
                     kind: MouseEventKind::VertWheel(-discrete_y as i16),
                     coords: self.last_mouse_coords,
@@ -805,7 +808,10 @@ impl WaylandWindowInner {
                     ),
                     mouse_buttons: self.mouse_buttons,
                     modifiers: self.modifiers,
-                    precise_scroll_delta: None,
+                    precise_scroll_delta: Some(PreciseScrollDelta {
+                        x: 0.0,
+                        y: -scaled_y as f32,
+                    }),
                     scroll_phase: None,
                     momentum_phase: None,
                 };

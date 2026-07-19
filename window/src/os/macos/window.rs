@@ -9,11 +9,12 @@ use crate::connection::ConnectionOps;
 use crate::os::macos::menu::{Menu, MenuItem, RepresentedItem};
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
-    Clipboard, Connection, ContextMenuItem, DeadKeyStatus, Dimensions, Handled, Image, KeyCode,
-    KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point,
-    PreciseScrollDelta, RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement,
-    ResolvedGeometry, ScreenPoint, ScrollPhase, Size, ULength, WindowDecorations, WindowEvent,
-    WindowEventSender, WindowOps, WindowState,
+    Clipboard, Connection, ContextMenuItem, DeadKeyStatus, Dimensions, FolderPickerOptions,
+    Handled, Image, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent,
+    MouseEventKind, MousePress, NativeTextInputSnapshot, Point, PreciseScrollDelta, RawKeyEvent,
+    Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint, ScrollPhase,
+    Size, TextCheckCapabilities, TextCheckIssue, TextCheckRequest, TextCheckResponse, ULength,
+    WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -42,7 +43,7 @@ use objc::declare::ClassDecl;
 use objc::rc::{StrongPtr, WeakPtr};
 use objc::runtime::{Class, Object, Protocol, Sel};
 use objc::*;
-use promise::Future;
+use promise::{Future, Promise};
 use raw_window_handle::{
     AppKitDisplayHandle, AppKitWindowHandle, DisplayHandle, HandleError, HasDisplayHandle,
     HasWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle,
@@ -50,6 +51,7 @@ use raw_window_handle::{
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, CStr};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -76,6 +78,56 @@ fn thinkterm_perf_enabled() -> bool {
             .map(|value| value != "0" && !value.is_empty())
             .unwrap_or(false)
     })
+}
+
+fn spell_document_tag(document_id: &str) -> NSInteger {
+    let mut hasher = DefaultHasher::new();
+    document_id.hash(&mut hasher);
+    (hasher.finish() & i64::MAX as u64).max(1) as NSInteger
+}
+
+fn byte_offset_for_utf16(text: &str, target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+    let mut utf16 = 0usize;
+    for (byte, ch) in text.char_indices() {
+        let next = utf16 + ch.len_utf16();
+        if next > target {
+            return byte;
+        }
+        utf16 = next;
+        if utf16 == target {
+            return byte + ch.len_utf8();
+        }
+    }
+    text.len()
+}
+
+fn utf16_offset_for_byte(text: &str, byte: usize) -> usize {
+    let byte = byte.min(text.len());
+    let mut boundary = byte;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text[..boundary].encode_utf16().count()
+}
+
+#[cfg(test)]
+mod native_text_range_tests {
+    use super::{byte_offset_for_utf16, utf16_offset_for_byte};
+
+    #[test]
+    fn utf8_and_utf16_offsets_round_trip_at_character_boundaries() {
+        let text = "a😀你e\u{301}";
+        for (byte, _) in text
+            .char_indices()
+            .chain(std::iter::once((text.len(), '\0')))
+        {
+            let utf16 = utf16_offset_for_byte(text, byte);
+            assert_eq!(byte_offset_for_utf16(text, utf16), byte);
+        }
+    }
 }
 
 fn macos_current_screen_max_fps() -> Option<usize> {
@@ -618,6 +670,7 @@ impl Window {
                 ime_last_event: None,
                 live_resizing: false,
                 ime_text: String::new(),
+                native_text_input_snapshot: None,
             }));
 
             let window: id = msg_send![get_window_class(), alloc];
@@ -907,6 +960,14 @@ impl WindowOps for Window {
     }
 
     fn pick_folder_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        self.pick_folder_async_with_options(FolderPickerOptions::default(), callback);
+    }
+
+    fn pick_folder_async_with_options(
+        &self,
+        options: FolderPickerOptions,
+        callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+    ) {
         unsafe {
             let _pool = NSAutoreleasePool::new(nil);
             let panel: id = msg_send![class!(NSOpenPanel), openPanel];
@@ -916,8 +977,8 @@ impl WindowOps for Window {
             let () = msg_send![*panel, setAllowsMultipleSelection: NO];
             let () = msg_send![*panel, setCanCreateDirectories: YES];
             let () = msg_send![*panel, setResolvesAliases: YES];
-            let title = nsstring("Open Project");
-            let prompt = nsstring("Open");
+            let title = nsstring(&options.title);
+            let prompt = nsstring(&options.prompt);
             let () = msg_send![*panel, setTitle: *title];
             let () = msg_send![*panel, setPrompt: *prompt];
 
@@ -1085,6 +1146,60 @@ impl WindowOps for Window {
     fn set_text_cursor_position(&self, cursor: Rect) {
         Connection::with_window_inner(self.id, move |inner| {
             inner.set_text_cursor_position(cursor);
+            Ok(())
+        });
+    }
+
+    fn set_native_text_input_snapshot(&self, snapshot: Option<NativeTextInputSnapshot>) {
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.set_native_text_input_snapshot(snapshot);
+            Ok(())
+        });
+    }
+
+    fn show_text_definition(&self, text: &str, anchor: Rect) {
+        let text = text.to_string();
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.show_text_definition(&text, anchor);
+            Ok(())
+        });
+    }
+
+    fn text_check_capabilities(&self) -> TextCheckCapabilities {
+        TextCheckCapabilities {
+            spelling: true,
+            suggestions: true,
+            ignore: true,
+            learn: true,
+        }
+    }
+
+    fn request_text_check(&self, request: TextCheckRequest) -> Future<TextCheckResponse> {
+        let mut promise = Promise::new();
+        let future = promise
+            .get_future()
+            .expect("new text-check promise must have a future");
+        let promise = Arc::new(Mutex::new(Some(promise)));
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.request_text_check(request, promise);
+            Ok(())
+        });
+        future
+    }
+
+    fn ignore_spelling_word(&self, document_id: &str, word: &str) {
+        let document_id = document_id.to_string();
+        let word = word.to_string();
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.ignore_spelling_word(&document_id, &word);
+            Ok(())
+        });
+    }
+
+    fn learn_spelling_word(&self, word: &str) {
+        let word = word.to_string();
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.learn_spelling_word(&word);
             Ok(())
         });
     }
@@ -1537,7 +1652,7 @@ impl WindowInner {
                             "",
                         );
                         if let Some(icon) = icon {
-                            menu_item.set_system_symbol_image(&icon);
+                            menu_item.set_context_menu_icon(icon);
                         }
                         menu_item.set_checked(checked);
                         menu_item.set_enabled(enabled);
@@ -1550,7 +1665,8 @@ impl WindowInner {
                             }
                         } else {
                             menu_item.set_target(view);
-                            menu_item.set_represented_item(RepresentedItem::KeyAssignment(action));
+                            menu_item
+                                .set_represented_item(RepresentedItem::ContextMenuAction(action));
                             menu.add_item(&menu_item);
                             has_items = true;
                         }
@@ -1659,6 +1775,150 @@ impl WindowInner {
                 let input_context: id = msg_send![&**self.view, inputContext];
                 let () = msg_send![input_context, invalidateCharacterCoordinates];
             }
+        }
+    }
+
+    fn set_native_text_input_snapshot(&mut self, snapshot: Option<NativeTextInputSnapshot>) {
+        if let Some(window_view) = WindowView::get_this(unsafe { &**self.view }) {
+            window_view.inner.borrow_mut().native_text_input_snapshot = snapshot;
+        }
+        if self.config.use_ime {
+            unsafe {
+                let input_context: id = msg_send![&**self.view, inputContext];
+                let () = msg_send![input_context, invalidateCharacterCoordinates];
+            }
+        }
+    }
+
+    fn show_text_definition(&mut self, text: &str, anchor: Rect) {
+        if text.trim().is_empty() {
+            return;
+        }
+        unsafe {
+            let frame = NSView::frame(*self.view as *mut _);
+            let backing_frame = NSView::convertRectToBacking(*self.view as *mut _, frame);
+            let scale = if frame.size.width > 0.0 {
+                backing_frame.size.width / frame.size.width
+            } else {
+                1.0
+            };
+            let attributed: id = msg_send![class!(NSAttributedString), alloc];
+            let attributed: id = msg_send![attributed, initWithString:*nsstring(text)];
+            let point = NSPoint::new(
+                anchor.origin.x as f64 / scale,
+                anchor.origin.y as f64 / scale,
+            );
+            let (): () = msg_send![
+                &**self.view,
+                showDefinitionForAttributedString: attributed
+                atPoint: point
+            ];
+            let (): () = msg_send![attributed, release];
+        }
+    }
+
+    fn request_text_check(
+        &mut self,
+        request: TextCheckRequest,
+        promise: Arc<Mutex<Option<Promise<TextCheckResponse>>>>,
+    ) {
+        unsafe {
+            let _pool = NSAutoreleasePool::new(nil);
+            let checker: id = msg_send![class!(NSSpellChecker), sharedSpellChecker];
+            let ns_text = nsstring(&request.text);
+            let ns_text_for_block = ns_text.clone();
+            let request_text = request.text.clone();
+            let request_id = request.request_id;
+            let document_tag = spell_document_tag(&request.document_id);
+            let promise_for_block = Arc::clone(&promise);
+            let block = RcBlock::new(
+                move |_sequence: NSInteger,
+                      results: *mut objc2::runtime::AnyObject,
+                      _orthography: *mut objc2::runtime::AnyObject,
+                      _word_count: NSInteger| {
+                    let results = results.cast::<Object>();
+                    let mut issues = Vec::new();
+                    if results != nil {
+                        let count: NSUInteger = msg_send![results, count];
+                        for index in 0..count {
+                            let result: id = msg_send![results, objectAtIndex:index];
+                            let range: NSRange = msg_send![result, range];
+                            let utf16_start = range.0.location as usize;
+                            let utf16_end = utf16_start.saturating_add(range.0.length as usize);
+                            let start = byte_offset_for_utf16(&request_text, utf16_start);
+                            let end = byte_offset_for_utf16(&request_text, utf16_end).max(start);
+                            if start == end || end > request_text.len() {
+                                continue;
+                            }
+
+                            let guesses: id = msg_send![
+                                checker,
+                                guessesForWordRange: range
+                                inString: *ns_text_for_block
+                                language: nil
+                                inSpellDocumentWithTag: document_tag
+                            ];
+                            let mut suggestions = Vec::new();
+                            if guesses != nil {
+                                let guess_count: NSUInteger = msg_send![guesses, count];
+                                for guess_index in 0..guess_count.min(5) {
+                                    let guess: id = msg_send![guesses, objectAtIndex:guess_index];
+                                    let guess = nsstring_to_str(guess).to_string();
+                                    if !suggestions.contains(&guess) {
+                                        suggestions.push(guess);
+                                    }
+                                }
+                            }
+                            issues.push(TextCheckIssue {
+                                range: start..end,
+                                suggestions,
+                            });
+                        }
+                    }
+                    if let Ok(mut promise) = promise_for_block.lock() {
+                        if let Some(mut promise) = promise.take() {
+                            promise.ok(TextCheckResponse { request_id, issues });
+                        }
+                    }
+                },
+            );
+            const NS_TEXT_CHECKING_TYPE_SPELLING: NSUInteger = 1 << 1;
+            let full_range = NSRange::new(0, request.text.encode_utf16().count() as u64);
+            let _: NSInteger = msg_send![
+                checker,
+                requestCheckingOfString: *ns_text
+                range: full_range
+                types: NS_TEXT_CHECKING_TYPE_SPELLING
+                options: nil
+                inSpellDocumentWithTag: document_tag
+                completionHandler: &*block
+            ];
+        }
+    }
+
+    fn ignore_spelling_word(&mut self, document_id: &str, word: &str) {
+        if word.trim().is_empty() {
+            return;
+        }
+        unsafe {
+            let checker: id = msg_send![class!(NSSpellChecker), sharedSpellChecker];
+            let word = nsstring(word);
+            let (): () = msg_send![
+                checker,
+                ignoreWord: *word
+                inSpellDocumentWithTag: spell_document_tag(document_id)
+            ];
+        }
+    }
+
+    fn learn_spelling_word(&mut self, word: &str) {
+        if word.trim().is_empty() {
+            return;
+        }
+        unsafe {
+            let checker: id = msg_send![class!(NSSpellChecker), sharedSpellChecker];
+            let word = nsstring(word);
+            let (): () = msg_send![checker, learnWord: *word];
         }
     }
 
@@ -2064,6 +2324,7 @@ struct Inner {
     live_resizing: bool,
 
     ime_text: String,
+    native_text_input_snapshot: Option<NativeTextInputSnapshot>,
 }
 
 #[repr(C)]
@@ -2512,15 +2773,29 @@ impl WindowView {
             if inner.ime_text.is_empty() {
                 NSRange::new(NSNotFound as _, 0)
             } else {
-                NSRange::new(0, inner.ime_text.len() as u64)
+                let start = inner
+                    .native_text_input_snapshot
+                    .as_ref()
+                    .map(|snapshot| utf16_offset_for_byte(&snapshot.text, snapshot.selection.start))
+                    .unwrap_or(0);
+                NSRange::new(start as u64, inner.ime_text.encode_utf16().count() as u64)
             }
         } else {
             NSRange::new(NSNotFound as _, 0)
         }
     }
 
-    extern "C" fn selected_range(_this: &mut Object, _sel: Sel) -> NSRange {
-        NSRange::new(NSNotFound as _, 0)
+    extern "C" fn selected_range(this: &mut Object, _sel: Sel) -> NSRange {
+        let Some(myself) = Self::get_this(this) else {
+            return NSRange::new(NSNotFound as _, 0);
+        };
+        let inner = myself.inner.borrow();
+        let Some(snapshot) = inner.native_text_input_snapshot.as_ref() else {
+            return NSRange::new(NSNotFound as _, 0);
+        };
+        let start = utf16_offset_for_byte(&snapshot.text, snapshot.selection.start);
+        let end = utf16_offset_for_byte(&snapshot.text, snapshot.selection.end);
+        NSRange::new(start as u64, end.saturating_sub(start) as u64)
     }
 
     // Called by the IME when inserting composed text and/or emoji
@@ -2538,6 +2813,40 @@ impl WindowView {
         );
         if let Some(myself) = Self::get_this(this) {
             let mut inner = myself.inner.borrow_mut();
+
+            if let Some(snapshot) = inner.native_text_input_snapshot.clone() {
+                let relative = if replacement_range.0.location == NSNotFound as u64 {
+                    snapshot.selection.clone()
+                } else {
+                    let start = byte_offset_for_utf16(
+                        &snapshot.text,
+                        replacement_range.0.location as usize,
+                    );
+                    let end = byte_offset_for_utf16(
+                        &snapshot.text,
+                        replacement_range
+                            .0
+                            .location
+                            .saturating_add(replacement_range.0.length)
+                            as usize,
+                    );
+                    start..end.max(start)
+                };
+                inner.ime_text.clear();
+                inner
+                    .events
+                    .dispatch(WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None));
+                inner.events.dispatch(WindowEvent::NativeTextInputReplace {
+                    token: snapshot.token,
+                    revision: snapshot.revision,
+                    source_range: snapshot.source_base + relative.start
+                        ..snapshot.source_base + relative.end,
+                    text: s.to_string(),
+                });
+                inner.ime_last_event.take();
+                inner.ime_state = ImeDisposition::Acted;
+                return;
+            }
 
             let key_is_down = inner.key_is_down.take().unwrap_or(true);
 
@@ -2622,25 +2931,70 @@ impl WindowView {
     }
 
     extern "C" fn attributed_substring_for_proposed_range(
-        _this: &mut Object,
+        this: &mut Object,
         _sel: Sel,
-        _proposed_range: NSRange,
-        _actual_range: NSRangePointer,
+        proposed_range: NSRange,
+        actual_range: NSRangePointer,
     ) -> id {
-        log::trace!(
-            "attributedSubstringForProposedRange {:?} {:?}",
-            _proposed_range,
-            _actual_range
-        );
-        nil
+        let Some(myself) = Self::get_this(this) else {
+            return nil;
+        };
+        let inner = myself.inner.borrow();
+        let Some(snapshot) = inner.native_text_input_snapshot.as_ref() else {
+            return nil;
+        };
+        let total = snapshot.text.encode_utf16().count();
+        let start_utf16 = (proposed_range.0.location as usize).min(total);
+        let end_utf16 = start_utf16
+            .saturating_add(proposed_range.0.length as usize)
+            .min(total);
+        let start = byte_offset_for_utf16(&snapshot.text, start_utf16);
+        let end = byte_offset_for_utf16(&snapshot.text, end_utf16).max(start);
+        if !actual_range.0.is_null() {
+            unsafe {
+                *actual_range.0 = NSRange::new(
+                    start_utf16 as u64,
+                    end_utf16.saturating_sub(start_utf16) as u64,
+                );
+            }
+        }
+        let substring = nsstring(&snapshot.text[start..end]);
+        unsafe {
+            let attributed: id = msg_send![class!(NSAttributedString), alloc];
+            let attributed: id = msg_send![attributed, initWithString:*substring];
+            let attributed: id = msg_send![attributed, autorelease];
+            attributed
+        }
     }
 
     extern "C" fn character_index_for_point(
-        _this: &mut Object,
+        this: &mut Object,
         _sel: Sel,
-        _point: NSPoint,
+        point: NSPoint,
     ) -> NSUInteger {
-        NSNotFound as _
+        let Some(myself) = Self::get_this(this) else {
+            return NSNotFound as _;
+        };
+        let inner = myself.inner.borrow();
+        let Some(snapshot) = inner.native_text_input_snapshot.as_ref() else {
+            return NSNotFound as _;
+        };
+        let window: id = unsafe { msg_send![this, window] };
+        let window_point: NSPoint = unsafe { msg_send![window, convertPointFromScreen:point] };
+        let view_point: NSPoint =
+            unsafe { msg_send![this, convertPoint:window_point fromView:nil] };
+        let view_rect = NSRect::new(view_point, NSSize::new(1.0, 1.0));
+        let backing: NSRect = unsafe { msg_send![this, convertRectToBacking:view_rect] };
+        let hit = snapshot.hits.iter().min_by(|a, b| {
+            let distance = |hit: &crate::NativeTextHit| {
+                let cx = hit.rect.origin.x as f64 + hit.rect.size.width as f64 / 2.0;
+                let cy = hit.rect.origin.y as f64 + hit.rect.size.height as f64 / 2.0;
+                (cx - backing.origin.x).powi(2) + (cy - backing.origin.y).powi(2)
+            };
+            distance(a).total_cmp(&distance(b))
+        });
+        hit.map(|hit| utf16_offset_for_byte(&snapshot.text, hit.byte) as NSUInteger)
+            .unwrap_or(NSNotFound as _)
     }
 
     extern "C" fn first_rect_for_character_range(
@@ -2663,12 +3017,28 @@ impl WindowView {
         let scale = frame.size.width / backing_frame.size.width;
 
         if let Some(this) = Self::get_this(this) {
-            let cursor_pos = this
-                .inner
-                .borrow()
-                .text_cursor_position
+            let inner = this.inner.borrow();
+            let target = inner
+                .native_text_input_snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    let byte = byte_offset_for_utf16(&snapshot.text, range.0.location as usize);
+                    snapshot
+                        .hits
+                        .iter()
+                        .min_by_key(|hit| hit.byte.abs_diff(byte))
+                        .map(|hit| hit.rect)
+                });
+            let cursor_pos = target
+                .unwrap_or(inner.text_cursor_position)
                 .to_f64()
                 .scale(scale, scale);
+
+            if !actual.0.is_null() {
+                unsafe {
+                    *actual.0 = range;
+                }
+            }
 
             NSRect::new(
                 NSPoint::new(
@@ -2874,6 +3244,19 @@ impl WindowView {
                         .dispatch(WindowEvent::PerformKeyAssignment(action));
                 }
             }
+            Some(RepresentedItem::ContextMenuAction(action)) => {
+                if let Some(this) = Self::get_this(this) {
+                    let event = match action {
+                        crate::ContextMenuAction::KeyAssignment(action) => {
+                            WindowEvent::PerformKeyAssignment(action)
+                        }
+                        crate::ContextMenuAction::ApplicationAction(action_id) => {
+                            WindowEvent::PerformContextMenuAction(action_id)
+                        }
+                    };
+                    this.inner.borrow_mut().events.dispatch(event);
+                }
+            }
             None => {}
         }
     }
@@ -3069,15 +3452,31 @@ impl WindowView {
             horz_delta = horz_delta.trunc();
         }
 
-        if vert_delta.abs() < 1.0 && horz_delta.abs() < 1.0 {
+        // Precise devices report pixel deltas. Always dispatch those events,
+        // even when the legacy line accumulator has not reached a whole line;
+        // pixel-scrolling surfaces (Files/Note/sidebars) consume the precise
+        // payload directly while terminal grids keep using the integer kind.
+        if vert_delta.abs() < 1.0 && horz_delta.abs() < 1.0 && precise_scroll_delta.is_none() {
             return;
         }
 
-        let vertical_is_dominant = vert_delta.abs() > horz_delta.abs();
-        let kind = if vertical_is_dominant {
-            MouseEventKind::VertWheel(round_away_from_zero(vert_delta))
+        let vertical_is_dominant = if vert_delta.abs() >= 1.0 || horz_delta.abs() >= 1.0 {
+            vert_delta.abs() > horz_delta.abs()
         } else {
-            MouseEventKind::HorzWheel(round_away_from_zero(horz_delta))
+            raw_vert_delta.abs() > raw_horz_delta.abs()
+        };
+        let kind = if vertical_is_dominant {
+            MouseEventKind::VertWheel(if vert_delta.abs() >= 1.0 {
+                round_away_from_zero(vert_delta)
+            } else {
+                0
+            })
+        } else {
+            MouseEventKind::HorzWheel(if horz_delta.abs() >= 1.0 {
+                round_away_from_zero(horz_delta)
+            } else {
+                0
+            })
         };
         if thinkterm_perf_enabled() {
             log::info!(

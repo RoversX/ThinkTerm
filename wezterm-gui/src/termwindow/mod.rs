@@ -58,7 +58,7 @@ use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
-use std::ops::Add;
+use std::ops::{Add, Range};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -247,6 +247,48 @@ pub enum TermWindowNotif {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum NoteEditorCommand {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    Delete,
+    SelectAll,
+    ReplaceSpelling {
+        revision: u64,
+        range: Range<usize>,
+        replacement: String,
+    },
+    IgnoreSpelling {
+        word: String,
+    },
+    LearnSpelling {
+        word: String,
+    },
+    LookUp {
+        text: String,
+        anchor: Rect,
+    },
+    ToggleSourceMode,
+    Save,
+    ChooseVault {
+        managed: bool,
+    },
+    NewNote,
+    OpenNote {
+        relative_path: String,
+    },
+    RevealVault,
+    ToggleVaultTree,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ContextMenuApplicationAction {
+    Note(NoteEditorCommand),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
     TabBar(TabBarItem),
@@ -295,8 +337,12 @@ pub enum UIItemType {
     RightSidebarSnippetDelete(String),
     RightSidebarSnippetScrollTrack,
     RightSidebarSnippetScrollThumb,
-    RightSidebarNoteModeToggle,
-    RightSidebarNoteSave,
+    RightSidebarNoteMenu,
+    RightSidebarNoteChooseVault,
+    RightSidebarNoteCreateVault,
+    RightSidebarNoteTreeToggle,
+    RightSidebarNoteTreeBack,
+    RightSidebarNoteTreeRow(String),
     RightSidebarNoteCodeToggle(usize),
     RightSidebarNoteCodeCopy(usize),
     RightSidebarNoteBody,
@@ -328,6 +374,12 @@ pub enum RightSidebarMode {
     Chat,
     Tasks,
     Snippets,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightSidebarNoteView {
+    Tree,
+    Editor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -459,6 +511,23 @@ pub(crate) struct RightSidebarFilePreviewImage {
     pub data: Arc<ImageData>,
     pub width: u32,
     pub height: u32,
+    pub encoded_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum RightSidebarNoteImageSource {
+    Local(PathBuf),
+    Remote(String),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RightSidebarNoteTableLayout {
+    pub source_start: usize,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub max_horizontal_scroll: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -968,6 +1037,8 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     context_menu: Option<ui::context_menu::ContextMenuState>,
+    context_menu_application_actions: HashMap<u64, ContextMenuApplicationAction>,
+    next_context_menu_application_action_id: u64,
     context_menu_suppressed_release: Option<MousePress>,
     dragging: Option<(UIItem, MouseEvent)>,
     // In-flight drag of a Files-panel row toward the terminal; becomes
@@ -1013,15 +1084,28 @@ pub struct TermWindow {
     right_sidebar_snippet_scroll_offset: f32,
     right_sidebar_snippet_scrollbar_visible_until: Option<Instant>,
     right_sidebar_note: crate::markdown_editor::NoteHostState,
-    right_sidebar_note_images: HashMap<PathBuf, RightSidebarFilePreviewImage>,
-    right_sidebar_note_images_loading: HashSet<PathBuf>,
-    right_sidebar_note_image_order: VecDeque<PathBuf>,
-    right_sidebar_note_code_highlights:
-        HashMap<(u64, usize, bool), Arc<Vec<Vec<::window::color::LinearRgba>>>>,
-    right_sidebar_note_code_highlight_order: VecDeque<(u64, usize, bool)>,
-    right_sidebar_note_code_highlights_pending: HashSet<(u64, usize)>,
-    right_sidebar_note_code_highlight_revision: u64,
-    right_sidebar_note_code_highlight_cancel: Arc<AtomicUsize>,
+    right_sidebar_note_view: RightSidebarNoteView,
+    right_sidebar_note_vault_index_root: Option<PathBuf>,
+    right_sidebar_note_vault_paths: Arc<Vec<String>>,
+    right_sidebar_note_vault_index_generation: u64,
+    right_sidebar_note_vault_indexing: bool,
+    right_sidebar_note_vault_last_scan: Option<Instant>,
+    right_sidebar_note_open_generation: u64,
+    right_sidebar_note_opening: Option<(PathBuf, String)>,
+    right_sidebar_note_open_failure: Option<((PathBuf, String), String)>,
+    right_sidebar_note_tree_scroll_offset: f32,
+    right_sidebar_note_tree_expanded: HashSet<String>,
+    right_sidebar_note_vault_tree_collapsed: bool,
+    right_sidebar_note_wide_layout: bool,
+    right_sidebar_note_table_horizontal_offsets: HashMap<usize, f32>,
+    right_sidebar_note_table_layouts: Vec<RightSidebarNoteTableLayout>,
+    right_sidebar_note_images: HashMap<RightSidebarNoteImageSource, RightSidebarFilePreviewImage>,
+    right_sidebar_note_images_loading: HashSet<RightSidebarNoteImageSource>,
+    right_sidebar_note_image_order: VecDeque<RightSidebarNoteImageSource>,
+    right_sidebar_note_image_failures: HashMap<RightSidebarNoteImageSource, Instant>,
+    right_sidebar_note_code_highlight: ui::right_sidebar::NoteCodeHighlightState,
+    right_sidebar_note_paint_cache: ui::right_sidebar::NotePaintCache,
+    right_sidebar_note_memory_release_token: u64,
     right_sidebar_file_view: RightSidebarFileView,
     right_sidebar_file_focus: Option<RightSidebarFileField>,
     right_sidebar_file_filter: TextInputState,
@@ -1269,6 +1353,9 @@ impl TermWindow {
         }
 
         if self.focused.is_none() {
+            self.right_sidebar_note.native_text_input_snapshot_key = None;
+            window.set_native_text_input_snapshot(None);
+            self.right_sidebar_note.freeze_live_source();
             self.save_right_sidebar_note_now();
             self.last_mouse_click = None;
             self.current_mouse_buttons.clear();
@@ -1605,6 +1692,8 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             context_menu: None,
+            context_menu_application_actions: HashMap::new(),
+            next_context_menu_application_action_id: 1,
             context_menu_suppressed_release: None,
             dragging: None,
             right_sidebar_file_drag: None,
@@ -1638,14 +1727,28 @@ impl TermWindow {
             right_sidebar_snippet_scroll_offset: 0.0,
             right_sidebar_snippet_scrollbar_visible_until: None,
             right_sidebar_note: crate::markdown_editor::NoteHostState::default(),
+            right_sidebar_note_view: RightSidebarNoteView::Editor,
+            right_sidebar_note_vault_index_root: None,
+            right_sidebar_note_vault_paths: Arc::new(Vec::new()),
+            right_sidebar_note_vault_index_generation: 0,
+            right_sidebar_note_vault_indexing: false,
+            right_sidebar_note_vault_last_scan: None,
+            right_sidebar_note_open_generation: 0,
+            right_sidebar_note_opening: None,
+            right_sidebar_note_open_failure: None,
+            right_sidebar_note_tree_scroll_offset: 0.0,
+            right_sidebar_note_tree_expanded: HashSet::new(),
+            right_sidebar_note_vault_tree_collapsed: false,
+            right_sidebar_note_wide_layout: false,
+            right_sidebar_note_table_horizontal_offsets: HashMap::new(),
+            right_sidebar_note_table_layouts: Vec::new(),
             right_sidebar_note_images: HashMap::new(),
             right_sidebar_note_images_loading: HashSet::new(),
             right_sidebar_note_image_order: VecDeque::new(),
-            right_sidebar_note_code_highlights: HashMap::new(),
-            right_sidebar_note_code_highlight_order: VecDeque::new(),
-            right_sidebar_note_code_highlights_pending: HashSet::new(),
-            right_sidebar_note_code_highlight_revision: 0,
-            right_sidebar_note_code_highlight_cancel: Arc::new(AtomicUsize::new(0)),
+            right_sidebar_note_image_failures: HashMap::new(),
+            right_sidebar_note_code_highlight: ui::right_sidebar::NoteCodeHighlightState::default(),
+            right_sidebar_note_paint_cache: ui::right_sidebar::NotePaintCache::default(),
+            right_sidebar_note_memory_release_token: 0,
             right_sidebar_file_view: RightSidebarFileView::Tree,
             right_sidebar_file_focus: None,
             right_sidebar_file_filter: TextInputState::new(),
@@ -1899,6 +2002,11 @@ impl TermWindow {
                 }
                 Ok(true)
             }
+            WindowEvent::PerformContextMenuAction(action_id) => {
+                self.perform_context_menu_application_action(action_id);
+                window.invalidate();
+                Ok(true)
+            }
             WindowEvent::FocusChanged(focused) => {
                 self.focus_changed(focused, window);
                 Ok(true)
@@ -1966,6 +2074,29 @@ impl TermWindow {
                 window.invalidate();
                 Ok(true)
             }
+            WindowEvent::NativeTextInputReplace {
+                token,
+                revision,
+                source_range,
+                text,
+            } => {
+                if self.right_sidebar_note.view.focused
+                    && self.right_sidebar_note.native_text_input_token == token
+                {
+                    if let Some(session) = self.right_sidebar_note.session.clone() {
+                        if session.lock().replace_range_at_revision(
+                            &mut self.right_sidebar_note.view,
+                            revision,
+                            source_range,
+                            &text,
+                        ) {
+                            self.note_did_edit();
+                        }
+                    }
+                }
+                window.invalidate();
+                Ok(true)
+            }
             WindowEvent::NeedRepaint => {
                 if self.resizes_pending > 0 {
                     self.is_repaint_pending = true;
@@ -2009,12 +2140,11 @@ impl TermWindow {
                 if self.right_sidebar_mode == RightSidebarMode::Tasks
                     && self.right_sidebar_note.view.focused
                 {
-                    let notebook = match crate::markdown_editor::default_notebook() {
-                        Ok(notebook) => notebook,
-                        Err(err) => {
-                            log::error!("failed to open Note attachment store: {err:#}");
-                            return Ok(true);
-                        }
+                    let Some(document) = self.right_sidebar_note.document.clone() else {
+                        log::warn!(
+                            "cannot import a Note attachment before a Vault document is open"
+                        );
+                        return Ok(true);
                     };
                     let paths = paths.clone();
                     let notify_window = window.clone();
@@ -2022,7 +2152,7 @@ impl TermWindow {
                         let markdown = promise::spawn::spawn_into_new_thread(move || {
                             let mut inserted = Vec::new();
                             for path in paths {
-                                match crate::markdown_editor::import_attachment(&notebook, &path) {
+                                match crate::markdown_editor::import_attachment(&document, &path) {
                                     Ok(relative) => {
                                         let alt = path
                                             .file_stem()

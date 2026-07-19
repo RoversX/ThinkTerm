@@ -9,8 +9,8 @@ use crate::os::x11::connection::XConnection;
 use crate::os::x11::window::XWindow;
 use crate::screen::Screens;
 use crate::{
-    Appearance, Clipboard, MouseCursor, Rect, RequestedWindowGeometry, ResizeIncrement,
-    ScreenPoint, WindowEvent, WindowOps,
+    Appearance, Clipboard, FolderPickerOptions, MouseCursor, Rect, RequestedWindowGeometry,
+    ResizeIncrement, ScreenPoint, WindowEvent, WindowOps,
 };
 use async_trait::async_trait;
 use config::ConfigHandle;
@@ -309,6 +309,14 @@ impl WindowOps for Window {
 
     fn pick_folder_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
         crate::os::xdg_desktop_portal::pick_folder_async(callback);
+    }
+
+    fn pick_folder_async_with_options(
+        &self,
+        options: FolderPickerOptions,
+        callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+    ) {
+        crate::os::xdg_desktop_portal::pick_folder_async_with_options(options, callback);
     }
 
     fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {

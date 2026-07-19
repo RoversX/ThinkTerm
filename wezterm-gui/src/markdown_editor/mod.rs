@@ -7,22 +7,33 @@
 mod document;
 mod host;
 mod projection;
+#[allow(dead_code)] // Removed once the Note paint host starts scheduling loads.
+mod remote_image;
+mod spellcheck;
 mod store;
 mod surface;
 
 pub(crate) use document::{
-    Affinity, EditorMode, EditorViewState, MarkdownDocumentSession, SaveState, SourcePosition,
-    SourceSelection,
+    Affinity, DocumentSnapshot, EditorMode, EditorViewState, MarkdownDocumentSession, SaveState,
+    SelectionGranularity, SourcePosition, SourceSelection,
 };
-pub(crate) use host::{NoteCodeBlockLayout, NoteHostState, NoteLineLayout, NoteRunLayout};
+pub(crate) use host::{
+    AutosaveWakeAction, NoteCodeBlockLayout, NoteHostState, NoteLineGeometry, NoteLineLayout,
+    NoteRunLayout,
+};
 pub(crate) use projection::{
     BlockKind, InlineStyle, MarkdownProjection, ProjectedCodeBlock, ProjectedObject, TableAlignment,
 };
+#[allow(unused_imports)] // Standalone API for the pending Note host integration.
+pub(crate) use remote_image::{load_remote_image, RemoteImage};
+pub(crate) use spellcheck::{build_spell_check_chunks_in_range, NoteSpellingIssue};
 pub(crate) use store::{
-    default_document_session, default_notebook, import_attachment, resolve_local_image,
-    save_document_revision,
+    import_attachment, open_vault_document, resolve_local_image, save_document_revision,
+    vault_file_paths, vault_markdown_paths, VaultDocument,
 };
+#[cfg(test)]
+pub(crate) use surface::wrap_visual_document_by_width;
 pub(crate) use surface::{
-    build_visual_document, fit_table_columns, wrap_visual_document_by_width, VisualDocument,
-    VisualLineKind,
+    build_visual_document, fit_table_columns, wrap_visual_document_by_width_cached, VisualDocument,
+    VisualLineKind, VisualWrapCache,
 };

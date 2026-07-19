@@ -47,6 +47,11 @@ pub struct Space {
     pub id: SpaceId,
     pub name: String,
     pub active_project_id: Option<ProjectId>,
+    /// The local Obsidian-compatible Vault shared by every Project in this
+    /// Space.  The Vault contents remain ordinary user-owned files; ThinkTerm
+    /// only persists this binding in its own workspace store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_vault: Option<SpaceVaultBinding>,
     #[serde(default)]
     pub is_default: bool,
     /// When set, this Space is dedicated to a wezterm mux client domain
@@ -55,6 +60,13 @@ pub struct Space {
     /// layout locally (the remote mux server owns the layout truth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_domain: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpaceVaultBinding {
+    pub root: PathBuf,
+    #[serde(default)]
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,6 +81,11 @@ pub struct Project {
     pub active_thread_id: Option<WorkspaceThreadId>,
     #[serde(default)]
     pub threads_collapsed: bool,
+    /// Vault-relative Markdown path last opened for this Project. Projects in
+    /// the same Space share a Vault but intentionally remember independent
+    /// active notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_note_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -571,6 +588,62 @@ pub fn active_space_name(space_id: &str) -> Option<String> {
         .map(|space| space.name.clone())
 }
 
+/// Return the Vault binding for a Space. A Space owns exactly one Vault and
+/// every Project in that Space sees the same root.
+pub fn space_note_vault(space_id: &str) -> Option<SpaceVaultBinding> {
+    let mut store = THREAD_STORE.lock();
+    if store.normalize_after_load() {
+        persist_locked(&store);
+    }
+    store
+        .spaces
+        .iter()
+        .find(|space| space.id == space_id)
+        .and_then(|space| space.note_vault.clone())
+}
+
+/// Bind a Space to a local Vault. Managed Vaults are allowed to be created;
+/// existing Vaults must already be directories. Canonicalizing here gives the
+/// document registry one stable key even when a picker returns a symlinked
+/// path.
+pub fn set_space_note_vault(
+    space_id: &str,
+    root: PathBuf,
+    managed: bool,
+) -> Result<SpaceVaultBinding> {
+    if managed {
+        fs::create_dir_all(&root)
+            .with_context(|| format!("create note vault {}", root.display()))?;
+    }
+    ensure!(
+        root.is_dir(),
+        "note vault is not a directory: {}",
+        root.display()
+    );
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("resolve note vault {}", root.display()))?;
+    let binding = SpaceVaultBinding { root, managed };
+
+    let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    let space = store
+        .spaces
+        .iter_mut()
+        .find(|space| space.id == space_id)
+        .with_context(|| format!("unknown Space {space_id}"))?;
+    if space.note_vault.as_ref() != Some(&binding) {
+        space.note_vault = Some(binding.clone());
+        // Folder picking runs its completion on the UI thread.  Serializing and
+        // fsyncing the complete workspace store here made selecting a Vault
+        // visibly stall before Note could even start loading.  The shared
+        // coalescing worker snapshots the latest store, so rapid changes still
+        // persist in order without blocking input.
+        schedule_workspace_thread_store_persist();
+    }
+    Ok(binding)
+}
+
 pub fn create_space(name: Option<String>) -> SpaceId {
     let mut store = THREAD_STORE.lock();
     store.normalize_after_load();
@@ -742,6 +815,7 @@ pub fn default_project_for_space(space_id: &str) -> Project {
         threads: vec![],
         active_thread_id: None,
         threads_collapsed: false,
+        active_note_path: None,
     }
 }
 
@@ -1278,6 +1352,71 @@ pub fn project_name(project_id: &str) -> Option<String> {
         .map(|project| project.name.clone())
 }
 
+pub fn active_project_id_for_space(space_id: &str) -> Option<ProjectId> {
+    let mut store = THREAD_STORE.lock();
+    if store.normalize_after_load() {
+        persist_locked(&store);
+    }
+    store.active_project_id_for_space(space_id)
+}
+
+pub fn project_active_note_path(project_id: &str) -> Option<String> {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .and_then(|project| project.active_note_path.clone())
+}
+
+/// Remember a Project's active note independently from its threads. Paths are
+/// persisted relative to the Space Vault so moving a Vault does not invalidate
+/// every Project selection.
+pub fn set_project_active_note_path(project_id: &str, path: Option<&str>) -> Result<bool> {
+    let normalized = path.map(normalize_vault_markdown_path).transpose()?;
+    let mut store = THREAD_STORE.lock();
+    let project = store
+        .projects
+        .iter_mut()
+        .find(|project| project.id == project_id)
+        .with_context(|| format!("unknown Project {project_id}"))?;
+    if project.active_note_path == normalized {
+        return Ok(false);
+    }
+    project.active_note_path = normalized;
+    // Note selection is presentation state and can change several times while
+    // the user moves through a Vault.  Coalesce those writes off the UI thread
+    // while keeping the in-memory value immediately authoritative.
+    schedule_workspace_thread_store_persist();
+    Ok(true)
+}
+
+pub fn normalize_vault_markdown_path(path: &str) -> Result<String> {
+    use std::path::Component;
+
+    let trimmed = path.trim();
+    ensure!(!trimmed.is_empty(), "note path is empty");
+    let path = Path::new(trimmed);
+    ensure!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md")),
+        "note path must end in .md: {trimmed}"
+    );
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => components.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("note path must remain inside the Vault: {trimmed}")
+            }
+        }
+    }
+    ensure!(!components.is_empty(), "note path is empty");
+    Ok(components.join("/"))
+}
+
 pub fn project_reveal_path(project_id: &str) -> Option<PathBuf> {
     let store = THREAD_STORE.lock();
     store.project_reveal_path(project_id)
@@ -1466,6 +1605,7 @@ impl WorkspaceThreadStore {
                 id: DEFAULT_SPACE_ID.to_string(),
                 name: DEFAULT_SPACE_NAME.to_string(),
                 active_project_id: self.active_project_id.clone(),
+                note_vault: None,
                 is_default: true,
                 client_domain: None,
             });
@@ -1564,6 +1704,7 @@ impl WorkspaceThreadStore {
             id: id.clone(),
             name,
             active_project_id: None,
+            note_vault: None,
             is_default: false,
             client_domain,
         });
@@ -2000,6 +2141,7 @@ impl WorkspaceThreadStore {
                 threads: vec![],
                 active_thread_id: None,
                 threads_collapsed: false,
+                active_note_path: None,
             });
         }
 
@@ -2053,6 +2195,7 @@ impl WorkspaceThreadStore {
             threads: vec![],
             active_thread_id: None,
             threads_collapsed: false,
+            active_note_path: None,
         };
         let session = WorkspaceThread::new(project_id.clone(), "main".to_string(), None);
         let thread_id = session.id.clone();
@@ -3688,6 +3831,7 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                         threads: vec![],
                         active_thread_id: None,
                         threads_collapsed: false,
+                        active_note_path: None,
                     });
                 }
                 let project = store
@@ -3727,6 +3871,7 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                     threads: vec![thread],
                     active_thread_id: Some(thread_id),
                     threads_collapsed: false,
+                    active_note_path: None,
                 });
                 changed = true;
             }
@@ -3793,6 +3938,7 @@ pub fn ensure_mux_domain_space(domain_name: &str) -> MuxDomainSpacePlan {
             threads: vec![],
             active_thread_id: None,
             threads_collapsed: false,
+            active_note_path: None,
         });
     }
 
@@ -3960,7 +4106,61 @@ mod tests {
             threads,
             active_thread_id: None,
             threads_collapsed: false,
+            active_note_path: None,
         }
+    }
+
+    #[test]
+    fn vault_binding_and_project_note_paths_round_trip() {
+        let vault = SpaceVaultBinding {
+            root: PathBuf::from("/tmp/ThinkTerm Notes"),
+            managed: false,
+        };
+        let mut store = test_store();
+        let space_id = store.spaces[0].id.clone();
+        store.spaces[0].note_vault = Some(vault.clone());
+        let mut first = test_project_in_space(
+            &space_id,
+            "project-first",
+            "First",
+            PathBuf::from("/tmp/first"),
+            vec![],
+        );
+        first.active_note_path = Some("Design/Overview.md".to_string());
+        let mut second = test_project_in_space(
+            &space_id,
+            "project-second",
+            "Second",
+            PathBuf::from("/tmp/second"),
+            vec![],
+        );
+        second.active_note_path = Some("Daily/Today.md".to_string());
+        store.projects.extend([first, second]);
+
+        let encoded = serde_json::to_string(&store).expect("serialize store");
+        let decoded: WorkspaceThreadStore =
+            serde_json::from_str(&encoded).expect("deserialize store");
+
+        assert_eq!(decoded.spaces[0].note_vault.as_ref(), Some(&vault));
+        assert_eq!(
+            decoded.projects[0].active_note_path.as_deref(),
+            Some("Design/Overview.md")
+        );
+        assert_eq!(
+            decoded.projects[1].active_note_path.as_deref(),
+            Some("Daily/Today.md")
+        );
+    }
+
+    #[test]
+    fn vault_markdown_paths_are_portable_and_cannot_escape() {
+        assert_eq!(
+            normalize_vault_markdown_path("./Design/Overview.MD").unwrap(),
+            "Design/Overview.MD"
+        );
+        assert!(normalize_vault_markdown_path("../outside.md").is_err());
+        assert!(normalize_vault_markdown_path("/absolute.md").is_err());
+        assert!(normalize_vault_markdown_path("image.png").is_err());
     }
 
     #[test]
@@ -4361,6 +4561,7 @@ mod tests {
             threads: vec![thread],
             active_thread_id: None,
             threads_collapsed: false,
+            active_note_path: None,
         });
 
         let state = store
@@ -4395,6 +4596,7 @@ mod tests {
             threads: vec![thread],
             active_thread_id: None,
             threads_collapsed: false,
+            active_note_path: None,
         });
 
         let plan = store

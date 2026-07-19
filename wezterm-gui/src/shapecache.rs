@@ -209,6 +209,7 @@ mod test {
         });
         let infos = vec![
             GlyphInfo {
+                #[cfg(debug_assertions)]
                 text: "a".to_string(),
                 only_char: Some('a'),
                 is_space: false,
@@ -222,6 +223,7 @@ mod test {
                 y_offset: PixelLength::new(0.0),
             },
             GlyphInfo {
+                #[cfg(debug_assertions)]
                 text: "你".to_string(),
                 only_char: Some('你'),
                 is_space: false,

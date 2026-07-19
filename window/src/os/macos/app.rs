@@ -151,6 +151,7 @@ extern "C" fn wezterm_perform_key_assignment(
                 conn.dispatch_app_event(ApplicationEvent::PerformKeyAssignment(action));
             }
         }
+        Some(RepresentedItem::ContextMenuAction(_)) => {}
         None => {}
     }
 }

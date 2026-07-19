@@ -2,6 +2,7 @@ use parking_lot::Mutex;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,6 +51,13 @@ impl SourceSelection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionGranularity {
+    Character,
+    Word,
+    MarkdownBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EditorMode {
     LivePreview,
     Source,
@@ -62,6 +70,12 @@ pub(crate) enum SaveState {
     Dirty,
     Saving(u64),
     Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DocumentSnapshot {
+    pub revision: u64,
+    pub source: Arc<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +110,21 @@ struct EditRecord {
     after: SourceSelection,
 }
 
+#[derive(Debug, Clone)]
+struct DocumentEdit {
+    replaced: Range<usize>,
+    inserted_len: usize,
+}
+
+impl DocumentEdit {
+    fn new(replaced: Range<usize>, inserted_len: usize) -> Self {
+        Self {
+            replaced,
+            inserted_len,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MarkdownDocumentSession {
     #[allow(dead_code)]
@@ -104,29 +133,43 @@ pub(crate) struct MarkdownDocumentSession {
     source: String,
     revision: u64,
     saved_revision: u64,
+    published: DocumentSnapshot,
+    /// Immutable view of the current edit revision.  Large notes must not be
+    /// copied once for projection and then copied again for autosave during
+    /// the same revision.
+    snapshot_cache: Option<DocumentSnapshot>,
     save_state: SaveState,
     line_starts: Vec<usize>,
     undo: Vec<EditRecord>,
     redo: Vec<EditRecord>,
     save_lock: Arc<Mutex<()>>,
+    disk_stamp: Option<(SystemTime, u64)>,
 }
 
 const MAX_UNDO_RECORDS: usize = 512;
 
 impl MarkdownDocumentSession {
     pub(crate) fn new(document_id: String, path: PathBuf, source: String) -> Self {
+        let disk_stamp = file_disk_stamp(&path);
         let line_starts = line_starts(&source);
+        let published = DocumentSnapshot {
+            revision: 0,
+            source: Arc::from(source.as_str()),
+        };
         Self {
             document_id,
             path,
             source,
             revision: 0,
             saved_revision: 0,
+            snapshot_cache: Some(published.clone()),
+            published,
             save_state: SaveState::Saved,
             line_starts,
             undo: vec![],
             redo: vec![],
             save_lock: Arc::new(Mutex::new(())),
+            disk_stamp,
         }
     }
 
@@ -146,20 +189,56 @@ impl MarkdownDocumentSession {
         self.revision != self.saved_revision
     }
 
-    pub(crate) fn snapshot_for_save(&mut self) -> (u64, PathBuf, String) {
-        let revision = self.revision;
+    pub(crate) fn current_snapshot(&mut self) -> DocumentSnapshot {
+        if let Some(snapshot) = self
+            .snapshot_cache
+            .as_ref()
+            .filter(|snapshot| snapshot.revision == self.revision)
+        {
+            return snapshot.clone();
+        }
+        let snapshot = DocumentSnapshot {
+            revision: self.revision,
+            source: Arc::from(self.source.as_str()),
+        };
+        self.snapshot_cache = Some(snapshot.clone());
+        snapshot
+    }
+
+    pub(crate) fn published_snapshot(&self) -> DocumentSnapshot {
+        self.published.clone()
+    }
+
+    pub(crate) fn snapshot_for_save(&mut self) -> (u64, PathBuf, Arc<str>) {
+        let snapshot = self.current_snapshot();
+        let revision = snapshot.revision;
         self.save_state = SaveState::Saving(revision);
-        (revision, self.path.clone(), self.source.clone())
+        (revision, self.path.clone(), snapshot.source)
     }
 
     pub(crate) fn save_lock(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.save_lock)
     }
 
-    pub(crate) fn finish_save(&mut self, revision: u64, result: anyhow::Result<()>) {
+    pub(crate) fn finish_save(
+        &mut self,
+        revision: u64,
+        source: Arc<str>,
+        result: anyhow::Result<()>,
+    ) {
         match result {
             Ok(()) => {
-                self.saved_revision = self.saved_revision.max(revision);
+                self.disk_stamp = file_disk_stamp(&self.path);
+                if revision >= self.saved_revision {
+                    self.saved_revision = revision;
+                    self.published = DocumentSnapshot {
+                        revision,
+                        source: Arc::clone(&source),
+                    };
+                    if revision == self.revision {
+                        self.snapshot_cache = Some(DocumentSnapshot { revision, source });
+                    }
+                }
                 self.save_state = if self.saved_revision == self.revision {
                     SaveState::Saved
                 } else {
@@ -173,6 +252,55 @@ impl MarkdownDocumentSession {
     pub(crate) fn selected_text(&self, view: &EditorViewState) -> Option<&str> {
         let range = self.clamped_selection_range(view);
         (range.start != range.end).then(|| &self.source[range])
+    }
+
+    pub(crate) fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub(crate) fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub(crate) fn disk_stamp(&self) -> Option<(SystemTime, u64)> {
+        self.disk_stamp
+    }
+
+    /// Apply a watcher snapshot using the product's explicit last-writer-wins
+    /// policy. A changed disk stamp with identical text is our own atomic save
+    /// and only advances the stamp; genuinely changed text replaces even a
+    /// dirty buffer and clears undo/redo so stale edits cannot be replayed onto
+    /// another application's version.
+    pub(crate) fn apply_external_snapshot(
+        &mut self,
+        view: &mut EditorViewState,
+        modified: SystemTime,
+        len: u64,
+        source: String,
+    ) -> bool {
+        let stamp = (modified, len);
+        if self.disk_stamp == Some(stamp) {
+            return false;
+        }
+        self.disk_stamp = Some(stamp);
+        if self.source == source {
+            return false;
+        }
+
+        self.source = source;
+        self.revision = self.revision.wrapping_add(1);
+        self.saved_revision = self.revision;
+        self.published = DocumentSnapshot {
+            revision: self.revision,
+            source: Arc::from(self.source.as_str()),
+        };
+        self.snapshot_cache = Some(self.published.clone());
+        self.save_state = SaveState::Saved;
+        self.line_starts = line_starts(&self.source);
+        self.undo.clear();
+        self.redo.clear();
+        self.clamp_view(view);
+        true
     }
 
     pub(crate) fn set_caret(&self, view: &mut EditorViewState, byte: usize, extend: bool) {
@@ -191,6 +319,21 @@ impl MarkdownDocumentSession {
             focus: SourcePosition::new(self.source.len()),
         };
         view.preferred_column = None;
+    }
+
+    pub(crate) fn word_range_at(&self, byte: usize) -> Range<usize> {
+        unicode_word_range_at(&self.source, byte)
+    }
+
+    pub(crate) fn source_line_selection_range(&self, byte: usize) -> Range<usize> {
+        let line = self.line_index(byte);
+        let start = self.line_starts[line];
+        let end = self
+            .line_starts
+            .get(line + 1)
+            .copied()
+            .unwrap_or(self.source.len());
+        start..end
     }
 
     pub(crate) fn clamp_view(&self, view: &mut EditorViewState) {
@@ -216,6 +359,27 @@ impl MarkdownDocumentSession {
         }
         let range = self.clamped_selection_range(view);
         self.replace_range(view, range, &filtered)
+    }
+
+    pub(crate) fn delete_selection(&mut self, view: &mut EditorViewState) -> bool {
+        if view.mode == EditorMode::ReadOnly || view.selection.is_caret() {
+            return false;
+        }
+        let range = self.clamped_selection_range(view);
+        self.replace_range(view, range, "")
+    }
+
+    pub(crate) fn replace_range_at_revision(
+        &mut self,
+        view: &mut EditorViewState,
+        revision: u64,
+        range: Range<usize>,
+        replacement: &str,
+    ) -> bool {
+        if self.revision != revision || view.mode == EditorMode::ReadOnly {
+            return false;
+        }
+        self.replace_range(view, range, replacement)
     }
 
     pub(crate) fn surround_selection(
@@ -390,26 +554,34 @@ impl MarkdownDocumentSession {
     }
 
     pub(crate) fn undo(&mut self, view: &mut EditorViewState) -> bool {
+        let stage = crate::input_diagnostics::StageTimer::begin("note_edit");
         let Some(edit) = self.undo.pop() else {
+            stage.finish(false);
             return false;
         };
         let end = edit.start + edit.inserted.len();
         self.source.replace_range(edit.start..end, &edit.deleted);
         view.selection = edit.before;
+        let mutation = DocumentEdit::new(edit.start..end, edit.deleted.len());
         self.redo.push(edit);
-        self.note_mutation();
+        self.note_mutation(mutation);
+        stage.finish(true);
         true
     }
 
     pub(crate) fn redo(&mut self, view: &mut EditorViewState) -> bool {
+        let stage = crate::input_diagnostics::StageTimer::begin("note_edit");
         let Some(edit) = self.redo.pop() else {
+            stage.finish(false);
             return false;
         };
         let end = edit.start + edit.deleted.len();
         self.source.replace_range(edit.start..end, &edit.inserted);
         view.selection = edit.after;
+        let mutation = DocumentEdit::new(edit.start..end, edit.inserted.len());
         self.undo.push(edit);
-        self.note_mutation();
+        self.note_mutation(mutation);
+        stage.finish(true);
         true
     }
 
@@ -419,14 +591,17 @@ impl MarkdownDocumentSession {
         range: Range<usize>,
         inserted: &str,
     ) -> bool {
+        let stage = crate::input_diagnostics::StageTimer::begin("note_edit");
         let start = clamp_char_boundary(&self.source, range.start);
         let end = clamp_char_boundary(&self.source, range.end).max(start);
         if start == end && inserted.is_empty() {
+            stage.finish(false);
             return false;
         }
         let before = view.selection;
         let deleted = self.source[start..end].to_string();
         self.source.replace_range(start..end, inserted);
+        let mutation = DocumentEdit::new(start..end, inserted.len());
         let after = SourceSelection::caret(start + inserted.len());
         view.selection = after;
         view.preferred_column = None;
@@ -441,14 +616,55 @@ impl MarkdownDocumentSession {
             self.undo.remove(0);
         }
         self.redo.clear();
-        self.note_mutation();
+        self.note_mutation(mutation);
+        stage.finish(true);
         true
     }
 
-    fn note_mutation(&mut self) {
+    fn note_mutation(&mut self, edit: DocumentEdit) {
         self.revision = self.revision.wrapping_add(1);
+        self.snapshot_cache = None;
         self.save_state = SaveState::Dirty;
-        self.line_starts = line_starts(&self.source);
+        self.update_line_starts(&edit);
+    }
+
+    fn update_line_starts(&mut self, edit: &DocumentEdit) {
+        let anchor_index = self
+            .line_starts
+            .partition_point(|start| *start <= edit.replaced.start)
+            .saturating_sub(1);
+        let anchor = self.line_starts[anchor_index];
+        let suffix_index = self
+            .line_starts
+            .partition_point(|start| *start <= edit.replaced.end);
+        let deleted_len = edit.replaced.end.saturating_sub(edit.replaced.start);
+        let shifted_suffix = self.line_starts[suffix_index..]
+            .iter()
+            .map(|start| {
+                if edit.inserted_len >= deleted_len {
+                    start.saturating_add(edit.inserted_len - deleted_len)
+                } else {
+                    start.saturating_sub(deleted_len - edit.inserted_len)
+                }
+            })
+            .collect::<Vec<_>>();
+        let rebuild_end = shifted_suffix
+            .first()
+            .copied()
+            .unwrap_or(self.source.len())
+            .min(self.source.len());
+
+        self.line_starts.truncate(anchor_index + 1);
+        self.line_starts.extend(
+            self.source[anchor..rebuild_end]
+                .match_indices('\n')
+                .map(|(relative, _)| anchor + relative + 1),
+        );
+        for start in shifted_suffix {
+            if self.line_starts.last().copied() != Some(start) {
+                self.line_starts.push(start);
+            }
+        }
     }
 
     fn clamped_selection_range(&self, view: &EditorViewState) -> Range<usize> {
@@ -476,6 +692,11 @@ impl MarkdownDocumentSession {
         let line = self.line_index(byte);
         (self.line_starts[line], self.line_end(line))
     }
+}
+
+fn file_disk_stamp(path: &std::path::Path) -> Option<(SystemTime, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 fn line_starts(source: &str) -> Vec<usize> {
@@ -558,6 +779,43 @@ fn next_word_boundary(source: &str, byte: usize) -> usize {
         cursor = next;
     }
     cursor
+}
+
+fn unicode_word_range_at(source: &str, byte: usize) -> Range<usize> {
+    if source.is_empty() {
+        return 0..0;
+    }
+    let byte = clamp_char_boundary(source, byte);
+    let seed_start = if byte == source.len() {
+        previous_grapheme_boundary(source, byte)
+    } else {
+        byte
+    };
+    let seed_end = next_grapheme_boundary(source, seed_start);
+    let seed = &source[seed_start..seed_end];
+    if seed.contains(['\r', '\n']) {
+        return seed_start..seed_start;
+    }
+    let class = word_class(seed);
+    let mut start = seed_start;
+    while start > 0 {
+        let previous = previous_grapheme_boundary(source, start);
+        let grapheme = &source[previous..start];
+        if grapheme.contains(['\r', '\n']) || word_class(grapheme) != class {
+            break;
+        }
+        start = previous;
+    }
+    let mut end = seed_end;
+    while end < source.len() {
+        let next = next_grapheme_boundary(source, end);
+        let grapheme = &source[end..next];
+        if grapheme.contains(['\r', '\n']) || word_class(grapheme) != class {
+            break;
+        }
+        end = next;
+    }
+    start..end
 }
 
 fn word_class(grapheme: &str) -> u8 {
@@ -659,6 +917,28 @@ mod tests {
     }
 
     #[test]
+    fn edits_update_line_index_without_rebuilding_the_document() {
+        let (mut session, mut view) = session("one\ntwo\nthree\nfour");
+        let assert_index = |session: &MarkdownDocumentSession| {
+            assert_eq!(session.line_starts, line_starts(session.source()));
+        };
+
+        session.set_caret(&mut view, 5, false);
+        assert!(session.insert_text(&mut view, "A\nB"));
+        assert_index(&session);
+        view.selection = SourceSelection {
+            anchor: SourcePosition::new(2),
+            focus: SourcePosition::new(12),
+        };
+        assert!(session.insert_text(&mut view, "joined"));
+        assert_index(&session);
+        assert!(session.undo(&mut view));
+        assert_index(&session);
+        assert!(session.redo(&mut view));
+        assert_index(&session);
+    }
+
+    #[test]
     fn vertical_navigation_preserves_grapheme_column() {
         let (session, mut view) = session("abcd\n你😀\nabcdef");
         session.set_caret(&mut view, 3, false);
@@ -673,11 +953,30 @@ mod tests {
         let (mut session, mut view) = session("a");
         session.set_caret(&mut view, 1, false);
         session.insert_text(&mut view, "b");
-        let (revision, _, _) = session.snapshot_for_save();
+        let (revision, _, source) = session.snapshot_for_save();
         session.insert_text(&mut view, "c");
-        session.finish_save(revision, Ok(()));
+        session.finish_save(revision, source, Ok(()));
         assert!(session.is_dirty());
         assert_eq!(session.save_state(), &SaveState::Dirty);
+        assert_eq!(session.published_snapshot().revision, revision);
+        assert_eq!(session.published_snapshot().source.as_ref(), "ab");
+        assert_eq!(session.source(), "abc");
+    }
+
+    #[test]
+    fn current_revision_reuses_one_immutable_snapshot() {
+        let (mut session, mut view) = session("a large note");
+        let first = session.current_snapshot();
+        let second = session.current_snapshot();
+        assert!(Arc::ptr_eq(&first.source, &second.source));
+
+        session.set_caret(&mut view, session.source().len(), false);
+        assert!(session.insert_text(&mut view, "!"));
+        let edited = session.current_snapshot();
+        assert!(!Arc::ptr_eq(&first.source, &edited.source));
+
+        let (_, _, for_save) = session.snapshot_for_save();
+        assert!(Arc::ptr_eq(&edited.source, &for_save));
     }
 
     #[test]
@@ -693,6 +992,28 @@ mod tests {
         view.mode = EditorMode::ReadOnly;
         assert!(!session.insert_text(&mut view, "x"));
         assert_eq!(session.source(), "**hello**");
+    }
+
+    #[test]
+    fn unicode_word_selection_respects_words_punctuation_and_emoji() {
+        let (session, _) = session("hello, 世界 😀 done");
+        assert_eq!(session.word_range_at(2), 0..5);
+        assert_eq!(session.word_range_at(5), 5..6);
+        let cjk = "hello, ".len();
+        assert_eq!(&session.source()[session.word_range_at(cjk)], "世界");
+        let emoji = session.source().find('😀').unwrap();
+        assert_eq!(&session.source()[session.word_range_at(emoji)], "😀");
+    }
+
+    #[test]
+    fn spelling_replacement_is_revision_gated_and_undoable() {
+        let (mut session, mut view) = session("a mistke here");
+        assert!(!session.replace_range_at_revision(&mut view, 9, 2..8, "mistake"));
+        assert_eq!(session.source(), "a mistke here");
+        assert!(session.replace_range_at_revision(&mut view, 0, 2..8, "mistake"));
+        assert_eq!(session.source(), "a mistake here");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "a mistke here");
     }
 
     #[test]
@@ -734,5 +1055,24 @@ mod tests {
         assert_eq!(&session.source()[view.selection.focus.byte..], "你好 world");
         session.move_word_right(&mut view, false);
         assert_eq!(&session.source()[view.selection.focus.byte..], " world");
+    }
+
+    #[test]
+    fn external_snapshot_is_last_writer_and_clears_local_history() {
+        let (mut session, mut view) = session("local");
+        session.set_caret(&mut view, session.source().len(), false);
+        assert!(session.insert_text(&mut view, " dirty"));
+        assert!(session.can_undo());
+
+        assert!(session.apply_external_snapshot(
+            &mut view,
+            SystemTime::now(),
+            8,
+            "external".to_string(),
+        ));
+        assert_eq!(session.source(), "external");
+        assert!(!session.is_dirty());
+        assert!(!session.can_undo());
+        assert!(!session.can_redo());
     }
 }

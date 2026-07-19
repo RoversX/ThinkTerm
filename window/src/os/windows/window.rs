@@ -2,10 +2,10 @@ use super::*;
 use crate::connection::ConnectionOps;
 use crate::parameters::{self, Parameters};
 use crate::{
-    Appearance, Clipboard, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent, Modifiers,
-    MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point, RawKeyEvent, Rect,
-    RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength, WindowDecorations,
-    WindowEvent, WindowEventSender, WindowOps, WindowState,
+    Appearance, Clipboard, DeadKeyStatus, Dimensions, FolderPickerOptions, Handled, KeyCode,
+    KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point,
+    RawKeyEvent, Rect, RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength,
+    WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -177,7 +177,10 @@ unsafe fn pathbuf_from_shell_string(raw_path: LPWSTR) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-unsafe fn pick_folder_dialog(hwnd: HWND) -> anyhow::Result<Option<PathBuf>> {
+unsafe fn pick_folder_dialog(
+    hwnd: HWND,
+    picker_options: &FolderPickerOptions,
+) -> anyhow::Result<Option<PathBuf>> {
     let coinit = CoInitializeEx(
         null_mut(),
         COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
@@ -200,8 +203,8 @@ unsafe fn pick_folder_dialog(hwnd: HWND) -> anyhow::Result<Option<PathBuf>> {
             "CoCreateInstance(FileOpenDialog)",
         )?;
 
-        let title = wide_null("Open Project");
-        let open = wide_null("Open");
+        let title = wide_null(&picker_options.title);
+        let open = wide_null(&picker_options.prompt);
         let mut selected_path = None;
         let mut result_item: *mut IShellItem = null_mut();
         let mut raw_path: LPWSTR = null_mut();
@@ -1082,10 +1085,18 @@ impl WindowOps for Window {
     }
 
     fn pick_folder_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        self.pick_folder_async_with_options(FolderPickerOptions::default(), callback);
+    }
+
+    fn pick_folder_async_with_options(
+        &self,
+        options: FolderPickerOptions,
+        callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+    ) {
         let hwnd = self.0 .0;
         promise::spawn::spawn(async move {
             let path = unsafe {
-                match pick_folder_dialog(hwnd) {
+                match pick_folder_dialog(hwnd, &options) {
                     Ok(path) => path,
                     Err(err) => {
                         log::warn!("failed to show folder picker: {err:#}");

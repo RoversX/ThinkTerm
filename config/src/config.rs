@@ -721,6 +721,14 @@ pub struct Config {
 
     #[dynamic(default = "default_true")]
     pub use_ime: bool,
+    /// Enable local, platform-provided spelling checks in the Note editor.
+    #[dynamic(default = "default_true")]
+    pub note_spellcheck_enabled: bool,
+    /// Allow Note documents to load HTTP/HTTPS images. Remote images are
+    /// fetched lazily by the Note host and are subject to strict size and
+    /// network-address limits.
+    #[dynamic(default = "default_true")]
+    pub note_remote_images_enabled: bool,
     #[dynamic(default)]
     pub xim_im_name: Option<String>,
     #[dynamic(default)]
@@ -2442,6 +2450,11 @@ mod tests {
     #[test]
     fn default_cwd_is_home() {
         assert_eq!(Config::default().default_cwd.as_ref(), Some(&*HOME_DIR));
+    }
+
+    #[test]
+    fn remote_note_images_are_enabled_by_default() {
+        assert!(Config::default().note_remote_images_enabled);
     }
 
     #[test]

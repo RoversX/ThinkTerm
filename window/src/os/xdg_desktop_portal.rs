@@ -185,18 +185,19 @@ fn first_file_uri_to_path(
         .map_err(|()| anyhow::anyhow!("portal uri is not a file path: {uri:?}"))
 }
 
-pub async fn pick_folder() -> anyhow::Result<Option<PathBuf>> {
+pub async fn pick_folder(options: crate::FolderPickerOptions) -> anyhow::Result<Option<PathBuf>> {
     let connection = zbus::ConnectionBuilder::session()?.build().await?;
     let proxy = PortalFileChooserProxy::new(&connection)
         .await
         .context("make file chooser proxy")?;
 
-    let mut options = HashMap::new();
-    options.insert("directory", Value::from(true));
-    options.insert("modal", Value::from(true));
+    let mut portal_options = HashMap::new();
+    portal_options.insert("directory", Value::from(true));
+    portal_options.insert("modal", Value::from(true));
+    portal_options.insert("accept_label", Value::from(options.prompt.as_str()));
 
     let handle = proxy
-        .OpenFile("", "Open Project", options)
+        .OpenFile("", &options.title, portal_options)
         .or(async {
             async_io::Timer::after(std::time::Duration::from_secs(1)).await;
             Err(std::io::Error::new(
@@ -234,8 +235,15 @@ pub async fn pick_folder() -> anyhow::Result<Option<PathBuf>> {
 }
 
 pub fn pick_folder_async(callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+    pick_folder_async_with_options(crate::FolderPickerOptions::default(), callback);
+}
+
+pub fn pick_folder_async_with_options(
+    options: crate::FolderPickerOptions,
+    callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+) {
     promise::spawn::spawn(async move {
-        let path = match pick_folder().await {
+        let path = match pick_folder(options).await {
             Ok(path) => path,
             Err(err) => {
                 log::warn!("failed to show xdg-desktop-portal folder picker: {err:#}");

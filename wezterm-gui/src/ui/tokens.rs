@@ -23,6 +23,7 @@ pub(crate) struct UiPalette {
     pub muted_text: LinearRgba,
     pub selected_text: LinearRgba,
     pub scrollbar_thumb: LinearRgba,
+    pub spelling_error: LinearRgba,
 }
 
 impl UiPalette {
@@ -49,6 +50,7 @@ impl UiPalette {
                 muted_text: rgb(142, 142, 147),
                 selected_text: rgb(255, 255, 255),
                 scrollbar_thumb: rgba(60, 60, 67, 0.32),
+                spelling_error: rgb(215, 38, 61),
             },
             Appearance::Dark | Appearance::DarkHighContrast => Self {
                 window_bg: rgb(25, 25, 26),
@@ -71,6 +73,7 @@ impl UiPalette {
                 muted_text: rgb(142, 142, 147),
                 selected_text: rgb(255, 255, 255),
                 scrollbar_thumb: rgba(142, 142, 147, 0.42),
+                spelling_error: rgb(255, 69, 58),
             },
         }
     }

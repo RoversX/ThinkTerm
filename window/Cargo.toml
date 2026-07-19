@@ -102,6 +102,7 @@ core-foundation.workspace = true
 core-graphics.workspace = true
 foreign-types.workspace = true
 objc.workspace = true
+objc2.workspace = true
 objc2-core-graphics.workspace = true
 plist.workspace = true
 shlex.workspace = true

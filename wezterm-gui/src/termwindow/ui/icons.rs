@@ -6,6 +6,7 @@ use window::Image;
 pub enum SvgIcon {
     Archive,
     ArrowLeft,
+    ArrowRight,
     Bell,
     Braces,
     Check,
@@ -52,6 +53,9 @@ pub enum SvgIcon {
     PinOff,
     Plus,
     RotateCcw,
+    RotateCw,
+    Save,
+    Scissors,
     Search,
     Server,
     Settings,
@@ -67,6 +71,7 @@ pub enum SvgIcon {
     SquareTerminal,
     SplitHorizontal,
     SplitVertical,
+    SpellCheck,
     Terminal,
     Trash2,
     X,
@@ -78,6 +83,9 @@ impl SvgIcon {
             Self::Archive => include_bytes!("../../../../third_party/lucide/icons/archive.svg"),
             Self::ArrowLeft => {
                 include_bytes!("../../../../third_party/lucide/icons/arrow-left.svg")
+            }
+            Self::ArrowRight => {
+                include_bytes!("../../../../third_party/lucide/icons/arrow-right.svg")
             }
             Self::Bell => include_bytes!("../../../../third_party/lucide/icons/bell.svg"),
             Self::Braces => include_bytes!("../../../../third_party/lucide/icons/braces.svg"),
@@ -171,6 +179,9 @@ impl SvgIcon {
             Self::RotateCcw => {
                 include_bytes!("../../../../third_party/lucide/icons/rotate-ccw.svg")
             }
+            Self::RotateCw => include_bytes!("../../../../third_party/lucide/icons/redo.svg"),
+            Self::Save => include_bytes!("../../../../third_party/lucide/icons/save.svg"),
+            Self::Scissors => include_bytes!("../../../../third_party/lucide/icons/scissors.svg"),
             Self::Search => include_bytes!("../../../../third_party/lucide/icons/search.svg"),
             Self::Server => include_bytes!("../../../../third_party/lucide/icons/server.svg"),
             Self::Settings => include_bytes!("../../../../third_party/lucide/icons/settings.svg"),
@@ -205,6 +216,9 @@ impl SvgIcon {
             }
             Self::SplitVertical => {
                 include_bytes!("../../../../third_party/lucide/icons/square-split-vertical.svg")
+            }
+            Self::SpellCheck => {
+                include_bytes!("../../../../third_party/lucide/icons/spell-check.svg")
             }
             Self::Terminal => include_bytes!("../../../../third_party/lucide/icons/terminal.svg"),
             Self::Trash2 => include_bytes!("../../../../third_party/lucide/icons/trash-2.svg"),
@@ -525,6 +539,7 @@ mod tests {
             SvgIcon::PinOff,
             SvgIcon::Plus,
             SvgIcon::RotateCcw,
+            SvgIcon::RotateCw,
             SvgIcon::Search,
             SvgIcon::Settings,
             SvgIcon::SlidersHorizontal,

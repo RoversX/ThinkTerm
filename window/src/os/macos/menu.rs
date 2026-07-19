@@ -1,5 +1,6 @@
 use crate::macos::{nsstring, nsstring_to_str};
 use crate::superclass;
+use crate::{ContextMenuAction, ContextMenuIcon};
 pub use cocoa::appkit::NSEventModifierFlags;
 use cocoa::appkit::{NSApp, NSApplication, NSMenu, NSMenuItem};
 pub use cocoa::base::SEL;
@@ -191,6 +192,7 @@ pub struct MenuItem {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RepresentedItem {
     KeyAssignment(KeyAssignment),
+    ContextMenuAction(ContextMenuAction),
 }
 
 impl RepresentedItem {
@@ -279,7 +281,7 @@ impl MenuItem {
         }
     }
 
-    pub fn set_system_symbol_image(&self, symbol_name: &str) {
+    pub fn set_system_symbol_image(&self, symbol_name: &str) -> bool {
         unsafe {
             let ns_image_cls = class!(NSImage);
             let supports_system_symbols: BOOL = msg_send![
@@ -288,7 +290,7 @@ impl MenuItem {
             ];
 
             if supports_system_symbols == NO {
-                return;
+                return false;
             }
 
             let image: id = msg_send![
@@ -298,11 +300,37 @@ impl MenuItem {
             ];
 
             if image.is_null() {
-                return;
+                return false;
             }
 
             let () = msg_send![image, setTemplate:YES];
             let () = msg_send![*self.item, setImage:image];
+            true
+        }
+    }
+
+    pub fn set_context_menu_icon(&self, icon: ContextMenuIcon) {
+        if self.set_system_symbol_image(icon.sf_symbol_name()) {
+            return;
+        }
+        unsafe {
+            let bytes = icon.lucide_svg();
+            let data: id = msg_send![
+                class!(NSData),
+                dataWithBytes: bytes.as_ptr()
+                length: bytes.len()
+            ];
+            if data.is_null() {
+                return;
+            }
+            let image: id = msg_send![class!(NSImage), alloc];
+            let image: id = msg_send![image, initWithData:data];
+            if image.is_null() {
+                return;
+            }
+            let image = StrongPtr::new(image);
+            let () = msg_send![*image, setTemplate:YES];
+            let () = msg_send![*self.item, setImage:*image];
         }
     }
 

@@ -12,8 +12,8 @@ use crate::termwindow::{
     TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    ContextMenuItem, IntegratedTitleButtonStyle, MouseButtons as WMB, MouseCursor, MouseEvent,
-    MouseEventKind as WMEK, MousePress, WindowDecorations, WindowOps, WindowState,
+    ContextMenuIcon, ContextMenuItem, IntegratedTitleButtonStyle, MouseButtons as WMB, MouseCursor,
+    MouseEvent, MouseEventKind as WMEK, MousePress, WindowDecorations, WindowOps, WindowState,
 };
 use config::keyassignment::{
     ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment, MouseEventTrigger,
@@ -60,6 +60,10 @@ fn note_drag_scroll_delta(
     }
 }
 
+fn note_horizontal_scroll_offset(current: f32, delta: f32, maximum: f32) -> f32 {
+    (current + delta).clamp(0.0, maximum.max(0.0))
+}
+
 fn trailing_action_reserved_width(
     fixed_clearance: usize,
     action_button_count: usize,
@@ -85,7 +89,9 @@ fn trailing_action_reserved_width(
 
 #[cfg(test)]
 mod window_tab_layout_tests {
-    use super::{note_drag_scroll_delta, trailing_action_reserved_width};
+    use super::{
+        note_drag_scroll_delta, note_horizontal_scroll_offset, trailing_action_reserved_width,
+    };
 
     #[test]
     fn trailing_actions_keep_tabs_before_the_new_tab_button() {
@@ -112,6 +118,14 @@ mod window_tab_layout_tests {
         assert!(
             note_drag_scroll_delta(30.0, 0.0, 200.0, 40.0, 28.0).expect("top edge delta") < 0.0
         );
+    }
+
+    #[test]
+    fn note_horizontal_scroll_is_clamped_to_table_extent() {
+        assert_eq!(note_horizontal_scroll_offset(20.0, 15.0, 100.0), 35.0);
+        assert_eq!(note_horizontal_scroll_offset(95.0, 15.0, 100.0), 100.0);
+        assert_eq!(note_horizontal_scroll_offset(5.0, -15.0, 100.0), 0.0);
+        assert_eq!(note_horizontal_scroll_offset(5.0, 15.0, 0.0), 0.0);
     }
 }
 
@@ -145,6 +159,40 @@ impl super::TermWindow {
             delta
         } else {
             -delta
+        }
+    }
+
+    fn sidebar_vertical_scroll_delta(event: &MouseEvent) -> Option<f32> {
+        if !matches!(event.kind, WMEK::VertWheel(_)) {
+            return None;
+        }
+        if let Some(delta) = event.precise_scroll_delta {
+            if delta.y.abs() > f32::EPSILON {
+                return Some(-delta.y);
+            }
+        }
+        match event.kind {
+            WMEK::VertWheel(amount) if amount != 0 => Some(Self::sidebar_scroll_pixels(amount)),
+            WMEK::VertWheel(_) => Some(0.0),
+            _ => None,
+        }
+    }
+
+    fn sidebar_horizontal_scroll_delta(event: &MouseEvent) -> Option<f32> {
+        if !matches!(event.kind, WMEK::HorzWheel(_)) {
+            return None;
+        }
+        if let Some(delta) = event.precise_scroll_delta {
+            if delta.x.abs() > f32::EPSILON {
+                return Some(-delta.x);
+            }
+        }
+        match event.kind {
+            WMEK::HorzWheel(amount) if amount != 0 => {
+                Some(Self::sidebar_scroll_pixels(amount) * 2.0)
+            }
+            WMEK::HorzWheel(_) => Some(0.0),
+            _ => None,
         }
     }
 
@@ -620,15 +668,15 @@ impl super::TermWindow {
             return false;
         }
 
-        let amount = match event.kind {
-            WMEK::VertWheel(amount) => amount,
+        let delta = match event.kind {
+            WMEK::VertWheel(_) => Self::sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
             // Trackpads often emit a little horizontal inertia while the user is
             // vertically scrolling. Consume it inside the sidebar so it doesn't
             // leak to tab or terminal wheel handlers at the scroll bounds.
             WMEK::HorzWheel(_) => return true,
             _ => return false,
         };
-        if amount == 0 {
+        if delta.abs() <= f32::EPSILON {
             return true;
         }
 
@@ -638,8 +686,7 @@ impl super::TermWindow {
         }
 
         self.show_workspace_sidebar_scrollbar();
-        let offset = (self.workspace_sidebar_scroll_offset + Self::sidebar_scroll_pixels(amount))
-            .clamp(0.0, max_offset);
+        let offset = (self.workspace_sidebar_scroll_offset + delta).clamp(0.0, max_offset);
         if (offset - self.workspace_sidebar_scroll_offset).abs() > f32::EPSILON {
             self.workspace_sidebar_scroll_offset = offset;
             context.invalidate();
@@ -647,6 +694,34 @@ impl super::TermWindow {
             context.invalidate();
         }
         true
+    }
+
+    fn scroll_right_sidebar_note_table_at(&mut self, x: f32, y: f32, delta: f32) -> bool {
+        let Some(layout) = self
+            .right_sidebar_note_table_layouts
+            .iter()
+            .rev()
+            .find(|layout| {
+                x >= layout.x
+                    && x < layout.x + layout.width
+                    && y >= layout.y
+                    && y < layout.y + layout.height
+            })
+            .copied()
+        else {
+            return false;
+        };
+        if layout.max_horizontal_scroll <= 0.0 {
+            return false;
+        }
+        let offset = self
+            .right_sidebar_note_table_horizontal_offsets
+            .entry(layout.source_start)
+            .or_default();
+        let next = note_horizontal_scroll_offset(*offset, delta, layout.max_horizontal_scroll);
+        let changed = (next - *offset).abs() > f32::EPSILON;
+        *offset = next;
+        changed
     }
 
     fn mouse_wheel_right_sidebar(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
@@ -660,13 +735,13 @@ impl super::TermWindow {
                     && y < rect.y.saturating_add(rect.height) as isize
                 {
                     let changed = match event.kind {
-                        WMEK::VertWheel(amount) if amount != 0 => {
-                            self.scroll_right_sidebar_file_preview(amount)
-                        }
+                        WMEK::VertWheel(_) => self.scroll_right_sidebar_file_preview_by(
+                            Self::sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
+                        ),
                         WMEK::HorzWheel(amount) if amount != 0 => {
                             self.scroll_right_sidebar_file_preview_horizontal(amount)
                         }
-                        WMEK::VertWheel(_) | WMEK::HorzWheel(_) => false,
+                        WMEK::HorzWheel(_) => false,
                         _ => return false,
                     };
                     if changed {
@@ -692,47 +767,75 @@ impl super::TermWindow {
         }
 
         if self.right_sidebar_mode == super::RightSidebarMode::Tasks {
-            if let WMEK::HorzWheel(amount) = event.kind {
-                if amount != 0
-                    && self.right_sidebar_note.scroll_code_block_at(
+            let shift_vertical = matches!(event.kind, WMEK::VertWheel(_))
+                && event.modifiers.contains(::window::Modifiers::SHIFT);
+            if matches!(event.kind, WMEK::HorzWheel(_)) || shift_vertical {
+                let delta = if shift_vertical {
+                    Self::sidebar_vertical_scroll_delta(event).unwrap_or(0.0)
+                } else {
+                    Self::sidebar_horizontal_scroll_delta(event).unwrap_or(0.0)
+                };
+                if delta.abs() > f32::EPSILON {
+                    let changed = self.scroll_right_sidebar_note_table_at(
                         event.coords.x as f32,
                         event.coords.y as f32,
-                        Self::sidebar_scroll_pixels(amount) * 2.0,
-                    )
-                {
-                    context.invalidate();
+                        delta,
+                    ) || self.right_sidebar_note.scroll_code_block_at(
+                        event.coords.x as f32,
+                        event.coords.y as f32,
+                        delta,
+                    );
+                    if changed {
+                        context.invalidate();
+                    }
                 }
                 return true;
             }
         }
 
-        let amount = match event.kind {
-            WMEK::VertWheel(amount) => amount,
+        let delta = match event.kind {
+            WMEK::VertWheel(_) => Self::sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
             WMEK::HorzWheel(_) => return true,
             _ => return false,
         };
-        if amount == 0 {
+        if delta.abs() <= f32::EPSILON {
             return true;
         }
 
         match self.right_sidebar_mode {
             super::RightSidebarMode::Chat => {
-                if self.scroll_right_sidebar_files(amount) {
+                if self.scroll_right_sidebar_files_by(delta) {
                     context.invalidate();
                 }
             }
             super::RightSidebarMode::Tasks => {
-                self.right_sidebar_note.reveal_caret = false;
-                if self
-                    .right_sidebar_note
-                    .scroll_by(Self::sidebar_scroll_pixels(amount))
-                {
+                let over_tree = matches!(
+                    self.resolve_ui_item(event).map(|item| item.item_type),
+                    Some(UIItemType::RightSidebarNoteTreeRow(_))
+                        | Some(UIItemType::RightSidebarNoteTreeBack)
+                        | Some(UIItemType::RightSidebarNoteTreeToggle)
+                ) || self.right_sidebar_note_view
+                    == crate::termwindow::RightSidebarNoteView::Tree;
+                let changed = if over_tree {
+                    let old = self.right_sidebar_note_tree_scroll_offset;
+                    self.right_sidebar_note_tree_scroll_offset =
+                        (self.right_sidebar_note_tree_scroll_offset + delta).max(0.0);
+                    (old - self.right_sidebar_note_tree_scroll_offset).abs() > f32::EPSILON
+                } else {
+                    self.right_sidebar_note.reveal_caret = false;
+                    self.right_sidebar_note.scroll_by(delta)
+                };
+                if changed {
                     context.invalidate();
                 }
             }
             super::RightSidebarMode::Snippets => {
                 let was_visible = self.right_sidebar_snippet_scrollbar_visible_until;
                 self.show_right_sidebar_snippet_scrollbar();
+                let amount = match event.kind {
+                    WMEK::VertWheel(amount) => amount,
+                    _ => 0,
+                };
                 if self.scroll_right_sidebar_snippets(amount)
                     || was_visible != self.right_sidebar_snippet_scrollbar_visible_until
                 {
@@ -796,8 +899,12 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_)
             | UIItemType::RightSidebarSnippetScrollTrack
             | UIItemType::RightSidebarSnippetScrollThumb
-            | UIItemType::RightSidebarNoteModeToggle
-            | UIItemType::RightSidebarNoteSave
+            | UIItemType::RightSidebarNoteMenu
+            | UIItemType::RightSidebarNoteChooseVault
+            | UIItemType::RightSidebarNoteCreateVault
+            | UIItemType::RightSidebarNoteTreeToggle
+            | UIItemType::RightSidebarNoteTreeBack
+            | UIItemType::RightSidebarNoteTreeRow(_)
             | UIItemType::RightSidebarNoteCodeToggle(_)
             | UIItemType::RightSidebarNoteCodeCopy(_)
             | UIItemType::RightSidebarNoteBody
@@ -865,8 +972,12 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_)
             | UIItemType::RightSidebarSnippetScrollTrack
             | UIItemType::RightSidebarSnippetScrollThumb
-            | UIItemType::RightSidebarNoteModeToggle
-            | UIItemType::RightSidebarNoteSave
+            | UIItemType::RightSidebarNoteMenu
+            | UIItemType::RightSidebarNoteChooseVault
+            | UIItemType::RightSidebarNoteCreateVault
+            | UIItemType::RightSidebarNoteTreeToggle
+            | UIItemType::RightSidebarNoteTreeBack
+            | UIItemType::RightSidebarNoteTreeRow(_)
             | UIItemType::RightSidebarNoteCodeToggle(_)
             | UIItemType::RightSidebarNoteCodeCopy(_)
             | UIItemType::RightSidebarNoteBody
@@ -1111,6 +1222,7 @@ impl super::TermWindow {
                             );
                         }
                         self.right_sidebar_note.drag_selection_active = false;
+                        self.right_sidebar_note.drag_selection_base = None;
                         context.invalidate();
                     }
                     if completed_drag.as_ref().is_some_and(|(item, _)| {
@@ -1569,8 +1681,7 @@ impl super::TermWindow {
         let position = self
             .right_sidebar_note
             .source_position_for_point(x as f32, y as f32);
-        self.right_sidebar_note.view.selection.focus = position;
-        self.right_sidebar_note.view.preferred_column = None;
+        self.right_sidebar_note.extend_selection_to(position);
         self.right_sidebar_note.reveal_caret = false;
         self.right_sidebar_note.refresh_projection();
     }
@@ -1984,8 +2095,12 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_) => {
                 self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
             }
-            UIItemType::RightSidebarNoteModeToggle
-            | UIItemType::RightSidebarNoteSave
+            UIItemType::RightSidebarNoteMenu
+            | UIItemType::RightSidebarNoteChooseVault
+            | UIItemType::RightSidebarNoteCreateVault
+            | UIItemType::RightSidebarNoteTreeToggle
+            | UIItemType::RightSidebarNoteTreeBack
+            | UIItemType::RightSidebarNoteTreeRow(_)
             | UIItemType::RightSidebarNoteCodeToggle(_)
             | UIItemType::RightSidebarNoteCodeCopy(_)
             | UIItemType::RightSidebarNoteBody => {
@@ -2038,17 +2153,48 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         match item.item_type.clone() {
-            UIItemType::RightSidebarNoteModeToggle => {
+            UIItemType::RightSidebarNoteMenu => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
-                    self.toggle_right_sidebar_note_mode();
+                    self.show_right_sidebar_note_menu(context, event.coords);
                     context.invalidate();
                 }
             }
-            UIItemType::RightSidebarNoteSave => {
+            UIItemType::RightSidebarNoteChooseVault => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
-                    self.save_right_sidebar_note_now();
+                    self.perform_right_sidebar_note_command(
+                        crate::termwindow::NoteEditorCommand::ChooseVault { managed: false },
+                    );
+                }
+            }
+            UIItemType::RightSidebarNoteCreateVault => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.perform_right_sidebar_note_command(
+                        crate::termwindow::NoteEditorCommand::ChooseVault { managed: true },
+                    );
+                }
+            }
+            UIItemType::RightSidebarNoteTreeToggle => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_right_sidebar_note_vault_tree();
+                    self.right_sidebar_note.view.focused = false;
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarNoteTreeBack => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.right_sidebar_note_view = crate::termwindow::RightSidebarNoteView::Editor;
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarNoteTreeRow(relative_path) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.activate_right_sidebar_note_tree_path(&relative_path);
                     context.invalidate();
                 }
             }
@@ -2121,12 +2267,93 @@ impl super::TermWindow {
                 }
             }
             UIItemType::RightSidebarNoteBody => {
-                context.set_cursor(Some(MouseCursor::Text));
-                if event.kind == WMEK::Press(MousePress::Left) {
-                    if let Some(range) = self
+                let external_link_target = self
+                    .right_sidebar_note
+                    .external_link_target_for_point(event.coords.x as f32, event.coords.y as f32);
+                context.set_cursor(Some(if external_link_target.is_some() {
+                    MouseCursor::Hand
+                } else {
+                    MouseCursor::Text
+                }));
+                if event.kind == WMEK::Press(MousePress::Right) {
+                    self.right_sidebar_note.begin_live_editing();
+                    let position = self
                         .right_sidebar_note
-                        .atomic_source_for_point(event.coords.x as f32, event.coords.y as f32)
+                        .source_position_for_point(event.coords.x as f32, event.coords.y as f32);
+                    self.right_sidebar_note.view.focused = true;
+                    let selected = self.right_sidebar_note.view.selection.range();
+                    if selected.is_empty()
+                        || position.byte < selected.start
+                        || position.byte >= selected.end
                     {
+                        self.right_sidebar_note.begin_selection(
+                            position,
+                            crate::markdown_editor::SelectionGranularity::Word,
+                            false,
+                        );
+                    }
+                    self.right_sidebar_note.reveal_caret = true;
+                    self.right_sidebar_note.refresh_projection();
+                    let items = self.right_sidebar_note_context_menu_items(event.coords);
+                    self.show_term_context_menu(context, event.coords, items);
+                    context.invalidate();
+                    return;
+                }
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    let click_streak = self
+                        .last_mouse_click
+                        .as_ref()
+                        .map(|click| click.streak)
+                        .unwrap_or(1);
+                    let extend = event.modifiers.contains(::window::Modifiers::SHIFT);
+                    if click_streak == 1 && !extend {
+                        if let Some(target) = external_link_target {
+                            wezterm_open_url::open_url(&target);
+                            context.invalidate();
+                            return;
+                        }
+                    }
+                    let atomic_range = self
+                        .right_sidebar_note
+                        .atomic_source_for_point(event.coords.x as f32, event.coords.y as f32);
+                    if let Some(range) = atomic_range.as_ref() {
+                        let wiki_link =
+                            self.right_sidebar_note
+                                .projection
+                                .objects
+                                .iter()
+                                .find_map(|object| match object {
+                                    crate::markdown_editor::ProjectedObject::WikiLink {
+                                        source,
+                                        target,
+                                        resolved_path,
+                                        ambiguous_paths,
+                                        ..
+                                    } if source == range => Some((
+                                        target.clone(),
+                                        resolved_path.clone(),
+                                        ambiguous_paths.clone(),
+                                    )),
+                                    _ => None,
+                                });
+                        if click_streak == 1 && !extend {
+                            if let Some((target, resolved_path, ambiguous_paths)) = wiki_link {
+                                if ambiguous_paths.len() > 1 {
+                                    self.show_right_sidebar_note_wiki_link_choices(
+                                        context,
+                                        event.coords,
+                                        ambiguous_paths,
+                                    );
+                                } else {
+                                    self.activate_or_create_right_sidebar_wiki_link(
+                                        &target,
+                                        resolved_path.as_deref(),
+                                    );
+                                }
+                                context.invalidate();
+                                return;
+                            }
+                        }
                         let replacement =
                             self.right_sidebar_note
                                 .session
@@ -2144,8 +2371,39 @@ impl super::TermWindow {
                                         }
                                     })
                                 });
-                        if let Some(replacement) = replacement {
-                            self.right_sidebar_note.view.focused = true;
+                        if click_streak == 1 && !extend {
+                            if let Some(replacement) = replacement {
+                                self.right_sidebar_note.view.focused = true;
+                                self.right_sidebar_note.view.selection =
+                                    crate::markdown_editor::SourceSelection {
+                                        anchor: crate::markdown_editor::SourcePosition::new(
+                                            range.start,
+                                        ),
+                                        focus: crate::markdown_editor::SourcePosition::new(
+                                            range.end,
+                                        ),
+                                    };
+                                self.push_right_sidebar_text(replacement);
+                                context.invalidate();
+                                return;
+                            }
+                        }
+                    }
+                    self.right_sidebar_note.begin_live_editing();
+                    let position = self
+                        .right_sidebar_note
+                        .source_position_for_point(event.coords.x as f32, event.coords.y as f32);
+                    self.right_sidebar_note.view.focused = true;
+                    let granularity = if click_streak >= 3 {
+                        crate::markdown_editor::SelectionGranularity::MarkdownBlock
+                    } else if click_streak == 2 {
+                        crate::markdown_editor::SelectionGranularity::Word
+                    } else {
+                        crate::markdown_editor::SelectionGranularity::Character
+                    };
+                    if click_streak == 2 && !extend {
+                        if let Some(range) = atomic_range {
+                            self.right_sidebar_note.selection_granularity = granularity;
                             self.right_sidebar_note.view.selection =
                                 crate::markdown_editor::SourceSelection {
                                     anchor: crate::markdown_editor::SourcePosition::new(
@@ -2153,18 +2411,15 @@ impl super::TermWindow {
                                     ),
                                     focus: crate::markdown_editor::SourcePosition::new(range.end),
                                 };
-                            self.push_right_sidebar_text(replacement);
-                            context.invalidate();
-                            return;
+                            self.right_sidebar_note.drag_selection_base = Some(range);
+                        } else {
+                            self.right_sidebar_note
+                                .begin_selection(position, granularity, extend);
                         }
+                    } else {
+                        self.right_sidebar_note
+                            .begin_selection(position, granularity, extend);
                     }
-                    let position = self
-                        .right_sidebar_note
-                        .source_position_for_point(event.coords.x as f32, event.coords.y as f32);
-                    self.right_sidebar_note.view.focused = true;
-                    self.right_sidebar_note.view.selection =
-                        crate::markdown_editor::SourceSelection::caret(position.byte);
-                    self.right_sidebar_note.view.preferred_column = None;
                     self.right_sidebar_note.reveal_caret = true;
                     self.right_sidebar_note.drag_selection_active = false;
                     self.right_sidebar_note.refresh_projection();
@@ -2317,8 +2572,12 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_) => {
                 self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
             }
-            UIItemType::RightSidebarNoteModeToggle
-            | UIItemType::RightSidebarNoteSave
+            UIItemType::RightSidebarNoteMenu
+            | UIItemType::RightSidebarNoteChooseVault
+            | UIItemType::RightSidebarNoteCreateVault
+            | UIItemType::RightSidebarNoteTreeToggle
+            | UIItemType::RightSidebarNoteTreeBack
+            | UIItemType::RightSidebarNoteTreeRow(_)
             | UIItemType::RightSidebarNoteCodeToggle(_)
             | UIItemType::RightSidebarNoteCodeCopy(_)
             | UIItemType::RightSidebarNoteBody => {
@@ -2612,6 +2871,12 @@ impl super::TermWindow {
                 self.clear_right_sidebar_text_focus();
             }
             self.right_sidebar_mode = mode;
+            if self.right_sidebar_mode == super::RightSidebarMode::Tasks {
+                self.right_sidebar_note_memory_release_token =
+                    self.right_sidebar_note_memory_release_token.wrapping_add(1);
+            } else if previous_mode == super::RightSidebarMode::Tasks {
+                self.schedule_right_sidebar_note_memory_release();
+            }
             // Leaving the file view (e.g. switching to Snippets/Tasks) makes the
             // file index idle; schedule it for release. Entering it refreshes +
             // (re)starts the periodic re-scan.
@@ -3138,8 +3403,8 @@ impl super::TermWindow {
     fn project_context_menu_items(&self, project_id: &str) -> Vec<ContextMenuItem> {
         let project_id = project_id.to_string();
         let mut reveal_item = ContextMenuItem::item_with_icon(
-            "Reveal in Folder",
-            "folder",
+            crate::termwindow::ui::context_menu::reveal_in_folder_label(),
+            ContextMenuIcon::Folder,
             KeyAssignment::RevealProjectInFolder(project_id.clone()),
         );
         if crate::workspace_threads::project_reveal_path(&project_id).is_none() {
@@ -3149,24 +3414,24 @@ impl super::TermWindow {
         vec![
             ContextMenuItem::item_with_icon(
                 "Rename Workspace...",
-                "pencil",
+                ContextMenuIcon::Edit,
                 KeyAssignment::PromptRenameProject(project_id.clone()),
             ),
             reveal_item,
             ContextMenuItem::item_with_icon(
                 "New Thread",
-                "plus.square",
+                ContextMenuIcon::New,
                 KeyAssignment::CreateWorkspaceThread(project_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
                 "Collapse / Expand Threads",
-                "chevron.right",
+                ContextMenuIcon::Collapse,
                 KeyAssignment::ToggleWorkspaceThreadsCollapsed(project_id.clone()),
             ),
             ContextMenuItem::Separator,
             ContextMenuItem::item_with_icon(
                 "Remove Workspace",
-                "folder.badge.minus",
+                ContextMenuIcon::FolderRemove,
                 KeyAssignment::RemoveProject(project_id),
             ),
         ]
@@ -3186,13 +3451,11 @@ impl super::TermWindow {
             let mut item = ContextMenuItem::item_with_icon(
                 label,
                 if space.is_default {
-                    "house"
+                    ContextMenuIcon::Home
                 } else if space.is_remote {
-                    // Must be a valid SF Symbol name: macOS renders these
-                    // through the native menu's imageWithSystemSymbolName.
-                    "server.rack"
+                    ContextMenuIcon::Server
                 } else {
-                    "square.stack"
+                    ContextMenuIcon::Stack
                 },
                 KeyAssignment::SwitchSpace(space.id.to_string()),
             )
@@ -3206,7 +3469,7 @@ impl super::TermWindow {
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item_with_icon(
             "New Space",
-            "plus.square",
+            ContextMenuIcon::New,
             KeyAssignment::CreateSpace,
         ));
         items.push(ContextMenuItem::item_with_icon(
@@ -3215,7 +3478,7 @@ impl super::TermWindow {
                 .find(|space| space.is_active)
                 .map(|space| format!("Rename \"{}\"...", space.name))
                 .unwrap_or_else(|| "Rename Space...".to_string()),
-            "pencil",
+            ContextMenuIcon::Edit,
             KeyAssignment::PromptRenameSpace(self.active_space_id.clone()),
         ));
         let active_space_id = spaces
@@ -3232,7 +3495,7 @@ impl super::TermWindow {
                 } else {
                     format!("Delete \"{}\"", space.name)
                 },
-                "trash",
+                ContextMenuIcon::Delete,
                 KeyAssignment::DeleteSpace(space.id),
             )
         };
@@ -3259,7 +3522,7 @@ impl super::TermWindow {
             if offer_remote_kill {
                 items.push(ContextMenuItem::item_with_icon(
                     format!("Delete \"{name}\" & End Remote Sessions"),
-                    "trash",
+                    ContextMenuIcon::Delete,
                     KeyAssignment::DeleteSpaceAndRemoteSessions(id),
                 ));
             }
@@ -3271,8 +3534,9 @@ impl super::TermWindow {
             .map(delete_item)
             .collect::<Vec<_>>();
         if !other_delete_candidates.is_empty() {
-            items.push(ContextMenuItem::submenu(
+            items.push(ContextMenuItem::submenu_with_icon(
                 "Delete Other Space",
+                ContextMenuIcon::Delete,
                 other_delete_candidates,
             ));
         }
@@ -3283,43 +3547,68 @@ impl super::TermWindow {
         use config::keyassignment::KeyAssignment;
 
         vec![
-            ContextMenuItem::item("Group by", KeyAssignment::Nop).disabled(),
-            ContextMenuItem::item_with_icon("Workspace", "folder", KeyAssignment::Nop)
-                .checked(true)
+            ContextMenuItem::item_with_icon("Group by", ContextMenuIcon::Stack, KeyAssignment::Nop)
                 .disabled(),
+            ContextMenuItem::item_with_icon(
+                "Workspace",
+                ContextMenuIcon::Folder,
+                KeyAssignment::Nop,
+            )
+            .checked(true)
+            .disabled(),
             ContextMenuItem::Separator,
-            ContextMenuItem::item("Show", KeyAssignment::Nop).disabled(),
-            ContextMenuItem::submenu(
+            ContextMenuItem::item_with_icon("Show", ContextMenuIcon::Info, KeyAssignment::Nop)
+                .disabled(),
+            ContextMenuItem::submenu_with_icon(
                 "Status",
+                ContextMenuIcon::Check,
                 vec![
                     ContextMenuItem::item_with_icon(
                         "Running",
-                        "arrow.triangle.2.circlepath",
+                        ContextMenuIcon::Refresh,
                         KeyAssignment::Nop,
                     )
                     .checked(true)
                     .disabled(),
                     ContextMenuItem::item_with_icon(
                         "Needs Attention",
-                        "exclamationmark.circle",
+                        ContextMenuIcon::Warning,
                         KeyAssignment::Nop,
                     )
                     .checked(true)
                     .disabled(),
-                    ContextMenuItem::item_with_icon("Done", "checkmark.circle", KeyAssignment::Nop)
-                        .checked(true)
-                        .disabled(),
+                    ContextMenuItem::item_with_icon(
+                        "Done",
+                        ContextMenuIcon::Check,
+                        KeyAssignment::Nop,
+                    )
+                    .checked(true)
+                    .disabled(),
                 ],
             ),
-            ContextMenuItem::item_with_icon("Unread", "envelope.badge", KeyAssignment::Nop)
-                .checked(true)
-                .disabled(),
-            ContextMenuItem::item_with_icon("Pinned", "pin", KeyAssignment::Nop)
+            ContextMenuItem::item_with_icon(
+                "Unread",
+                ContextMenuIcon::Notification,
+                KeyAssignment::Nop,
+            )
+            .checked(true)
+            .disabled(),
+            ContextMenuItem::item_with_icon("Pinned", ContextMenuIcon::Pin, KeyAssignment::Nop)
                 .checked(true)
                 .disabled(),
             ContextMenuItem::Separator,
-            ContextMenuItem::item("Collapse All", KeyAssignment::Nop).disabled(),
-            ContextMenuItem::item("Mark All Read", KeyAssignment::Nop).disabled(),
+            ContextMenuItem::item_with_icon(
+                "Collapse All",
+                ContextMenuIcon::Collapse,
+                KeyAssignment::Nop,
+            )
+            .disabled(),
+            ContextMenuItem::item_with_icon(
+                "Mark All Read",
+                ContextMenuIcon::Check,
+                KeyAssignment::Nop,
+            )
+            .disabled(),
         ]
     }
 
@@ -3394,14 +3683,14 @@ impl super::TermWindow {
             if connection.is_remote && connection.is_live {
                 items.push(ContextMenuItem::item_with_icon(
                     "Disconnect Thread",
-                    "unlink",
+                    ContextMenuIcon::Close,
                     KeyAssignment::DisconnectWorkspaceThread(thread_id.clone()),
                 ));
                 items.push(ContextMenuItem::Separator);
             } else if connection.is_remote && remote_host_exists {
                 items.push(ContextMenuItem::item_with_icon(
                     "Connect Thread",
-                    "link",
+                    ContextMenuIcon::ExternalLink,
                     KeyAssignment::ConnectWorkspaceThread(thread_id.clone()),
                 ));
                 items.push(ContextMenuItem::Separator);
@@ -3415,22 +3704,26 @@ impl super::TermWindow {
                 } else {
                     "Pin Thread"
                 },
-                if is_pinned { "pin.slash" } else { "pin" },
+                if is_pinned {
+                    ContextMenuIcon::Unpin
+                } else {
+                    ContextMenuIcon::Pin
+                },
                 KeyAssignment::ToggleWorkspaceThreadPinned(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
                 "Rename Thread...",
-                "pencil",
+                ContextMenuIcon::Edit,
                 KeyAssignment::PromptRenameWorkspaceThread(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
                 "Delete Thread",
-                "trash",
+                ContextMenuIcon::Delete,
                 KeyAssignment::DeleteWorkspaceThread(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
                 "Mark as Unread",
-                "envelope.badge",
+                ContextMenuIcon::Notification,
                 KeyAssignment::MarkWorkspaceThreadUnread(thread_id),
             ),
         ]);
@@ -4367,7 +4660,7 @@ impl super::TermWindow {
     fn pane_nav_tab_context_menu_items(&self, pane_id: mux::pane::PaneId) -> Vec<ContextMenuItem> {
         vec![ContextMenuItem::item_with_icon(
             "Rename Tab...",
-            "pencil",
+            ContextMenuIcon::Edit,
             KeyAssignment::PromptRenamePaneTab(pane_id),
         )]
     }
@@ -4755,19 +5048,31 @@ impl super::TermWindow {
 
         let mut items = vec![ContextMenuItem::item_with_icon(
             "Rename Tab...",
-            "pencil",
+            ContextMenuIcon::Edit,
             Self::tab_context_action(tab_idx, KeyAssignment::PromptRenameTab),
         )];
 
         let mut close_items = vec![];
         if let Some(action) = Self::close_tabs_to_left_action(tab_idx) {
-            close_items.push(ContextMenuItem::item("Close Tabs to Left", action));
+            close_items.push(ContextMenuItem::item_with_icon(
+                "Close Tabs to Left",
+                ContextMenuIcon::Close,
+                action,
+            ));
         }
         if let Some(action) = Self::close_tabs_to_right_action(tab_idx, tab_count) {
-            close_items.push(ContextMenuItem::item("Close Tabs to Right", action));
+            close_items.push(ContextMenuItem::item_with_icon(
+                "Close Tabs to Right",
+                ContextMenuIcon::Close,
+                action,
+            ));
         }
         if let Some(action) = Self::close_other_tabs_action(tab_idx, tab_count) {
-            close_items.push(ContextMenuItem::item("Close Other Tabs", action));
+            close_items.push(ContextMenuItem::item_with_icon(
+                "Close Other Tabs",
+                ContextMenuIcon::Close,
+                action,
+            ));
         }
         if !close_items.is_empty() {
             items.push(ContextMenuItem::Separator);
@@ -4776,14 +5081,16 @@ impl super::TermWindow {
 
         let mut move_items = vec![];
         if tab_idx > 0 {
-            move_items.push(ContextMenuItem::item(
+            move_items.push(ContextMenuItem::item_with_icon(
                 "Move Tab Left",
+                ContextMenuIcon::MoveLeft,
                 Self::tab_context_action(tab_idx, KeyAssignment::MoveTab(tab_idx - 1)),
             ));
         }
         if tab_idx + 1 < tab_count {
-            move_items.push(ContextMenuItem::item(
+            move_items.push(ContextMenuItem::item_with_icon(
                 "Move Tab Right",
+                ContextMenuIcon::MoveRight,
                 Self::tab_context_action(tab_idx, KeyAssignment::MoveTab(tab_idx + 1)),
             ));
         }
@@ -4795,15 +5102,16 @@ impl super::TermWindow {
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item_with_icon(
             "New Terminal Tab to Right",
-            "plus.square",
+            ContextMenuIcon::Terminal,
             Self::tab_context_action(
                 tab_idx,
                 KeyAssignment::SpawnTabToRight(SpawnTabDomain::CurrentPaneDomain),
             ),
         ));
         items.push(ContextMenuItem::Separator);
-        items.push(ContextMenuItem::item(
+        items.push(ContextMenuItem::item_with_icon(
             "Zoom Pane",
+            ContextMenuIcon::Expand,
             Self::tab_context_action(tab_idx, KeyAssignment::TogglePaneZoomState),
         ));
 
@@ -5002,7 +5310,11 @@ impl super::TermWindow {
     }
 
     fn terminal_context_menu_items(&self) -> Vec<ContextMenuItem> {
-        fn split_item(label: &str, icon: &str, direction: PaneDirection) -> ContextMenuItem {
+        fn split_item(
+            label: &str,
+            icon: ContextMenuIcon,
+            direction: PaneDirection,
+        ) -> ContextMenuItem {
             ContextMenuItem::item_with_icon(
                 label,
                 icon,
@@ -5018,26 +5330,169 @@ impl super::TermWindow {
         vec![
             ContextMenuItem::item_with_icon(
                 "Copy",
-                "doc.on.doc",
+                ContextMenuIcon::Copy,
                 KeyAssignment::CopyTo(ClipboardCopyDestination::Clipboard),
             ),
             ContextMenuItem::item_with_icon(
                 "Paste",
-                "doc.on.clipboard",
+                ContextMenuIcon::Paste,
                 KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard),
             ),
             ContextMenuItem::Separator,
-            split_item("Split Right", "rectangle.split.2x1", PaneDirection::Right),
-            split_item("Split Left", "rectangle.split.2x1", PaneDirection::Left),
-            split_item("Split Down", "rectangle.split.1x2", PaneDirection::Down),
-            split_item("Split Up", "rectangle.split.1x2", PaneDirection::Up),
+            split_item(
+                "Split Right",
+                ContextMenuIcon::SplitHorizontal,
+                PaneDirection::Right,
+            ),
+            split_item(
+                "Split Left",
+                ContextMenuIcon::SplitHorizontal,
+                PaneDirection::Left,
+            ),
+            split_item(
+                "Split Down",
+                ContextMenuIcon::SplitVertical,
+                PaneDirection::Down,
+            ),
+            split_item(
+                "Split Up",
+                ContextMenuIcon::SplitVertical,
+                PaneDirection::Up,
+            ),
             ContextMenuItem::Separator,
             ContextMenuItem::item_with_icon(
                 "Reset Terminal",
-                "arrow.clockwise",
+                ContextMenuIcon::Refresh,
                 KeyAssignment::ResetTerminal,
             ),
         ]
+    }
+
+    fn right_sidebar_note_context_menu_items(
+        &mut self,
+        anchor: window::Point,
+    ) -> Vec<ContextMenuItem> {
+        use crate::termwindow::{ContextMenuApplicationAction, NoteEditorCommand};
+
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return vec![];
+        };
+        let session = session.lock();
+        let editable =
+            self.right_sidebar_note.view.mode != crate::markdown_editor::EditorMode::ReadOnly;
+        let has_selection = !self.right_sidebar_note.view.selection.is_caret();
+        let has_text = !session.source().is_empty();
+        let can_undo = editable && session.can_undo();
+        let can_redo = editable && session.can_redo();
+        let revision = session.revision();
+        let selected_range = self.right_sidebar_note.view.selection.range();
+        let spelling_issue = self
+            .right_sidebar_note
+            .spelling_issues
+            .iter()
+            .find(|issue| {
+                issue.source.start < selected_range.end && selected_range.start < issue.source.end
+            })
+            .cloned();
+        let lookup_text = session
+            .selected_text(&self.right_sidebar_note.view)
+            .map(str::to_string)
+            .filter(|text| !text.trim().is_empty());
+        drop(session);
+
+        self.begin_context_menu_application_actions();
+        let mut items = Vec::new();
+        if let Some(issue) = spelling_issue {
+            for suggestion in issue.suggestions.iter().take(5) {
+                items.push(self.context_menu_application_item_with_icon(
+                    suggestion.clone(),
+                    ContextMenuIcon::Spellcheck,
+                    ContextMenuApplicationAction::Note(NoteEditorCommand::ReplaceSpelling {
+                        revision,
+                        range: issue.source.clone(),
+                        replacement: suggestion.clone(),
+                    }),
+                    editable,
+                ));
+            }
+            if !issue.suggestions.is_empty() {
+                items.push(ContextMenuItem::Separator);
+            }
+            items.push(self.context_menu_application_item_with_icon(
+                "Ignore Spelling",
+                ContextMenuIcon::Spellcheck,
+                ContextMenuApplicationAction::Note(NoteEditorCommand::IgnoreSpelling {
+                    word: issue.word.clone(),
+                }),
+                true,
+            ));
+            items.push(self.context_menu_application_item_with_icon(
+                "Learn Spelling",
+                ContextMenuIcon::Spellcheck,
+                ContextMenuApplicationAction::Note(NoteEditorCommand::LearnSpelling {
+                    word: issue.word,
+                }),
+                true,
+            ));
+            items.push(ContextMenuItem::Separator);
+        }
+        if let Some(text) = lookup_text {
+            items.push(self.context_menu_application_item_with_icon(
+                "Look Up",
+                ContextMenuIcon::Search,
+                ContextMenuApplicationAction::Note(NoteEditorCommand::LookUp {
+                    text,
+                    anchor: window::Rect::new(anchor, window::Size::new(1, 1)),
+                }),
+                true,
+            ));
+            items.push(ContextMenuItem::Separator);
+        }
+        items.push(self.context_menu_application_item_with_icon(
+            "Undo",
+            ContextMenuIcon::Undo,
+            ContextMenuApplicationAction::Note(NoteEditorCommand::Undo),
+            can_undo,
+        ));
+        items.push(self.context_menu_application_item_with_icon(
+            "Redo",
+            ContextMenuIcon::Redo,
+            ContextMenuApplicationAction::Note(NoteEditorCommand::Redo),
+            can_redo,
+        ));
+        items.push(ContextMenuItem::Separator);
+        items.push(self.context_menu_application_item_with_icon(
+            "Cut",
+            ContextMenuIcon::Cut,
+            ContextMenuApplicationAction::Note(NoteEditorCommand::Cut),
+            editable && has_selection,
+        ));
+        items.push(self.context_menu_application_item_with_icon(
+            "Copy",
+            ContextMenuIcon::Copy,
+            ContextMenuApplicationAction::Note(NoteEditorCommand::Copy),
+            has_selection,
+        ));
+        items.push(self.context_menu_application_item_with_icon(
+            "Paste",
+            ContextMenuIcon::Paste,
+            ContextMenuApplicationAction::Note(NoteEditorCommand::Paste),
+            editable,
+        ));
+        items.push(self.context_menu_application_item_with_icon(
+            "Delete",
+            ContextMenuIcon::Delete,
+            ContextMenuApplicationAction::Note(NoteEditorCommand::Delete),
+            editable && has_selection,
+        ));
+        items.push(ContextMenuItem::Separator);
+        items.push(self.context_menu_application_item_with_icon(
+            "Select All",
+            ContextMenuIcon::Check,
+            ContextMenuApplicationAction::Note(NoteEditorCommand::SelectAll),
+            has_text,
+        ));
+        items
     }
 
     fn mouse_event_terminal(

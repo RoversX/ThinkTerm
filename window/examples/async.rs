@@ -88,6 +88,9 @@ impl MyWindow {
             | WindowEvent::DroppedUrl(_)
             | WindowEvent::DroppedString(_)
             | WindowEvent::PerformKeyAssignment(_)
+            | WindowEvent::PerformContextMenuAction(_)
+            | WindowEvent::NativeTextInputReplace { .. }
+            | WindowEvent::ToggleWorkspaceSidebar
             | WindowEvent::MouseLeave
             | WindowEvent::SetInnerSizeCompleted => {}
         }

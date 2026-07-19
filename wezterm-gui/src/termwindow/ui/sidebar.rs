@@ -2365,6 +2365,23 @@ impl crate::TermWindow {
         color: LinearRgba,
         radius: f32,
     ) -> anyhow::Result<()> {
+        self.fill_vertically_rounded_rectangle(layers, layer_num, rect, color, radius, true, true)
+    }
+
+    /// Fill a rectangle whose top and bottom corner pairs can be rounded
+    /// independently. Scrollable surfaces use this to preserve the real edge's
+    /// corners while keeping a viewport-created cut edge square.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fill_vertically_rounded_rectangle(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        color: LinearRgba,
+        radius: f32,
+        round_top: bool,
+        round_bottom: bool,
+    ) -> anyhow::Result<()> {
         let radius = snapped_rounded_corner_radius(rect, radius);
         // Sub-pixel radii round down to a 0px corner sprite (which panics when
         // building its pixmap), so fall back to a plain rectangle below ~1px.
@@ -2374,46 +2391,76 @@ impl crate::TermWindow {
         }
 
         let corner_size = euclid::size2(radius, radius);
-        self.poly_quad(
-            layers,
-            layer_num,
-            euclid::point2(rect.min_x(), rect.min_y()),
-            TOP_LEFT_ROUNDED_CORNER,
-            0,
-            corner_size,
-            color,
-        )?
-        .set_grayscale();
-        self.poly_quad(
-            layers,
-            layer_num,
-            euclid::point2(rect.max_x() - radius, rect.min_y()),
-            TOP_RIGHT_ROUNDED_CORNER,
-            0,
-            corner_size,
-            color,
-        )?
-        .set_grayscale();
-        self.poly_quad(
-            layers,
-            layer_num,
-            euclid::point2(rect.min_x(), rect.max_y() - radius),
-            BOTTOM_LEFT_ROUNDED_CORNER,
-            0,
-            corner_size,
-            color,
-        )?
-        .set_grayscale();
-        self.poly_quad(
-            layers,
-            layer_num,
-            euclid::point2(rect.max_x() - radius, rect.max_y() - radius),
-            BOTTOM_RIGHT_ROUNDED_CORNER,
-            0,
-            corner_size,
-            color,
-        )?
-        .set_grayscale();
+        if round_top {
+            self.poly_quad(
+                layers,
+                layer_num,
+                euclid::point2(rect.min_x(), rect.min_y()),
+                TOP_LEFT_ROUNDED_CORNER,
+                0,
+                corner_size,
+                color,
+            )?
+            .set_grayscale();
+            self.poly_quad(
+                layers,
+                layer_num,
+                euclid::point2(rect.max_x() - radius, rect.min_y()),
+                TOP_RIGHT_ROUNDED_CORNER,
+                0,
+                corner_size,
+                color,
+            )?
+            .set_grayscale();
+        } else {
+            self.filled_rectangle(
+                layers,
+                layer_num,
+                euclid::rect(rect.min_x(), rect.min_y(), radius, radius),
+                color,
+            )?;
+            self.filled_rectangle(
+                layers,
+                layer_num,
+                euclid::rect(rect.max_x() - radius, rect.min_y(), radius, radius),
+                color,
+            )?;
+        }
+        if round_bottom {
+            self.poly_quad(
+                layers,
+                layer_num,
+                euclid::point2(rect.min_x(), rect.max_y() - radius),
+                BOTTOM_LEFT_ROUNDED_CORNER,
+                0,
+                corner_size,
+                color,
+            )?
+            .set_grayscale();
+            self.poly_quad(
+                layers,
+                layer_num,
+                euclid::point2(rect.max_x() - radius, rect.max_y() - radius),
+                BOTTOM_RIGHT_ROUNDED_CORNER,
+                0,
+                corner_size,
+                color,
+            )?
+            .set_grayscale();
+        } else {
+            self.filled_rectangle(
+                layers,
+                layer_num,
+                euclid::rect(rect.min_x(), rect.max_y() - radius, radius, radius),
+                color,
+            )?;
+            self.filled_rectangle(
+                layers,
+                layer_num,
+                euclid::rect(rect.max_x() - radius, rect.max_y() - radius, radius, radius),
+                color,
+            )?;
+        }
 
         self.filled_rectangle(
             layers,

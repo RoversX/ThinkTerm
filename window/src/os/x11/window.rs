@@ -576,7 +576,9 @@ impl XWindowInner {
             self.drag_and_drop.src_window = Some(srcwin);
             let moretypes = data[1] & 0x01 != 0;
             let xdndversion = data[1] >> 24 as u8;
-            log::trace!("ClientMessage {msgtype_name}, Version {xdndversion}, more than 3 types: {moretypes}");
+            log::trace!(
+                "ClientMessage {msgtype_name}, Version {xdndversion}, more than 3 types: {moretypes}"
+            );
             if !moretypes {
                 self.drag_and_drop.src_types = data[2..]
                     .into_iter()
@@ -622,7 +624,9 @@ impl XWindowInner {
                 conn.atom_name(self.drag_and_drop.target_type)
             );
         } else if self.drag_and_drop.src_window != Some(srcwin) {
-            log::error!("ClientMessage {msgtype_name} received, but no Xdnd in progress or source window mismatch");
+            log::error!(
+                "ClientMessage {msgtype_name} received, but no Xdnd in progress or source window mismatch"
+            );
         } else if msgtype == conn.atom_xdndposition {
             self.drag_and_drop.time = data[3];
             let (x, y) = (data[2] >> 16 as u16, data[2] as u16);

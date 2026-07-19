@@ -5,10 +5,10 @@ use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use ::window::color::LinearRgba;
 use ::window::{
-    Appearance, ContextMenuItem, MouseCursor, MouseEvent, MouseEventKind, MousePress, WindowOps,
+    Appearance, ContextMenuAction, ContextMenuIcon, ContextMenuItem, MouseCursor, MouseEvent,
+    MouseEventKind, MousePress, WindowOps,
 };
 use anyhow::Context;
-use config::keyassignment::KeyAssignment;
 use mux::pane::Pane;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,6 +31,16 @@ const MENU_RADIUS: f32 = 22.0;
 const MENU_ROW_RADIUS: f32 = 15.0;
 const MENU_ROW_HOVER_INSET_X: usize = 8;
 const MENU_ROW_HOVER_INSET_Y: usize = 2;
+
+pub(crate) fn reveal_in_folder_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else if cfg!(target_os = "windows") {
+        "Show in File Explorer"
+    } else {
+        "Show in Folder"
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ContextMenuState {
@@ -115,7 +125,7 @@ impl ContextMenuState {
         }
     }
 
-    fn action_for_path(&self, path: &[usize]) -> Option<KeyAssignment> {
+    fn action_for_path(&self, path: &[usize]) -> Option<ContextMenuAction> {
         match self.item_at_path(path) {
             Some(ContextMenuItem::Item {
                 action,
@@ -145,6 +155,47 @@ impl MenuRect {
 }
 
 impl crate::TermWindow {
+    pub(crate) fn begin_context_menu_application_actions(&mut self) {
+        self.context_menu_application_actions.clear();
+    }
+
+    pub(crate) fn context_menu_application_item_with_icon(
+        &mut self,
+        label: impl Into<String>,
+        icon: ContextMenuIcon,
+        action: crate::termwindow::ContextMenuApplicationAction,
+        enabled: bool,
+    ) -> ContextMenuItem {
+        let action_id = self.next_context_menu_application_action_id;
+        self.next_context_menu_application_action_id = self
+            .next_context_menu_application_action_id
+            .wrapping_add(1)
+            .max(1);
+        self.context_menu_application_actions
+            .insert(action_id, action);
+        let item = ContextMenuItem::application_item(label, action_id).with_icon(icon);
+        if enabled {
+            item
+        } else {
+            item.disabled()
+        }
+    }
+
+    pub(crate) fn perform_context_menu_application_action(&mut self, action_id: u64) {
+        let Some(action) = self
+            .context_menu_application_actions
+            .get(&action_id)
+            .cloned()
+        else {
+            return;
+        };
+        match action {
+            crate::termwindow::ContextMenuApplicationAction::Note(command) => {
+                self.perform_right_sidebar_note_command(command);
+            }
+        }
+    }
+
     pub(crate) fn show_term_context_menu(
         &mut self,
         context: &dyn WindowOps,
@@ -203,8 +254,15 @@ impl crate::TermWindow {
                     if let Some(action) = menu.action_for_path(&path) {
                         self.close_fallback_context_menu();
                         context.invalidate();
-                        if let Err(err) = self.perform_key_assignment(pane, &action) {
-                            log::error!("context menu action failed: {err:#}");
+                        match action {
+                            ContextMenuAction::KeyAssignment(action) => {
+                                if let Err(err) = self.perform_key_assignment(pane, &action) {
+                                    log::error!("context menu action failed: {err:#}");
+                                }
+                            }
+                            ContextMenuAction::ApplicationAction(action_id) => {
+                                self.perform_context_menu_application_action(action_id);
+                            }
                         }
                         return true;
                     }
@@ -746,44 +804,46 @@ fn context_menu_palette(appearance: Appearance) -> UiPalette {
     palette
 }
 
-fn menu_icon(icon: &str) -> Option<SvgIcon> {
+fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
     match icon {
-        "app" => Some(SvgIcon::ExternalLink),
-        "arrow.clockwise" => Some(SvgIcon::RotateCcw),
-        "arrow.up.right.square" => Some(SvgIcon::ExternalLink),
-        "arrow.triangle.2.circlepath" => Some(SvgIcon::RotateCcw),
-        "checkmark.circle" => Some(SvgIcon::CircleCheck),
-        "chevron.right" => Some(SvgIcon::ChevronRight),
-        "doc.on.doc" => Some(SvgIcon::Copy),
-        "doc.on.clipboard" => Some(SvgIcon::ClipboardPaste),
-        "envelope.badge" => Some(SvgIcon::Bell),
-        "exclamationmark.circle" => Some(SvgIcon::CircleAlert),
-        "folder" => Some(SvgIcon::Folder),
-        "folder.badge.minus" => Some(SvgIcon::FolderMinus),
-        "folder.badge.plus" => Some(SvgIcon::FolderPlus),
-        "folder.badge.questionmark" => Some(SvgIcon::FolderOpen),
-        "folder.badge.xmark" => Some(SvgIcon::FolderOpen),
-        "folder.fill" => Some(SvgIcon::Folder),
-        "folder.fill.badge.gearshape" => Some(SvgIcon::Settings),
-        "folder.fill.badge.minus" => Some(SvgIcon::FolderMinus),
-        "folder.fill.badge.plus" => Some(SvgIcon::FolderPlus),
-        "folder.fill.badge.xmark" => Some(SvgIcon::FolderOpen),
-        "house" => Some(SvgIcon::House),
-        "pencil" => Some(SvgIcon::Pencil),
-        "pin" => Some(SvgIcon::Pin),
-        "pin.slash" => Some(SvgIcon::PinOff),
-        "plus" => Some(SvgIcon::Plus),
-        "plus.square" => Some(SvgIcon::SquarePlus),
-        "rectangle.split.1x2" => Some(SvgIcon::SplitVertical),
-        "rectangle.split.2x1" => Some(SvgIcon::SplitHorizontal),
-        "sidebar.leading" => Some(SvgIcon::PanelLeft),
-        "square.and.pencil" => Some(SvgIcon::NotebookTabs),
-        "server.rack" => Some(SvgIcon::Server),
-        "square.stack" => Some(SvgIcon::SquareStack),
-        "terminal" => Some(SvgIcon::Terminal),
-        "trash" => Some(SvgIcon::Trash2),
-        "trash.fill" => Some(SvgIcon::Trash2),
-        "xmark" => Some(SvgIcon::X),
-        _ => None,
+        ContextMenuIcon::Application | ContextMenuIcon::ExternalLink => Some(SvgIcon::ExternalLink),
+        ContextMenuIcon::Back | ContextMenuIcon::MoveLeft => Some(SvgIcon::ArrowLeft),
+        ContextMenuIcon::Check => Some(SvgIcon::CircleCheck),
+        ContextMenuIcon::Close => Some(SvgIcon::X),
+        ContextMenuIcon::Code => Some(SvgIcon::CodeXml),
+        ContextMenuIcon::Collapse => Some(SvgIcon::Shrink),
+        ContextMenuIcon::Copy => Some(SvgIcon::Copy),
+        ContextMenuIcon::Cut => Some(SvgIcon::Scissors),
+        ContextMenuIcon::Delete => Some(SvgIcon::Trash2),
+        ContextMenuIcon::Edit => Some(SvgIcon::Pencil),
+        ContextMenuIcon::Expand => Some(SvgIcon::Expand),
+        ContextMenuIcon::File => Some(SvgIcon::File),
+        ContextMenuIcon::Folder => Some(SvgIcon::Folder),
+        ContextMenuIcon::FolderAdd => Some(SvgIcon::FolderPlus),
+        ContextMenuIcon::FolderRemove => Some(SvgIcon::FolderMinus),
+        ContextMenuIcon::Home => Some(SvgIcon::House),
+        ContextMenuIcon::Info => Some(SvgIcon::Info),
+        ContextMenuIcon::MoveRight => Some(SvgIcon::ArrowRight),
+        ContextMenuIcon::New => Some(SvgIcon::Plus),
+        ContextMenuIcon::Note => Some(SvgIcon::NotebookTabs),
+        ContextMenuIcon::Notification => Some(SvgIcon::Bell),
+        ContextMenuIcon::Paste => Some(SvgIcon::ClipboardPaste),
+        ContextMenuIcon::Pin => Some(SvgIcon::Pin),
+        ContextMenuIcon::Refresh => Some(SvgIcon::RotateCcw),
+        ContextMenuIcon::Redo => Some(SvgIcon::RotateCw),
+        ContextMenuIcon::Save => Some(SvgIcon::Save),
+        ContextMenuIcon::Search => Some(SvgIcon::Search),
+        ContextMenuIcon::Server => Some(SvgIcon::Server),
+        ContextMenuIcon::Settings => Some(SvgIcon::Settings),
+        ContextMenuIcon::Sidebar => Some(SvgIcon::PanelLeft),
+        ContextMenuIcon::Spellcheck => Some(SvgIcon::SpellCheck),
+        ContextMenuIcon::SplitHorizontal => Some(SvgIcon::SplitHorizontal),
+        ContextMenuIcon::SplitVertical => Some(SvgIcon::SplitVertical),
+        ContextMenuIcon::Stack | ContextMenuIcon::Window => Some(SvgIcon::SquareStack),
+        ContextMenuIcon::Terminal => Some(SvgIcon::Terminal),
+        ContextMenuIcon::Undo => Some(SvgIcon::RotateCcw),
+        ContextMenuIcon::Unpin => Some(SvgIcon::PinOff),
+        ContextMenuIcon::Vault => Some(SvgIcon::FolderTree),
+        ContextMenuIcon::Warning => Some(SvgIcon::CircleAlert),
     }
 }

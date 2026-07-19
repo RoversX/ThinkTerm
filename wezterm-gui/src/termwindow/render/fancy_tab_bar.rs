@@ -1442,6 +1442,122 @@ impl crate::TermWindow {
         Ok((x_pos - start_x).max(0.0))
     }
 
+    /// Pixel-clip glyph quads and their texture coordinates at both horizontal
+    /// edges. This is intended for horizontally scrollable text surfaces; fixed
+    /// labels continue to use `paint_cached_ui_shape_clipped`, which preserves
+    /// its whole-glyph truncation behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_cached_ui_shape_pixel_clipped<F>(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        metrics: &RenderMetrics,
+        shaped: &[ShapedInfo],
+        start_x: f32,
+        y: f32,
+        clip_left: f32,
+        clip_right: f32,
+        mut color_for: F,
+    ) -> anyhow::Result<f32>
+    where
+        F: FnMut(&ShapedInfo) -> LinearRgba,
+    {
+        if shaped.is_empty() || clip_right <= clip_left {
+            return Ok(0.0);
+        }
+
+        let Some(gl_state) = self.render_state.as_ref() else {
+            return Ok(0.0);
+        };
+        let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
+        let left_offset = self.dimensions.pixel_width as f32 / -2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / -2.0;
+        let baseline = metrics.cell_size.height as f32 + metrics.descender.get() as f32;
+        let mut x_pos = start_x;
+
+        for info in shaped {
+            let advance = info.glyph.x_advance.get() as f32;
+
+            if let Some(key) = info.block_key {
+                let sprite = glyph_cache.cached_block(key, metrics)?;
+                let texture = sprite.texture_coords();
+                if let Some(clip) = horizontal_texture_clip(
+                    x_pos,
+                    x_pos + advance,
+                    texture.min_x(),
+                    texture.max_x(),
+                    clip_left,
+                    clip_right,
+                ) {
+                    let color = color_for(info);
+                    let mut quad = layers.allocate(2)?;
+                    quad.set_position(
+                        clip.position_left + left_offset,
+                        y + top_offset,
+                        clip.position_right + left_offset,
+                        y + top_offset + metrics.cell_size.height as f32,
+                    );
+                    quad.set_texture_discrete(
+                        clip.texture_left,
+                        clip.texture_right,
+                        texture.min_y(),
+                        texture.max_y(),
+                    );
+                    quad.set_fg_color(color);
+                    quad.set_alt_color_and_mix_value(color, 0.0);
+                    quad.set_hsv(None);
+                } else if x_pos >= clip_right {
+                    break;
+                }
+                x_pos += advance;
+                continue;
+            }
+
+            let glyph = &info.glyph;
+            if let Some(texture) = glyph.texture.as_ref() {
+                let glyph_x = x_pos + (glyph.x_offset + glyph.bearing_x).get() as f32;
+                let glyph_y = y - (glyph.y_offset + glyph.bearing_y).get() as f32 + baseline;
+                let glyph_width = texture.coords.size.width as f32 * glyph.scale as f32;
+                let glyph_height = texture.coords.size.height as f32 * glyph.scale as f32;
+                let texture_rect = texture.texture_coords();
+                if let Some(clip) = horizontal_texture_clip(
+                    glyph_x,
+                    glyph_x + glyph_width,
+                    texture_rect.min_x(),
+                    texture_rect.max_x(),
+                    clip_left,
+                    clip_right,
+                ) {
+                    let color = color_for(info);
+                    let mut quad = layers.allocate(2)?;
+                    quad.set_position(
+                        clip.position_left + left_offset,
+                        glyph_y + top_offset,
+                        clip.position_right + left_offset,
+                        glyph_y + top_offset + glyph_height,
+                    );
+                    quad.set_texture_discrete(
+                        clip.texture_left,
+                        clip.texture_right,
+                        texture_rect.min_y(),
+                        texture_rect.max_y(),
+                    );
+                    quad.set_fg_color(color);
+                    quad.set_alt_color_and_mix_value(color, 0.0);
+                    quad.set_has_color(glyph.has_color);
+                    quad.set_hsv(None);
+                } else if glyph_x >= clip_right {
+                    break;
+                }
+            } else if x_pos >= clip_right {
+                break;
+            }
+
+            x_pos += advance;
+        }
+
+        Ok((x_pos - start_x).max(0.0))
+    }
+
     fn paint_fancy_tab_icon(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -1477,6 +1593,49 @@ impl crate::TermWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HorizontalTextureClip {
+    position_left: f32,
+    position_right: f32,
+    texture_left: f32,
+    texture_right: f32,
+}
+
+fn horizontal_texture_clip(
+    position_left: f32,
+    position_right: f32,
+    texture_left: f32,
+    texture_right: f32,
+    clip_left: f32,
+    clip_right: f32,
+) -> Option<HorizontalTextureClip> {
+    let width = position_right - position_left;
+    if !(width > 0.0 && texture_right > texture_left && clip_right > clip_left) {
+        return None;
+    }
+    let visible_left = position_left.max(clip_left);
+    let visible_right = position_right.min(clip_right);
+    if visible_right <= visible_left {
+        return None;
+    }
+    // A sub-pixel remnant of a clipped glyph (particularly the outer edge of
+    // braces) rasterizes as a stray dot. Keep genuine partial glyphs, but drop
+    // the final fragment once it is narrower than one physical pixel.
+    let was_clipped = visible_left > position_left || visible_right < position_right;
+    if was_clipped && visible_right - visible_left < 1.0 {
+        return None;
+    }
+    let left_fraction = (visible_left - position_left) / width;
+    let right_fraction = (visible_right - position_left) / width;
+    let texture_width = texture_right - texture_left;
+    Some(HorizontalTextureClip {
+        position_left: visible_left,
+        position_right: visible_right,
+        texture_left: texture_left + texture_width * left_fraction,
+        texture_right: texture_left + texture_width * right_fraction,
+    })
+}
+
 fn fancy_tab_icon_size(metrics: &RenderMetrics, tab_bar_height: f32) -> f32 {
     let cell_height = metrics.cell_size.height.max(1) as f32;
     let from_bar = (tab_bar_height - cell_height * 0.45).max(1.0);
@@ -1497,4 +1656,38 @@ fn is_legacy_progress_marker(value: &str) -> bool {
         ch as u32,
         0x2800..=0x28ff | 0xf0130 | 0xf0a9e..=0xf0aa5 | 0xee00..=0xee0b
     )
+}
+
+#[cfg(test)]
+mod pixel_clip_tests {
+    use super::{horizontal_texture_clip, HorizontalTextureClip};
+
+    #[test]
+    fn horizontal_texture_clip_crops_position_and_uv_together() {
+        let clip = horizontal_texture_clip(10.0, 30.0, 0.2, 0.6, 15.0, 25.0).unwrap();
+        assert_eq!(
+            clip,
+            HorizontalTextureClip {
+                position_left: 15.0,
+                position_right: 25.0,
+                texture_left: 0.3,
+                texture_right: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn horizontal_texture_clip_rejects_invisible_or_invalid_quads() {
+        assert!(horizontal_texture_clip(10.0, 20.0, 0.2, 0.6, 20.0, 30.0).is_none());
+        assert!(horizontal_texture_clip(10.0, 10.0, 0.2, 0.6, 0.0, 30.0).is_none());
+        assert!(horizontal_texture_clip(10.0, 20.0, 0.6, 0.2, 0.0, 30.0).is_none());
+    }
+
+    #[test]
+    fn horizontal_texture_clip_hides_subpixel_clipped_remnants() {
+        assert!(horizontal_texture_clip(10.0, 20.0, 0.2, 0.6, 19.25, 30.0).is_none());
+
+        // Do not discard a naturally narrow quad when no clipping occurred.
+        assert!(horizontal_texture_clip(10.0, 10.75, 0.2, 0.6, 0.0, 30.0).is_some());
+    }
 }

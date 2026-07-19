@@ -81,6 +81,7 @@ rangeset.workspace = true
 ratelim.workspace = true
 rayon.workspace = true
 regex.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 resvg.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
@@ -98,6 +99,7 @@ thinkterm-syntax = { path = "../thinkterm-syntax" }
 trash.workspace = true
 umask.workspace = true
 unicode-normalization.workspace = true
+unicode-linebreak = "0.1"
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 uuid = { workspace = true, features = ["v4"] }

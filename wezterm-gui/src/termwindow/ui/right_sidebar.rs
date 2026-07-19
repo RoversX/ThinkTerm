@@ -1,12 +1,14 @@
 use crate::markdown_editor::{
-    default_notebook, fit_table_columns, resolve_local_image, save_document_revision,
-    wrap_visual_document_by_width, BlockKind, EditorMode, NoteCodeBlockLayout, NoteLineLayout,
-    NoteRunLayout, ProjectedCodeBlock, ProjectedObject, SaveState, SourceSelection, TableAlignment,
-    VisualLineKind,
+    AutosaveWakeAction, BlockKind, EditorMode, NoteCodeBlockLayout, NoteLineGeometry,
+    NoteLineLayout, NoteRunLayout, NoteSpellingIssue, ProjectedCodeBlock, ProjectedObject,
+    SaveState, SourceSelection, TableAlignment, VisualLineKind, build_spell_check_chunks_in_range,
+    build_visual_document, fit_table_columns, load_remote_image, open_vault_document,
+    resolve_local_image, save_document_revision, vault_file_paths, vault_markdown_paths,
+    wrap_visual_document_by_width_cached,
 };
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::ui::icons::{
-    material_file_icon_for_name, material_folder_icon_for_name, MaterialIcon, SvgIcon,
+    MaterialIcon, SvgIcon, material_file_icon_for_name, material_folder_icon_for_name,
 };
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET,
@@ -14,16 +16,17 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
 use crate::termwindow::{
-    RightSidebarFileCharBag, RightSidebarFileField, RightSidebarFileIndex,
+    NoteEditorCommand, RightSidebarFileCharBag, RightSidebarFileField, RightSidebarFileIndex,
     RightSidebarFileIndexEntry, RightSidebarFileIndexStatus, RightSidebarFilePreviewImage,
     RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
     RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSliceCacheKey,
     RightSidebarFilePreviewSliceCacheValue, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
     RightSidebarFileView, RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
+    RightSidebarNoteImageSource, RightSidebarNoteTableLayout, RightSidebarNoteView,
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
     TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup,
 };
-use crate::ui::{scale_ui_usize, unscale_ui_usize, TextInputState, UiPalette};
+use crate::ui::{TextInputState, UiPalette, scale_ui_usize, unscale_ui_usize};
 use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use anyhow::Context;
@@ -31,7 +34,7 @@ use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource, KeyA
 use mux::Mux;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
@@ -42,13 +45,14 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use termwiz::image::{ImageData, ImageDataType};
 use termwiz::input::{KeyCode as TermKeyCode, Modifiers as TermModifiers};
-use thinkterm_syntax::{HighlightKind, HighlightResult, HighlightSpan};
+use thinkterm_syntax::{HighlightKind, HighlightResult, HighlightSpan, LanguageId};
+use unicode_segmentation::UnicodeSegmentation;
 use walkdir::{DirEntry as WalkDirEntry, WalkDir};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{
-    Clipboard, ContextMenuItem, DeadKeyStatus, IntegratedTitleButtonStyle, Point, Rect,
-    WindowDecorations, WindowOps,
+    Clipboard, ContextMenuIcon, ContextMenuItem, DeadKeyStatus, FolderPickerOptions,
+    IntegratedTitleButtonStyle, Point, Rect, WindowDecorations, WindowOps,
 };
 
 const RIGHT_SIDEBAR_SECTION_GAP: usize = 12;
@@ -78,20 +82,31 @@ const RIGHT_SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
 const SNIPPET_CARET_WIDTH: f32 = 3.0;
 const NOTE_TOOLBAR_HEIGHT: usize = 54;
 const NOTE_BODY_TOP_GAP: usize = 12;
-const NOTE_BODY_PADDING: usize = 16;
+const NOTE_BODY_PADDING: usize = 24;
+const NOTE_READING_MAX_WIDTH: usize = 720;
 const NOTE_LINE_GAP: usize = 5;
 const NOTE_CARET_WIDTH: f32 = 2.0;
 const NOTE_TABLE_CELL_HORIZONTAL_PADDING: usize = 10;
 const NOTE_TABLE_CELL_VERTICAL_PADDING: usize = 7;
-const NOTE_TABLE_MIN_COLUMN_WIDTH: usize = 64;
+const NOTE_TABLE_MIN_COLUMN_WIDTH: usize = 120;
+const NOTE_TABLE_MAX_COLUMN_WIDTH: usize = 480;
+const NOTE_TABLE_SCROLLBAR_HEIGHT: usize = 3;
 const NOTE_CODE_HEADER_HEIGHT: usize = 38;
 const NOTE_CODE_HORIZONTAL_PADDING: usize = 12;
 const NOTE_CODE_VERTICAL_PADDING: usize = 9;
 const NOTE_CODE_CONTROL_SIZE: usize = 28;
 const NOTE_CODE_BLOCK_RADIUS: f32 = SIDEBAR_ROW_RADIUS;
 const NOTE_CODE_HIGHLIGHT_CACHE_CAPACITY: usize = 64;
-const NOTE_AUTOSAVE_MS: u64 = 300;
+const NOTE_CODE_HIGHLIGHT_LAST_BLOCK_CAPACITY: usize = 64;
+const NOTE_CODE_HIGHLIGHT_DEBOUNCE_MS: u64 = 120;
+const NOTE_CODE_HIGHLIGHT_REPAINT_MS: u64 = 8;
+const NOTE_AUTOSAVE_MS: u64 = 500;
+const NOTE_SPELLCHECK_DEBOUNCE_MS: u64 = 300;
 const NOTE_IMAGE_CACHE_CAPACITY: usize = 32;
+const NOTE_IMAGE_CACHE_MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
+const NOTE_VAULT_SPLIT_MIN_WIDTH: usize = 620;
+const NOTE_VAULT_TREE_WIDTH: usize = 230;
+const NOTE_VAULT_RESCAN_SECS: u64 = 10;
 const FILE_FONT_MIN_SIZE: f64 = 14.0;
 const FILE_FILTER_HEIGHT: usize = 66;
 const FILE_TREE_TOP_GAP: usize = 14;
@@ -121,6 +136,7 @@ const FILE_INDEX_ENTRY_LIMIT: usize = 100_000;
 // How long the file panel must stay closed/idle before its in-memory index and
 // buffers are released. Reopening within this window keeps everything resident.
 const FILE_INDEX_IDLE_RELEASE_SECS: u64 = 30;
+const NOTE_IDLE_RELEASE_SECS: u64 = 30;
 // How often the Files panel re-scans the tree while it's visible + focused.
 const FILE_INDEX_RESCAN_SECS: u64 = 90;
 // Max number of (root, project) view-state snapshots kept in memory.
@@ -161,25 +177,426 @@ fn note_code_row_height(
         }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoteVaultTreeRow {
+    relative_path: String,
+    name: String,
+    depth: usize,
+    is_dir: bool,
+}
+
+fn note_vault_tree_rows(
+    markdown_paths: &[String],
+    expanded: &HashSet<String>,
+) -> Vec<NoteVaultTreeRow> {
+    let mut directories = BTreeSet::new();
+    for path in markdown_paths {
+        let mut current = PathBuf::new();
+        let mut components = Path::new(path).components().peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                break;
+            }
+            current.push(component.as_os_str());
+            directories.insert(current.to_string_lossy().replace('\\', "/"));
+        }
+    }
+
+    let mut candidates = directories
+        .iter()
+        .map(|path| (path.clone(), true))
+        .chain(markdown_paths.iter().cloned().map(|path| (path, false)))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left, left_dir), (right, right_dir)| {
+        let left_key = left.to_ascii_lowercase();
+        let right_key = right.to_ascii_lowercase();
+        left_key
+            .cmp(&right_key)
+            .then_with(|| right_dir.cmp(left_dir))
+    });
+
+    candidates
+        .into_iter()
+        .filter_map(|(relative_path, is_dir)| {
+            let path = Path::new(&relative_path);
+            let parent_visible = path
+                .ancestors()
+                .skip(1)
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .all(|parent| expanded.contains(&parent.to_string_lossy().replace('\\', "/")));
+            if !parent_visible {
+                return None;
+            }
+            Some(NoteVaultTreeRow {
+                name: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&relative_path)
+                    .to_string(),
+                depth: path.components().count().saturating_sub(1),
+                relative_path,
+                is_dir,
+            })
+        })
+        .collect()
+}
+
+fn visible_code_block_rounded_edges(
+    block_top: f32,
+    block_bottom: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+) -> (bool, bool) {
+    (block_top >= viewport_top, block_bottom <= viewport_bottom)
+}
+
+fn virtual_note_line_range(
+    geometry: &[NoteLineGeometry],
+    scroll: f32,
+    viewport_height: f32,
+) -> std::ops::Range<usize> {
+    if geometry.is_empty() || viewport_height <= 0.0 {
+        return 0..0;
+    }
+    let overscan = viewport_height * 2.0;
+    let paint_top = (scroll - overscan).max(0.0);
+    let paint_bottom = scroll + viewport_height + overscan;
+    let start = geometry.partition_point(|line| line.top + line.height + line.gap < paint_top);
+    let end = geometry
+        .partition_point(|line| line.top <= paint_bottom)
+        .min(geometry.len());
+    start..end
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NoteApproximateTextMetrics {
+    latin: f32,
+    space: f32,
+    wide: f32,
+}
+
+fn approximate_note_text_width(text: &str, metrics: NoteApproximateTextMetrics) -> f32 {
+    text.graphemes(true)
+        .map(|grapheme| {
+            if grapheme.chars().all(char::is_whitespace) {
+                metrics.space
+            } else if grapheme.is_ascii() {
+                metrics.latin
+            } else if unicode_width::UnicodeWidthStr::width(grapheme) >= 2 {
+                metrics.wide
+            } else {
+                metrics.latin
+            }
+        })
+        .sum()
+}
+
 #[derive(Debug, Clone)]
 struct NoteTableRowPaintLayout {
+    table_start: usize,
     column_widths: Rc<Vec<f32>>,
     alignments: Rc<Vec<TableAlignment>>,
     row_index: usize,
     row_count: usize,
+    total_width: f32,
+    horizontal_offset: f32,
+    max_horizontal_scroll: f32,
+}
+
+fn scrollable_note_table_columns(
+    desired: &[f32],
+    available_width: f32,
+    minimum_width: f32,
+    maximum_width: f32,
+) -> Vec<f32> {
+    if desired.is_empty() {
+        return Vec::new();
+    }
+    let available_width = available_width.max(1.0);
+    let minimum_width = minimum_width.max(1.0);
+    let maximum_width = maximum_width.max(minimum_width);
+    let widths = desired
+        .iter()
+        .map(|width| width.clamp(minimum_width, maximum_width))
+        .collect::<Vec<_>>();
+    let total = widths.iter().sum::<f32>();
+    if total < available_width {
+        fit_table_columns(&widths, available_width, minimum_width)
+    } else {
+        widths
+    }
+}
+
+fn note_image_display_size(
+    image_width: u32,
+    image_height: u32,
+    available_width: f32,
+    available_height: f32,
+) -> (f32, f32) {
+    if image_width == 0 || image_height == 0 || available_width <= 0.0 || available_height <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    // Markdown images should be useful at reading distance, including small
+    // logos and diagrams.  Allow moderate upscaling while bounding both axes;
+    // giant/tall images remain contained inside the current viewport.
+    const MAX_UPSCALE: f32 = 3.0;
+    let scale = (available_width / image_width as f32)
+        .min(available_height / image_height as f32)
+        .min(MAX_UPSCALE);
+    (
+        (image_width as f32 * scale).max(1.0),
+        (image_height as f32 * scale).max(1.0),
+    )
+}
+
+fn note_image_row_height(
+    image: Option<&RightSidebarFilePreviewImage>,
+    text_height: f32,
+    available_width: f32,
+    available_height: f32,
+) -> f32 {
+    image
+        .map(|image| {
+            note_image_display_size(image.width, image.height, available_width, available_height).1
+        })
+        .unwrap_or(text_height)
+        .max(text_height)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NoteTextureClip {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    texture_left: f32,
+    texture_top: f32,
+    texture_right: f32,
+    texture_bottom: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clip_note_texture(
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    texture_left: f32,
+    texture_top: f32,
+    texture_right: f32,
+    texture_bottom: f32,
+    clip_left: f32,
+    clip_top: f32,
+    clip_right: f32,
+    clip_bottom: f32,
+) -> Option<NoteTextureClip> {
+    let width = right - left;
+    let height = bottom - top;
+    if width <= 0.0
+        || height <= 0.0
+        || texture_right <= texture_left
+        || texture_bottom <= texture_top
+        || clip_right <= clip_left
+        || clip_bottom <= clip_top
+    {
+        return None;
+    }
+    let visible_left = left.max(clip_left);
+    let visible_top = top.max(clip_top);
+    let visible_right = right.min(clip_right);
+    let visible_bottom = bottom.min(clip_bottom);
+    if visible_right <= visible_left || visible_bottom <= visible_top {
+        return None;
+    }
+    let texture_width = texture_right - texture_left;
+    let texture_height = texture_bottom - texture_top;
+    Some(NoteTextureClip {
+        left: visible_left,
+        top: visible_top,
+        right: visible_right,
+        bottom: visible_bottom,
+        texture_left: texture_left + texture_width * ((visible_left - left) / width),
+        texture_top: texture_top + texture_height * ((visible_top - top) / height),
+        texture_right: texture_left + texture_width * ((visible_right - left) / width),
+        texture_bottom: texture_top + texture_height * ((visible_bottom - top) / height),
+    })
+}
+
+fn note_open_pending_for_vault(opening: Option<&(PathBuf, String)>, vault_root: &Path) -> bool {
+    opening.is_some_and(|(root, _)| root == vault_root)
 }
 
 #[derive(Debug, Clone)]
 struct NoteCodeRowPaintLayout {
     block_start: usize,
     language: String,
+    code: Arc<ProjectedCodeBlock>,
     row_index: usize,
     row_count: usize,
     collapsed: bool,
-    colors: Arc<Vec<Vec<LinearRgba>>>,
     horizontal_offset: f32,
     block_height: f32,
     max_horizontal_scroll: f32,
+}
+
+/// Immutable component geometry for one visual/layout revision. Vertical
+/// scrolling only clones these Arcs; it must not clone the full Markdown
+/// projection or remeasure every table/code cell on every frame.
+#[derive(Default)]
+pub(crate) struct NotePaintCache {
+    key: Option<u64>,
+    table_rows: Arc<HashMap<usize, NoteTableRowPaintLayout>>,
+    code_rows: Arc<HashMap<usize, NoteCodeRowPaintLayout>>,
+    image_sources: Arc<HashMap<usize, RightSidebarNoteImageSource>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct NoteCodeHighlightKey {
+    language: LanguageId,
+    content_hash: u64,
+    content_len: usize,
+}
+
+#[derive(Debug)]
+struct NoteCodeHighlightEntry {
+    key: NoteCodeHighlightKey,
+    source: Arc<str>,
+    light: Arc<Vec<Vec<LinearRgba>>>,
+    dark: Arc<Vec<Vec<LinearRgba>>>,
+}
+
+impl NoteCodeHighlightEntry {
+    fn colors(&self, use_dark_theme: bool) -> Arc<Vec<Vec<LinearRgba>>> {
+        if use_dark_theme {
+            Arc::clone(&self.dark)
+        } else {
+            Arc::clone(&self.light)
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct NoteCodeHighlightState {
+    cache: HashMap<NoteCodeHighlightKey, Arc<NoteCodeHighlightEntry>>,
+    cache_order: VecDeque<NoteCodeHighlightKey>,
+    last_by_block: HashMap<usize, Arc<NoteCodeHighlightEntry>>,
+    last_block_order: VecDeque<usize>,
+    scheduled: HashMap<usize, (NoteCodeHighlightKey, u64)>,
+    in_flight: HashMap<usize, (NoteCodeHighlightKey, Arc<AtomicUsize>)>,
+    next_generation: u64,
+    repaint_scheduled: bool,
+}
+
+impl NoteCodeHighlightState {
+    fn cached(
+        &self,
+        key: NoteCodeHighlightKey,
+        source: &str,
+    ) -> Option<Arc<NoteCodeHighlightEntry>> {
+        self.cache
+            .get(&key)
+            .filter(|entry| entry.source.as_ref() == source)
+            .cloned()
+    }
+
+    fn insert_cache(&mut self, entry: Arc<NoteCodeHighlightEntry>) {
+        let key = entry.key;
+        if !self.cache.contains_key(&key) {
+            self.cache_order.push_back(key);
+        }
+        self.cache.insert(key, entry);
+        while self.cache_order.len() > NOTE_CODE_HIGHLIGHT_CACHE_CAPACITY {
+            if let Some(expired) = self.cache_order.pop_front() {
+                self.cache.remove(&expired);
+            }
+        }
+    }
+
+    fn remember_block(&mut self, block_start: usize, entry: Arc<NoteCodeHighlightEntry>) {
+        self.last_block_order.retain(|start| *start != block_start);
+        self.last_block_order.push_back(block_start);
+        self.last_by_block.insert(block_start, entry);
+        while self.last_block_order.len() > NOTE_CODE_HIGHLIGHT_LAST_BLOCK_CAPACITY {
+            if let Some(expired) = self.last_block_order.pop_front() {
+                self.last_by_block.remove(&expired);
+            }
+        }
+    }
+
+    fn previous_for_block(
+        &self,
+        block_start: usize,
+        language: LanguageId,
+    ) -> Option<Arc<NoteCodeHighlightEntry>> {
+        self.last_by_block
+            .get(&block_start)
+            .filter(|entry| entry.key.language == language)
+            .cloned()
+    }
+
+    fn schedule_block(&mut self, block_start: usize, key: NoteCodeHighlightKey) -> Option<u64> {
+        if self
+            .scheduled
+            .get(&block_start)
+            .is_some_and(|(scheduled, _)| *scheduled == key)
+            || self
+                .in_flight
+                .get(&block_start)
+                .is_some_and(|(pending, _)| *pending == key)
+        {
+            return None;
+        }
+        self.scheduled.remove(&block_start);
+        if let Some((_, cancellation)) = self.in_flight.remove(&block_start) {
+            cancellation.store(1, AtomicOrdering::Relaxed);
+        }
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        self.scheduled.insert(block_start, (key, generation));
+        Some(generation)
+    }
+
+    fn cancel_block_work(&mut self, block_start: usize) {
+        self.scheduled.remove(&block_start);
+        if let Some((_, cancellation)) = self.in_flight.remove(&block_start) {
+            cancellation.store(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn retain_blocks(&mut self, current: &HashSet<usize>) {
+        let removed = self
+            .scheduled
+            .keys()
+            .chain(self.in_flight.keys())
+            .chain(self.last_by_block.keys())
+            .copied()
+            .filter(|start| !current.contains(start))
+            .collect::<HashSet<_>>();
+        for block_start in removed {
+            self.cancel_block_work(block_start);
+            self.last_by_block.remove(&block_start);
+        }
+        self.last_block_order
+            .retain(|start| current.contains(start));
+    }
+}
+
+fn note_code_highlight_key(code: &ProjectedCodeBlock) -> Option<NoteCodeHighlightKey> {
+    if code.text.len() > thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT {
+        return None;
+    }
+    let language = code
+        .language
+        .as_deref()
+        .and_then(thinkterm_syntax::detect_fence)?;
+    let mut hasher = DefaultHasher::new();
+    code.text.hash(&mut hasher);
+    Some(NoteCodeHighlightKey {
+        language,
+        content_hash: hasher.finish(),
+        content_len: code.text.len(),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -540,14 +957,23 @@ impl crate::TermWindow {
                 self.clear_right_sidebar_text_focus();
             }
             self.schedule_right_sidebar_file_memory_release();
+            self.schedule_right_sidebar_note_memory_release();
         } else {
             self.kick_right_sidebar_file_rescan_cycle();
+            if self.right_sidebar_mode == RightSidebarMode::Tasks {
+                self.right_sidebar_note_memory_release_token =
+                    self.right_sidebar_note_memory_release_token.wrapping_add(1);
+            }
         }
     }
 
     pub fn expand_right_sidebar(&mut self) {
         self.right_sidebar_collapsed = false;
         self.kick_right_sidebar_file_rescan_cycle();
+        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            self.right_sidebar_note_memory_release_token =
+                self.right_sidebar_note_memory_release_token.wrapping_add(1);
+        }
     }
 
     /// The file panel (and its in-memory index) is only relevant while the right
@@ -609,6 +1035,67 @@ impl crate::TermWindow {
         self.right_sidebar_file_browse_rows = Vec::new();
         self.right_sidebar_file_browse_cache_key = None;
         self.invalidate_window();
+    }
+
+    /// Notes are entirely lazy at runtime: once the panel stays hidden, drop
+    /// source/projection/wrap/highlight/image/index state.  The persisted active
+    /// path is enough to reopen it; no polling or worker remains owned by the
+    /// feature while it is unused.
+    pub(crate) fn schedule_right_sidebar_note_memory_release(&mut self) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.right_sidebar_note_memory_release_token =
+            self.right_sidebar_note_memory_release_token.wrapping_add(1);
+        let token = self.right_sidebar_note_memory_release_token;
+        let target = Instant::now() + Duration::from_secs(NOTE_IDLE_RELEASE_SECS);
+        promise::spawn::spawn(async move {
+            smol::Timer::at(target).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.release_right_sidebar_note_memory_if_idle(token);
+            })));
+        })
+        .detach();
+    }
+
+    fn release_right_sidebar_note_memory_if_idle(&mut self, token: u64) {
+        if token != self.right_sidebar_note_memory_release_token
+            || self.right_sidebar_note_visible()
+        {
+            return;
+        }
+        if self
+            .right_sidebar_note
+            .session
+            .as_ref()
+            .is_some_and(|session| session.lock().is_dirty())
+        {
+            self.save_right_sidebar_note_now();
+            self.schedule_right_sidebar_note_memory_release();
+            return;
+        }
+
+        self.right_sidebar_note_open_generation =
+            self.right_sidebar_note_open_generation.wrapping_add(1);
+        self.right_sidebar_note_vault_index_generation = self
+            .right_sidebar_note_vault_index_generation
+            .wrapping_add(1);
+        self.right_sidebar_note = crate::markdown_editor::NoteHostState::default();
+        self.right_sidebar_note_opening = None;
+        self.right_sidebar_note_open_failure = None;
+        self.right_sidebar_note_vault_index_root = None;
+        self.right_sidebar_note_vault_paths = Arc::new(Vec::new());
+        self.right_sidebar_note_vault_indexing = false;
+        self.right_sidebar_note_vault_last_scan = None;
+        self.right_sidebar_note_tree_expanded.clear();
+        self.right_sidebar_note_table_horizontal_offsets.clear();
+        self.right_sidebar_note_table_layouts.clear();
+        self.right_sidebar_note_images.clear();
+        self.right_sidebar_note_images_loading.clear();
+        self.right_sidebar_note_image_order.clear();
+        self.right_sidebar_note_image_failures.clear();
+        self.right_sidebar_note_code_highlight = NoteCodeHighlightState::default();
+        self.right_sidebar_note_paint_cache = NotePaintCache::default();
     }
 
     fn right_sidebar_file_view_state_key(&self) -> Option<(PathBuf, String)> {
@@ -712,11 +1199,20 @@ impl crate::TermWindow {
         self.right_sidebar_file_focus = None;
         self.right_sidebar_note.view.focused = false;
         if note_was_focused {
+            self.right_sidebar_note.native_text_input_snapshot_key = None;
+            if let Some(window) = self.window.as_ref() {
+                window.set_native_text_input_snapshot(None);
+            }
+            self.right_sidebar_note.freeze_live_source();
             self.save_right_sidebar_note_now();
         }
     }
 
     pub(crate) fn open_new_snippet_editor(&mut self) {
+        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            self.clear_right_sidebar_text_focus();
+            self.schedule_right_sidebar_note_memory_release();
+        }
         self.right_sidebar_mode = RightSidebarMode::Snippets;
         self.right_sidebar_snippet_view = RightSidebarSnippetView::EditNew;
         self.right_sidebar_snippet_scroll_offset = 0.0;
@@ -729,6 +1225,10 @@ impl crate::TermWindow {
         let Some(snippet) = crate::snippets::get_snippet(id) else {
             return;
         };
+        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            self.clear_right_sidebar_text_focus();
+            self.schedule_right_sidebar_note_memory_release();
+        }
         self.right_sidebar_mode = RightSidebarMode::Snippets;
         self.right_sidebar_snippet_view = RightSidebarSnippetView::EditExisting(snippet.id);
         self.right_sidebar_snippet_scroll_offset = 0.0;
@@ -809,47 +1309,18 @@ impl crate::TermWindow {
         (old - self.right_sidebar_snippet_scroll_offset).abs() > f32::EPSILON
     }
 
-    pub(crate) fn scroll_right_sidebar_files(&mut self, amount: i16) -> bool {
-        if self.right_sidebar_collapsed
-            || self.right_sidebar_mode != RightSidebarMode::Chat
-            || amount == 0
-        {
-            return false;
-        }
-
+    pub(crate) fn scroll_right_sidebar_files_by(&mut self, delta: f32) -> bool {
         let old = self.right_sidebar_file_tree_scroll_offset;
-        let steps = amount.unsigned_abs().max(1) as f32;
-        let delta = (steps * 14.0).min(98.0);
-        if amount < 0 {
-            self.right_sidebar_file_tree_scroll_offset += delta;
-        } else {
-            self.right_sidebar_file_tree_scroll_offset =
-                (self.right_sidebar_file_tree_scroll_offset - delta).max(0.0);
-        }
+        self.right_sidebar_file_tree_scroll_offset =
+            (self.right_sidebar_file_tree_scroll_offset + delta).max(0.0);
         (old - self.right_sidebar_file_tree_scroll_offset).abs() > f32::EPSILON
     }
 
-    pub(crate) fn scroll_right_sidebar_file_preview(&mut self, amount: i16) -> bool {
-        if self.right_sidebar_collapsed
-            || self.right_sidebar_mode != RightSidebarMode::Chat
-            || self.right_sidebar_file_view != RightSidebarFileView::Preview
-            || self.right_sidebar_file_selected.is_none()
-            || amount == 0
-        {
-            return false;
-        }
-
+    pub(crate) fn scroll_right_sidebar_file_preview_by(&mut self, delta: f32) -> bool {
         let old = self.right_sidebar_file_preview_scroll_offset;
         let max = self.right_sidebar_file_preview_scroll_max();
-        let steps = amount.unsigned_abs().max(1) as f32;
-        let delta = (steps * 14.0).min(98.0);
-        if amount < 0 {
-            self.right_sidebar_file_preview_scroll_offset =
-                (self.right_sidebar_file_preview_scroll_offset + delta).clamp(0.0, max);
-        } else {
-            self.right_sidebar_file_preview_scroll_offset =
-                (self.right_sidebar_file_preview_scroll_offset - delta).clamp(0.0, max);
-        }
+        self.right_sidebar_file_preview_scroll_offset =
+            (self.right_sidebar_file_preview_scroll_offset + delta).clamp(0.0, max);
         (old - self.right_sidebar_file_preview_scroll_offset).abs() > f32::EPSILON
     }
 
@@ -1026,90 +1497,178 @@ impl crate::TermWindow {
         code: &ProjectedCodeBlock,
         use_dark_theme: bool,
     ) -> Arc<Vec<Vec<LinearRgba>>> {
-        let revision = self.right_sidebar_note.projection_revision.unwrap_or(0);
-        if self.right_sidebar_note_code_highlight_revision != revision {
-            self.right_sidebar_note_code_highlight_cancel
-                .store(1, AtomicOrdering::Relaxed);
-            self.right_sidebar_note_code_highlight_cancel = Arc::new(AtomicUsize::new(0));
-            self.right_sidebar_note_code_highlight_revision = revision;
-            self.right_sidebar_note_code_highlights_pending.clear();
+        let Some(key) = note_code_highlight_key(code) else {
+            return Arc::new(vec![vec![]; note_code_line_count(&code.text)]);
+        };
+        if let Some(entry) = self
+            .right_sidebar_note_code_highlight
+            .cached(key, &code.text)
+        {
+            self.right_sidebar_note_code_highlight
+                .cancel_block_work(code.source.start);
+            self.right_sidebar_note_code_highlight
+                .remember_block(code.source.start, Arc::clone(&entry));
+            return entry.colors(use_dark_theme);
         }
 
-        let key = (revision, code.source.start, use_dark_theme);
-        if let Some(lines) = self.right_sidebar_note_code_highlights.get(&key).cloned() {
-            return lines;
-        }
-
-        let lines = Arc::new(vec![vec![]; note_code_line_count(&code.text)]);
-        self.insert_note_code_highlight_cache(key, Arc::clone(&lines));
-
-        let supported = code.text.len() <= thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT
-            && code
-                .language
-                .as_deref()
-                .and_then(thinkterm_syntax::detect_fence)
-                .is_some();
-        let pending_key = (revision, code.source.start);
-        if supported
-            && self
-                .right_sidebar_note_code_highlights_pending
-                .insert(pending_key)
+        let previous = self
+            .right_sidebar_note_code_highlight
+            .previous_for_block(code.source.start, key.language);
+        if let Some(generation) = self
+            .right_sidebar_note_code_highlight
+            .schedule_block(code.source.start, key)
         {
             if let Some(window) = self.window.as_ref().cloned() {
                 let code = code.clone();
-                let cancellation = Arc::clone(&self.right_sidebar_note_code_highlight_cancel);
-                syntax_highlight_pool().spawn(move || {
-                    let result = note_code_highlight_pair(&code, Some(cancellation.as_ref()));
+                promise::spawn::spawn(async move {
+                    smol::Timer::after(Duration::from_millis(NOTE_CODE_HIGHLIGHT_DEBOUNCE_MS))
+                        .await;
                     window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                        term_window.apply_note_code_highlight_result(pending_key, result);
+                        term_window.start_note_code_highlight(
+                            code.source.start,
+                            key,
+                            generation,
+                            code,
+                        );
                     })));
-                });
+                })
+                .detach();
             } else {
-                self.right_sidebar_note_code_highlights_pending
-                    .remove(&pending_key);
+                self.right_sidebar_note_code_highlight
+                    .scheduled
+                    .remove(&code.source.start);
             }
         }
 
-        lines
+        previous
+            .map(|entry| entry.colors(use_dark_theme))
+            .unwrap_or_else(|| Arc::new(vec![vec![]; note_code_line_count(&code.text)]))
     }
 
-    fn insert_note_code_highlight_cache(
+    fn current_note_code_matches(
+        &self,
+        block_start: usize,
+        key: NoteCodeHighlightKey,
+        source: &str,
+    ) -> bool {
+        self.right_sidebar_note
+            .projection
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                ProjectedObject::CodeBlock(code) if code.source.start == block_start => Some(code),
+                _ => None,
+            })
+            .is_some_and(|code| {
+                note_code_highlight_key(code) == Some(key) && code.text.as_str() == source
+            })
+    }
+
+    fn start_note_code_highlight(
         &mut self,
-        key: (u64, usize, bool),
-        lines: Arc<Vec<Vec<LinearRgba>>>,
+        block_start: usize,
+        key: NoteCodeHighlightKey,
+        generation: u64,
+        code: ProjectedCodeBlock,
     ) {
-        if !self.right_sidebar_note_code_highlights.contains_key(&key) {
-            self.right_sidebar_note_code_highlight_order.push_back(key);
-        }
-        self.right_sidebar_note_code_highlights.insert(key, lines);
-        while self.right_sidebar_note_code_highlight_order.len()
-            > NOTE_CODE_HIGHLIGHT_CACHE_CAPACITY
+        if self
+            .right_sidebar_note_code_highlight
+            .scheduled
+            .get(&block_start)
+            .copied()
+            != Some((key, generation))
         {
-            if let Some(expired) = self.right_sidebar_note_code_highlight_order.pop_front() {
-                self.right_sidebar_note_code_highlights.remove(&expired);
-            }
+            return;
         }
+        self.right_sidebar_note_code_highlight
+            .scheduled
+            .remove(&block_start);
+        if !self.current_note_code_matches(block_start, key, &code.text) {
+            return;
+        }
+        if let Some(entry) = self
+            .right_sidebar_note_code_highlight
+            .cached(key, &code.text)
+        {
+            self.right_sidebar_note_code_highlight
+                .remember_block(block_start, entry);
+            self.schedule_note_code_highlight_repaint();
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let cancellation = Arc::new(AtomicUsize::new(0));
+        self.right_sidebar_note_code_highlight
+            .in_flight
+            .insert(block_start, (key, Arc::clone(&cancellation)));
+        let source: Arc<str> = Arc::from(code.text.as_str());
+        syntax_highlight_pool().spawn(move || {
+            let stage = crate::input_diagnostics::StageTimer::begin("note_highlight");
+            let result = note_code_highlight_pair(&code, Some(cancellation.as_ref()));
+            stage.finish(result.is_some());
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_note_code_highlight_result(block_start, key, source, result);
+            })));
+        });
     }
 
     fn apply_note_code_highlight_result(
         &mut self,
-        pending_key: (u64, usize),
+        block_start: usize,
+        key: NoteCodeHighlightKey,
+        source: Arc<str>,
         result: Option<(Vec<Vec<LinearRgba>>, Vec<Vec<LinearRgba>>)>,
     ) {
-        self.right_sidebar_note_code_highlights_pending
-            .remove(&pending_key);
-        if self.right_sidebar_note.projection_revision.unwrap_or(0) != pending_key.0 {
-            return;
+        if self
+            .right_sidebar_note_code_highlight
+            .in_flight
+            .get(&block_start)
+            .is_some_and(|(pending, _)| *pending == key)
+        {
+            self.right_sidebar_note_code_highlight
+                .in_flight
+                .remove(&block_start);
         }
         let Some((light, dark)) = result else {
             return;
         };
-        self.insert_note_code_highlight_cache(
-            (pending_key.0, pending_key.1, false),
-            Arc::new(light),
-        );
-        self.insert_note_code_highlight_cache((pending_key.0, pending_key.1, true), Arc::new(dark));
-        self.invalidate_window();
+        let current_matches = self.current_note_code_matches(block_start, key, &source);
+        let entry = Arc::new(NoteCodeHighlightEntry {
+            key,
+            source,
+            light: Arc::new(light),
+            dark: Arc::new(dark),
+        });
+        self.right_sidebar_note_code_highlight
+            .insert_cache(Arc::clone(&entry));
+        if current_matches {
+            self.right_sidebar_note_code_highlight
+                .remember_block(block_start, entry);
+            self.schedule_note_code_highlight_repaint();
+        }
+    }
+
+    fn schedule_note_code_highlight_repaint(&mut self) {
+        if self.right_sidebar_note_code_highlight.repaint_scheduled {
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.right_sidebar_note_code_highlight.repaint_scheduled = true;
+        promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(NOTE_CODE_HIGHLIGHT_REPAINT_MS)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window
+                    .right_sidebar_note_code_highlight
+                    .repaint_scheduled = false;
+                if term_window.right_sidebar_note_visible() {
+                    term_window.invalidate_window();
+                }
+            })));
+        })
+        .detach();
     }
 
     /// Per-byte colours for a whole preview line, keyed by (generation, line
@@ -1274,29 +1833,29 @@ impl crate::TermWindow {
         if !path.is_dir() {
             items.push(ContextMenuItem::item_with_icon(
                 "Open",
-                "arrow.up.forward.app",
+                ContextMenuIcon::ExternalLink,
                 KeyAssignment::OpenFileWithSystemDefault(path_string.clone()),
             ));
         }
         items.push(ContextMenuItem::item_with_icon(
-            "Reveal in Folder",
-            "folder",
+            super::context_menu::reveal_in_folder_label(),
+            ContextMenuIcon::Folder,
             KeyAssignment::RevealFileInFolder(path_string.clone()),
         ));
         items.push(ContextMenuItem::item_with_icon(
             "Copy Path",
-            "doc.on.doc",
+            ContextMenuIcon::Copy,
             KeyAssignment::CopyFilePathToClipboard(path_string.clone()),
         ));
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item_with_icon(
             "Rename...",
-            "pencil",
+            ContextMenuIcon::Edit,
             KeyAssignment::RenameSidebarFile(path_string.clone()),
         ));
         items.push(ContextMenuItem::item_with_icon(
             "Move to Trash",
-            "trash",
+            ContextMenuIcon::Delete,
             KeyAssignment::TrashSidebarFile(path_string),
         ));
         items
@@ -1419,7 +1978,7 @@ impl crate::TermWindow {
                 .map(|candidate| {
                     ContextMenuItem::item_with_icon(
                         format!("Open With {}", candidate.label),
-                        "app",
+                        ContextMenuIcon::Application,
                         KeyAssignment::OpenFileWith {
                             path: path_string.clone(),
                             app: candidate.id,
@@ -1434,7 +1993,7 @@ impl crate::TermWindow {
         }
         items.push(ContextMenuItem::item_with_icon(
             "Open With Other…",
-            "app",
+            ContextMenuIcon::Application,
             KeyAssignment::PickOpenFileWithApp(path_string),
         ));
         items
@@ -1553,11 +2112,7 @@ impl crate::TermWindow {
                 text.push_str(&preview_text_range(&line.plain, line_start, line_end));
             }
         }
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 
     fn right_sidebar_file_preview_selection_range(
@@ -2127,6 +2682,411 @@ impl crate::TermWindow {
         }
     }
 
+    pub(crate) fn perform_right_sidebar_note_command(&mut self, command: NoteEditorCommand) {
+        match command {
+            NoteEditorCommand::Undo => {
+                if let Some(session) = self.right_sidebar_note.session.clone() {
+                    if session.lock().undo(&mut self.right_sidebar_note.view) {
+                        self.note_did_edit();
+                    }
+                }
+            }
+            NoteEditorCommand::Redo => {
+                if let Some(session) = self.right_sidebar_note.session.clone() {
+                    if session.lock().redo(&mut self.right_sidebar_note.view) {
+                        self.note_did_edit();
+                    }
+                }
+            }
+            NoteEditorCommand::Cut => self.cut_right_sidebar_focused_input(),
+            NoteEditorCommand::Copy => {
+                self.copy_right_sidebar_focused_input(ClipboardCopyDestination::Clipboard)
+            }
+            NoteEditorCommand::Paste => {
+                self.paste_into_right_sidebar_from_clipboard(ClipboardPasteSource::Clipboard)
+            }
+            NoteEditorCommand::Delete => {
+                if let Some(session) = self.right_sidebar_note.session.clone() {
+                    if session
+                        .lock()
+                        .delete_selection(&mut self.right_sidebar_note.view)
+                    {
+                        self.note_did_edit();
+                    }
+                }
+            }
+            NoteEditorCommand::SelectAll => {
+                if let Some(session) = self.right_sidebar_note.session.clone() {
+                    session.lock().select_all(&mut self.right_sidebar_note.view);
+                    self.right_sidebar_note.refresh_projection();
+                }
+            }
+            NoteEditorCommand::ReplaceSpelling {
+                revision,
+                range,
+                replacement,
+            } => {
+                if let Some(session) = self.right_sidebar_note.session.clone() {
+                    if session.lock().replace_range_at_revision(
+                        &mut self.right_sidebar_note.view,
+                        revision,
+                        range,
+                        &replacement,
+                    ) {
+                        self.note_did_edit();
+                    }
+                }
+            }
+            NoteEditorCommand::IgnoreSpelling { word } => {
+                self.ignore_right_sidebar_note_spelling(&word);
+            }
+            NoteEditorCommand::LearnSpelling { word } => {
+                self.learn_right_sidebar_note_spelling(&word);
+            }
+            NoteEditorCommand::LookUp { text, anchor } => {
+                if let Some(window) = self.window.as_ref() {
+                    window.show_text_definition(&text, anchor);
+                }
+            }
+            NoteEditorCommand::ToggleSourceMode => self.toggle_right_sidebar_note_mode(),
+            NoteEditorCommand::Save => self.save_right_sidebar_note_now(),
+            NoteEditorCommand::ChooseVault { managed } => {
+                self.choose_right_sidebar_note_vault(managed)
+            }
+            NoteEditorCommand::NewNote => self.create_right_sidebar_note(),
+            NoteEditorCommand::OpenNote { relative_path } => {
+                self.activate_right_sidebar_note_tree_path(&relative_path)
+            }
+            NoteEditorCommand::RevealVault => {
+                if let Some(vault) = workspace_threads::space_note_vault(&self.active_space_id) {
+                    wezterm_open_url::reveal_path(&vault.root);
+                }
+            }
+            NoteEditorCommand::ToggleVaultTree => self.toggle_right_sidebar_note_vault_tree(),
+        }
+    }
+
+    pub(crate) fn toggle_right_sidebar_note_vault_tree(&mut self) {
+        if self.right_sidebar_note_wide_layout {
+            self.right_sidebar_note_vault_tree_collapsed =
+                !self.right_sidebar_note_vault_tree_collapsed;
+        } else {
+            self.right_sidebar_note_view = match self.right_sidebar_note_view {
+                RightSidebarNoteView::Tree => RightSidebarNoteView::Editor,
+                RightSidebarNoteView::Editor => RightSidebarNoteView::Tree,
+            };
+        }
+        self.right_sidebar_note_tree_scroll_offset = 0.0;
+    }
+
+    fn choose_right_sidebar_note_vault(&mut self, managed: bool) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let space_id = self.active_space_id.clone();
+        let notify_window = window.clone();
+        let options = if managed {
+            FolderPickerOptions {
+                title: "Create Vault".to_string(),
+                prompt: "Create".to_string(),
+            }
+        } else {
+            FolderPickerOptions {
+                title: "Choose Vault".to_string(),
+                prompt: "Choose".to_string(),
+            }
+        };
+        window.pick_folder_async_with_options(
+            options,
+            Box::new(move |path| {
+                let Some(path) = path else {
+                    return;
+                };
+                let result = workspace_threads::set_space_note_vault(&space_id, path, managed);
+                notify_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.right_sidebar_note_open_generation = term_window
+                        .right_sidebar_note_open_generation
+                        .wrapping_add(1);
+                    term_window.right_sidebar_note_opening = None;
+                    term_window.right_sidebar_note_open_failure = None;
+                    match result {
+                        Ok(_) => term_window.right_sidebar_note.clear_document(None),
+                        Err(err) => term_window
+                            .right_sidebar_note
+                            .clear_document(Some(format!("{err:#}"))),
+                    }
+                    term_window.invalidate_window();
+                })));
+            }),
+        );
+    }
+
+    fn create_right_sidebar_note(&mut self) {
+        let Some(vault) = workspace_threads::space_note_vault(&self.active_space_id) else {
+            return;
+        };
+        let Some(project_id) =
+            workspace_threads::active_project_id_for_space(&self.active_space_id)
+        else {
+            return;
+        };
+        let existing = vault_markdown_paths(&vault.root).unwrap_or_default();
+        let existing = existing
+            .into_iter()
+            .map(|path| path.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let mut sequence = 1usize;
+        let relative_path = loop {
+            let candidate = if sequence == 1 {
+                "Untitled.md".to_string()
+            } else {
+                format!("Untitled {sequence}.md")
+            };
+            if !existing.contains(&candidate.to_ascii_lowercase()) {
+                break candidate;
+            }
+            sequence += 1;
+        };
+        self.right_sidebar_note_open_failure = None;
+        self.request_right_sidebar_note_open(vault.root, relative_path, true, project_id, true);
+    }
+
+    pub(crate) fn activate_right_sidebar_note_tree_path(&mut self, relative_path: &str) {
+        let Some(vault) = workspace_threads::space_note_vault(&self.active_space_id) else {
+            return;
+        };
+        let candidate = vault.root.join(relative_path);
+        if candidate.is_dir() {
+            if !self.right_sidebar_note_tree_expanded.remove(relative_path) {
+                self.right_sidebar_note_tree_expanded
+                    .insert(relative_path.to_string());
+            }
+            return;
+        }
+        if candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("md"))
+        {
+            let safe_candidate = candidate.canonicalize().ok().filter(|candidate| {
+                vault
+                    .root
+                    .canonicalize()
+                    .is_ok_and(|root| candidate.starts_with(root))
+            });
+            let Some(candidate) = safe_candidate else {
+                self.right_sidebar_note.load_error =
+                    Some(format!("Vault file is unavailable: {relative_path}"));
+                return;
+            };
+            match url::Url::from_file_path(&candidate) {
+                Ok(url) => wezterm_open_url::open_url(url.as_str()),
+                Err(()) => {
+                    self.right_sidebar_note.load_error =
+                        Some(format!("Unable to open {}", candidate.display()));
+                }
+            }
+            return;
+        }
+        let Some(project_id) =
+            workspace_threads::active_project_id_for_space(&self.active_space_id)
+        else {
+            return;
+        };
+        self.right_sidebar_note_open_failure = None;
+        self.request_right_sidebar_note_open(
+            vault.root,
+            relative_path.to_string(),
+            false,
+            project_id,
+            false,
+        );
+    }
+
+    pub(crate) fn activate_or_create_right_sidebar_wiki_link(
+        &mut self,
+        target: &str,
+        resolved_path: Option<&str>,
+    ) {
+        if let Some(path) = resolved_path {
+            self.activate_right_sidebar_note_tree_path(path);
+            return;
+        }
+        let Some(document) = self.right_sidebar_note.document.clone() else {
+            return;
+        };
+        let target = target.split(['#', '^']).next().unwrap_or(target).trim();
+        if target.is_empty() {
+            return;
+        }
+        let mut relative = Path::new(&document.relative_path)
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target);
+        if relative.extension().is_none() {
+            relative.set_extension("md");
+        }
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let relative = match workspace_threads::normalize_vault_markdown_path(&relative) {
+            Ok(relative) => relative,
+            Err(err) => {
+                self.right_sidebar_note.load_error = Some(format!("{err:#}"));
+                return;
+            }
+        };
+        let Some(project_id) =
+            workspace_threads::active_project_id_for_space(&self.active_space_id)
+        else {
+            return;
+        };
+        self.right_sidebar_note_vault_last_scan = None;
+        self.right_sidebar_note_open_failure = None;
+        self.request_right_sidebar_note_open(
+            document.vault_root,
+            relative,
+            true,
+            project_id,
+            false,
+        );
+    }
+
+    pub(crate) fn show_right_sidebar_note_wiki_link_choices(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: window::Point,
+        candidates: Vec<String>,
+    ) {
+        self.begin_context_menu_application_actions();
+        let items = candidates
+            .into_iter()
+            .map(|relative_path| {
+                self.context_menu_application_item_with_icon(
+                    relative_path.clone(),
+                    ContextMenuIcon::File,
+                    crate::termwindow::ContextMenuApplicationAction::Note(
+                        NoteEditorCommand::OpenNote { relative_path },
+                    ),
+                    true,
+                )
+            })
+            .collect();
+        self.show_term_context_menu(context, anchor, items);
+    }
+
+    pub(crate) fn show_right_sidebar_note_menu(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: window::Point,
+    ) {
+        self.begin_context_menu_application_actions();
+        let source_mode = self.right_sidebar_note.view.mode == EditorMode::Source;
+        let save_enabled = !matches!(
+            self.right_sidebar_note.display_save_state(),
+            SaveState::Saved | SaveState::Saving(_)
+        );
+        let mut source_item = self.context_menu_application_item_with_icon(
+            "Source Mode",
+            ContextMenuIcon::Code,
+            crate::termwindow::ContextMenuApplicationAction::Note(
+                NoteEditorCommand::ToggleSourceMode,
+            ),
+            true,
+        );
+        source_item = source_item.checked(source_mode);
+        let vault_tree_label = if self.right_sidebar_note_wide_layout {
+            if self.right_sidebar_note_vault_tree_collapsed {
+                "Show Vault Sidebar"
+            } else {
+                "Hide Vault Sidebar"
+            }
+        } else if self.right_sidebar_note_view == RightSidebarNoteView::Tree {
+            "Hide Vault"
+        } else {
+            "Show Vault"
+        };
+        let items = vec![
+            self.context_menu_application_item_with_icon(
+                "New Note",
+                ContextMenuIcon::Note,
+                crate::termwindow::ContextMenuApplicationAction::Note(NoteEditorCommand::NewNote),
+                true,
+            ),
+            self.context_menu_application_item_with_icon(
+                "Save",
+                ContextMenuIcon::Save,
+                crate::termwindow::ContextMenuApplicationAction::Note(NoteEditorCommand::Save),
+                save_enabled,
+            ),
+            source_item,
+            self.context_menu_application_item_with_icon(
+                vault_tree_label,
+                ContextMenuIcon::Sidebar,
+                crate::termwindow::ContextMenuApplicationAction::Note(
+                    NoteEditorCommand::ToggleVaultTree,
+                ),
+                true,
+            ),
+            ContextMenuItem::Separator,
+            self.context_menu_application_item_with_icon(
+                "Choose Another Vault…",
+                ContextMenuIcon::Vault,
+                crate::termwindow::ContextMenuApplicationAction::Note(
+                    NoteEditorCommand::ChooseVault { managed: false },
+                ),
+                true,
+            ),
+            self.context_menu_application_item_with_icon(
+                super::context_menu::reveal_in_folder_label(),
+                ContextMenuIcon::Folder,
+                crate::termwindow::ContextMenuApplicationAction::Note(
+                    NoteEditorCommand::RevealVault,
+                ),
+                workspace_threads::space_note_vault(&self.active_space_id).is_some(),
+            ),
+        ];
+        self.show_term_context_menu(context, anchor, items);
+    }
+
+    fn ignore_right_sidebar_note_spelling(&mut self, word: &str) {
+        let Some(session) = self.right_sidebar_note.session.as_ref() else {
+            return;
+        };
+        let document_id = session.lock().document_id.clone();
+        if let Some(window) = self.window.as_ref() {
+            window.ignore_spelling_word(&document_id, word);
+        }
+        self.right_sidebar_note.spelling_issues = Arc::new(
+            self.right_sidebar_note
+                .spelling_issues
+                .iter()
+                .filter(|issue| !issue.word.eq_ignore_ascii_case(word))
+                .cloned()
+                .collect(),
+        );
+        self.right_sidebar_note.spelling_revision = None;
+        self.right_sidebar_note.spelling_context = None;
+        self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
+        self.invalidate_window();
+    }
+
+    fn learn_right_sidebar_note_spelling(&mut self, word: &str) {
+        if let Some(window) = self.window.as_ref() {
+            window.learn_spelling_word(word);
+        }
+        self.right_sidebar_note.spelling_issues = Arc::new(
+            self.right_sidebar_note
+                .spelling_issues
+                .iter()
+                .filter(|issue| !issue.word.eq_ignore_ascii_case(word))
+                .cloned()
+                .collect(),
+        );
+        self.right_sidebar_note.spelling_revision = None;
+        self.right_sidebar_note.spelling_context = None;
+        self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
+        self.invalidate_window();
+    }
+
     pub(crate) fn cut_right_sidebar_focused_input(&mut self) {
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             let Some(session) = self.right_sidebar_note.session.clone() else {
@@ -2421,6 +3381,7 @@ impl crate::TermWindow {
 
     pub(crate) fn push_right_sidebar_text(&mut self, text: &str) -> bool {
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
+            self.right_sidebar_note.begin_live_editing();
             let Some(session) = self.right_sidebar_note.session.clone() else {
                 return false;
             };
@@ -2442,6 +3403,7 @@ impl crate::TermWindow {
     }
 
     fn handle_right_sidebar_note_key(&mut self, key: TermKeyCode, mods: TermModifiers) -> bool {
+        self.right_sidebar_note.begin_live_editing();
         let shift = mods.contains(TermModifiers::SHIFT);
         let super_ = mods.contains(TermModifiers::SUPER);
         let ctrl = mods.contains(TermModifiers::CTRL);
@@ -2705,11 +3667,14 @@ impl crate::TermWindow {
             EditorMode::LivePreview => EditorMode::Source,
             EditorMode::Source | EditorMode::ReadOnly => EditorMode::LivePreview,
         };
+        self.schedule_right_sidebar_note_parse();
         self.right_sidebar_note.refresh_projection();
+        self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
         self.invalidate_window();
     }
 
     pub(crate) fn save_right_sidebar_note_now(&mut self) {
+        self.right_sidebar_note.cancel_autosave_deadline();
         let Some(session) = self.right_sidebar_note.session.clone() else {
             return;
         };
@@ -2719,27 +3684,39 @@ impl crate::TermWindow {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
+        let origin_mux_window_id = self.mux_window_id;
+        let saved_session = Arc::clone(&session);
         promise::spawn::spawn(async move {
-            let result =
-                promise::spawn::spawn_into_new_thread(move || save_document_revision(&session))
-                    .await;
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                if let Err(err) = result {
-                    log::error!("failed to save Note: {err:#}");
-                }
-                if let Some(front_end) = crate::frontend::try_front_end() {
-                    for gui_window in front_end.gui_windows() {
-                        gui_window.window.invalidate();
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                let stage = crate::input_diagnostics::StageTimer::begin("note_save");
+                let result = save_document_revision(&session);
+                stage.finish(result.is_ok());
+                result
+            })
+            .await;
+            window.notify(TermWindowNotif::Apply(Box::new(
+                move |term_window| match result {
+                    Ok(outcome) => {
+                        term_window.publish_right_sidebar_note_revision(
+                            origin_mux_window_id,
+                            saved_session,
+                            outcome.saved_revision,
+                        );
                     }
-                } else {
-                    term_window.invalidate_window();
-                }
-            })));
+                    Err(err) => {
+                        log::error!("failed to save Note: {err:#}");
+                        if term_window.right_sidebar_note_visible() {
+                            term_window.invalidate_window();
+                        }
+                    }
+                },
+            )));
         })
         .detach();
     }
 
     pub(crate) fn flush_right_sidebar_note_blocking(&mut self) {
+        self.right_sidebar_note.cancel_autosave_deadline();
         let Some(session) = self.right_sidebar_note.session.clone() else {
             return;
         };
@@ -2750,41 +3727,506 @@ impl crate::TermWindow {
         }
     }
 
-    fn note_did_edit(&mut self) {
+    pub(crate) fn note_did_edit(&mut self) {
         self.right_sidebar_note.refresh_projection();
+        self.schedule_right_sidebar_note_parse();
         self.right_sidebar_note.reveal_caret = true;
-        self.right_sidebar_note.save_generation =
-            self.right_sidebar_note.save_generation.wrapping_add(1);
-        let generation = self.right_sidebar_note.save_generation;
+        self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(
+            NOTE_SPELLCHECK_DEBOUNCE_MS,
+        ));
+        if self
+            .right_sidebar_note
+            .note_edited(Instant::now(), Duration::from_millis(NOTE_AUTOSAVE_MS))
+        {
+            if let Some(window) = self.window.as_ref().cloned() {
+                Self::schedule_right_sidebar_note_autosave_wakeup(
+                    window,
+                    Duration::from_millis(NOTE_AUTOSAVE_MS),
+                );
+            }
+        }
+    }
+
+    fn schedule_right_sidebar_note_parse(&mut self) {
+        let Some((revision, source, mode, caret, document)) =
+            self.right_sidebar_note.background_parse_request()
+        else {
+            return;
+        };
         let Some(window) = self.window.as_ref().cloned() else {
+            self.right_sidebar_note.parse_in_flight_revision = None;
             return;
         };
         promise::spawn::spawn(async move {
-            smol::Timer::after(Duration::from_millis(NOTE_AUTOSAVE_MS)).await;
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                if term_window.right_sidebar_note.save_generation != generation {
-                    return;
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                let stage = crate::input_diagnostics::StageTimer::begin("note_projection");
+                let mut projection = crate::markdown_editor::MarkdownProjection::parse(&source);
+                if let Some((vault_root, relative_path)) = document {
+                    projection.resolve_vault_links(&vault_root, &relative_path);
                 }
-                term_window.save_right_sidebar_note_now();
+                let visual = build_visual_document(&source, &projection, mode, caret);
+                stage.finish(true);
+                Ok((projection, visual))
+            })
+            .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                match result {
+                    Ok((projection, visual)) => {
+                        let applied = term_window
+                            .right_sidebar_note
+                            .apply_background_parse(revision, mode, caret, projection, visual);
+                        if applied {
+                            term_window
+                                .schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
+                            term_window.invalidate_window();
+                        }
+                    }
+                    Err(err) => {
+                        term_window.right_sidebar_note.parse_in_flight_revision = None;
+                        log::error!("failed to parse Note in background: {err:#}");
+                    }
+                }
+                if term_window.right_sidebar_note.background_parse_pending() {
+                    term_window.schedule_right_sidebar_note_parse();
+                }
             })));
         })
         .detach();
-        if let Some(front_end) = crate::frontend::try_front_end() {
-            for gui_window in front_end.gui_windows() {
-                gui_window
-                    .window
-                    .notify(TermWindowNotif::Apply(Box::new(|term_window| {
-                        if let Some(session) = term_window.right_sidebar_note.session.clone() {
-                            session
-                                .lock()
-                                .clamp_view(&mut term_window.right_sidebar_note.view);
-                            term_window.right_sidebar_note.refresh_projection();
-                            term_window.invalidate_window();
+    }
+
+    fn schedule_right_sidebar_note_wrap(
+        &mut self,
+        wrap_key: usize,
+        wrap_width: f32,
+        normal_metrics: NoteApproximateTextMetrics,
+        h1_metrics: NoteApproximateTextMetrics,
+        h2_metrics: NoteApproximateTextMetrics,
+        h3_metrics: NoteApproximateTextMetrics,
+        code_metrics: NoteApproximateTextMetrics,
+    ) {
+        let Some((key, visual, mut wrap_cache)) =
+            self.right_sidebar_note.background_wrap_request(wrap_key)
+        else {
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.right_sidebar_note.background_wrap_in_flight_key = None;
+            self.right_sidebar_note.wrap_cache = wrap_cache;
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                let stage = crate::input_diagnostics::StageTimer::begin("note_wrap");
+                let wrapped = wrap_visual_document_by_width_cached(
+                    &visual,
+                    wrap_width,
+                    wrap_key,
+                    &mut wrap_cache,
+                    |block, _, text| {
+                        let metrics = match block {
+                            BlockKind::Heading(1) => h1_metrics,
+                            BlockKind::Heading(2) => h2_metrics,
+                            BlockKind::Heading(_) => h3_metrics,
+                            BlockKind::CodeBlock => code_metrics,
+                            _ => normal_metrics,
+                        };
+                        Ok::<f32, anyhow::Error>(approximate_note_text_width(text, metrics))
+                    },
+                )?;
+                stage.finish(true);
+                Ok((wrapped, wrap_cache))
+            })
+            .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                match result {
+                    Ok((wrapped, wrap_cache)) => {
+                        term_window
+                            .right_sidebar_note
+                            .apply_background_wrap(key, wrapped, wrap_cache);
+                    }
+                    Err(err) => {
+                        if term_window.right_sidebar_note.background_wrap_in_flight_key == Some(key)
+                        {
+                            term_window.right_sidebar_note.background_wrap_in_flight_key = None;
                         }
-                    })));
+                        log::error!("failed to wrap Note in background: {err:#}");
+                    }
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    fn note_approximate_text_metrics(
+        &self,
+        font: &Rc<LoadedFont>,
+        render_metrics: &RenderMetrics,
+    ) -> anyhow::Result<NoteApproximateTextMetrics> {
+        // Background wrapping cannot move LoadedFont to its worker thread. Shape
+        // a tiny representative sample on the UI thread and pass only these
+        // Copy metrics across. Using the terminal cell width for every grapheme
+        // made proportional Latin text almost twice as wide as what we paint,
+        // causing long notes to wrap much earlier than short notes.
+        const LATIN_SAMPLE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        const WIDE_SAMPLE: &str = "系统";
+
+        let latin = self.cached_ui_text_advance(font, render_metrics, LATIN_SAMPLE)?
+            / LATIN_SAMPLE.chars().count() as f32;
+        let space = self.cached_ui_text_advance(font, render_metrics, " ")?;
+        let wide = self.cached_ui_text_advance(font, render_metrics, WIDE_SAMPLE)?
+            / WIDE_SAMPLE.chars().count() as f32;
+
+        Ok(NoteApproximateTextMetrics {
+            latin: latin.max(1.0),
+            space: space.max(1.0),
+            wide: wide.max(1.0),
+        })
+    }
+
+    fn schedule_right_sidebar_note_spellcheck(&mut self, delay: Duration) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        if !self.config.note_spellcheck_enabled
+            || !window.text_check_capabilities().spelling
+            || self.right_sidebar_note.view.mode == EditorMode::ReadOnly
+        {
+            return;
+        }
+        let Some(session) = self.right_sidebar_note.session.as_ref() else {
+            return;
+        };
+        let revision = session.lock().revision();
+        let focus = self.right_sidebar_note.view.selection.focus.byte;
+        let current_context_is_valid = self.right_sidebar_note.spelling_revision == Some(revision)
+            && self
+                .right_sidebar_note
+                .spelling_context
+                .as_ref()
+                .is_some_and(|context| context.start <= focus && focus <= context.end);
+        if current_context_is_valid
+            || self.right_sidebar_note.spellcheck_scheduled_revision == Some(revision)
+            || self.right_sidebar_note.spellcheck_in_flight_revision == Some(revision)
+        {
+            return;
+        }
+        self.right_sidebar_note.spellcheck_scheduled_revision = Some(revision);
+        promise::spawn::spawn(async move {
+            smol::Timer::after(delay).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.run_right_sidebar_note_spellcheck(revision);
+            })));
+        })
+        .detach();
+    }
+
+    fn run_right_sidebar_note_spellcheck(&mut self, revision: u64) {
+        if self.right_sidebar_note.spellcheck_scheduled_revision != Some(revision) {
+            return;
+        }
+        self.right_sidebar_note.spellcheck_scheduled_revision = None;
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return;
+        };
+        let (document_id, chunks, check_range) = {
+            let session = session.lock();
+            if session.revision() != revision {
+                self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(
+                    NOTE_SPELLCHECK_DEBOUNCE_MS,
+                ));
+                return;
             }
-        } else {
+            let source = session.source();
+            let mut check_range = if source.len() > 64 * 1024 {
+                self.right_sidebar_note
+                    .projection
+                    .active_block_range(self.right_sidebar_note.view.selection.focus.byte)
+                    .unwrap_or_else(|| {
+                        session.source_line_selection_range(
+                            self.right_sidebar_note.view.selection.focus.byte,
+                        )
+                    })
+            } else {
+                0..source.len()
+            };
+            const MAX_SPELLCHECK_CONTEXT_BYTES: usize = 64 * 1024;
+            if check_range.end.saturating_sub(check_range.start) > MAX_SPELLCHECK_CONTEXT_BYTES {
+                let focus = self
+                    .right_sidebar_note
+                    .view
+                    .selection
+                    .focus
+                    .byte
+                    .min(source.len());
+                let mut start = focus.saturating_sub(MAX_SPELLCHECK_CONTEXT_BYTES / 2);
+                while start < focus && !source.is_char_boundary(start) {
+                    start += 1;
+                }
+                let mut end = (start + MAX_SPELLCHECK_CONTEXT_BYTES).min(source.len());
+                while end > start && !source.is_char_boundary(end) {
+                    end -= 1;
+                }
+                check_range = start..end;
+            }
+            (
+                session.document_id.clone(),
+                build_spell_check_chunks_in_range(
+                    source,
+                    &self.right_sidebar_note.projection,
+                    check_range.clone(),
+                ),
+                check_range,
+            )
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.right_sidebar_note.spellcheck_in_flight_revision = Some(revision);
+        promise::spawn::spawn(async move {
+            let mut issues = Vec::new();
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let request_id = revision.wrapping_mul(1_000_003).wrapping_add(index as u64);
+                let response = window
+                    .request_text_check(window::TextCheckRequest {
+                        document_id: document_id.clone(),
+                        request_id,
+                        text: chunk.text.clone(),
+                    })
+                    .await;
+                let Ok(response) = response else {
+                    continue;
+                };
+                if response.request_id != request_id {
+                    continue;
+                }
+                for issue in response.issues {
+                    let Some(source_range) = chunk.source_range_for_issue(issue.range.clone())
+                    else {
+                        continue;
+                    };
+                    let Some(word) = chunk.text.get(issue.range).map(str::to_string) else {
+                        continue;
+                    };
+                    issues.push(NoteSpellingIssue {
+                        source: source_range,
+                        word,
+                        suggestions: issue.suggestions,
+                    });
+                }
+            }
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_right_sidebar_note_spellcheck(revision, check_range, issues);
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_right_sidebar_note_spellcheck(
+        &mut self,
+        revision: u64,
+        check_range: std::ops::Range<usize>,
+        mut issues: Vec<NoteSpellingIssue>,
+    ) {
+        if self.right_sidebar_note.spellcheck_in_flight_revision == Some(revision) {
+            self.right_sidebar_note.spellcheck_in_flight_revision = None;
+        }
+        let Some(session) = self.right_sidebar_note.session.as_ref() else {
+            return;
+        };
+        if session.lock().revision() != revision {
+            self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(
+                NOTE_SPELLCHECK_DEBOUNCE_MS,
+            ));
+            return;
+        }
+        issues.sort_by_key(|issue| (issue.source.start, issue.source.end));
+        issues.dedup_by(|a, b| a.source == b.source);
+        self.right_sidebar_note.spelling_issues = Arc::new(issues);
+        self.right_sidebar_note.spelling_revision = Some(revision);
+        self.right_sidebar_note.spelling_context = Some(check_range.clone());
+        let focus = self.right_sidebar_note.view.selection.focus.byte;
+        if focus < check_range.start || focus > check_range.end {
+            self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
+        }
+        self.invalidate_window();
+    }
+
+    fn sync_right_sidebar_note_native_text_input_snapshot(&mut self, wrap_key: usize) {
+        let active = self.right_sidebar_note.view.focused
+            && self.right_sidebar_note.view.mode != EditorMode::ReadOnly;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        if !active {
+            if self
+                .right_sidebar_note
+                .native_text_input_snapshot_key
+                .take()
+                .is_some()
+            {
+                window.set_native_text_input_snapshot(None);
+            }
+            return;
+        }
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return;
+        };
+        let selection = self.right_sidebar_note.view.selection.range();
+        let revision = session.lock().revision();
+        let key = (
+            revision,
+            selection.start,
+            selection.end,
+            self.right_sidebar_note.view.scroll_offset.to_bits(),
+            wrap_key,
+        );
+        if self.right_sidebar_note.native_text_input_snapshot_key == Some(key) {
+            return;
+        }
+
+        const MAX_NATIVE_CONTEXT_BYTES: usize = 64 * 1024;
+        let focus = self.right_sidebar_note.view.selection.focus.byte;
+        let mut context = self
+            .right_sidebar_note
+            .projection
+            .active_block_range(focus)
+            .unwrap_or_else(|| session.lock().source_line_selection_range(focus));
+        let (context_text, native_selection) = {
+            let session = session.lock();
+            let source = session.source();
+            let focus = focus.min(source.len());
+            context.start = context.start.min(selection.start).min(source.len());
+            context.end = context.end.max(selection.end).min(source.len());
+            let native_selection =
+                if context.end.saturating_sub(context.start) > MAX_NATIVE_CONTEXT_BYTES {
+                    let half = MAX_NATIVE_CONTEXT_BYTES / 2;
+                    let mut start = focus.saturating_sub(half);
+                    let mut end = start
+                        .saturating_add(MAX_NATIVE_CONTEXT_BYTES)
+                        .min(source.len());
+                    start = end.saturating_sub(MAX_NATIVE_CONTEXT_BYTES);
+                    while start > 0 && !source.is_char_boundary(start) {
+                        start -= 1;
+                    }
+                    while end > start && !source.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    context = start..end;
+                    focus..focus
+                } else {
+                    selection.clone()
+                };
+            while context.start > 0 && !source.is_char_boundary(context.start) {
+                context.start -= 1;
+            }
+            while context.end > context.start && !source.is_char_boundary(context.end) {
+                context.end -= 1;
+            }
+            (source[context.clone()].to_string(), native_selection)
+        };
+
+        let mut hits = Vec::new();
+        for line in &self.right_sidebar_note.line_layouts {
+            for run in &line.runs {
+                for (x, byte) in &run.boundaries {
+                    if *byte < context.start || *byte > context.end {
+                        continue;
+                    }
+                    hits.push(window::NativeTextHit {
+                        rect: Rect::new(
+                            Point::new(*x as isize, line.y as isize),
+                            window::Size::new(1, line.height.max(1.0) as isize),
+                        ),
+                        byte: byte.saturating_sub(context.start),
+                    });
+                }
+            }
+        }
+        self.right_sidebar_note.native_text_input_token = self
+            .right_sidebar_note
+            .native_text_input_token
+            .wrapping_add(1)
+            .max(1);
+        let relative_selection = native_selection.start.saturating_sub(context.start)
+            ..native_selection.end.saturating_sub(context.start);
+        window.set_native_text_input_snapshot(Some(window::NativeTextInputSnapshot {
+            token: self.right_sidebar_note.native_text_input_token,
+            revision,
+            source_base: context.start,
+            text: context_text,
+            selection: relative_selection,
+            hits,
+        }));
+        self.right_sidebar_note.native_text_input_snapshot_key = Some(key);
+    }
+
+    fn schedule_right_sidebar_note_autosave_wakeup(window: window::Window, delay: Duration) {
+        promise::spawn::spawn(async move {
+            smol::Timer::after(delay).await;
+            let notify_window = window.clone();
+            window.notify(TermWindowNotif::Apply(Box::new(
+                move |term_window| match term_window
+                    .right_sidebar_note
+                    .autosave_woke(Instant::now())
+                {
+                    AutosaveWakeAction::Idle => {}
+                    AutosaveWakeAction::SaveNow => term_window.save_right_sidebar_note_now(),
+                    AutosaveWakeAction::Reschedule(remaining) => {
+                        Self::schedule_right_sidebar_note_autosave_wakeup(notify_window, remaining);
+                    }
+                },
+            )));
+        })
+        .detach();
+    }
+
+    fn right_sidebar_note_visible(&self) -> bool {
+        !self.right_sidebar_collapsed && self.right_sidebar_mode == RightSidebarMode::Tasks
+    }
+
+    fn apply_right_sidebar_note_published_revision(
+        &mut self,
+        session: &Arc<parking_lot::Mutex<crate::markdown_editor::MarkdownDocumentSession>>,
+        saved_revision: u64,
+    ) {
+        if self
+            .right_sidebar_note
+            .session
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, session))
+        {
+            return;
+        }
+        self.right_sidebar_note
+            .apply_published_snapshot(saved_revision);
+        // Live hosts remain Live, but still repaint the Saving/Saved badge.
+        if self.right_sidebar_note_visible() {
             self.invalidate_window();
+        }
+    }
+
+    fn publish_right_sidebar_note_revision(
+        &mut self,
+        origin_mux_window_id: mux::window::WindowId,
+        session: Arc<parking_lot::Mutex<crate::markdown_editor::MarkdownDocumentSession>>,
+        saved_revision: u64,
+    ) {
+        self.apply_right_sidebar_note_published_revision(&session, saved_revision);
+        let Some(front_end) = crate::frontend::try_front_end() else {
+            return;
+        };
+        for gui_window in front_end.gui_windows() {
+            if gui_window.mux_window_id == origin_mux_window_id {
+                continue;
+            }
+            let session = Arc::clone(&session);
+            gui_window
+                .window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window
+                        .apply_right_sidebar_note_published_revision(&session, saved_revision);
+                })));
         }
     }
 
@@ -3838,6 +5280,325 @@ impl crate::TermWindow {
         }
     }
 
+    fn refresh_note_vault_index_if_needed(&mut self, root: &Path) {
+        let root_changed = self
+            .right_sidebar_note_vault_index_root
+            .as_ref()
+            .is_none_or(|current| current != root);
+        if root_changed {
+            self.right_sidebar_note_vault_index_generation = self
+                .right_sidebar_note_vault_index_generation
+                .wrapping_add(1);
+            self.right_sidebar_note_vault_index_root = Some(root.to_path_buf());
+            self.right_sidebar_note_vault_paths = Arc::new(Vec::new());
+            self.right_sidebar_note_tree_expanded.clear();
+            self.right_sidebar_note_vault_last_scan = None;
+            self.right_sidebar_note_vault_indexing = false;
+            self.right_sidebar_note_tree_scroll_offset = 0.0;
+        }
+        if self.right_sidebar_note_vault_indexing
+            || (!root_changed
+                && self.right_sidebar_note_vault_last_scan.is_some_and(|last| {
+                    last.elapsed() < Duration::from_secs(NOTE_VAULT_RESCAN_SECS)
+                }))
+        {
+            return;
+        }
+
+        self.right_sidebar_note_vault_index_generation = self
+            .right_sidebar_note_vault_index_generation
+            .wrapping_add(1);
+        let generation = self.right_sidebar_note_vault_index_generation;
+        self.right_sidebar_note_vault_indexing = true;
+        self.right_sidebar_note_vault_last_scan = Some(Instant::now());
+        let root = root.to_path_buf();
+        let worker_root = root.clone();
+        let active_document = self
+            .right_sidebar_note
+            .document
+            .as_ref()
+            .filter(|document| document.vault_root == root)
+            .map(|document| {
+                (
+                    document.document_path.clone(),
+                    document.session.lock().disk_stamp(),
+                )
+            });
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                let paths = vault_file_paths(&worker_root)?;
+                let active_snapshot = active_document
+                    .map(|(path, known_stamp)| -> anyhow::Result<_> {
+                        let metadata = fs::metadata(&path)
+                            .with_context(|| format!("stat {}", path.display()))?;
+                        let modified = metadata
+                            .modified()
+                            .with_context(|| format!("read mtime {}", path.display()))?;
+                        let len = metadata.len();
+                        if known_stamp == Some((modified, len)) {
+                            return Ok(None);
+                        }
+                        let source = fs::read_to_string(&path)
+                            .with_context(|| format!("read {}", path.display()))?;
+                        Ok(Some((modified, len, source)))
+                    })
+                    .transpose()?
+                    .flatten();
+                Ok::<_, anyhow::Error>((paths, active_snapshot))
+            })
+            .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                if generation != term_window.right_sidebar_note_vault_index_generation
+                    || term_window.right_sidebar_note_vault_index_root.as_ref() != Some(&root)
+                {
+                    return;
+                }
+                term_window.right_sidebar_note_vault_indexing = false;
+                let mut changed = term_window.right_sidebar_note.document.is_none();
+                match result {
+                    Ok((paths, active_snapshot)) => {
+                        if term_window.right_sidebar_note_vault_paths.as_ref() != &paths {
+                            for path in &paths {
+                                let mut parent = Path::new(path).parent();
+                                while let Some(directory) = parent {
+                                    if directory.as_os_str().is_empty() {
+                                        break;
+                                    }
+                                    term_window
+                                        .right_sidebar_note_tree_expanded
+                                        .insert(directory.to_string_lossy().replace('\\', "/"));
+                                    parent = directory.parent();
+                                }
+                            }
+                            term_window.right_sidebar_note_vault_paths = Arc::new(paths);
+                            changed = true;
+                        }
+                        if let Some((modified, len, source)) = active_snapshot {
+                            changed |= term_window
+                                .right_sidebar_note
+                                .apply_external_snapshot(modified, len, source);
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        changed = term_window.right_sidebar_note.load_error.as_deref()
+                            != Some(message.as_str());
+                        term_window.right_sidebar_note.load_error = Some(message);
+                    }
+                }
+                if changed {
+                    term_window.invalidate_window();
+                }
+            })));
+        })
+        .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_note_vault_tree(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        narrow: bool,
+    ) -> anyhow::Result<()> {
+        let header_height = self.ui_px(NOTE_TOOLBAR_HEIGHT);
+        let button_size = header_height;
+        let mut title_x = content_x + self.ui_px(SIDEBAR_INSET);
+        if narrow {
+            self.paint_snippet_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                button_size,
+                SvgIcon::ArrowLeft,
+                UIItemType::RightSidebarNoteTreeBack,
+            )?;
+            title_x = content_x + button_size + self.ui_px(6);
+        } else {
+            self.paint_snippet_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x + content_width.saturating_sub(button_size),
+                content_top,
+                button_size,
+                SvgIcon::PanelLeftClose,
+                UIItemType::RightSidebarNoteTreeToggle,
+            )?;
+        }
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            "Vault",
+            title_x,
+            content_top + header_height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
+            content_x.saturating_add(content_width).saturating_sub(
+                title_x + self.ui_px(SIDEBAR_INSET) + if narrow { 0 } else { button_size },
+            ),
+            foreground,
+        )?;
+
+        let rows = note_vault_tree_rows(
+            &self.right_sidebar_note_vault_paths,
+            &self.right_sidebar_note_tree_expanded,
+        );
+        let tree_top = content_top + header_height + self.ui_px(4);
+        let tree_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
+        let visible_height = tree_bottom.saturating_sub(tree_top);
+        let row_metrics = right_sidebar_file_row_metrics(ui_metrics);
+        let max_scroll = rows
+            .len()
+            .saturating_mul(row_metrics.row_height)
+            .saturating_sub(visible_height) as f32;
+        self.right_sidebar_note_tree_scroll_offset = self
+            .right_sidebar_note_tree_scroll_offset
+            .clamp(0.0, max_scroll);
+        let range = visible_file_row_range(
+            rows.len(),
+            self.right_sidebar_note_tree_scroll_offset,
+            visible_height,
+            row_metrics.row_height,
+        );
+        let selected = self
+            .right_sidebar_note
+            .document
+            .as_ref()
+            .map(|document| document.relative_path.as_str());
+        for index in range {
+            let row = &rows[index];
+            let y = tree_top as f32 + (index * row_metrics.row_height) as f32
+                - self.right_sidebar_note_tree_scroll_offset;
+            let y = y.floor().max(tree_top as f32) as usize;
+            let height = row_metrics.row_height.min(tree_bottom.saturating_sub(y));
+            if height == 0 {
+                continue;
+            }
+            let active = !row.is_dir && selected == Some(row.relative_path.as_str());
+            let hovered = self.is_pointer_over_ui_rect(content_x, y, content_width, height);
+            if active || hovered {
+                self.fill_rounded_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(
+                        content_x as f32,
+                        y as f32,
+                        content_width as f32,
+                        height as f32,
+                    ),
+                    if active {
+                        chrome.selected_bg.mul_alpha(0.46)
+                    } else {
+                        chrome.sidebar_button_hover_bg
+                    },
+                    self.ui_f32(SIDEBAR_ROW_RADIUS),
+                )?;
+            }
+            self.ui_items.push(UIItem {
+                x: content_x,
+                y,
+                width: content_width,
+                height,
+                item_type: UIItemType::RightSidebarNoteTreeRow(row.relative_path.clone()),
+            });
+            let indent = row
+                .depth
+                .saturating_mul(row_metrics.indent_step)
+                .min(content_width.saturating_sub(24));
+            let icon_x = content_x + self.ui_px(SIDEBAR_INSET) + indent;
+            let icon_y = y + height.saturating_sub(row_metrics.icon_size) / 2;
+            if row.is_dir {
+                self.paint_sidebar_icon(
+                    layers,
+                    if self
+                        .right_sidebar_note_tree_expanded
+                        .contains(&row.relative_path)
+                    {
+                        SvgIcon::FolderOpen
+                    } else {
+                        SvgIcon::Folder
+                    },
+                    icon_x,
+                    icon_y,
+                    row_metrics.icon_size,
+                    muted_fg,
+                )?;
+            } else {
+                if let Some(icon) = material_file_icon_for_name(&row.name) {
+                    self.paint_sidebar_material_icon(
+                        layers,
+                        icon,
+                        icon_x,
+                        icon_y,
+                        row_metrics.icon_size,
+                    )?;
+                } else {
+                    self.paint_sidebar_icon(
+                        layers,
+                        SvgIcon::FileText,
+                        icon_x,
+                        icon_y,
+                        row_metrics.icon_size,
+                        if active { foreground } else { muted_fg },
+                    )?;
+                }
+            }
+            let text_x = icon_x + row_metrics.icon_size + row_metrics.icon_gap;
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                &row.name,
+                text_x,
+                y + height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
+                content_x
+                    .saturating_add(content_width)
+                    .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET)),
+                if active { foreground } else { muted_fg },
+            )?;
+        }
+
+        if self.right_sidebar_note_tree_scroll_offset > 0.0 {
+            self.paint_right_sidebar_file_top_fade(
+                layers,
+                chrome,
+                content_x,
+                tree_top,
+                content_width,
+                self.ui_px(FILE_SCROLL_FADE_HEIGHT),
+            )?;
+        }
+        if !narrow {
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    content_x.saturating_add(content_width) as f32,
+                    content_top as f32,
+                    1.0,
+                    content_bottom.saturating_sub(content_top) as f32,
+                ),
+                chrome.separator,
+            )?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint_note_sidebar(
         &mut self,
@@ -3853,7 +5614,11 @@ impl crate::TermWindow {
         content_bottom: usize,
         base_font_size: f64,
     ) -> anyhow::Result<()> {
-        if !self.right_sidebar_note.ensure_loaded() {
+        self.right_sidebar_note_table_layouts.clear();
+        if let Some(vault) = workspace_threads::space_note_vault(&self.active_space_id) {
+            self.refresh_note_vault_index_if_needed(&vault.root);
+        }
+        if !self.ensure_active_right_sidebar_note_document() {
             let message = self
                 .right_sidebar_note
                 .load_error
@@ -3869,104 +5634,100 @@ impl crate::TermWindow {
                 content_width,
                 muted_fg,
             )?;
+            if workspace_threads::space_note_vault(&self.active_space_id).is_none() {
+                let button_height = self.ui_px(52);
+                let gap = self.ui_px(10);
+                let first_y = content_top + ui_metrics.cell_size.height as usize + self.ui_px(20);
+                self.paint_snippet_button(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    first_y,
+                    content_width,
+                    button_height,
+                    Some(SvgIcon::FolderOpen),
+                    "Choose Existing Vault…",
+                    UIItemType::RightSidebarNoteChooseVault,
+                    true,
+                )?;
+                self.paint_snippet_button(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    first_y + button_height + gap,
+                    content_width,
+                    button_height,
+                    Some(SvgIcon::FolderPlus),
+                    "Create New Vault…",
+                    UIItemType::RightSidebarNoteCreateVault,
+                    true,
+                )?;
+            }
             return Ok(());
         }
-        self.right_sidebar_note.refresh_projection();
-
-        let toolbar_height = self.ui_px(NOTE_TOOLBAR_HEIGHT);
-        let button_gap = self.ui_px(8);
-        let mode_label = match self.right_sidebar_note.view.mode {
-            EditorMode::LivePreview => "Preview",
-            EditorMode::Source => "Source",
-            EditorMode::ReadOnly => "Read only",
-        };
-        let save_state = self
-            .right_sidebar_note
-            .session
-            .as_ref()
-            .map(|session| session.lock().save_state().clone())
-            .unwrap_or(SaveState::Saved);
-        let save_label = match &save_state {
-            SaveState::Saved => "Saved",
-            SaveState::Dirty => "Save",
-            SaveState::Saving(_) => "Saving…",
-            SaveState::Failed(_) => "Retry",
-        };
-        let compact_button_padding = self.ui_px(SIDEBAR_INSET) * 2;
-        let desired_mode_width = (self.sidebar_text_width(ui_font, mode_label)?.ceil() as usize
-            + compact_button_padding)
-            .max(self.ui_px(64));
-        let desired_save_width = (self.sidebar_text_width(ui_font, save_label)?.ceil() as usize
-            + compact_button_padding)
-            .max(self.ui_px(64));
-        let desired_actions_width = desired_mode_width + button_gap + desired_save_width;
-        let title_label = "Inbox.md";
-        let title_label_width = self.sidebar_text_width(ui_font, title_label)?.ceil() as usize;
-        let show_title = content_width >= title_label_width + button_gap + desired_actions_width;
-        let (title_width, mode_x, mode_width, save_width) = if show_title {
-            let title_width = content_width.saturating_sub(desired_actions_width + button_gap);
-            (
-                title_width,
-                content_x + title_width + button_gap,
-                desired_mode_width,
-                desired_save_width,
-            )
-        } else {
-            let action_width = content_width.saturating_sub(button_gap);
-            let mode_width = action_width / 2;
-            (
-                0,
-                content_x,
-                mode_width,
-                action_width.saturating_sub(mode_width),
-            )
-        };
-        if show_title {
-            self.paint_sidebar_text(
+        let wide_layout = content_width >= self.ui_px(NOTE_VAULT_SPLIT_MIN_WIDTH);
+        self.right_sidebar_note_wide_layout = wide_layout;
+        let split = wide_layout && !self.right_sidebar_note_vault_tree_collapsed;
+        if !wide_layout && self.right_sidebar_note_view == RightSidebarNoteView::Tree {
+            self.paint_note_vault_tree(
                 layers,
                 ui_font,
                 ui_metrics,
-                title_label,
-                content_x,
-                content_top
-                    + (toolbar_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
-                title_width,
+                chrome,
                 foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                content_bottom,
+                true,
             )?;
+            return Ok(());
         }
-        self.paint_snippet_button(
-            layers,
-            ui_font,
-            ui_metrics,
-            chrome,
-            foreground,
-            muted_fg,
-            mode_x,
-            content_top,
-            mode_width,
-            toolbar_height,
-            None,
-            mode_label,
-            UIItemType::RightSidebarNoteModeToggle,
-            true,
-        )?;
-        let save_x = mode_x + mode_width + button_gap;
-        self.paint_snippet_button(
-            layers,
-            ui_font,
-            ui_metrics,
-            chrome,
-            foreground,
-            muted_fg,
-            save_x,
-            content_top,
-            save_width,
-            toolbar_height,
-            None,
-            save_label,
-            UIItemType::RightSidebarNoteSave,
-            !matches!(save_state, SaveState::Saving(_)),
-        )?;
+        let (content_x, content_width) = if split {
+            let tree_width = self
+                .ui_px(NOTE_VAULT_TREE_WIDTH)
+                .min(content_width.saturating_sub(self.ui_px(300)));
+            self.paint_note_vault_tree(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                tree_width,
+                content_bottom,
+                false,
+            )?;
+            (
+                content_x + tree_width + self.ui_px(SIDEBAR_INSET),
+                content_width.saturating_sub(tree_width + self.ui_px(SIDEBAR_INSET)),
+            )
+        } else {
+            (content_x, content_width)
+        };
+        self.right_sidebar_note.refresh_projection();
+        self.schedule_right_sidebar_note_parse();
+        self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
+
+        let toolbar_height = self.ui_px(NOTE_TOOLBAR_HEIGHT);
+        let menu_size = toolbar_height;
+        let show_tree_button = !split;
+        let tree_button_icon = if wide_layout {
+            SvgIcon::PanelLeftOpen
+        } else {
+            SvgIcon::FolderTree
+        };
 
         let body_y = content_top + toolbar_height + self.ui_px(NOTE_BODY_TOP_GAP);
         let body_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
@@ -3974,6 +5735,7 @@ impl crate::TermWindow {
         if body_height == 0 || content_width == 0 {
             return Ok(());
         }
+        let note_layout_stage = crate::input_diagnostics::StageTimer::begin("note_layout");
         self.ui_items.push(UIItem {
             x: content_x,
             y: body_y,
@@ -4027,6 +5789,18 @@ impl crate::TermWindow {
         let code_metrics = RenderMetrics::with_font_metrics(&code_font.metrics());
         let selection = self.right_sidebar_note.view.selection;
         let focused = self.right_sidebar_note.view.focused;
+        let spelling_issues = (self.right_sidebar_note.spelling_revision
+            == self.right_sidebar_note.projection_revision
+            && self.right_sidebar_note.view.mode != EditorMode::ReadOnly)
+            .then(|| Arc::clone(&self.right_sidebar_note.spelling_issues));
+        let active_spelling_word = if focused && selection.is_caret() {
+            self.right_sidebar_note
+                .session
+                .as_ref()
+                .map(|session| session.lock().word_range_at(selection.focus.byte))
+        } else {
+            None
+        };
         self.right_sidebar_note.view.preedit = if focused {
             match &self.dead_key_status {
                 DeadKeyStatus::Composing(text) => Some(text.clone()),
@@ -4037,120 +5811,130 @@ impl crate::TermWindow {
         };
         let preedit = self.right_sidebar_note.view.preedit.clone();
         let padding = self.ui_px(NOTE_BODY_PADDING) as f32;
-        let text_left = content_x as f32 + padding;
+        let available_reading_width = (content_width as f32 - padding * 2.0).max(1.0);
+        let reading_width = available_reading_width.min(self.ui_f32(NOTE_READING_MAX_WIDTH as f32));
+        let text_left = content_x as f32 + (content_width as f32 - reading_width) / 2.0;
         let clip_left = text_left;
-        let clip_right = (content_x + content_width) as f32 - padding;
+        let clip_right = text_left + reading_width;
         let wrap_width = (clip_right - clip_left).max(1.0);
         let mut wrap_hasher = DefaultHasher::new();
         (wrap_width.floor() as usize).hash(&mut wrap_hasher);
         self.dimensions.dpi.hash(&mut wrap_hasher);
-        for font_id in [
-            ui_font.id(),
-            bold_font.id(),
-            italic_font.id(),
-            bold_italic_font.id(),
-            h1_font.id(),
-            h2_font.id(),
-            h3_font.id(),
-            h1_italic_font.id(),
-            h2_italic_font.id(),
-            h3_italic_font.id(),
-            code_font.id(),
+        // LoadedFont ids are allocation identities. Appearance changes rebuild
+        // those objects even when typography is identical, which used to
+        // throw away the whole Note wrap cache on every light/dark switch.
+        // Hash only inputs that can actually change line breaks.
+        base_font_size.to_bits().hash(&mut wrap_hasher);
+        normal_weight.hash(&mut wrap_hasher);
+        self.config.font.hash(&mut wrap_hasher);
+        for metrics in [
+            ui_metrics,
+            bold_metrics,
+            italic_metrics,
+            bold_italic_metrics,
+            h1_metrics,
+            h2_metrics,
+            h3_metrics,
+            h1_italic_metrics,
+            h2_italic_metrics,
+            h3_italic_metrics,
+            code_metrics,
         ] {
-            font_id.hash(&mut wrap_hasher);
+            metrics.cell_size.width.hash(&mut wrap_hasher);
+            metrics.cell_size.height.hash(&mut wrap_hasher);
         }
         let wrap_key = wrap_hasher.finish() as usize;
         let visual = if let Some(visual) = self.right_sidebar_note.cached_wrapped_visual(wrap_key) {
             visual
+        } else if self.right_sidebar_note.prefers_background_wrap() {
+            let normal_approx_metrics = self.note_approximate_text_metrics(ui_font, &ui_metrics)?;
+            let h1_approx_metrics = self.note_approximate_text_metrics(&h1_font, &h1_metrics)?;
+            let h2_approx_metrics = self.note_approximate_text_metrics(&h2_font, &h2_metrics)?;
+            let h3_approx_metrics = self.note_approximate_text_metrics(&h3_font, &h3_metrics)?;
+            let code_approx_metrics =
+                self.note_approximate_text_metrics(&code_font, &code_metrics)?;
+            self.schedule_right_sidebar_note_wrap(
+                wrap_key,
+                wrap_width,
+                normal_approx_metrics,
+                h1_approx_metrics,
+                h2_approx_metrics,
+                h3_approx_metrics,
+                code_approx_metrics,
+            );
+            self.right_sidebar_note.provisional_wrapped_visual()
         } else {
-            let wrapped = wrap_visual_document_by_width(
+            let wrap_stage = crate::input_diagnostics::StageTimer::begin("note_wrap");
+            let mut wrap_cache = std::mem::take(&mut self.right_sidebar_note.wrap_cache);
+            let wrapped = wrap_visual_document_by_width_cached(
                 &self.right_sidebar_note.visual,
                 wrap_width,
-                |block, run| {
+                wrap_key,
+                &mut wrap_cache,
+                |block, style, text| {
                     let (font, metrics) = match block {
-                        BlockKind::Heading(1) if run.style.emphasis => {
+                        BlockKind::Heading(1) if style.emphasis => {
                             (&h1_italic_font, h1_italic_metrics)
                         }
-                        BlockKind::Heading(2) if run.style.emphasis => {
+                        BlockKind::Heading(2) if style.emphasis => {
                             (&h2_italic_font, h2_italic_metrics)
                         }
-                        BlockKind::Heading(_) if run.style.emphasis => {
+                        BlockKind::Heading(_) if style.emphasis => {
                             (&h3_italic_font, h3_italic_metrics)
                         }
                         BlockKind::Heading(1) => (&h1_font, h1_metrics),
                         BlockKind::Heading(2) => (&h2_font, h2_metrics),
                         BlockKind::Heading(_) => (&h3_font, h3_metrics),
                         BlockKind::CodeBlock => (&code_font, code_metrics),
-                        _ if run.style.strong && run.style.emphasis => {
+                        _ if style.strong && style.emphasis => {
                             (&bold_italic_font, bold_italic_metrics)
                         }
-                        _ if run.style.strong => (&bold_font, bold_metrics),
-                        _ if run.style.emphasis => (&italic_font, italic_metrics),
+                        _ if style.strong => (&bold_font, bold_metrics),
+                        _ if style.emphasis => (&italic_font, italic_metrics),
                         _ => (ui_font, ui_metrics),
                     };
-                    self.cached_ui_text_advance(font, &metrics, &run.text)
+                    self.cached_ui_text_advance(font, &metrics, text)
                 },
-            )?;
+            );
+            self.right_sidebar_note.wrap_cache = wrap_cache;
+            let wrapped = wrapped?;
+            wrap_stage.finish(true);
             self.right_sidebar_note
                 .cache_wrapped_visual(wrap_key, wrapped)
         };
-        let projected_objects = self.right_sidebar_note.projection.objects.clone();
+        if visual.lines.is_empty() && self.right_sidebar_note.prefers_background_wrap() {
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                "Laying out note…",
+                content_x + self.ui_px(NOTE_BODY_PADDING),
+                body_y + self.ui_px(NOTE_BODY_PADDING),
+                content_width.saturating_sub(self.ui_px(NOTE_BODY_PADDING) * 2),
+                muted_fg,
+            )?;
+            self.right_sidebar_note.line_layouts.clear();
+            self.right_sidebar_note.code_block_layouts.clear();
+            self.right_sidebar_note.viewport_height = body_height as f32;
+            self.right_sidebar_note.content_height = body_height as f32;
+            self.paint_note_editor_toolbar(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                menu_size,
+                show_tree_button,
+                tree_button_icon,
+            )?;
+            note_layout_stage.finish(true);
+            return Ok(());
+        }
         let table_horizontal_padding = self.ui_f32(NOTE_TABLE_CELL_HORIZONTAL_PADDING as f32);
         let table_vertical_padding = self.ui_f32(NOTE_TABLE_CELL_VERTICAL_PADDING as f32);
         let table_row_height = ui_metrics.cell_size.height as f32 + table_vertical_padding * 2.0;
-        let mut table_rows = vec![None; visual.lines.len()];
-        for object in &projected_objects {
-            let ProjectedObject::Table(table) = object else {
-                continue;
-            };
-            let row_indices = visual
-                .lines
-                .iter()
-                .enumerate()
-                .filter_map(|(index, line)| {
-                    (line.block == BlockKind::Table
-                        && line.runs.iter().any(|run| {
-                            table.source.start <= run.source.start
-                                && run.source.end <= table.source.end
-                        }))
-                    .then_some(index)
-                })
-                .collect::<Vec<_>>();
-            let column_count = table.rows.iter().map(Vec::len).max().unwrap_or(0);
-            if row_indices.is_empty() || column_count == 0 {
-                continue;
-            }
-            let mut desired_widths = vec![0.0f32; column_count];
-            for (row_index, row) in table.rows.iter().enumerate() {
-                let (font, metrics) = if row_index == 0 {
-                    (&bold_font, bold_metrics)
-                } else {
-                    (ui_font, ui_metrics)
-                };
-                for (column_index, cell) in row.iter().enumerate() {
-                    let width = self.cached_ui_text_advance(font, &metrics, &cell.text)?
-                        + table_horizontal_padding * 2.0;
-                    desired_widths[column_index] = desired_widths[column_index].max(width);
-                }
-            }
-            let column_widths = Rc::new(fit_table_columns(
-                &desired_widths,
-                wrap_width,
-                self.ui_f32(NOTE_TABLE_MIN_COLUMN_WIDTH as f32),
-            ));
-            let mut alignments = table.alignments.clone();
-            alignments.resize(column_count, TableAlignment::None);
-            let alignments = Rc::new(alignments);
-            let row_count = row_indices.len();
-            for (row_index, visual_index) in row_indices.into_iter().enumerate() {
-                table_rows[visual_index] = Some(NoteTableRowPaintLayout {
-                    column_widths: Rc::clone(&column_widths),
-                    alignments: Rc::clone(&alignments),
-                    row_index,
-                    row_count,
-                });
-            }
-        }
         let use_dark_syntax_theme = matches!(
             crate::native_settings::effective_appearance(),
             window::Appearance::Dark | window::Appearance::DarkHighContrast
@@ -4160,129 +5944,396 @@ impl crate::TermWindow {
         let code_header_height = self.ui_f32(NOTE_CODE_HEADER_HEIGHT as f32);
         let code_line_height = code_metrics.cell_size.height as f32;
         let code_inner_width = (wrap_width - code_horizontal_padding * 2.0).max(1.0);
-        let mut code_rows = vec![None; visual.lines.len()];
-        for object in &projected_objects {
-            let ProjectedObject::CodeBlock(code) = object else {
-                continue;
-            };
-            let row_indices = visual
-                .lines
-                .iter()
-                .enumerate()
-                .filter_map(|(index, line)| {
-                    (line.block == BlockKind::CodeBlock
-                        && code.content.start <= line.source.start
-                        && line.source.end <= code.content.end)
-                        .then_some(index)
-                })
-                .collect::<Vec<_>>();
-            if row_indices.is_empty() {
-                continue;
-            }
-            let highlights = self.cached_note_code_highlights(code, use_dark_syntax_theme);
-            let collapsed = self
-                .right_sidebar_note
-                .collapsed_code_blocks
-                .contains(&code.source.start);
-            let max_content_width = code
-                .text
-                .split_inclusive('\n')
-                .map(|raw_line| raw_line.strip_suffix('\n').unwrap_or(raw_line))
-                .map(|line| self.cached_ui_text_advance(&code_font, &code_metrics, line))
-                .collect::<anyhow::Result<Vec<_>>>()?
-                .into_iter()
-                .fold(0.0f32, f32::max);
-            let max_horizontal_scroll = (max_content_width - code_inner_width).max(0.0);
-            let horizontal_offset = self
-                .right_sidebar_note
-                .code_horizontal_offsets
-                .entry(code.source.start)
-                .or_default();
-            *horizontal_offset = horizontal_offset.clamp(0.0, max_horizontal_scroll);
-            let horizontal_offset = *horizontal_offset;
-            let row_count = row_indices.len();
-            let block_height = code_header_height
-                + if collapsed {
-                    0.0
-                } else {
-                    code_vertical_padding * 2.0 + code_line_height * row_count as f32
-                };
-            let language = code
-                .language
-                .as_deref()
-                .unwrap_or("code")
-                .to_ascii_uppercase();
-            for (row_index, visual_index) in row_indices.into_iter().enumerate() {
-                code_rows[visual_index] = Some(NoteCodeRowPaintLayout {
-                    block_start: code.source.start,
-                    language: language.clone(),
-                    row_index,
-                    row_count,
-                    collapsed,
-                    colors: Arc::clone(&highlights),
-                    horizontal_offset,
-                    block_height,
-                    max_horizontal_scroll,
-                });
-            }
+        let active_document = self.right_sidebar_note.document.clone();
+        let mut component_hasher = DefaultHasher::new();
+        wrap_key.hash(&mut component_hasher);
+        (Arc::as_ptr(&visual) as usize).hash(&mut component_hasher);
+        self.right_sidebar_note
+            .projection_revision
+            .hash(&mut component_hasher);
+        self.config
+            .note_remote_images_enabled
+            .hash(&mut component_hasher);
+        if let Some(document) = active_document.as_ref() {
+            document.vault_root.hash(&mut component_hasher);
+            document.relative_path.hash(&mut component_hasher);
         }
-        let notebook = default_notebook().ok();
+        let mut collapsed_blocks = self
+            .right_sidebar_note
+            .collapsed_code_blocks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        collapsed_blocks.sort_unstable();
+        collapsed_blocks.hash(&mut component_hasher);
+        let mut code_offsets = self
+            .right_sidebar_note
+            .code_horizontal_offsets
+            .iter()
+            .map(|(source, offset)| (*source, offset.to_bits()))
+            .collect::<Vec<_>>();
+        code_offsets.sort_unstable_by_key(|(source, _)| *source);
+        code_offsets.hash(&mut component_hasher);
+        let mut table_offsets = self
+            .right_sidebar_note_table_horizontal_offsets
+            .iter()
+            .map(|(source, offset)| (*source, offset.to_bits()))
+            .collect::<Vec<_>>();
+        table_offsets.sort_unstable_by_key(|(source, _)| *source);
+        table_offsets.hash(&mut component_hasher);
+        let component_key = component_hasher.finish();
+
+        if self.right_sidebar_note_paint_cache.key != Some(component_key) {
+            // Component geometry only needs heavyweight objects. Avoid a deep
+            // clone of every inline emphasis/link/tag in a multi-megabyte
+            // projection when the first full layout is published.
+            let projected_objects = self
+                .right_sidebar_note
+                .projection
+                .objects
+                .iter()
+                .filter(|object| {
+                    matches!(
+                        object,
+                        ProjectedObject::Table(_)
+                            | ProjectedObject::CodeBlock(_)
+                            | ProjectedObject::Image { .. }
+                            | ProjectedObject::WikiLink { embed: true, .. }
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let current_code_starts = projected_objects
+                .iter()
+                .filter_map(|object| match object {
+                    ProjectedObject::CodeBlock(code) => Some(code.source.start),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            self.right_sidebar_note_code_highlight
+                .retain_blocks(&current_code_starts);
+
+            let mut table_rows = HashMap::new();
+            let mut current_table_starts = HashSet::new();
+            for object in &projected_objects {
+                let ProjectedObject::Table(table) = object else {
+                    continue;
+                };
+                let start = visual
+                    .lines
+                    .partition_point(|line| line.source.end < table.source.start);
+                let end = visual
+                    .lines
+                    .partition_point(|line| line.source.start <= table.source.end);
+                let row_indices = (start..end)
+                    .filter(|index| {
+                        let line = &visual.lines[*index];
+                        line.block == BlockKind::Table
+                            && line.runs.iter().any(|run| {
+                                table.source.start <= run.source.start
+                                    && run.source.end <= table.source.end
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let column_count = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+                if row_indices.is_empty() || column_count == 0 {
+                    continue;
+                }
+                let mut desired_widths = vec![0.0f32; column_count];
+                for (row_index, row) in table.rows.iter().enumerate() {
+                    let (font, metrics) = if row_index == 0 {
+                        (&bold_font, bold_metrics)
+                    } else {
+                        (ui_font, ui_metrics)
+                    };
+                    for (column_index, cell) in row.iter().enumerate() {
+                        let width = self.cached_ui_text_advance(font, &metrics, &cell.text)?
+                            + table_horizontal_padding * 2.0;
+                        desired_widths[column_index] = desired_widths[column_index].max(width);
+                    }
+                }
+                let column_widths = Rc::new(scrollable_note_table_columns(
+                    &desired_widths,
+                    wrap_width,
+                    self.ui_f32(NOTE_TABLE_MIN_COLUMN_WIDTH as f32),
+                    self.ui_f32(NOTE_TABLE_MAX_COLUMN_WIDTH as f32),
+                ));
+                let total_width = column_widths.iter().sum::<f32>();
+                let max_horizontal_scroll = (total_width - wrap_width).max(0.0);
+                current_table_starts.insert(table.source.start);
+                let horizontal_offset = self
+                    .right_sidebar_note_table_horizontal_offsets
+                    .entry(table.source.start)
+                    .or_default();
+                *horizontal_offset = horizontal_offset.clamp(0.0, max_horizontal_scroll);
+                let horizontal_offset = *horizontal_offset;
+                let mut alignments = table.alignments.clone();
+                alignments.resize(column_count, TableAlignment::None);
+                let alignments = Rc::new(alignments);
+                let row_count = row_indices.len();
+                for (row_index, visual_index) in row_indices.into_iter().enumerate() {
+                    table_rows.insert(
+                        visual_index,
+                        NoteTableRowPaintLayout {
+                            table_start: table.source.start,
+                            column_widths: Rc::clone(&column_widths),
+                            alignments: Rc::clone(&alignments),
+                            row_index,
+                            row_count,
+                            total_width,
+                            horizontal_offset,
+                            max_horizontal_scroll,
+                        },
+                    );
+                }
+            }
+            self.right_sidebar_note_table_horizontal_offsets
+                .retain(|source_start, _| current_table_starts.contains(source_start));
+
+            let mut code_rows = HashMap::new();
+            for object in &projected_objects {
+                let ProjectedObject::CodeBlock(code) = object else {
+                    continue;
+                };
+                let start = visual
+                    .lines
+                    .partition_point(|line| line.source.end < code.content.start);
+                let end = visual
+                    .lines
+                    .partition_point(|line| line.source.start <= code.content.end);
+                let row_indices = (start..end)
+                    .filter(|index| {
+                        let line = &visual.lines[*index];
+                        line.block == BlockKind::CodeBlock
+                            && code.content.start <= line.source.start
+                            && line.source.end <= code.content.end
+                    })
+                    .collect::<Vec<_>>();
+                if row_indices.is_empty() {
+                    continue;
+                }
+                let collapsed = self
+                    .right_sidebar_note
+                    .collapsed_code_blocks
+                    .contains(&code.source.start);
+                let mut max_content_width = 0.0f32;
+                for raw_line in code.text.split_inclusive('\n') {
+                    let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+                    max_content_width = max_content_width.max(self.cached_ui_text_advance(
+                        &code_font,
+                        &code_metrics,
+                        line,
+                    )?);
+                }
+                let max_horizontal_scroll = (max_content_width - code_inner_width).max(0.0);
+                let horizontal_offset = self
+                    .right_sidebar_note
+                    .code_horizontal_offsets
+                    .entry(code.source.start)
+                    .or_default();
+                *horizontal_offset = horizontal_offset.clamp(0.0, max_horizontal_scroll);
+                let horizontal_offset = *horizontal_offset;
+                let row_count = row_indices.len();
+                let block_height = code_header_height
+                    + if collapsed {
+                        0.0
+                    } else {
+                        code_vertical_padding * 2.0 + code_line_height * row_count as f32
+                    };
+                let language = code
+                    .language
+                    .as_deref()
+                    .unwrap_or("code")
+                    .to_ascii_uppercase();
+                let code = Arc::new(code.clone());
+                for (row_index, visual_index) in row_indices.into_iter().enumerate() {
+                    code_rows.insert(
+                        visual_index,
+                        NoteCodeRowPaintLayout {
+                            block_start: code.source.start,
+                            language: language.clone(),
+                            code: Arc::clone(&code),
+                            row_index,
+                            row_count,
+                            collapsed,
+                            horizontal_offset,
+                            block_height,
+                            max_horizontal_scroll,
+                        },
+                    );
+                }
+            }
+
+            let mut image_sources = HashMap::new();
+            if let Some(document) = active_document.as_ref() {
+                for object in &projected_objects {
+                    let resolved = match object {
+                        ProjectedObject::Image { source, target, .. } => {
+                            if self.config.note_remote_images_enabled
+                                && (target.starts_with("https://") || target.starts_with("http://"))
+                            {
+                                Some((
+                                    source.start,
+                                    RightSidebarNoteImageSource::Remote(target.clone()),
+                                ))
+                            } else {
+                                resolve_local_image(
+                                    &document.vault_root,
+                                    &document.document_path,
+                                    target,
+                                )
+                                .ok()
+                                .map(|path| {
+                                    (source.start, RightSidebarNoteImageSource::Local(path))
+                                })
+                            }
+                        }
+                        ProjectedObject::WikiLink {
+                            source,
+                            embed: true,
+                            resolved_path: Some(target),
+                            ..
+                        } => {
+                            let candidate = document.vault_root.join(target).canonicalize().ok();
+                            candidate
+                                .filter(|candidate| candidate.starts_with(&document.vault_root))
+                                .map(|path| {
+                                    (source.start, RightSidebarNoteImageSource::Local(path))
+                                })
+                        }
+                        _ => None,
+                    };
+                    if let Some((source_start, source)) = resolved {
+                        image_sources.insert(source_start, source);
+                    }
+                }
+            }
+            self.right_sidebar_note_paint_cache = NotePaintCache {
+                key: Some(component_key),
+                table_rows: Arc::new(table_rows),
+                code_rows: Arc::new(code_rows),
+                image_sources: Arc::new(image_sources),
+            };
+        }
+        let table_rows = Arc::clone(&self.right_sidebar_note_paint_cache.table_rows);
+        let code_rows = Arc::clone(&self.right_sidebar_note_paint_cache.code_rows);
+        let note_image_paths = Arc::clone(&self.right_sidebar_note_paint_cache.image_sources);
         let viewport_top = body_y as f32;
         let viewport_bottom = body_bottom as f32;
-        let image_line_height = self.ui_f32(180.0);
+        let image_max_height = (body_height as f32 * 0.72)
+            .max(ui_metrics.cell_size.height as f32)
+            .min(self.ui_f32(720.0));
         let line_gap = self.ui_px(NOTE_LINE_GAP) as f32;
-        let mut measured_y = padding;
-        let mut caret_row = None;
-        for (line_index, line) in visual.lines.iter().enumerate() {
-            let metrics = match line.block {
-                BlockKind::Heading(1) => h1_metrics,
-                BlockKind::Heading(2) => h2_metrics,
-                BlockKind::Heading(_) => h3_metrics,
-                BlockKind::CodeBlock => code_metrics,
-                _ => ui_metrics,
-            };
-            let mut height = metrics.cell_size.height as f32;
-            if line.kind == VisualLineKind::Image {
-                height = height.max(image_line_height);
-            }
-            if table_rows[line_index].is_some() {
-                height = table_row_height;
-            }
-            if let Some(code_row) = code_rows[line_index].as_ref() {
-                height = note_code_row_height(
-                    code_row.row_index,
-                    code_row.row_count,
-                    code_row.collapsed,
-                    code_line_height,
-                    code_header_height,
-                    code_vertical_padding,
-                );
-            }
-            if selection.is_caret()
-                && (line.runs.iter().any(|run| {
-                    run.source.start <= selection.focus.byte
-                        && selection.focus.byte <= run.source.end
-                }) || (line.runs.is_empty() && line.source.start == selection.focus.byte)
-                    || selection.focus.byte == line.source.end)
-            {
-                caret_row = Some((measured_y, height));
-            }
-            let row_gap = if let Some(code_row) = code_rows[line_index].as_ref() {
-                if code_row.row_index + 1 < code_row.row_count {
-                    0.0
-                } else {
-                    line_gap
+        let mut geometry_hasher = DefaultHasher::new();
+        wrap_key.hash(&mut geometry_hasher);
+        self.right_sidebar_note
+            .visual_key
+            .hash(&mut geometry_hasher);
+        table_row_height.to_bits().hash(&mut geometry_hasher);
+        code_line_height.to_bits().hash(&mut geometry_hasher);
+        code_header_height.to_bits().hash(&mut geometry_hasher);
+        code_vertical_padding.to_bits().hash(&mut geometry_hasher);
+        image_max_height.to_bits().hash(&mut geometry_hasher);
+        let mut loaded_image_metrics = note_image_paths
+            .iter()
+            .filter_map(|(source_start, path)| {
+                self.right_sidebar_note_images
+                    .get(path)
+                    .map(|image| (*source_start, image.width, image.height))
+            })
+            .collect::<Vec<_>>();
+        loaded_image_metrics.sort_unstable();
+        loaded_image_metrics.hash(&mut geometry_hasher);
+        line_gap.to_bits().hash(&mut geometry_hasher);
+        let mut collapsed = self
+            .right_sidebar_note
+            .collapsed_code_blocks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        collapsed.sort_unstable();
+        collapsed.hash(&mut geometry_hasher);
+        let geometry_key = geometry_hasher.finish();
+        if self.right_sidebar_note.line_geometry_key != Some(geometry_key)
+            || self.right_sidebar_note.line_geometry.len() != visual.lines.len()
+        {
+            let mut top = padding;
+            let mut geometry = Vec::with_capacity(visual.lines.len());
+            for (line_index, line) in visual.lines.iter().enumerate() {
+                let metrics = match line.block {
+                    BlockKind::Heading(1) => h1_metrics,
+                    BlockKind::Heading(2) => h2_metrics,
+                    BlockKind::Heading(_) => h3_metrics,
+                    BlockKind::CodeBlock => code_metrics,
+                    _ => ui_metrics,
+                };
+                let mut height = metrics.cell_size.height as f32;
+                if line.kind == VisualLineKind::Image {
+                    let image = note_image_paths
+                        .get(&line.source.start)
+                        .and_then(|path| self.right_sidebar_note_images.get(path));
+                    height = note_image_row_height(image, height, wrap_width, image_max_height);
                 }
-            } else {
-                table_rows[line_index]
-                    .as_ref()
-                    .filter(|row| row.row_index + 1 < row.row_count)
-                    .map(|_| 0.0)
-                    .unwrap_or(line_gap)
-            };
-            measured_y += height + row_gap;
+                if matches!(
+                    line.block,
+                    BlockKind::Properties | BlockKind::Callout | BlockKind::Embed
+                ) {
+                    height += self.ui_f32(8.0);
+                }
+                if table_rows.contains_key(&line_index) {
+                    height = table_row_height;
+                }
+                if let Some(code_row) = code_rows.get(&line_index) {
+                    height = note_code_row_height(
+                        code_row.row_index,
+                        code_row.row_count,
+                        code_row.collapsed,
+                        code_line_height,
+                        code_header_height,
+                        code_vertical_padding,
+                    );
+                }
+                let gap = if let Some(code_row) = code_rows.get(&line_index) {
+                    if code_row.row_index + 1 < code_row.row_count {
+                        0.0
+                    } else {
+                        line_gap
+                    }
+                } else {
+                    let grouped_card_continues =
+                        visual
+                            .lines
+                            .get(line_index + 1)
+                            .is_some_and(|next| match line.block {
+                                BlockKind::Properties | BlockKind::Callout => {
+                                    next.block == line.block
+                                }
+                                BlockKind::Embed => {
+                                    next.block == line.block && next.source == line.source
+                                }
+                                _ => false,
+                            });
+                    if grouped_card_continues {
+                        0.0
+                    } else {
+                        table_rows
+                            .get(&line_index)
+                            .filter(|row| row.row_index + 1 < row.row_count)
+                            .map(|_| 0.0)
+                            .unwrap_or(line_gap)
+                    }
+                };
+                geometry.push(NoteLineGeometry { top, height, gap });
+                top += height + gap;
+            }
+            self.right_sidebar_note.line_geometry_key = Some(geometry_key);
+            self.right_sidebar_note.line_geometry = Arc::new(geometry);
         }
-        let measured_content_height = measured_y + padding;
+        let line_geometry = Arc::clone(&self.right_sidebar_note.line_geometry);
+        let measured_content_height = line_geometry
+            .last()
+            .map(|line| line.top + line.height + line.gap + padding)
+            .unwrap_or(padding * 2.0);
         let max_scroll = (measured_content_height - body_height as f32).max(0.0);
         let mut scroll = self
             .right_sidebar_note
@@ -4290,7 +6341,22 @@ impl crate::TermWindow {
             .scroll_offset
             .clamp(0.0, max_scroll);
         if focused && self.right_sidebar_note.reveal_caret {
-            if let Some((caret_top, caret_height)) = caret_row {
+            let caret_byte = selection.focus.byte;
+            let candidate_start = visual
+                .lines
+                .partition_point(|line| line.source.end < caret_byte);
+            let candidate_end = visual
+                .lines
+                .partition_point(|line| line.source.start <= caret_byte);
+            let caret_row = (candidate_start..candidate_end)
+                .find(|index| {
+                    let line = &visual.lines[*index];
+                    line.source.start <= caret_byte && caret_byte <= line.source.end
+                })
+                .and_then(|index| line_geometry.get(index));
+            if let Some(caret_row) = caret_row {
+                let caret_top = caret_row.top;
+                let caret_height = caret_row.height;
                 let safe_top = scroll + padding;
                 let safe_bottom = scroll + body_height as f32 - padding;
                 if caret_top < safe_top {
@@ -4303,15 +6369,19 @@ impl crate::TermWindow {
             self.right_sidebar_note.reveal_caret = false;
         }
         self.right_sidebar_note.view.scroll_offset = scroll;
-        let mut logical_y = padding;
         let mut layouts = Vec::new();
         let mut code_block_layouts = Vec::new();
+        let mut table_layouts = Vec::new();
         let mut caret_rect: Option<(f32, f32, f32)> = None;
         let selected = selection.range();
 
-        for (line_index, line) in visual.lines.iter().enumerate() {
-            let table_row = table_rows[line_index].as_ref();
-            let code_row = code_rows[line_index].as_ref();
+        let paint_range = virtual_note_line_range(&line_geometry, scroll, body_height as f32);
+        let paint_start = paint_range.start;
+        for line_index in paint_range {
+            let line = &visual.lines[line_index];
+            let geometry = line_geometry[line_index];
+            let table_row = table_rows.get(&line_index);
+            let code_row = code_rows.get(&line_index);
             let (line_font, line_metrics) = match line.block {
                 BlockKind::Heading(1) => (&h1_font, h1_metrics),
                 BlockKind::Heading(2) => (&h2_font, h2_metrics),
@@ -4319,38 +6389,10 @@ impl crate::TermWindow {
                 BlockKind::CodeBlock => (&code_font, code_metrics),
                 _ => (ui_font, ui_metrics),
             };
-            let mut line_height = line_metrics.cell_size.height as f32;
-            if line.kind == VisualLineKind::Image {
-                line_height = line_height.max(image_line_height);
-            }
-            if table_row.is_some() {
-                line_height = table_row_height;
-            }
-            if let Some(code_row) = code_row {
-                line_height = note_code_row_height(
-                    code_row.row_index,
-                    code_row.row_count,
-                    code_row.collapsed,
-                    code_line_height,
-                    code_header_height,
-                    code_vertical_padding,
-                );
-            }
-            let line_y = body_y as f32 + logical_y - scroll;
+            let line_height = geometry.height;
+            let line_y = body_y as f32 + geometry.top - scroll;
             let line_bottom = line_y + line_height;
             let visible = line_bottom >= viewport_top && line_y <= viewport_bottom;
-            let row_gap = if let Some(code_row) = code_row {
-                if code_row.row_index + 1 < code_row.row_count {
-                    0.0
-                } else {
-                    line_gap
-                }
-            } else {
-                table_row
-                    .filter(|row| row.row_index + 1 < row.row_count)
-                    .map(|_| 0.0)
-                    .unwrap_or(line_gap)
-            };
             let code_text_y = code_row.map(|row| {
                 if row.row_index == 0 {
                     line_y + code_header_height + code_vertical_padding
@@ -4358,33 +6400,62 @@ impl crate::TermWindow {
                     line_y
                 }
             });
-            let mut x = if let Some(code_row) = code_row {
+            let card_horizontal_padding = self.ui_f32(10.0);
+            let card_vertical_padding = self.ui_f32(4.0);
+            let continuation_indent = line.continuation_indent();
+            let mut x = if let Some(table_row) = table_row {
+                text_left - table_row.horizontal_offset
+            } else if let Some(code_row) = code_row {
                 text_left + code_horizontal_padding - code_row.horizontal_offset
+            } else if matches!(
+                line.block,
+                BlockKind::Properties | BlockKind::Callout | BlockKind::Embed
+            ) {
+                text_left + card_horizontal_padding + continuation_indent
             } else {
-                text_left
+                text_left + continuation_indent
             };
             let mut run_layouts = Vec::new();
 
-            if let Some(code_row) = code_row.filter(|row| row.row_index == 0) {
-                let block_bottom = line_y + code_row.block_height;
-                let draw_top = line_y.max(viewport_top);
+            let starts_painted_code_block = code_row.is_some_and(|row| {
+                row.row_index == 0
+                    || line_index == paint_start
+                    || code_rows
+                        .get(&line_index.saturating_sub(1))
+                        .is_none_or(|previous| previous.block_start != row.block_start)
+            });
+            if let Some(code_row) = code_row.filter(|_| starts_painted_code_block) {
+                let block_top = line_y
+                    - if code_row.row_index == 0 {
+                        0.0
+                    } else {
+                        code_header_height
+                            + code_vertical_padding
+                            + code_line_height * code_row.row_index as f32
+                    };
+                let block_bottom = block_top + code_row.block_height;
+                let draw_top = block_top.max(viewport_top);
                 let draw_bottom = block_bottom.min(viewport_bottom);
                 if draw_bottom > draw_top {
                     let block_rect =
                         euclid::rect(text_left, draw_top, wrap_width, draw_bottom - draw_top);
-                    if line_y >= viewport_top && block_bottom <= viewport_bottom {
-                        self.fill_rounded_rectangle(
-                            layers,
-                            1,
-                            block_rect,
-                            chrome.sidebar_button_bg,
-                            self.ui_f32(NOTE_CODE_BLOCK_RADIUS),
-                        )?;
-                    } else {
-                        self.filled_rectangle(layers, 1, block_rect, chrome.sidebar_button_bg)?;
-                    }
+                    let (round_top, round_bottom) = visible_code_block_rounded_edges(
+                        block_top,
+                        block_bottom,
+                        viewport_top,
+                        viewport_bottom,
+                    );
+                    self.fill_vertically_rounded_rectangle(
+                        layers,
+                        1,
+                        block_rect,
+                        chrome.sidebar_button_bg,
+                        self.ui_f32(NOTE_CODE_BLOCK_RADIUS),
+                        round_top,
+                        round_bottom,
+                    )?;
                 }
-                let content_y = line_y + code_header_height;
+                let content_y = block_top + code_header_height;
                 let content_height = (code_row.block_height - code_header_height).max(0.0);
                 code_block_layouts.push(NoteCodeBlockLayout {
                     source_start: code_row.block_start,
@@ -4394,11 +6465,11 @@ impl crate::TermWindow {
                     height: content_height,
                     max_horizontal_scroll: code_row.max_horizontal_scroll,
                 });
-                if line_y >= viewport_top
-                    && line_y + code_header_height <= viewport_bottom
+                if block_top >= viewport_top
+                    && block_top + code_header_height <= viewport_bottom
                     && code_header_height >= 1.0
                 {
-                    let header_y = line_y.max(0.0) as usize;
+                    let header_y = block_top.max(0.0) as usize;
                     let header_height = code_header_height as usize;
                     self.ui_items.push(UIItem {
                         x: text_left as usize,
@@ -4455,7 +6526,7 @@ impl crate::TermWindow {
                         1,
                         euclid::rect(
                             text_left,
-                            line_y + code_header_height - 1.0,
+                            block_top + code_header_height - 1.0,
                             wrap_width,
                             1.0,
                         ),
@@ -4465,39 +6536,75 @@ impl crate::TermWindow {
             }
 
             if line_height <= 0.0 {
-                logical_y += row_gap;
                 continue;
             }
 
-            let note_image_path = if visible && line.kind == VisualLineKind::Image {
-                projected_objects.iter().find_map(|object| match object {
-                    ProjectedObject::Image { source, target, .. } if *source == line.source => {
-                        notebook.as_ref().and_then(|notebook| {
-                            resolve_local_image(
-                                &notebook.content_root,
-                                &notebook.document_path,
-                                target,
-                            )
-                            .ok()
-                        })
-                    }
-                    _ => None,
-                })
+            let note_image_source = if visible && line.kind == VisualLineKind::Image {
+                note_image_paths.get(&line.source.start).cloned()
             } else {
                 None
             };
-            let note_image = note_image_path
+            let note_image = note_image_source
                 .as_ref()
-                .and_then(|path| self.right_sidebar_note_images.get(path))
+                .and_then(|source| self.right_sidebar_note_images.get(source))
                 .cloned();
             if note_image.is_none() {
-                if let Some(path) = note_image_path.clone() {
-                    self.schedule_right_sidebar_note_image(path);
+                if let Some(source) = note_image_source.clone() {
+                    self.schedule_right_sidebar_note_image(source);
                 }
             }
 
             if visible {
+                if matches!(
+                    line.block,
+                    BlockKind::Properties | BlockKind::Callout | BlockKind::Embed
+                ) {
+                    let belongs_to_same_card = |other_block: BlockKind, same_source: bool| {
+                        other_block == line.block
+                            && (matches!(line.block, BlockKind::Properties | BlockKind::Callout)
+                                || same_source)
+                    };
+                    let same_as_previous = line_index > 0
+                        && belongs_to_same_card(
+                            visual.lines[line_index - 1].block,
+                            visual.lines[line_index - 1].source == line.source,
+                        );
+                    let same_as_next = visual.lines.get(line_index + 1).is_some_and(|next| {
+                        belongs_to_same_card(next.block, next.source == line.source)
+                    });
+                    let background = match line.block {
+                        BlockKind::Properties => chrome.control_bg.mul_alpha(0.72),
+                        BlockKind::Callout => chrome.selected_bg.mul_alpha(0.20),
+                        BlockKind::Embed => chrome.sidebar_button_bg,
+                        _ => unreachable!(),
+                    };
+                    self.fill_vertically_rounded_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(text_left, line_y, wrap_width, line_height),
+                        background,
+                        self.ui_f32(SIDEBAR_ROW_RADIUS),
+                        !same_as_previous,
+                        !same_as_next,
+                    )?;
+                    if matches!(line.block, BlockKind::Callout | BlockKind::Embed) {
+                        self.filled_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(text_left, line_y, self.ui_f32(3.0).max(1.0), line_height),
+                            chrome.secondary_text,
+                        )?;
+                    }
+                }
                 if let Some(table_row) = table_row {
+                    table_layouts.push(RightSidebarNoteTableLayout {
+                        source_start: table_row.table_start,
+                        x: text_left,
+                        y: line_y.max(viewport_top),
+                        width: wrap_width,
+                        height: line_bottom.min(viewport_bottom) - line_y.max(viewport_top),
+                        max_horizontal_scroll: table_row.max_horizontal_scroll,
+                    });
                     if table_row.row_index == 0 {
                         self.filled_rectangle(
                             layers,
@@ -4520,20 +6627,58 @@ impl crate::TermWindow {
                             chrome.separator,
                         )?;
                     }
-                    let mut boundary_x = text_left;
-                    self.filled_rectangle(
-                        layers,
-                        1,
-                        euclid::rect(boundary_x, line_y, 1.0, line_height),
-                        chrome.separator,
-                    )?;
-                    for column_width in table_row.column_widths.iter() {
-                        boundary_x += *column_width;
+                    let mut boundary_x = text_left - table_row.horizontal_offset;
+                    if boundary_x >= clip_left && boundary_x <= clip_right {
                         self.filled_rectangle(
                             layers,
                             1,
-                            euclid::rect(boundary_x - 1.0, line_y, 1.0, line_height),
+                            euclid::rect(boundary_x, line_y, 1.0, line_height),
                             chrome.separator,
+                        )?;
+                    }
+                    for column_width in table_row.column_widths.iter() {
+                        boundary_x += *column_width;
+                        if boundary_x >= clip_left && boundary_x <= clip_right {
+                            self.filled_rectangle(
+                                layers,
+                                1,
+                                euclid::rect(boundary_x - 1.0, line_y, 1.0, line_height),
+                                chrome.separator,
+                            )?;
+                        }
+                    }
+                    if table_row.row_index + 1 == table_row.row_count
+                        && table_row.max_horizontal_scroll > 0.0
+                    {
+                        let track_height = self.ui_f32(NOTE_TABLE_SCROLLBAR_HEIGHT as f32);
+                        let thumb_width = (wrap_width * wrap_width / table_row.total_width)
+                            .max(self.ui_f32(24.0))
+                            .min(wrap_width);
+                        let thumb_x = text_left
+                            + (wrap_width - thumb_width)
+                                * (table_row.horizontal_offset
+                                    / table_row.max_horizontal_scroll.max(1.0));
+                        self.filled_rectangle(
+                            layers,
+                            2,
+                            euclid::rect(
+                                text_left,
+                                line_y + line_height - track_height,
+                                wrap_width,
+                                track_height,
+                            ),
+                            chrome.separator.mul_alpha(0.46),
+                        )?;
+                        self.filled_rectangle(
+                            layers,
+                            2,
+                            euclid::rect(
+                                thumb_x,
+                                line_y + line_height - track_height,
+                                thumb_width,
+                                track_height,
+                            ),
+                            chrome.scrollbar_thumb,
                         )?;
                     }
                 }
@@ -4561,6 +6706,8 @@ impl crate::TermWindow {
                                 line_y,
                                 (clip_right - text_left).max(0.0),
                                 line_height,
+                                viewport_top,
+                                viewport_bottom,
                             )?;
                         }
                     }
@@ -4582,7 +6729,6 @@ impl crate::TermWindow {
             }
 
             if !visible {
-                logical_y += line_height + row_gap;
                 continue;
             }
 
@@ -4618,8 +6764,10 @@ impl crate::TermWindow {
                             .copied()
                             .unwrap_or(0.0);
                         let cell_left = x;
-                        let cell_right = (cell_left + cell_width).min(clip_right);
-                        let cell_clip_left = (cell_left + table_horizontal_padding).min(cell_right);
+                        let cell_right = cell_left + cell_width;
+                        let cell_clip_left = (cell_left + table_horizontal_padding)
+                            .max(clip_left)
+                            .min(clip_right);
                         let cell_clip_right = (cell_right - table_horizontal_padding)
                             .max(cell_clip_left)
                             .min(clip_right);
@@ -4660,6 +6808,18 @@ impl crate::TermWindow {
                             content_right,
                             content_left,
                             (content_right - content_left).max(0.0),
+                        )
+                    } else if matches!(
+                        line.block,
+                        BlockKind::Properties | BlockKind::Callout | BlockKind::Embed
+                    ) {
+                        (
+                            x,
+                            line_y + card_vertical_padding,
+                            clip_left + card_horizontal_padding,
+                            clip_right - card_horizontal_padding,
+                            x,
+                            advance,
                         )
                     } else {
                         (x, line_y, clip_left, clip_right, x, advance)
@@ -4719,8 +6879,13 @@ impl crate::TermWindow {
                     } else {
                         foreground
                     };
-                    let code_colors = code_row.and_then(|row| row.colors.get(row.row_index));
-                    self.paint_cached_ui_shape_clipped(
+                    let code_colors = code_row.map(|row| {
+                        (
+                            row.row_index,
+                            self.cached_note_code_highlights(&row.code, use_dark_syntax_theme),
+                        )
+                    });
+                    self.paint_cached_ui_shape_pixel_clipped(
                         layers,
                         &metrics,
                         &shaped,
@@ -4730,6 +6895,8 @@ impl crate::TermWindow {
                         run_clip_right,
                         |info| {
                             code_colors
+                                .as_ref()
+                                .and_then(|(row_index, lines)| lines.get(*row_index))
                                 .and_then(|colors| colors.get(info.cluster))
                                 .copied()
                                 .unwrap_or(color)
@@ -4747,6 +6914,50 @@ impl crate::TermWindow {
                             ),
                             color,
                         )?;
+                    }
+                    if !run.atomic {
+                        if let Some(issues) = spelling_issues.as_ref() {
+                            for issue in issues.iter().filter(|issue| {
+                                issue.source.start < run.source.end
+                                    && run.source.start < issue.source.end
+                                    && !active_spelling_word.as_ref().is_some_and(|active| {
+                                        active.start < issue.source.end
+                                            && issue.source.start < active.end
+                                    })
+                            }) {
+                                let source_start = issue.source.start.max(run.source.start);
+                                let source_end = issue.source.end.min(run.source.end);
+                                let underline_start =
+                                    note_boundary_x(&boundaries, source_start).max(run_clip_left);
+                                let underline_end =
+                                    note_boundary_x(&boundaries, source_end).min(run_clip_right);
+                                let segment_width = self.ui_f32(1.5).max(1.0);
+                                let segment_gap = self.ui_f32(1.0).max(1.0);
+                                let mut underline_x = underline_start;
+                                let mut raised = false;
+                                while underline_x < underline_end {
+                                    let width =
+                                        segment_width.min((underline_end - underline_x).max(0.0));
+                                    if width <= 0.0 {
+                                        break;
+                                    }
+                                    self.filled_rectangle(
+                                        layers,
+                                        2,
+                                        euclid::rect(
+                                            underline_x,
+                                            run_y + run_height
+                                                - self.ui_f32(if raised { 1.0 } else { 2.0 }),
+                                            width,
+                                            self.ui_f32(1.0).max(1.0),
+                                        ),
+                                        chrome.spelling_error,
+                                    )?;
+                                    raised = !raised;
+                                    underline_x += segment_width + segment_gap;
+                                }
+                            }
+                        }
                     }
                 }
                 if focused
@@ -4791,7 +7002,7 @@ impl crate::TermWindow {
                     if code_row.is_some() {
                         text_left + code_horizontal_padding
                     } else {
-                        text_left
+                        text_left + continuation_indent
                     },
                     code_text_y.unwrap_or(line_y),
                     if code_row.is_some() {
@@ -4817,14 +7028,15 @@ impl crate::TermWindow {
                 },
                 runs: run_layouts,
             });
-            logical_y += line_height + row_gap;
         }
 
         self.right_sidebar_note.line_layouts = layouts;
         self.right_sidebar_note.code_block_layouts = code_block_layouts;
+        self.right_sidebar_note_table_layouts = table_layouts;
         self.right_sidebar_note.viewport_height = body_height as f32;
         self.right_sidebar_note.content_height = measured_content_height;
         self.right_sidebar_note.clamp_scroll();
+        self.sync_right_sidebar_note_native_text_input_snapshot(wrap_key);
 
         if let Some((caret_x, caret_y, caret_height)) = caret_rect {
             if caret_y + caret_height >= viewport_top && caret_y <= viewport_bottom {
@@ -4878,6 +7090,45 @@ impl crate::TermWindow {
             }
         }
 
+        self.paint_right_sidebar_file_mask(
+            layers,
+            chrome,
+            content_x,
+            content_top,
+            content_width,
+            body_y.saturating_sub(content_top),
+        )?;
+        self.paint_right_sidebar_file_mask(
+            layers,
+            chrome,
+            content_x,
+            body_bottom,
+            content_width,
+            content_bottom.saturating_sub(body_bottom),
+        )?;
+        if self.right_sidebar_note.view.scroll_offset > 0.0 {
+            self.paint_right_sidebar_note_top_fade(
+                layers,
+                chrome,
+                content_x,
+                body_y,
+                content_width,
+                self.ui_px(FILE_SCROLL_FADE_HEIGHT).min(body_height),
+            )?;
+        }
+        self.paint_note_editor_toolbar(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            content_top,
+            content_width,
+            menu_size,
+            show_tree_button,
+            tree_button_icon,
+        )?;
+
         if self.right_sidebar_note.content_height > self.right_sidebar_note.viewport_height {
             let track_height = body_height as f32;
             let thumb_height = (track_height * self.right_sidebar_note.viewport_height
@@ -4901,37 +7152,294 @@ impl crate::TermWindow {
                 chrome.scrollbar_thumb,
             )?;
         }
+        note_layout_stage.finish(true);
         Ok(())
     }
 
-    fn schedule_right_sidebar_note_image(&mut self, path: PathBuf) {
-        if self.right_sidebar_note_images.contains_key(&path)
-            || !self.right_sidebar_note_images_loading.insert(path.clone())
+    #[allow(clippy::too_many_arguments)]
+    fn paint_note_editor_toolbar(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        menu_size: usize,
+        show_tree_button: bool,
+        tree_button_icon: SvgIcon,
+    ) -> anyhow::Result<()> {
+        if show_tree_button {
+            if self.is_pointer_over_ui_rect(content_x, content_top, menu_size, menu_size) {
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        content_x as f32,
+                        content_top as f32,
+                        menu_size as f32,
+                        menu_size as f32,
+                    ),
+                    chrome.control_hover_bg,
+                    WINDOW_TAB_ADD_BUTTON_RADIUS,
+                )?;
+            }
+            self.paint_snippet_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                menu_size,
+                tree_button_icon,
+                UIItemType::RightSidebarNoteTreeToggle,
+            )?;
+        }
+        let menu_x = content_x + content_width.saturating_sub(menu_size);
+        if self.is_pointer_over_ui_rect(menu_x, content_top, menu_size, menu_size) {
+            self.fill_rounded_rectangle(
+                layers,
+                2,
+                euclid::rect(
+                    menu_x as f32,
+                    content_top as f32,
+                    menu_size as f32,
+                    menu_size as f32,
+                ),
+                chrome.control_hover_bg,
+                WINDOW_TAB_ADD_BUTTON_RADIUS,
+            )?;
+        }
+        self.paint_snippet_icon_button(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            menu_x,
+            content_top,
+            menu_size,
+            SvgIcon::Ellipsis,
+            UIItemType::RightSidebarNoteMenu,
+        )
+    }
+
+    fn request_right_sidebar_note_open(
+        &mut self,
+        vault_root: PathBuf,
+        relative_path: String,
+        create: bool,
+        project_id: String,
+        focus: bool,
+    ) -> bool {
+        let key = (vault_root.clone(), relative_path.clone());
+        if self
+            .right_sidebar_note
+            .document
+            .as_ref()
+            .is_some_and(|document| {
+                document.vault_root == vault_root && document.relative_path == relative_path
+            })
+        {
+            self.right_sidebar_note_opening = None;
+            self.right_sidebar_note_open_failure = None;
+            self.right_sidebar_note.load_error = None;
+            if focus {
+                self.right_sidebar_note.view.focused = true;
+            }
+            if let Err(err) =
+                workspace_threads::set_project_active_note_path(&project_id, Some(&relative_path))
+            {
+                log::warn!("failed to persist active Note path: {err:#}");
+            }
+            return true;
+        }
+        if let Some((failed_key, message)) = self.right_sidebar_note_open_failure.as_ref() {
+            if failed_key == &key {
+                self.right_sidebar_note.load_error = Some(message.clone());
+                return false;
+            }
+        }
+        if self.right_sidebar_note_opening.as_ref() == Some(&key) {
+            self.right_sidebar_note.load_error = Some("Opening note…".to_string());
+            return false;
+        }
+
+        // Keep switching responsive.  The immutable save snapshot and the new
+        // document read can proceed independently on workers; save completion
+        // is session-gated so it cannot publish into the newly bound note.
+        if self.right_sidebar_note.document.is_some() {
+            self.right_sidebar_note.freeze_live_source();
+            self.save_right_sidebar_note_now();
+        }
+        self.right_sidebar_note_open_generation =
+            self.right_sidebar_note_open_generation.wrapping_add(1);
+        let generation = self.right_sidebar_note_open_generation;
+        self.right_sidebar_note_opening = Some(key.clone());
+        self.right_sidebar_note_open_failure = None;
+        self.right_sidebar_note.load_error = Some("Opening note…".to_string());
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.right_sidebar_note_opening = None;
+            return false;
+        };
+
+        promise::spawn::spawn(async move {
+            let worker_root = vault_root.clone();
+            let worker_path = relative_path.clone();
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                open_vault_document(&worker_root, &worker_path, create)
+            })
+            .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                if term_window.right_sidebar_note_open_generation != generation
+                    || term_window.right_sidebar_note_opening.as_ref() != Some(&key)
+                {
+                    return;
+                }
+                term_window.right_sidebar_note_opening = None;
+                match result {
+                    Ok(document) => {
+                        term_window.right_sidebar_note_open_failure = None;
+                        term_window.right_sidebar_note.load_error = None;
+                        term_window.right_sidebar_note.bind_document(document);
+                        term_window.right_sidebar_note.view.focused = focus;
+                        term_window.right_sidebar_note_view = RightSidebarNoteView::Editor;
+                        term_window
+                            .right_sidebar_note_table_horizontal_offsets
+                            .clear();
+                        term_window.right_sidebar_note_table_layouts.clear();
+                        if let Err(err) = workspace_threads::set_project_active_note_path(
+                            &project_id,
+                            Some(&relative_path),
+                        ) {
+                            log::warn!("failed to persist active Note path: {err:#}");
+                        }
+                        if create {
+                            term_window.right_sidebar_note_vault_last_scan = None;
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        term_window.right_sidebar_note.load_error = Some(message.clone());
+                        term_window.right_sidebar_note_open_failure = Some((key, message));
+                    }
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+        false
+    }
+
+    fn ensure_active_right_sidebar_note_document(&mut self) -> bool {
+        let Some(vault) = workspace_threads::space_note_vault(&self.active_space_id) else {
+            self.right_sidebar_note.clear_document(Some(
+                "Choose an existing Vault or create a new one to start Notes.".to_string(),
+            ));
+            return false;
+        };
+        let Some(project_id) =
+            workspace_threads::active_project_id_for_space(&self.active_space_id)
+        else {
+            self.right_sidebar_note
+                .clear_document(Some("No active Project in this Space.".to_string()));
+            return false;
+        };
+
+        // The persisted active path is updated only after the worker has
+        // successfully opened the clicked file. Until then it still names the
+        // old document. Re-applying it from paint would cancel the user's new
+        // request before its completion callback can bind the document.
+        if note_open_pending_for_vault(self.right_sidebar_note_opening.as_ref(), &vault.root) {
+            return self.right_sidebar_note.document.is_some();
+        }
+
+        let relative_path = match workspace_threads::project_active_note_path(&project_id) {
+            Some(path) => path,
+            None => {
+                if self.right_sidebar_note_vault_index_root.as_ref() != Some(&vault.root)
+                    || self.right_sidebar_note_vault_indexing
+                {
+                    self.right_sidebar_note.load_error = Some("Indexing Vault…".to_string());
+                    return false;
+                }
+                self.right_sidebar_note_vault_paths
+                    .iter()
+                    .find(|path| {
+                        Path::new(path)
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| "Untitled.md".to_string())
+            }
+        };
+        let create = !vault.root.join(&relative_path).exists();
+        self.request_right_sidebar_note_open(vault.root, relative_path, create, project_id, false)
+    }
+
+    fn schedule_right_sidebar_note_image(&mut self, source: RightSidebarNoteImageSource) {
+        if self.right_sidebar_note_images.contains_key(&source)
+            || self
+                .right_sidebar_note_image_failures
+                .get(&source)
+                .is_some_and(|failed| failed.elapsed() < Duration::from_secs(60))
+            || !self
+                .right_sidebar_note_images_loading
+                .insert(source.clone())
         {
             return;
         }
         let Some(window) = self.window.as_ref().cloned() else {
-            self.right_sidebar_note_images_loading.remove(&path);
+            self.right_sidebar_note_images_loading.remove(&source);
             return;
         };
         promise::spawn::spawn(async move {
-            let load_path = path.clone();
-            let result =
-                promise::spawn::spawn_into_new_thread(move || load_file_preview_image(&load_path))
-                    .await;
+            let load_source = source.clone();
+            let result = promise::spawn::spawn_into_new_thread(move || match load_source {
+                RightSidebarNoteImageSource::Local(path) => load_file_preview_image(&path),
+                RightSidebarNoteImageSource::Remote(url) => {
+                    let image = load_remote_image(&url)?;
+                    let encoded_bytes = image.bytes.len();
+                    let width = image.width;
+                    let height = image.height;
+                    Ok(RightSidebarFilePreviewImage {
+                        data: Arc::new(ImageData::with_data(image.into_image_data())),
+                        width,
+                        height,
+                        encoded_bytes,
+                    })
+                }
+            })
+            .await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.right_sidebar_note_images_loading.remove(&path);
+                term_window
+                    .right_sidebar_note_images_loading
+                    .remove(&source);
                 match result {
                     Ok(image) => {
                         term_window
-                            .right_sidebar_note_image_order
-                            .retain(|cached| cached != &path);
+                            .right_sidebar_note_image_failures
+                            .remove(&source);
                         term_window
                             .right_sidebar_note_image_order
-                            .push_back(path.clone());
-                        term_window.right_sidebar_note_images.insert(path, image);
+                            .retain(|cached| cached != &source);
+                        term_window
+                            .right_sidebar_note_image_order
+                            .push_back(source.clone());
+                        term_window
+                            .right_sidebar_note_images
+                            .insert(source.clone(), image);
                         while term_window.right_sidebar_note_image_order.len()
                             > NOTE_IMAGE_CACHE_CAPACITY
+                            || term_window
+                                .right_sidebar_note_images
+                                .values()
+                                .map(|image| image.encoded_bytes)
+                                .sum::<usize>()
+                                > NOTE_IMAGE_CACHE_MAX_ENCODED_BYTES
                         {
                             if let Some(expired) =
                                 term_window.right_sidebar_note_image_order.pop_front()
@@ -4941,7 +7449,10 @@ impl crate::TermWindow {
                         }
                     }
                     Err(err) => {
-                        log::warn!("unable to render Note image {}: {err:#}", path.display());
+                        term_window
+                            .right_sidebar_note_image_failures
+                            .insert(source.clone(), Instant::now());
+                        log::warn!("unable to render Note image {:?}: {err:#}", source);
                     }
                 }
                 term_window.invalidate_window();
@@ -4959,15 +7470,14 @@ impl crate::TermWindow {
         y: f32,
         width: f32,
         height: f32,
+        clip_top: f32,
+        clip_bottom: f32,
     ) -> anyhow::Result<()> {
         if image.width == 0 || image.height == 0 || width <= 0.0 || height <= 0.0 {
             return Ok(());
         }
-        let scale = (width / image.width as f32)
-            .min(height / image.height as f32)
-            .min(1.0);
-        let draw_width = (image.width as f32 * scale).max(1.0);
-        let draw_height = (image.height as f32 * scale).max(1.0);
+        let (draw_width, draw_height) =
+            note_image_display_size(image.width, image.height, width, height);
         let draw_x = x + (width - draw_width) / 2.0;
         let draw_y = y + (height - draw_height) / 2.0;
         let Some(gl_state) = self.render_state.as_ref() else {
@@ -4979,16 +7489,38 @@ impl crate::TermWindow {
             .cached_image(&image.data, None, self.allow_images)
             .context("right sidebar Note image")?;
         self.update_next_frame_time(next_due);
+        let texture = sprite.texture_coords();
+        let Some(clip) = clip_note_texture(
+            draw_x,
+            draw_y,
+            draw_x + draw_width,
+            draw_y + draw_height,
+            texture.min_x(),
+            texture.min_y(),
+            texture.max_x(),
+            texture.max_y(),
+            x,
+            clip_top,
+            x + width,
+            clip_bottom,
+        ) else {
+            return Ok(());
+        };
         let left_offset = self.dimensions.pixel_width as f32 / 2.0;
         let top_offset = self.dimensions.pixel_height as f32 / 2.0;
         let mut quad = layers.allocate(2)?;
         quad.set_position(
-            draw_x - left_offset,
-            draw_y - top_offset,
-            draw_x + draw_width - left_offset,
-            draw_y + draw_height - top_offset,
+            clip.left - left_offset,
+            clip.top - top_offset,
+            clip.right - left_offset,
+            clip.bottom - top_offset,
         );
-        quad.set_texture(sprite.texture_coords());
+        quad.set_texture_discrete(
+            clip.texture_left,
+            clip.texture_right,
+            clip.texture_top,
+            clip.texture_bottom,
+        );
         quad.set_hsv(None);
         quad.set_has_color(true);
         quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
@@ -5543,6 +8075,30 @@ impl crate::TermWindow {
                 empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + self.ui_px(SIDEBAR_INSET) * 3,
             ),
             muted_fg,
+        )
+    }
+
+    fn paint_right_sidebar_note_top_fade(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> anyhow::Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let opaque_height = self.ui_px(12).min(height);
+        self.paint_right_sidebar_file_mask(layers, chrome, x, y, width, opaque_height)?;
+        self.paint_right_sidebar_file_top_fade(
+            layers,
+            chrome,
+            x,
+            y + opaque_height,
+            width,
+            height.saturating_sub(opaque_height),
         )
     }
 
@@ -6601,7 +9157,7 @@ impl crate::TermWindow {
         let y = line_y as f32;
 
         if line.spans.is_empty() {
-            self.paint_cached_ui_shape_clipped(
+            self.paint_cached_ui_shape_pixel_clipped(
                 layers,
                 &ui_metrics,
                 &shaped,
@@ -6613,7 +9169,7 @@ impl crate::TermWindow {
             )?;
         } else {
             let colors = self.cached_full_line_colors(line_index, line);
-            self.paint_cached_ui_shape_clipped(
+            self.paint_cached_ui_shape_pixel_clipped(
                 layers,
                 &ui_metrics,
                 &shaped,
@@ -7950,11 +10506,7 @@ fn syntax_color(kind: HighlightKind, use_dark_theme: bool) -> LinearRgba {
 }
 
 fn preview_line_count(lines: &[RightSidebarFilePreviewLine]) -> usize {
-    if lines.is_empty() {
-        1
-    } else {
-        lines.len()
-    }
+    if lines.is_empty() { 1 } else { lines.len() }
 }
 
 fn decimal_digit_count(mut value: usize) -> usize {
@@ -8313,6 +10865,7 @@ fn load_file_preview_image(path: &Path) -> anyhow::Result<RightSidebarFilePrevie
         data: Arc::new(ImageData::with_data(image_data)),
         width,
         height,
+        encoded_bytes: metadata.len() as usize,
     })
 }
 
@@ -8407,8 +10960,8 @@ impl RightSidebarFileCharBag {
 /// `Arc<RightSidebarFileIndex>` instead of each scanning and holding its own
 /// copy. Only weak refs live here, so an index is freed the moment the last
 /// window drops its strong ref (e.g. via the idle-release path).
-fn shared_file_index_registry(
-) -> &'static Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>> {
+fn shared_file_index_registry()
+-> &'static Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>>> =
         OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -9017,27 +11570,32 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_right_sidebar_file_index, full_line_colors_by_byte,
-        image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
-        naturalish_cmp, note_code_highlight_lines, note_code_row_height,
-        open_with_candidate_allowed, path_key, preview_line_count, preview_lines_from_text,
-        preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
-        preview_visible_line_range, right_sidebar_file_browse_rows_from_index,
-        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key,
-        search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
-        sorted_open_with_candidates, visible_file_row_range, wrap_snippet_text_for_width,
         FILE_PREVIEW_MAX_BYTES, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
+        NoteApproximateTextMetrics, NoteCodeHighlightEntry, NoteCodeHighlightState,
+        approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
+        full_line_colors_by_byte,
+        image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
+        naturalish_cmp, note_code_highlight_key, note_code_highlight_lines, note_code_row_height,
+        note_image_display_size, note_open_pending_for_vault, open_with_candidate_allowed,
+        path_key, preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
+        preview_text_range, preview_visible_colored, preview_visible_line_range,
+        right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
+        right_sidebar_open_with_cache_key, scrollable_note_table_columns,
+        search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
+        sorted_open_with_candidates, virtual_note_line_range, visible_code_block_rounded_edges,
+        visible_file_row_range, wrap_snippet_text_for_width,
     };
-    use crate::markdown_editor::ProjectedCodeBlock;
+    use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
     use crate::termwindow::{RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan};
     use crate::utilsprites::RenderMetrics;
     use std::collections::HashSet;
     use std::fs;
     use std::io::Cursor;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use wezterm_font::units::PixelLength;
-    use window::color::LinearRgba;
     use window::Size;
+    use window::color::LinearRgba;
 
     fn test_render_metrics(cell_height: isize, cell_width: isize) -> RenderMetrics {
         RenderMetrics {
@@ -9048,6 +11606,89 @@ mod tests {
             strike_row: 0,
             cell_size: Size::new(cell_width, cell_height),
         }
+    }
+
+    #[test]
+    fn note_virtualization_keeps_two_viewports_of_overscan() {
+        let geometry = (0..1_000)
+            .map(|index| NoteLineGeometry {
+                top: index as f32 * 10.0,
+                height: 10.0,
+                gap: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let range = virtual_note_line_range(&geometry, 5_000.0, 100.0);
+        assert!(range.start <= 480);
+        assert!(range.end >= 530);
+        assert!(range.len() < 60, "virtual range was {} rows", range.len());
+    }
+
+    #[test]
+    fn note_images_scale_responsively_without_escaping_the_viewport() {
+        assert_eq!(note_image_display_size(0, 100, 600.0, 500.0), (0.0, 0.0));
+        assert_eq!(
+            note_image_display_size(200, 100, 600.0, 500.0),
+            (600.0, 300.0)
+        );
+        assert_eq!(
+            note_image_display_size(1200, 2400, 600.0, 500.0),
+            (250.0, 500.0)
+        );
+    }
+
+    #[test]
+    fn note_images_clip_position_and_texture_at_the_body_edges() {
+        let clip = clip_note_texture(
+            0.0, 0.0, 100.0, 100.0, 0.0, 0.0, 1.0, 1.0, 10.0, 25.0, 90.0, 75.0,
+        )
+        .unwrap();
+        assert_eq!(clip.left, 10.0);
+        assert_eq!(clip.top, 25.0);
+        assert_eq!(clip.right, 90.0);
+        assert_eq!(clip.bottom, 75.0);
+        assert_eq!(clip.texture_left, 0.1);
+        assert_eq!(clip.texture_top, 0.25);
+        assert_eq!(clip.texture_right, 0.9);
+        assert_eq!(clip.texture_bottom, 0.75);
+    }
+
+    #[test]
+    fn background_note_width_does_not_double_count_cjk_or_emoji() {
+        let metrics = NoteApproximateTextMetrics {
+            latin: 5.0,
+            space: 3.0,
+            wide: 10.0,
+        };
+        assert_eq!(approximate_note_text_width("abc", metrics), 15.0);
+        assert_eq!(approximate_note_text_width("a b", metrics), 13.0);
+        assert_eq!(approximate_note_text_width("系统", metrics), 20.0);
+        assert_eq!(approximate_note_text_width("👨‍👩‍👧‍👦", metrics), 10.0);
+
+        let mixed = "alpha：示例 beta";
+        let all_full_width = mixed.chars().count() as f32 * metrics.wide;
+        assert!(approximate_note_text_width(mixed, metrics) < all_full_width * 0.7);
+    }
+
+    #[test]
+    fn pending_note_open_wins_over_the_old_persisted_active_path() {
+        let root = std::path::PathBuf::from("/vault");
+        let opening = (root.clone(), "Second.md".to_string());
+        assert!(note_open_pending_for_vault(Some(&opening), &root));
+        assert!(!note_open_pending_for_vault(
+            Some(&opening),
+            std::path::Path::new("/another-vault")
+        ));
+    }
+
+    #[test]
+    fn wide_note_tables_keep_natural_width_for_horizontal_scrolling() {
+        let widths = scrollable_note_table_columns(&[260.0, 240.0, 220.0], 400.0, 120.0, 480.0);
+        assert_eq!(widths, vec![260.0, 240.0, 220.0]);
+        assert!(widths.iter().sum::<f32>() > 400.0);
+
+        let narrow = scrollable_note_table_columns(&[20.0, 40.0], 400.0, 120.0, 480.0);
+        assert_eq!(narrow.iter().sum::<f32>(), 400.0);
+        assert!(narrow.iter().all(|width| *width >= 120.0));
     }
 
     #[test]
@@ -9075,12 +11716,77 @@ mod tests {
     }
 
     #[test]
+    fn note_code_highlight_cache_is_content_based_and_keeps_previous_colors() {
+        let code = |start: usize, text: &str, language: &str| ProjectedCodeBlock {
+            source: start..start + text.len() + 12,
+            content: start + 6..start + 6 + text.len(),
+            text: text.to_string(),
+            language: Some(language.to_string()),
+        };
+        let python = code(0, "print(1)\n", "python");
+        let shifted_alias = code(200, "print(1)\n", "py");
+        let changed = code(0, "print(2)\n", "python");
+        let key = note_code_highlight_key(&python).unwrap();
+        assert_eq!(key, note_code_highlight_key(&shifted_alias).unwrap());
+        let changed_key = note_code_highlight_key(&changed).unwrap();
+        assert_ne!(key, changed_key);
+
+        let empty = Arc::new(vec![vec![]]);
+        let entry = Arc::new(NoteCodeHighlightEntry {
+            key,
+            source: Arc::from(python.text.as_str()),
+            light: Arc::clone(&empty),
+            dark: Arc::clone(&empty),
+        });
+        let mut state = NoteCodeHighlightState::default();
+        state.insert_cache(Arc::clone(&entry));
+        state.remember_block(python.source.start, Arc::clone(&entry));
+        assert!(state.cached(key, &python.text).is_some());
+        assert!(state.cached(key, "hash collision guard").is_none());
+        assert!(
+            state
+                .previous_for_block(python.source.start, changed_key.language)
+                .is_some()
+        );
+
+        let generation = state
+            .schedule_block(python.source.start, changed_key)
+            .unwrap();
+        assert!(generation > 0);
+        assert!(
+            state
+                .schedule_block(python.source.start, changed_key)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn note_code_row_heights_form_one_continuous_block() {
         assert_eq!(note_code_row_height(0, 3, false, 20.0, 38.0, 9.0), 67.0);
         assert_eq!(note_code_row_height(1, 3, false, 20.0, 38.0, 9.0), 20.0);
         assert_eq!(note_code_row_height(2, 3, false, 20.0, 38.0, 9.0), 29.0);
         assert_eq!(note_code_row_height(0, 3, true, 20.0, 38.0, 9.0), 38.0);
         assert_eq!(note_code_row_height(1, 3, true, 20.0, 38.0, 9.0), 0.0);
+    }
+
+    #[test]
+    fn clipped_code_blocks_only_round_real_visible_edges() {
+        assert_eq!(
+            visible_code_block_rounded_edges(20.0, 80.0, 0.0, 100.0),
+            (true, true)
+        );
+        assert_eq!(
+            visible_code_block_rounded_edges(-20.0, 80.0, 0.0, 100.0),
+            (false, true)
+        );
+        assert_eq!(
+            visible_code_block_rounded_edges(20.0, 120.0, 0.0, 100.0),
+            (true, false)
+        );
+        assert_eq!(
+            visible_code_block_rounded_edges(-20.0, 120.0, 0.0, 100.0),
+            (false, false)
+        );
     }
 
     #[test]
@@ -9347,7 +12053,7 @@ mod tests {
         assert!(image_pixels_within_preview_budget(1920, 1080)); // 2 MP
         assert!(image_pixels_within_preview_budget(4096, 2160)); // ~8.8 MP (4K)
         assert!(image_pixels_within_preview_budget(4000, 4000)); // 16 MP (== budget)
-                                                                 // Bombs are rejected, and the u64 product cannot overflow.
+        // Bombs are rejected, and the u64 product cannot overflow.
         assert!(!image_pixels_within_preview_budget(8000, 8000)); // 64 MP
         assert!(!image_pixels_within_preview_budget(100_000, 100_000));
         assert!(!image_pixels_within_preview_budget(u32::MAX, u32::MAX));

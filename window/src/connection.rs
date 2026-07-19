@@ -97,11 +97,11 @@ pub trait ConnectionOps {
                         Some(info) => info.rect,
                         None => {
                             log::error!(
-                            "Requested display {} was not found; available displays are: {:?}. \
+                                "Requested display {} was not found; available displays are: {:?}. \
                              Using primary display instead",
-                            name,
-                            screens.by_name,
-                        );
+                                name,
+                                screens.by_name,
+                            );
                             screens.main.rect
                         }
                     },

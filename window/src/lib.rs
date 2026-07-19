@@ -4,6 +4,7 @@ use config::window::WindowLevel;
 use config::{ConfigHandle, Dimension, GeometryOrigin};
 use promise::Future;
 use std::any::Any;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use thiserror::Error;
@@ -57,12 +58,63 @@ pub struct Dimensions {
     pub dpi: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContextMenuAction {
+    KeyAssignment(config::keyassignment::KeyAssignment),
+    ApplicationAction(u64),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextCheckCapabilities {
+    pub spelling: bool,
+    pub suggestions: bool,
+    pub ignore: bool,
+    pub learn: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextCheckRequest {
+    pub document_id: String,
+    pub request_id: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextCheckIssue {
+    /// UTF-8 byte range in `TextCheckRequest::text`.
+    pub range: Range<usize>,
+    pub suggestions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextCheckResponse {
+    pub request_id: u64,
+    pub issues: Vec<TextCheckIssue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeTextHit {
+    pub rect: Rect,
+    /// UTF-8 byte offset in `NativeTextInputSnapshot::text`.
+    pub byte: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeTextInputSnapshot {
+    pub token: u64,
+    pub revision: u64,
+    pub source_base: usize,
+    pub text: String,
+    pub selection: Range<usize>,
+    pub hits: Vec<NativeTextHit>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ContextMenuItem {
     Item {
         label: String,
-        icon: Option<String>,
-        action: config::keyassignment::KeyAssignment,
+        icon: Option<ContextMenuIcon>,
+        action: ContextMenuAction,
         checked: bool,
         enabled: bool,
         submenu: Vec<ContextMenuItem>,
@@ -70,12 +122,180 @@ pub enum ContextMenuItem {
     Separator,
 }
 
+/// Platform-neutral menu icon intent. Native macOS menus translate this to a
+/// version-safe SF Symbol and fall back to the same bundled Lucide asset used
+/// by ThinkTerm's Windows/Linux menu renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContextMenuIcon {
+    Application,
+    Back,
+    Check,
+    Close,
+    Code,
+    Collapse,
+    Copy,
+    Cut,
+    Delete,
+    Edit,
+    Expand,
+    ExternalLink,
+    File,
+    Folder,
+    FolderAdd,
+    FolderRemove,
+    Home,
+    Info,
+    MoveLeft,
+    MoveRight,
+    New,
+    Note,
+    Notification,
+    Paste,
+    Pin,
+    Refresh,
+    Redo,
+    Save,
+    Search,
+    Server,
+    Settings,
+    Sidebar,
+    Spellcheck,
+    SplitHorizontal,
+    SplitVertical,
+    Stack,
+    Terminal,
+    Undo,
+    Unpin,
+    Vault,
+    Warning,
+    Window,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderPickerOptions {
+    pub title: String,
+    pub prompt: String,
+}
+
+impl Default for FolderPickerOptions {
+    fn default() -> Self {
+        Self {
+            title: "Open Project".to_string(),
+            prompt: "Open".to_string(),
+        }
+    }
+}
+
+impl ContextMenuIcon {
+    pub fn sf_symbol_name(self) -> &'static str {
+        match self {
+            Self::Application => "app",
+            Self::Back => "chevron.left",
+            Self::Check => "checkmark.circle",
+            Self::Close => "xmark",
+            Self::Code => "chevron.left.forwardslash.chevron.right",
+            Self::Collapse => "rectangle.compress.vertical",
+            Self::Copy => "doc.on.doc",
+            Self::Cut => "scissors",
+            Self::Delete => "trash",
+            Self::Edit => "pencil",
+            Self::Expand => "rectangle.expand.vertical",
+            Self::ExternalLink => "arrow.up.right.square",
+            Self::File => "doc",
+            Self::Folder | Self::Vault => "folder",
+            Self::FolderAdd => "folder.badge.plus",
+            Self::FolderRemove => "folder.badge.minus",
+            Self::Home => "house",
+            Self::Info => "info.circle",
+            Self::MoveLeft => "arrow.left",
+            Self::MoveRight => "arrow.right",
+            Self::New => "plus",
+            Self::Note => "square.and.pencil",
+            Self::Notification => "bell",
+            Self::Paste => "doc.on.clipboard",
+            Self::Pin => "pin",
+            Self::Refresh => "arrow.clockwise",
+            Self::Redo => "arrow.uturn.forward",
+            Self::Save => "square.and.arrow.down",
+            Self::Search => "magnifyingglass",
+            Self::Server => "server.rack",
+            Self::Settings => "gearshape",
+            Self::Sidebar => "sidebar.leading",
+            Self::Spellcheck => "textformat.abc.dottedunderline",
+            Self::SplitHorizontal => "rectangle.split.2x1",
+            Self::SplitVertical => "rectangle.split.1x2",
+            Self::Stack => "square.stack",
+            Self::Terminal => "terminal",
+            Self::Undo => "arrow.uturn.backward",
+            Self::Unpin => "pin.slash",
+            Self::Warning => "exclamationmark.circle",
+            Self::Window => "macwindow",
+        }
+    }
+
+    pub fn lucide_svg(self) -> &'static [u8] {
+        match self {
+            Self::Application => include_bytes!("../../third_party/lucide/icons/app-window.svg"),
+            Self::Back | Self::MoveLeft => {
+                include_bytes!("../../third_party/lucide/icons/arrow-left.svg")
+            }
+            Self::Check => include_bytes!("../../third_party/lucide/icons/circle-check.svg"),
+            Self::Close => include_bytes!("../../third_party/lucide/icons/x.svg"),
+            Self::Code => include_bytes!("../../third_party/lucide/icons/code-xml.svg"),
+            Self::Collapse => include_bytes!("../../third_party/lucide/icons/shrink.svg"),
+            Self::Copy => include_bytes!("../../third_party/lucide/icons/copy.svg"),
+            Self::Cut => include_bytes!("../../third_party/lucide/icons/scissors.svg"),
+            Self::Delete => include_bytes!("../../third_party/lucide/icons/trash-2.svg"),
+            Self::Edit => include_bytes!("../../third_party/lucide/icons/pencil.svg"),
+            Self::Expand => include_bytes!("../../third_party/lucide/icons/expand.svg"),
+            Self::ExternalLink => {
+                include_bytes!("../../third_party/lucide/icons/external-link.svg")
+            }
+            Self::File => include_bytes!("../../third_party/lucide/icons/file.svg"),
+            Self::Folder => include_bytes!("../../third_party/lucide/icons/folder.svg"),
+            Self::FolderAdd => include_bytes!("../../third_party/lucide/icons/folder-plus.svg"),
+            Self::FolderRemove => {
+                include_bytes!("../../third_party/lucide/icons/folder-minus.svg")
+            }
+            Self::Home => include_bytes!("../../third_party/lucide/icons/house.svg"),
+            Self::Info => include_bytes!("../../third_party/lucide/icons/info.svg"),
+            Self::MoveRight => include_bytes!("../../third_party/lucide/icons/arrow-right.svg"),
+            Self::New => include_bytes!("../../third_party/lucide/icons/plus.svg"),
+            Self::Note => include_bytes!("../../third_party/lucide/icons/notebook-tabs.svg"),
+            Self::Notification => include_bytes!("../../third_party/lucide/icons/bell.svg"),
+            Self::Paste => include_bytes!("../../third_party/lucide/icons/clipboard-paste.svg"),
+            Self::Pin => include_bytes!("../../third_party/lucide/icons/pin.svg"),
+            Self::Refresh => include_bytes!("../../third_party/lucide/icons/rotate-ccw.svg"),
+            Self::Redo => include_bytes!("../../third_party/lucide/icons/redo.svg"),
+            Self::Save => include_bytes!("../../third_party/lucide/icons/save.svg"),
+            Self::Search => include_bytes!("../../third_party/lucide/icons/search.svg"),
+            Self::Server => include_bytes!("../../third_party/lucide/icons/server.svg"),
+            Self::Settings => include_bytes!("../../third_party/lucide/icons/settings.svg"),
+            Self::Sidebar => include_bytes!("../../third_party/lucide/icons/panel-left.svg"),
+            Self::Spellcheck => include_bytes!("../../third_party/lucide/icons/spell-check.svg"),
+            Self::SplitHorizontal => {
+                include_bytes!("../../third_party/lucide/icons/square-split-horizontal.svg")
+            }
+            Self::SplitVertical => {
+                include_bytes!("../../third_party/lucide/icons/square-split-vertical.svg")
+            }
+            Self::Stack => include_bytes!("../../third_party/lucide/icons/square-stack.svg"),
+            Self::Terminal => include_bytes!("../../third_party/lucide/icons/terminal.svg"),
+            Self::Undo => include_bytes!("../../third_party/lucide/icons/undo.svg"),
+            Self::Unpin => include_bytes!("../../third_party/lucide/icons/pin-off.svg"),
+            Self::Vault => include_bytes!("../../third_party/lucide/icons/folder-tree.svg"),
+            Self::Warning => include_bytes!("../../third_party/lucide/icons/circle-alert.svg"),
+            Self::Window => include_bytes!("../../third_party/lucide/icons/panels-top-left.svg"),
+        }
+    }
+}
+
 impl ContextMenuItem {
     pub fn item(label: impl Into<String>, action: config::keyassignment::KeyAssignment) -> Self {
         Self::Item {
             label: label.into(),
             icon: None,
-            action,
+            action: ContextMenuAction::KeyAssignment(action),
             checked: false,
             enabled: true,
             submenu: vec![],
@@ -84,13 +304,24 @@ impl ContextMenuItem {
 
     pub fn item_with_icon(
         label: impl Into<String>,
-        icon: impl Into<String>,
+        icon: ContextMenuIcon,
         action: config::keyassignment::KeyAssignment,
     ) -> Self {
         Self::Item {
             label: label.into(),
-            icon: Some(icon.into()),
-            action,
+            icon: Some(icon),
+            action: ContextMenuAction::KeyAssignment(action),
+            checked: false,
+            enabled: true,
+            submenu: vec![],
+        }
+    }
+
+    pub fn application_item(label: impl Into<String>, action_id: u64) -> Self {
+        Self::Item {
+            label: label.into(),
+            icon: None,
+            action: ContextMenuAction::ApplicationAction(action_id),
             checked: false,
             enabled: true,
             submenu: vec![],
@@ -100,6 +331,13 @@ impl ContextMenuItem {
     pub fn disabled(mut self) -> Self {
         if let Self::Item { enabled, .. } = &mut self {
             *enabled = false;
+        }
+        self
+    }
+
+    pub fn with_icon(mut self, icon_value: ContextMenuIcon) -> Self {
+        if let Self::Item { icon, .. } = &mut self {
+            *icon = Some(icon_value);
         }
         self
     }
@@ -115,7 +353,22 @@ impl ContextMenuItem {
         Self::Item {
             label: label.into(),
             icon: None,
-            action: config::keyassignment::KeyAssignment::Nop,
+            action: ContextMenuAction::KeyAssignment(config::keyassignment::KeyAssignment::Nop),
+            checked: false,
+            enabled: true,
+            submenu: items,
+        }
+    }
+
+    pub fn submenu_with_icon(
+        label: impl Into<String>,
+        icon: ContextMenuIcon,
+        items: Vec<ContextMenuItem>,
+    ) -> Self {
+        Self::Item {
+            label: label.into(),
+            icon: Some(icon),
+            action: ContextMenuAction::KeyAssignment(config::keyassignment::KeyAssignment::Nop),
             checked: false,
             enabled: true,
             submenu: items,
@@ -250,6 +503,13 @@ pub enum WindowEvent {
 
     AdviseDeadKeyStatus(DeadKeyStatus),
 
+    NativeTextInputReplace {
+        token: u64,
+        revision: u64,
+        source_range: Range<usize>,
+        text: String,
+    },
+
     /// Called to handle a raw key event, prior to any dead key,
     /// keymap composition or other higher level treatment.
     /// If you handle this key event, you must call
@@ -282,6 +542,9 @@ pub enum WindowEvent {
 
     /// Called by menubar dispatching stuff on some systems
     PerformKeyAssignment(config::keyassignment::KeyAssignment),
+
+    /// Dispatches an application-private action selected from a native menu.
+    PerformContextMenuAction(u64),
 
     AdviseModifiersLedStatus(Modifiers, KeyboardLedStatus),
 }
@@ -349,6 +612,14 @@ pub trait WindowOps {
         callback(None);
     }
 
+    fn pick_folder_async_with_options(
+        &self,
+        _options: FolderPickerOptions,
+        callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+    ) {
+        self.pick_folder_async(callback);
+    }
+
     /// Show a native picker for choosing an application (macOS: .app bundle,
     /// Windows: .exe, Linux: .desktop entry or executable).
     fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
@@ -394,6 +665,27 @@ pub trait WindowOps {
     /// cursor input location.  This is used primarily for
     /// the platform specific input method editor
     fn set_text_cursor_position(&self, _cursor: Rect) {}
+
+    /// Exposes bounded custom-editor text to native text input services.
+    fn set_native_text_input_snapshot(&self, _snapshot: Option<NativeTextInputSnapshot>) {}
+
+    /// Show the platform's dictionary/definition UI for a piece of text.
+    fn show_text_definition(&self, _text: &str, _anchor: Rect) {}
+
+    fn text_check_capabilities(&self) -> TextCheckCapabilities {
+        TextCheckCapabilities::default()
+    }
+
+    fn request_text_check(&self, request: TextCheckRequest) -> Future<TextCheckResponse> {
+        Future::ok(TextCheckResponse {
+            request_id: request.request_id,
+            issues: vec![],
+        })
+    }
+
+    fn ignore_spelling_word(&self, _document_id: &str, _word: &str) {}
+
+    fn learn_spelling_word(&self, _word: &str) {}
 
     /// Initiate textual transfer from the clipboard
     fn get_clipboard(&self, clipboard: Clipboard) -> Future<String>;
