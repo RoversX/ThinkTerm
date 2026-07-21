@@ -7,7 +7,6 @@
 mod document;
 mod host;
 mod projection;
-#[allow(dead_code)] // Removed once the Note paint host starts scheduling loads.
 mod remote_image;
 mod spellcheck;
 mod store;
@@ -24,8 +23,7 @@ pub(crate) use host::{
 pub(crate) use projection::{
     BlockKind, InlineStyle, MarkdownProjection, ProjectedCodeBlock, ProjectedObject, TableAlignment,
 };
-#[allow(unused_imports)] // Standalone API for the pending Note host integration.
-pub(crate) use remote_image::{load_remote_image, RemoteImage};
+pub(crate) use remote_image::load_remote_image;
 pub(crate) use spellcheck::{build_spell_check_chunks_in_range, NoteSpellingIssue};
 pub(crate) use store::{
     import_attachment, open_vault_document, resolve_local_image, save_document_revision,

@@ -222,11 +222,7 @@ fn ranges_intersect(a: &Range<usize>, b: &Range<usize>) -> bool {
 }
 
 fn front_matter_range(source: &str) -> Option<Range<usize>> {
-    if !source.starts_with("---\n") {
-        return None;
-    }
-    let end = source[4..].find("\n---").map(|offset| 4 + offset + 4)?;
-    Some(0..end.min(source.len()))
+    super::projection::frontmatter_range(source)
 }
 
 #[cfg(test)]
@@ -247,6 +243,34 @@ mod tests {
         assert!(!text.contains("https://example.com"));
         assert!(!text.contains("codde"));
         assert!(!text.contains("let mistke"));
+    }
+
+    #[test]
+    fn unclosed_frontmatter_does_not_swallow_prose_before_a_dash_line() {
+        // The opening `---` is never closed by an exact `---` line, so this is
+        // not frontmatter; every prose line must still be spellchecked.
+        let source = "---\ntitlee: draft\n--- not a closing fence\nProse eror here.\n";
+        let projection = MarkdownProjection::parse(source);
+        let text = build_spell_check_chunks(source, &projection)
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("titlee"));
+        assert!(text.contains("Prose eror"));
+    }
+
+    #[test]
+    fn crlf_frontmatter_is_excluded_from_spellcheck() {
+        let source = "---\r\ntitle: Helo\r\n---\r\n\r\nProse mistke.\r\n";
+        let projection = MarkdownProjection::parse(source);
+        let text = build_spell_check_chunks(source, &projection)
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("Helo"));
+        assert!(text.contains("Prose mistke"));
     }
 
     #[test]

@@ -634,6 +634,22 @@ impl MarkdownProjection {
             .min_by_key(|node| node.source.end.saturating_sub(node.source.start))
     }
 
+    /// Cache key for caret-dependent syntax reveal in Live Preview. Must agree
+    /// with `build_visual_document`: frontmatter reveals only for a strictly
+    /// interior caret, so its boundary positions map to "nothing revealed".
+    pub(crate) fn caret_reveal_start(&self, byte: usize) -> usize {
+        match self.active_syntax(byte) {
+            Some(node)
+                if node.kind == MarkdownSyntaxKind::Frontmatter
+                    && !(node.source.start < byte && byte < node.source.end) =>
+            {
+                usize::MAX
+            }
+            Some(node) => node.source.start,
+            None => usize::MAX,
+        }
+    }
+
     pub(crate) fn active_block_range(&self, byte: usize) -> Option<Range<usize>> {
         let end = self
             .blocks
@@ -687,6 +703,12 @@ fn range_is_literal_code_or_frontmatter(
                 | MarkdownSyntaxKind::Frontmatter
         ) && ranges_overlap(&node.source, range)
     })
+}
+
+/// The source range of a leading YAML frontmatter block, if present. Shared
+/// with spellcheck so both agree on what counts as frontmatter.
+pub(crate) fn frontmatter_range(source: &str) -> Option<Range<usize>> {
+    parse_frontmatter(source).map(|(range, _)| range)
 }
 
 fn parse_frontmatter(source: &str) -> Option<(Range<usize>, Vec<ProjectedProperty>)> {

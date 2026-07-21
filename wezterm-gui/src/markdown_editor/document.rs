@@ -141,12 +141,20 @@ pub(crate) struct MarkdownDocumentSession {
     save_state: SaveState,
     line_starts: Vec<usize>,
     undo: Vec<EditRecord>,
+    /// Total `deleted + inserted` bytes retained across `undo`, so one huge
+    /// delete or paste cannot pin megabytes per record up to the count cap.
+    undo_bytes: usize,
     redo: Vec<EditRecord>,
     save_lock: Arc<Mutex<()>>,
     disk_stamp: Option<(SystemTime, u64)>,
 }
 
 const MAX_UNDO_RECORDS: usize = 512;
+const MAX_UNDO_BYTES: usize = 4 * 1024 * 1024;
+
+fn edit_record_bytes(record: &EditRecord) -> usize {
+    record.deleted.len() + record.inserted.len()
+}
 
 impl MarkdownDocumentSession {
     pub(crate) fn new(document_id: String, path: PathBuf, source: String) -> Self {
@@ -167,6 +175,7 @@ impl MarkdownDocumentSession {
             save_state: SaveState::Saved,
             line_starts,
             undo: vec![],
+            undo_bytes: 0,
             redo: vec![],
             save_lock: Arc::new(Mutex::new(())),
             disk_stamp,
@@ -298,6 +307,7 @@ impl MarkdownDocumentSession {
         self.save_state = SaveState::Saved;
         self.line_starts = line_starts(&self.source);
         self.undo.clear();
+        self.undo_bytes = 0;
         self.redo.clear();
         self.clamp_view(view);
         true
@@ -406,6 +416,115 @@ impl MarkdownDocumentSession {
                 focus: SourcePosition::new(start + prefix.len() + selected_len),
             }
         };
+        if let Some(edit) = self.undo.last_mut() {
+            edit.after = view.selection;
+        }
+        true
+    }
+
+    /// Whether Tab should indent whole lines rather than insert spaces at the
+    /// caret: any multi-line selection, or a caret on a Markdown list/quote
+    /// line (including task lists and ordered lists).
+    pub(crate) fn tab_indents_lines(&self, view: &EditorViewState) -> bool {
+        let range = self.clamped_selection_range(view);
+        // Any selection containing a newline (including one that ends exactly
+        // at the next line's start, like "first\n") indents lines; falling
+        // through to insert_text would replace the selection and join lines.
+        if self.source[range.clone()].contains('\n') {
+            return true;
+        }
+        let (line_start, line_end) = self.line_bounds(range.start);
+        markdown_line_continuation(self.source[line_start..line_end].trim_start()).is_some()
+    }
+
+    pub(crate) fn indent_lines(&mut self, view: &mut EditorViewState) -> bool {
+        self.reindent_lines(view, true)
+    }
+
+    pub(crate) fn outdent_lines(&mut self, view: &mut EditorViewState) -> bool {
+        self.reindent_lines(view, false)
+    }
+
+    fn reindent_lines(&mut self, view: &mut EditorViewState, indent: bool) -> bool {
+        const LINE_INDENT: &str = "    ";
+        if view.mode == EditorMode::ReadOnly {
+            return false;
+        }
+        let anchor = clamp_char_boundary(&self.source, view.selection.anchor.byte);
+        let focus = clamp_char_boundary(&self.source, view.selection.focus.byte);
+        let range = anchor.min(focus)..anchor.max(focus);
+        let first_line = self.line_index(range.start);
+        let last_pos = if range.end > range.start {
+            range.end - 1
+        } else {
+            range.end
+        };
+        let last_line = self.line_index(last_pos.max(range.start));
+        let span_start = self.line_starts[first_line];
+        let span_end = self.line_end(last_line);
+
+        let mut replacement = String::with_capacity(span_end - span_start + LINE_INDENT.len());
+        // (old line start, byte delta applied at that line's start)
+        let mut deltas: Vec<(usize, isize)> = Vec::with_capacity(last_line - first_line + 1);
+        for line in first_line..=last_line {
+            let start = self.line_starts[line];
+            let end = self.line_end(line);
+            let text = &self.source[start..end];
+            if line > first_line {
+                replacement.push('\n');
+            }
+            if indent {
+                replacement.push_str(LINE_INDENT);
+                replacement.push_str(text);
+                deltas.push((start, LINE_INDENT.len() as isize));
+            } else {
+                let removed = if text.starts_with('\t') {
+                    1
+                } else {
+                    text.bytes()
+                        .take(LINE_INDENT.len())
+                        .take_while(|byte| *byte == b' ')
+                        .count()
+                };
+                replacement.push_str(&text[removed..]);
+                deltas.push((start, -(removed as isize)));
+            }
+        }
+        if replacement == self.source[span_start..span_end] {
+            return false;
+        }
+
+        let total: isize = deltas.iter().map(|(_, delta)| *delta).sum();
+        let map = |position: usize| -> usize {
+            if position < span_start {
+                return position;
+            }
+            if position > span_end {
+                return (position as isize + total).max(span_start as isize) as usize;
+            }
+            let index = deltas
+                .partition_point(|(start, _)| *start <= position)
+                .saturating_sub(1);
+            let (line_start, delta) = deltas[index];
+            let shifted_start: isize = line_start as isize
+                + deltas[..index].iter().map(|(_, delta)| *delta).sum::<isize>();
+            let relative = position - line_start;
+            let relative = if delta >= 0 {
+                relative + delta as usize
+            } else {
+                relative.saturating_sub(delta.unsigned_abs())
+            };
+            shifted_start as usize + relative
+        };
+        let (new_anchor, new_focus) = (map(anchor), map(focus));
+        if !self.replace_range(view, span_start..span_end, &replacement) {
+            return false;
+        }
+        view.selection = SourceSelection {
+            anchor: SourcePosition::new(new_anchor),
+            focus: SourcePosition::new(new_focus),
+        };
+        view.preferred_column = None;
         if let Some(edit) = self.undo.last_mut() {
             edit.after = view.selection;
         }
@@ -554,14 +673,19 @@ impl MarkdownDocumentSession {
     }
 
     pub(crate) fn undo(&mut self, view: &mut EditorViewState) -> bool {
+        if view.mode == EditorMode::ReadOnly {
+            return false;
+        }
         let stage = crate::input_diagnostics::StageTimer::begin("note_edit");
         let Some(edit) = self.undo.pop() else {
             stage.finish(false);
             return false;
         };
+        self.undo_bytes = self.undo_bytes.saturating_sub(edit_record_bytes(&edit));
         let end = edit.start + edit.inserted.len();
         self.source.replace_range(edit.start..end, &edit.deleted);
         view.selection = edit.before;
+        view.preferred_column = None;
         let mutation = DocumentEdit::new(edit.start..end, edit.deleted.len());
         self.redo.push(edit);
         self.note_mutation(mutation);
@@ -570,6 +694,9 @@ impl MarkdownDocumentSession {
     }
 
     pub(crate) fn redo(&mut self, view: &mut EditorViewState) -> bool {
+        if view.mode == EditorMode::ReadOnly {
+            return false;
+        }
         let stage = crate::input_diagnostics::StageTimer::begin("note_edit");
         let Some(edit) = self.redo.pop() else {
             stage.finish(false);
@@ -578,8 +705,9 @@ impl MarkdownDocumentSession {
         let end = edit.start + edit.deleted.len();
         self.source.replace_range(edit.start..end, &edit.inserted);
         view.selection = edit.after;
+        view.preferred_column = None;
         let mutation = DocumentEdit::new(edit.start..end, edit.inserted.len());
-        self.undo.push(edit);
+        self.push_undo(edit);
         self.note_mutation(mutation);
         stage.finish(true);
         true
@@ -605,20 +733,30 @@ impl MarkdownDocumentSession {
         let after = SourceSelection::caret(start + inserted.len());
         view.selection = after;
         view.preferred_column = None;
-        self.undo.push(EditRecord {
+        self.push_undo(EditRecord {
             start,
             deleted,
             inserted: inserted.to_string(),
             before,
             after,
         });
-        if self.undo.len() > MAX_UNDO_RECORDS {
-            self.undo.remove(0);
-        }
         self.redo.clear();
         self.note_mutation(mutation);
         stage.finish(true);
         true
+    }
+
+    fn push_undo(&mut self, record: EditRecord) {
+        self.undo_bytes = self.undo_bytes.saturating_add(edit_record_bytes(&record));
+        self.undo.push(record);
+        while self.undo.len() > 1
+            && (self.undo.len() > MAX_UNDO_RECORDS || self.undo_bytes > MAX_UNDO_BYTES)
+        {
+            let evicted = self.undo.remove(0);
+            self.undo_bytes = self
+                .undo_bytes
+                .saturating_sub(edit_record_bytes(&evicted));
+        }
     }
 
     fn note_mutation(&mut self, edit: DocumentEdit) {
@@ -992,6 +1130,127 @@ mod tests {
         view.mode = EditorMode::ReadOnly;
         assert!(!session.insert_text(&mut view, "x"));
         assert_eq!(session.source(), "**hello**");
+    }
+
+    #[test]
+    fn undo_history_is_byte_bounded_but_keeps_the_newest_record() {
+        let big = "x".repeat(MAX_UNDO_BYTES / 2 + 1);
+        let (mut session, mut view) = session("");
+        session.insert_text(&mut view, "small edit");
+        for _ in 0..3 {
+            session.select_all(&mut view);
+            session.insert_text(&mut view, &big);
+        }
+        assert!(session.undo_bytes <= MAX_UNDO_BYTES.max(edit_record_bytes(
+            session.undo.last().expect("newest record retained")
+        )));
+        // Older records were evicted to honor the byte cap...
+        assert!(session.undo.len() < 4);
+        // ...but the newest edit is always undoable.
+        assert!(session.undo(&mut view));
+        assert!(session.redo(&mut view));
+        assert_eq!(session.source(), big);
+    }
+
+    #[test]
+    fn tab_indents_list_lines_and_multi_line_selections() {
+        let (session, mut view) = session("plain prose\n- item\n1. ordered\n> quote");
+        session.set_caret(&mut view, 2, false);
+        assert!(!session.tab_indents_lines(&view));
+        session.set_caret(&mut view, session.source().find("item").unwrap(), false);
+        assert!(session.tab_indents_lines(&view));
+        session.set_caret(&mut view, session.source().find("ordered").unwrap(), false);
+        assert!(session.tab_indents_lines(&view));
+        session.set_caret(&mut view, session.source().find("quote").unwrap(), false);
+        assert!(session.tab_indents_lines(&view));
+        view.selection = SourceSelection {
+            anchor: SourcePosition::new(2),
+            focus: SourcePosition::new(session.source().find("item").unwrap()),
+        };
+        assert!(session.tab_indents_lines(&view));
+    }
+
+    #[test]
+    fn newline_ending_selection_indents_its_line_instead_of_replacing_it() {
+        let (mut session, mut view) = session("first\nsecond");
+        // Select "first\n" — ends exactly at the start of the second line.
+        view.selection = SourceSelection {
+            anchor: SourcePosition::new(0),
+            focus: SourcePosition::new(6),
+        };
+        assert!(session.tab_indents_lines(&view));
+        assert!(session.indent_lines(&mut view));
+        assert_eq!(session.source(), "    first\nsecond");
+    }
+
+    #[test]
+    fn indent_and_outdent_shift_selected_lines_and_are_undoable() {
+        let (mut session, mut view) = session("- one\n- two\n- three");
+        let anchor = session.source().find("one").unwrap();
+        let focus = session.source().find("two").unwrap();
+        view.selection = SourceSelection {
+            anchor: SourcePosition::new(anchor),
+            focus: SourcePosition::new(focus),
+        };
+        assert!(session.indent_lines(&mut view));
+        assert_eq!(session.source(), "    - one\n    - two\n- three");
+        assert_eq!(view.selection.anchor.byte, anchor + 4);
+        assert_eq!(view.selection.focus.byte, focus + 8);
+        // The original selection covered "one\n- "; the indented equivalent
+        // keeps both endpoints anchored to the same text.
+        assert_eq!(&session.source()[view.selection.range()], "one\n    - ");
+
+        assert!(session.outdent_lines(&mut view));
+        assert_eq!(session.source(), "- one\n- two\n- three");
+        assert_eq!(view.selection.anchor.byte, anchor);
+        assert_eq!(view.selection.focus.byte, focus);
+
+        // Nothing left to strip: outdent is a no-op, not an edit.
+        assert!(!session.outdent_lines(&mut view));
+
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "    - one\n    - two\n- three");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "- one\n- two\n- three");
+    }
+
+    #[test]
+    fn outdent_strips_a_tab_or_partial_indent_and_clamps_the_caret() {
+        let (mut tabbed, mut tabbed_view) = session("\t- tabbed\n  - short");
+        tabbed.select_all(&mut tabbed_view);
+        assert!(tabbed.outdent_lines(&mut tabbed_view));
+        assert_eq!(tabbed.source(), "- tabbed\n- short");
+
+        let (mut indented, mut indented_view) = session("    - item");
+        indented.set_caret(&mut indented_view, 2, false);
+        assert!(indented.outdent_lines(&mut indented_view));
+        assert_eq!(indented.source(), "- item");
+        assert_eq!(indented_view.selection.focus.byte, 0);
+    }
+
+    #[test]
+    fn undo_redo_respect_read_only_and_reset_preferred_column() {
+        let (mut session, mut view) = session("line one\nline two");
+        session.set_caret(&mut view, session.source().len(), false);
+        session.insert_text(&mut view, "!");
+        session.move_vertical(&mut view, -1, false);
+        assert!(view.preferred_column.is_some());
+
+        view.mode = EditorMode::ReadOnly;
+        assert!(!session.undo(&mut view));
+        assert_eq!(session.source(), "line one\nline two!");
+        assert!(session.can_undo());
+
+        view.mode = EditorMode::LivePreview;
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "line one\nline two");
+        assert_eq!(view.preferred_column, None);
+
+        session.move_vertical(&mut view, -1, false);
+        assert!(view.preferred_column.is_some());
+        assert!(session.redo(&mut view));
+        assert_eq!(session.source(), "line one\nline two!");
+        assert_eq!(view.preferred_column, None);
     }
 
     #[test]

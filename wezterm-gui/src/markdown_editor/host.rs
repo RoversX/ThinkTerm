@@ -4,7 +4,7 @@ use super::{
     SourcePosition, SourceSelection, VaultDocument, VisualDocument, VisualWrapCache,
 };
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -101,8 +101,9 @@ pub(crate) struct NoteHostState {
     pub selection_granularity: SelectionGranularity,
     pub drag_selection_base: Option<Range<usize>>,
     pub drag_autoscroll_scheduled: bool,
-    pub collapsed_code_blocks: HashSet<usize>,
-    pub code_horizontal_offsets: HashMap<usize, f32>,
+    /// Ordered so paint can hash them each frame without sorting a copy.
+    pub collapsed_code_blocks: BTreeSet<usize>,
+    pub code_horizontal_offsets: BTreeMap<usize, f32>,
     pub code_block_layouts: Vec<NoteCodeBlockLayout>,
     pub spelling_issues: Arc<Vec<NoteSpellingIssue>>,
     pub spelling_revision: Option<u64>,
@@ -113,6 +114,10 @@ pub(crate) struct NoteHostState {
     pub native_text_input_token: u64,
     pub parse_requested_revision: Option<u64>,
     pub parse_in_flight_revision: Option<u64>,
+    /// The current projection reused cached wiki-link data but at least one
+    /// link had no cached resolution; a background parse round trip owes us
+    /// the authoritative vault lookup.
+    links_resolution_pending: bool,
     background_wrap_preferred: bool,
     background_wrap_requested_key: Option<NoteBackgroundWrapKey>,
     background_wrap_generation: u64,
@@ -157,8 +162,8 @@ impl Default for NoteHostState {
             selection_granularity: SelectionGranularity::Character,
             drag_selection_base: None,
             drag_autoscroll_scheduled: false,
-            collapsed_code_blocks: HashSet::new(),
-            code_horizontal_offsets: HashMap::new(),
+            collapsed_code_blocks: BTreeSet::new(),
+            code_horizontal_offsets: BTreeMap::new(),
             code_block_layouts: vec![],
             spelling_issues: Arc::new(vec![]),
             spelling_revision: None,
@@ -169,6 +174,7 @@ impl Default for NoteHostState {
             native_text_input_token: 0,
             parse_requested_revision: None,
             parse_in_flight_revision: None,
+            links_resolution_pending: false,
             background_wrap_preferred: false,
             background_wrap_requested_key: None,
             background_wrap_generation: 0,
@@ -220,6 +226,7 @@ impl NoteHostState {
         self.native_text_input_snapshot_key = None;
         self.parse_requested_revision = None;
         self.parse_in_flight_revision = None;
+        self.links_resolution_pending = false;
         self.background_wrap_preferred = false;
         self.background_wrap_requested_key = None;
         let snapshot = self
@@ -241,11 +248,7 @@ impl NoteHostState {
         let end = progressive_preview_end(&snapshot.source, PROGRESSIVE_PREVIEW_BYTES);
         let source = &snapshot.source[..end];
         self.projection = MarkdownProjection::parse(source);
-        let active_start = self
-            .projection
-            .active_syntax(0)
-            .map(|node| node.source.start)
-            .unwrap_or(usize::MAX);
+        let active_start = self.projection.caret_reveal_start(0);
         self.visual = Arc::new(build_visual_document(
             source,
             &self.projection,
@@ -273,6 +276,7 @@ impl NoteHostState {
         self.line_geometry = Arc::new(vec![]);
         self.parse_requested_revision = None;
         self.parse_in_flight_revision = None;
+        self.links_resolution_pending = false;
         self.background_wrap_preferred = false;
         self.background_wrap_requested_key = None;
     }
@@ -306,6 +310,19 @@ impl NoteHostState {
         self.spelling_issues = Arc::new(vec![]);
         self.refresh_projection();
         true
+    }
+
+    /// The exact snapshot this host currently displays. Background work
+    /// (link resolution, large-note parsing) must operate on this snapshot —
+    /// not the live session — or a Published host sharing a dirty session
+    /// would parse text it is not showing.
+    fn display_snapshot(&self) -> Option<DocumentSnapshot> {
+        let session = self.session.as_ref()?;
+        Some(match &self.display_source {
+            NoteDisplaySource::Published => session.lock().published_snapshot(),
+            NoteDisplaySource::Live => session.lock().current_snapshot(),
+            NoteDisplaySource::Frozen(snapshot) => snapshot.clone(),
+        })
     }
 
     pub(crate) fn refresh_projection(&mut self) {
@@ -361,32 +378,41 @@ impl NoteHostState {
                 })
                 .collect::<HashMap<_, _>>();
             let mut projection = MarkdownProjection::parse(source);
-            if matches!(self.display_source, NoteDisplaySource::Published) {
-                if let Some(document) = self.document.as_ref() {
-                    projection.resolve_vault_links(&document.vault_root, &document.relative_path);
-                }
-            } else {
-                for object in &mut projection.objects {
-                    let ProjectedObject::WikiLink {
-                        target,
-                        embed,
-                        resolved_path,
-                        ambiguous_paths,
-                        rendered_lines,
-                        ..
-                    } = object
-                    else {
-                        continue;
-                    };
-                    if let Some((cached_path, cached_ambiguous_paths, cached_lines)) =
-                        cached_links.get(&(target.clone(), *embed))
-                    {
-                        *resolved_path = cached_path.clone();
-                        *ambiguous_paths = cached_ambiguous_paths.clone();
-                        *rendered_lines = cached_lines.clone();
-                    }
+            // Never walk the vault (or read embedded notes) on the UI thread:
+            // reuse the previous projection's resolutions for immediate paint
+            // and let the background parse worker do the authoritative lookup.
+            let mut links_missing_resolution = false;
+            let mut any_links = false;
+            for object in &mut projection.objects {
+                let ProjectedObject::WikiLink {
+                    target,
+                    embed,
+                    resolved_path,
+                    ambiguous_paths,
+                    rendered_lines,
+                    ..
+                } = object
+                else {
+                    continue;
+                };
+                any_links = true;
+                if let Some((cached_path, cached_ambiguous_paths, cached_lines)) =
+                    cached_links.get(&(target.clone(), *embed))
+                {
+                    *resolved_path = cached_path.clone();
+                    *ambiguous_paths = cached_ambiguous_paths.clone();
+                    *rendered_lines = cached_lines.clone();
+                } else {
+                    links_missing_resolution = true;
                 }
             }
+            // Published projections used to re-resolve on every reparse, which
+            // is what picks up created/renamed targets and edited embeds; keep
+            // that freshness, just on the worker instead of the UI thread.
+            // Live/Frozen keep the old cache-authoritative behavior and only
+            // owe a round trip for links the cache has never seen.
+            self.links_resolution_pending = links_missing_resolution
+                || (any_links && matches!(self.display_source, NoteDisplaySource::Published));
             self.projection = projection;
             let code_starts = self
                 .projection
@@ -410,9 +436,7 @@ impl NoteHostState {
         }
         let active_start = self
             .projection
-            .active_syntax(self.view.selection.focus.byte)
-            .map(|node| node.source.start)
-            .unwrap_or(usize::MAX);
+            .caret_reveal_start(self.view.selection.focus.byte);
         let key = (revision, self.view.mode, active_start);
         if self.visual_key != Some(key) {
             if projection_stage.is_none() {
@@ -445,11 +469,10 @@ impl NoteHostState {
         usize,
         Option<(std::path::PathBuf, String)>,
     )> {
-        let session = self.session.as_ref()?.clone();
-        let snapshot = session.lock().current_snapshot();
-        if snapshot.source.len() <= BACKGROUND_PARSE_THRESHOLD_BYTES
-            || self.projection_revision == Some(snapshot.revision)
-        {
+        let snapshot = self.display_snapshot()?;
+        let needs_full_parse = snapshot.source.len() > BACKGROUND_PARSE_THRESHOLD_BYTES
+            && self.projection_revision != Some(snapshot.revision);
+        if !needs_full_parse && !self.links_resolution_pending {
             return None;
         }
         self.parse_requested_revision = Some(snapshot.revision);
@@ -482,21 +505,19 @@ impl NoteHostState {
             return false;
         }
         self.parse_in_flight_revision = None;
-        let current_revision = self
-            .session
-            .as_ref()
-            .map(|session| session.lock().revision());
-        if current_revision != Some(revision)
+        let display_revision = self
+            .display_snapshot()
+            .map(|snapshot| snapshot.revision);
+        if display_revision != Some(revision)
             || self.view.mode != mode
             || self.view.selection.focus.byte != caret
         {
             return false;
         }
-        let active_start = projection
-            .active_syntax(caret)
-            .map(|node| node.source.start)
-            .unwrap_or(usize::MAX);
+        let active_start = projection.caret_reveal_start(caret);
         self.projection = projection;
+        // The worker performed the authoritative vault-link resolution.
+        self.links_resolution_pending = false;
         self.visual = Arc::new(visual);
         self.background_wrap_preferred =
             self.visual.estimated_wrap_work_bytes() >= BACKGROUND_WRAP_THRESHOLD_BYTES;
@@ -573,11 +594,11 @@ impl NoteHostState {
     }
 
     pub(crate) fn background_parse_pending(&self) -> bool {
-        let current = self
-            .session
-            .as_ref()
-            .map(|session| session.lock().revision());
-        current.is_some_and(|revision| self.projection_revision != Some(revision))
+        if self.links_resolution_pending {
+            return self.session.is_some();
+        }
+        self.display_snapshot()
+            .is_some_and(|snapshot| self.projection_revision != Some(snapshot.revision))
     }
 
     pub(crate) fn begin_live_editing(&mut self) {
@@ -1048,6 +1069,72 @@ mod state_tests {
         assert!(!host.visual.lines.is_empty());
         assert_eq!(host.projection_revision, None);
         assert!(!host.prefers_background_wrap());
+        assert!(host.background_parse_request().is_some());
+    }
+
+    #[test]
+    fn small_note_wiki_links_resolve_via_background_parse_not_ui_thread() {
+        let source = "See [[Other Note]] for details.";
+        let mut host = host_with_source(source);
+        // The synchronous refresh reused (empty) cached link data, so it owes
+        // a background round trip for the authoritative vault lookup.
+        assert!(host.background_parse_pending());
+        let (revision, request_source, mode, caret, _) =
+            host.background_parse_request().expect("resolution request");
+        assert_eq!(request_source.as_ref(), source);
+
+        // Single flight while the worker runs.
+        assert!(host.background_parse_request().is_none());
+
+        let resolved = MarkdownProjection::parse(source);
+        let visual = build_visual_document(source, &resolved, mode, caret);
+        assert!(host.apply_background_parse(revision, mode, caret, resolved, visual));
+        assert!(!host.background_parse_pending());
+        assert!(host.background_parse_request().is_none());
+    }
+
+    #[test]
+    fn published_host_resolves_links_for_the_displayed_snapshot_not_the_live_one() {
+        let mut host = host_with_source("See [[Other]]");
+        let session = host.session.as_ref().unwrap().clone();
+        let mut other_view = EditorViewState::default();
+        let end = session.lock().source().len();
+        session.lock().set_caret(&mut other_view, end, false);
+        assert!(session.lock().insert_text(&mut other_view, " and [[Extra]]"));
+
+        // The Published host must request its displayed (published) snapshot,
+        // not the newer dirty session text.
+        let (revision, source, mode, caret, _) =
+            host.background_parse_request().expect("resolution request");
+        assert_eq!(source.as_ref(), "See [[Other]]");
+        assert_eq!(revision, 0);
+
+        let resolved = MarkdownProjection::parse(&source);
+        let visual = build_visual_document(&source, &resolved, mode, caret);
+        assert!(host.apply_background_parse(revision, mode, caret, resolved, visual));
+        // Settled: no repeated background parsing while the session stays
+        // dirty and the display stays Published.
+        assert!(!host.background_parse_pending());
+        assert!(host.background_parse_request().is_none());
+    }
+
+    #[test]
+    fn published_reparse_rechecks_vault_links_even_on_cache_hits() {
+        let mut host = host_with_source("See [[Other]]");
+        let (revision, source, mode, caret, _) =
+            host.background_parse_request().expect("initial resolution");
+        let resolved = MarkdownProjection::parse(&source);
+        let visual = build_visual_document(&source, &resolved, mode, caret);
+        assert!(host.apply_background_parse(revision, mode, caret, resolved, visual));
+        assert!(!host.background_parse_pending());
+
+        // An external writer changed the note; the link target may have
+        // changed on disk too, so a cache hit must not suppress the
+        // background re-resolution the old synchronous path performed.
+        let external = "Also see [[Other]].".to_string();
+        let len = external.len() as u64;
+        assert!(host.apply_external_snapshot(SystemTime::now(), len, external));
+        assert!(host.background_parse_pending());
         assert!(host.background_parse_request().is_some());
     }
 

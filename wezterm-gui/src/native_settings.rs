@@ -195,6 +195,8 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) workspace_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_file_preview_width: Option<usize>,
+    pub(crate) right_sidebar_note_pane_width: Option<usize>,
+    pub(crate) right_sidebar_note_pane_expanded: Option<bool>,
     pub(crate) right_sidebar_open_with_app: Option<NativeOpenWithApp>,
     pub(crate) right_sidebar_custom_open_with_apps: Vec<NativeOpenWithApp>,
     pub(crate) tab_font_size: Option<f64>,
@@ -459,6 +461,17 @@ pub(crate) fn right_sidebar_file_preview_width() -> Option<usize> {
     load().chrome.right_sidebar_file_preview_width
 }
 
+pub(crate) fn right_sidebar_note_pane_width() -> Option<usize> {
+    load().chrome.right_sidebar_note_pane_width
+}
+
+pub(crate) fn right_sidebar_note_pane_expanded() -> bool {
+    load()
+        .chrome
+        .right_sidebar_note_pane_expanded
+        .unwrap_or(false)
+}
+
 pub(crate) fn right_sidebar_open_with_app() -> Option<NativeOpenWithApp> {
     load().chrome.right_sidebar_open_with_app
 }
@@ -477,6 +490,18 @@ pub(crate) fn save_right_sidebar_width(width: usize) -> anyhow::Result<()> {
 pub(crate) fn save_right_sidebar_file_preview_width(width: usize) -> anyhow::Result<()> {
     let mut settings = load();
     settings.chrome.right_sidebar_file_preview_width = Some(width);
+    save(&settings)
+}
+
+pub(crate) fn save_right_sidebar_note_pane_width(width: usize) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.chrome.right_sidebar_note_pane_width = Some(width);
+    save(&settings)
+}
+
+pub(crate) fn save_right_sidebar_note_pane_expanded(expanded: bool) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.chrome.right_sidebar_note_pane_expanded = Some(expanded);
     save(&settings)
 }
 

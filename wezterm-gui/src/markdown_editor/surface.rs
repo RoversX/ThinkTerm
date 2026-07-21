@@ -609,15 +609,21 @@ pub(crate) fn build_visual_document(
         if let Some(object) = objects.get(object_index) {
             let range = object.source();
             if range.start == idx && range.end > range.start {
-                if range.start <= caret
+                let reveal = (range.start <= caret
                     && caret <= range.end
                     && matches!(
                         object,
                         ProjectedObject::WikiLink { .. }
                             | ProjectedObject::Callout { .. }
                             | ProjectedObject::BlockId { .. }
-                    )
-                {
+                    ))
+                    // Frontmatter reveals only when the caret is strictly
+                    // inside it, so a freshly opened document (caret at 0)
+                    // keeps the projected Properties view.
+                    || (range.start < caret
+                        && caret < range.end
+                        && matches!(object, ProjectedObject::Frontmatter { .. }));
+                if reveal {
                     append_revealed_source_range(
                         &mut lines,
                         &mut line,
@@ -1214,6 +1220,31 @@ mod tests {
         assert!(!text.contains("  - notes"));
         assert!(text.contains("title: Example"));
         assert!(text.contains("tags:"));
+    }
+
+    #[test]
+    fn live_preview_reveals_raw_frontmatter_when_caret_is_strictly_inside() {
+        let source = "---\ntitle: Example\ntags:\n  - notes\n---\n\n# Body\n";
+        let projection = MarkdownProjection::parse(source);
+        let caret = source.find("Example").unwrap();
+        let doc = build_visual_document(source, &projection, EditorMode::LivePreview, caret);
+        let text = doc
+            .lines
+            .iter()
+            .map(VisualLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("---"));
+        assert!(text.contains("title: Example"));
+        assert!(text.contains("  - notes"));
+
+        // The reveal-vs-projected states must hash to different visual keys so
+        // the host rebuilds when the caret enters or leaves the frontmatter.
+        assert_ne!(
+            projection.caret_reveal_start(caret),
+            projection.caret_reveal_start(0)
+        );
     }
 
     #[test]

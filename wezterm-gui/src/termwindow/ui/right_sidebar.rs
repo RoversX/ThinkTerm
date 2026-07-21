@@ -123,6 +123,8 @@ const FILE_PREVIEW_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const FILE_PREVIEW_IMAGE_MAX_PIXELS: u64 = 16_000_000;
 const FILE_PREVIEW_PANE_MIN_WIDTH: usize = 360;
 const FILE_PREVIEW_PANE_DEFAULT_WIDTH: usize = 560;
+const NOTE_PANE_MIN_WIDTH: usize = FILE_PREVIEW_PANE_MIN_WIDTH;
+const NOTE_PANE_DEFAULT_WIDTH: usize = FILE_PREVIEW_PANE_DEFAULT_WIDTH;
 const FILE_PREVIEW_SLICE_CACHE_CAPACITY: usize = 256;
 // Lines up to this many columns are shaped whole (once, cached) so horizontal
 // scrolling is pure translation of the cached glyph run instead of re-shaping a
@@ -250,6 +252,18 @@ fn visible_code_block_rounded_edges(
     (block_top >= viewport_top, block_bottom <= viewport_bottom)
 }
 
+/// Hash an already-ordered sequence with the same shape as `Vec::hash`
+/// (length prefix + elements) so adjacent collections cannot alias.
+fn hash_ordered_iter<H: std::hash::Hasher, T: Hash>(
+    hasher: &mut H,
+    iter: impl ExactSizeIterator<Item = T>,
+) {
+    iter.len().hash(hasher);
+    for item in iter {
+        item.hash(hasher);
+    }
+}
+
 fn virtual_note_line_range(
     geometry: &[NoteLineGeometry],
     scroll: f32,
@@ -258,7 +272,9 @@ fn virtual_note_line_range(
     if geometry.is_empty() || viewport_height <= 0.0 {
         return 0..0;
     }
-    let overscan = viewport_height * 2.0;
+    // Enough off-screen rows for drag-selection and caret hit-testing near the
+    // edges without paying for multiple invisible viewports per frame.
+    let overscan = viewport_height * 0.75;
     let paint_top = (scroll - overscan).max(0.0);
     let paint_bottom = scroll + viewport_height + overscan;
     let start = geometry.partition_point(|line| line.top + line.height + line.gap < paint_top);
@@ -782,6 +798,14 @@ pub fn right_sidebar_file_preview_width(dpi: usize) -> usize {
         .max(min_width)
 }
 
+pub fn right_sidebar_note_pane_width_for_dpi(dpi: usize) -> usize {
+    let min_width = scale_ui_usize(NOTE_PANE_MIN_WIDTH, dpi);
+    crate::native_settings::right_sidebar_note_pane_width()
+        .map(|width| scale_ui_usize(width, dpi))
+        .unwrap_or_else(|| scale_ui_usize(NOTE_PANE_DEFAULT_WIDTH, dpi))
+        .max(min_width)
+}
+
 impl crate::TermWindow {
     fn right_sidebar_file_preview_active(&self) -> bool {
         !self.right_sidebar_collapsed
@@ -809,7 +833,9 @@ impl crate::TermWindow {
             .saturating_sub((border.left + border.right).get() as usize)
     }
 
-    fn right_sidebar_file_preview_total_max_width(&self) -> usize {
+    /// Maximum sidebar-column + expanded-pane total width. Shared by the file
+    /// preview pane and the Note pane; both keep a terminal reserve.
+    fn right_sidebar_pane_total_max_width(&self) -> usize {
         let available_width = self.right_sidebar_available_width();
         let content_width = available_width.saturating_sub(self.workspace_sidebar_width());
         let min_preview_total =
@@ -831,7 +857,7 @@ impl crate::TermWindow {
         }
 
         let max_preview_width = self
-            .right_sidebar_file_preview_total_max_width()
+            .right_sidebar_pane_total_max_width()
             .saturating_sub(self.right_sidebar_tree_width());
         if max_preview_width < self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH) {
             return None;
@@ -847,14 +873,47 @@ impl crate::TermWindow {
         Some(width)
     }
 
+    pub(crate) fn right_sidebar_note_pane_active(&self) -> bool {
+        !self.right_sidebar_collapsed
+            && self.right_sidebar_mode == RightSidebarMode::Tasks
+            && self.right_sidebar_note_pane_expanded
+            // Without a vault there is no editor to expand; the sidebar shows
+            // the choose/create-vault UI inline instead of a blank pane.
+            && workspace_threads::space_note_vault(&self.active_space_id).is_some()
+    }
+
+    pub(crate) fn right_sidebar_note_pane_width(&self) -> Option<usize> {
+        if !self.right_sidebar_note_pane_active() {
+            return None;
+        }
+        let max_pane_width = self
+            .right_sidebar_pane_total_max_width()
+            .saturating_sub(self.right_sidebar_tree_width());
+        if max_pane_width < self.ui_px(NOTE_PANE_MIN_WIDTH) {
+            return None;
+        }
+        let configured_width = if self.right_sidebar_note_pane_width == 0 {
+            self.ui_px(NOTE_PANE_DEFAULT_WIDTH)
+        } else {
+            self.right_sidebar_note_pane_width
+        };
+        Some(configured_width.clamp(self.ui_px(NOTE_PANE_MIN_WIDTH), max_pane_width))
+    }
+
     pub fn right_sidebar_width(&self) -> usize {
         if self.right_sidebar_collapsed {
             0
         } else {
+            // The file preview pane and the Note pane are mutually exclusive
+            // (different sidebar modes); at most one is non-zero.
+            let pane_width = self
+                .right_sidebar_file_preview_width()
+                .or_else(|| self.right_sidebar_note_pane_width())
+                .unwrap_or(0);
             self.right_sidebar_tree_width()
-                .saturating_add(self.right_sidebar_file_preview_width().unwrap_or(0))
-                .min(if self.right_sidebar_file_preview_active() {
-                    self.right_sidebar_file_preview_total_max_width()
+                .saturating_add(pane_width)
+                .min(if pane_width > 0 {
+                    self.right_sidebar_pane_total_max_width()
                 } else {
                     self.right_sidebar_available_width()
                 })
@@ -916,7 +975,7 @@ impl crate::TermWindow {
         }
 
         let max_preview_width = self
-            .right_sidebar_file_preview_total_max_width()
+            .right_sidebar_pane_total_max_width()
             .saturating_sub(self.right_sidebar_tree_width());
         if max_preview_width < self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH) {
             return false;
@@ -926,6 +985,26 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_width =
             width.clamp(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH), max_preview_width);
         old_width != self.right_sidebar_file_preview_width
+    }
+
+    pub(crate) fn set_right_sidebar_note_pane_total_width(&mut self, width: usize) -> bool {
+        if !self.right_sidebar_note_pane_active() {
+            return false;
+        }
+
+        let tree_width = self.right_sidebar_tree_width();
+        let pane_width = width.saturating_sub(tree_width);
+        let max_pane_width = self
+            .right_sidebar_pane_total_max_width()
+            .saturating_sub(tree_width);
+        if max_pane_width < self.ui_px(NOTE_PANE_MIN_WIDTH) {
+            return false;
+        }
+
+        let old_width = self.right_sidebar_note_pane_width;
+        self.right_sidebar_note_pane_width =
+            pane_width.clamp(self.ui_px(NOTE_PANE_MIN_WIDTH), max_pane_width);
+        old_width != self.right_sidebar_note_pane_width
     }
 
     pub fn persist_right_sidebar_width(&self) {
@@ -1379,7 +1458,7 @@ impl crate::TermWindow {
 
         if !self.right_sidebar_file_preview_active() {
             let max_tree_for_preview = self
-                .right_sidebar_file_preview_total_max_width()
+                .right_sidebar_pane_total_max_width()
                 .saturating_sub(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH))
                 .max(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
             self.right_sidebar_file_tree_width = self
@@ -3403,7 +3482,9 @@ impl crate::TermWindow {
     }
 
     fn handle_right_sidebar_note_key(&mut self, key: TermKeyCode, mods: TermModifiers) -> bool {
-        self.right_sidebar_note.begin_live_editing();
+        // begin_live_editing() is deliberately deferred until a key is known
+        // to be handled: an unrelated key must not flip the display source to
+        // Live and invalidate the projection caches.
         let shift = mods.contains(TermModifiers::SHIFT);
         let super_ = mods.contains(TermModifiers::SUPER);
         let ctrl = mods.contains(TermModifiers::CTRL);
@@ -3415,10 +3496,16 @@ impl crate::TermWindow {
             ctrl && !super_ && !alt
         };
 
-        if word_modifier {
+        if word_modifier
+            && matches!(
+                key,
+                TermKeyCode::LeftArrow | TermKeyCode::RightArrow | TermKeyCode::Backspace
+            )
+        {
             let Some(session) = self.right_sidebar_note.session.clone() else {
                 return false;
             };
+            self.right_sidebar_note.begin_live_editing();
             match key {
                 TermKeyCode::LeftArrow => {
                     session
@@ -3450,6 +3537,17 @@ impl crate::TermWindow {
         }
 
         if command && !alt {
+            let command_handled = match key {
+                TermKeyCode::LeftArrow | TermKeyCode::RightArrow => super_,
+                TermKeyCode::Char(
+                    'a' | 'A' | 'c' | 'C' | 'x' | 'X' | 'v' | 'V' | 'z' | 'Z' | 's' | 'S' | 'e'
+                    | 'E' | 'b' | 'B' | 'i' | 'I',
+                ) => true,
+                _ => false,
+            };
+            if command_handled {
+                self.right_sidebar_note.begin_live_editing();
+            }
             match key {
                 TermKeyCode::LeftArrow if super_ => {
                     if let Some(session) = self.right_sidebar_note.session.clone() {
@@ -3544,9 +3642,27 @@ impl crate::TermWindow {
             return false;
         }
 
+        let will_handle = matches!(
+            key,
+            TermKeyCode::Escape
+                | TermKeyCode::LeftArrow
+                | TermKeyCode::RightArrow
+                | TermKeyCode::UpArrow
+                | TermKeyCode::DownArrow
+                | TermKeyCode::Home
+                | TermKeyCode::End
+                | TermKeyCode::Backspace
+                | TermKeyCode::Delete
+                | TermKeyCode::Enter
+                | TermKeyCode::Tab
+        ) || matches!(key, TermKeyCode::Char(ch) if !ch.is_control());
+        if !will_handle {
+            return false;
+        }
         let Some(session) = self.right_sidebar_note.session.clone() else {
             return false;
         };
+        self.right_sidebar_note.begin_live_editing();
         let mut changed = false;
         let handled = match key {
             TermKeyCode::Escape => {
@@ -3638,7 +3754,20 @@ impl crate::TermWindow {
                         .lock()
                         .set_caret(&mut self.right_sidebar_note.view, target, false);
                     self.right_sidebar_note.reveal_caret = true;
-                } else {
+                } else if session
+                    .lock()
+                    .tab_indents_lines(&self.right_sidebar_note.view)
+                {
+                    changed = if shift {
+                        session
+                            .lock()
+                            .outdent_lines(&mut self.right_sidebar_note.view)
+                    } else {
+                        session
+                            .lock()
+                            .indent_lines(&mut self.right_sidebar_note.view)
+                    };
+                } else if !shift {
                     changed = session
                         .lock()
                         .insert_text(&mut self.right_sidebar_note.view, "    ");
@@ -4452,6 +4581,83 @@ impl crate::TermWindow {
         old_preview != self.right_sidebar_file_preview_width || tree_changed
     }
 
+    pub(crate) fn right_sidebar_note_pane_rect(&self) -> Option<RightSidebarRect> {
+        let sidebar = self.right_sidebar_rect()?;
+        let width = self.right_sidebar_note_pane_width()?;
+        if sidebar.width <= width {
+            return None;
+        }
+        Some(RightSidebarRect {
+            x: sidebar.x,
+            y: sidebar.y,
+            width,
+            height: sidebar.height,
+        })
+    }
+
+    pub(crate) fn set_right_sidebar_note_pane_split_x(&mut self, split_x: isize) -> bool {
+        let Some(total_rect) = self.right_sidebar_rect() else {
+            return false;
+        };
+        if self.right_sidebar_note_pane_rect().is_none() {
+            return false;
+        }
+
+        let total_left = total_rect.x;
+        let total_right = total_rect.x.saturating_add(total_rect.width);
+        let min_pane = self.ui_px(NOTE_PANE_MIN_WIDTH);
+        let max_pane = total_rect
+            .width
+            .saturating_sub(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
+        let min_tree = self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH);
+        let max_tree = self.right_sidebar_max_width().min(total_rect.width);
+        let min_split = total_left
+            .saturating_add(min_pane)
+            .max(total_right.saturating_sub(max_tree));
+        let max_split = total_right
+            .saturating_sub(min_tree)
+            .min(total_left.saturating_add(max_pane));
+        if min_split > max_split {
+            return false;
+        }
+
+        let split_x = split_x.clamp(min_split as isize, max_split as isize) as usize;
+        let pane_width = split_x.saturating_sub(total_left);
+        let tree_width = total_right.saturating_sub(split_x);
+        let old_pane = self.right_sidebar_note_pane_width;
+        self.right_sidebar_note_pane_width = pane_width;
+        let old_tree = self.right_sidebar_width;
+        self.set_right_sidebar_width(tree_width);
+        old_pane != self.right_sidebar_note_pane_width || old_tree != self.right_sidebar_width
+    }
+
+    pub fn persist_right_sidebar_note_pane_width(&self) {
+        let width = self
+            .right_sidebar_note_pane_width()
+            .unwrap_or(self.right_sidebar_note_pane_width)
+            .max(self.ui_px(NOTE_PANE_MIN_WIDTH));
+        let width = unscale_ui_usize(width, self.dimensions.dpi);
+        if let Err(err) = crate::native_settings::save_right_sidebar_note_pane_width(width) {
+            log::warn!("failed to save right sidebar Note pane width: {err:#}");
+        }
+    }
+
+    pub(crate) fn toggle_right_sidebar_note_pane(&mut self) {
+        self.right_sidebar_note_pane_expanded = !self.right_sidebar_note_pane_expanded;
+        if let Err(err) = crate::native_settings::save_right_sidebar_note_pane_expanded(
+            self.right_sidebar_note_pane_expanded,
+        ) {
+            log::warn!("failed to save right sidebar Note pane mode: {err:#}");
+        }
+        // The sidebar total width changed; reflow the terminal like the file
+        // preview open/close paths do.
+        if let Some(window) = self.window.as_ref().cloned() {
+            let dimensions = self.dimensions;
+            self.apply_dimensions(&dimensions, None, &window);
+            window.invalidate();
+        }
+    }
+
     fn right_sidebar_file_preview_font_size(&self) -> f64 {
         let settings = crate::native_settings::load();
         let base_font_size = crate::native_settings::home_font_size(&settings);
@@ -4893,6 +5099,56 @@ impl crate::TermWindow {
             )?;
         }
 
+        if let Some(pane_rect) = self.right_sidebar_note_pane_rect() {
+            // Chrome only; paint_note_sidebar paints the editor into this
+            // rect later in the frame.
+            if pane_rect.y > 0 {
+                self.filled_rectangle(
+                    layers,
+                    0,
+                    euclid::rect(
+                        pane_rect.x as f32,
+                        0.0,
+                        pane_rect.width as f32,
+                        pane_rect.y as f32,
+                    ),
+                    sidebar_bg,
+                )
+                .context("right sidebar note pane top background")?;
+            }
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(
+                    pane_rect.x as f32,
+                    pane_rect.y as f32,
+                    pane_rect.width as f32,
+                    pane_rect.height as f32,
+                ),
+                sidebar_bg,
+            )
+            .context("right sidebar note pane background")?;
+            self.ui_items.push(UIItem {
+                x: pane_rect.x,
+                y: 0,
+                width: pane_rect.width,
+                height: pane_rect.y.saturating_add(pane_rect.height),
+                item_type: UIItemType::RightSidebarBackground,
+            });
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    pane_rect.x as f32,
+                    pane_rect.y as f32,
+                    1.0,
+                    pane_rect.height as f32,
+                ),
+                chrome.separator,
+            )
+            .context("right sidebar note pane left separator")?;
+        }
+
         if rect.y > 0 {
             self.filled_rectangle(
                 layers,
@@ -4946,6 +5202,17 @@ impl crate::TermWindow {
                 width: self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH),
                 height: rect.height,
                 item_type: UIItemType::RightSidebarFilePreviewResize,
+            });
+        }
+        if self.right_sidebar_note_pane_rect().is_some() {
+            self.ui_items.push(UIItem {
+                x: rect
+                    .x
+                    .saturating_sub(self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH) / 2),
+                y: rect.y,
+                width: self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH),
+                height: rect.height,
+                item_type: UIItemType::RightSidebarNotePaneResize,
             });
         }
 
@@ -5411,6 +5678,7 @@ impl crate::TermWindow {
         content_width: usize,
         content_bottom: usize,
         narrow: bool,
+        show_header_button: bool,
     ) -> anyhow::Result<()> {
         let header_height = self.ui_px(NOTE_TOOLBAR_HEIGHT);
         let button_size = header_height;
@@ -5428,7 +5696,7 @@ impl crate::TermWindow {
                 UIItemType::RightSidebarNoteTreeBack,
             )?;
             title_x = content_x + button_size + self.ui_px(6);
-        } else {
+        } else if show_header_button {
             self.paint_snippet_icon_button(
                 layers,
                 chrome,
@@ -5671,7 +5939,73 @@ impl crate::TermWindow {
                     true,
                 )?;
             }
+            // The expanded pane may be reserved while the note is still
+            // loading (or failed); keep the collapse toggle reachable so the
+            // pane is never blank and stuck.
+            if let Some(pane_rect) = self.right_sidebar_note_pane_rect() {
+                let inset = self.ui_px(SIDEBAR_INSET);
+                let button_size = self.ui_px(NOTE_TOOLBAR_HEIGHT);
+                self.paint_sidebar_text(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    &message,
+                    pane_rect.x + inset * 2,
+                    pane_rect.y + inset * 2 + button_size + self.ui_px(NOTE_BODY_TOP_GAP),
+                    pane_rect.width.saturating_sub(inset * 4),
+                    muted_fg,
+                )?;
+                self.paint_snippet_icon_button(
+                    layers,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    pane_rect
+                        .x
+                        .saturating_add(pane_rect.width)
+                        .saturating_sub(inset * 2 + button_size),
+                    pane_rect.y + inset * 2,
+                    button_size,
+                    SvgIcon::Shrink,
+                    UIItemType::RightSidebarNotePaneToggle,
+                )?;
+            }
             return Ok(());
+        }
+        if let Some(pane_rect) = self.right_sidebar_note_pane_rect() {
+            // Pane mode: the sidebar column holds the vault tree and the
+            // editor paints into the expanded pane on its left.
+            self.right_sidebar_note_wide_layout = true;
+            self.paint_note_vault_tree(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                content_bottom,
+                false,
+                false,
+            )?;
+            let inset = self.ui_px(SIDEBAR_INSET);
+            return self.paint_note_editor_area(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                pane_rect.x + inset * 2,
+                pane_rect.y + inset * 2,
+                pane_rect.width.saturating_sub(inset * 4),
+                pane_rect.y.saturating_add(pane_rect.height),
+                base_font_size,
+                false,
+                SvgIcon::FolderTree,
+            );
         }
         let wide_layout = content_width >= self.ui_px(NOTE_VAULT_SPLIT_MIN_WIDTH);
         self.right_sidebar_note_wide_layout = wide_layout;
@@ -5688,6 +6022,7 @@ impl crate::TermWindow {
                 content_top,
                 content_width,
                 content_bottom,
+                true,
                 true,
             )?;
             return Ok(());
@@ -5708,6 +6043,7 @@ impl crate::TermWindow {
                 tree_width,
                 content_bottom,
                 false,
+                true,
             )?;
             (
                 content_x + tree_width + self.ui_px(SIDEBAR_INSET),
@@ -5716,18 +6052,54 @@ impl crate::TermWindow {
         } else {
             (content_x, content_width)
         };
-        self.right_sidebar_note.refresh_projection();
-        self.schedule_right_sidebar_note_parse();
-        self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
-
-        let toolbar_height = self.ui_px(NOTE_TOOLBAR_HEIGHT);
-        let menu_size = toolbar_height;
         let show_tree_button = !split;
         let tree_button_icon = if wide_layout {
             SvgIcon::PanelLeftOpen
         } else {
             SvgIcon::FolderTree
         };
+        self.paint_note_editor_area(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            content_top,
+            content_width,
+            content_bottom,
+            base_font_size,
+            show_tree_button,
+            tree_button_icon,
+        )
+    }
+
+    /// Paint the Note toolbar and editor body into an arbitrary content rect —
+    /// either inline in the sidebar column or in the expanded Note pane.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_note_editor_area(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        base_font_size: f64,
+        show_tree_button: bool,
+        tree_button_icon: SvgIcon,
+    ) -> anyhow::Result<()> {
+        self.right_sidebar_note.refresh_projection();
+        self.schedule_right_sidebar_note_parse();
+        self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
+
+        let toolbar_height = self.ui_px(NOTE_TOOLBAR_HEIGHT);
+        let menu_size = toolbar_height;
 
         let body_y = content_top + toolbar_height + self.ui_px(NOTE_BODY_TOP_GAP);
         let body_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
@@ -5958,29 +6330,25 @@ impl crate::TermWindow {
             document.vault_root.hash(&mut component_hasher);
             document.relative_path.hash(&mut component_hasher);
         }
-        let mut collapsed_blocks = self
-            .right_sidebar_note
-            .collapsed_code_blocks
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        collapsed_blocks.sort_unstable();
-        collapsed_blocks.hash(&mut component_hasher);
-        let mut code_offsets = self
-            .right_sidebar_note
-            .code_horizontal_offsets
-            .iter()
-            .map(|(source, offset)| (*source, offset.to_bits()))
-            .collect::<Vec<_>>();
-        code_offsets.sort_unstable_by_key(|(source, _)| *source);
-        code_offsets.hash(&mut component_hasher);
-        let mut table_offsets = self
-            .right_sidebar_note_table_horizontal_offsets
-            .iter()
-            .map(|(source, offset)| (*source, offset.to_bits()))
-            .collect::<Vec<_>>();
-        table_offsets.sort_unstable_by_key(|(source, _)| *source);
-        table_offsets.hash(&mut component_hasher);
+        // These are ordered maps/sets so each frame can hash them in place
+        // without sorting a temporary copy.
+        hash_ordered_iter(
+            &mut component_hasher,
+            self.right_sidebar_note.collapsed_code_blocks.iter(),
+        );
+        hash_ordered_iter(
+            &mut component_hasher,
+            self.right_sidebar_note
+                .code_horizontal_offsets
+                .iter()
+                .map(|(source, offset)| (*source, offset.to_bits())),
+        );
+        hash_ordered_iter(
+            &mut component_hasher,
+            self.right_sidebar_note_table_horizontal_offsets
+                .iter()
+                .map(|(source, offset)| (*source, offset.to_bits())),
+        );
         let component_key = component_hasher.finish();
 
         if self.right_sidebar_note_paint_cache.key != Some(component_key) {
@@ -6245,14 +6613,10 @@ impl crate::TermWindow {
         loaded_image_metrics.sort_unstable();
         loaded_image_metrics.hash(&mut geometry_hasher);
         line_gap.to_bits().hash(&mut geometry_hasher);
-        let mut collapsed = self
-            .right_sidebar_note
-            .collapsed_code_blocks
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        collapsed.sort_unstable();
-        collapsed.hash(&mut geometry_hasher);
+        hash_ordered_iter(
+            &mut geometry_hasher,
+            self.right_sidebar_note.collapsed_code_blocks.iter(),
+        );
         let geometry_key = geometry_hasher.finish();
         if self.right_sidebar_note.line_geometry_key != Some(geometry_key)
             || self.right_sidebar_note.line_geometry.len() != visual.lines.len()
@@ -6369,9 +6733,14 @@ impl crate::TermWindow {
             self.right_sidebar_note.reveal_caret = false;
         }
         self.right_sidebar_note.view.scroll_offset = scroll;
-        let mut layouts = Vec::new();
-        let mut code_block_layouts = Vec::new();
-        let mut table_layouts = Vec::new();
+        // Reuse last frame's allocations; scroll repaints refill these every
+        // frame and the capacities are stable.
+        let mut layouts = std::mem::take(&mut self.right_sidebar_note.line_layouts);
+        layouts.clear();
+        let mut code_block_layouts = std::mem::take(&mut self.right_sidebar_note.code_block_layouts);
+        code_block_layouts.clear();
+        let mut table_layouts = std::mem::take(&mut self.right_sidebar_note_table_layouts);
+        table_layouts.clear();
         let mut caret_rect: Option<(f32, f32, f32)> = None;
         let selected = selection.range();
 
@@ -7222,7 +7591,42 @@ impl crate::TermWindow {
             menu_size,
             SvgIcon::Ellipsis,
             UIItemType::RightSidebarNoteMenu,
-        )
+        )?;
+
+        // Inline <-> expanded-pane switch, immediately left of the menu.
+        let pane_toggle_x = menu_x.saturating_sub(menu_size + self.ui_px(2));
+        if pane_toggle_x > content_x {
+            if self.is_pointer_over_ui_rect(pane_toggle_x, content_top, menu_size, menu_size) {
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        pane_toggle_x as f32,
+                        content_top as f32,
+                        menu_size as f32,
+                        menu_size as f32,
+                    ),
+                    chrome.control_hover_bg,
+                    WINDOW_TAB_ADD_BUTTON_RADIUS,
+                )?;
+            }
+            self.paint_snippet_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                pane_toggle_x,
+                content_top,
+                menu_size,
+                if self.right_sidebar_note_pane_expanded {
+                    SvgIcon::Shrink
+                } else {
+                    SvgIcon::Expand
+                },
+                UIItemType::RightSidebarNotePaneToggle,
+            )?;
+        }
+        Ok(())
     }
 
     fn request_right_sidebar_note_open(
@@ -11609,7 +12013,7 @@ mod tests {
     }
 
     #[test]
-    fn note_virtualization_keeps_two_viewports_of_overscan() {
+    fn note_virtualization_keeps_modest_overscan_around_the_viewport() {
         let geometry = (0..1_000)
             .map(|index| NoteLineGeometry {
                 top: index as f32 * 10.0,
@@ -11617,10 +12021,12 @@ mod tests {
                 gap: 0.0,
             })
             .collect::<Vec<_>>();
+        // Viewport covers rows 500..510; overscan must extend past both edges
+        // without painting multiple invisible viewports.
         let range = virtual_note_line_range(&geometry, 5_000.0, 100.0);
-        assert!(range.start <= 480);
-        assert!(range.end >= 530);
-        assert!(range.len() < 60, "virtual range was {} rows", range.len());
+        assert!(range.start <= 495);
+        assert!(range.end >= 515);
+        assert!(range.len() < 30, "virtual range was {} rows", range.len());
     }
 
     #[test]

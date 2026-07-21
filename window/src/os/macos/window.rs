@@ -2791,7 +2791,13 @@ impl WindowView {
         };
         let inner = myself.inner.borrow();
         let Some(snapshot) = inner.native_text_input_snapshot.as_ref() else {
-            return NSRange::new(NSNotFound as _, 0);
+            // The terminal has no reified text storage, but system text
+            // services still need a valid caret: macOS dictation queries
+            // selectedRange and treats NSNotFound as "no editable text",
+            // silently discarding the dictated words. Reporting an empty
+            // selection at 0 lets dictation deliver text through the normal
+            // insertText: path.
+            return NSRange::new(0, 0);
         };
         let start = utf16_offset_for_byte(&snapshot.text, snapshot.selection.start);
         let end = utf16_offset_for_byte(&snapshot.text, snapshot.selection.end);

@@ -887,6 +887,8 @@ impl super::TermWindow {
             | UIItemType::RightSidebarBackground
             | UIItemType::RightSidebarResize
             | UIItemType::RightSidebarFilePreviewResize
+            | UIItemType::RightSidebarNotePaneResize
+            | UIItemType::RightSidebarNotePaneToggle
             | UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -960,6 +962,8 @@ impl super::TermWindow {
             | UIItemType::RightSidebarBackground
             | UIItemType::RightSidebarResize
             | UIItemType::RightSidebarFilePreviewResize
+            | UIItemType::RightSidebarNotePaneResize
+            | UIItemType::RightSidebarNotePaneToggle
             | UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -1195,6 +1199,13 @@ impl super::TermWindow {
                         item.item_type == UIItemType::RightSidebarFilePreviewResize
                     }) {
                         self.persist_right_sidebar_file_preview_width();
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::RightSidebarNotePaneResize
+                            || (item.item_type == UIItemType::RightSidebarResize
+                                && self.right_sidebar_note_pane_rect().is_some())
+                    }) {
+                        self.persist_right_sidebar_note_pane_width();
                     }
                     if completed_drag
                         .as_ref()
@@ -1771,6 +1782,9 @@ impl super::TermWindow {
             UIItemType::RightSidebarFilePreviewResize => {
                 self.drag_right_sidebar_file_preview_resize(item, start_event, event, context);
             }
+            UIItemType::RightSidebarNotePaneResize => {
+                self.drag_right_sidebar_note_pane_resize(item, start_event, event, context);
+            }
             UIItemType::RightSidebarSnippetScrollThumb => {
                 self.drag_right_sidebar_snippet_scroll_thumb(item, start_event, event, context);
             }
@@ -1924,6 +1938,8 @@ impl super::TermWindow {
         self.expand_right_sidebar();
         if self.right_sidebar_file_preview_rect().is_some() {
             self.set_right_sidebar_file_preview_total_width(width);
+        } else if self.right_sidebar_note_pane_rect().is_some() {
+            self.set_right_sidebar_note_pane_total_width(width);
         } else {
             self.set_right_sidebar_width(width);
         }
@@ -1940,6 +1956,20 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if self.set_right_sidebar_file_preview_split_x(event.coords.x) {
+            context.invalidate();
+        }
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drag_right_sidebar_note_pane_resize(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if self.set_right_sidebar_note_pane_split_x(event.coords.x) {
             context.invalidate();
         }
         context.set_cursor(Some(MouseCursor::SizeLeftRight));
@@ -2058,6 +2088,9 @@ impl super::TermWindow {
             UIItemType::RightSidebarFilePreviewResize => {
                 self.mouse_event_right_sidebar_file_preview_resize(item, event, context);
             }
+            UIItemType::RightSidebarNotePaneResize => {
+                self.mouse_event_right_sidebar_note_pane_resize(item, event, context);
+            }
             UIItemType::RightSidebarSnippetScrollTrack => {
                 self.mouse_event_right_sidebar_snippet_scroll_track(item, event, context);
             }
@@ -2103,7 +2136,8 @@ impl super::TermWindow {
             | UIItemType::RightSidebarNoteTreeRow(_)
             | UIItemType::RightSidebarNoteCodeToggle(_)
             | UIItemType::RightSidebarNoteCodeCopy(_)
-            | UIItemType::RightSidebarNoteBody => {
+            | UIItemType::RightSidebarNoteBody
+            | UIItemType::RightSidebarNotePaneToggle => {
                 self.mouse_event_right_sidebar_note(item.clone(), event, context);
             }
             UIItemType::RightSidebarFileFilter
@@ -2181,6 +2215,13 @@ impl super::TermWindow {
                 if event.kind == WMEK::Press(MousePress::Left) {
                     self.toggle_right_sidebar_note_vault_tree();
                     self.right_sidebar_note.view.focused = false;
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarNotePaneToggle => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_right_sidebar_note_pane();
                     context.invalidate();
                 }
             }
@@ -2535,6 +2576,9 @@ impl super::TermWindow {
             UIItemType::RightSidebarFilePreviewResize => {
                 self.mouse_event_right_sidebar_file_preview_resize(item, event, context);
             }
+            UIItemType::RightSidebarNotePaneResize => {
+                self.mouse_event_right_sidebar_note_pane_resize(item, event, context);
+            }
             UIItemType::RightSidebarSnippetScrollTrack => {
                 self.mouse_event_right_sidebar_snippet_scroll_track(item, event, context);
             }
@@ -2580,7 +2624,8 @@ impl super::TermWindow {
             | UIItemType::RightSidebarNoteTreeRow(_)
             | UIItemType::RightSidebarNoteCodeToggle(_)
             | UIItemType::RightSidebarNoteCodeCopy(_)
-            | UIItemType::RightSidebarNoteBody => {
+            | UIItemType::RightSidebarNoteBody
+            | UIItemType::RightSidebarNotePaneToggle => {
                 self.mouse_event_right_sidebar_note(item.clone(), event, context);
             }
             UIItemType::RightSidebarFileFilter
@@ -2723,6 +2768,18 @@ impl super::TermWindow {
     }
 
     pub fn mouse_event_right_sidebar_file_preview_resize(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
+    pub fn mouse_event_right_sidebar_note_pane_resize(
         &mut self,
         item: UIItem,
         event: MouseEvent,
