@@ -97,6 +97,8 @@ impl super::TermWindow {
         self.shape_generation += 1;
         self.pane_font_cache.borrow_mut().clear();
         self.shape_cache.borrow_mut().clear();
+        self.ui_shape_caches.borrow_mut().clear_all();
+        self.publish_ui_shape_cache_diagnostics();
         self.line_to_ele_shape_cache.borrow_mut().clear();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
@@ -745,6 +747,8 @@ impl super::TermWindow {
         self.quad_generation += 1;
         self.shape_generation += 1;
         self.shape_cache.borrow_mut().clear();
+        self.ui_shape_caches.borrow_mut().clear_all();
+        self.publish_ui_shape_cache_diagnostics();
         self.line_to_ele_shape_cache.borrow_mut().clear();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();

@@ -922,6 +922,8 @@ impl crate::TermWindow {
     pub fn recreate_texture_atlas(&mut self, size: Option<usize>) -> anyhow::Result<()> {
         self.shape_generation += 1;
         self.shape_cache.borrow_mut().clear();
+        self.ui_shape_caches.borrow_mut().clear_all();
+        self.publish_ui_shape_cache_diagnostics();
         self.line_to_ele_shape_cache.borrow_mut().clear();
         if let Some(render_state) = self.render_state.as_mut() {
             render_state.recreate_texture_atlas(&self.fonts, &self.render_metrics, size)?;

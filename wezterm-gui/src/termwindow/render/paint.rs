@@ -136,6 +136,8 @@ impl crate::TermWindow {
                         self.invalidate_modal();
                         self.shape_generation += 1;
                         self.shape_cache.borrow_mut().clear();
+                        self.ui_shape_caches.borrow_mut().clear_all();
+                        self.publish_ui_shape_cache_diagnostics();
                         self.line_to_ele_shape_cache.borrow_mut().clear();
                     } else {
                         log::error!("paint_pass failed: {:#}", err);
@@ -147,6 +149,7 @@ impl crate::TermWindow {
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
         self.call_draw(frame).ok();
+        self.publish_ui_shape_cache_diagnostics_throttled();
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",

@@ -1031,6 +1031,19 @@ pub struct TermWindow {
     quad_generation: usize,
     shape_generation: usize,
     shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<Vec<ShapedInfo>>>>>,
+    /// Per-domain shaping caches for proportional UI text (chrome / Note /
+    /// File Preview), separate from the terminal's `shape_cache`. Sharing one
+    /// LFU meant a long note's thousands of run strings re-shaped every fling
+    /// on the UI thread AND evicted the terminal's and chrome's entries; the
+    /// split also gives each domain a byte budget and independent idle
+    /// release.
+    ui_shape_caches: RefCell<crate::shapecache::UiShapeCaches>,
+    /// Which domain cache `cached_ui_shape` routes to; set by the Note and
+    /// File Preview paint entry points, Chrome otherwise.
+    ui_text_domain: std::cell::Cell<crate::shapecache::UiTextDomain>,
+    /// Throttles the periodic paint-time diagnostics publish; clears and
+    /// releases publish immediately regardless.
+    last_ui_shape_diagnostics_publish: std::cell::Cell<Option<Instant>>,
     line_to_ele_shape_cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
 
     line_state_cache: RefCell<LfuCacheU64<Arc<CachedLineState>>>,
@@ -1665,6 +1678,9 @@ impl TermWindow {
                 |config| config.shape_cache_size,
                 &config,
             )),
+            ui_shape_caches: RefCell::new(crate::shapecache::UiShapeCaches::new(&config)),
+            ui_text_domain: std::cell::Cell::new(crate::shapecache::UiTextDomain::Chrome),
+            last_ui_shape_diagnostics_publish: std::cell::Cell::new(None),
             line_state_cache: RefCell::new(LfuCacheU64::new(
                 "line_state_cache.hit.rate",
                 "line_state_cache.miss.rate",
@@ -2294,6 +2310,8 @@ impl TermWindow {
             TermWindowNotif::InvalidateShapeCache => {
                 self.shape_generation += 1;
                 self.shape_cache.borrow_mut().clear();
+                self.ui_shape_caches.borrow_mut().clear_all();
+                self.publish_ui_shape_cache_diagnostics();
                 self.invalidate_modal();
                 window.invalidate();
             }
@@ -2637,6 +2655,18 @@ impl TermWindow {
         self.resize_mux_tabs_to_current_terminal_size();
         self.apply_workspace_thread_font_scales();
         self.sync_current_workspace_thread();
+
+        // A Space/thread switch can replace the active pane without changing
+        // the native window's focus state, so no FocusChanged event follows
+        // to focus the newly adopted pane. Do that handoff immediately rather
+        // than requiring the user to click the terminal first.
+        if self.focused.is_some() {
+            if let Some(pane) = self.get_active_pane_or_overlay() {
+                pane.advise_focus();
+                Mux::get().record_focus_for_current_identity(pane.pane_id());
+            }
+        }
+
         self.update_title();
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -3014,6 +3044,7 @@ impl TermWindow {
     ) -> bool {
         if self.active_space_id == space_id {
             if let Some(thread_id) = preferred_thread {
+                self.clear_right_sidebar_text_focus();
                 self.activate_workspace_thread(thread_id, window);
             } else {
                 window.invalidate();
@@ -3027,6 +3058,10 @@ impl TermWindow {
             return false;
         }
         let previous_sidebar_width = self.right_sidebar_width();
+        // Text focus belongs to the Space being left. Clear it while that
+        // Space is still active so Note state is frozen/saved against the
+        // correct document and keyboard input can reach the destination pane.
+        self.clear_right_sidebar_text_focus();
         self.set_content_view_active(false);
         self.active_space_id = space_id.clone();
         self.refresh_active_space_note_vault_flag();
@@ -3352,6 +3387,12 @@ impl TermWindow {
             shape_cache.update_config(&config);
             shape_cache.clear();
         }
+        {
+            let mut ui_shape_caches = self.ui_shape_caches.borrow_mut();
+            ui_shape_caches.update_config(&config);
+            ui_shape_caches.clear_all();
+        }
+        self.publish_ui_shape_cache_diagnostics();
         self.line_state_cache.borrow_mut().update_config(&config);
         self.line_quad_cache.borrow_mut().update_config(&config);
         self.line_to_ele_shape_cache
@@ -6331,8 +6372,59 @@ impl TermWindow {
     }
 }
 
+impl TermWindow {
+    /// Publish this window's per-domain shaping-cache gauges in one batch
+    /// (single diagnostics lock). Called unthrottled after cache clears and
+    /// idle releases so the panel never shows stale non-zero values.
+    pub(crate) fn publish_ui_shape_cache_diagnostics(&self) {
+        if !crate::input_diagnostics::enabled() {
+            return;
+        }
+        self.last_ui_shape_diagnostics_publish
+            .set(Some(Instant::now()));
+        let caches = self.ui_shape_caches.borrow();
+        let mut values: Vec<(&'static str, u64)> = Vec::with_capacity(27);
+        for domain in [
+            crate::shapecache::UiTextDomain::Chrome,
+            crate::shapecache::UiTextDomain::Note,
+            crate::shapecache::UiTextDomain::FilePreview,
+        ] {
+            let cache = caches.domain(domain);
+            let stats = cache.stats();
+            let names = domain.gauge_names();
+            values.push((names.len, cache.len() as u64));
+            values.push((names.bytes, cache.total_weight() as u64));
+            values.push((names.cap, cache.cap() as u64));
+            values.push((names.budget, cache.byte_budget() as u64));
+            values.push((names.hits, stats.hits));
+            values.push((names.misses, stats.misses));
+            values.push((names.rejected_oversize, stats.rejected_oversize));
+            values.push((names.evicted_entries, stats.evicted_entries));
+            values.push((names.evicted_bytes, stats.evicted_bytes));
+        }
+        crate::input_diagnostics::set_gauges_for_source(self.space_owner_id, &values);
+    }
+
+    /// Throttled variant for the per-frame paint path.
+    pub(crate) fn publish_ui_shape_cache_diagnostics_throttled(&self) {
+        const PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
+        if !crate::input_diagnostics::enabled() {
+            return;
+        }
+        if self
+            .last_ui_shape_diagnostics_publish
+            .get()
+            .is_some_and(|last| last.elapsed() < PUBLISH_INTERVAL)
+        {
+            return;
+        }
+        self.publish_ui_shape_cache_diagnostics();
+    }
+}
+
 impl Drop for TermWindow {
     fn drop(&mut self) {
+        crate::input_diagnostics::remove_gauges_for_source(self.space_owner_id);
         gpu_debug(format!(
             "drop main_window backend={} size={}x{} dpi={}",
             if self.webgpu.is_some() {

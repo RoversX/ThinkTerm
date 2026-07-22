@@ -16,8 +16,21 @@ struct Entry<K, V> {
     frequency_link: RBTreeLink,
     freq: RefCell<u16>,
     last_tick: RefCell<u32>,
+    /// Caller-estimated resident size for byte-budgeted caches; 0 for
+    /// entries inserted through the unweighted `put`.
+    weight: usize,
     key: K,
     value: V,
+}
+
+/// What happened structurally during a `put_weighted` call, so callers can
+/// maintain their own cheap diagnostics counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PutOutcome {
+    /// The entry alone exceeded the whole byte budget and was not cached.
+    pub rejected_oversize: bool,
+    pub evicted_entries: usize,
+    pub evicted_bytes: usize,
 }
 
 intrusive_adapter!(RecencyAdapter<K,V> = Rc<Entry<K,V>>: Entry<K,V> { recency_link: LinkedListLink });
@@ -55,6 +68,11 @@ pub struct LfuCache<K, V, S = BuildHasherDefault<AHasher>> {
     len: usize,
     /// tracks number of operations that affect the frequency/age of entries
     tick: u32,
+    /// Sum of entry weights; only meaningful for byte-budgeted caches.
+    total_weight: usize,
+    /// Optional byte budget; `None` preserves the classic count-only cache.
+    byte_budget: Option<usize>,
+    byte_budget_func: Option<CapFunc>,
 }
 
 impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S> {
@@ -82,8 +100,18 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             recency_index: LinkedList::new(RecencyAdapter::new()),
             len: 0,
             tick: 0,
+            total_weight: 0,
+            byte_budget: None,
+            byte_budget_func: None,
             hasher,
         }
+    }
+
+    #[cfg(test)]
+    fn with_capacity_and_budget(cap: usize, budget: usize) -> Self {
+        let mut cache = Self::with_capacity(cap);
+        cache.byte_budget = Some(budget);
+        cache
     }
 
     pub fn new(
@@ -111,8 +139,30 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             recency_index: LinkedList::new(RecencyAdapter::new()),
             len: 0,
             tick: 0,
+            total_weight: 0,
+            byte_budget: None,
+            byte_budget_func: None,
             hasher,
         }
+    }
+
+    /// A cache limited both by entry count and by a byte budget; use
+    /// `put_weighted` to insert entries carrying a resident-size estimate.
+    pub fn new_weighted(
+        hit: &'static str,
+        miss: &'static str,
+        cap_func: CapFunc,
+        byte_budget_func: CapFunc,
+        config: &ConfigHandle,
+    ) -> Self {
+        let mut cache = Self::new(hit, miss, cap_func, config);
+        cache.byte_budget = Some(byte_budget_func(config));
+        cache.byte_budget_func = Some(byte_budget_func);
+        cache
+    }
+
+    pub fn total_weight(&self) -> usize {
+        self.total_weight
     }
 
     fn bucket_for_key<Q: Hash>(&self, k: &Q) -> usize {
@@ -147,8 +197,22 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         let new_cap = (self.cap_func)(config);
         if new_cap != self.cap {
             self.cap = new_cap;
-            while self.len > self.cap {
-                self.evict_one();
+        }
+        if let Some(budget_func) = self.byte_budget_func {
+            self.byte_budget = Some(budget_func(config));
+        }
+        self.enforce_limits();
+    }
+
+    /// Evict until both the entry cap and the byte budget are satisfied.
+    fn enforce_limits(&mut self) {
+        while self.len > self.cap
+            || self
+                .byte_budget
+                .is_some_and(|budget| self.total_weight > budget)
+        {
+            if self.evict_one().is_none() {
+                break;
             }
         }
     }
@@ -194,8 +258,9 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         }
     }
 
-    /// Remove the entry with the smallest frequency value
-    fn evict_one(&mut self) {
+    /// Remove the entry with the smallest frequency value, returning its
+    /// weight so byte-budgeted callers can account for it.
+    fn evict_one(&mut self) -> Option<usize> {
         self.decay_least_recent();
 
         let mut cursor = self.frequency_index.lower_bound_mut(Bound::Included(&0));
@@ -210,6 +275,10 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                 self.recency_index.cursor_mut_from_ptr(&*entry).remove();
             }
             self.len -= 1;
+            self.total_weight = self.total_weight.saturating_sub(entry.weight);
+            Some(entry.weight)
+        } else {
+            None
         }
     }
 
@@ -220,6 +289,7 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             bucket.clear();
         }
         self.len = 0;
+        self.total_weight = 0;
     }
 
     pub fn get<'a, Q: ?Sized + Debug>(&'a mut self, k: &Q) -> Option<&'a V>
@@ -272,6 +342,16 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
     }
 
     pub fn put(&mut self, k: K, v: V) {
+        self.put_weighted(k, v, 0);
+    }
+
+    /// Insert an entry carrying a caller-estimated resident size. Evicts by
+    /// LFU until both the entry-count cap and the byte budget (when
+    /// configured) are satisfied. An entry whose weight alone exceeds the
+    /// whole budget is not cached at all — a single pathological item must
+    /// not permanently occupy the entire cache.
+    pub fn put_weighted(&mut self, k: K, v: V, weight: usize) -> PutOutcome {
+        let mut outcome = PutOutcome::default();
         let bucket = self.bucket_for_key(&k);
 
         self.tick += 1;
@@ -285,26 +365,44 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                 .front_mut();
             while let Some(entry) = cursor.get() {
                 if entry.key == k {
+                    let old_weight = entry.weight;
                     unsafe {
                         self.frequency_index.cursor_mut_from_ptr(entry).remove();
                         self.recency_index.cursor_mut_from_ptr(entry).remove();
                     }
                     cursor.remove();
                     self.len -= 1;
+                    self.total_weight = self.total_weight.saturating_sub(old_weight);
                     break;
                 }
                 cursor.move_next();
             }
         }
 
-        while self.len >= self.cap {
-            self.evict_one();
+        if self.byte_budget.is_some_and(|budget| weight > budget) {
+            outcome.rejected_oversize = true;
+            return outcome;
+        }
+
+        while self.len >= self.cap
+            || self
+                .byte_budget
+                .is_some_and(|budget| self.total_weight + weight > budget)
+        {
+            match self.evict_one() {
+                Some(evicted_weight) => {
+                    outcome.evicted_entries += 1;
+                    outcome.evicted_bytes += evicted_weight;
+                }
+                None => break,
+            }
         }
 
         let entry = Rc::new(Entry {
             key: k,
             value: v,
             freq: RefCell::new(0),
+            weight,
             recency_link: LinkedListLink::new(),
             frequency_link: RBTreeLink::new(),
             hash_link: LinkedListLink::new(),
@@ -314,9 +412,11 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         self.frequency_index.insert(Rc::clone(&entry));
         self.recency_index.push_front(entry);
         self.len += 1;
+        self.total_weight = self.total_weight.saturating_add(weight);
         if self.buckets.len() < self.cap && self.len > self.buckets.len() / 2 {
             self.grow_hash();
         }
+        outcome
     }
 }
 
@@ -726,6 +826,102 @@ mod test {
 ]
 "
         );
+    }
+
+    #[test]
+    fn weighted_count_cap_still_evicts() {
+        let mut cache = LfuCacheU64::<u32>::with_capacity_and_budget(4, 1_000_000);
+        for i in 0..6u64 {
+            cache.put_weighted(i, i as u32, 10);
+        }
+        k9::assert_equal!(cache.len(), 4);
+        k9::assert_equal!(cache.total_weight(), 40);
+    }
+
+    #[test]
+    fn weighted_byte_budget_evicts_before_count_cap() {
+        let mut cache = LfuCacheU64::<u32>::with_capacity_and_budget(100, 100);
+        for i in 0..10u64 {
+            let outcome = cache.put_weighted(i, i as u32, 30);
+            k9::assert_equal!(outcome.rejected_oversize, false);
+        }
+        // 100-byte budget holds at most 3 entries of 30 bytes.
+        k9::assert_equal!(cache.len(), 3);
+        k9::assert_equal!(cache.total_weight(), 90);
+    }
+
+    #[test]
+    fn weighted_replace_same_key_updates_weight() {
+        let mut cache = LfuCacheU64::<u32>::with_capacity_and_budget(8, 1_000);
+        cache.put_weighted(1, 1, 100);
+        cache.put_weighted(1, 2, 250);
+        k9::assert_equal!(cache.len(), 1);
+        k9::assert_equal!(cache.total_weight(), 250);
+        k9::assert_equal!(cache.get(&1).copied(), Some(2));
+    }
+
+    #[test]
+    fn weighted_oversize_entry_is_rejected_and_not_cached() {
+        let mut cache = LfuCacheU64::<u32>::with_capacity_and_budget(8, 100);
+        cache.put_weighted(1, 1, 40);
+        let outcome = cache.put_weighted(2, 2, 500);
+        k9::assert_equal!(outcome.rejected_oversize, true);
+        k9::assert_equal!(cache.get(&2).is_none(), true);
+        // The smaller resident entry is unaffected.
+        k9::assert_equal!(cache.len(), 1);
+        k9::assert_equal!(cache.total_weight(), 40);
+
+        // Replacing an existing key with an oversize value removes the stale
+        // entry rather than leaving it behind.
+        let outcome = cache.put_weighted(1, 9, 500);
+        k9::assert_equal!(outcome.rejected_oversize, true);
+        k9::assert_equal!(cache.len(), 0);
+        k9::assert_equal!(cache.total_weight(), 0);
+    }
+
+    #[test]
+    fn weighted_clear_resets_len_and_weight() {
+        let mut cache = LfuCacheU64::<u32>::with_capacity_and_budget(8, 1_000);
+        cache.put_weighted(1, 1, 100);
+        cache.put_weighted(2, 2, 200);
+        cache.clear();
+        k9::assert_equal!(cache.len(), 0);
+        k9::assert_equal!(cache.total_weight(), 0);
+    }
+
+    #[test]
+    fn weighted_eviction_reports_outcome() {
+        let mut cache = LfuCacheU64::<u32>::with_capacity_and_budget(100, 100);
+        cache.put_weighted(1, 1, 60);
+        cache.put_weighted(2, 2, 30);
+        let outcome = cache.put_weighted(3, 3, 60);
+        k9::assert_equal!(outcome.evicted_entries >= 1, true);
+        k9::assert_equal!(outcome.evicted_bytes >= 60, true);
+        k9::assert_equal!(cache.total_weight() <= 100, true);
+    }
+
+    #[test]
+    fn shrinking_byte_budget_evicts_immediately() {
+        let mut cache = LfuCacheU64::<u32>::with_capacity_and_budget(8, 1_000);
+        for i in 0..5u64 {
+            cache.put_weighted(i, i as u32, 100);
+        }
+        k9::assert_equal!(cache.total_weight(), 500);
+        // Same path update_config takes after re-reading the budget.
+        cache.byte_budget = Some(250);
+        cache.enforce_limits();
+        k9::assert_equal!(cache.total_weight() <= 250, true);
+        k9::assert_equal!(cache.len() <= 2, true);
+    }
+
+    #[test]
+    fn unweighted_put_keeps_zero_weight() {
+        let mut cache = LfuCacheU64::<u32>::with_capacity(4);
+        for i in 0..10u64 {
+            cache.put(i, i as u32);
+        }
+        k9::assert_equal!(cache.len(), 4);
+        k9::assert_equal!(cache.total_weight(), 0);
     }
 
     #[test]

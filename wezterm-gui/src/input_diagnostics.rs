@@ -26,6 +26,9 @@ pub(crate) struct InputDiagnosticsSnapshot {
     pub(crate) recent_p95: Duration,
     pub(crate) slowest_stage: Option<StageSnapshot>,
     pub(crate) stages: Vec<StageSnapshot>,
+    /// Gauge values summed across every reporting source (window); each
+    /// source publishes its own set so windows never clobber each other.
+    pub(crate) gauges: Vec<(&'static str, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +90,9 @@ impl InputDiagnosticsSnapshot {
                 format_duration(stage.recent_p95),
                 format_duration(stage.max_duration),
             ));
+        }
+        for (name, value) in &self.gauges {
+            lines.push(format!("gauge.{name}: {value} (process total)"));
         }
         lines
     }
@@ -169,6 +175,10 @@ struct InputDiagnosticsState {
     max_duration: Duration,
     recent: VecDeque<Duration>,
     stages: HashMap<&'static str, StageStats>,
+    /// Per-source (per-window) gauge sets, keyed by a stable source id such
+    /// as `space_owner_id`. Kept separate so multiple windows do not
+    /// overwrite each other; snapshots aggregate across sources.
+    gauges: HashMap<u64, HashMap<&'static str, u64>>,
 }
 
 impl Default for InputDiagnosticsState {
@@ -185,6 +195,7 @@ impl Default for InputDiagnosticsState {
             max_duration: Duration::ZERO,
             recent: VecDeque::with_capacity(RECENT_LIMIT),
             stages: HashMap::new(),
+            gauges: HashMap::new(),
         }
     }
 }
@@ -200,6 +211,33 @@ impl InputDiagnosticsState {
         self.max_duration = Duration::ZERO;
         self.recent.clear();
         self.stages.clear();
+        self.gauges.clear();
+    }
+
+    fn set_gauges_for_source(&mut self, source_id: u64, values: &[(&'static str, u64)]) {
+        if !self.enabled {
+            return;
+        }
+        let entry = self.gauges.entry(source_id).or_default();
+        for (name, value) in values {
+            entry.insert(name, *value);
+        }
+    }
+
+    fn remove_gauges_for_source(&mut self, source_id: u64) {
+        self.gauges.remove(&source_id);
+    }
+
+    fn aggregated_gauges(&self) -> Vec<(&'static str, u64)> {
+        let mut totals: HashMap<&'static str, u64> = HashMap::new();
+        for source in self.gauges.values() {
+            for (name, value) in source {
+                *totals.entry(name).or_default() += value;
+            }
+        }
+        let mut totals: Vec<_> = totals.into_iter().collect();
+        totals.sort_by_key(|(name, _)| *name);
+        totals
     }
 
     fn set_enabled(&mut self, enabled: bool) {
@@ -271,6 +309,7 @@ impl InputDiagnosticsState {
             recent_p95: percentile_duration(&self.recent, 0.95),
             slowest_stage,
             stages,
+            gauges: self.aggregated_gauges(),
         }
     }
 }
@@ -327,6 +366,18 @@ pub(crate) fn snapshot() -> InputDiagnosticsSnapshot {
     state().lock().snapshot()
 }
 
+/// Publish one window's gauge set in a single lock acquisition. Values are
+/// stored per source so concurrent windows never overwrite each other;
+/// snapshots aggregate across sources.
+pub(crate) fn set_gauges_for_source(source_id: u64, values: &[(&'static str, u64)]) {
+    state().lock().set_gauges_for_source(source_id, values);
+}
+
+/// Drop a closed window's gauges so they do not linger in process totals.
+pub(crate) fn remove_gauges_for_source(source_id: u64) {
+    state().lock().remove_gauges_for_source(source_id);
+}
+
 fn push_recent(recent: &mut VecDeque<Duration>, duration: Duration) {
     if recent.len() == RECENT_LIMIT {
         recent.pop_front();
@@ -358,5 +409,57 @@ pub(crate) fn format_duration(duration: Duration) -> String {
         format!("{:.2} ms", micros / 1000.0)
     } else {
         format!("{micros:.0} us")
+    }
+}
+
+#[cfg(test)]
+mod gauge_tests {
+    use super::*;
+
+    fn enabled_state() -> InputDiagnosticsState {
+        let mut state = InputDiagnosticsState::default();
+        state.set_enabled(true);
+        state
+    }
+
+    #[test]
+    fn gauges_are_isolated_per_source_and_summed_in_snapshots() {
+        let mut state = enabled_state();
+        state.set_gauges_for_source(1, &[("note_cache_len", 10), ("note_cache_bytes", 100)]);
+        state.set_gauges_for_source(2, &[("note_cache_len", 5)]);
+        // A later publish from source 1 replaces only its own values.
+        state.set_gauges_for_source(1, &[("note_cache_len", 7)]);
+
+        let gauges = state.aggregated_gauges();
+        assert!(gauges.contains(&("note_cache_len", 12)));
+        assert!(gauges.contains(&("note_cache_bytes", 100)));
+    }
+
+    #[test]
+    fn removed_source_disappears_from_totals() {
+        let mut state = enabled_state();
+        state.set_gauges_for_source(1, &[("note_cache_len", 10)]);
+        state.set_gauges_for_source(2, &[("note_cache_len", 5)]);
+        state.remove_gauges_for_source(1);
+        assert_eq!(state.aggregated_gauges(), vec![("note_cache_len", 5)]);
+        state.remove_gauges_for_source(2);
+        assert!(state.aggregated_gauges().is_empty());
+    }
+
+    #[test]
+    fn reset_clears_stages_and_gauges() {
+        let mut state = enabled_state();
+        state.record_stage("note_wrap_sync", Duration::from_millis(1), true);
+        state.set_gauges_for_source(1, &[("note_cache_len", 10)]);
+        state.clear_stats();
+        assert!(state.stages.is_empty());
+        assert!(state.aggregated_gauges().is_empty());
+    }
+
+    #[test]
+    fn disabled_state_ignores_gauge_publishes() {
+        let mut state = InputDiagnosticsState::default();
+        state.set_gauges_for_source(1, &[("note_cache_len", 10)]);
+        assert!(state.aggregated_gauges().is_empty());
     }
 }

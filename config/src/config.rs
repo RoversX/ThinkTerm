@@ -729,6 +729,11 @@ pub struct Config {
     /// network-address limits.
     #[dynamic(default = "default_true")]
     pub note_remote_images_enabled: bool,
+    /// Maximum reading width of the Note editor text column, in design
+    /// pixels (2x Retina pixels on macOS). The column is centered when the
+    /// Note area is wider than this.
+    #[dynamic(default = "default_note_reading_max_width")]
+    pub note_reading_max_width: usize,
     #[dynamic(default)]
     pub xim_im_name: Option<String>,
     #[dynamic(default)]
@@ -2286,6 +2291,10 @@ impl DroppedFileQuoting {
 
 fn default_glyph_cache_image_cache_size() -> usize {
     256
+}
+
+fn default_note_reading_max_width() -> usize {
+    820
 }
 
 fn default_shape_cache_size() -> usize {

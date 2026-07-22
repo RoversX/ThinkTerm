@@ -1257,9 +1257,17 @@ impl crate::TermWindow {
             style,
             text,
         };
+        let domain = self.ui_text_domain.get();
 
-        if let Some(cached) = self.lookup_cached_shape(&key) {
-            return cached.map(|shaped| (shaped, UiShapeCacheLookup::Hit));
+        match self
+            .ui_shape_caches
+            .borrow_mut()
+            .domain_mut(domain)
+            .get(&key as &dyn crate::shapecache::ShapeCacheKeyTrait)
+        {
+            Some(Ok(shaped)) => return Ok((Rc::clone(shaped), UiShapeCacheLookup::Hit)),
+            Some(Err(err)) => return Err(anyhow!("cached shaper error: {}", err)),
+            None => {}
         }
 
         let Some(window) = self.window.as_ref().cloned() else {
@@ -1269,6 +1277,9 @@ impl crate::TermWindow {
             return Ok((Rc::new(Vec::new()), UiShapeCacheLookup::Skipped));
         };
 
+        // Cache misses shape on the UI thread; surfaced per domain in Input
+        // Diagnostics so fast-scroll shaping bursts are attributable.
+        let miss_stage = crate::input_diagnostics::StageTimer::begin(domain.miss_stage_name());
         let infos = match font.shape(
             text,
             move || window.notify(TermWindowNotif::InvalidateShapeCache),
@@ -1281,11 +1292,16 @@ impl crate::TermWindow {
             Ok(infos) => infos,
             Err(err) => {
                 if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
+                    miss_stage.finish(false);
                     return Err(err);
                 }
 
                 let res = anyhow!("shaper error: {}", err);
-                self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
+                self.ui_shape_caches
+                    .borrow_mut()
+                    .domain_mut(domain)
+                    .put(key.to_owned(), Err(err));
+                miss_stage.finish(false);
                 return Err(res);
             }
         };
@@ -1295,9 +1311,11 @@ impl crate::TermWindow {
             self.glyph_infos_to_glyphs(style, &mut glyph_cache, &infos, font, metrics)?
         };
         let shaped = Rc::new(ShapedInfo::process(&infos, &glyphs));
-        self.shape_cache
+        self.ui_shape_caches
             .borrow_mut()
+            .domain_mut(domain)
             .put(key.to_owned(), Ok(Rc::clone(&shaped)));
+        miss_stage.finish(true);
         Ok((shaped, UiShapeCacheLookup::Miss))
     }
 

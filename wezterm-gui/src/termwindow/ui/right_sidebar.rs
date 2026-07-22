@@ -83,7 +83,6 @@ const SNIPPET_CARET_WIDTH: f32 = 3.0;
 const NOTE_TOOLBAR_HEIGHT: usize = 54;
 const NOTE_BODY_TOP_GAP: usize = 12;
 const NOTE_BODY_PADDING: usize = 24;
-const NOTE_READING_MAX_WIDTH: usize = 720;
 const NOTE_LINE_GAP: usize = 5;
 const NOTE_CARET_WIDTH: f32 = 2.0;
 const NOTE_TABLE_CELL_HORIZONTAL_PADDING: usize = 10;
@@ -250,6 +249,42 @@ fn visible_code_block_rounded_edges(
     viewport_bottom: f32,
 ) -> (bool, bool) {
     (block_top >= viewport_top, block_bottom <= viewport_bottom)
+}
+
+/// Idle-release decisions extracted as pure functions so the token/visibility
+/// logic is unit-testable without a TermWindow or real timers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteReleaseAction {
+    Skip,
+    SaveAndReschedule,
+    Release,
+}
+
+fn note_release_action(token_matches: bool, visible: bool, dirty: bool) -> NoteReleaseAction {
+    if !token_matches || visible {
+        NoteReleaseAction::Skip
+    } else if dirty {
+        NoteReleaseAction::SaveAndReschedule
+    } else {
+        NoteReleaseAction::Release
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileReleaseAction {
+    Skip,
+    RescheduleWhileIndexing,
+    Release,
+}
+
+fn file_release_action(token_matches: bool, visible: bool, indexing: bool) -> FileReleaseAction {
+    if !token_matches || visible {
+        FileReleaseAction::Skip
+    } else if indexing {
+        FileReleaseAction::RescheduleWhileIndexing
+    } else {
+        FileReleaseAction::Release
+    }
 }
 
 /// Hash an already-ordered sequence with the same shape as `Vec::hash`
@@ -1095,14 +1130,24 @@ impl crate::TermWindow {
     /// since scheduling, or if an index build is still in flight. The root and
     /// expanded-folder set are kept so reopening rebuilds the same view.
     fn release_right_sidebar_file_memory_if_idle(&mut self, token: u64) {
-        if token != self.right_sidebar_file_memory_release_token
-            || self.right_sidebar_file_view_active()
-            || matches!(
+        match file_release_action(
+            token == self.right_sidebar_file_memory_release_token,
+            self.right_sidebar_file_view_active(),
+            matches!(
                 self.right_sidebar_file_index_status,
                 RightSidebarFileIndexStatus::Indexing
-            )
-        {
-            return;
+            ),
+        ) {
+            FileReleaseAction::Skip => return,
+            FileReleaseAction::RescheduleWhileIndexing => {
+                // The panel is hidden but an index build is still running; a
+                // bare return here used to leak the whole File state forever
+                // (no timer remained). Re-arm the release so it lands once
+                // indexing settles.
+                self.schedule_right_sidebar_file_memory_release();
+                return;
+            }
+            FileReleaseAction::Release => {}
         }
 
         // Remember the view (paths/scroll/filter, a few KB) BEFORE the teardown
@@ -1122,6 +1167,8 @@ impl crate::TermWindow {
         self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Empty;
         self.right_sidebar_file_browse_rows = Vec::new();
         self.right_sidebar_file_browse_cache_key = None;
+        self.ui_shape_caches.borrow_mut().clear_file_preview();
+        self.publish_ui_shape_cache_diagnostics();
         self.invalidate_window();
     }
 
@@ -1147,20 +1194,21 @@ impl crate::TermWindow {
     }
 
     fn release_right_sidebar_note_memory_if_idle(&mut self, token: u64) {
-        if token != self.right_sidebar_note_memory_release_token
-            || self.right_sidebar_note_visible()
-        {
-            return;
-        }
-        if self
-            .right_sidebar_note
-            .session
-            .as_ref()
-            .is_some_and(|session| session.lock().is_dirty())
-        {
-            self.save_right_sidebar_note_now();
-            self.schedule_right_sidebar_note_memory_release();
-            return;
+        match note_release_action(
+            token == self.right_sidebar_note_memory_release_token,
+            self.right_sidebar_note_visible(),
+            self.right_sidebar_note
+                .session
+                .as_ref()
+                .is_some_and(|session| session.lock().is_dirty()),
+        ) {
+            NoteReleaseAction::Skip => return,
+            NoteReleaseAction::SaveAndReschedule => {
+                self.save_right_sidebar_note_now();
+                self.schedule_right_sidebar_note_memory_release();
+                return;
+            }
+            NoteReleaseAction::Release => {}
         }
 
         self.right_sidebar_note_open_generation =
@@ -1184,6 +1232,8 @@ impl crate::TermWindow {
         self.right_sidebar_note_image_failures.clear();
         self.right_sidebar_note_code_highlight = NoteCodeHighlightState::default();
         self.right_sidebar_note_paint_cache = NotePaintCache::default();
+        self.ui_shape_caches.borrow_mut().clear_note();
+        self.publish_ui_shape_cache_diagnostics();
     }
 
     fn right_sidebar_file_view_state_key(&self) -> Option<(PathBuf, String)> {
@@ -3959,7 +4009,9 @@ impl crate::TermWindow {
         };
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
-                let stage = crate::input_diagnostics::StageTimer::begin("note_wrap");
+                // Worker-side wrap: slow is acceptable here. Decisions about
+                // real incremental wrapping must look at note_wrap_sync only.
+                let stage = crate::input_diagnostics::StageTimer::begin("note_wrap_background");
                 let wrapped = wrap_visual_document_by_width_cached(
                     &visual,
                     wrap_width,
@@ -6133,8 +6185,49 @@ impl crate::TermWindow {
 
     /// Paint the Note toolbar and editor body into an arbitrary content rect —
     /// either inline in the sidebar column or in the expanded Note pane.
+    /// Routes all shaping inside (wrap measurement, prose, preedit, toolbar)
+    /// through the Note domain cache.
     #[allow(clippy::too_many_arguments)]
     fn paint_note_editor_area(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        base_font_size: f64,
+        show_tree_button: bool,
+        tree_button_icon: SvgIcon,
+    ) -> anyhow::Result<()> {
+        let previous_domain = self
+            .ui_text_domain
+            .replace(crate::shapecache::UiTextDomain::Note);
+        let result = self.paint_note_editor_area_impl(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            content_top,
+            content_width,
+            content_bottom,
+            base_font_size,
+            show_tree_button,
+            tree_button_icon,
+        );
+        self.ui_text_domain.set(previous_domain);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_note_editor_area_impl(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
@@ -6240,7 +6333,8 @@ impl crate::TermWindow {
         let preedit = self.right_sidebar_note.view.preedit.clone();
         let padding = self.ui_px(NOTE_BODY_PADDING) as f32;
         let available_reading_width = (content_width as f32 - padding * 2.0).max(1.0);
-        let reading_width = available_reading_width.min(self.ui_f32(NOTE_READING_MAX_WIDTH as f32));
+        let reading_width = available_reading_width
+            .min(self.ui_f32(self.config.note_reading_max_width.max(320) as f32));
         let text_left = content_x as f32 + (content_width as f32 - reading_width) / 2.0;
         let clip_left = text_left;
         let clip_right = text_left + reading_width;
@@ -6274,7 +6368,7 @@ impl crate::TermWindow {
         let wrap_key = wrap_hasher.finish() as usize;
         let visual = if let Some(visual) = self.right_sidebar_note.cached_wrapped_visual(wrap_key) {
             visual
-        } else if self.right_sidebar_note.prefers_background_wrap() {
+        } else if self.right_sidebar_note.should_background_wrap(wrap_key) {
             let normal_approx_metrics = self.note_approximate_text_metrics(ui_font, &ui_metrics)?;
             let h1_approx_metrics = self.note_approximate_text_metrics(&h1_font, &h1_metrics)?;
             let h2_approx_metrics = self.note_approximate_text_metrics(&h2_font, &h2_metrics)?;
@@ -6292,7 +6386,9 @@ impl crate::TermWindow {
             );
             self.right_sidebar_note.provisional_wrapped_visual()
         } else {
-            let wrap_stage = crate::input_diagnostics::StageTimer::begin("note_wrap");
+            // UI-thread wrap: the number that decides whether real
+            // incremental wrapping is ever needed.
+            let wrap_stage = crate::input_diagnostics::StageTimer::begin("note_wrap_sync");
             let mut wrap_cache = std::mem::take(&mut self.right_sidebar_note.wrap_cache);
             let wrapped = wrap_visual_document_by_width_cached(
                 &self.right_sidebar_note.visual,
@@ -7996,6 +8092,29 @@ impl crate::TermWindow {
 
     #[allow(clippy::too_many_arguments)]
     fn paint_right_sidebar_file_preview_pane(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        rect: RightSidebarRect,
+    ) -> anyhow::Result<()> {
+        // All preview shaping (visible slices, horizontal-scroll full lines,
+        // syntax-coloured lines) goes through the File Preview domain cache.
+        let previous_domain = self
+            .ui_text_domain
+            .replace(crate::shapecache::UiTextDomain::FilePreview);
+        let result = self.paint_right_sidebar_file_preview_pane_impl(
+            layers, ui_font, ui_metrics, chrome, foreground, muted_fg, rect,
+        );
+        self.ui_text_domain.set(previous_domain);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_right_sidebar_file_preview_pane_impl(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
@@ -12037,6 +12156,7 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        FileReleaseAction, NoteReleaseAction, file_release_action, note_release_action,
         FILE_PREVIEW_MAX_BYTES, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
         NoteApproximateTextMetrics, NoteCodeHighlightEntry, NoteCodeHighlightState,
         approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
@@ -12073,6 +12193,48 @@ mod tests {
             strike_row: 0,
             cell_size: Size::new(cell_width, cell_height),
         }
+    }
+
+    #[test]
+    fn idle_release_decisions_respect_token_visibility_and_dirty_state() {
+        // Stale token: another open re-armed the timer; never release.
+        assert_eq!(
+            note_release_action(false, false, false),
+            NoteReleaseAction::Skip
+        );
+        assert_eq!(
+            file_release_action(false, false, false),
+            FileReleaseAction::Skip
+        );
+        // Visible feature: never release, even with a matching token.
+        assert_eq!(
+            note_release_action(true, true, false),
+            NoteReleaseAction::Skip
+        );
+        assert_eq!(
+            file_release_action(true, true, true),
+            FileReleaseAction::Skip
+        );
+        // Hidden + idle: release.
+        assert_eq!(
+            note_release_action(true, false, false),
+            NoteReleaseAction::Release
+        );
+        assert_eq!(
+            file_release_action(true, false, false),
+            FileReleaseAction::Release
+        );
+        // Dirty Note saves first and re-arms instead of dropping edits.
+        assert_eq!(
+            note_release_action(true, false, true),
+            NoteReleaseAction::SaveAndReschedule
+        );
+        // Hidden while still indexing: re-arm so the release eventually
+        // happens instead of leaking forever.
+        assert_eq!(
+            file_release_action(true, false, true),
+            FileReleaseAction::RescheduleWhileIndexing
+        );
     }
 
     #[test]

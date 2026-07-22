@@ -132,6 +132,18 @@ pub(crate) struct NoteHostState {
     /// for it.
     reveal_key_cache: Option<(u64, usize, usize)>,
     background_wrap_preferred: bool,
+    /// `estimated_wrap_work_bytes()` of the current visual document, stored
+    /// at rebuild so per-frame decisions never re-walk every line. This
+    /// estimate deliberately excludes code/table/image/rule component lines,
+    /// so it must never be the only input to the sync-vs-background wrap
+    /// decision: the cached wrap still hashes and shifts EVERY visual line.
+    wrap_work_estimate: usize,
+    /// Length of the full displayed snapshot's source (for progressive
+    /// previews this is the complete document, not the seeded slice).
+    displayed_source_bytes: usize,
+    /// Line count of the current visual document — what the cached wrap's
+    /// reuse pass actually iterates.
+    visual_line_count: usize,
     background_wrap_requested_key: Option<NoteBackgroundWrapKey>,
     background_wrap_generation: u64,
     pub background_wrap_in_flight_key: Option<NoteBackgroundWrapKey>,
@@ -147,6 +159,11 @@ const PROGRESSIVE_PREVIEW_BYTES: usize = 6 * 1024;
 /// Keep small notes immediate, but move ordinary multi-page notes (including
 /// the 40 KiB regression fixture) off the UI thread.
 const BACKGROUND_WRAP_THRESHOLD_BYTES: usize = 8 * 1024;
+/// Upper bounds for the primed-cache synchronous wrap: beyond any of these
+/// the O(all lines) reuse pass itself is too expensive for a keystroke.
+const PRIMED_SYNC_WRAP_MAX_SOURCE_BYTES: usize = 256 * 1024;
+const PRIMED_SYNC_WRAP_MAX_LINES: usize = 4096;
+const PRIMED_SYNC_WRAP_MAX_WORK_BYTES: usize = 256 * 1024;
 
 impl Default for NoteHostState {
     fn default() -> Self {
@@ -192,6 +209,9 @@ impl Default for NoteHostState {
             links_resolution_pending: false,
             reveal_key_cache: None,
             background_wrap_preferred: false,
+            wrap_work_estimate: 0,
+            displayed_source_bytes: 0,
+            visual_line_count: 0,
             background_wrap_requested_key: None,
             background_wrap_generation: 0,
             background_wrap_in_flight_key: None,
@@ -244,7 +264,7 @@ impl NoteHostState {
         self.parse_in_flight_revision = None;
         self.links_resolution_pending = false;
         self.reveal_key_cache = None;
-        self.background_wrap_preferred = false;
+        self.reset_wrap_work_metrics();
         self.background_wrap_requested_key = None;
         let snapshot = self
             .session
@@ -275,8 +295,14 @@ impl NoteHostState {
             self.view.mode,
             0,
         ));
+        // Record the FULL document size (the gate metrics must not lie about
+        // what the display represents), but keep the seed itself on the
+        // synchronous wrap path: this visual is deliberately tiny so a
+        // multi-megabyte note paints useful first-screen text immediately.
+        // The full background parse installs honest metrics right after.
+        self.refresh_wrap_work_metrics(snapshot.source.len());
         self.background_wrap_preferred =
-            self.visual.estimated_wrap_work_bytes() >= BACKGROUND_WRAP_THRESHOLD_BYTES;
+            self.wrap_work_estimate >= BACKGROUND_WRAP_THRESHOLD_BYTES;
         self.visual_key = Some((snapshot.revision, self.view.mode, active_start));
         // This is deliberately not the complete revision.  The regular
         // background parse path will replace it with the full projection.
@@ -298,7 +324,7 @@ impl NoteHostState {
         self.parse_in_flight_revision = None;
         self.links_resolution_pending = false;
         self.reveal_key_cache = None;
-        self.background_wrap_preferred = false;
+        self.reset_wrap_work_metrics();
         self.background_wrap_requested_key = None;
     }
 
@@ -482,8 +508,7 @@ impl NoteHostState {
                 self.view.mode,
                 self.view.selection.focus.byte,
             ));
-            self.background_wrap_preferred =
-                self.visual.estimated_wrap_work_bytes() >= BACKGROUND_WRAP_THRESHOLD_BYTES;
+            self.refresh_wrap_work_metrics(source.len());
             self.visual_key = Some(key);
             self.wrapped_key = None;
         }
@@ -546,14 +571,17 @@ impl NoteHostState {
         {
             return false;
         }
+        let display_source_len = self
+            .display_snapshot()
+            .map(|snapshot| snapshot.source.len())
+            .unwrap_or(0);
         let active_start = projection.caret_reveal_start(caret);
         self.projection = projection;
         self.reveal_key_cache = Some((revision, caret, active_start));
         // The worker performed the authoritative vault-link resolution.
         self.links_resolution_pending = false;
         self.visual = Arc::new(visual);
-        self.background_wrap_preferred =
-            self.visual.estimated_wrap_work_bytes() >= BACKGROUND_WRAP_THRESHOLD_BYTES;
+        self.refresh_wrap_work_metrics(display_source_len);
         self.projection_revision = Some(revision);
         self.visual_key = Some((revision, mode, active_start));
         self.wrapped_key = None;
@@ -599,6 +627,48 @@ impl NoteHostState {
 
     pub(crate) fn prefers_background_wrap(&self) -> bool {
         self.background_wrap_preferred
+    }
+
+    /// Whether the paint path should hand this wrap to the background worker
+    /// (accepting one provisional stale frame) instead of wrapping
+    /// synchronously.
+    ///
+    /// A primed cache makes the synchronous wrap re-measure only changed
+    /// lines, so typing stays on the immediate path with no per-key flash —
+    /// but the reuse pass still hashes and shifts every line (O(total
+    /// lines)), so truly huge notes keep the background path even when
+    /// primed.
+    pub(crate) fn should_background_wrap(&self, wrap_key: usize) -> bool {
+        if !self.background_wrap_preferred {
+            return false;
+        }
+        !(self.wrap_cache.is_primed_for(wrap_key)
+            && self.displayed_source_bytes <= PRIMED_SYNC_WRAP_MAX_SOURCE_BYTES
+            && self.visual_line_count <= PRIMED_SYNC_WRAP_MAX_LINES
+            && self.wrap_work_estimate <= PRIMED_SYNC_WRAP_MAX_WORK_BYTES)
+    }
+
+    /// Recompute the wrap-decision inputs after installing a new visual
+    /// document. `background_wrap_preferred` must trigger on total size and
+    /// line count as well: `estimated_wrap_work_bytes` excludes code/table/
+    /// image/rule lines, but the cached wrap's reuse pass iterates every
+    /// line, so a huge code-only note with a tiny wrap-work estimate must
+    /// still stay off the UI thread.
+    fn refresh_wrap_work_metrics(&mut self, displayed_source_bytes: usize) {
+        self.wrap_work_estimate = self.visual.estimated_wrap_work_bytes();
+        self.displayed_source_bytes = displayed_source_bytes;
+        self.visual_line_count = self.visual.lines.len();
+        self.background_wrap_preferred = self.wrap_work_estimate
+            >= BACKGROUND_WRAP_THRESHOLD_BYTES
+            || self.displayed_source_bytes > PRIMED_SYNC_WRAP_MAX_SOURCE_BYTES
+            || self.visual_line_count > PRIMED_SYNC_WRAP_MAX_LINES;
+    }
+
+    fn reset_wrap_work_metrics(&mut self) {
+        self.wrap_work_estimate = 0;
+        self.displayed_source_bytes = 0;
+        self.visual_line_count = 0;
+        self.background_wrap_preferred = false;
     }
 
     pub(crate) fn apply_background_wrap(
@@ -1264,6 +1334,142 @@ mod state_tests {
             host.autosave_woke(start + Duration::from_millis(1200)),
             AutosaveWakeAction::Idle
         );
+    }
+
+    #[test]
+    fn primed_wrap_cache_keeps_typing_synchronous_but_not_for_huge_notes() {
+        let wrap_key = 7usize;
+        let measure = |_: super::super::BlockKind, _: super::super::InlineStyle, text: &str| {
+            Ok::<f32, ()>(text.chars().count() as f32)
+        };
+
+        // Ordinary multi-page note: background-preferred, but once the wrap
+        // cache is primed for this width, typing wraps synchronously.
+        let mut host = host_with_source(&"ordinary prose that wraps ".repeat(1_000));
+        assert!(host.prefers_background_wrap());
+        assert!(host.should_background_wrap(wrap_key), "first layout");
+        super::super::wrap_visual_document_by_width_cached(
+            &Arc::clone(&host.visual),
+            120.0,
+            wrap_key,
+            &mut host.wrap_cache,
+            measure,
+        )
+        .unwrap();
+        assert!(!host.should_background_wrap(wrap_key), "primed → sync");
+        assert!(
+            host.should_background_wrap(wrap_key + 1),
+            "other width is not primed"
+        );
+
+        // Huge note: even a primed cache pays O(total lines) per reuse pass,
+        // so it stays on the background path. Sources this large parse on the
+        // worker, so install the visual through the background-parse flow.
+        let mut huge = host_with_source(&"prose ".repeat(60_000));
+        let (revision, source, mode, caret, _) =
+            huge.background_parse_request().expect("huge parse request");
+        let projection = MarkdownProjection::parse(&source);
+        let visual = build_visual_document(&source, &projection, mode, caret);
+        assert!(huge.apply_background_parse(revision, mode, caret, projection, visual));
+        super::super::wrap_visual_document_by_width_cached(
+            &Arc::clone(&huge.visual),
+            120.0,
+            wrap_key,
+            &mut huge.wrap_cache,
+            measure,
+        )
+        .unwrap();
+        assert!(huge.should_background_wrap(wrap_key));
+    }
+
+    #[test]
+    fn component_heavy_notes_stay_on_background_wrap_despite_tiny_work_estimate() {
+        let wrap_key = 3usize;
+        let measure = |_: super::super::BlockKind, _: super::super::InlineStyle, text: &str| {
+            Ok::<f32, ()>(text.chars().count() as f32)
+        };
+
+        // ~50 KiB code-only note: estimated_wrap_work_bytes excludes code
+        // lines, so it is tiny — but the reuse pass still walks every visual
+        // line, so the line count must force the background path.
+        let code_source = format!("```text\n{}```", "code line\n".repeat(5_000));
+        let mut code_host = host_with_source(&code_source);
+        assert!(
+            code_host.wrap_work_estimate < BACKGROUND_WRAP_THRESHOLD_BYTES,
+            "estimate ignores code lines"
+        );
+        assert!(code_host.visual_line_count > PRIMED_SYNC_WRAP_MAX_LINES);
+        assert!(code_host.prefers_background_wrap());
+        super::super::wrap_visual_document_by_width_cached(
+            &Arc::clone(&code_host.visual),
+            120.0,
+            wrap_key,
+            &mut code_host.wrap_cache,
+            measure,
+        )
+        .unwrap();
+        assert!(
+            code_host.should_background_wrap(wrap_key),
+            "primed cache must not pull a huge code note onto the UI thread"
+        );
+
+        // Table-heavy note: same rule via the table rows.
+        let table_source = format!(
+            "| A | B |\n| - | - |\n{}",
+            "| aa | bb |\n".repeat(5_000)
+        );
+        let mut table_host = host_with_source(&table_source);
+        assert!(table_host.visual_line_count > PRIMED_SYNC_WRAP_MAX_LINES);
+        assert!(table_host.prefers_background_wrap());
+        super::super::wrap_visual_document_by_width_cached(
+            &Arc::clone(&table_host.visual),
+            120.0,
+            wrap_key,
+            &mut table_host.wrap_cache,
+            measure,
+        )
+        .unwrap();
+        assert!(table_host.should_background_wrap(wrap_key));
+    }
+
+    #[test]
+    fn wrap_metrics_reset_on_clear_and_track_full_source_for_previews() {
+        // Small doc: metrics reflect the synchronous build...
+        let mut host = host_with_source("plain prose");
+        assert!(host.displayed_source_bytes > 0);
+        assert!(host.visual_line_count > 0);
+        // ...and clear_document zeroes everything.
+        host.clear_document(None);
+        assert_eq!(host.displayed_source_bytes, 0);
+        assert_eq!(host.visual_line_count, 0);
+        assert_eq!(host.wrap_work_estimate, 0);
+        assert!(!host.prefers_background_wrap());
+
+        // Progressive preview seeds only the first screen but must gate on
+        // the FULL document size.
+        let paragraph = "First-screen text with **formatting** and enough words to wrap.\n\n";
+        let source = paragraph.repeat(BACKGROUND_PARSE_THRESHOLD_BYTES / paragraph.len() + 8);
+        let full_len = source.len();
+        let session = Arc::new(Mutex::new(MarkdownDocumentSession::new(
+            "large".into(),
+            PathBuf::from("Large.md"),
+            source,
+        )));
+        let document = VaultDocument {
+            vault_root: PathBuf::from("vault"),
+            relative_path: "Large.md".into(),
+            document_path: PathBuf::from("vault/Large.md"),
+            session,
+        };
+        let mut host = NoteHostState::default();
+        assert!(host.bind_document(document));
+        assert_eq!(
+            host.displayed_source_bytes, full_len,
+            "the metric reports the full document, not the seeded slice"
+        );
+        // The tiny seed itself still paints via the synchronous wrap so the
+        // first screen appears immediately (matches the seed test above).
+        assert!(!host.prefers_background_wrap());
     }
 
     #[test]

@@ -573,6 +573,15 @@ pub(crate) struct VisualWrapCache {
     source_line_lookup: HashMap<u64, Vec<usize>>,
 }
 
+impl VisualWrapCache {
+    /// Whether a wrap at this key can reuse per-line results, making a
+    /// synchronous wrap cheap even for large documents (only changed lines
+    /// are re-measured). False after a width change or a size-cap eviction.
+    pub(crate) fn is_primed_for(&self, wrap_key: usize) -> bool {
+        self.wrap_key == Some(wrap_key) && !self.wrapped.lines.is_empty()
+    }
+}
+
 pub(crate) fn build_visual_document(
     source: &str,
     projection: &MarkdownProjection,

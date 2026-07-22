@@ -118,6 +118,379 @@ impl<'a> std::hash::Hash for dyn ShapeCacheKeyTrait + 'a {
     }
 }
 
+/// Which UI surface a piece of proportional text belongs to. Shaping is
+/// routed through per-domain caches so a long Note cannot evict tab-bar or
+/// sidebar entries (nor the terminal grid's cache), and so Note / File
+/// Preview shaping memory can be released independently when hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiTextDomain {
+    Chrome,
+    Note,
+    FilePreview,
+}
+
+impl UiTextDomain {
+    pub fn miss_stage_name(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome_shape_miss",
+            Self::Note => "note_shape_miss",
+            Self::FilePreview => "file_preview_shape_miss",
+        }
+    }
+
+    pub fn gauge_names(self) -> &'static UiShapeGaugeNames {
+        match self {
+            Self::Chrome => &CHROME_GAUGE_NAMES,
+            Self::Note => &NOTE_GAUGE_NAMES,
+            Self::FilePreview => &FILE_PREVIEW_GAUGE_NAMES,
+        }
+    }
+}
+
+/// Static gauge names per domain (the diagnostics API requires
+/// `&'static str`).
+pub struct UiShapeGaugeNames {
+    pub len: &'static str,
+    pub bytes: &'static str,
+    pub cap: &'static str,
+    pub budget: &'static str,
+    pub hits: &'static str,
+    pub misses: &'static str,
+    pub rejected_oversize: &'static str,
+    pub evicted_entries: &'static str,
+    pub evicted_bytes: &'static str,
+}
+
+static CHROME_GAUGE_NAMES: UiShapeGaugeNames = UiShapeGaugeNames {
+    len: "chrome_cache_len",
+    bytes: "chrome_cache_bytes",
+    cap: "chrome_cache_cap",
+    budget: "chrome_cache_budget",
+    hits: "chrome_cache_hits",
+    misses: "chrome_cache_misses",
+    rejected_oversize: "chrome_cache_rejected_oversize",
+    evicted_entries: "chrome_cache_evictions_count",
+    evicted_bytes: "chrome_cache_evictions_bytes",
+};
+
+static NOTE_GAUGE_NAMES: UiShapeGaugeNames = UiShapeGaugeNames {
+    len: "note_cache_len",
+    bytes: "note_cache_bytes",
+    cap: "note_cache_cap",
+    budget: "note_cache_budget",
+    hits: "note_cache_hits",
+    misses: "note_cache_misses",
+    rejected_oversize: "note_cache_rejected_oversize",
+    evicted_entries: "note_cache_evictions_count",
+    evicted_bytes: "note_cache_evictions_bytes",
+};
+
+static FILE_PREVIEW_GAUGE_NAMES: UiShapeGaugeNames = UiShapeGaugeNames {
+    len: "file_preview_cache_len",
+    bytes: "file_preview_cache_bytes",
+    cap: "file_preview_cache_cap",
+    budget: "file_preview_cache_budget",
+    hits: "file_preview_cache_hits",
+    misses: "file_preview_cache_misses",
+    rejected_oversize: "file_preview_cache_rejected_oversize",
+    evicted_entries: "file_preview_cache_evictions_count",
+    evicted_bytes: "file_preview_cache_evictions_bytes",
+};
+
+/// Cumulative counters maintained locally (plain fields, no global locks on
+/// the request path) and published in batch to the diagnostics panel.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UiShapeCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub rejected_oversize: u64,
+    pub evicted_entries: u64,
+    pub evicted_bytes: u64,
+}
+
+pub type UiShapedValue = anyhow::Result<Rc<Vec<ShapedInfo>>>;
+
+const SHAPE_ENTRY_FIXED_OVERHEAD: usize = 128;
+const SHAPE_ERR_ENTRY_BYTES: usize = 256;
+
+fn estimate_text_style_heap_bytes(style: &TextStyle) -> usize {
+    style
+        .font
+        .capacity()
+        .saturating_mul(std::mem::size_of::<config::FontAttributes>())
+        .saturating_add(
+            style
+                .font
+                .iter()
+                .map(|attributes| attributes.family.capacity())
+                .sum(),
+        )
+}
+
+/// Estimated resident bytes for one cache entry. Glyph bitmaps live in the
+/// shared glyph atlas behind `Rc<CachedGlyph>` and are deliberately not
+/// counted here.
+pub fn estimate_shaped_entry_bytes(key: &ShapeCacheKey, value: &UiShapedValue) -> usize {
+    let key_bytes = std::mem::size_of::<ShapeCacheKey>()
+        .saturating_add(key.text.capacity())
+        .saturating_add(estimate_text_style_heap_bytes(&key.style));
+    let value_bytes = match value {
+        Ok(shaped) => std::mem::size_of::<Vec<ShapedInfo>>()
+            .saturating_add(shaped.capacity().saturating_mul(std::mem::size_of::<ShapedInfo>())),
+        Err(_) => SHAPE_ERR_ENTRY_BYTES,
+    };
+    SHAPE_ENTRY_FIXED_OVERHEAD
+        .saturating_add(key_bytes)
+        .saturating_add(value_bytes)
+}
+
+fn chrome_shape_cache_cap(config: &config::ConfigHandle) -> usize {
+    config.shape_cache_size
+}
+fn note_shape_cache_cap(config: &config::ConfigHandle) -> usize {
+    config.shape_cache_size.saturating_mul(4)
+}
+fn file_preview_shape_cache_cap(config: &config::ConfigHandle) -> usize {
+    config.shape_cache_size.saturating_mul(2)
+}
+fn chrome_shape_cache_budget(_: &config::ConfigHandle) -> usize {
+    4 * 1024 * 1024
+}
+fn note_shape_cache_budget(_: &config::ConfigHandle) -> usize {
+    32 * 1024 * 1024
+}
+fn file_preview_shape_cache_budget(_: &config::ConfigHandle) -> usize {
+    16 * 1024 * 1024
+}
+
+pub struct UiShapeDomainCache {
+    cache: lfucache::LfuCache<ShapeCacheKey, UiShapedValue>,
+    stats: UiShapeCacheStats,
+    cap_func: fn(&config::ConfigHandle) -> usize,
+    budget_func: fn(&config::ConfigHandle) -> usize,
+    cap: usize,
+    byte_budget: usize,
+}
+
+impl UiShapeDomainCache {
+    fn new(domain: UiTextDomain, config: &config::ConfigHandle) -> Self {
+        let (hit, miss, cap_func, budget_func): (
+            &'static str,
+            &'static str,
+            fn(&config::ConfigHandle) -> usize,
+            fn(&config::ConfigHandle) -> usize,
+        ) = match domain {
+            UiTextDomain::Chrome => (
+                "chrome_shape_cache.hit.rate",
+                "chrome_shape_cache.miss.rate",
+                chrome_shape_cache_cap,
+                chrome_shape_cache_budget,
+            ),
+            UiTextDomain::Note => (
+                "note_shape_cache.hit.rate",
+                "note_shape_cache.miss.rate",
+                note_shape_cache_cap,
+                note_shape_cache_budget,
+            ),
+            UiTextDomain::FilePreview => (
+                "file_preview_shape_cache.hit.rate",
+                "file_preview_shape_cache.miss.rate",
+                file_preview_shape_cache_cap,
+                file_preview_shape_cache_budget,
+            ),
+        };
+        Self {
+            cache: lfucache::LfuCache::new_weighted(hit, miss, cap_func, budget_func, config),
+            stats: UiShapeCacheStats::default(),
+            cap_func,
+            budget_func,
+            cap: cap_func(config),
+            byte_budget: budget_func(config),
+        }
+    }
+
+    pub fn get(&mut self, key: &dyn ShapeCacheKeyTrait) -> Option<&UiShapedValue> {
+        let value = self.cache.get(key);
+        if value.is_some() {
+            self.stats.hits += 1;
+        } else {
+            self.stats.misses += 1;
+        }
+        value
+    }
+
+    pub fn put(&mut self, key: ShapeCacheKey, value: UiShapedValue) {
+        let weight = estimate_shaped_entry_bytes(&key, &value);
+        let outcome = self.cache.put_weighted(key, value, weight);
+        if outcome.rejected_oversize {
+            self.stats.rejected_oversize += 1;
+        }
+        self.stats.evicted_entries += outcome.evicted_entries as u64;
+        self.stats.evicted_bytes += outcome.evicted_bytes as u64;
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
+    pub fn update_config(&mut self, config: &config::ConfigHandle) {
+        self.cache.update_config(config);
+        self.cap = (self.cap_func)(config);
+        self.byte_budget = (self.budget_func)(config);
+    }
+
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn total_weight(&self) -> usize {
+        self.cache.total_weight()
+    }
+
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    pub fn byte_budget(&self) -> usize {
+        self.byte_budget
+    }
+
+    pub fn stats(&self) -> UiShapeCacheStats {
+        self.stats
+    }
+}
+
+/// The three per-domain proportional-text shaping caches; the terminal grid
+/// keeps its own separate `shape_cache`.
+pub struct UiShapeCaches {
+    chrome: UiShapeDomainCache,
+    note: UiShapeDomainCache,
+    file_preview: UiShapeDomainCache,
+}
+
+impl UiShapeCaches {
+    pub fn new(config: &config::ConfigHandle) -> Self {
+        Self {
+            chrome: UiShapeDomainCache::new(UiTextDomain::Chrome, config),
+            note: UiShapeDomainCache::new(UiTextDomain::Note, config),
+            file_preview: UiShapeDomainCache::new(UiTextDomain::FilePreview, config),
+        }
+    }
+
+    pub fn domain_mut(&mut self, domain: UiTextDomain) -> &mut UiShapeDomainCache {
+        match domain {
+            UiTextDomain::Chrome => &mut self.chrome,
+            UiTextDomain::Note => &mut self.note,
+            UiTextDomain::FilePreview => &mut self.file_preview,
+        }
+    }
+
+    pub fn domain(&self, domain: UiTextDomain) -> &UiShapeDomainCache {
+        match domain {
+            UiTextDomain::Chrome => &self.chrome,
+            UiTextDomain::Note => &self.note,
+            UiTextDomain::FilePreview => &self.file_preview,
+        }
+    }
+
+    pub fn clear_all(&mut self) {
+        self.chrome.clear();
+        self.note.clear();
+        self.file_preview.clear();
+    }
+
+    /// Note idle release: only the Note domain is dropped.
+    pub fn clear_note(&mut self) {
+        self.note.clear();
+    }
+
+    /// File Preview idle release: only the preview domain is dropped.
+    pub fn clear_file_preview(&mut self) {
+        self.file_preview.clear();
+    }
+
+    pub fn update_config(&mut self, config: &config::ConfigHandle) {
+        self.chrome.update_config(config);
+        self.note.update_config(config);
+        self.file_preview.update_config(config);
+    }
+}
+
+#[cfg(test)]
+mod ui_shape_cache_tests {
+    use super::*;
+
+    fn key(text: &str) -> ShapeCacheKey {
+        ShapeCacheKey {
+            font_identity: 1,
+            style: TextStyle::default(),
+            text: text.to_string(),
+        }
+    }
+
+    fn caches() -> UiShapeCaches {
+        UiShapeCaches::new(&config::configuration())
+    }
+
+    #[test]
+    fn domains_are_isolated_and_release_independently() {
+        let mut caches = caches();
+        caches
+            .domain_mut(UiTextDomain::Chrome)
+            .put(key("chrome"), Ok(Rc::new(vec![])));
+        caches
+            .domain_mut(UiTextDomain::Note)
+            .put(key("note"), Ok(Rc::new(vec![])));
+        caches
+            .domain_mut(UiTextDomain::FilePreview)
+            .put(key("preview"), Ok(Rc::new(vec![])));
+
+        caches.clear_note();
+        assert_eq!(caches.domain(UiTextDomain::Note).len(), 0);
+        assert_eq!(caches.domain(UiTextDomain::Note).total_weight(), 0);
+        assert_eq!(caches.domain(UiTextDomain::Chrome).len(), 1);
+        assert_eq!(caches.domain(UiTextDomain::FilePreview).len(), 1);
+
+        caches.clear_file_preview();
+        assert_eq!(caches.domain(UiTextDomain::FilePreview).len(), 0);
+        assert_eq!(caches.domain(UiTextDomain::FilePreview).total_weight(), 0);
+        assert_eq!(caches.domain(UiTextDomain::Chrome).len(), 1);
+
+        caches.clear_all();
+        assert_eq!(caches.domain(UiTextDomain::Chrome).len(), 0);
+        assert_eq!(caches.domain(UiTextDomain::Chrome).total_weight(), 0);
+    }
+
+    #[test]
+    fn oversize_entries_are_rejected_and_counted() {
+        let mut caches = caches();
+        let note = caches.domain_mut(UiTextDomain::Note);
+        // Exceeds the 32 MiB note budget on its own.
+        let huge = "x".repeat(40 * 1024 * 1024);
+        note.put(key(&huge), Ok(Rc::new(vec![])));
+        assert_eq!(note.len(), 0);
+        assert_eq!(note.total_weight(), 0);
+        assert_eq!(note.stats().rejected_oversize, 1);
+    }
+
+    #[test]
+    fn hit_and_miss_counters_track_lookups() {
+        let mut caches = caches();
+        let chrome = caches.domain_mut(UiTextDomain::Chrome);
+        let probe = key("label");
+        assert!(chrome
+            .get(&probe as &dyn ShapeCacheKeyTrait)
+            .is_none());
+        chrome.put(key("label"), Ok(Rc::new(vec![])));
+        assert!(chrome
+            .get(&probe as &dyn ShapeCacheKeyTrait)
+            .is_some());
+        let stats = chrome.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::glyphcache::CachedGlyph;
