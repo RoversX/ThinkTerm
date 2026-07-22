@@ -110,7 +110,15 @@ pub(crate) struct NoteHostState {
     pub spelling_context: Option<Range<usize>>,
     pub spellcheck_scheduled_revision: Option<u64>,
     pub spellcheck_in_flight_revision: Option<u64>,
-    pub native_text_input_snapshot_key: Option<(u64, usize, usize, u32, usize)>,
+    /// (revision, selection start, selection end, wrap key). Scroll position
+    /// is deliberately NOT part of the key: rebuilding the snapshot per
+    /// scrolled frame copied up to 64 KB of text and thousands of hit rects.
+    pub native_text_input_snapshot_key: Option<(u64, usize, usize, usize)>,
+    /// Scroll offset (bits) the current snapshot's hit rects were built at,
+    /// so a settle refresh can catch them up after scrolling stops.
+    pub native_text_input_snapshot_scroll: Option<u32>,
+    /// Last time the Note body scroll offset actually changed.
+    pub last_scroll_change: Option<Instant>,
     pub native_text_input_token: u64,
     pub parse_requested_revision: Option<u64>,
     pub parse_in_flight_revision: Option<u64>,
@@ -118,6 +126,11 @@ pub(crate) struct NoteHostState {
     /// link had no cached resolution; a background parse round trip owes us
     /// the authoritative vault lookup.
     links_resolution_pending: bool,
+    /// Memoized `caret_reveal_start` for the current projection, keyed by
+    /// (revision, caret). `active_syntax` is a linear scan over every syntax
+    /// node and refresh runs once per paint; a pure scroll frame must not pay
+    /// for it.
+    reveal_key_cache: Option<(u64, usize, usize)>,
     background_wrap_preferred: bool,
     background_wrap_requested_key: Option<NoteBackgroundWrapKey>,
     background_wrap_generation: u64,
@@ -171,10 +184,13 @@ impl Default for NoteHostState {
             spellcheck_scheduled_revision: None,
             spellcheck_in_flight_revision: None,
             native_text_input_snapshot_key: None,
+            native_text_input_snapshot_scroll: None,
+            last_scroll_change: None,
             native_text_input_token: 0,
             parse_requested_revision: None,
             parse_in_flight_revision: None,
             links_resolution_pending: false,
+            reveal_key_cache: None,
             background_wrap_preferred: false,
             background_wrap_requested_key: None,
             background_wrap_generation: 0,
@@ -227,6 +243,7 @@ impl NoteHostState {
         self.parse_requested_revision = None;
         self.parse_in_flight_revision = None;
         self.links_resolution_pending = false;
+        self.reveal_key_cache = None;
         self.background_wrap_preferred = false;
         self.background_wrap_requested_key = None;
         let snapshot = self
@@ -248,6 +265,9 @@ impl NoteHostState {
         let end = progressive_preview_end(&snapshot.source, PROGRESSIVE_PREVIEW_BYTES);
         let source = &snapshot.source[..end];
         self.projection = MarkdownProjection::parse(source);
+        // Deliberately uncached: this is a partial seed projection that the
+        // full background parse replaces.
+        self.reveal_key_cache = None;
         let active_start = self.projection.caret_reveal_start(0);
         self.visual = Arc::new(build_visual_document(
             source,
@@ -277,6 +297,7 @@ impl NoteHostState {
         self.parse_requested_revision = None;
         self.parse_in_flight_revision = None;
         self.links_resolution_pending = false;
+        self.reveal_key_cache = None;
         self.background_wrap_preferred = false;
         self.background_wrap_requested_key = None;
     }
@@ -414,6 +435,7 @@ impl NoteHostState {
             self.links_resolution_pending = links_missing_resolution
                 || (any_links && matches!(self.display_source, NoteDisplaySource::Published));
             self.projection = projection;
+            self.reveal_key_cache = None;
             let code_starts = self
                 .projection
                 .objects
@@ -434,9 +456,19 @@ impl NoteHostState {
             }
             self.visual_key = None;
         }
-        let active_start = self
-            .projection
-            .caret_reveal_start(self.view.selection.focus.byte);
+        let caret = self.view.selection.focus.byte;
+        let active_start = match self.reveal_key_cache {
+            Some((cached_revision, cached_caret, result))
+                if cached_revision == revision && cached_caret == caret =>
+            {
+                result
+            }
+            _ => {
+                let result = self.projection.caret_reveal_start(caret);
+                self.reveal_key_cache = Some((revision, caret, result));
+                result
+            }
+        };
         let key = (revision, self.view.mode, active_start);
         if self.visual_key != Some(key) {
             if projection_stage.is_none() {
@@ -516,6 +548,7 @@ impl NoteHostState {
         }
         let active_start = projection.caret_reveal_start(caret);
         self.projection = projection;
+        self.reveal_key_cache = Some((revision, caret, active_start));
         // The worker performed the authoritative vault-link resolution.
         self.links_resolution_pending = false;
         self.visual = Arc::new(visual);
@@ -984,7 +1017,11 @@ impl NoteHostState {
         let old = self.view.scroll_offset;
         self.view.scroll_offset += delta;
         self.clamp_scroll();
-        (old - self.view.scroll_offset).abs() > f32::EPSILON
+        let changed = (old - self.view.scroll_offset).abs() > f32::EPSILON;
+        if changed {
+            self.last_scroll_change = Some(Instant::now());
+        }
+        changed
     }
 
     pub(crate) fn toggle_code_block(&mut self, source_start: usize) -> bool {
@@ -1070,6 +1107,24 @@ mod state_tests {
         assert_eq!(host.projection_revision, None);
         assert!(!host.prefers_background_wrap());
         assert!(host.background_parse_request().is_some());
+    }
+
+    #[test]
+    fn reveal_cache_tracks_caret_moves_within_one_revision() {
+        let source = "A **bold** word";
+        let mut host = host_with_source(source);
+        let key_outside = host.visual_key;
+
+        host.view.selection = SourceSelection::caret(source.find("bold").unwrap());
+        host.refresh_projection();
+        assert_ne!(host.visual_key, key_outside, "caret inside strong reveals");
+
+        host.view.selection = SourceSelection::caret(0);
+        host.refresh_projection();
+        assert_eq!(
+            host.visual_key, key_outside,
+            "memoized reveal key must not stick to the previous caret"
+        );
     }
 
     #[test]

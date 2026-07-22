@@ -1137,6 +1137,14 @@ pub struct TermWindow {
     right_sidebar_file_preview_width: usize,
     right_sidebar_note_pane_expanded: bool,
     right_sidebar_note_pane_width: usize,
+    /// Cached `space_note_vault(active_space_id).is_some()` so the hot layout
+    /// predicate does not lock the workspace store; refreshed on space/vault
+    /// changes and self-healed once per Note paint.
+    active_space_has_note_vault: bool,
+    /// Sidebar width from before a Space switch whose reflow must wait until
+    /// the destination mux window is adopted (`switch_to_mux_window`), so the
+    /// resize/SIGWINCH never hits the Space being left.
+    pending_sidebar_reflow_width: Option<usize>,
     right_sidebar_file_preview_generation: u64,
     right_sidebar_file_preview_highlight_cancel: Arc<AtomicUsize>,
     right_sidebar_file_preview_lines: Vec<RightSidebarFilePreviewLine>,
@@ -1579,6 +1587,8 @@ impl TermWindow {
         });
         let workspace_layout_structure_fingerprint =
             crate::workspace_threads::window_layout_structure_fingerprint(mux_window_id);
+        let active_space_has_note_vault =
+            crate::workspace_threads::space_note_vault(&active_space_id).is_some();
 
         let myself = Self {
             created: Instant::now(),
@@ -1783,6 +1793,8 @@ impl TermWindow {
             right_sidebar_note_pane_expanded:
                 crate::native_settings::right_sidebar_note_pane_expanded(),
             right_sidebar_note_pane_width: ui::right_sidebar_note_pane_width_for_dpi(dpi as usize),
+            active_space_has_note_vault,
+            pending_sidebar_reflow_width: None,
             right_sidebar_file_preview_generation: 0,
             right_sidebar_file_preview_highlight_cancel: Arc::new(AtomicUsize::new(0)),
             right_sidebar_file_preview_lines: Vec::new(),
@@ -2583,7 +2595,10 @@ impl TermWindow {
                 .gui_window_for_mux_window(mux_window_id)
                 .is_some()
         {
-            // Already showing it and the mapping is current; nothing to do.
+            // Already showing it and the mapping is current; a deferred
+            // Space-switch reflow can settle now since there is no other
+            // window to protect from the resize.
+            self.consume_pending_sidebar_reflow();
             return;
         }
 
@@ -2602,6 +2617,11 @@ impl TermWindow {
         self.current_highlight.take();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
+
+        // The destination window is adopted; a Space switch that changed the
+        // sidebar width can resize the terminal now without touching the
+        // window being left.
+        self.consume_pending_sidebar_reflow();
 
         // Tab::resize updates the local split tree but deliberately skips
         // remote mirror panes. Force the per-pane GUI-sized resize now rather
@@ -2967,27 +2987,60 @@ impl TermWindow {
         self.invalidate_window_if(crate::workspace_threads::refresh_all_thread_work());
     }
 
-    fn switch_space(&mut self, space_id: String, window: &Window) {
+    pub(crate) fn switch_space(&mut self, space_id: String, window: &Window) {
+        self.switch_space_to_thread(space_id, None, window);
+    }
+
+    /// Switch this window to another Space, activating `preferred_thread`
+    /// when given (a notification jump) instead of the Space's recorded
+    /// active thread — starting both activations can leave the window on the
+    /// wrong thread when the first one materializes asynchronously.
+    ///
+    /// Returns false when no navigation happened (the destination Space is
+    /// already shown in another window).
+    pub(crate) fn switch_space_to_thread(
+        &mut self,
+        space_id: String,
+        preferred_thread: Option<String>,
+        window: &Window,
+    ) -> bool {
         if self.active_space_id == space_id {
-            window.invalidate();
-            return;
+            if let Some(thread_id) = preferred_thread {
+                self.activate_workspace_thread(thread_id, window);
+            } else {
+                window.invalidate();
+            }
+            return true;
         }
         self.snapshot_active_workspace_thread_layout();
         self.workspace_sidebar_pending_thread_selection = None;
         if !crate::workspace_threads::switch_window_space(self.space_owner_id, &space_id) {
             window.invalidate();
-            return;
+            return false;
         }
+        let previous_sidebar_width = self.right_sidebar_width();
         self.set_content_view_active(false);
         self.active_space_id = space_id.clone();
+        self.refresh_active_space_note_vault_flag();
         self.sync_content_view_surfaces_with_mux();
         self.workspace_sidebar_scroll_offset = 0.0;
-        if let Some(thread_id) = crate::workspace_threads::ensure_active_thread_for_space(&space_id)
-        {
+        // Vault availability differs between Spaces; an expanded Note pane
+        // can activate or deactivate here and the terminal must follow. The
+        // reflow is deferred until switch_to_mux_window adopts the
+        // destination (activation may attach or materialize asynchronously)
+        // so the resize and its SIGWINCH reach the new Space's PTYs, not the
+        // Space being left.
+        self.pending_sidebar_reflow_width = Some(previous_sidebar_width);
+        let target_thread = preferred_thread
+            .or_else(|| crate::workspace_threads::ensure_active_thread_for_space(&space_id));
+        if let Some(thread_id) = target_thread {
             self.activate_workspace_thread(thread_id, window);
         } else {
+            // Nothing to adopt; settle the reflow immediately.
+            self.consume_pending_sidebar_reflow();
             window.invalidate();
         }
+        true
     }
 
     /// Delete a remote Space AND end its sessions on the server: send a
@@ -3034,9 +3087,15 @@ impl TermWindow {
             Ok(deleted) => {
                 let deleted_active_space = self.active_space_id == space_id;
                 if deleted_active_space {
+                    let previous_sidebar_width = self.right_sidebar_width();
                     self.active_space_id = deleted.fallback_space_id.clone();
+                    self.refresh_active_space_note_vault_flag();
                     self.sync_content_view_surfaces_with_mux();
                     self.workspace_sidebar_scroll_offset = 0.0;
+                    // Deferred until the fallback Space's mux window is
+                    // adopted so the resize does not hit the deleted Space's
+                    // panes.
+                    self.pending_sidebar_reflow_width = Some(previous_sidebar_width);
                     if let Some(window) = window {
                         if let Some(thread_id) =
                             crate::workspace_threads::ensure_active_thread_for_space(
@@ -3045,8 +3104,11 @@ impl TermWindow {
                         {
                             self.activate_workspace_thread(thread_id, window);
                         } else {
+                            self.consume_pending_sidebar_reflow();
                             window.invalidate();
                         }
+                    } else {
+                        self.consume_pending_sidebar_reflow();
                     }
                 }
 

@@ -878,8 +878,17 @@ impl crate::TermWindow {
             && self.right_sidebar_mode == RightSidebarMode::Tasks
             && self.right_sidebar_note_pane_expanded
             // Without a vault there is no editor to expand; the sidebar shows
-            // the choose/create-vault UI inline instead of a blank pane.
-            && workspace_threads::space_note_vault(&self.active_space_id).is_some()
+            // the choose/create-vault UI inline instead of a blank pane. This
+            // is a cached flag: the predicate sits inside right_sidebar_width
+            // and must not lock the workspace store.
+            && self.active_space_has_note_vault
+    }
+
+    /// Re-derive the cached vault flag from the store. Call after anything
+    /// that can change the active Space or its vault binding.
+    pub(crate) fn refresh_active_space_note_vault_flag(&mut self) {
+        self.active_space_has_note_vault =
+            workspace_threads::space_note_vault(&self.active_space_id).is_some();
     }
 
     pub(crate) fn right_sidebar_note_pane_width(&self) -> Option<usize> {
@@ -2883,6 +2892,11 @@ impl crate::TermWindow {
                 };
                 let result = workspace_threads::set_space_note_vault(&space_id, path, managed);
                 notify_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let previous_sidebar_width = term_window.right_sidebar_width();
+                    term_window.refresh_active_space_note_vault_flag();
+                    // Binding a vault can activate an expanded Note pane in a
+                    // Space that previously had none.
+                    term_window.reflow_right_sidebar_if_width_changed(previous_sidebar_width);
                     term_window.right_sidebar_note_open_generation = term_window
                         .right_sidebar_note_open_generation
                         .wrapping_add(1);
@@ -4203,15 +4217,28 @@ impl crate::TermWindow {
         };
         let selection = self.right_sidebar_note.view.selection.range();
         let revision = session.lock().revision();
-        let key = (
-            revision,
-            selection.start,
-            selection.end,
-            self.right_sidebar_note.view.scroll_offset.to_bits(),
-            wrap_key,
-        );
+        let key = (revision, selection.start, selection.end, wrap_key);
+        let scroll_bits = self.right_sidebar_note.view.scroll_offset.to_bits();
         if self.right_sidebar_note.native_text_input_snapshot_key == Some(key) {
-            return;
+            if self.right_sidebar_note.native_text_input_snapshot_scroll == Some(scroll_bits) {
+                return;
+            }
+            // Only the scroll moved: the text/selection are still correct and
+            // just the hit rects are stale. Rebuilding costs a large context
+            // copy plus per-glyph rects, so skip it while the user is still
+            // scrolling; the caret-blink repaint performs the settle refresh
+            // shortly after the scroll stops.
+            const SNAPSHOT_SCROLL_SETTLE: Duration = Duration::from_millis(150);
+            if self
+                .right_sidebar_note
+                .last_scroll_change
+                .is_some_and(|changed| changed.elapsed() < SNAPSHOT_SCROLL_SETTLE)
+            {
+                // Guarantee a repaint shortly after scrolling settles so the
+                // refresh below runs even if nothing else invalidates.
+                self.update_next_frame_time(Some(Instant::now() + SNAPSHOT_SCROLL_SETTLE));
+                return;
+            }
         }
 
         const MAX_NATIVE_CONTEXT_BYTES: usize = 64 * 1024;
@@ -4288,6 +4315,7 @@ impl crate::TermWindow {
             hits,
         }));
         self.right_sidebar_note.native_text_input_snapshot_key = Some(key);
+        self.right_sidebar_note.native_text_input_snapshot_scroll = Some(scroll_bits);
     }
 
     fn schedule_right_sidebar_note_autosave_wakeup(window: window::Window, delay: Duration) {
@@ -4639,6 +4667,29 @@ impl crate::TermWindow {
         let width = unscale_ui_usize(width, self.dimensions.dpi);
         if let Err(err) = crate::native_settings::save_right_sidebar_note_pane_width(width) {
             log::warn!("failed to save right sidebar Note pane width: {err:#}");
+        }
+    }
+
+    /// Reflow the terminal when a state change (space switch, vault binding,
+    /// pane activation) altered the computed sidebar width; a bare invalidate
+    /// leaves the terminal sized for the old width and the difference shows
+    /// as dead space.
+    pub(crate) fn reflow_right_sidebar_if_width_changed(&mut self, previous_width: usize) {
+        if self.right_sidebar_width() == previous_width {
+            return;
+        }
+        if let Some(window) = self.window.as_ref().cloned() {
+            let dimensions = self.dimensions;
+            self.apply_dimensions(&dimensions, None, &window);
+            window.invalidate();
+        }
+    }
+
+    /// Settle a Space-switch reflow that was deferred until the destination
+    /// mux window was adopted.
+    pub(crate) fn consume_pending_sidebar_reflow(&mut self) {
+        if let Some(previous_width) = self.pending_sidebar_reflow_width.take() {
+            self.reflow_right_sidebar_if_width_changed(previous_width);
         }
     }
 
@@ -5529,7 +5580,8 @@ impl crate::TermWindow {
                 return Ok(());
             }
             RightSidebarMode::Tasks => {
-                self.paint_note_sidebar(
+                let stage = crate::input_diagnostics::StageTimer::begin("note_paint");
+                let result = self.paint_note_sidebar(
                     layers,
                     &ui_font,
                     ui_metrics,
@@ -5541,7 +5593,9 @@ impl crate::TermWindow {
                     content_width,
                     rect.y.saturating_add(rect.height),
                     base_font_size,
-                )?;
+                );
+                stage.finish(result.is_ok());
+                result?;
                 return Ok(());
             }
         }
@@ -5883,7 +5937,9 @@ impl crate::TermWindow {
         base_font_size: f64,
     ) -> anyhow::Result<()> {
         self.right_sidebar_note_table_layouts.clear();
-        if let Some(vault) = workspace_threads::space_note_vault(&self.active_space_id) {
+        let vault = workspace_threads::space_note_vault(&self.active_space_id);
+        self.active_space_has_note_vault = vault.is_some();
+        if let Some(vault) = vault {
             self.refresh_note_vault_index_if_needed(&vault.root);
         }
         if !self.ensure_active_right_sidebar_note_document() {
@@ -6622,7 +6678,14 @@ impl crate::TermWindow {
             || self.right_sidebar_note.line_geometry.len() != visual.lines.len()
         {
             let mut top = padding;
-            let mut geometry = Vec::with_capacity(visual.lines.len());
+            // Reuse the previous geometry allocation when this host holds the
+            // only reference (paint-local clones are dropped each frame).
+            let mut geometry = Arc::try_unwrap(std::mem::take(
+                &mut self.right_sidebar_note.line_geometry,
+            ))
+            .unwrap_or_default();
+            geometry.clear();
+            geometry.reserve(visual.lines.len());
             for (line_index, line) in visual.lines.iter().enumerate() {
                 let metrics = match line.block {
                     BlockKind::Heading(1) => h1_metrics,

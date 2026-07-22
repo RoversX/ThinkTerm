@@ -2895,22 +2895,22 @@ impl WindowView {
             let mut inner = myself.inner.borrow_mut();
             inner.ime_text = s.to_string();
 
-            /*
-            let key_is_down = inner.key_is_down.take().unwrap_or(true);
+            // Advise the GUI right here rather than relying on the keyDown
+            // handler's post-interpretKeyEvents dispatch: keyboard IMEs are
+            // always driven by a key event, but dictation updates the marked
+            // text spontaneously with no key event at all, and without this
+            // the live transcription is invisible until the final insertText.
+            // The keyDown path may advise the same status again; that is a
+            // harmless duplicate.
+            let status = if inner.ime_text.is_empty() {
+                DeadKeyStatus::None
+            } else {
+                DeadKeyStatus::Composing(inner.ime_text.clone())
+            };
+            inner
+                .events
+                .dispatch(WindowEvent::AdviseDeadKeyStatus(status));
 
-            let key = KeyCode::composed(s);
-
-            let event = KeyEvent {
-                key,
-                modifiers: Modifiers::NONE,
-                repeat_count: 1,
-                key_is_down,
-            }
-            .normalize_shift();
-
-            inner.ime_last_event.replace(event.clone());
-            inner.events.dispatch(WindowEvent::KeyEvent(event));
-            */
             inner.ime_last_event.take();
             inner.ime_state = ImeDisposition::Acted;
         }
@@ -2924,6 +2924,9 @@ impl WindowView {
             // but iterm doesn't... and we've never seen
             // this get called so far?
             inner.ime_text.clear();
+            inner
+                .events
+                .dispatch(WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None));
             inner.ime_last_event.take();
             inner.ime_state = ImeDisposition::Acted;
         }
@@ -3394,9 +3397,18 @@ impl WindowView {
         let precise_scroll_delta = if precise
             && (raw_vert_delta.abs() > f64::EPSILON || raw_horz_delta.abs() > f64::EPSILON)
         {
+            // scrollingDeltaX/Y are in points; mouse coordinates and all of
+            // the chrome geometry consuming this payload are in backing
+            // pixels (see the convertRectToBacking in mouse_common). Convert
+            // here so every consumer receives uniform physical pixels.
+            let rect = NSRect::new(
+                NSPoint::new(0., 0.),
+                NSSize::new(raw_horz_delta, raw_vert_delta),
+            );
+            let backing = unsafe { NSView::convertRectToBacking(this as id, rect) };
             Some(PreciseScrollDelta {
-                x: raw_horz_delta as f32,
-                y: raw_vert_delta as f32,
+                x: f64::copysign(backing.size.width, raw_horz_delta) as f32,
+                y: f64::copysign(backing.size.height, raw_vert_delta) as f32,
             })
         } else {
             None
