@@ -1376,7 +1376,7 @@ impl crate::TermWindow {
                                     y: 0,
                                     ..*self.cursor
                                 },
-                                dead_key_or_leader: self.term_window.dead_key_status
+                                dead_key_or_leader: *self.term_window.terminal_dead_key_status()
                                     != DeadKeyStatus::None
                                     || self.term_window.leader_is_active(),
                                 cursor_fg: self.cursor_fg,
@@ -1384,7 +1384,10 @@ impl crate::TermWindow {
                                 cursor_border_color: self.cursor_border_color,
                                 cursor_is_default_color: self.cursor_is_default_color,
                             }),
-                            match (self.pos.is_active, &self.term_window.dead_key_status) {
+                            match (
+                                self.pos.is_active,
+                                self.term_window.terminal_dead_key_status(),
+                            ) {
                                 (true, DeadKeyStatus::Composing(composing)) => {
                                     Some(composing.to_string())
                                 }
@@ -1464,7 +1467,7 @@ impl crate::TermWindow {
                         font_identity: self.font_identity,
                         composing: if self.cursor.y == stable_row && self.pos.is_active {
                             if let DeadKeyStatus::Composing(composing) =
-                                &self.term_window.dead_key_status
+                                self.term_window.terminal_dead_key_status()
                             {
                                 Some((self.cursor.x, composing.to_string()))
                             } else {

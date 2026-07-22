@@ -6373,6 +6373,19 @@ impl TermWindow {
 }
 
 impl TermWindow {
+    /// The IME composing status as the TERMINAL should see it. While a
+    /// sidebar text input (the Note editor, snippet fields, file filter)
+    /// holds keyboard focus, composed text is routed there — the terminal
+    /// cursor must not render a duplicate preedit overlay at the prompt.
+    pub(crate) fn terminal_dead_key_status(&self) -> &DeadKeyStatus {
+        static NONE: DeadKeyStatus = DeadKeyStatus::None;
+        if self.right_sidebar_has_text_focus() {
+            &NONE
+        } else {
+            &self.dead_key_status
+        }
+    }
+
     /// Publish this window's per-domain shaping-cache gauges in one batch
     /// (single diagnostics lock). Called unthrottled after cache clears and
     /// idle releases so the panel never shows stale non-zero values.
