@@ -763,6 +763,84 @@ impl FilePreviewPaintProfile {
     }
 }
 
+/// Per-paint profiler for the Note markdown body, mirroring
+/// `FilePreviewPaintProfile`. Enable with `THINKTERM_PROFILE_NOTE=1`; frames
+/// slower than 8ms log a breakdown so jank can be attributed precisely.
+struct NotePaintProfile {
+    enabled: bool,
+    start: Option<Instant>,
+    wrap_source: &'static str,
+    total_lines: usize,
+    painted_lines: usize,
+    visible_lines: usize,
+    painted_runs: usize,
+    shape_requests: usize,
+    shape_cache_hits: usize,
+    shape_cache_misses: usize,
+}
+
+impl NotePaintProfile {
+    fn new() -> Self {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled =
+            *ENABLED.get_or_init(|| std::env::var_os("THINKTERM_PROFILE_NOTE").is_some());
+        Self {
+            enabled,
+            start: enabled.then(Instant::now),
+            wrap_source: "",
+            total_lines: 0,
+            painted_lines: 0,
+            visible_lines: 0,
+            painted_runs: 0,
+            shape_requests: 0,
+            shape_cache_hits: 0,
+            shape_cache_misses: 0,
+        }
+    }
+
+    /// Whole-frame shape accounting from the Note domain cache's cumulative
+    /// counters: covers wrap measurement, approximate sampling, tables, code
+    /// layout, preedit and toolbar — not just the visible run loop.
+    fn capture_note_cache_delta(
+        &mut self,
+        before: crate::shapecache::UiShapeCacheStats,
+        after: crate::shapecache::UiShapeCacheStats,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.shape_cache_hits = after.hits.saturating_sub(before.hits) as usize;
+        self.shape_cache_misses = after.misses.saturating_sub(before.misses) as usize;
+        self.shape_requests = self.shape_cache_hits + self.shape_cache_misses;
+    }
+
+    fn finish(&self, scroll_offset: f32) {
+        if !self.enabled {
+            return;
+        }
+        let Some(start) = self.start else {
+            return;
+        };
+        let elapsed = start.elapsed();
+        if elapsed < Duration::from_millis(8) {
+            return;
+        }
+        log::info!(
+            "note paint: {:?}, wrap={}, lines={}, painted={}, visible={}, runs={}, shape_requests={}, shape_hits={}, shape_misses={}, scroll={:.1}",
+            elapsed,
+            self.wrap_source,
+            self.total_lines,
+            self.painted_lines,
+            self.visible_lines,
+            self.painted_runs,
+            self.shape_requests,
+            self.shape_cache_hits,
+            self.shape_cache_misses,
+            scroll_offset
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RightSidebarFilePreviewBodyMetrics {
     x: usize,
@@ -6243,6 +6321,16 @@ impl crate::TermWindow {
         show_tree_button: bool,
         tree_button_icon: SvgIcon,
     ) -> anyhow::Result<()> {
+        // Starts before refresh_projection so parse/projection/visual-build
+        // costs (typing and open latency) are attributed to the frame, not
+        // just the layout/paint tail.
+        let mut note_profile = NotePaintProfile::new();
+        let note_stats_before = note_profile.enabled.then(|| {
+            self.ui_shape_caches
+                .borrow()
+                .domain(crate::shapecache::UiTextDomain::Note)
+                .stats()
+        });
         self.right_sidebar_note.refresh_projection();
         self.schedule_right_sidebar_note_parse();
         self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
@@ -6367,25 +6455,73 @@ impl crate::TermWindow {
         }
         let wrap_key = wrap_hasher.finish() as usize;
         let visual = if let Some(visual) = self.right_sidebar_note.cached_wrapped_visual(wrap_key) {
+            note_profile.wrap_source = "cached";
             visual
         } else if self.right_sidebar_note.should_background_wrap(wrap_key) {
+            note_profile.wrap_source = "background-provisional";
             let normal_approx_metrics = self.note_approximate_text_metrics(ui_font, &ui_metrics)?;
             let h1_approx_metrics = self.note_approximate_text_metrics(&h1_font, &h1_metrics)?;
             let h2_approx_metrics = self.note_approximate_text_metrics(&h2_font, &h2_metrics)?;
             let h3_approx_metrics = self.note_approximate_text_metrics(&h3_font, &h3_metrics)?;
             let code_approx_metrics =
                 self.note_approximate_text_metrics(&code_font, &code_metrics)?;
-            self.schedule_right_sidebar_note_wrap(
-                wrap_key,
-                wrap_width,
-                normal_approx_metrics,
-                h1_approx_metrics,
-                h2_approx_metrics,
-                h3_approx_metrics,
-                code_approx_metrics,
-            );
-            self.right_sidebar_note.provisional_wrapped_visual()
+            let provisional = self.right_sidebar_note.provisional_wrapped_visual();
+            if provisional.lines.is_empty() && !self.right_sidebar_note.visual.lines.is_empty() {
+                // Freshly opened note with no wrapped content yet. The
+                // background worker would run exactly this approximate wrap
+                // (same algorithm, same inputs), so do it synchronously ONCE
+                // and install it as the real wrapped result — content shows
+                // on the first frame (like File Preview) and no duplicate
+                // worker round-trip re-lays-out identical content. Only
+                // documents ≤ the 64 KiB parse threshold reach here with a
+                // full visual; larger ones carry the tiny progressive-preview
+                // seed, and their full wrap goes to the worker below on a
+                // later frame.
+                let wrap_stage = crate::input_diagnostics::StageTimer::begin("note_wrap_sync");
+                let mut wrap_cache = std::mem::take(&mut self.right_sidebar_note.wrap_cache);
+                let wrapped = wrap_visual_document_by_width_cached(
+                    &Arc::clone(&self.right_sidebar_note.visual),
+                    wrap_width,
+                    wrap_key,
+                    &mut wrap_cache,
+                    |block, _, text| {
+                        let metrics = match block {
+                            BlockKind::Heading(1) => h1_approx_metrics,
+                            BlockKind::Heading(2) => h2_approx_metrics,
+                            BlockKind::Heading(_) => h3_approx_metrics,
+                            BlockKind::CodeBlock => code_approx_metrics,
+                            _ => normal_approx_metrics,
+                        };
+                        Ok::<f32, anyhow::Error>(approximate_note_text_width(text, metrics))
+                    },
+                );
+                self.right_sidebar_note.wrap_cache = wrap_cache;
+                match wrapped {
+                    Ok(wrapped) => {
+                        wrap_stage.finish(true);
+                        note_profile.wrap_source = "approx-sync";
+                        self.right_sidebar_note
+                            .cache_wrapped_visual(wrap_key, wrapped)
+                    }
+                    Err(_) => {
+                        wrap_stage.finish(false);
+                        provisional
+                    }
+                }
+            } else {
+                self.schedule_right_sidebar_note_wrap(
+                    wrap_key,
+                    wrap_width,
+                    normal_approx_metrics,
+                    h1_approx_metrics,
+                    h2_approx_metrics,
+                    h3_approx_metrics,
+                    code_approx_metrics,
+                );
+                provisional
+            }
         } else {
+            note_profile.wrap_source = "sync";
             // UI-thread wrap: the number that decides whether real
             // incremental wrapping is ever needed.
             let wrap_stage = crate::input_diagnostics::StageTimer::begin("note_wrap_sync");
@@ -6454,6 +6590,15 @@ impl crate::TermWindow {
                 tree_button_icon,
             )?;
             note_layout_stage.finish(true);
+            if let Some(before) = note_stats_before {
+                let after = self
+                    .ui_shape_caches
+                    .borrow()
+                    .domain(crate::shapecache::UiTextDomain::Note)
+                    .stats();
+                note_profile.capture_note_cache_delta(before, after);
+            }
+            note_profile.finish(self.right_sidebar_note.view.scroll_offset);
             return Ok(());
         }
         let table_horizontal_padding = self.ui_f32(NOTE_TABLE_CELL_HORIZONTAL_PADDING as f32);
@@ -6903,9 +7048,11 @@ impl crate::TermWindow {
         let mut caret_rect: Option<(f32, f32, f32)> = None;
         let selected = selection.range();
 
+        note_profile.total_lines = visual.lines.len();
         let paint_range = virtual_note_line_range(&line_geometry, scroll, body_height as f32);
         let paint_start = paint_range.start;
         for line_index in paint_range {
+            note_profile.painted_lines += 1;
             let line = &visual.lines[line_index];
             let geometry = line_geometry[line_index];
             let table_row = table_rows.get(&line_index);
@@ -7259,6 +7406,7 @@ impl crate::TermWindow {
             if !visible {
                 continue;
             }
+            note_profile.visible_lines += 1;
 
             for (run_index, run) in line.runs.iter().enumerate() {
                 let (font, metrics) = match line.block {
@@ -7280,6 +7428,7 @@ impl crate::TermWindow {
                     _ => (line_font, line_metrics),
                 };
                 let (shaped, _) = self.cached_ui_shape(font, &metrics, &run.text)?;
+                note_profile.painted_runs += 1;
                 let advance = shaped
                     .iter()
                     .map(|info| info.glyph.x_advance.get() as f32)
@@ -7681,6 +7830,15 @@ impl crate::TermWindow {
             )?;
         }
         note_layout_stage.finish(true);
+        if let Some(before) = note_stats_before {
+            let after = self
+                .ui_shape_caches
+                .borrow()
+                .domain(crate::shapecache::UiTextDomain::Note)
+                .stats();
+            note_profile.capture_note_cache_delta(before, after);
+        }
+        note_profile.finish(self.right_sidebar_note.view.scroll_offset);
         Ok(())
     }
 
