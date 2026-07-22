@@ -277,6 +277,25 @@ impl crate::TermWindow {
         }
     }
 
+    /// Apply the persisted view-options status filter. Must run everywhere a
+    /// `WorkspaceThreadsView` feeds the sidebar (paint, scroll height, hit
+    /// testing) or row math diverges from the painted rows.
+    fn apply_workspace_thread_status_filter(
+        &self,
+        mut view: workspace_threads::WorkspaceThreadsView,
+    ) -> workspace_threads::WorkspaceThreadsView {
+        let hidden = crate::native_settings::workspace_sidebar_hidden_statuses()
+            .iter()
+            .filter_map(|key| {
+                workspace_threads::WorkspaceThreadWorkStatus::from_settings_key(key)
+            })
+            .collect::<Vec<_>>();
+        if !hidden.is_empty() {
+            workspace_threads::filter_threads_view_by_status(&mut view, &hidden);
+        }
+        view
+    }
+
     fn sidebar_thread_status_kind(
         &self,
         session: &workspace_threads::WorkspaceThreadView,
@@ -573,10 +592,12 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view = workspace_threads::view_for_current_project(
-            &self.active_space_id,
-            &active_workspace,
-            &workspaces,
+        let view = self.apply_workspace_thread_status_filter(
+            workspace_threads::view_for_current_project(
+                &self.active_space_id,
+                &active_workspace,
+                &workspaces,
+            ),
         );
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
@@ -620,10 +641,12 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view = workspace_threads::view_for_current_project(
-            &self.active_space_id,
-            &active_workspace,
-            &workspaces,
+        let view = self.apply_workspace_thread_status_filter(
+            workspace_threads::view_for_current_project(
+                &self.active_space_id,
+                &active_workspace,
+                &workspaces,
+            ),
         );
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
@@ -838,10 +861,12 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view = workspace_threads::view_for_current_project(
-            &self.active_space_id,
-            &active_workspace,
-            &workspaces,
+        let view = self.apply_workspace_thread_status_filter(
+            workspace_threads::view_for_current_project(
+                &self.active_space_id,
+                &active_workspace,
+                &workspaces,
+            ),
         );
 
         let header_icon_size = icon_size.min(self.ui_px(32));
@@ -1225,6 +1250,24 @@ impl crate::TermWindow {
                 muted_fg
             },
         )?;
+        if workspace_threads::pending_work_notification_count() > 0 {
+            // Unread badge; reuses the attention hue the Space indicators use.
+            let badge_size = self.ui_px(8).max(4);
+            self.fill_rounded_rectangle(
+                layers,
+                2,
+                euclid::rect(
+                    (notification_action_x + notification_action_size)
+                        .saturating_sub(badge_size + self.ui_px(6)) as f32,
+                    (notification_action_y + self.ui_px(6)) as f32,
+                    badge_size as f32,
+                    badge_size as f32,
+                ),
+                SPACE_DISCONNECTED_COLOR,
+                badge_size as f32 / 2.0,
+            )
+            .context("sidebar notification badge")?;
+        }
         let list_top = layout.list_top;
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let max_scroll = {

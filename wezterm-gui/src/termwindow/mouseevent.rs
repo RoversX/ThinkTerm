@@ -2169,7 +2169,7 @@ impl super::TermWindow {
                 self.mouse_event_workspace_sidebar_view_options(item, event, context);
             }
             UIItemType::WorkspaceSidebarNotifications => {
-                context.set_cursor(Some(MouseCursor::Hand));
+                self.mouse_event_workspace_sidebar_notifications(item.clone(), event, context);
             }
             UIItemType::ContextMenuBackdrop => {
                 context.set_cursor(Some(MouseCursor::Arrow));
@@ -2555,7 +2555,7 @@ impl super::TermWindow {
                 self.mouse_event_workspace_sidebar_view_options(item, event, context);
             }
             UIItemType::WorkspaceSidebarNotifications => {
-                context.set_cursor(Some(MouseCursor::Hand));
+                self.mouse_event_workspace_sidebar_notifications(item.clone(), event, context);
             }
             UIItemType::RightSidebarToggle => {
                 self.mouse_event_right_sidebar_toggle(event, context);
@@ -3147,11 +3147,8 @@ impl super::TermWindow {
                 item.x.saturating_add(item.width) as isize,
                 item.y.saturating_add(item.height / 2) as isize,
             );
-            self.show_term_context_menu(
-                context,
-                coords,
-                self.workspace_sidebar_view_options_menu_items(),
-            );
+            let items = self.workspace_sidebar_view_options_menu_items();
+            self.show_term_context_menu(context, coords, items);
         }
     }
 
@@ -3600,8 +3597,48 @@ impl super::TermWindow {
         items
     }
 
-    fn workspace_sidebar_view_options_menu_items(&self) -> Vec<ContextMenuItem> {
+    fn workspace_sidebar_view_options_menu_items(&mut self) -> Vec<ContextMenuItem> {
         use config::keyassignment::KeyAssignment;
+        use crate::workspace_threads::WorkspaceThreadWorkStatus;
+
+        self.begin_context_menu_application_actions();
+        let hidden = crate::native_settings::workspace_sidebar_hidden_statuses();
+        let mut status_items = Vec::new();
+        for (label, icon, status) in [
+            (
+                "Running",
+                ContextMenuIcon::Refresh,
+                WorkspaceThreadWorkStatus::Running,
+            ),
+            (
+                "Needs Attention",
+                ContextMenuIcon::Warning,
+                WorkspaceThreadWorkStatus::NeedsAttention,
+            ),
+            (
+                "Done",
+                ContextMenuIcon::Check,
+                WorkspaceThreadWorkStatus::FinishedUnseen,
+            ),
+            (
+                "Idle",
+                ContextMenuIcon::Info,
+                WorkspaceThreadWorkStatus::Idle,
+            ),
+        ] {
+            let visible = !hidden.iter().any(|key| key == status.settings_key());
+            status_items.push(
+                self.context_menu_application_item_with_icon(
+                    label,
+                    icon,
+                    crate::termwindow::ContextMenuApplicationAction::ToggleWorkspaceStatusFilter(
+                        status,
+                    ),
+                    true,
+                )
+                .checked(visible),
+            );
+        }
 
         vec![
             ContextMenuItem::item_with_icon("Group by", ContextMenuIcon::Stack, KeyAssignment::Nop)
@@ -3616,57 +3653,94 @@ impl super::TermWindow {
             ContextMenuItem::Separator,
             ContextMenuItem::item_with_icon("Show", ContextMenuIcon::Info, KeyAssignment::Nop)
                 .disabled(),
-            ContextMenuItem::submenu_with_icon(
-                "Status",
-                ContextMenuIcon::Check,
-                vec![
-                    ContextMenuItem::item_with_icon(
-                        "Running",
-                        ContextMenuIcon::Refresh,
-                        KeyAssignment::Nop,
-                    )
-                    .checked(true)
-                    .disabled(),
-                    ContextMenuItem::item_with_icon(
-                        "Needs Attention",
-                        ContextMenuIcon::Warning,
-                        KeyAssignment::Nop,
-                    )
-                    .checked(true)
-                    .disabled(),
-                    ContextMenuItem::item_with_icon(
-                        "Done",
-                        ContextMenuIcon::Check,
-                        KeyAssignment::Nop,
-                    )
-                    .checked(true)
-                    .disabled(),
-                ],
-            ),
-            ContextMenuItem::item_with_icon(
-                "Unread",
+            ContextMenuItem::submenu_with_icon("Status", ContextMenuIcon::Check, status_items),
+        ]
+    }
+
+    /// Toggle a status's visibility in the workspace sidebar, refusing the
+    /// toggle that would hide every status and leave the list empty.
+    pub(crate) fn toggle_workspace_sidebar_status_filter(
+        &mut self,
+        status: crate::workspace_threads::WorkspaceThreadWorkStatus,
+    ) {
+        let mut hidden = crate::native_settings::workspace_sidebar_hidden_statuses();
+        let key = status.settings_key();
+        if let Some(index) = hidden.iter().position(|entry| entry == key) {
+            hidden.remove(index);
+        } else {
+            hidden.push(key.to_string());
+            let parsed = hidden
+                .iter()
+                .filter_map(|entry| {
+                    crate::workspace_threads::WorkspaceThreadWorkStatus::from_settings_key(entry)
+                })
+                .collect::<Vec<_>>();
+            if crate::workspace_threads::hidden_statuses_cover_all(&parsed) {
+                return;
+            }
+        }
+        if let Err(err) = crate::native_settings::save_workspace_sidebar_hidden_statuses(hidden) {
+            log::warn!("failed to save sidebar status filter: {err:#}");
+        }
+        self.invalidate_window();
+    }
+
+    /// The notification bell: pending finished/attention threads across every
+    /// Space; activating an entry jumps to that thread.
+    pub fn mouse_event_workspace_sidebar_notifications(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        use config::keyassignment::KeyAssignment;
+
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+        let coords = window::Point::new(
+            item.x.saturating_add(item.width) as isize,
+            item.y.saturating_add(item.height / 2) as isize,
+        );
+        let notifications = crate::workspace_threads::pending_work_notifications();
+        self.begin_context_menu_application_actions();
+        let items = if notifications.is_empty() {
+            vec![ContextMenuItem::item_with_icon(
+                "No notifications",
                 ContextMenuIcon::Notification,
                 KeyAssignment::Nop,
             )
-            .checked(true)
-            .disabled(),
-            ContextMenuItem::item_with_icon("Pinned", ContextMenuIcon::Pin, KeyAssignment::Nop)
-                .checked(true)
-                .disabled(),
-            ContextMenuItem::Separator,
-            ContextMenuItem::item_with_icon(
-                "Collapse All",
-                ContextMenuIcon::Collapse,
-                KeyAssignment::Nop,
-            )
-            .disabled(),
-            ContextMenuItem::item_with_icon(
-                "Mark All Read",
-                ContextMenuIcon::Check,
-                KeyAssignment::Nop,
-            )
-            .disabled(),
-        ]
+            .disabled()]
+        } else {
+            notifications
+                .into_iter()
+                .map(|notification| {
+                    let icon = match notification.status {
+                        crate::workspace_threads::WorkspaceThreadWorkStatus::NeedsAttention => {
+                            ContextMenuIcon::Warning
+                        }
+                        _ => ContextMenuIcon::Check,
+                    };
+                    let label = format!(
+                        "{} — {} · {}",
+                        notification.thread_name,
+                        notification.project_name,
+                        notification.space_name
+                    );
+                    self.context_menu_application_item_with_icon(
+                        label,
+                        icon,
+                        crate::termwindow::ContextMenuApplicationAction::ActivateWorkspaceThread {
+                            space_id: notification.space_id,
+                            thread_id: notification.thread_id,
+                        },
+                        true,
+                    )
+                })
+                .collect()
+        };
+        self.show_term_context_menu(context, coords, items);
     }
 
     fn open_remote_workspace_thread_without_connecting(

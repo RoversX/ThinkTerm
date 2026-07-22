@@ -287,6 +287,14 @@ pub(crate) enum NoteEditorCommand {
 #[derive(Clone, Debug)]
 pub(crate) enum ContextMenuApplicationAction {
     Note(NoteEditorCommand),
+    /// Notification bell entry: jump to a thread, switching Space first when
+    /// it lives elsewhere, and acknowledge its unseen work.
+    ActivateWorkspaceThread {
+        space_id: String,
+        thread_id: String,
+    },
+    /// Sidebar view-options: show/hide threads with this work status.
+    ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

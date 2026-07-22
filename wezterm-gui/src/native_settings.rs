@@ -201,6 +201,9 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) right_sidebar_custom_open_with_apps: Vec<NativeOpenWithApp>,
     pub(crate) tab_font_size: Option<f64>,
     pub(crate) pane_header_font_size: Option<f64>,
+    /// Workspace-thread statuses hidden by the sidebar view-options filter,
+    /// as stable keys ("idle", "running", "needs-attention", "finished").
+    pub(crate) workspace_sidebar_hidden_statuses: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -474,6 +477,16 @@ pub(crate) fn right_sidebar_note_pane_expanded() -> bool {
 
 pub(crate) fn right_sidebar_open_with_app() -> Option<NativeOpenWithApp> {
     load().chrome.right_sidebar_open_with_app
+}
+
+pub(crate) fn workspace_sidebar_hidden_statuses() -> Vec<String> {
+    load().chrome.workspace_sidebar_hidden_statuses
+}
+
+pub(crate) fn save_workspace_sidebar_hidden_statuses(hidden: Vec<String>) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.chrome.workspace_sidebar_hidden_statuses = hidden;
+    save(&settings)
 }
 
 pub(crate) fn force_fallback_context_menu() -> bool {

@@ -193,6 +193,31 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::Note(command) => {
                 self.perform_right_sidebar_note_command(command);
             }
+            crate::termwindow::ContextMenuApplicationAction::ActivateWorkspaceThread {
+                space_id,
+                thread_id,
+            } => {
+                let Some(window) = self.window.clone() else {
+                    return;
+                };
+                // One activation of exactly the notified thread; letting
+                // switch_space start the Space's recorded thread first can
+                // land on the wrong thread when activation is asynchronous.
+                let navigated =
+                    self.switch_space_to_thread(space_id, Some(thread_id.clone()), &window);
+                // A Space owned by another window cannot be navigated from
+                // here; keep the notification so the click is not lost.
+                if navigated
+                    && crate::workspace_threads::acknowledge_thread_work_for_thread(&thread_id)
+                {
+                    self.invalidate_window();
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::ToggleWorkspaceStatusFilter(
+                status,
+            ) => {
+                self.toggle_workspace_sidebar_status_filter(status);
+            }
         }
     }
 

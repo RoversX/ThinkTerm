@@ -178,6 +178,44 @@ pub enum WorkspaceThreadWorkStatus {
     FinishedUnseen,
 }
 
+impl WorkspaceThreadWorkStatus {
+    pub const ALL: [Self; 4] = [
+        Self::Idle,
+        Self::Running,
+        Self::NeedsAttention,
+        Self::FinishedUnseen,
+    ];
+
+    /// Stable identifier used to persist sidebar status filters.
+    pub fn settings_key(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::NeedsAttention => "needs-attention",
+            Self::FinishedUnseen => "finished",
+        }
+    }
+
+    pub fn from_settings_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|status| status.settings_key() == key)
+    }
+}
+
+/// A thread whose work finished without being seen or needs attention,
+/// across every Space; feeds the sidebar notification bell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadWorkNotification {
+    pub space_id: SpaceId,
+    pub space_name: String,
+    pub project_name: String,
+    pub thread_id: WorkspaceThreadId,
+    pub thread_name: String,
+    pub status: WorkspaceThreadWorkStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkspaceThreadWorkChange {
     changed: bool,
@@ -1098,6 +1136,55 @@ pub fn acknowledge_thread_work_for_workspace(workspace: &str) -> bool {
         persist_locked(&store);
     }
     change.changed
+}
+
+/// Clear the unseen/attention flags of one thread by id (used when a
+/// notification entry is activated from the bell menu).
+pub fn acknowledge_thread_work_for_thread(thread_id: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let change = store.acknowledge_thread_work_for_thread(thread_id);
+    if change.should_persist {
+        persist_locked(&store);
+    }
+    change.changed
+}
+
+/// Threads across every Space whose work needs attention or finished without
+/// being seen. NeedsAttention entries sort first.
+pub fn pending_work_notifications() -> Vec<ThreadWorkNotification> {
+    let mut store = THREAD_STORE.lock();
+    if store.normalize_after_load() {
+        persist_locked(&store);
+    }
+    store.pending_work_notifications()
+}
+
+pub fn pending_work_notification_count() -> usize {
+    let store = THREAD_STORE.lock();
+    store.pending_work_notification_count()
+}
+
+/// Drop threads whose status is hidden by the sidebar view options. The
+/// active thread is always kept so the row the user is looking at cannot
+/// vanish from under them.
+pub fn filter_threads_view_by_status(
+    view: &mut WorkspaceThreadsView,
+    hidden: &[WorkspaceThreadWorkStatus],
+) {
+    let keep =
+        |thread: &WorkspaceThreadView| thread.is_active || !hidden.contains(&thread.work_status);
+    view.pinned_threads.retain(keep);
+    for project in &mut view.projects {
+        project.threads.retain(keep);
+    }
+}
+
+/// Guard for the view-options menu: refuse a toggle that would hide every
+/// status and leave the sidebar inexplicably empty.
+pub fn hidden_statuses_cover_all(hidden: &[WorkspaceThreadWorkStatus]) -> bool {
+    WorkspaceThreadWorkStatus::ALL
+        .iter()
+        .all(|status| hidden.contains(status))
 }
 
 pub fn acknowledge_thread_work_for_workspace_deferred(workspace: &str) -> bool {
@@ -2675,6 +2762,75 @@ impl WorkspaceThreadStore {
             changed: false,
             should_persist: false,
         }
+    }
+
+    fn acknowledge_thread_work_for_thread(&mut self, thread_id: &str) -> WorkspaceThreadWorkChange {
+        for project in &mut self.projects {
+            for session in &mut project.threads {
+                if session.id == thread_id {
+                    let should_persist = session.work_finished_unseen;
+                    let changed = session.work_needs_attention || session.work_finished_unseen;
+                    session.work_needs_attention = false;
+                    session.work_finished_unseen = false;
+                    return WorkspaceThreadWorkChange {
+                        changed,
+                        should_persist,
+                    };
+                }
+            }
+        }
+        WorkspaceThreadWorkChange {
+            changed: false,
+            should_persist: false,
+        }
+    }
+
+    fn pending_work_notifications(&self) -> Vec<ThreadWorkNotification> {
+        let mut notifications = Vec::new();
+        for project in &self.projects {
+            let space_name = self
+                .spaces
+                .iter()
+                .find(|space| space.id == project.space_id)
+                .map(|space| space.name.clone())
+                .unwrap_or_default();
+            for session in &project.threads {
+                let status = session.work_status();
+                if matches!(
+                    status,
+                    WorkspaceThreadWorkStatus::NeedsAttention
+                        | WorkspaceThreadWorkStatus::FinishedUnseen
+                ) {
+                    notifications.push(ThreadWorkNotification {
+                        space_id: project.space_id.clone(),
+                        space_name: space_name.clone(),
+                        project_name: project.name.clone(),
+                        thread_id: session.id.clone(),
+                        thread_name: session.name.clone(),
+                        status,
+                    });
+                }
+            }
+        }
+        notifications.sort_by_key(|notification| match notification.status {
+            WorkspaceThreadWorkStatus::NeedsAttention => 0,
+            _ => 1,
+        });
+        notifications
+    }
+
+    fn pending_work_notification_count(&self) -> usize {
+        self.projects
+            .iter()
+            .flat_map(|project| project.threads.iter())
+            .filter(|session| {
+                matches!(
+                    session.work_status(),
+                    WorkspaceThreadWorkStatus::NeedsAttention
+                        | WorkspaceThreadWorkStatus::FinishedUnseen
+                )
+            })
+            .count()
     }
 
     fn thread_workspace_names(&self) -> Vec<String> {
@@ -4711,6 +4867,108 @@ mod tests {
             store.projects[0].threads[0].work_status(),
             WorkspaceThreadWorkStatus::FinishedUnseen
         );
+    }
+
+    #[test]
+    fn pending_notifications_list_attention_first_and_skip_idle_running() {
+        let mut store = test_store();
+        let mut finished = WorkspaceThread::new(
+            "project-1".to_string(),
+            "done".to_string(),
+            Some("workspace-1".to_string()),
+        );
+        finished.work_finished_unseen = true;
+        let mut attention = WorkspaceThread::new(
+            "project-1".to_string(),
+            "stuck".to_string(),
+            Some("workspace-2".to_string()),
+        );
+        attention.work_needs_attention = true;
+        let mut running = WorkspaceThread::new(
+            "project-1".to_string(),
+            "busy".to_string(),
+            Some("workspace-3".to_string()),
+        );
+        running.work_is_running = true;
+        let idle = WorkspaceThread::new(
+            "project-1".to_string(),
+            "quiet".to_string(),
+            Some("workspace-4".to_string()),
+        );
+        store.projects.push(test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![finished, attention, running, idle],
+        ));
+
+        let notifications = store.pending_work_notifications();
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].thread_name, "stuck");
+        assert_eq!(
+            notifications[0].status,
+            WorkspaceThreadWorkStatus::NeedsAttention
+        );
+        assert_eq!(notifications[1].thread_name, "done");
+        assert_eq!(notifications[0].project_name, "thinkterm");
+        assert_eq!(notifications[0].space_id, default_space_id());
+        assert!(!notifications[0].space_name.is_empty());
+        assert_eq!(store.pending_work_notification_count(), 2);
+
+        let thread_id = notifications[1].thread_id.clone();
+        let change = store.acknowledge_thread_work_for_thread(&thread_id);
+        assert!(change.changed);
+        assert!(change.should_persist);
+        assert_eq!(store.pending_work_notification_count(), 1);
+        // Running state is runtime truth and must survive acknowledgement.
+        assert!(store.projects[0].threads[2].work_is_running);
+    }
+
+    #[test]
+    fn status_filter_hides_threads_but_never_the_active_one() {
+        let hidden = [WorkspaceThreadWorkStatus::Idle];
+        let make = |name: &str, status, is_active| WorkspaceThreadView {
+            id: name.to_string(),
+            name: name.to_string(),
+            is_active,
+            is_materialized: true,
+            is_pinned: false,
+            is_unread: false,
+            work_status: status,
+        };
+        let mut view = WorkspaceThreadsView {
+            pinned_threads: vec![make("pinned-idle", WorkspaceThreadWorkStatus::Idle, false)],
+            projects: vec![ProjectView {
+                id: "p".to_string(),
+                name: "p".to_string(),
+                is_active: true,
+                threads_collapsed: false,
+                threads: vec![
+                    make("active-idle", WorkspaceThreadWorkStatus::Idle, true),
+                    make("idle", WorkspaceThreadWorkStatus::Idle, false),
+                    make("running", WorkspaceThreadWorkStatus::Running, false),
+                ],
+                is_remote: false,
+                distro: None,
+            }],
+        };
+        filter_threads_view_by_status(&mut view, &hidden);
+        assert!(view.pinned_threads.is_empty());
+        let names: Vec<_> = view.projects[0]
+            .threads
+            .iter()
+            .map(|thread| thread.name.as_str())
+            .collect();
+        assert_eq!(names, ["active-idle", "running"]);
+
+        assert!(!hidden_statuses_cover_all(&hidden));
+        assert!(hidden_statuses_cover_all(&WorkspaceThreadWorkStatus::ALL));
+        for status in WorkspaceThreadWorkStatus::ALL {
+            assert_eq!(
+                WorkspaceThreadWorkStatus::from_settings_key(status.settings_key()),
+                Some(status)
+            );
+        }
     }
 
     #[test]
