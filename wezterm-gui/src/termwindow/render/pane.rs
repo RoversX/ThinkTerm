@@ -87,26 +87,42 @@ impl crate::TermWindow {
         ))
     }
 
-    pub(crate) fn pane_frame_rect(&self, pos: &PositionedPane) -> anyhow::Result<RectF> {
-        let (content_pane_x, pane_y) = self.pane_content_origin(pos)?;
-        let content_pane_width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
-        let content_pane_right = content_pane_x + content_pane_width;
-        let pane_x = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
+    /// Horizontal span (x, width) of a pane's chrome: the cell-aligned
+    /// content only covers `cols * cell_width`, so extend outward to the
+    /// window/sidebar edges (absorbing padding and the column remainder)
+    /// and half-way across split dividers, so that adjacent pane nav bars
+    /// tile the full window width without background-colored gaps.
+    pub(crate) fn pane_chrome_span(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {
+        let (content_pane_x, _) = self.pane_content_origin(pos)?;
+        let cell_w = self.render_metrics.cell_size.width as f32;
+        let content_pane_right = content_pane_x + pos.width as f32 * cell_w;
+        let pane_x = if pos.left == 0 {
             self.tab_bar_left_edge() as f32
         } else {
-            content_pane_x
+            content_pane_x - cell_w / 2.0
         };
+        let is_rightmost = pos.left + pos.width >= self.terminal_size.cols;
+        let right = if is_rightmost {
+            let border = self.get_os_border();
+            (self.dimensions.pixel_width as f32
+                - border.right.get() as f32
+                - self.right_sidebar_width() as f32)
+                .max(content_pane_right)
+        } else {
+            content_pane_right + cell_w / 2.0
+        };
+        Ok((pane_x, (right - pane_x).max(1.0)))
+    }
+
+    pub(crate) fn pane_frame_rect(&self, pos: &PositionedPane) -> anyhow::Result<RectF> {
+        let (_, pane_y) = self.pane_content_origin(pos)?;
+        let (pane_x, pane_width) = self.pane_chrome_span(pos)?;
         let mut height = (pos.height as f32 * self.render_metrics.cell_size.height as f32).max(1.0);
         if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) && pos.top > 0 {
             height = height.max(self.pane_nav_bar_height() as f32);
         }
 
-        Ok(euclid::rect(
-            pane_x,
-            pane_y,
-            (content_pane_right - pane_x).max(1.0),
-            height,
-        ))
+        Ok(euclid::rect(pane_x, pane_y, pane_width, height))
     }
 
     fn paint_collapsed_pane_nav_bar(
@@ -524,18 +540,11 @@ impl crate::TermWindow {
             return Ok(0);
         }
 
-        let (content_pane_x, pane_y) = self.pane_content_origin(pos)?;
-        let content_pane_width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
-        if content_pane_width <= 0.0 {
+        let (_, pane_y) = self.pane_content_origin(pos)?;
+        if pos.width == 0 {
             return Ok(0);
         }
-        let content_pane_right = content_pane_x + content_pane_width;
-        let pane_x = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
-            self.tab_bar_left_edge() as f32
-        } else {
-            content_pane_x
-        };
-        let pane_width = (content_pane_right - pane_x).max(1.0);
+        let (pane_x, pane_width) = self.pane_chrome_span(pos)?;
 
         let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
         let background = chrome.sidebar_bg;
