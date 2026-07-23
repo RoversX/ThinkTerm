@@ -15,7 +15,7 @@ use crate::ui::{
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
 use config::{configuration, Dimension, GeometryOrigin};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,9 +39,20 @@ use crate::native_settings::{
     DEFAULT_SIDEBAR_FONT_SIZE, DEFAULT_TAB_FONT_SIZE,
 };
 
+// All chrome geometry below is authored in 2x macOS backing pixels.
+// settings_ui_scale_for_dpi maps it onto other platforms by treating the
+// design as a 192dpi surface, which halves everything at a 1x/96dpi
+// display and keeps the proportions identical to macOS.
 const DEFAULT_WIDTH: usize = 1840;
 const DEFAULT_HEIGHT: usize = 1205;
-const SIDEBAR_BRAND_FONT_SIZE: f64 = 17.0;
+// Font sizes are points, not scaled pixels: on macOS one point renders as
+// one logical pixel, while at 96dpi it renders as 4/3 px, so non-mac
+// sizes are 0.75x to come out at the same visual size.
+const SIDEBAR_BRAND_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
+    17.0
+} else {
+    12.75
+};
 const SIDEBAR_BRAND_FONT_WEIGHT: u16 = 750;
 const CONTROL_HEIGHT: f32 = 56.0;
 const CONTROL_RADIUS: f32 = 14.0;
@@ -51,7 +62,11 @@ const NAV_ROW_STEP: f32 = 68.0;
 const HEADER_HEIGHT: f32 = 132.0;
 const SIDEBAR_TITLE_Y: f32 = 78.0;
 const SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME: f32 = 34.0;
-const SIDEBAR_BRAND_FONT_SIZE_WITH_CUSTOM_CHROME: f64 = 22.0;
+const SIDEBAR_BRAND_FONT_SIZE_WITH_CUSTOM_CHROME: f64 = if cfg!(target_os = "macos") {
+    22.0
+} else {
+    16.5
+};
 const SIDEBAR_SEARCH_Y: f32 = 142.0;
 const SIDEBAR_LIST_TOP: f32 = 222.0;
 const CONTENT_TITLE_Y: f32 = 82.0;
@@ -66,7 +81,58 @@ const SETTINGS_WINDOW_BUTTON_GAP: f32 = 4.0;
 const SETTINGS_WINDOW_BUTTON_ICON_SIZE: f32 = 26.0;
 
 thread_local! {
-    static SETTINGS_WINDOW: RefCell<Option<Rc<RefCell<SettingsWindow>>>> = RefCell::new(None);
+    static SETTINGS_WINDOW: RefCell<SettingsWindowSlot> =
+        RefCell::new(SettingsWindowSlot::Closed);
+    static SETTINGS_WINDOW_NEXT_ID: Cell<u64> = const { Cell::new(1) };
+}
+
+enum SettingsWindowSlot {
+    Closed,
+    Opening(u64),
+    Open {
+        instance_id: u64,
+        settings: Rc<RefCell<SettingsWindow>>,
+    },
+}
+
+enum SettingsShowAction {
+    Start(u64),
+    Focus(Window),
+    Ignore,
+}
+
+fn next_settings_window_id() -> u64 {
+    SETTINGS_WINDOW_NEXT_ID.with(|next| {
+        let id = next.get().max(1);
+        next.set(id.wrapping_add(1).max(1));
+        id
+    })
+}
+
+fn settings_window_for_instance(instance_id: u64) -> Option<Rc<RefCell<SettingsWindow>>> {
+    SETTINGS_WINDOW.with(|slot| match &*slot.borrow() {
+        SettingsWindowSlot::Open {
+            instance_id: current_id,
+            settings,
+        } if *current_id == instance_id => Some(Rc::clone(settings)),
+        SettingsWindowSlot::Closed | SettingsWindowSlot::Opening(_) => None,
+        SettingsWindowSlot::Open { .. } => None,
+    })
+}
+
+fn settings_window_pixel_size(
+    dpi: usize,
+    active_screen_size: Option<(usize, usize)>,
+) -> (usize, usize) {
+    let mut width = scale_ui_usize(DEFAULT_WIDTH, dpi);
+    let mut height = scale_ui_usize(DEFAULT_HEIGHT, dpi);
+    if !cfg!(target_os = "macos") {
+        if let Some((screen_width, screen_height)) = active_screen_size {
+            width = width.min(screen_width.max(1).saturating_mul(9) / 10);
+            height = height.min(screen_height.max(1).saturating_mul(9) / 10);
+        }
+    }
+    (width, height)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -966,6 +1032,26 @@ mod config_candidate_tests {
             dir.path().join("wezterm.lua")
         );
     }
+
+    #[test]
+    fn non_macos_settings_window_fits_the_active_screen() {
+        if !cfg!(target_os = "macos") {
+            // 2x-authored 1840x1205 halves to 920x603 on a 96dpi display
+            assert_eq!(settings_window_pixel_size(96, None), (920, 603));
+            assert_eq!(
+                settings_window_pixel_size(96, Some((1920, 1080))),
+                (920, 603)
+            );
+            assert_eq!(
+                settings_window_pixel_size(96, Some((1366, 768))),
+                (920, 603)
+            );
+            assert_eq!(
+                settings_window_pixel_size(96, Some((900, 620))),
+                (810, 558)
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1081,30 +1167,69 @@ struct SettingsPalette {
 }
 
 pub fn show() {
-    let already_open = SETTINGS_WINDOW.with(|slot| {
-        if let Some(settings) = slot.borrow().as_ref() {
-            if let Some(window) = settings.borrow().window.as_ref() {
-                window.show();
-                window.focus();
-                return true;
+    let action = SETTINGS_WINDOW.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match std::mem::replace(&mut *slot, SettingsWindowSlot::Closed) {
+            SettingsWindowSlot::Closed => {
+                let instance_id = next_settings_window_id();
+                *slot = SettingsWindowSlot::Opening(instance_id);
+                SettingsShowAction::Start(instance_id)
+            }
+            SettingsWindowSlot::Opening(instance_id) => {
+                *slot = SettingsWindowSlot::Opening(instance_id);
+                SettingsShowAction::Ignore
+            }
+            SettingsWindowSlot::Open {
+                instance_id,
+                settings,
+            } => {
+                let window = settings.borrow().window.clone();
+                *slot = SettingsWindowSlot::Open {
+                    instance_id,
+                    settings,
+                };
+                match window {
+                    Some(window) => SettingsShowAction::Focus(window),
+                    None => {
+                        let instance_id = next_settings_window_id();
+                        *slot = SettingsWindowSlot::Opening(instance_id);
+                        SettingsShowAction::Start(instance_id)
+                    }
+                }
             }
         }
-        false
     });
 
-    if already_open {
-        return;
-    }
-
-    promise::spawn::spawn(async {
-        if let Err(err) = SettingsWindow::open().await {
-            log::error!("failed to open settings window: {err:#}");
+    match action {
+        SettingsShowAction::Focus(window) => {
+            window.show();
+            window.focus();
         }
-    })
-    .detach();
+        SettingsShowAction::Ignore => {}
+        SettingsShowAction::Start(instance_id) => {
+            promise::spawn::spawn(async move {
+                if let Err(err) = SettingsWindow::open(instance_id).await {
+                    SETTINGS_WINDOW.with(|slot| {
+                        let mut slot = slot.borrow_mut();
+                        if matches!(
+                            *slot,
+                            SettingsWindowSlot::Opening(opening_id)
+                                if opening_id == instance_id
+                        ) {
+                            *slot = SettingsWindowSlot::Closed;
+                        }
+                    });
+                    log::error!("failed to open settings window: {err:#}");
+                }
+            })
+            .detach();
+        }
+    }
 }
 
 struct SettingsWindow {
+    instance_id: u64,
+    cleaned_up: bool,
     window: Option<Window>,
     dimensions: Dimensions,
     window_state: WindowState,
@@ -1134,7 +1259,7 @@ impl SettingsWindow {
         scale_ui_usize(value, self.dimensions.dpi)
     }
 
-    async fn open() -> anyhow::Result<()> {
+    async fn open(instance_id: u64) -> anyhow::Result<()> {
         let config = configuration();
         let dpi = window::default_dpi() as usize;
         let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
@@ -1155,9 +1280,23 @@ impl SettingsWindow {
         let appearance = Connection::get()
             .map(|conn| conn.get_appearance())
             .unwrap_or(Appearance::Dark);
+        let active_screen_size = if cfg!(target_os = "macos") {
+            None
+        } else {
+            Connection::get()
+                .and_then(|conn| conn.screens().ok())
+                .map(|screens| {
+                    (
+                        screens.active.rect.size.width.max(1) as usize,
+                        screens.active.rect.size.height.max(1) as usize,
+                    )
+                })
+        };
+        let (pixel_width, pixel_height) =
+            settings_window_pixel_size(dpi, active_screen_size);
         let dimensions = Dimensions {
-            pixel_width: scale_ui_usize(DEFAULT_WIDTH, dpi),
-            pixel_height: scale_ui_usize(DEFAULT_HEIGHT, dpi),
+            pixel_width,
+            pixel_height,
             dpi,
         };
 
@@ -1174,6 +1313,8 @@ impl SettingsWindow {
             .unwrap_or_else(|| Self::effective_font_family(&config));
 
         let settings = Rc::new(RefCell::new(Self {
+            instance_id,
+            cleaned_up: false,
             window: None,
             dimensions,
             window_state: WindowState::default(),
@@ -1219,18 +1360,45 @@ impl SettingsWindow {
         .await?;
 
         window.set_title("ThinkTerm Settings");
-        let webgpu = Rc::new(WebGpuState::new(&window, dimensions, &config).await?);
+        let webgpu = match WebGpuState::new(&window, dimensions, &config).await {
+            Ok(webgpu) => Rc::new(webgpu),
+            Err(err) => {
+                window.close();
+                return Err(err);
+            }
+        };
         webgpu.resize(dimensions);
         let dimensions = *webgpu.dimensions.borrow();
         {
             let mut settings = settings.borrow_mut();
             settings.dimensions = dimensions;
-            settings.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
+            if let Err(err) = settings.created(RenderContext::WebGpu(Rc::clone(&webgpu))) {
+                window.close();
+                return Err(err);
+            }
             settings.webgpu.replace(webgpu);
             settings.window.replace(window.clone());
         }
 
-        SETTINGS_WINDOW.with(|slot| slot.replace(Some(settings)));
+        let installed = SETTINGS_WINDOW.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if matches!(
+                *slot,
+                SettingsWindowSlot::Opening(opening_id) if opening_id == instance_id
+            ) {
+                *slot = SettingsWindowSlot::Open {
+                    instance_id,
+                    settings,
+                };
+                true
+            } else {
+                false
+            }
+        });
+        if !installed {
+            window.close();
+            return Ok(());
+        }
 
         window.show();
         window.invalidate();
@@ -1244,24 +1412,41 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn cleanup(&mut self) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        self.commit_focused_input();
+        self.ui.memory_monitoring = false;
+        self.ui.memory_monitor_generation = self.ui.memory_monitor_generation.wrapping_add(1);
+        self.render_state.take();
+        self.webgpu.take();
+        self.window.take();
+
+        let instance_id = self.instance_id;
+        SETTINGS_WINDOW.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let current = std::mem::replace(&mut *slot, SettingsWindowSlot::Closed);
+            match current {
+                SettingsWindowSlot::Open {
+                    instance_id: current_id,
+                    ..
+                } if current_id == instance_id => {}
+                other => *slot = other,
+            }
+        });
+    }
+
     fn dispatch(&mut self, event: WindowEvent, window: &Window) -> anyhow::Result<bool> {
         match event {
             WindowEvent::CloseRequested => {
-                self.commit_focused_input();
+                self.cleanup();
                 window.close();
                 Ok(true)
             }
             WindowEvent::Destroyed => {
-                self.commit_focused_input();
-                self.ui.memory_monitoring = false;
-                self.ui.memory_monitor_generation =
-                    self.ui.memory_monitor_generation.wrapping_add(1);
-                self.render_state.take();
-                self.webgpu.take();
-                self.window.take();
-                SETTINGS_WINDOW.with(|slot| {
-                    slot.borrow_mut().take();
-                });
+                self.cleanup();
                 Ok(true)
             }
             WindowEvent::Resized {
@@ -1493,12 +1678,10 @@ impl SettingsWindow {
 
     fn schedule_memory_monitor_tick(&self, window: &Window, generation: u64) {
         let window = window.clone();
+        let instance_id = self.instance_id;
         promise::spawn::spawn_into_main_thread(async move {
             smol::Timer::after(Duration::from_millis(1500)).await;
-            SETTINGS_WINDOW.with(|slot| {
-                let Some(settings) = slot.borrow().as_ref().cloned() else {
-                    return;
-                };
+            if let Some(settings) = settings_window_for_instance(instance_id) {
                 let mut settings = settings.borrow_mut();
                 if !settings.ui.memory_monitoring
                     || settings.ui.memory_monitor_generation != generation
@@ -1510,7 +1693,7 @@ impl SettingsWindow {
                 settings.ui.memory_snapshot = Some(snapshot);
                 window.invalidate();
                 settings.schedule_memory_monitor_tick(&window, generation);
-            });
+            }
         })
         .detach();
     }
@@ -1578,6 +1761,7 @@ impl SettingsWindow {
 
         self.ui.main_window_resource_lines =
             vec![format!("Main windows: {} pending", windows.len())];
+        let instance_id = self.instance_id;
         for (idx, gui_window) in windows.into_iter().enumerate() {
             let label = format!("Main window {}", idx + 1);
             gui_window
@@ -1585,10 +1769,7 @@ impl SettingsWindow {
                 .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                     move |term_window| {
                         let lines = term_window.memory_resource_lines(&label);
-                        SETTINGS_WINDOW.with(|slot| {
-                            let Some(settings) = slot.borrow().as_ref().cloned() else {
-                                return;
-                            };
+                        if let Some(settings) = settings_window_for_instance(instance_id) {
                             let mut settings = settings.borrow_mut();
                             settings
                                 .ui
@@ -1598,7 +1779,7 @@ impl SettingsWindow {
                             if let Some(window) = settings.window.as_ref() {
                                 window.invalidate();
                             }
-                        });
+                        }
                     },
                 )));
         }
@@ -1606,12 +1787,10 @@ impl SettingsWindow {
 
     fn schedule_copied_state_clear(&self, window: &Window) {
         let window = window.clone();
+        let instance_id = self.instance_id;
         promise::spawn::spawn_into_main_thread(async move {
             smol::Timer::after(Duration::from_millis(1450)).await;
-            SETTINGS_WINDOW.with(|slot| {
-                let Some(settings) = slot.borrow().as_ref().cloned() else {
-                    return;
-                };
+            if let Some(settings) = settings_window_for_instance(instance_id) {
                 let mut settings = settings.borrow_mut();
                 if settings
                     .ui
@@ -1629,7 +1808,7 @@ impl SettingsWindow {
                     settings.ui.input_diagnostics_copied_until = None;
                     window.invalidate();
                 }
-            });
+            }
         })
         .detach();
     }
@@ -1746,20 +1925,18 @@ impl SettingsWindow {
     ) -> bool {
         let future = window.get_clipboard(Clipboard::Clipboard);
         let window = window.clone();
+        let instance_id = self.instance_id;
         promise::spawn::spawn(async move {
             if let Ok(text) = future.await {
                 promise::spawn::spawn_into_main_thread(async move {
-                    SETTINGS_WINDOW.with(|slot| {
-                        let Some(settings) = slot.borrow().as_ref().cloned() else {
-                            return;
-                        };
+                    if let Some(settings) = settings_window_for_instance(instance_id) {
                         let mut settings = settings.borrow_mut();
                         if settings.ui.interaction.focused == Some(focused)
                             && settings.push_focused_input(focused, &text)
                         {
                             window.invalidate();
                         }
-                    });
+                    }
                 })
                 .detach();
             }
@@ -2212,7 +2389,7 @@ impl SettingsWindow {
     }
 
     fn settings_content_extent(&self, bottom_y: f32) -> f32 {
-        (bottom_y + 65.0).max(self.content_bottom())
+        (bottom_y + self.ui_px(65.0)).max(self.content_bottom())
     }
 
     fn developer_mode_enabled(&self) -> bool {
@@ -2261,7 +2438,11 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::WindowClose => {
-                self.commit_focused_input();
+                // Run cleanup before closing: on X11 the window is removed
+                // from the event map inside close(), so the Destroyed event
+                // never reaches us and the singleton slot would stay Open,
+                // pointing at a dead window.
+                self.cleanup();
                 window.close();
             }
             SettingsAction::Select(section) => {
@@ -2757,7 +2938,23 @@ impl SettingsWindow {
             }
         }
 
-        let clear_color = wgpu_color(self.palette().window_bg);
+        let corner_radius =
+            crate::termwindow::render::draw::effective_window_corner_radius(
+                configuration().window_decorations,
+                self.window_state,
+                self.dimensions.dpi,
+            );
+        let window_border = crate::termwindow::render::draw::effective_window_border(
+            configuration().window_decorations,
+            self.window_state,
+            self.dimensions.dpi,
+            self.effective_appearance(),
+        );
+        let clear_color = if corner_radius > 0.0 {
+            wgpu::Color::TRANSPARENT
+        } else {
+            wgpu_color(self.palette().window_bg)
+        };
         let render_state = self
             .render_state
             .as_ref()
@@ -2769,6 +2966,8 @@ impl SettingsWindow {
             [1.0, 1.0, 1.0],
             0,
             clear_color,
+            corner_radius,
+            window_border,
         )?;
         Ok(true)
     }
@@ -2803,7 +3002,11 @@ impl SettingsWindow {
         }
 
         let config = configuration();
-        Self::settings_window_shows_window_buttons_for_config(&config)
+        crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons(
+            config.window_decorations,
+            self.window_state,
+        ) && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
+            && !config.integrated_title_buttons.is_empty()
     }
 
     fn settings_window_shows_window_buttons_for_config(config: &config::ConfigHandle) -> bool {
@@ -3018,7 +3221,7 @@ impl SettingsWindow {
         let nav_font = Rc::clone(&self.ui_font);
         let tokens = self.ui.tokens;
         let sidebar_width = self.ui.sidebar.width;
-        let sidebar_icon_size = ((self.metrics.cell_size.height as f32 + 8.0)
+        let sidebar_icon_size = ((self.metrics.cell_size.height as f32 + self.ui_px(8.0))
             .clamp(self.ui_px(24.0), self.ui_px(34.0))
             .round()) as usize;
 
@@ -3053,16 +3256,16 @@ impl SettingsWindow {
         self.draw_svg_icon(
             layers,
             SettingsIcon::Search.svg(),
-            search_rect.origin.x + 15.0,
+            search_rect.origin.x + self.ui_px(15.0),
             search_rect.origin.y + (search_rect.size.height - sidebar_icon_size as f32) / 2.0,
             sidebar_icon_size as f32,
             palette.muted_text,
         )?;
         if !self.ui.search.is_empty() {
-            let clear_size = 34.0;
+            let clear_size = self.ui_px(34.0);
             let clear_icon_size = self.ui_px(24.0);
             let clear_rect = rect(
-                search_rect.origin.x + search_rect.size.width - clear_size - 10.0,
+                search_rect.origin.x + search_rect.size.width - clear_size - self.ui_px(10.0),
                 search_rect.origin.y + (search_rect.size.height - clear_size) / 2.0,
                 clear_size,
                 clear_size,
@@ -3080,7 +3283,7 @@ impl SettingsWindow {
                     clear_rect.size.width,
                     clear_rect.size.height,
                     palette.control_hover_bg,
-                    14.0,
+                    self.ui_px(14.0),
                 )?;
             }
             self.draw_svg_icon(
@@ -3123,7 +3326,7 @@ impl SettingsWindow {
 
         let sections = self.filtered_sections();
         let list_top = self.ui_px(SIDEBAR_LIST_TOP);
-        let list_bottom = (self.dimensions.pixel_height as f32 - 16.0).max(list_top);
+        let list_bottom = (self.dimensions.pixel_height as f32 - self.ui_px(16.0)).max(list_top);
         let list_height = list_bottom - list_top;
         let content_extent = sections.len() as f32 * self.ui_px(NAV_ROW_STEP) + 8.0;
         self.ui
@@ -3142,7 +3345,7 @@ impl SettingsWindow {
                 layers,
                 &ui_font,
                 tokens.sidebar_padding + 12.0,
-                list_top + 18.0,
+                list_top + self.ui_px(18.0),
                 "No settings found",
                 palette.muted_text,
                 sidebar_width - tokens.sidebar_padding * 2.0 - 24.0,
@@ -3158,7 +3361,7 @@ impl SettingsWindow {
             let selected = section == self.selected;
             let hovered = self.ui.interaction.hovered == Some(action);
             let pressed = self.ui.interaction.pressed == Some(action);
-            let row_y = y - 6.0;
+            let row_y = y - self.ui_px(6.0);
             let row_x = tokens.sidebar_padding;
             let row_width = sidebar_width - tokens.sidebar_padding * 2.0;
             let row_bg = if selected {
@@ -3196,7 +3399,7 @@ impl SettingsWindow {
             self.draw_svg_icon(
                 layers,
                 section.icon().svg(),
-                row_x + 14.0,
+                row_x + self.ui_px(14.0),
                 row_y + (self.ui_px(NAV_ROW_HEIGHT) - sidebar_icon_size as f32) / 2.0,
                 sidebar_icon_size as f32,
                 text_color,
@@ -3204,11 +3407,11 @@ impl SettingsWindow {
             self.draw_text(
                 layers,
                 &nav_font,
-                row_x + 56.0,
+                row_x + self.ui_px(56.0),
                 self.control_text_y(row_y, self.ui_px(NAV_ROW_HEIGHT)),
                 section.label(),
                 text_color,
-                row_width - 76.0,
+                row_width - self.ui_px(76.0),
             )?;
             y += self.ui_px(NAV_ROW_STEP);
         }
@@ -3232,7 +3435,7 @@ impl SettingsWindow {
         let content_gap = if window_width < 980.0 { 30.0 } else { 46.0 };
         let right_margin = if window_width < 980.0 { 34.0 } else { 50.0 };
         let x = sidebar_width + content_gap;
-        let max_width = (window_width - x - right_margin).max(280.0);
+        let max_width = (window_width - x - right_margin).max(self.ui_px(280.0));
         let content_top = self.content_scroll_area_top();
         let content_area = rect(
             sidebar_width + 1.0,
@@ -3414,7 +3617,7 @@ impl SettingsWindow {
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let theme_row_count = 4;
         let typography_row_count = 6;
-        let app_icon_note_space = self.metrics.cell_size.height as f32 + 10.0;
+        let app_icon_note_space = self.metrics.cell_size.height as f32 + self.ui_px(10.0);
         let (theme_card_y, mut y) = self.settings_card_geometry(section_y, theme_row_count);
         let theme_card_height = self.settings_card_height(theme_row_count) + app_icon_note_space;
         let typography_title_y =
@@ -3816,7 +4019,7 @@ impl SettingsWindow {
         )?;
         self.draw_button(
             layers,
-            x + developer_width + 14.0,
+            x + developer_width + self.ui_px(14.0),
             button_y,
             self.button_width_for_label("Show Onboarding Now", 300.0),
             "Show Onboarding Now",
@@ -3861,7 +4064,7 @@ impl SettingsWindow {
         )?;
 
         let preview_width = if two_column {
-            (max_width * 0.52).min(620.0)
+            (max_width * 0.52).min(self.ui_px(620.0))
         } else {
             max_width
         };
@@ -3871,7 +4074,7 @@ impl SettingsWindow {
             x
         };
         let notes_width = if two_column {
-            (max_width - preview_width - 42.0).max(280.0)
+            (max_width - preview_width - self.ui_px(42.0)).max(self.ui_px(280.0))
         } else {
             max_width
         };
@@ -3928,9 +4131,9 @@ impl SettingsWindow {
         self.paint_preview_button(layers, x, 578.0 - scroll, 250.0, "Normal Button", false)?;
         self.paint_preview_button(
             layers,
-            x + 270.0,
+            x + self.ui_px(270.0),
             578.0 - scroll,
-            220.0,
+            self.ui_px(220.0),
             "Accent Button",
             true,
         )?;
@@ -4051,7 +4254,7 @@ impl SettingsWindow {
         self.paint_style_group(
             layers,
             notes_x,
-            notes_top + 330.0 - scroll,
+            notes_top + self.ui_px(330.0) - scroll,
             notes_width,
             "Typography",
             &type_tokens,
@@ -4059,7 +4262,7 @@ impl SettingsWindow {
         self.paint_style_group(
             layers,
             notes_x,
-            notes_top + 590.0 - scroll,
+            notes_top + self.ui_px(590.0) - scroll,
             notes_width,
             "Layout",
             &layout_tokens,
@@ -4352,7 +4555,7 @@ impl SettingsWindow {
             primary_label,
             SettingsAction::ToggleMemoryMonitoring,
         )?;
-        let refresh_x = x + self.button_width_for_label(primary_label, 300.0) + 16.0;
+        let refresh_x = x + self.button_width_for_label(primary_label, 300.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             refresh_x,
@@ -4366,7 +4569,7 @@ impl SettingsWindow {
             .memory_snapshot_copied_until
             .is_some_and(|until| Instant::now() < until);
         let copy_label = if copied { "Copied" } else { "Copy" };
-        let copy_x = refresh_x + self.button_width_for_label("Refresh Now", 210.0) + 16.0;
+        let copy_x = refresh_x + self.button_width_for_label("Refresh Now", 210.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             copy_x,
@@ -4388,7 +4591,7 @@ impl SettingsWindow {
             input_primary_label,
             SettingsAction::ToggleInputDiagnostics,
         )?;
-        let reset_input_x = x + self.button_width_for_label(input_primary_label, 250.0) + 16.0;
+        let reset_input_x = x + self.button_width_for_label(input_primary_label, 250.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             reset_input_x,
@@ -4402,7 +4605,7 @@ impl SettingsWindow {
             .input_diagnostics_copied_until
             .is_some_and(|until| Instant::now() < until);
         let input_copy_label = if input_copied { "Copied" } else { "Copy Input" };
-        let copy_input_x = reset_input_x + self.button_width_for_label("Reset Input", 190.0) + 16.0;
+        let copy_input_x = reset_input_x + self.button_width_for_label("Reset Input", 190.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             copy_input_x,
@@ -4417,7 +4620,7 @@ impl SettingsWindow {
             layers,
             &ui_font,
             row_x,
-            resource_card_y + 28.0,
+            resource_card_y + self.ui_px(28.0),
             "Renderer Resources",
             palette.title,
             row_width,
@@ -4427,7 +4630,7 @@ impl SettingsWindow {
                 layers,
                 &ui_font,
                 row_x,
-                resource_card_y + 66.0 + resource_line_height * idx as f32,
+                resource_card_y + self.ui_px(66.0) + resource_line_height * idx as f32,
                 line,
                 palette.secondary_text,
                 row_width,
@@ -4451,8 +4654,8 @@ impl SettingsWindow {
             layers,
             0,
             x,
-            y + 28.0,
-            width.min(420.0),
+            y + self.ui_px(28.0),
+            width.min(self.ui_px(420.0)),
             self.ui_px(CONTROL_HEIGHT),
             palette.search_bg,
             palette.search_border,
@@ -4461,11 +4664,11 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            x + 18.0,
+            x + self.ui_px(18.0),
             self.control_text_y(y + 28.0, self.ui_px(CONTROL_HEIGHT)),
             "Search settings...",
             palette.muted_text,
-            width.min(420.0) - 36.0,
+            width.min(self.ui_px(420.0)) - self.ui_px(36.0),
         )?;
         Ok(())
     }
@@ -4481,7 +4684,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
-        let row_width = width.min(420.0);
+        let row_width = width.min(self.ui_px(420.0));
         if selected {
             self.draw_rounded_rect(
                 layers,
@@ -4508,7 +4711,7 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            x + 16.0,
+            x + self.ui_px(16.0),
             self.control_text_y(y, self.ui_px(NAV_ROW_HEIGHT)),
             label,
             if selected {
@@ -4551,7 +4754,7 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &Rc::clone(&self.ui_font),
-            x + 18.0,
+            x + self.ui_px(18.0),
             self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             label,
             if accent {
@@ -4559,7 +4762,7 @@ impl SettingsWindow {
             } else {
                 palette.text
             },
-            width - 36.0,
+            width - self.ui_px(36.0),
         )?;
         Ok(())
     }
@@ -4587,7 +4790,7 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &Rc::clone(&self.ui_font),
-            x + 14.0,
+            x + self.ui_px(14.0),
             self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             value,
             palette.text,
@@ -4596,11 +4799,11 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &Rc::clone(&self.ui_font),
-            x + width - 28.0,
+            x + width - self.ui_px(28.0),
             self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             "v",
             palette.muted_text,
-            14.0,
+            self.ui_px(14.0),
         )?;
         Ok(())
     }
@@ -4624,9 +4827,9 @@ impl SettingsWindow {
             palette.title,
             width,
         )?;
-        self.paint_separator(layers, x, y + 28.0, width)?;
+        self.paint_separator(layers, x, y + self.ui_px(28.0), width)?;
 
-        let mut row_y = y + 58.0;
+        let mut row_y = y + self.ui_px(58.0);
         for token in tokens {
             self.paint_style_token(
                 layers,
@@ -4850,7 +5053,7 @@ impl SettingsWindow {
             "Load WezTerm Source",
             SettingsAction::LoadWezTermSource,
         )?;
-        let second_x = x + self.button_width_for_label("Load WezTerm Source", 290.0) + 16.0;
+        let second_x = x + self.button_width_for_label("Load WezTerm Source", 290.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             second_x,
@@ -4859,7 +5062,7 @@ impl SettingsWindow {
             "Select All",
             SettingsAction::SelectAllImportFields,
         )?;
-        let third_x = second_x + self.button_width_for_label("Select All", 180.0) + 16.0;
+        let third_x = second_x + self.button_width_for_label("Select All", 180.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             third_x,
@@ -4868,7 +5071,7 @@ impl SettingsWindow {
             "Clear",
             SettingsAction::ClearImportFields,
         )?;
-        let fourth_x = third_x + self.button_width_for_label("Clear", 150.0) + 16.0;
+        let fourth_x = third_x + self.button_width_for_label("Clear", 150.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             fourth_x,
@@ -4886,7 +5089,7 @@ impl SettingsWindow {
             "Open WezTerm Source",
             SettingsAction::OpenWezTermConfigFile,
         )?;
-        let fifth_x = x + self.button_width_for_label("Open WezTerm Source", 300.0) + 16.0;
+        let fifth_x = x + self.button_width_for_label("Open WezTerm Source", 300.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             fifth_x,
@@ -4910,7 +5113,7 @@ impl SettingsWindow {
         let palette = self.palette();
         self.ui
             .content_scroll
-            .set_extents(self.content_bottom(), 240.0);
+            .set_extents(self.content_bottom(), self.ui_px(240.0));
         let scroll = self.ui.content_scroll.offset;
         self.draw_text(
             layers,
@@ -4947,7 +5150,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
         let control_width = if width >= 680.0 {
             280.0_f32.min(width * 0.36)
@@ -4955,7 +5158,7 @@ impl SettingsWindow {
             220.0_f32.min(width * 0.44)
         };
         let control_x = x + width - control_width;
-        let control_y = y + 4.0;
+        let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
@@ -4981,11 +5184,11 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            control_x + 14.0,
+            control_x + self.ui_px(14.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             value,
             palette.text,
-            control_width - 26.0,
+            control_width - self.ui_px(26.0),
         )?;
         Ok(())
     }
@@ -5005,7 +5208,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
         let control_width = if width >= 680.0 {
             280.0_f32.min(width * 0.36)
@@ -5013,7 +5216,7 @@ impl SettingsWindow {
             220.0_f32.min(width * 0.44)
         };
         let control_x = x + width - control_width;
-        let control_y = y + 4.0;
+        let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
         let control_rect = rect(
             control_x,
@@ -5063,11 +5266,11 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            control_x + 14.0,
+            control_x + self.ui_px(14.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             if enabled { "On" } else { "Off" },
             palette.text,
-            control_width - 26.0,
+            control_width - self.ui_px(26.0),
         )?;
         Ok(())
     }
@@ -5087,7 +5290,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
         let control_width = if width >= 680.0 {
             280.0_f32.min(width * 0.36)
@@ -5095,7 +5298,7 @@ impl SettingsWindow {
             220.0_f32.min(width * 0.44)
         };
         let control_x = x + width - control_width;
-        let control_y = y + 4.0;
+        let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
         let control_rect = rect(
             control_x,
@@ -5145,11 +5348,11 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            control_x + 14.0,
+            control_x + self.ui_px(14.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             value,
             palette.text,
-            control_width - 26.0,
+            control_width - self.ui_px(26.0),
         )?;
         Ok(())
     }
@@ -5172,14 +5375,14 @@ impl SettingsWindow {
         let pressed = enabled && self.ui.interaction.pressed == Some(action);
 
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
         let row_rect = rect(
-            x - 14.0,
-            y - 18.0,
-            width + 28.0,
-            self.settings_row_visual_height() + 18.0,
+            x - self.ui_px(14.0),
+            y - self.ui_px(18.0),
+            width + self.ui_px(28.0),
+            self.settings_row_visual_height() + self.ui_px(18.0),
         );
         if enabled {
             self.ui_context.push(row_rect, WidgetKind::Button, action);
@@ -5200,13 +5403,13 @@ impl SettingsWindow {
                 row_rect.size.width,
                 row_rect.size.height,
                 bg,
-                16.0,
+                self.ui_px(16.0),
             )?;
         }
 
         let checkbox_size = 30.0;
         let checkbox_x = x;
-        let checkbox_y = y + 6.0;
+        let checkbox_y = y + self.ui_px(6.0);
         let checkbox_fill = if selected {
             palette.nav_selected_bg
         } else if hovered {
@@ -5228,29 +5431,29 @@ impl SettingsWindow {
             checkbox_size,
             checkbox_fill,
             checkbox_border,
-            8.0,
+            self.ui_px(8.0),
         )?;
         if selected {
             self.draw_rounded_rect(
                 layers,
                 1,
-                checkbox_x + 8.0,
-                checkbox_y + 8.0,
-                checkbox_size - 16.0,
-                checkbox_size - 16.0,
+                checkbox_x + self.ui_px(8.0),
+                checkbox_y + self.ui_px(8.0),
+                checkbox_size - self.ui_px(16.0),
+                checkbox_size - self.ui_px(16.0),
                 palette.selected_text,
-                4.0,
+                self.ui_px(4.0),
             )?;
         }
 
-        let label_x = x + checkbox_size + 18.0;
+        let label_x = x + checkbox_size + self.ui_px(18.0);
         let value_width = if width >= 760.0 {
             280.0_f32.min(width * 0.30)
         } else {
             210.0_f32.min(width * 0.34)
         };
         let value_x = x + width - value_width;
-        let text_width = (value_x - label_x - 28.0).max(width * 0.42);
+        let text_width = (value_x - label_x - self.ui_px(28.0)).max(width * 0.42);
         let title = format!("{} / {}", field.category, field.label);
         self.draw_text(
             layers,
@@ -5275,7 +5478,7 @@ impl SettingsWindow {
             text_width,
         )?;
 
-        let preview_y = y + 4.0;
+        let preview_y = y + self.ui_px(4.0);
         self.draw_rounded_frame(
             layers,
             0,
@@ -5287,15 +5490,15 @@ impl SettingsWindow {
             palette.control_border,
             self.ui_px(CONTROL_RADIUS),
         )?;
-        let preview = self.text_with_ellipsis(&ui_font, &field.preview, value_width - 28.0);
+        let preview = self.text_with_ellipsis(&ui_font, &field.preview, value_width - self.ui_px(28.0));
         self.draw_text(
             layers,
             &ui_font,
-            value_x + 14.0,
+            value_x + self.ui_px(14.0),
             self.control_text_y(preview_y, self.ui_px(CONTROL_HEIGHT)),
             &preview,
             palette.text,
-            value_width - 28.0,
+            value_width - self.ui_px(28.0),
         )?;
         Ok(())
     }
@@ -5318,7 +5521,7 @@ impl SettingsWindow {
             height,
             palette.card_bg,
             palette.separator,
-            28.0,
+            self.ui_px(28.0),
         )
     }
 
@@ -5351,7 +5554,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
         let control_width = if width >= 680.0 {
@@ -5360,7 +5563,7 @@ impl SettingsWindow {
             220.0_f32.min(width * 0.44)
         };
         let control_x = x + width - control_width;
-        let control_y = y + 4.0;
+        let control_y = y + self.ui_px(4.0);
         let dynamic_icon_size =
             (self.metrics.cell_size.height as f32 + 4.0).clamp(self.ui_px(24.0), self.ui_px(34.0));
         let reset_size = self.ui_px(CONTROL_HEIGHT);
@@ -5428,12 +5631,12 @@ impl SettingsWindow {
                 self.draw_rounded_rect(
                     layers,
                     1,
-                    button_rect.origin.x + 4.0,
-                    button_rect.origin.y + 4.0,
-                    button_rect.size.width - 8.0,
-                    button_rect.size.height - 8.0,
+                    button_rect.origin.x + self.ui_px(4.0),
+                    button_rect.origin.y + self.ui_px(4.0),
+                    button_rect.size.width - self.ui_px(8.0),
+                    button_rect.size.height - self.ui_px(8.0),
                     palette.control_hover_bg,
-                    self.ui_px(CONTROL_RADIUS) - 4.0,
+                    self.ui_px(CONTROL_RADIUS - 4.0),
                 )?;
             }
             self.draw_svg_icon(
@@ -5458,11 +5661,11 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            value_x + 8.0,
+            value_x + self.ui_px(8.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             &value_label,
             palette.text,
-            value_width - 16.0,
+            value_width - self.ui_px(16.0),
         )?;
 
         Ok(())
@@ -5484,7 +5687,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
         let control_width = if width >= 680.0 {
@@ -5493,7 +5696,7 @@ impl SettingsWindow {
             220.0_f32.min(width * 0.44)
         };
         let control_x = x + width - control_width;
-        let control_y = y + 4.0;
+        let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
         let focused = self.ui.interaction.focused == Some(action);
         let hovered = self.ui.interaction.hovered == Some(action);
@@ -5565,17 +5768,17 @@ impl SettingsWindow {
                 layers,
                 1,
                 control_x + 12.0,
-                control_y + 6.0,
-                selection_width + 8.0,
+                control_y + self.ui_px(6.0),
+                selection_width + self.ui_px(8.0),
                 self.ui_px(CONTROL_HEIGHT) - 12.0,
                 palette.nav_selected_bg.mul_alpha(0.56),
-                self.ui_px(CONTROL_RADIUS) - 4.0,
+                self.ui_px(CONTROL_RADIUS - 4.0),
             )?;
         }
         self.draw_text(
             layers,
             &ui_font,
-            control_x + 16.0,
+            control_x + self.ui_px(16.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             display,
             text_color,
@@ -5584,7 +5787,7 @@ impl SettingsWindow {
         if focused && !selected_all {
             let caret_text = if value.trim().is_empty() { "" } else { value };
             let caret_x = control_x
-                + 18.0
+                + self.ui_px(18.0)
                 + self
                     .measure_text_width(&ui_font, caret_text)
                     .min(control_width - 42.0);
@@ -5592,9 +5795,9 @@ impl SettingsWindow {
                 layers,
                 1,
                 caret_x - 1.0,
-                control_y + 8.0,
-                3.0,
-                self.ui_px(CONTROL_HEIGHT) - 16.0,
+                control_y + self.ui_px(8.0),
+                self.ui_px(3.0).max(1.0),
+                self.ui_px(CONTROL_HEIGHT - 16.0),
                 palette.nav_selected_bg,
             )?;
         }
@@ -5613,7 +5816,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
         let (control_x, control_y, control_width) = self.theme_mode_control_geometry(x, y, width);
@@ -5675,18 +5878,18 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            control_x + 16.0,
+            control_x + self.ui_px(16.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             self.native_settings.appearance.theme_mode.label(),
             palette.text,
-            control_width - 60.0,
+            control_width - self.ui_px(60.0),
         )?;
         self.draw_svg_icon(
             layers,
             SvgIcon::ChevronDown,
-            control_x + control_width - 38.0,
+            control_x + control_width - self.ui_px(38.0),
             control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            22.0,
+            self.ui_px(22.0),
             palette.secondary_text,
         )?;
 
@@ -5706,7 +5909,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
@@ -5750,7 +5953,7 @@ impl SettingsWindow {
             layers,
             &ui_font,
             x,
-            self.settings_row_description_y(y) + self.metrics.cell_size.height as f32 + 4.0,
+            self.settings_row_description_y(y) + self.metrics.cell_size.height as f32 + self.ui_px(4.0),
             note,
             palette.muted_text,
             text_width,
@@ -5769,18 +5972,18 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            control_x + 16.0,
+            control_x + self.ui_px(16.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             self.native_settings.appearance.app_icon.label(),
             palette.text,
-            control_width - 60.0,
+            control_width - self.ui_px(60.0),
         )?;
         self.draw_svg_icon(
             layers,
             SvgIcon::ChevronDown,
-            control_x + control_width - 38.0,
+            control_x + control_width - self.ui_px(38.0),
             control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            22.0,
+            self.ui_px(22.0),
             palette.secondary_text,
         )?;
 
@@ -5798,7 +6001,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
@@ -5860,18 +6063,18 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            control_x + 16.0,
+            control_x + self.ui_px(16.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             self.current_main_renderer().label(),
             palette.text,
-            control_width - 60.0,
+            control_width - self.ui_px(60.0),
         )?;
         self.draw_svg_icon(
             layers,
             SvgIcon::ChevronDown,
-            control_x + control_width - 38.0,
+            control_x + control_width - self.ui_px(38.0),
             control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            22.0,
+            self.ui_px(22.0),
             palette.secondary_text,
         )?;
 
@@ -5889,7 +6092,7 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         if draw_top_rule {
-            self.paint_separator(layers, x, y - 28.0, width)?;
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
         let button_label = if self.main_renderer_restart_required() {
@@ -5897,7 +6100,7 @@ impl SettingsWindow {
         } else {
             "Restart"
         };
-        let button_width = self.button_width_for_label(button_label, 0.0).max(220.0);
+        let button_width = self.button_width_for_label(button_label, 0.0).max(self.ui_px(220.0));
         let button_x = x + width - button_width;
         let text_width = (button_x - x - 24.0).max(width * 0.45);
         let value = if self.main_renderer_restart_required() {
@@ -5918,7 +6121,7 @@ impl SettingsWindow {
         self.draw_button(
             layers,
             button_x,
-            y + 4.0,
+            y + self.ui_px(4.0),
             button_width,
             button_label,
             SettingsAction::RestartApplication,
@@ -5937,7 +6140,7 @@ impl SettingsWindow {
         } else {
             220.0_f32.min(width * 0.44)
         };
-        (x + width - control_width, y + 4.0, control_width)
+        (x + width - control_width, y + self.ui_px(4.0), control_width)
     }
 
     fn paint_open_dropdown_overlay(
@@ -6109,7 +6312,7 @@ impl SettingsWindow {
 
         let mut row_y = y + menu_padding;
         for (label, action, selected) in options.iter().copied() {
-            let row_rect = rect(x + 8.0, row_y, width - 16.0, row_height);
+            let row_rect = rect(x + self.ui_px(8.0), row_y, width - self.ui_px(16.0), row_height);
             self.ui_context.push(row_rect, WidgetKind::Button, action);
             let hovered = self.ui.interaction.hovered == Some(action);
             let pressed = self.ui.interaction.pressed == Some(action);
@@ -6131,13 +6334,13 @@ impl SettingsWindow {
                     row_rect.size.width,
                     row_rect.size.height,
                     row_bg,
-                    9.0,
+                    self.ui_px(9.0),
                 )?;
             }
             self.draw_text(
                 layers,
                 &ui_font,
-                row_rect.origin.x + 14.0,
+                row_rect.origin.x + self.ui_px(14.0),
                 self.control_text_y(row_rect.origin.y, row_height),
                 label,
                 if selected {
@@ -6145,7 +6348,7 @@ impl SettingsWindow {
                 } else {
                     palette.text
                 },
-                row_rect.size.width - 28.0,
+                row_rect.size.width - self.ui_px(28.0),
             )?;
             row_y += row_height + row_gap;
         }
@@ -6260,30 +6463,30 @@ impl SettingsWindow {
         if spec.focused && spec.selected_all && !spec.text.is_empty() {
             let selection_width = self
                 .measure_text_width(&Rc::clone(&self.ui_font), spec.text)
-                .min((spec.rect.size.width - 116.0).max(0.0));
+                .min((spec.rect.size.width - self.ui_px(116.0)).max(0.0));
             self.draw_rounded_rect(
                 layers,
                 1,
-                spec.rect.origin.x + 54.0,
-                spec.rect.origin.y + 6.0,
-                selection_width + 8.0,
+                spec.rect.origin.x + self.ui_px(54.0),
+                spec.rect.origin.y + self.ui_px(6.0),
+                selection_width + self.ui_px(8.0),
                 spec.rect.size.height - 12.0,
                 palette.nav_selected_bg.mul_alpha(0.56),
-                self.ui.tokens.control_radius - 4.0,
+                self.ui.tokens.control_radius - self.ui_px(4.0),
             )?;
         }
         self.draw_text(
             layers,
             &Rc::clone(&self.ui_font),
-            spec.rect.origin.x + 58.0,
+            spec.rect.origin.x + self.ui_px(58.0),
             self.control_text_y(spec.rect.origin.y, spec.rect.size.height),
             text,
             color,
-            spec.rect.size.width - 116.0,
+            spec.rect.size.width - self.ui_px(116.0),
         )?;
         if spec.focused && !spec.selected_all {
             let caret_x = spec.rect.origin.x
-                + 60.0
+                + self.ui_px(60.0)
                 + self
                     .measure_text_width(&Rc::clone(&self.ui_font), spec.text)
                     .min((spec.rect.size.width - 124.0).max(0.0));
@@ -6291,9 +6494,9 @@ impl SettingsWindow {
                 layers,
                 1,
                 caret_x - 1.0,
-                spec.rect.origin.y + 8.0,
-                3.0,
-                spec.rect.size.height - 16.0,
+                spec.rect.origin.y + self.ui_px(8.0),
+                self.ui_px(3.0).max(1.0),
+                spec.rect.size.height - self.ui_px(16.0),
                 palette.nav_selected_bg,
             )?;
         }
@@ -6370,11 +6573,11 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &Rc::clone(&self.ui_font),
-            x + 14.0,
+            x + self.ui_px(14.0),
             self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             button.label,
             palette.text,
-            width - 36.0,
+            width - self.ui_px(36.0),
         )?;
         Ok(())
     }
@@ -6420,7 +6623,9 @@ impl SettingsWindow {
     }
 
     fn button_width_for_label(&self, label: &str, min_width: f32) -> f32 {
-        (self.measure_text_width(&Rc::clone(&self.ui_font), label) + 44.0).max(min_width)
+        // min_width is in design pixels, like the layout constants
+        (self.measure_text_width(&Rc::clone(&self.ui_font), label) + self.ui_px(44.0))
+            .max(self.ui_px(min_width))
     }
 
     fn control_text_y(&self, y: f32, height: f32) -> f32 {

@@ -433,6 +433,7 @@ impl TabBarState {
         pane_info: &[PaneInformation],
         colors: Option<&TabBarColors>,
         config: &ConfigHandle,
+        use_integrated_title_buttons: bool,
         tab_scroll_offset: f32,
         left_status: &str,
         right_status: &str,
@@ -461,10 +462,6 @@ impl TabBarState {
                 new_tab_hover_attrs.clone()
             },
         );
-
-        let use_integrated_title_buttons = config
-            .window_decorations
-            .contains(window::WindowDecorations::INTEGRATED_BUTTONS);
 
         // We ultimately want to produce a line looking like this:
         // ` | tab1-title x | tab2-title x |  +      . - X `

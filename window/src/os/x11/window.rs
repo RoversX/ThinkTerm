@@ -108,6 +108,8 @@ pub(crate) struct XWindowInner {
     current_mouse_event: Option<MouseEvent>,
     window_drag_position: Option<ScreenPoint>,
     dragging: bool,
+    edge_resizing: bool,
+    resize_cursor_active: bool,
     outstanding_configure_requests: usize,
     pending_finished_resizes: usize,
 }
@@ -115,6 +117,71 @@ pub(crate) struct XWindowInner {
 /// <https://specifications.freedesktop.org/wm-spec/wm-spec-latest.html#idm46409506331616>
 const _NET_WM_MOVERESIZE_MOVE: u32 = 8;
 const _NET_WM_MOVERESIZE_CANCEL: u32 = 11;
+const X11_RESIZE_EDGE_LOGICAL_PIXELS: f64 = 6.0;
+const ICCCM_ICONIC_STATE: u32 = 3;
+
+fn wm_change_state_iconic_data() -> [u32; 5] {
+    [ICCCM_ICONIC_STATE, 0, 0, 0, 0]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+enum X11ResizeEdge {
+    TopLeft = 0,
+    Top = 1,
+    TopRight = 2,
+    Right = 3,
+    BottomRight = 4,
+    Bottom = 5,
+    BottomLeft = 6,
+    Left = 7,
+}
+
+impl X11ResizeEdge {
+    fn cursor(self) -> MouseCursor {
+        match self {
+            Self::Top | Self::Bottom => MouseCursor::SizeUpDown,
+            Self::Left | Self::Right => MouseCursor::SizeLeftRight,
+            Self::TopLeft | Self::BottomRight => MouseCursor::SizeNorthWestSouthEast,
+            Self::TopRight | Self::BottomLeft => MouseCursor::SizeNorthEastSouthWest,
+        }
+    }
+}
+
+fn x11_resize_edge_at(
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    edge_pixels: u16,
+) -> Option<X11ResizeEdge> {
+    let x = i32::from(x);
+    let y = i32::from(y);
+    let width = i32::from(width);
+    let height = i32::from(height);
+    if x < 0 || y < 0 || x >= width || y >= height || width == 0 || height == 0 {
+        return None;
+    }
+
+    let edge_x = i32::from(edge_pixels.max(1)).min((width / 2).max(1));
+    let edge_y = i32::from(edge_pixels.max(1)).min((height / 2).max(1));
+    let left = x < edge_x;
+    let right = x >= width - edge_x;
+    let top = y < edge_y;
+    let bottom = y >= height - edge_y;
+
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(X11ResizeEdge::TopLeft),
+        (_, true, true, _) => Some(X11ResizeEdge::TopRight),
+        (true, _, _, true) => Some(X11ResizeEdge::BottomLeft),
+        (_, true, _, true) => Some(X11ResizeEdge::BottomRight),
+        (_, _, true, _) => Some(X11ResizeEdge::Top),
+        (_, _, _, true) => Some(X11ResizeEdge::Bottom),
+        (true, _, _, _) => Some(X11ResizeEdge::Left),
+        (_, true, _, _) => Some(X11ResizeEdge::Right),
+        _ => None,
+    }
+}
 
 // `_MOTIF_WM_HINTS` uses a different bit layout for decorations than it does
 // for window functions. Keep the decoration values explicit so that asking
@@ -150,6 +217,12 @@ fn motif_decorations_for(decorations: WindowDecorations) -> u32 {
     } else {
         MWM_DECOR_ALL
     }
+}
+
+fn uses_client_resize_edges(decorations: WindowDecorations) -> bool {
+    decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
+        && decorations.contains(WindowDecorations::RESIZE)
+        && motif_decorations_for(decorations) == 0
 }
 
 impl Drop for XWindowInner {
@@ -273,6 +346,45 @@ impl XWindowInner {
 
     fn set_cursor(&mut self, cursor: Option<MouseCursor>) -> anyhow::Result<()> {
         self.cursors.set_cursor(self.window_id, cursor)
+    }
+
+    fn wm_supports_moveresize(&self) -> bool {
+        let conn = self.conn();
+        let supported = conn
+            .supported
+            .borrow()
+            .contains(&conn.atom_net_wm_moveresize);
+        supported
+    }
+
+    fn resize_edge_at(&self, x: i16, y: i16) -> Option<X11ResizeEdge> {
+        if !uses_client_resize_edges(self.config.window_decorations)
+            || !self.last_wm_state.can_resize()
+            || !self.wm_supports_moveresize()
+        {
+            return None;
+        }
+
+        let edge_pixels =
+            (X11_RESIZE_EDGE_LOGICAL_PIXELS * self.dpi / crate::DEFAULT_DPI).round() as u16;
+        x11_resize_edge_at(x, y, self.width, self.height, edge_pixels)
+    }
+
+    fn update_resize_cursor(&mut self, x: i16, y: i16) -> anyhow::Result<bool> {
+        if let Some(edge) = self.resize_edge_at(x, y) {
+            self.set_cursor(Some(edge.cursor()))?;
+            self.resize_cursor_active = true;
+            Ok(true)
+        } else {
+            if self.resize_cursor_active {
+                // None selects the blank (invisible) cursor on X11; restore
+                // the default arrow instead. The next dispatched motion lets
+                // the application pick a more specific cursor.
+                self.set_cursor(Some(MouseCursor::Arrow))?;
+                self.resize_cursor_active = false;
+            }
+            Ok(false)
+        }
     }
 
     fn check_dpi_and_synthesize_resize(&mut self) {
@@ -463,9 +575,33 @@ impl XWindowInner {
     ) -> anyhow::Result<()> {
         self.copy_and_paste.time = time;
 
+        if self.edge_resizing {
+            if !pressed && detail == 1 {
+                self.edge_resizing = false;
+                return Ok(());
+            }
+            if pressed {
+                // A new press means that the WM already completed the resize
+                // without forwarding its release to us. Do not swallow the
+                // new application click.
+                self.edge_resizing = false;
+            }
+        }
+
         if self.cancel_drag() {
             log::debug!("cancel drag due to button {detail} {state:?}");
             return Ok(());
+        }
+
+        if pressed && detail == 1 {
+            if let Some(edge) = self.resize_edge_at(event_x, event_y) {
+                self.set_cursor(Some(edge.cursor()))?;
+                self.resize_cursor_active = true;
+                if self.net_wm_moveresize(root_x as u32, root_y as u32, edge as u32, 1) {
+                    self.edge_resizing = true;
+                    return Ok(());
+                }
+            }
         }
 
         let kind = match detail {
@@ -762,6 +898,9 @@ impl XWindowInner {
                     .process_key_release_event(key_release, &mut self.events);
             }
             Event::X(xcb::x::Event::MotionNotify(motion)) => {
+                if self.update_resize_cursor(motion.event_x(), motion.event_y())? {
+                    return Ok(());
+                }
                 let event = MouseEvent {
                     kind: MouseEventKind::Move,
                     coords: Point::new(
@@ -1259,6 +1398,13 @@ impl XWindowInner {
                 window_state |= WindowState::HIDDEN;
             }
         }
+        if let Ok(owner) = conn.send_and_wait_request(&xcb::x::GetSelectionOwner {
+            selection: conn.atom_net_wm_cm,
+        }) {
+            if owner.owner() != xcb::x::Window::none() {
+                window_state |= WindowState::COMPOSITED;
+            }
+        }
 
         Ok(window_state)
     }
@@ -1518,6 +1664,8 @@ impl XWindow {
                 current_mouse_event: None,
                 window_drag_position: None,
                 dragging: false,
+                edge_resizing: false,
+                resize_cursor_active: false,
                 outstanding_configure_requests: 0,
                 pending_finished_resizes: 0,
             }))
@@ -1652,7 +1800,23 @@ impl XWindowInner {
         log::trace!("clear out self.window_id");
         self.window_id = xcb::x::Window::none();
     }
-    fn hide(&mut self) {}
+    fn hide(&mut self) {
+        let conn = self.conn();
+        conn.send_request_no_reply_log(&xcb::x::SendEvent {
+            propagate: false,
+            destination: xcb::x::SendEventDest::Window(conn.root),
+            event_mask: xcb::x::EventMask::SUBSTRUCTURE_REDIRECT
+                | xcb::x::EventMask::SUBSTRUCTURE_NOTIFY,
+            event: &xcb::x::ClientMessageEvent::new(
+                self.window_id,
+                conn.atom_wm_change_state,
+                xcb::x::ClientMessageData::Data32(wm_change_state_iconic_data()),
+            ),
+        });
+        if let Err(err) = conn.flush() {
+            log::error!("Error flushing WM_CHANGE_STATE minimize request: {err:#}");
+        }
+    }
     fn show(&mut self) {
         self.conn().send_request_no_reply_log(&xcb::x::MapWindow {
             window: self.window_id,
@@ -1726,7 +1890,13 @@ impl XWindowInner {
         }
     }
 
-    fn net_wm_moveresize(&mut self, x_root: u32, y_root: u32, direction: u32, button: u32) {
+    fn net_wm_moveresize(
+        &mut self,
+        x_root: u32,
+        y_root: u32,
+        direction: u32,
+        button: u32,
+    ) -> bool {
         let source_indication = 1;
         let conn = self.conn();
 
@@ -1736,7 +1906,7 @@ impl XWindowInner {
             .contains(&conn.atom_net_wm_moveresize)
         {
             log::debug!("WM doesn't support _NET_WM_MOVERESIZE");
-            return;
+            return false;
         }
 
         log::debug!("net_wm_moveresize {x_root},{y_root} direction={direction} button={button}");
@@ -1749,11 +1919,6 @@ impl XWindowInner {
             conn.send_request_no_reply_log(&xcb::x::UngrabPointer {
                 time: self.copy_and_paste.time,
             });
-            // Flag to ourselves that we are dragging.
-            // This is also used to gate the fallback of calling
-            // set_window_position in case the WM doesn't support
-            // _NET_WM_MOVERESIZE and we returned early above.
-            self.dragging = true;
         }
 
         conn.send_request_no_reply_log(&xcb::x::SendEvent {
@@ -1774,6 +1939,7 @@ impl XWindowInner {
             ),
         });
         conn.flush().context("flush moveresize").ok();
+        true
     }
 
     fn request_drag_move(&mut self) -> anyhow::Result<()> {
@@ -1783,7 +1949,12 @@ impl XWindowInner {
         let y_root = pos.y as u32;
         let button = 1; // Left
 
-        self.net_wm_moveresize(x_root, y_root, _NET_WM_MOVERESIZE_MOVE, button);
+        if self.net_wm_moveresize(x_root, y_root, _NET_WM_MOVERESIZE_MOVE, button) {
+            // This gates the manual set_window_position fallback. Edge
+            // resizing deliberately uses a separate state because it never
+            // dispatched an application mouse press.
+            self.dragging = true;
+        }
         Ok(())
     }
 
@@ -2301,5 +2472,55 @@ mod tests {
             motif_decorations_for(WindowDecorations::INTEGRATED_BUTTONS),
             0
         );
+    }
+
+    #[test]
+    fn client_resize_edges_are_only_used_for_frameless_integrated_windows() {
+        assert!(uses_client_resize_edges(
+            WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE
+        ));
+        for decorations in [
+            WindowDecorations::TITLE | WindowDecorations::RESIZE,
+            WindowDecorations::RESIZE,
+            WindowDecorations::INTEGRATED_BUTTONS,
+            WindowDecorations::NONE,
+        ] {
+            assert!(!uses_client_resize_edges(decorations));
+        }
+    }
+
+    #[test]
+    fn resize_edge_hit_testing_covers_all_directions() {
+        let width = 100;
+        let height = 80;
+        let edge = 6;
+        for (x, y, expected) in [
+            (0, 0, X11ResizeEdge::TopLeft),
+            (50, 0, X11ResizeEdge::Top),
+            (99, 0, X11ResizeEdge::TopRight),
+            (99, 40, X11ResizeEdge::Right),
+            (99, 79, X11ResizeEdge::BottomRight),
+            (50, 79, X11ResizeEdge::Bottom),
+            (0, 79, X11ResizeEdge::BottomLeft),
+            (0, 40, X11ResizeEdge::Left),
+        ] {
+            assert_eq!(
+                x11_resize_edge_at(x, y, width, height, edge),
+                Some(expected)
+            );
+        }
+        assert_eq!(x11_resize_edge_at(50, 40, width, height, edge), None);
+    }
+
+    #[test]
+    fn resize_edge_hit_testing_rejects_outside_coordinates() {
+        assert_eq!(x11_resize_edge_at(-1, 0, 100, 80, 6), None);
+        assert_eq!(x11_resize_edge_at(100, 0, 100, 80, 6), None);
+        assert_eq!(x11_resize_edge_at(0, 80, 100, 80, 6), None);
+    }
+
+    #[test]
+    fn minimize_uses_icccm_iconic_state_payload() {
+        assert_eq!(wm_change_state_iconic_data(), [3, 0, 0, 0, 0]);
     }
 }

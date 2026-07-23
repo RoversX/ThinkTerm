@@ -105,10 +105,14 @@ pub(crate) struct SshHostsView {
     filtered: Vec<SshHostEntry>,
     system_host_count: usize,
     system_hosts_collapsed: bool,
+    /// Split position in design pixels; painted via ctx.px.
     left_width: f32,
     dragging_left_pane: bool,
     last_area_x: f32,
     last_area_w: f32,
+    /// ui scale captured at paint time so mouse handlers (no DrawContext)
+    /// can convert pointer pixels back into design pixels.
+    last_ui_scale: f32,
     list_area: RectF,
     /// When true the focused field is "select-all"; the next edit replaces it.
     select_all: bool,
@@ -131,6 +135,7 @@ impl SshHostsView {
             dragging_left_pane: false,
             last_area_x: 0.0,
             last_area_w: 0.0,
+            last_ui_scale: 1.0,
             list_area: rect(0.0, 0.0, 0.0, 0.0),
             select_all: false,
             widgets: UiContext::default(),
@@ -353,8 +358,12 @@ impl SshHostsView {
             }
             WMEK::Move => {
                 if self.dragging_left_pane {
+                    let scale = self.last_ui_scale.max(0.01);
                     self.left_width =
-                        Self::clamp_left_width(x - self.last_area_x, self.last_area_w);
+                        Self::clamp_left_width(
+                            (x - self.last_area_x) / scale,
+                            self.last_area_w / scale,
+                        );
                     return ContentViewResponse::Redraw;
                 }
                 if self.interaction.hovered != hit {
@@ -670,20 +679,21 @@ impl SshHostsView {
         let h = area.size.height;
         self.last_area_x = ox;
         self.last_area_w = w;
-        self.left_width = Self::clamp_left_width(self.left_width, w);
+        self.last_ui_scale = ctx.px(1.0).max(0.01);
+        self.left_width = Self::clamp_left_width(self.left_width, w / self.last_ui_scale);
 
         // Background.
         ctx.draw_rect(layers, 0, ox, oy, w, h, palette.window_bg)?;
 
-        let left_w = self.left_width;
-        let left_x = ox + PAD;
-        let inner_left_w = left_w - PAD * 2.0;
+        let left_w = ctx.px(self.left_width);
+        let left_x = ox + ctx.px(PAD);
+        let inner_left_w = left_w - ctx.px(PAD * 2.0);
 
-        let search_y = oy + PAD + 48.0;
+        let search_y = oy + ctx.px(PAD + 48.0);
 
         // Host list.
-        let list_top = search_y + INPUT_H + 14.0;
-        let list_bottom = oy + h - PAD;
+        let list_top = search_y + ctx.px(INPUT_H + 14.0);
+        let list_bottom = oy + h - ctx.px(PAD);
         self.list_area = rect(
             left_x,
             list_top,
@@ -696,7 +706,7 @@ impl SshHostsView {
                 layers,
                 font,
                 left_x,
-                list_top + 8.0,
+                list_top + ctx.px(8.0),
                 "No hosts yet. Click + to add.",
                 palette.muted_text,
                 inner_left_w,
@@ -717,15 +727,15 @@ impl SshHostsView {
                 } else {
                     0
                 };
-            let mut content_h = Self::rows_height(think_count, row_h);
+            let mut content_h = Self::rows_height(think_count, row_h, ctx.px(ROW_GAP));
             if self.system_host_count > 0 {
                 if content_h > 0.0 {
-                    content_h += ROW_GAP + 4.0;
+                    content_h += ctx.px(ROW_GAP + 4.0);
                 } else {
-                    content_h += 4.0;
+                    content_h += ctx.px(4.0);
                 }
-                content_h += GROUP_ROW_H + 10.0;
-                content_h += Self::rows_height(visible_system_count, row_h);
+                content_h += ctx.px(GROUP_ROW_H + 10.0);
+                content_h += Self::rows_height(visible_system_count, row_h, ctx.px(ROW_GAP));
             }
             self.scroll
                 .set_extents(self.list_area.size.height, content_h);
@@ -754,12 +764,12 @@ impl SshHostsView {
                         list_bottom,
                     )?;
                 }
-                row_y += row_h + ROW_GAP;
+                row_y += row_h + ctx.px(ROW_GAP);
             }
 
             if self.system_host_count > 0 {
-                row_y += 4.0;
-                if Self::row_visible(row_y, GROUP_ROW_H, list_top, list_bottom) {
+                row_y += ctx.px(4.0);
+                if Self::row_visible(row_y, ctx.px(GROUP_ROW_H), list_top, list_bottom) {
                     self.paint_system_group_header(
                         ctx,
                         layers,
@@ -771,7 +781,7 @@ impl SshHostsView {
                         list_top,
                         list_bottom,
                     )?;
-                    row_y += GROUP_ROW_H + 10.0;
+                    row_y += ctx.px(GROUP_ROW_H + 10.0);
                 }
                 if !self.system_hosts_collapsed || !self.search.trim().is_empty() {
                     for (i, entry) in filtered
@@ -797,7 +807,7 @@ impl SshHostsView {
                                 list_bottom,
                             )?;
                         }
-                        row_y += row_h + ROW_GAP;
+                        row_y += row_h + ctx.px(ROW_GAP);
                     }
                 }
             }
@@ -830,7 +840,7 @@ impl SshHostsView {
             layers,
             font,
             left_x,
-            oy + PAD,
+            oy + ctx.px(PAD),
             search_y,
             inner_left_w,
             palette,
@@ -842,17 +852,17 @@ impl SshHostsView {
         }
 
         // Right pane: form or empty hint.
-        let right_x = ox + left_w + PAD;
-        let right_w = (ox + w - PAD) - right_x;
+        let right_x = ox + left_w + ctx.px(PAD);
+        let right_w = (ox + w - ctx.px(PAD)) - right_x;
         // Vertical separator.
         let split_x = ox + left_w;
         ctx.draw_rect(
             layers,
             0,
             split_x,
-            oy + PAD,
+            oy + ctx.px(PAD),
             if self.dragging_left_pane { 2.0 } else { 1.0 },
-            h - PAD * 2.0,
+            h - ctx.px(PAD * 2.0),
             if self.dragging_left_pane {
                 palette.selected_bg
             } else {
@@ -860,7 +870,12 @@ impl SshHostsView {
             },
         )?;
         self.widgets.push(
-            rect(split_x - SPLIT_HANDLE_W / 2.0, oy, SPLIT_HANDLE_W, h),
+            rect(
+                split_x - ctx.px(SPLIT_HANDLE_W / 2.0),
+                oy,
+                ctx.px(SPLIT_HANDLE_W),
+                h,
+            ),
             WidgetKind::ResizeHandle,
             SshViewAction::ResizeLeftPane,
         );
@@ -874,7 +889,7 @@ impl SshHostsView {
                 tokens,
                 cursor_on,
                 right_x,
-                oy + PAD,
+                oy + ctx.px(PAD),
                 right_w,
             )?;
         } else {
@@ -917,7 +932,12 @@ impl SshHostsView {
             inner_left_w,
         )?;
 
-        let search_rect = rect(left_x, search_y, inner_left_w - INPUT_H - 8.0, INPUT_H);
+        let search_rect = rect(
+            left_x,
+            search_y,
+            inner_left_w - ctx.px(INPUT_H + 8.0),
+            ctx.px(INPUT_H),
+        );
         self.widgets
             .push(search_rect, WidgetKind::TextInput, SshViewAction::Search);
         let search_focused = matches!(self.focus, Focus::Search);
@@ -940,7 +960,7 @@ impl SshHostsView {
             tokens.control_radius,
         )?;
 
-        let text_pad = 12.0;
+        let text_pad = ctx.px(12.0);
         let (search_text, search_color) = if self.search.is_empty() && !search_focused {
             ("Search hosts...", palette.muted_text)
         } else {
@@ -953,12 +973,12 @@ impl SshHostsView {
             ctx.draw_rounded_rect(
                 layers,
                 2,
-                search_rect.origin.x + text_pad - 4.0,
-                search_rect.origin.y + 5.0,
-                selection_width + 8.0,
+                search_rect.origin.x + text_pad - ctx.px(4.0),
+                search_rect.origin.y + ctx.px(5.0),
+                selection_width + ctx.px(8.0),
                 search_rect.size.height - 10.0,
                 palette.selected_bg.mul_alpha(0.56),
-                (tokens.control_radius - 5.0).max(3.0),
+                (tokens.control_radius - ctx.px(5.0)).max(ctx.px(3.0)),
             )?;
         }
         ctx.draw_text_on_layer(
@@ -981,15 +1001,15 @@ impl SshHostsView {
                 layers,
                 2,
                 caret_x - 1.0,
-                search_rect.origin.y + 5.0,
-                3.0,
+                search_rect.origin.y + ctx.px(5.0),
+                ctx.px(3.0),
                 search_rect.size.height - 10.0,
                 palette.selected_bg,
             )?;
         }
 
-        let add_x = left_x + inner_left_w - INPUT_H;
-        let add_rect = rect(add_x, search_y, INPUT_H, INPUT_H);
+        let add_x = left_x + inner_left_w - ctx.px(INPUT_H);
+        let add_rect = rect(add_x, search_y, ctx.px(INPUT_H), ctx.px(INPUT_H));
         self.widgets
             .push(add_rect, WidgetKind::Button, SshViewAction::New);
         let add_hovered = self.interaction.hovered == Some(SshViewAction::New);
@@ -1002,14 +1022,23 @@ impl SshHostsView {
             LinearRgba::TRANSPARENT
         };
         if add_bg.3 > 0.0 {
-            ctx.draw_rounded_rect(layers, 2, add_x, search_y, INPUT_H, INPUT_H, add_bg, 8.0)?;
+            ctx.draw_rounded_rect(
+                layers,
+                2,
+                add_x,
+                search_y,
+                ctx.px(INPUT_H),
+                ctx.px(INPUT_H),
+                add_bg,
+                ctx.px(8.0),
+            )?;
         }
         let icon_size = (ctx.metrics.cell_size.height as f32 + 4.0).clamp(20.0, 30.0);
         ctx.draw_svg_icon(
             layers,
             SvgIcon::Plus,
-            add_x + (INPUT_H - icon_size) / 2.0,
-            search_y + (INPUT_H - icon_size) / 2.0,
+            add_x + (ctx.px(INPUT_H) - icon_size) / 2.0,
+            search_y + (ctx.px(INPUT_H) - icon_size) / 2.0,
             icon_size,
             if add_hovered || add_pressed {
                 palette.text
@@ -1037,7 +1066,7 @@ impl SshHostsView {
             return Ok(());
         }
 
-        let fade_height = LIST_FADE_HEIGHT.min(area.size.height).ceil() as usize;
+        let fade_height = ctx.px(LIST_FADE_HEIGHT).min(area.size.height).ceil() as usize;
         if fade_height == 0 {
             return Ok(());
         }
@@ -1116,7 +1145,7 @@ impl SshHostsView {
         list_bottom: f32,
     ) -> anyhow::Result<()> {
         let hit_y = y.max(list_top);
-        let hit_h = (y + GROUP_ROW_H).min(list_bottom) - hit_y;
+        let hit_h = (y + ctx.px(GROUP_ROW_H)).min(list_bottom) - hit_y;
         let rect = rect(x, hit_y, width, hit_h.max(0.0));
         self.widgets.push(
             rect,
@@ -1131,7 +1160,7 @@ impl SshHostsView {
                 x,
                 y,
                 width,
-                GROUP_ROW_H,
+                ctx.px(GROUP_ROW_H),
                 palette.sidebar_row_hover_bg,
                 10.0,
             )?;
@@ -1146,8 +1175,8 @@ impl SshHostsView {
         ctx.draw_text(
             layers,
             font,
-            x + 42.0,
-            y + 8.0,
+            x + ctx.px(42.0),
+            y + ctx.px(8.0),
             &label,
             palette.muted_text,
             (width - 50.0).max(0.0),
@@ -1156,14 +1185,14 @@ impl SshHostsView {
     }
 
     fn host_row_height(ctx: &DrawContext) -> f32 {
-        (ctx.metrics.cell_size.height as f32 * 2.15 + 26.0).max(ROW_MIN_H)
+        (ctx.metrics.cell_size.height as f32 * 2.15 + ctx.px(26.0)).max(ctx.px(ROW_MIN_H))
     }
 
-    fn rows_height(count: usize, row_h: f32) -> f32 {
+    fn rows_height(count: usize, row_h: f32, row_gap: f32) -> f32 {
         if count == 0 {
             0.0
         } else {
-            count as f32 * row_h + (count.saturating_sub(1)) as f32 * ROW_GAP
+            count as f32 * row_h + (count.saturating_sub(1)) as f32 * row_gap
         }
     }
 
@@ -1207,13 +1236,13 @@ impl SshHostsView {
             LinearRgba::TRANSPARENT
         };
         if bg.3 > 0.0 {
-            ctx.draw_rounded_rect(layers, 0, x, y, width, row_h, bg, HOST_ROW_RADIUS)?;
+            ctx.draw_rounded_rect(layers, 0, x, y, width, row_h, bg, ctx.px(HOST_ROW_RADIUS))?;
         }
 
         // OS / brand icon.
         let line_h = ctx.metrics.cell_size.height as f32;
-        let icon_size = (line_h * 1.05).clamp(34.0, 48.0);
-        let icon_x = x + 12.0;
+        let icon_size = (line_h * 1.05).clamp(ctx.px(34.0), ctx.px(48.0));
+        let icon_x = x + ctx.px(12.0);
         let icon_y = y + (row_h - icon_size) / 2.0;
         match spec.detected_distro.as_deref().and_then(distro_to_icon) {
             Some(brand) => ctx.draw_brand_icon(layers, brand, icon_x, icon_y, icon_size)?,
@@ -1227,16 +1256,16 @@ impl SshHostsView {
             )?,
         }
 
-        let text_x = icon_x + icon_size + 14.0;
+        let text_x = icon_x + icon_size + ctx.px(14.0);
         let action_space = if entry.source == SshHostSource::ThinkTerm {
-            HOST_ACTION_RIGHT_PAD + HOST_ACTION_BTN * 2.0 + HOST_ACTION_GAP + 10.0
+            ctx.px(HOST_ACTION_RIGHT_PAD + HOST_ACTION_BTN * 2.0 + HOST_ACTION_GAP + 10.0)
         } else {
-            16.0
+            ctx.px(16.0)
         };
         let text_w = width - (text_x - x) - action_space;
         let stack_h = line_h * 2.02;
-        let title_y = y + ((row_h - stack_h) / 2.0).max(8.0) - 2.0;
-        let subtitle_y = (title_y + line_h * 1.02).min(y + row_h - line_h - 8.0);
+        let title_y = y + ((row_h - stack_h) / 2.0).max(ctx.px(8.0)) - ctx.px(2.0);
+        let subtitle_y = (title_y + line_h * 1.02).min(y + row_h - line_h - ctx.px(8.0));
         ctx.draw_text(
             layers,
             font,
@@ -1279,7 +1308,7 @@ impl SshHostsView {
         if entry.source == SshHostSource::System {
             return Ok(());
         }
-        let btn = HOST_ACTION_BTN;
+        let btn = ctx.px(HOST_ACTION_BTN);
         let btn_y = y + (row_h - btn) / 2.0;
         draw_icon_button(
             ctx,
@@ -1287,7 +1316,7 @@ impl SshHostsView {
             &mut self.widgets,
             &self.interaction,
             palette,
-            x + width - HOST_ACTION_RIGHT_PAD - btn * 2.0 - HOST_ACTION_GAP,
+            x + width - ctx.px(HOST_ACTION_RIGHT_PAD) - btn * 2.0 - ctx.px(HOST_ACTION_GAP),
             btn_y,
             btn,
             SvgIcon::SlidersHorizontal,
@@ -1299,7 +1328,7 @@ impl SshHostsView {
             &mut self.widgets,
             &self.interaction,
             palette,
-            x + width - HOST_ACTION_RIGHT_PAD - btn,
+            x + width - ctx.px(HOST_ACTION_RIGHT_PAD) - btn,
             btn_y,
             btn,
             SvgIcon::Trash2,
@@ -1341,8 +1370,8 @@ impl SshHostsView {
         )?;
 
         let line_h = ctx.metrics.cell_size.height as f32;
-        let field_w = width.min(560.0);
-        let mut cur_y = y + line_h + 18.0;
+        let field_w = width.min(ctx.px(560.0));
+        let mut cur_y = y + line_h + ctx.px(18.0);
         for i in 0..BASE_FIELD_COUNT {
             ctx.draw_text(
                 layers,
@@ -1353,7 +1382,7 @@ impl SshHostsView {
                 palette.muted_text,
                 field_w,
             )?;
-            let input_y = cur_y + line_h + 6.0;
+            let input_y = cur_y + line_h + ctx.px(6.0);
             // Mask the password field.
             let masked = if i == FIELD_PASSWORD {
                 "•".repeat(fields[i].chars().count())
@@ -1373,23 +1402,23 @@ impl SshHostsView {
                 &self.interaction,
                 palette,
                 tokens,
-                12.0,
+                ctx.px(12.0),
                 cursor_on,
                 TextInputSpec {
                     placeholder: "",
                     text: shown,
-                    rect: rect(x, input_y, field_w, INPUT_H),
+                    rect: rect(x, input_y, field_w, ctx.px(INPUT_H)),
                     focused: focus == Focus::Field(i),
                     selected_all: focus == Focus::Field(i) && self.select_all,
                     action: SshViewAction::FocusField(i),
                 },
             )?;
-            cur_y = input_y + INPUT_H + 18.0;
+            cur_y = input_y + ctx.px(INPUT_H + 18.0);
         }
 
         // Detect-OS toggle.
-        let toggle_w = 44.0;
-        let toggle_h = 24.0;
+        let toggle_w = ctx.px(44.0);
+        let toggle_h = ctx.px(24.0);
         ctx.draw_text(
             layers,
             font,
@@ -1397,7 +1426,7 @@ impl SshHostsView {
             cur_y + (toggle_h - line_h) / 2.0,
             "Detect OS on connect",
             palette.text,
-            field_w - toggle_w - 12.0,
+            field_w - toggle_w - ctx.px(12.0),
         )?;
         draw_toggle(
             ctx,
@@ -1408,7 +1437,7 @@ impl SshHostsView {
             detect_os,
             SshViewAction::ToggleDetect,
         )?;
-        cur_y += toggle_h + 24.0;
+        cur_y += toggle_h + ctx.px(24.0);
 
         // Use-Mosh toggle: connect by launching the local `mosh` client instead
         // of the SSH domain.
@@ -1419,7 +1448,7 @@ impl SshHostsView {
             cur_y + (toggle_h - line_h) / 2.0,
             "Connect with Mosh",
             palette.text,
-            field_w - toggle_w - 12.0,
+            field_w - toggle_w - ctx.px(12.0),
         )?;
         draw_toggle(
             ctx,
@@ -1430,7 +1459,7 @@ impl SshHostsView {
             use_mosh,
             SshViewAction::ToggleMosh,
         )?;
-        cur_y += toggle_h + 24.0;
+        cur_y += toggle_h + ctx.px(24.0);
 
         if use_mosh {
             draw_text_input(
@@ -1441,18 +1470,18 @@ impl SshHostsView {
                 &self.interaction,
                 palette,
                 tokens,
-                12.0,
+                ctx.px(12.0),
                 cursor_on,
                 TextInputSpec {
                     placeholder: ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND,
                     text: &fields[FIELD_MOSH_SERVER],
-                    rect: rect(x, cur_y, field_w, INPUT_H),
+                    rect: rect(x, cur_y, field_w, ctx.px(INPUT_H)),
                     focused: focus == Focus::Field(FIELD_MOSH_SERVER),
                     selected_all: focus == Focus::Field(FIELD_MOSH_SERVER) && self.select_all,
                     action: SshViewAction::FocusField(FIELD_MOSH_SERVER),
                 },
             )?;
-            cur_y += INPUT_H + 24.0;
+            cur_y += ctx.px(INPUT_H + 24.0);
         }
 
         // ThinkTerm-Connect toggle: attach the persistent remote mux domain
@@ -1465,7 +1494,7 @@ impl SshHostsView {
             cur_y + (toggle_h - line_h) / 2.0,
             "ThinkTerm Connect (persistent mux)",
             palette.text,
-            field_w - toggle_w - 12.0,
+            field_w - toggle_w - ctx.px(12.0),
         )?;
         draw_toggle(
             ctx,
@@ -1476,7 +1505,7 @@ impl SshHostsView {
             multiplexing,
             SshViewAction::ToggleMux,
         )?;
-        cur_y += toggle_h + 24.0;
+        cur_y += toggle_h + ctx.px(24.0);
 
         if let Some(err) = &error {
             ctx.draw_text(
@@ -1488,12 +1517,12 @@ impl SshHostsView {
                 palette.text,
                 field_w,
             )?;
-            cur_y += line_h + 12.0;
+            cur_y += line_h + ctx.px(12.0);
         }
 
         // Buttons sized to their (measured) label so nothing is truncated.
-        let gap = 12.0;
-        let btn_w = |label: &str| ctx.measure_text_width(font, label) + 36.0;
+        let gap = ctx.px(12.0);
+        let btn_w = |label: &str| ctx.measure_text_width(font, label) + ctx.px(36.0);
         let mut bx = x;
         for (label, action, primary) in [
             ("Save & Open", SshViewAction::SaveAndConnect, true),
@@ -1504,7 +1533,7 @@ impl SshHostsView {
             let spec = ButtonSpec {
                 label,
                 action,
-                rect: rect(bx, cur_y, w, BTN_H),
+                rect: rect(bx, cur_y, w, ctx.px(BTN_H)),
                 state: self.button_state(action, primary),
                 kind: WidgetKind::Button,
             };

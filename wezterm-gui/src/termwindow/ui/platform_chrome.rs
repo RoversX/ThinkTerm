@@ -22,6 +22,14 @@ pub struct WindowTabChromeParams {
     pub dpi: usize,
 }
 
+pub fn uses_integrated_window_buttons(
+    decorations: WindowDecorations,
+    window_state: WindowState,
+) -> bool {
+    decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
+        && !window_state.contains(WindowState::SERVER_DECORATED)
+}
+
 impl WindowTabChromeParams {
     fn px(self, value: usize) -> usize {
         scale_ui_usize(value, self.dpi)
@@ -45,6 +53,10 @@ impl WindowTabChromeParams {
         }
 
         0
+    }
+
+    pub fn uses_integrated_window_buttons(self) -> bool {
+        uses_integrated_window_buttons(self.window_decorations, self.window_state)
     }
 
     pub fn shows_sidebar_toggle_action(self) -> bool {
@@ -106,9 +118,7 @@ impl WindowTabChromeParams {
             return leading_action_padding.max(self.px(MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH) as f32);
         }
 
-        if self
-            .window_decorations
-            .contains(WindowDecorations::INTEGRATED_BUTTONS)
+        if self.uses_integrated_window_buttons()
             && (self.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Left
                 || self.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative)
         {
@@ -149,11 +159,10 @@ pub fn workspace_sidebar_toolbar_uses_fullscreen_style(window_state: WindowState
     window_state.contains(WindowState::FULL_SCREEN)
 }
 
+/// Sizes are design pixels (2x macOS backing); callers scale via ui_px.
 pub fn workspace_sidebar_toolbar_button_size(window_state: WindowState) -> usize {
     if workspace_sidebar_toolbar_uses_fullscreen_style(window_state) {
         WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
-    } else if !cfg!(target_os = "macos") {
-        WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE + 8
     } else {
         WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
     }
@@ -162,9 +171,48 @@ pub fn workspace_sidebar_toolbar_button_size(window_state: WindowState) -> usize
 pub fn workspace_sidebar_toolbar_icon_size(window_state: WindowState) -> usize {
     if workspace_sidebar_toolbar_uses_fullscreen_style(window_state) {
         WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE
-    } else if !cfg!(target_os = "macos") {
-        WINDOW_TAB_LEADING_ACTION_ICON_SIZE + 6
     } else {
         WINDOW_TAB_LEADING_ACTION_ICON_SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_decorations_suppress_integrated_window_buttons() {
+        let decorations = WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE;
+        assert!(uses_integrated_window_buttons(
+            decorations,
+            WindowState::default()
+        ));
+        assert!(!uses_integrated_window_buttons(
+            decorations,
+            WindowState::SERVER_DECORATED
+        ));
+    }
+
+    #[test]
+    fn toolbar_sizes_are_shared_design_pixels() {
+        // Same design-pixel values on every platform; ui_px maps them to
+        // the local scale (halving at 96dpi), so per-OS values would
+        // double-apply the reduction.
+        assert_eq!(
+            workspace_sidebar_toolbar_button_size(WindowState::default()),
+            WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE
+        );
+        assert_eq!(
+            workspace_sidebar_toolbar_icon_size(WindowState::default()),
+            WINDOW_TAB_LEADING_ACTION_ICON_SIZE
+        );
+        assert_eq!(
+            workspace_sidebar_toolbar_button_size(WindowState::FULL_SCREEN),
+            WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE
+        );
+        assert_eq!(
+            workspace_sidebar_toolbar_icon_size(WindowState::FULL_SCREEN),
+            WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE
+        );
     }
 }

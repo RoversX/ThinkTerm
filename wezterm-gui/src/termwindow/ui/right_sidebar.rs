@@ -10,6 +10,7 @@ use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorT
 use crate::termwindow::ui::icons::{
     MaterialIcon, SvgIcon, material_file_icon_for_name, material_folder_icon_for_name,
 };
+use crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET,
     SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_RADIUS, WINDOW_TAB_ADD_BUTTON_RADIUS,
@@ -52,7 +53,7 @@ use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{
     Clipboard, ContextMenuIcon, ContextMenuItem, DeadKeyStatus, FolderPickerOptions,
-    IntegratedTitleButtonStyle, Point, Rect, WindowDecorations, WindowOps,
+    IntegratedTitleButtonStyle, Point, Rect, WindowOps,
 };
 
 const RIGHT_SIDEBAR_SECTION_GAP: usize = 12;
@@ -106,7 +107,10 @@ const NOTE_IMAGE_CACHE_MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const NOTE_VAULT_SPLIT_MIN_WIDTH: usize = 620;
 const NOTE_VAULT_TREE_WIDTH: usize = 230;
 const NOTE_VAULT_RESCAN_SECS: u64 = 10;
-const FILE_FONT_MIN_SIZE: f64 = 14.0;
+// Points render 4/3 larger at 96dpi than on macOS, so the floor follows
+// the same 0.75x rule as the default font sizes; otherwise it pins the
+// Files panel above any reasonable Home Font Size setting on Linux.
+const FILE_FONT_MIN_SIZE: f64 = if cfg!(target_os = "macos") { 14.0 } else { 10.5 };
 const FILE_FILTER_HEIGHT: usize = 66;
 const FILE_TREE_TOP_GAP: usize = 14;
 const FILE_SCROLL_FADE_HEIGHT: usize = 32;
@@ -1050,10 +1054,7 @@ impl crate::TermWindow {
 
     fn right_sidebar_window_button_reserved_width(&self) -> usize {
         if cfg!(target_os = "macos")
-            || !self
-                .config
-                .window_decorations
-                .contains(WindowDecorations::INTEGRATED_BUTTONS)
+            || !uses_integrated_window_buttons(self.config.window_decorations, self.window_state)
             || self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
         {
             return 0;
@@ -1513,7 +1514,7 @@ impl crate::TermWindow {
         let old = self.right_sidebar_snippet_scroll_offset;
         let max = self.right_sidebar_snippet_scroll_max();
         let steps = amount.unsigned_abs().max(1) as f32;
-        let delta = (steps * 6.0).min(42.0);
+        let delta = (steps * self.ui_f32(6.0)).min(self.ui_f32(42.0));
         if amount < 0 {
             self.right_sidebar_snippet_scroll_offset =
                 (self.right_sidebar_snippet_scroll_offset + delta).clamp(0.0, max);
@@ -5027,7 +5028,7 @@ impl crate::TermWindow {
         let track_height = visible_height.max(1);
         let thumb_height = ((visible_height as f32 / metrics.total_height as f32)
             * track_height as f32)
-            .clamp(28.0, track_height as f32);
+            .clamp(self.ui_f32(28.0), track_height as f32);
         let travel = (track_height as f32 - thumb_height).max(1.0);
         let scroll_offset = self
             .right_sidebar_file_preview_scroll_offset
@@ -5073,7 +5074,7 @@ impl crate::TermWindow {
         let track_width = text_width.max(1);
         let track_height = self.ui_px(FILE_PREVIEW_SCROLLBAR_THICKNESS);
         let thumb_width = ((visible_columns as f32 / max_columns as f32) * track_width as f32)
-            .clamp(28.0, track_width as f32);
+            .clamp(self.ui_f32(28.0), track_width as f32);
         let travel = (track_width as f32 - thumb_width).max(1.0);
         let scroll_offset = self
             .right_sidebar_file_preview_horizontal_offset
@@ -5166,7 +5167,7 @@ impl crate::TermWindow {
         let track_width = 4usize;
         let track_height = visible_height.max(1);
         let thumb_height = ((visible_height as f32 / total_height as f32) * track_height as f32)
-            .clamp(28.0, track_height as f32);
+            .clamp(self.ui_f32(28.0), track_height as f32);
         let travel = (track_height as f32 - thumb_height).max(1.0);
         let scroll_offset = self
             .right_sidebar_snippet_scroll_offset
@@ -10725,7 +10726,7 @@ impl crate::TermWindow {
                                     text_x as f32 + start_w,
                                     baseline_y as f32 - 2.0,
                                     sel_w,
-                                    ui_metrics.cell_size.height as f32 + 4.0,
+                                    ui_metrics.cell_size.height as f32 + self.ui_f32(4.0),
                                 ),
                                 chrome.selected_bg.mul_alpha(0.55),
                             )

@@ -93,6 +93,8 @@ pub struct XConnection {
     pub atom_net_wm_icon: Atom,
     pub atom_net_move_resize_window: Atom,
     pub atom_net_wm_moveresize: Atom,
+    pub atom_wm_change_state: Atom,
+    pub atom_net_wm_cm: Atom,
     pub atom_net_supported: Atom,
     pub atom_net_supporting_wm_check: Atom,
     pub atom_net_active_window: Atom,
@@ -711,6 +713,8 @@ impl XConnection {
         let atom_net_wm_icon = Self::intern_atom(&conn, "_NET_WM_ICON")?;
         let atom_net_move_resize_window = Self::intern_atom(&conn, "_NET_MOVERESIZE_WINDOW")?;
         let atom_net_wm_moveresize = Self::intern_atom(&conn, "_NET_WM_MOVERESIZE")?;
+        let atom_wm_change_state = Self::intern_atom(&conn, "WM_CHANGE_STATE")?;
+        let atom_net_wm_cm = Self::intern_atom(&conn, &format!("_NET_WM_CM_S{}", screen_num))?;
         let atom_net_supported = Self::intern_atom(&conn, "_NET_SUPPORTED")?;
         let atom_net_supporting_wm_check = Self::intern_atom(&conn, "_NET_SUPPORTING_WM_CHECK")?;
         let atom_net_active_window = Self::intern_atom(&conn, "_NET_ACTIVE_WINDOW")?;
@@ -847,6 +851,8 @@ impl XConnection {
             atom_net_wm_name,
             atom_net_move_resize_window,
             atom_net_wm_moveresize,
+            atom_wm_change_state,
+            atom_net_wm_cm,
             atom_net_supported,
             atom_net_supporting_wm_check,
             atom_net_active_window,

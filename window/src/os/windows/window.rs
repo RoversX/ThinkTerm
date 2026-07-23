@@ -1989,6 +1989,8 @@ fn apply_mouse_cursor(cursor: Option<MouseCursor>) {
                     MouseCursor::Text => IDC_IBEAM,
                     MouseCursor::SizeUpDown => IDC_SIZENS,
                     MouseCursor::SizeLeftRight => IDC_SIZEWE,
+                    MouseCursor::SizeNorthWestSouthEast => IDC_SIZENWSE,
+                    MouseCursor::SizeNorthEastSouthWest => IDC_SIZENESW,
                 },
             ));
         },

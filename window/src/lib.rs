@@ -390,6 +390,8 @@ pub enum MouseCursor {
     Text,
     SizeUpDown,
     SizeLeftRight,
+    SizeNorthWestSouthEast,
+    SizeNorthEastSouthWest,
 }
 
 /// Represents the preferred appearance of the windowing
@@ -422,7 +424,7 @@ impl std::string::ToString for Appearance {
 
 bitflags! {
     #[derive(Default)]
-    pub struct WindowState: u8 {
+    pub struct WindowState: u16 {
         /// Occupies the whole screen; cannot be resized while in this state.
         const FULL_SCREEN = 1<<1;
         /// Maximized along either or both of horizontal or vertical dimensions;
@@ -435,6 +437,12 @@ bitflags! {
         const ALWAYS_ON_TOP = 1<<4;
         /// Always on bottom (docked) window
         const ALWAYS_ON_BOTTOM = 1<<5;
+        /// The compositor/window manager is drawing the title bar.
+        const SERVER_DECORATED = 1<<6;
+        /// The compositor has tiled the window against one or more edges.
+        const TILED = 1<<7;
+        /// The window system can preserve transparent pixels in the surface.
+        const COMPOSITED = 1<<8;
     }
 }
 

@@ -21,6 +21,8 @@ uniform sampler2D atlas_nearest_sampler;
 uniform sampler2D atlas_linear_sampler;
 uniform bool subpixel_aa;
 uniform uint milliseconds;
+uniform vec3 window_clip;
+uniform vec4 window_border;
 
 struct ColorEase {
   vec4 in_function;
@@ -82,6 +84,45 @@ vec4 apply_hsv(vec4 c, vec3 transform)
   }
   vec3 hsv = rgb2hsv(c.rgb) * transform;
   return vec4(hsv2rgb(hsv).rgb, c.a);
+}
+
+float rounded_window_coverage(vec2 position)
+{
+  float radius = window_clip.z;
+  if (radius <= 0.0) {
+    return 1.0;
+  }
+
+  bool in_corner_x = position.x < radius || position.x > window_clip.x - radius;
+  bool in_corner_y = position.y < radius || position.y > window_clip.y - radius;
+  if (!in_corner_x || !in_corner_y) {
+    return 1.0;
+  }
+
+  vec2 center = vec2(
+    position.x > window_clip.x * 0.5 ? window_clip.x - radius : radius,
+    position.y > window_clip.y * 0.5 ? window_clip.y - radius : radius
+  );
+  return 1.0 - smoothstep(radius - 1.0, radius, distance(position, center));
+}
+
+float rounded_window_signed_distance(vec2 position)
+{
+  vec2 viewport = window_clip.xy;
+  vec2 half_size = viewport * 0.5;
+  float radius = min(max(window_clip.z, 0.0), min(half_size.x, half_size.y));
+  vec2 q = abs(position - half_size) - (half_size - vec2(radius));
+  return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+float rounded_window_border_coverage(vec2 position)
+{
+  float width = window_border.w;
+  if (width <= 0.0) {
+    return 0.0;
+  }
+  float signed_distance = rounded_window_signed_distance(position);
+  return smoothstep(-width - 0.5, -width + 0.5, signed_distance);
 }
 
 /*
@@ -154,6 +195,19 @@ void main() {
   }
 
   color = apply_hsv(color, o_hsv);
+
+  float border_coverage = rounded_window_border_coverage(gl_FragCoord.xy);
+  color = mix(color, vec4(window_border.rgb, 1.0), border_coverage);
+  if (subpixel_aa) {
+    colorMask = mix(colorMask, vec4(1.0), border_coverage);
+  }
+
+  float coverage = rounded_window_coverage(gl_FragCoord.xy);
+  if (coverage <= 0.0) {
+    discard;
+  }
+  color.a *= coverage;
+  colorMask *= coverage;
 
   // We MUST output SRGB and tell glium that we do that (outputs_srgb),
   // otherwise something in glium over-gamma-corrects depending on the gl setup.

@@ -399,10 +399,18 @@ impl crate::TermWindow {
         let target_rect = state.target.as_ref().map(|target| target.rect);
 
         if let Some(rect) = target_rect {
-            let chrome =
-                UiPalette::for_appearance(crate::native_settings::effective_appearance());
-            let fill = chrome.selected_bg.mul_alpha(0.28);
-            let border = chrome.selected_bg.mul_alpha(0.8);
+            // Explicit accent blue: the palette's selected_bg is gray in
+            // dark mode, but the drop preview should read as blue in both.
+            let accent = match crate::native_settings::effective_appearance() {
+                window::Appearance::Light | window::Appearance::LightHighContrast => {
+                    LinearRgba::with_srgba(0, 122, 255, 255)
+                }
+                window::Appearance::Dark | window::Appearance::DarkHighContrast => {
+                    LinearRgba::with_srgba(10, 132, 255, 255)
+                }
+            };
+            let fill = accent.mul_alpha(0.28);
+            let border = accent.mul_alpha(0.8);
 
             let gl_state = self.render_state.as_ref().unwrap();
             let layer = gl_state

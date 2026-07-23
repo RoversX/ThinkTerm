@@ -81,6 +81,99 @@ impl WaylandDimensions for Dimensions {
     }
 }
 
+const WAYLAND_RESIZE_EDGE_LOGICAL_PIXELS: f64 = 6.0;
+
+fn requested_wayland_decoration_mode(
+    decorations: WindowDecorations,
+) -> Option<DecorationMode> {
+    if decorations == WindowDecorations::NONE {
+        None
+    } else if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS) {
+        Some(DecorationMode::Client)
+    } else if decorations == WindowDecorations::default() {
+        Some(DecorationMode::Server)
+    } else {
+        Some(DecorationMode::Client)
+    }
+}
+
+fn wayland_fallback_frame_visible(
+    decorations: WindowDecorations,
+    effective_mode: DecorationMode,
+) -> bool {
+    effective_mode == DecorationMode::Client && decorations.shows_separate_title_bar()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaylandSurfaceResizeEdge {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+}
+
+impl WaylandSurfaceResizeEdge {
+    fn cursor(self) -> MouseCursor {
+        match self {
+            Self::Top | Self::Bottom => MouseCursor::SizeUpDown,
+            Self::Left | Self::Right => MouseCursor::SizeLeftRight,
+            Self::TopLeft | Self::BottomRight => MouseCursor::SizeNorthWestSouthEast,
+            Self::TopRight | Self::BottomLeft => MouseCursor::SizeNorthEastSouthWest,
+        }
+    }
+
+    fn xdg_edge(self) -> XdgResizeEdge {
+        match self {
+            Self::TopLeft => XdgResizeEdge::TopLeft,
+            Self::Top => XdgResizeEdge::Top,
+            Self::TopRight => XdgResizeEdge::TopRight,
+            Self::Right => XdgResizeEdge::Right,
+            Self::BottomRight => XdgResizeEdge::BottomRight,
+            Self::Bottom => XdgResizeEdge::Bottom,
+            Self::BottomLeft => XdgResizeEdge::BottomLeft,
+            Self::Left => XdgResizeEdge::Left,
+        }
+    }
+}
+
+fn wayland_surface_resize_edge_at(
+    x: isize,
+    y: isize,
+    width: usize,
+    height: usize,
+    edge_pixels: usize,
+) -> Option<WaylandSurfaceResizeEdge> {
+    if x < 0 || y < 0 || x as usize >= width || y as usize >= height || width == 0 || height == 0
+    {
+        return None;
+    }
+
+    let x = x as usize;
+    let y = y as usize;
+    let edge_x = edge_pixels.max(1).min((width / 2).max(1));
+    let edge_y = edge_pixels.max(1).min((height / 2).max(1));
+    let left = x < edge_x;
+    let right = x >= width - edge_x;
+    let top = y < edge_y;
+    let bottom = y >= height - edge_y;
+
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(WaylandSurfaceResizeEdge::TopLeft),
+        (_, true, true, _) => Some(WaylandSurfaceResizeEdge::TopRight),
+        (true, _, _, true) => Some(WaylandSurfaceResizeEdge::BottomLeft),
+        (_, true, _, true) => Some(WaylandSurfaceResizeEdge::BottomRight),
+        (_, _, true, _) => Some(WaylandSurfaceResizeEdge::Top),
+        (_, _, _, true) => Some(WaylandSurfaceResizeEdge::Bottom),
+        (true, _, _, _) => Some(WaylandSurfaceResizeEdge::Left),
+        (_, true, _, _) => Some(WaylandSurfaceResizeEdge::Right),
+        _ => None,
+    }
+}
+
 use super::copy_and_paste::CopyAndPaste;
 use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
@@ -246,16 +339,7 @@ impl WaylandWindow {
         window.set_app_id(class_name.to_string());
         window.set_title(name.to_string());
         let decorations = config.window_decorations;
-
-        let decor_mode = if decorations == WindowDecorations::NONE {
-            None
-        } else if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS) {
-            Some(DecorationMode::Client)
-        } else if decorations == WindowDecorations::default() {
-            Some(DecorationMode::Server)
-        } else {
-            Some(DecorationMode::Client)
-        };
+        let decor_mode = requested_wayland_decoration_mode(decorations);
         window.request_decoration_mode(decor_mode);
 
         let mut window_frame = {
@@ -265,10 +349,9 @@ impl WaylandWindow {
             FallbackFrame::new(&window, shm, subcompositor, qh.clone())
                 .expect("failed to create csd frame")
         };
-        let hidden = match decor_mode {
-            Some(DecorationMode::Client) => false,
-            _ => true,
-        };
+        let hidden = !decor_mode
+            .map(|mode| wayland_fallback_frame_visible(decorations, mode))
+            .unwrap_or(false);
         window_frame.set_hidden(hidden);
         if !hidden {
             window_frame.resize(
@@ -310,6 +393,9 @@ impl WaylandWindow {
             window_state: WindowState::default(),
             last_mouse_coords: Point::new(0, 0),
             mouse_buttons: MouseButtons::NONE,
+            surface_resize_cursor_active: false,
+            surface_resize_in_progress: false,
+            last_pointer_press_serial: None,
             hscroll_remainder: 0.0,
             vscroll_remainder: 0.0,
 
@@ -405,6 +491,13 @@ impl WindowOps for WaylandWindow {
     fn set_cursor(&self, cursor: Option<MouseCursor>) {
         WaylandConnection::with_window_inner(self.0, move |inner| {
             inner.set_cursor(cursor);
+            Ok(())
+        });
+    }
+
+    fn request_drag_move(&self) {
+        WaylandConnection::with_window_inner(self.0, |inner| {
+            inner.begin_surface_move();
             Ok(())
         });
     }
@@ -576,6 +669,9 @@ pub struct WaylandWindowInner {
     window_state: WindowState,
     last_mouse_coords: Point,
     mouse_buttons: MouseButtons,
+    surface_resize_cursor_active: bool,
+    surface_resize_in_progress: bool,
+    last_pointer_press_serial: Option<u32>,
     hscroll_remainder: f64,
     vscroll_remainder: f64,
     modifiers: Modifiers,
@@ -623,6 +719,85 @@ impl WaylandWindowInner {
         }
 
         self.do_paint().unwrap();
+    }
+
+    fn apply_fallback_frame_visibility(&mut self, effective_mode: DecorationMode) {
+        let visible =
+            wayland_fallback_frame_visible(self.config.window_decorations, effective_mode);
+        self.window_frame.set_hidden(!visible);
+        if visible {
+            let width = NonZeroU32::new(
+                self.pixels_to_surface(self.dimensions.pixel_width as i32)
+                    .max(1) as u32,
+            )
+            .unwrap();
+            let height = NonZeroU32::new(
+                self.pixels_to_surface(self.dimensions.pixel_height as i32)
+                    .max(1) as u32,
+            )
+            .unwrap();
+            self.window_frame.resize(width, height);
+        }
+        if self.window.is_some() {
+            let (x, y) = self.window_frame.location();
+            let surface_width = self.pixels_to_surface(self.dimensions.pixel_width as i32);
+            let surface_height = self.pixels_to_surface(self.dimensions.pixel_height as i32);
+            self.window
+                .as_mut()
+                .unwrap()
+                .xdg_surface()
+                .set_window_geometry(x, y, surface_width, surface_height);
+        }
+    }
+
+    fn surface_resize_edge_at(&self, coords: Point) -> Option<WaylandSurfaceResizeEdge> {
+        if !self
+            .config
+            .window_decorations
+            .contains(WindowDecorations::RESIZE)
+            || !self.window_state.can_resize()
+            || self.window_state.contains(WindowState::SERVER_DECORATED)
+            || !self.window_frame.is_hidden()
+        {
+            return None;
+        }
+
+        let edge_pixels =
+            (WAYLAND_RESIZE_EDGE_LOGICAL_PIXELS * self.dimensions.dpi as f64 / crate::DEFAULT_DPI)
+                .round() as usize;
+        wayland_surface_resize_edge_at(
+            coords.x,
+            coords.y,
+            self.dimensions.pixel_width,
+            self.dimensions.pixel_height,
+            edge_pixels,
+        )
+    }
+
+    fn begin_surface_resize(&mut self, serial: u32, edge: WaylandSurfaceResizeEdge) {
+        let conn = Connection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow();
+        let Some(seat) = state.pointer_seat.as_ref() else {
+            return;
+        };
+        if let Some(window) = self.window.as_ref() {
+            window.resize(seat, serial, edge.xdg_edge());
+            self.surface_resize_in_progress = true;
+        }
+    }
+
+    fn begin_surface_move(&mut self) {
+        let Some(serial) = self.last_pointer_press_serial.take() else {
+            return;
+        };
+        let conn = Connection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow();
+        let Some(seat) = state.pointer_seat.as_ref() else {
+            return;
+        };
+        if let Some(window) = self.window.as_ref() {
+            window.move_(seat, serial);
+        }
     }
 
     fn refresh_frame(&mut self) {
@@ -712,24 +887,52 @@ impl WaylandWindowInner {
                 self.surface_to_pixels(y as i32) as isize,
             );
             self.last_mouse_coords = coords;
-            let event = MouseEvent {
-                kind: MouseEventKind::Move,
-                coords,
-                screen_coords: ScreenPoint::new(
-                    coords.x + self.dimensions.pixel_width as isize,
-                    coords.y + self.dimensions.pixel_height as isize,
-                ),
-                mouse_buttons: self.mouse_buttons,
-                modifiers: self.modifiers,
-                precise_scroll_delta: None,
-                scroll_phase: None,
-                momentum_phase: None,
-            };
-            self.events.dispatch(WindowEvent::MouseEvent(event));
+            if let Some(edge) = self.surface_resize_edge_at(coords) {
+                self.set_cursor(Some(edge.cursor()));
+                self.surface_resize_cursor_active = true;
+            } else {
+                if self.surface_resize_cursor_active {
+                    // None hides the pointer entirely; restore the arrow and
+                    // let the application pick a more specific cursor on the
+                    // next dispatched motion.
+                    self.set_cursor(Some(MouseCursor::Arrow));
+                    self.surface_resize_cursor_active = false;
+                }
+                let event = MouseEvent {
+                    kind: MouseEventKind::Move,
+                    coords,
+                    screen_coords: ScreenPoint::new(
+                        coords.x + self.dimensions.pixel_width as isize,
+                        coords.y + self.dimensions.pixel_height as isize,
+                    ),
+                    mouse_buttons: self.mouse_buttons,
+                    modifiers: self.modifiers,
+                    precise_scroll_delta: None,
+                    scroll_phase: None,
+                    momentum_phase: None,
+                };
+                self.events.dispatch(WindowEvent::MouseEvent(event));
+            }
             self.refresh_frame();
         }
 
-        while let Some((button, state)) = PendingMouse::next_button(&pending_mouse) {
+        while let Some((button, state, serial)) = PendingMouse::next_button(&pending_mouse) {
+            if button == MousePress::Left && self.surface_resize_in_progress {
+                if state == ButtonState::Released {
+                    self.surface_resize_in_progress = false;
+                }
+                continue;
+            }
+            if button == MousePress::Left && state == ButtonState::Pressed {
+                if let Some(edge) = self.surface_resize_edge_at(self.last_mouse_coords) {
+                    self.begin_surface_resize(serial, edge);
+                    continue;
+                }
+                self.last_pointer_press_serial = Some(serial);
+            } else if button == MousePress::Left && state == ButtonState::Released {
+                self.last_pointer_press_serial = None;
+            }
+
             let button_mask = match button {
                 MousePress::Left => MouseButtons::LEFT,
                 MousePress::Right => MouseButtons::RIGHT,
@@ -837,12 +1040,14 @@ impl WaylandWindowInner {
             self.events.dispatch(WindowEvent::CloseRequested);
         }
 
+        let mut window_state_changed = false;
         if let Some(window_state) = pending.window_state.take() {
             log::debug!(
                 "dispatch_pending_event self.window_state={:?}, pending:{:?}",
                 self.window_state,
                 window_state
             );
+            window_state_changed = self.window_state != window_state;
             self.window_state = window_state;
         }
 
@@ -858,6 +1063,7 @@ impl WaylandWindowInner {
         }
 
         if let Some(ref window_config) = pending.window_configure {
+            self.apply_fallback_frame_visibility(window_config.decoration_mode);
             self.window_frame.update_state(window_config.state);
             self.window_frame
                 .update_wm_capabilities(window_config.capabilities);
@@ -919,10 +1125,10 @@ impl WaylandWindowInner {
                     dpi,
                 };
 
-                // Only trigger a resize if the new dimensions are different;
-                // this makes things more efficient and a little more smooth
-                if new_dimensions != old_dimensions {
+                let dimensions_changed = new_dimensions != old_dimensions;
+                if dimensions_changed || window_state_changed {
                     self.dimensions = new_dimensions;
+                    window_state_changed = false;
 
                     self.events.dispatch(WindowEvent::Resized {
                         dimensions: self.dimensions,
@@ -931,6 +1137,8 @@ impl WaylandWindowInner {
                         // assume no.
                         live_resizing: false,
                     });
+                }
+                if dimensions_changed {
                     // Avoid blurring by matching the scaling factor of the
                     // compositor; if it is going to double the size then
                     // we render at double the size anyway and tell it that
@@ -969,6 +1177,13 @@ impl WaylandWindowInner {
                 self.do_paint().unwrap();
             }
         }
+        if window_state_changed && self.window.is_some() {
+            self.events.dispatch(WindowEvent::Resized {
+                dimensions: self.dimensions,
+                window_state: self.window_state,
+                live_resizing: false,
+            });
+        }
         if pending.refresh_decorations && self.window.is_some() {
             self.refresh_frame();
         }
@@ -1002,6 +1217,8 @@ impl WaylandWindowInner {
                         MouseCursor::Hand => CursorIcon::Pointer,
                         MouseCursor::SizeUpDown => CursorIcon::NsResize,
                         MouseCursor::SizeLeftRight => CursorIcon::EwResize,
+                        MouseCursor::SizeNorthWestSouthEast => CursorIcon::NwseResize,
+                        MouseCursor::SizeNorthEastSouthWest => CursorIcon::NeswResize,
                         MouseCursor::Text => CursorIcon::Text,
                     },
                 ) {
@@ -1285,6 +1502,12 @@ impl WaylandWindowInner {
 
     fn config_did_change(&mut self, config: ConfigHandle) {
         self.config = config;
+        let decor_mode = requested_wayland_decoration_mode(self.config.window_decorations);
+        if let Some(window) = self.window.as_ref() {
+            window.request_decoration_mode(decor_mode);
+        }
+        self.apply_fallback_frame_visibility(decor_mode.unwrap_or(DecorationMode::Client));
+        self.refresh_frame();
         self.update_window_background_blur();
     }
 
@@ -1345,12 +1568,23 @@ impl WaylandState {
                     changed = true;
                 }
 
-                let mut state = WindowState::default();
+                let mut state = WindowState::COMPOSITED;
                 if configure.state.contains(SCTKWindowState::FULLSCREEN) {
                     state |= WindowState::FULL_SCREEN;
                 }
                 if configure.state.contains(SCTKWindowState::MAXIMIZED) {
                     state |= WindowState::MAXIMIZED;
+                }
+                if configure.state.intersects(
+                    SCTKWindowState::TILED_LEFT
+                        | SCTKWindowState::TILED_RIGHT
+                        | SCTKWindowState::TILED_TOP
+                        | SCTKWindowState::TILED_BOTTOM,
+                ) {
+                    state |= WindowState::TILED;
+                }
+                if configure.decoration_mode == DecorationMode::Server {
+                    state |= WindowState::SERVER_DECORATED;
                 }
 
                 log::debug!(
@@ -1360,7 +1594,7 @@ impl WaylandState {
                     configure.state
                 );
 
-                if pending_event.window_state.is_none() && state != WindowState::default() {
+                if pending_event.window_state != Some(state) {
                     changed = true;
                 }
 
@@ -1553,5 +1787,66 @@ impl HasWindowHandle for WaylandWindow {
         let inner = handle.borrow();
         let handle = inner.window_handle()?;
         unsafe { Ok(WindowHandle::borrow_raw(handle.as_raw())) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integrated_buttons_use_client_mode_without_fallback_header() {
+        let decorations = WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE;
+        assert_eq!(
+            requested_wayland_decoration_mode(decorations),
+            Some(DecorationMode::Client)
+        );
+        assert!(!wayland_fallback_frame_visible(
+            decorations,
+            DecorationMode::Client
+        ));
+    }
+
+    #[test]
+    fn fallback_header_requires_title_and_client_mode() {
+        let decorations = WindowDecorations::TITLE | WindowDecorations::RESIZE;
+        assert!(wayland_fallback_frame_visible(
+            decorations,
+            DecorationMode::Client
+        ));
+        assert!(!wayland_fallback_frame_visible(
+            decorations,
+            DecorationMode::Server
+        ));
+        assert!(!wayland_fallback_frame_visible(
+            WindowDecorations::RESIZE,
+            DecorationMode::Client
+        ));
+    }
+
+    #[test]
+    fn surface_resize_hit_testing_covers_all_directions() {
+        let width = 100;
+        let height = 80;
+        let edge = 6;
+        for (x, y, expected) in [
+            (0, 0, WaylandSurfaceResizeEdge::TopLeft),
+            (50, 0, WaylandSurfaceResizeEdge::Top),
+            (99, 0, WaylandSurfaceResizeEdge::TopRight),
+            (99, 40, WaylandSurfaceResizeEdge::Right),
+            (99, 79, WaylandSurfaceResizeEdge::BottomRight),
+            (50, 79, WaylandSurfaceResizeEdge::Bottom),
+            (0, 79, WaylandSurfaceResizeEdge::BottomLeft),
+            (0, 40, WaylandSurfaceResizeEdge::Left),
+        ] {
+            assert_eq!(
+                wayland_surface_resize_edge_at(x, y, width, height, edge),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            wayland_surface_resize_edge_at(50, 40, width, height, edge),
+            None
+        );
     }
 }

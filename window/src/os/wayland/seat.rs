@@ -50,6 +50,7 @@ impl SeatHandler for WaylandState {
                     )
                     .expect("Failed to create pointer");
                 self.pointer = Some(pointer);
+                self.pointer_seat = Some(seat.clone());
             }
             Capability::Touch /* if self.touch.is_none() */ => {
                 log::trace!("Setting touch capability");
@@ -85,6 +86,7 @@ impl SeatHandler for WaylandState {
             Capability::Pointer => {
                 log::trace!("Lost pointer capability");
                 self.pointer.take(); // ThemedPointer's drop implementation calls wl_pointer.release() already.
+                self.pointer_seat.take();
             }
             Capability::Touch => {
                 log::trace!("Lost touch capability");

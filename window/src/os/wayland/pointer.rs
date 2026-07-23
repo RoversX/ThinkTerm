@@ -94,7 +94,7 @@ pub struct PendingMouse {
     window_id: usize,
     pub(super) copy_and_paste: Arc<Mutex<CopyAndPaste>>,
     surface_coords: Option<(f64, f64)>,
-    button: Vec<(MousePress, ButtonState)>,
+    button: Vec<(MousePress, ButtonState, u32)>,
     scroll: Option<(f64, f64)>,
     in_window: bool,
 }
@@ -131,7 +131,8 @@ impl PendingMouse {
                 self.surface_coords.replace(evt.position);
                 changed
             }
-            PointerEventKind::Press { button, .. } | PointerEventKind::Release { button, .. } => {
+            PointerEventKind::Press { button, serial, .. }
+            | PointerEventKind::Release { button, serial, .. } => {
                 fn linux_button(b: u32) -> Option<MousePress> {
                     // See BTN_LEFT and friends in <linux/input-event-codes.h>
                     match b {
@@ -151,7 +152,7 @@ impl PendingMouse {
                     PointerEventKind::Release { .. } => ButtonState::Released,
                     _ => unreachable!(),
                 };
-                self.button.push((button, button_state));
+                self.button.push((button, button_state, serial));
                 changed
             }
             PointerEventKind::Axis {
@@ -168,7 +169,9 @@ impl PendingMouse {
         }
     }
 
-    pub(super) fn next_button(pending: &Arc<Mutex<Self>>) -> Option<(MousePress, ButtonState)> {
+    pub(super) fn next_button(
+        pending: &Arc<Mutex<Self>>,
+    ) -> Option<(MousePress, ButtonState, u32)> {
         let mut pending = pending.lock().unwrap();
         if pending.button.is_empty() {
             None

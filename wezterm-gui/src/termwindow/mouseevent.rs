@@ -14,7 +14,7 @@ use crate::termwindow::{
 };
 use ::window::{
     ContextMenuIcon, ContextMenuItem, IntegratedTitleButtonStyle, MouseButtons as WMB, MouseCursor,
-    MouseEvent, MouseEventKind as WMEK, MousePress, WindowDecorations, WindowOps, WindowState,
+    MouseEvent, MouseEventKind as WMEK, MousePress, WindowOps, WindowState,
 };
 use config::keyassignment::{
     ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment, MouseEventTrigger,
@@ -279,9 +279,8 @@ impl super::TermWindow {
         };
         let window_button_count = if self.right_sidebar_width() == 0
             && self
-                .config
-                .window_decorations
-                .contains(WindowDecorations::INTEGRATED_BUTTONS)
+                .window_tab_chrome_params()
+                .uses_integrated_window_buttons()
             && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
         {
             self.config.integrated_title_buttons.len()
@@ -3058,7 +3057,13 @@ impl super::TermWindow {
                 context.request_drag_move();
             }
             #[cfg(not(target_os = "macos"))]
-            self.window_drag_position.replace(event);
+            {
+                // X11's _NET_WM_MOVERESIZE request needs the root coordinates
+                // from this press. The last hover/move position can be stale
+                // and causes the WM to start the drag from the wrong anchor.
+                context.set_window_drag_position(event.screen_coords);
+                self.window_drag_position.replace(event);
+            }
             #[cfg(not(target_os = "macos"))]
             context.request_drag_move();
         }

@@ -3,6 +3,7 @@ use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorT
 use crate::shapecache::{BorrowedShapeCacheKey, ShapedInfo};
 use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::ui::icons::SvgIcon;
+use crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
     TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
@@ -21,7 +22,7 @@ use wezterm_font::{ClearShapeCache, LoadedFont};
 use wezterm_term::Line;
 use window::color::LinearRgba;
 use window::WindowOps;
-use window::{IntegratedTitleButton, IntegratedTitleButtonStyle, WindowDecorations, WindowState};
+use window::{IntegratedTitleButton, IntegratedTitleButtonStyle, WindowState};
 
 const WINDOW_TAB_INSET: usize = 8;
 const WINDOW_TAB_ICON_GAP: usize = 8;
@@ -363,9 +364,7 @@ impl crate::TermWindow {
     }
 
     fn fancy_tab_bar_shows_window_buttons(&self) -> bool {
-        self.config
-            .window_decorations
-            .contains(WindowDecorations::INTEGRATED_BUTTONS)
+        uses_integrated_window_buttons(self.config.window_decorations, self.window_state)
             && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
             && !self.config.integrated_title_buttons.is_empty()
     }

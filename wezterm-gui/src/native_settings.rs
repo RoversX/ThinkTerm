@@ -6,17 +6,23 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use window::{Appearance, Connection, ConnectionOps};
 
-pub(crate) const DEFAULT_SETTINGS_FONT_SIZE: f64 = 14.0;
-pub(crate) const DEFAULT_SETTINGS_FONT_WEIGHT: u16 = 600;
-#[cfg(target_os = "windows")]
-pub(crate) const DEFAULT_HOME_FONT_SIZE: f64 = 14.0;
-#[cfg(not(target_os = "windows"))]
-pub(crate) const DEFAULT_HOME_FONT_SIZE: f64 = 15.0;
-pub(crate) const DEFAULT_SIDEBAR_FONT_SIZE: f64 = 15.0;
-pub(crate) const DEFAULT_TAB_FONT_SIZE: f64 = 14.0;
-pub(crate) const DEFAULT_PANE_HEADER_FONT_SIZE: f64 = 14.0;
+// One point is one logical pixel on macOS but 4/3 px at 96dpi, so the
+// non-mac size is 0.75x for the same visual size (14px UI text).
+pub(crate) const DEFAULT_SETTINGS_FONT_SIZE: f64 =
+    if cfg!(target_os = "macos") { 14.0 } else { 10.5 };
+pub(crate) const DEFAULT_SETTINGS_FONT_WEIGHT: u16 =
+    if cfg!(target_os = "macos") { 600 } else { 500 };
+pub(crate) const DEFAULT_HOME_FONT_SIZE: f64 =
+    if cfg!(target_os = "macos") { 15.0 } else { 11.25 };
+pub(crate) const DEFAULT_SIDEBAR_FONT_SIZE: f64 =
+    if cfg!(target_os = "macos") { 15.0 } else { 11.25 };
+pub(crate) const DEFAULT_TAB_FONT_SIZE: f64 =
+    if cfg!(target_os = "macos") { 14.0 } else { 10.5 };
+pub(crate) const DEFAULT_PANE_HEADER_FONT_SIZE: f64 =
+    if cfg!(target_os = "macos") { 14.0 } else { 10.5 };
 pub(crate) const DEFAULT_BOTTOM_QUOTE_INTERVAL_MINUTES: u32 = 60;
-pub(crate) const DEFAULT_BOTTOM_QUOTE_FONT_SIZE: f64 = 10.0;
+pub(crate) const DEFAULT_BOTTOM_QUOTE_FONT_SIZE: f64 =
+    if cfg!(target_os = "macos") { 10.0 } else { 7.5 };
 pub(crate) const ONBOARDING_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]

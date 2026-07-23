@@ -8,8 +8,76 @@ use ::window::glium::uniforms::{
     MagnifySamplerFilter, MinifySamplerFilter, Sampler, SamplerWrapFunction,
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
-use ::window::Dimensions;
+use ::window::color::LinearRgba;
+use ::window::{Appearance, Dimensions, WindowDecorations, WindowState};
 use config::FreeTypeLoadTarget;
+
+const LINUX_WINDOW_CORNER_RADIUS: f32 = 12.0;
+const LINUX_WINDOW_BORDER_WIDTH: f32 = 1.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WindowBorder {
+    pub width: f32,
+    pub color: [f32; 3],
+}
+
+impl WindowBorder {
+    const NONE: Self = Self {
+        width: 0.0,
+        color: [0.0; 3],
+    };
+}
+
+pub(crate) fn effective_window_corner_radius(
+    decorations: WindowDecorations,
+    window_state: WindowState,
+    dpi: usize,
+) -> f32 {
+    if cfg!(target_os = "linux")
+        && crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons(
+            decorations,
+            window_state,
+        )
+        && window_state.can_resize()
+        && !window_state.contains(WindowState::TILED)
+        && window_state.contains(WindowState::COMPOSITED)
+    {
+        LINUX_WINDOW_CORNER_RADIUS * dpi.max(1) as f32 / 96.0
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn effective_window_border(
+    decorations: WindowDecorations,
+    window_state: WindowState,
+    dpi: usize,
+    appearance: Appearance,
+) -> WindowBorder {
+    if !cfg!(target_os = "linux")
+        || !crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons(
+            decorations,
+            window_state,
+        )
+        || !window_state.can_resize()
+        || window_state.contains(WindowState::TILED)
+    {
+        return WindowBorder::NONE;
+    }
+
+    let color = match appearance {
+        Appearance::Light | Appearance::LightHighContrast => {
+            LinearRgba::with_srgba(199, 199, 204, 255)
+        }
+        Appearance::Dark | Appearance::DarkHighContrast => {
+            LinearRgba::with_srgba(68, 68, 76, 255)
+        }
+    };
+    WindowBorder {
+        width: LINUX_WINDOW_BORDER_WIDTH * dpi.max(1) as f32 / 96.0,
+        color: [color.0, color.1, color.2],
+    }
+}
 
 pub(crate) fn draw_webgpu_layers(
     webgpu: &WebGpuState,
@@ -18,6 +86,8 @@ pub(crate) fn draw_webgpu_layers(
     foreground_text_hsb: [f32; 3],
     milliseconds: u32,
     clear_color: wgpu::Color,
+    corner_radius: f32,
+    window_border: WindowBorder,
 ) -> anyhow::Result<()> {
     let acquire_start = crate::perf::now();
     let output = webgpu.surface.get_current_texture()?;
@@ -109,6 +179,18 @@ pub(crate) fn draw_webgpu_layers(
                 uniforms = webgpu.create_uniform(ShaderUniform {
                     foreground_text_hsb,
                     milliseconds,
+                    viewport_and_corner: [
+                        dimensions.pixel_width as f32,
+                        dimensions.pixel_height as f32,
+                        corner_radius,
+                        0.0,
+                    ],
+                    window_border: [
+                        window_border.color[0],
+                        window_border.color[1],
+                        window_border.color[2],
+                        window_border.width,
+                    ],
                     projection,
                 });
 
@@ -160,6 +242,17 @@ impl crate::TermWindow {
         ];
 
         let milliseconds = self.created.elapsed().as_millis() as u32;
+        let corner_radius = effective_window_corner_radius(
+            self.config.window_decorations,
+            self.window_state,
+            self.dimensions.dpi,
+        );
+        let window_border = effective_window_border(
+            self.config.window_decorations,
+            self.window_state,
+            self.dimensions.dpi,
+            crate::native_settings::effective_appearance(),
+        );
         draw_webgpu_layers(
             webgpu,
             render_state,
@@ -172,6 +265,8 @@ impl crate::TermWindow {
                 b: 0.,
                 a: 0.,
             },
+            corner_radius,
+            window_border,
         )
     }
 
@@ -261,6 +356,28 @@ impl crate::TermWindow {
         );
 
         let milliseconds = self.created.elapsed().as_millis() as u32;
+        let corner_radius = effective_window_corner_radius(
+            self.config.window_decorations,
+            self.window_state,
+            self.dimensions.dpi,
+        );
+        let window_clip = (
+            self.dimensions.pixel_width as f32,
+            self.dimensions.pixel_height as f32,
+            corner_radius,
+        );
+        let window_border = effective_window_border(
+            self.config.window_decorations,
+            self.window_state,
+            self.dimensions.dpi,
+            crate::native_settings::effective_appearance(),
+        );
+        let window_border = (
+            window_border.color[0],
+            window_border.color[1],
+            window_border.color[2],
+            window_border.width,
+        );
 
         let cursor_blink: ColorEaseUniform = (*self.cursor_blink_state.borrow()).into();
         let blink: ColorEaseUniform = (*self.blink_state.borrow()).into();
@@ -282,6 +399,8 @@ impl crate::TermWindow {
                     uniforms.add("foreground_text_hsb", &foreground_text_hsb);
                     uniforms.add("subpixel_aa", &subpixel_aa);
                     uniforms.add("milliseconds", &milliseconds);
+                    uniforms.add("window_clip", &window_clip);
+                    uniforms.add("window_border", &window_border);
                     uniforms.add_struct("cursor_blink", &cursor_blink);
                     uniforms.add_struct("blink", &blink);
                     uniforms.add_struct("rapid_blink", &rapid_blink);
@@ -304,5 +423,102 @@ impl crate::TermWindow {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_corner_radius_only_applies_to_floating_client_chrome() {
+        let decorations = WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE;
+        let radius =
+            effective_window_corner_radius(decorations, WindowState::COMPOSITED, 96);
+        if cfg!(target_os = "linux") {
+            assert_eq!(radius, 12.0);
+        } else {
+            assert_eq!(radius, 0.0);
+        }
+
+        for state in [
+            WindowState::MAXIMIZED,
+            WindowState::FULL_SCREEN,
+            WindowState::TILED,
+            WindowState::SERVER_DECORATED,
+        ] {
+            assert_eq!(
+                effective_window_corner_radius(
+                    decorations,
+                    state | WindowState::COMPOSITED,
+                    96,
+                ),
+                0.0
+            );
+        }
+        assert_eq!(
+            effective_window_corner_radius(
+                WindowDecorations::TITLE | WindowDecorations::RESIZE,
+                WindowState::COMPOSITED,
+                96,
+            ),
+            0.0
+        );
+        assert_eq!(
+            effective_window_corner_radius(decorations, WindowState::default(), 96),
+            0.0
+        );
+    }
+
+    #[test]
+    fn linux_window_border_tracks_appearance_and_floating_state() {
+        let decorations = WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE;
+        let dark = effective_window_border(
+            decorations,
+            WindowState::COMPOSITED,
+            96,
+            Appearance::Dark,
+        );
+        let light = effective_window_border(
+            decorations,
+            WindowState::COMPOSITED,
+            96,
+            Appearance::Light,
+        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(dark.width, 1.0);
+            assert_eq!(light.width, 1.0);
+            assert_ne!(dark.color, light.color);
+            assert_eq!(
+                effective_window_border(
+                    decorations,
+                    WindowState::COMPOSITED,
+                    192,
+                    Appearance::Dark,
+                )
+                .width,
+                2.0
+            );
+        } else {
+            assert_eq!(dark, WindowBorder::NONE);
+            assert_eq!(light, WindowBorder::NONE);
+        }
+
+        for state in [
+            WindowState::MAXIMIZED,
+            WindowState::FULL_SCREEN,
+            WindowState::TILED,
+            WindowState::SERVER_DECORATED,
+        ] {
+            assert_eq!(
+                effective_window_border(
+                    decorations,
+                    state | WindowState::COMPOSITED,
+                    96,
+                    Appearance::Dark,
+                ),
+                WindowBorder::NONE
+            );
+        }
     }
 }

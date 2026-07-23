@@ -2590,6 +2590,10 @@ unsafe fn ns_cursor_instance(cursor: MouseCursor) -> id {
         MouseCursor::Hand => msg_send![cls, pointingHandCursor],
         MouseCursor::SizeUpDown => msg_send![cls, resizeUpDownCursor],
         MouseCursor::SizeLeftRight => msg_send![cls, resizeLeftRightCursor],
+        // AppKit doesn't expose public diagonal resize cursor selectors.
+        MouseCursor::SizeNorthWestSouthEast | MouseCursor::SizeNorthEastSouthWest => {
+            msg_send![cls, arrowCursor]
+        }
     }
 }
 
@@ -2603,6 +2607,8 @@ fn cursor_to_code(cursor: Option<MouseCursor>) -> i64 {
         Some(MouseCursor::Hand) => 3,
         Some(MouseCursor::SizeUpDown) => 4,
         Some(MouseCursor::SizeLeftRight) => 5,
+        Some(MouseCursor::SizeNorthWestSouthEast) => 6,
+        Some(MouseCursor::SizeNorthEastSouthWest) => 7,
     }
 }
 
@@ -2614,6 +2620,8 @@ fn code_to_cursor(code: i64) -> Option<MouseCursor> {
         3 => Some(MouseCursor::Hand),
         4 => Some(MouseCursor::SizeUpDown),
         5 => Some(MouseCursor::SizeLeftRight),
+        6 => Some(MouseCursor::SizeNorthWestSouthEast),
+        7 => Some(MouseCursor::SizeNorthEastSouthWest),
         _ => None,
     }
 }

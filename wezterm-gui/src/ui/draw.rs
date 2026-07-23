@@ -43,6 +43,11 @@ impl<'a> DrawContext<'a> {
         }
     }
 
+    /// Design pixels (2x macOS backing) → this window's backing pixels.
+    pub(crate) fn px(&self, value: f32) -> f32 {
+        crate::ui::scale_ui_f32(value, self.dimensions.dpi)
+    }
+
     pub(crate) fn draw_rect(
         &self,
         layers: &mut TripleLayerQuadAllocator<'_>,

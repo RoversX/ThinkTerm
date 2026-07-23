@@ -1017,7 +1017,7 @@ impl crate::TermWindow {
                     space_menu_height as f32,
                 ),
                 chrome.sidebar_button_hover_bg,
-                self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+                self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
             )
             .context("sidebar space menu button")?;
         }
@@ -1156,7 +1156,7 @@ impl crate::TermWindow {
             } else {
                 chrome.sidebar_button_bg
             },
-            self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+            self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
         )
         .context("sidebar add thread button")?;
         self.fill_rounded_rectangle(
@@ -1173,7 +1173,7 @@ impl crate::TermWindow {
             } else {
                 chrome.sidebar_button_bg
             },
-            self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+            self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
         )
         .context("sidebar notifications button")?;
         if let Some(project_id) = active_project_id.clone() {
@@ -1934,7 +1934,7 @@ impl crate::TermWindow {
                         space_menu_height as f32,
                     ),
                     chrome.sidebar_button_hover_bg,
-                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+                    self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
                 )
                 .context("sidebar space menu button repaint")?;
             }
@@ -2003,7 +2003,7 @@ impl crate::TermWindow {
                 } else {
                     chrome.sidebar_button_bg
                 },
-                self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+                self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
             )
             .context("sidebar add thread button repaint")?;
             let notification_action_hovered = self.is_pointer_over_ui_rect(
@@ -2026,7 +2026,7 @@ impl crate::TermWindow {
                 } else {
                     chrome.sidebar_button_bg
                 },
-                self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+                self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
             )
             .context("sidebar notifications button repaint")?;
             let top_action_fg = if active_project_id.is_some() {
@@ -2196,7 +2196,7 @@ impl crate::TermWindow {
                         settings_row_height as f32,
                     ),
                     chrome.sidebar_row_hover_bg,
-                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+                    self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
                 )
                 .context("sidebar settings button hover")?;
             }
@@ -2218,7 +2218,7 @@ impl crate::TermWindow {
                         settings_action_size as f32,
                     ),
                     chrome.sidebar_button_hover_bg,
-                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+                    self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
                 )
                 .context("sidebar settings view options hover")?;
             }
@@ -2240,7 +2240,7 @@ impl crate::TermWindow {
                         settings_action_size as f32,
                     ),
                     chrome.sidebar_button_hover_bg,
-                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+                    self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
                 )
                 .context("sidebar ssh hosts hover")?;
             }

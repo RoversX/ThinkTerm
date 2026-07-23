@@ -506,33 +506,36 @@ impl OnboardingView {
     }
 
     fn line_h(ctx: &DrawContext) -> f32 {
-        (ctx.metrics.cell_size.height as f32 + 14.0).max(34.0)
+        (ctx.metrics.cell_size.height as f32 + ctx.px(14.0)).max(ctx.px(34.0))
     }
 
     fn compact_line_h(ctx: &DrawContext) -> f32 {
-        (ctx.metrics.cell_size.height as f32 + 8.0).max(28.0)
+        (ctx.metrics.cell_size.height as f32 + ctx.px(8.0)).max(ctx.px(28.0))
     }
 
     fn control_h(ctx: &DrawContext) -> f32 {
-        (ctx.metrics.cell_size.height as f32 + 30.0).max(60.0)
+        (ctx.metrics.cell_size.height as f32 + ctx.px(30.0)).max(ctx.px(60.0))
     }
 
     fn preference_choice_h(ctx: &DrawContext) -> f32 {
-        (Self::control_h(ctx) + 10.0).clamp(68.0, 80.0)
+        (Self::control_h(ctx) + ctx.px(10.0)).clamp(ctx.px(68.0), ctx.px(80.0))
     }
 
     fn preference_group_height(ctx: &DrawContext, choice_count: usize) -> f32 {
         let rows = choice_count.div_ceil(2).max(1) as f32;
-        Self::line_h(ctx) + 26.0 + rows * Self::preference_choice_h(ctx) + (rows - 1.0) * 18.0
+        Self::line_h(ctx)
+            + ctx.px(26.0)
+            + rows * Self::preference_choice_h(ctx)
+            + (rows - 1.0) * ctx.px(18.0)
     }
 
     fn action_h(ctx: &DrawContext) -> f32 {
-        Self::control_h(ctx).min(68.0).max(ACTION_H)
+        Self::control_h(ctx).min(ctx.px(68.0)).max(ctx.px(ACTION_H))
     }
 
     fn centered_text_y(ctx: &DrawContext, area: RectF) -> f32 {
         let text_h = ctx.metrics.cell_size.height as f32;
-        area.origin.y + ((area.size.height - text_h) / 2.0).max(4.0)
+        area.origin.y + ((area.size.height - text_h) / 2.0).max(ctx.px(4.0))
     }
 
     fn transition_duration() -> Duration {
@@ -623,17 +626,17 @@ impl OnboardingView {
             palette.window_bg,
         )?;
 
-        let shell = inset_rect(area, OUTER_PAD);
-        let content_w = shell.size.width.min(CONTENT_MAX_W).max(0.0);
+        let shell = inset_rect(area, ctx.px(OUTER_PAD));
+        let content_w = shell.size.width.min(ctx.px(CONTENT_MAX_W)).max(0.0);
         let content_x = shell.origin.x + ((shell.size.width - content_w) / 2.0).max(0.0);
         let content = rect(content_x, shell.origin.y, content_w, shell.size.height);
 
         self.paint_header(ctx, layers, content, palette, font, title_font)?;
         let body = rect(
             content.origin.x,
-            content.origin.y + HEADER_H,
+            content.origin.y + ctx.px(HEADER_H),
             content.size.width,
-            (content.size.height - HEADER_H - FOOTER_H).max(0.0),
+            (content.size.height - ctx.px(HEADER_H + FOOTER_H)).max(0.0),
         );
         self.paint_body(ctx, layers, body, palette, font, tokens, section_font)?;
         self.paint_status(ctx, layers, content, palette, font)?;
@@ -654,7 +657,7 @@ impl OnboardingView {
             layers,
             title_font,
             content.origin.x,
-            content.origin.y + 6.0,
+            content.origin.y + ctx.px(6.0),
             self.step.title(),
             palette.text,
             content.size.width,
@@ -664,8 +667,8 @@ impl OnboardingView {
             layers,
             font,
             content.origin.x,
-            content.origin.y + 64.0,
-            content.size.width.min(900.0),
+            content.origin.y + ctx.px(64.0),
+            content.size.width.min(ctx.px(900.0)),
             self.step.eyebrow(),
             palette.muted_text,
             2,
@@ -674,7 +677,7 @@ impl OnboardingView {
             layers,
             0,
             content.origin.x,
-            content.origin.y + HEADER_H - 24.0,
+            content.origin.y + ctx.px(HEADER_H - 24.0),
             content.size.width,
             1.0,
             palette.separator,
@@ -695,13 +698,13 @@ impl OnboardingView {
             font,
             area.origin.x,
             area.origin.y,
-            area.size.width.min(960.0),
+            area.size.width.min(ctx.px(960.0)),
             "Open folders, review imports, and keep terminal sessions tied to the work they belong to.",
             palette.secondary_text,
             2,
         )?;
         let line_h = Self::line_h(ctx);
-        let card_h = (line_h * 3.2 + 58.0).max(156.0);
+        let card_h = (line_h * 3.2 + ctx.px(58.0)).max(ctx.px(156.0));
         let cards = [
             (
                 SvgIcon::Layers,
@@ -719,10 +722,10 @@ impl OnboardingView {
                 "Return to long-running terminal work quickly.",
             ),
         ];
-        let card_gap = 22.0;
-        let card_w = ((area.size.width - card_gap * 2.0) / 3.0).max(240.0);
+        let card_gap = ctx.px(22.0);
+        let card_w = ((area.size.width - card_gap * 2.0) / 3.0).max(ctx.px(240.0));
         let mut x = area.origin.x;
-        let y = area.origin.y + line_h * 2.0 + 46.0;
+        let y = area.origin.y + line_h * 2.0 + ctx.px(46.0);
         for (icon, title, description) in cards {
             self.paint_info_card(
                 ctx,
@@ -741,9 +744,9 @@ impl OnboardingView {
             layers,
             rect(
                 area.origin.x,
-                y + card_h + 24.0,
+                y + card_h + ctx.px(24.0),
                 area.size.width,
-                (line_h * 2.6 + 54.0).max(136.0),
+                (line_h * 2.6 + ctx.px(54.0)).max(ctx.px(136.0)),
             ),
             palette,
             font,
@@ -768,7 +771,7 @@ impl OnboardingView {
             font,
             area.origin.x,
             area.origin.y,
-            area.size.width.min(960.0),
+            area.size.width.min(ctx.px(960.0)),
             "Choose a source to scan. v1 imports manual folders only, and nothing is created until review.",
             palette.secondary_text,
             2,
@@ -776,9 +779,9 @@ impl OnboardingView {
         let line_h = Self::line_h(ctx);
         let grid_w = area.size.width;
         let gap = 20.0;
-        let card_w = ((grid_w - gap) / 2.0).max(280.0);
-        let card_h = (line_h * 3.0 + 64.0).max(164.0);
-        let start_y = area.origin.y + line_h * 2.0 + 42.0;
+        let card_w = ((grid_w - gap) / 2.0).max(ctx.px(280.0));
+        let card_h = (line_h * 3.0 + ctx.px(64.0)).max(ctx.px(164.0));
+        let start_y = area.origin.y + line_h * 2.0 + ctx.px(42.0);
         for (idx, provider) in ImportProvider::all().iter().enumerate() {
             let is_manual = *provider == ImportProvider::Manual;
             let row = idx / 2;
@@ -827,24 +830,24 @@ impl OnboardingView {
         let list = rect(
             area.origin.x,
             area.origin.y + line_h + 20.0,
-            area.size.width.min(820.0),
+            area.size.width.min(ctx.px(820.0)),
             (area.size.height - line_h - 28.0).max(0.0),
         );
         if self.pending_projects.is_empty() {
             self.paint_empty_state(ctx, layers, list, palette, font)?;
             return Ok(());
         }
-        let content_h = self.pending_projects.len() as f32 * PROJECT_ROW_H
-            + self.pending_projects.len().saturating_sub(1) as f32 * PROJECT_ROW_GAP;
+        let content_h = self.pending_projects.len() as f32 * ctx.px(PROJECT_ROW_H)
+            + self.pending_projects.len().saturating_sub(1) as f32 * ctx.px(PROJECT_ROW_GAP);
         self.review_scroll.set_extents(list.size.height, content_h);
         let mut y = list.origin.y - self.review_scroll.offset;
         let projects = self.pending_projects.clone();
         for (idx, project) in projects.iter().enumerate() {
-            if y + PROJECT_ROW_H >= list.origin.y && y <= list.origin.y + list.size.height {
+            if y + ctx.px(PROJECT_ROW_H) >= list.origin.y && y <= list.origin.y + list.size.height {
                 self.paint_project_row(
                     ctx,
                     layers,
-                    rect(list.origin.x, y, list.size.width, PROJECT_ROW_H),
+                    rect(list.origin.x, y, list.size.width, ctx.px(PROJECT_ROW_H)),
                     list,
                     palette,
                     font,
@@ -852,7 +855,7 @@ impl OnboardingView {
                     project,
                 )?;
             }
-            y += PROJECT_ROW_H + PROJECT_ROW_GAP;
+            y += ctx.px(PROJECT_ROW_H + PROJECT_ROW_GAP);
         }
         if self.review_scroll.has_overflow() {
             draw_scrollbar(ctx, layers, palette, tokens, list, self.review_scroll)?;
@@ -869,7 +872,7 @@ impl OnboardingView {
         font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
-        let group_w = area.size.width.min(1120.0);
+        let group_w = area.size.width.min(ctx.px(1120.0));
         let language_h = Self::preference_group_height(ctx, 4);
         self.paint_preference_group(
             ctx,
@@ -902,7 +905,7 @@ impl OnboardingView {
                 ),
             ],
         )?;
-        let appearance_y = area.origin.y + language_h + 54.0;
+        let appearance_y = area.origin.y + language_h + ctx.px(54.0);
         let appearance_h = Self::preference_group_height(ctx, 3);
         self.paint_preference_group(
             ctx,
@@ -930,8 +933,8 @@ impl OnboardingView {
                 ),
             ],
         )?;
-        let toggle_y = appearance_y + appearance_h + 58.0;
-        let toggle_row = rect(area.origin.x, toggle_y, group_w, 124.0);
+        let toggle_y = appearance_y + appearance_h + ctx.px(58.0);
+        let toggle_row = rect(area.origin.x, toggle_y, group_w, ctx.px(124.0));
         self.widgets.push(
             toggle_row,
             WidgetKind::Button,
@@ -955,13 +958,13 @@ impl OnboardingView {
             toggle_row.size.height,
             toggle_bg,
             palette.control_border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
         let toggle_rect = rect(
-            toggle_row.origin.x + 24.0,
-            toggle_row.origin.y + 47.0,
-            54.0,
-            30.0,
+            toggle_row.origin.x + ctx.px(24.0),
+            toggle_row.origin.y + ctx.px(47.0),
+            ctx.px(54.0),
+            ctx.px(30.0),
         );
         draw_toggle(
             ctx,
@@ -976,19 +979,19 @@ impl OnboardingView {
             layers,
             section_font,
             toggle_row.origin.x + 100.0,
-            toggle_row.origin.y + 26.0,
+            toggle_row.origin.y + ctx.px(26.0),
             "Show left sidebar by default",
             palette.text,
-            toggle_row.size.width - 124.0,
+            toggle_row.size.width - ctx.px(124.0),
         )?;
         ctx.draw_text(
             layers,
             font,
             toggle_row.origin.x + 100.0,
-            toggle_row.origin.y + 72.0,
+            toggle_row.origin.y + ctx.px(72.0),
             "Applies to newly opened main windows and this setup finish.",
             palette.muted_text,
-            toggle_row.size.width - 124.0,
+            toggle_row.size.width - ctx.px(124.0),
         )?;
         Ok(())
     }
@@ -1016,18 +1019,18 @@ impl OnboardingView {
             ("Appearance", self.selected_appearance.label().to_string()),
         ];
         let mut y = area.origin.y;
-        let row_h = (Self::line_h(ctx) + 34.0).max(64.0);
+        let row_h = (Self::line_h(ctx) + ctx.px(34.0)).max(ctx.px(64.0));
         for (label, value) in rows {
             self.paint_summary_row(
                 ctx,
                 layers,
-                rect(area.origin.x, y, area.size.width.min(760.0), row_h),
+                rect(area.origin.x, y, area.size.width.min(ctx.px(760.0)), row_h),
                 palette,
                 font,
                 label,
                 &value,
             )?;
-            y += row_h + 12.0;
+            y += row_h + ctx.px(12.0);
         }
         Ok(())
     }
@@ -1040,7 +1043,7 @@ impl OnboardingView {
         palette: UiPalette,
         font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
-        let footer_y = content.origin.y + content.size.height - FOOTER_H;
+        let footer_y = content.origin.y + content.size.height - ctx.px(FOOTER_H);
         ctx.draw_rect(
             layers,
             0,
@@ -1059,13 +1062,13 @@ impl OnboardingView {
         )?;
 
         let action_h = Self::action_h(ctx);
-        let y = footer_y + 76.0;
+        let y = footer_y + ctx.px(76.0);
         let primary_w = if self.step == Step::ReviewProjects {
-            330.0
+            ctx.px(330.0)
         } else if self.step == Step::Ready {
-            290.0
+            ctx.px(290.0)
         } else {
-            230.0
+            ctx.px(230.0)
         };
         let primary = rect(
             content.origin.x + content.size.width - primary_w,
@@ -1100,7 +1103,7 @@ impl OnboardingView {
         self.paint_button(
             ctx,
             layers,
-            rect(content.origin.x, y, 154.0, action_h),
+            rect(content.origin.x, y, ctx.px(154.0), action_h),
             palette,
             font,
             "Skip",
@@ -1125,7 +1128,10 @@ impl OnboardingView {
             layers,
             font,
             content.origin.x,
-            content.origin.y + content.size.height - FOOTER_H - Self::compact_line_h(ctx) - 16.0,
+            content.origin.y + content.size.height
+                - ctx.px(FOOTER_H)
+                - Self::compact_line_h(ctx)
+                - ctx.px(16.0),
             status,
             palette.muted_text,
             content.size.width,
@@ -1165,7 +1171,7 @@ impl OnboardingView {
             area.size.width * 0.42,
         )?;
 
-        let track_w = (area.size.width * 0.46).min(520.0).max(280.0);
+        let track_w = (area.size.width * 0.46).min(ctx.px(520.0)).max(ctx.px(280.0));
         let track_x = area.origin.x + area.size.width - track_w;
         let center_y = area.origin.y + area.size.height / 2.0;
         let segment_w = track_w / steps.len().max(1) as f32;
@@ -1174,22 +1180,22 @@ impl OnboardingView {
             layers,
             0,
             track_x,
-            center_y - 2.0,
+            center_y - ctx.px(2.0),
             track_w,
-            4.0,
+            ctx.px(4.0),
             palette.control_border,
-            2.0,
+            ctx.px(2.0),
         )?;
         let fill_w = segment_w * (progress_index + 1.0);
         ctx.draw_rounded_rect(
             layers,
             1,
             track_x,
-            center_y - 2.0,
+            center_y - ctx.px(2.0),
             fill_w.min(track_w),
-            4.0,
+            ctx.px(4.0),
             active_progress,
-            2.0,
+            ctx.px(2.0),
         )?;
         for (idx, step) in steps.iter().enumerate() {
             let active = *step == self.step;
@@ -1197,7 +1203,7 @@ impl OnboardingView {
             let complete = idx_f < progress_index.floor();
             let active_strength = (1.0 - (idx_f - progress_index).abs()).clamp(0.0, 1.0);
             let cx = track_x + segment_w * idx as f32 + segment_w / 2.0;
-            let size = 14.0 + 4.0 * active_strength;
+            let size = ctx.px(14.0) + ctx.px(4.0) * active_strength;
             let color = if complete || active || active_strength > 0.01 {
                 active_progress
             } else {
@@ -1238,34 +1244,34 @@ impl OnboardingView {
             card.size.height,
             palette.control_bg,
             palette.control_border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
         let line_h = Self::line_h(ctx);
-        let icon_y = card.origin.y + 24.0;
+        let icon_y = card.origin.y + ctx.px(24.0);
         ctx.draw_svg_icon(
             layers,
             icon,
-            card.origin.x + 24.0,
+            card.origin.x + ctx.px(24.0),
             icon_y,
-            28.0,
+            ctx.px(28.0),
             palette.secondary_text,
         )?;
         ctx.draw_text(
             layers,
             font,
-            card.origin.x + 68.0,
-            card.origin.y + 22.0,
+            card.origin.x + ctx.px(68.0),
+            card.origin.y + ctx.px(22.0),
             title,
             palette.text,
-            card.size.width - 92.0,
+            card.size.width - ctx.px(92.0),
         )?;
         self.draw_wrapped_text(
             ctx,
             layers,
             font,
-            card.origin.x + 24.0,
-            card.origin.y + 26.0 + line_h,
-            card.size.width - 48.0,
+            card.origin.x + ctx.px(24.0),
+            card.origin.y + ctx.px(26.0) + line_h,
+            card.size.width - ctx.px(48.0),
             description,
             palette.secondary_text,
             2,
@@ -1311,7 +1317,7 @@ impl OnboardingView {
             card.size.height,
             bg,
             border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
         let icon_color = if available {
             palette.secondary_text
@@ -1321,27 +1327,27 @@ impl OnboardingView {
         ctx.draw_svg_icon(
             layers,
             provider.icon(),
-            card.origin.x + 18.0,
-            card.origin.y + 22.0,
-            28.0,
+            card.origin.x + ctx.px(18.0),
+            card.origin.y + ctx.px(22.0),
+            ctx.px(28.0),
             icon_color,
         )?;
         ctx.draw_text(
             layers,
             font,
             card.origin.x + 60.0,
-            card.origin.y + 16.0,
+            card.origin.y + ctx.px(16.0),
             provider.label(),
             palette.text,
-            card.size.width - 78.0,
+            card.size.width - ctx.px(78.0),
         )?;
         self.draw_wrapped_text(
             ctx,
             layers,
             font,
             card.origin.x + 60.0,
-            card.origin.y + 16.0 + line_h,
-            card.size.width - 78.0,
+            card.origin.y + ctx.px(16.0) + line_h,
+            card.size.width - ctx.px(78.0),
             provider.description(),
             palette.muted_text,
             2,
@@ -1355,14 +1361,14 @@ impl OnboardingView {
             layers,
             font,
             card.origin.x + 60.0,
-            card.origin.y + card.size.height - line_h - 12.0,
+            card.origin.y + card.size.height - line_h - ctx.px(12.0),
             badge,
             if available {
                 palette.secondary_text
             } else {
                 palette.muted_text
             },
-            card.size.width - 78.0,
+            card.size.width - ctx.px(78.0),
         )
     }
 
@@ -1404,9 +1410,14 @@ impl OnboardingView {
             row.size.height,
             bg,
             palette.control_border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
-        let checkbox = rect(row.origin.x + 16.0, row.origin.y + 24.0, 28.0, 28.0);
+        let checkbox = rect(
+            row.origin.x + ctx.px(16.0),
+            row.origin.y + ctx.px(24.0),
+            ctx.px(28.0),
+            ctx.px(28.0),
+        );
         ctx.draw_rounded_frame(
             layers,
             1,
@@ -1424,51 +1435,51 @@ impl OnboardingView {
             } else {
                 palette.control_border
             },
-            6.0,
+            ctx.px(6.0),
         )?;
         if project.selected {
             ctx.draw_svg_icon(
                 layers,
                 SvgIcon::CircleCheck,
-                checkbox.origin.x + 3.0,
-                checkbox.origin.y + 3.0,
-                22.0,
+                checkbox.origin.x + ctx.px(3.0),
+                checkbox.origin.y + ctx.px(3.0),
+                ctx.px(22.0),
                 palette.selected_text,
             )?;
         }
         ctx.draw_text(
             layers,
             font,
-            row.origin.x + 62.0,
-            row.origin.y + 16.0,
+            row.origin.x + ctx.px(62.0),
+            row.origin.y + ctx.px(16.0),
             &project.name,
             palette.text,
-            row.size.width - 154.0,
+            row.size.width - ctx.px(154.0),
         )?;
         let line_h = Self::line_h(ctx);
         ctx.draw_text(
             layers,
             font,
-            row.origin.x + 62.0,
-            row.origin.y + 16.0 + line_h,
+            row.origin.x + ctx.px(62.0),
+            row.origin.y + ctx.px(16.0) + line_h,
             &project.path.display().to_string(),
             palette.secondary_text,
-            row.size.width - 154.0,
+            row.size.width - ctx.px(154.0),
         )?;
         ctx.draw_text(
             layers,
             font,
-            row.origin.x + row.size.width - 132.0,
-            row.origin.y + 16.0,
+            row.origin.x + row.size.width - ctx.px(132.0),
+            row.origin.y + ctx.px(16.0),
             project.source.label(),
             palette.muted_text,
-            76.0,
+            ctx.px(76.0),
         )?;
         let remove = rect(
-            row.origin.x + row.size.width - 46.0,
-            row.origin.y + 22.0,
-            32.0,
-            32.0,
+            row.origin.x + row.size.width - ctx.px(46.0),
+            row.origin.y + ctx.px(22.0),
+            ctx.px(32.0),
+            ctx.px(32.0),
         );
         self.widgets.push(
             remove,
@@ -1485,15 +1496,15 @@ impl OnboardingView {
                 remove.size.width,
                 remove.size.height,
                 palette.control_hover_bg,
-                8.0,
+                ctx.px(8.0),
             )?;
         }
         ctx.draw_svg_icon(
             layers,
             SvgIcon::X,
-            remove.origin.x + 8.0,
-            remove.origin.y + 8.0,
-            16.0,
+            remove.origin.x + ctx.px(8.0),
+            remove.origin.y + ctx.px(8.0),
+            ctx.px(16.0),
             palette.muted_text,
         )
     }
@@ -1510,7 +1521,7 @@ impl OnboardingView {
         let card = rect(
             area.origin.x,
             area.origin.y,
-            area.size.width.min(720.0),
+            area.size.width.min(ctx.px(720.0)),
             line_h * 3.4,
         );
         ctx.draw_rounded_frame(
@@ -1522,32 +1533,32 @@ impl OnboardingView {
             card.size.height,
             palette.control_bg,
             palette.control_border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
         ctx.draw_svg_icon(
             layers,
             SvgIcon::FolderOpen,
-            card.origin.x + 22.0,
-            card.origin.y + 26.0,
-            34.0,
+            card.origin.x + ctx.px(22.0),
+            card.origin.y + ctx.px(26.0),
+            ctx.px(34.0),
             palette.muted_text,
         )?;
         ctx.draw_text(
             layers,
             font,
-            card.origin.x + 76.0,
-            card.origin.y + 24.0,
+            card.origin.x + ctx.px(76.0),
+            card.origin.y + ctx.px(24.0),
             "No projects queued",
             palette.text,
-            card.size.width - 98.0,
+            card.size.width - ctx.px(98.0),
         )?;
         self.draw_wrapped_text(
             ctx,
             layers,
             font,
-            card.origin.x + 76.0,
-            card.origin.y + 24.0 + line_h,
-            card.size.width - 98.0,
+            card.origin.x + ctx.px(76.0),
+            card.origin.y + ctx.px(24.0) + line_h,
+            card.size.width - ctx.px(98.0),
             "Go back to choose a folder manually, continue with an empty workspace, or Skip setup.",
             palette.secondary_text,
             2,
@@ -1576,15 +1587,15 @@ impl OnboardingView {
             area.size.width,
         )?;
         let columns = 2usize;
-        let gap = 18.0;
+        let gap = ctx.px(18.0);
         let control_h = Self::preference_choice_h(ctx);
-        let width = ((area.size.width - gap) / columns as f32).max(180.0);
-        let start_y = area.origin.y + line_h + 26.0;
+        let width = ((area.size.width - gap) / columns as f32).max(ctx.px(180.0));
+        let start_y = area.origin.y + line_h + ctx.px(26.0);
         for (idx, (label, action, selected)) in choices.iter().enumerate() {
             let col = idx % columns;
             let row = idx / columns;
             let x = area.origin.x + col as f32 * (width + gap);
-            let y = start_y + row as f32 * (control_h + 18.0);
+            let y = start_y + row as f32 * (control_h + ctx.px(18.0));
             self.paint_choice_pill(
                 ctx,
                 layers,
@@ -1636,12 +1647,12 @@ impl OnboardingView {
             area.size.height,
             bg,
             border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
         ctx.draw_text(
             layers,
             font,
-            area.origin.x + 22.0,
+            area.origin.x + ctx.px(22.0),
             Self::centered_text_y(ctx, area),
             label,
             if selected {
@@ -1649,7 +1660,7 @@ impl OnboardingView {
             } else {
                 palette.secondary_text
             },
-            area.size.width - 44.0,
+            area.size.width - ctx.px(44.0),
         )
     }
 
@@ -1698,11 +1709,11 @@ impl OnboardingView {
             area.size.height,
             bg,
             border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
         let text_w = ctx.measure_text_width(font, label);
         let max_text_w = (area.size.width - 24.0).max(0.0);
-        let x = area.origin.x + ((area.size.width - text_w.min(max_text_w)) / 2.0).max(12.0);
+        let x = area.origin.x + ((area.size.width - text_w.min(max_text_w)) / 2.0).max(ctx.px(12.0));
         ctx.draw_text(
             layers,
             font,
@@ -1733,12 +1744,12 @@ impl OnboardingView {
             row.size.height,
             palette.control_bg,
             palette.control_border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
         ctx.draw_text(
             layers,
             font,
-            row.origin.x + 18.0,
+            row.origin.x + ctx.px(18.0),
             Self::centered_text_y(ctx, row),
             label,
             palette.secondary_text,

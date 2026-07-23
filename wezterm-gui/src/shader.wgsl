@@ -38,6 +38,8 @@ const IS_GRAY_SCALE: f32 = 4.0;
 struct ShaderUniform {
   foreground_text_hsb: vec3<f32>,
   milliseconds: u32,
+  viewport_and_corner: vec4<f32>,
+  window_border: vec4<f32>,
   projection: mat4x4<f32>,
 };
 @group(0) @binding(0) var<uniform> uniforms: ShaderUniform;
@@ -70,6 +72,51 @@ fn apply_hsv(c: vec4<f32>, transform: vec3<f32>) -> vec4<f32>
 {
   let hsv = rgb2hsv(c.rgb) * transform;
   return vec4<f32>(hsv2rgb(hsv).rgb, c.a);
+}
+
+fn rounded_window_coverage(position: vec2<f32>) -> f32 {
+  let viewport = uniforms.viewport_and_corner.xy;
+  let radius = uniforms.viewport_and_corner.z;
+  if radius <= 0.0 {
+    return 1.0;
+  }
+
+  let in_corner_x = position.x < radius || position.x > viewport.x - radius;
+  let in_corner_y = position.y < radius || position.y > viewport.y - radius;
+  if !in_corner_x || !in_corner_y {
+    return 1.0;
+  }
+
+  let center = vec2<f32>(
+    select(radius, viewport.x - radius, position.x > viewport.x * 0.5),
+    select(radius, viewport.y - radius, position.y > viewport.y * 0.5),
+  );
+  let feather = 1.0;
+  return 1.0 - smoothstep(radius - feather, radius, distance(position, center));
+}
+
+fn rounded_window_signed_distance(position: vec2<f32>) -> f32 {
+  let viewport = uniforms.viewport_and_corner.xy;
+  let half_size = viewport * 0.5;
+  let radius = min(
+    max(uniforms.viewport_and_corner.z, 0.0),
+    min(half_size.x, half_size.y),
+  );
+  let q = abs(position - half_size) - (half_size - vec2<f32>(radius));
+  return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+fn rounded_window_border_coverage(position: vec2<f32>) -> f32 {
+  let width = uniforms.window_border.w;
+  if width <= 0.0 {
+    return 0.0;
+  }
+  let signed_distance = rounded_window_signed_distance(position);
+  return smoothstep(
+    -width - 0.5,
+    -width + 0.5,
+    signed_distance,
+  );
 }
 
 @vertex
@@ -119,6 +166,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   }
 
   color = apply_hsv(color, hsv);
+  let border_coverage = rounded_window_border_coverage(in.clip_position.xy);
+  color = mix(
+    color,
+    vec4<f32>(uniforms.window_border.rgb, 1.0),
+    border_coverage,
+  );
+  let coverage = rounded_window_coverage(in.clip_position.xy);
+  if coverage <= 0.0 {
+    discard;
+  }
+  color.a *= coverage;
 
   return color;
 }

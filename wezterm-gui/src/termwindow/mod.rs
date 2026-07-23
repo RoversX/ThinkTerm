@@ -4257,6 +4257,10 @@ impl TermWindow {
             &panes,
             tab_bar_colors,
             &self.config,
+            crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons(
+                self.config.window_decorations,
+                self.window_state,
+            ),
             self.tab_bar_scroll_offset,
             &self.left_status,
             &self.right_status,

@@ -62,6 +62,7 @@ pub(super) struct WaylandState {
     pub(super) keyboard_window_id: Option<usize>,
 
     pub(super) pointer: Option<ThemedPointer<PointerUserData>>,
+    pub(super) pointer_seat: Option<wayland_client::protocol::wl_seat::WlSeat>,
     pub(super) surface_to_pending: HashMap<ObjectId, Arc<Mutex<PendingMouse>>>,
 
     pub(super) data_device_manager_state: DataDeviceManagerState,
@@ -107,6 +108,7 @@ impl WaylandState {
             key_repeat_delay: 400,
             keyboard_window_id: None,
             pointer: None,
+            pointer_seat: None,
             surface_to_pending: HashMap::new(),
             data_device_manager_state: DataDeviceManagerState::bind(globals, qh)?,
             data_device: None,

@@ -139,17 +139,19 @@ impl UiTokens {
     }
 }
 
-/// ThinkTerm's custom chrome is expressed in design pixels: Retina pixels on
-/// macOS and logical pixels elsewhere. Convert those values to the current
-/// monitor's backing-pixel grid.
+/// ThinkTerm's custom chrome is authored in 2x macOS backing pixels on every
+/// platform. Convert those values to the current monitor's backing-pixel
+/// grid: on macOS a 2x surface reports dpi 144, so that is the design dpi;
+/// elsewhere windows report logical dpi, so the design maps to 192 — a
+/// 96dpi/100% display renders at 0.5, Windows 150% (144dpi) at 0.75 and
+/// 200% (192dpi) at 1.0, all matching the macOS logical proportions.
 pub(crate) fn ui_scale_for_dpi(dpi: usize) -> f32 {
     let design_dpi = if cfg!(target_os = "macos") {
-        // The custom chrome was authored on a 2x macOS backing surface.
         144.0
     } else {
-        96.0
+        192.0
     };
-    (dpi.max(1) as f32 / design_dpi).clamp(0.5, 4.0)
+    (dpi.max(1) as f32 / design_dpi).clamp(0.25, 4.0)
 }
 
 pub(crate) fn scale_ui_usize(value: usize, dpi: usize) -> usize {
@@ -199,7 +201,7 @@ mod tests {
         if cfg!(target_os = "macos") {
             144
         } else {
-            96
+            192
         }
     }
 

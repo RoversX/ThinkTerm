@@ -22,7 +22,7 @@ mod tests {
 
     #[test]
     fn fancy_height_scales_with_monitor_dpi() {
-        let design_dpi = if cfg!(target_os = "macos") { 144 } else { 96 };
+        let design_dpi = if cfg!(target_os = "macos") { 144 } else { 192 };
         let base = fancy_tab_bar_pixel_height(20, design_dpi);
         let doubled = fancy_tab_bar_pixel_height(40, design_dpi * 2);
         assert_eq!(doubled, base * 2);
@@ -30,7 +30,7 @@ mod tests {
 
     #[test]
     fn fancy_height_keeps_compact_comfortable_proportion() {
-        let dpi = if cfg!(target_os = "macos") { 144 } else { 96 };
+        let dpi = if cfg!(target_os = "macos") { 144 } else { 192 };
         assert_eq!(fancy_tab_bar_pixel_height(20, dpi), 44);
         assert_eq!(
             fancy_tab_bar_pixel_height(30, dpi) - fancy_tab_bar_pixel_height(20, dpi),

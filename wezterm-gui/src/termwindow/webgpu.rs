@@ -26,6 +26,8 @@ fn gpu_debug(message: impl AsRef<str>) {
 pub struct ShaderUniform {
     pub foreground_text_hsb: [f32; 3],
     pub milliseconds: u32,
+    pub viewport_and_corner: [f32; 4],
+    pub window_border: [f32; 4],
     pub projection: [[f32; 4]; 4],
     // sampler2D atlas_nearest_sampler;
     // sampler2D atlas_linear_sampler;
@@ -50,6 +52,21 @@ pub struct WebGpuState {
 pub struct RawHandlePair {
     window: RawWindowHandle,
     display: RawDisplayHandle,
+}
+
+#[cfg(test)]
+mod shader_tests {
+    #[test]
+    fn main_wgsl_shader_parses_and_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(include_str!("../shader.wgsl"))
+            .expect("main WGSL shader should parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("main WGSL shader should validate");
+    }
 }
 
 impl RawHandlePair {

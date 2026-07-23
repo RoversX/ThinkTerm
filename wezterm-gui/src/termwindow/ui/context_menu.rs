@@ -14,23 +14,26 @@ use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_font::LoadedFont;
 
-const MENU_MIN_WIDTH: usize = 220;
-const MENU_MAX_WIDTH: usize = 500;
-const MENU_WINDOW_MARGIN: usize = 12;
-const MENU_PADDING_X: usize = 14;
-const MENU_PADDING_Y: usize = 10;
-const MENU_LABEL_GAP: usize = 12;
-const MENU_ICON_SIZE: usize = 21;
-const MENU_ICON_SLOT: usize = 32;
-const MENU_CHECK_SLOT: usize = 28;
-const MENU_ARROW_SLOT: usize = 28;
-const MENU_ROW_EXTRA_HEIGHT: usize = 22;
-const MENU_SEPARATOR_HEIGHT: usize = 9;
-const MENU_BORDER_WIDTH: f32 = 1.0;
-const MENU_RADIUS: f32 = 22.0;
-const MENU_ROW_RADIUS: f32 = 15.0;
-const MENU_ROW_HOVER_INSET_X: usize = 8;
-const MENU_ROW_HOVER_INSET_Y: usize = 2;
+// Design pixels (2x macOS backing), scaled via ui_px/ui_f32 like the rest
+// of the chrome. The fallback menu only shows on non-mac (and behind a
+// debug flag on mac).
+const MENU_MIN_WIDTH: usize = 440;
+const MENU_MAX_WIDTH: usize = 1000;
+const MENU_WINDOW_MARGIN: usize = 24;
+const MENU_PADDING_X: usize = 28;
+const MENU_PADDING_Y: usize = 20;
+const MENU_LABEL_GAP: usize = 24;
+const MENU_ICON_SIZE: usize = 42;
+const MENU_ICON_SLOT: usize = 64;
+const MENU_CHECK_SLOT: usize = 56;
+const MENU_ARROW_SLOT: usize = 56;
+const MENU_ROW_EXTRA_HEIGHT: usize = 44;
+const MENU_SEPARATOR_HEIGHT: usize = 18;
+const MENU_BORDER_WIDTH: f32 = 2.0;
+const MENU_RADIUS: f32 = 44.0;
+const MENU_ROW_RADIUS: f32 = 30.0;
+const MENU_ROW_HOVER_INSET_X: usize = 16;
+const MENU_ROW_HOVER_INSET_Y: usize = 4;
 
 pub(crate) fn reveal_in_folder_label() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -359,7 +362,9 @@ impl crate::TermWindow {
             .title_font_with_size(menu_font_size)
             .context("context menu ui font")?;
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
-        let row_height = (ui_metrics.cell_size.height as usize + MENU_ROW_EXTRA_HEIGHT).max(28);
+        let row_height = (ui_metrics.cell_size.height as usize
+            + self.ui_px(MENU_ROW_EXTRA_HEIGHT))
+        .max(self.ui_px(56));
         let palette = context_menu_palette(crate::native_settings::effective_appearance());
 
         let gl_state = self.render_state.as_ref().unwrap();
@@ -522,7 +527,7 @@ fn compute_menu_metrics(
     window_width: usize,
 ) -> anyhow::Result<MenuMetrics> {
     let mut label_width = 0usize;
-    let mut height = MENU_PADDING_Y * 2;
+    let mut height = term.ui_px(MENU_PADDING_Y) * 2;
 
     for row in rows {
         match row {
@@ -534,21 +539,22 @@ fn compute_menu_metrics(
                 height = height.saturating_add(row_height);
             }
             MenuRow::Separator => {
-                height = height.saturating_add(MENU_SEPARATOR_HEIGHT);
+                height = height.saturating_add(term.ui_px(MENU_SEPARATOR_HEIGHT));
             }
         }
     }
 
-    let ideal_width = MENU_PADDING_X * 2
-        + MENU_CHECK_SLOT
-        + MENU_ICON_SLOT
-        + MENU_LABEL_GAP
+    let ideal_width = term.ui_px(MENU_PADDING_X) * 2
+        + term.ui_px(MENU_CHECK_SLOT)
+        + term.ui_px(MENU_ICON_SLOT)
+        + term.ui_px(MENU_LABEL_GAP)
         + label_width
-        + MENU_ARROW_SLOT;
-    let max_width = MENU_MAX_WIDTH
-        .min(window_width.saturating_sub(MENU_WINDOW_MARGIN * 2))
+        + term.ui_px(MENU_ARROW_SLOT);
+    let max_width = term
+        .ui_px(MENU_MAX_WIDTH)
+        .min(window_width.saturating_sub(term.ui_px(MENU_WINDOW_MARGIN) * 2))
         .max(1);
-    let min_width = MENU_MIN_WIDTH.min(max_width);
+    let min_width = term.ui_px(MENU_MIN_WIDTH).min(max_width);
     let width = ideal_width.clamp(min_width, max_width);
 
     Ok(MenuMetrics {
@@ -616,7 +622,7 @@ fn paint_menu_panel(
             metrics.height as f32,
         ),
         LinearRgba::with_components(0.0, 0.0, 0.0, 0.18),
-        MENU_RADIUS,
+        term.ui_f32(MENU_RADIUS),
     )?;
     term.fill_rounded_rectangle_with_border(
         layers,
@@ -624,8 +630,8 @@ fn paint_menu_panel(
         rect,
         palette.control_bg,
         palette.control_border,
-        MENU_RADIUS,
-        MENU_BORDER_WIDTH,
+        term.ui_f32(MENU_RADIUS),
+        term.ui_f32(MENU_BORDER_WIDTH).max(1.0),
     )
 }
 
@@ -644,34 +650,34 @@ fn paint_menu_rows(
     layout: &mut Vec<ContextMenuLayoutItem>,
 ) -> anyhow::Result<()> {
     let (x, y) = origin;
-    let mut cursor_y = y + MENU_PADDING_Y;
+    let mut cursor_y = y + term.ui_px(MENU_PADDING_Y);
 
     for row in rows {
         match row {
             MenuRow::Separator => {
-                let sep_y = cursor_y + MENU_SEPARATOR_HEIGHT / 2;
+                let sep_y = cursor_y + term.ui_px(MENU_SEPARATOR_HEIGHT) / 2;
                 term.filled_rectangle(
                     layers,
                     2,
                     euclid::rect(
-                        (x + MENU_PADDING_X) as f32,
+                        (x + term.ui_px(MENU_PADDING_X)) as f32,
                         sep_y as f32,
-                        metrics.width.saturating_sub(MENU_PADDING_X * 2) as f32,
+                        metrics.width.saturating_sub(term.ui_px(MENU_PADDING_X) * 2) as f32,
                         1.0,
                     ),
                     palette.separator,
                 )?;
-                cursor_y += MENU_SEPARATOR_HEIGHT;
+                cursor_y += term.ui_px(MENU_SEPARATOR_HEIGHT);
             }
             MenuRow::Item { index, item } => {
                 let mut path = menu_path.to_vec();
                 path.push(*index);
                 let item_rect = MenuRect {
-                    x: x + MENU_BORDER_WIDTH as usize,
+                    x: x + term.ui_f32(MENU_BORDER_WIDTH) as usize,
                     y: cursor_y,
                     width: metrics
                         .width
-                        .saturating_sub((MENU_BORDER_WIDTH as usize) * 2),
+                        .saturating_sub((term.ui_f32(MENU_BORDER_WIDTH) as usize) * 2),
                     height: metrics.row_height,
                 };
                 let has_submenu = match item {
@@ -689,13 +695,15 @@ fn paint_menu_rows(
                         layers,
                         2,
                         euclid::rect(
-                            item_rect.x.saturating_add(MENU_ROW_HOVER_INSET_X) as f32,
-                            item_rect.y.saturating_add(MENU_ROW_HOVER_INSET_Y) as f32,
-                            item_rect.width.saturating_sub(MENU_ROW_HOVER_INSET_X * 2) as f32,
-                            item_rect.height.saturating_sub(MENU_ROW_HOVER_INSET_Y * 2) as f32,
+                            item_rect.x.saturating_add(term.ui_px(MENU_ROW_HOVER_INSET_X)) as f32,
+                            item_rect.y.saturating_add(term.ui_px(MENU_ROW_HOVER_INSET_Y)) as f32,
+                            item_rect.width.saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_X) * 2)
+                                as f32,
+                            item_rect.height.saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_Y) * 2)
+                                as f32,
                         ),
                         palette.control_hover_bg,
-                        MENU_ROW_RADIUS,
+                        term.ui_f32(MENU_ROW_RADIUS),
                     )?;
                 }
 
@@ -716,16 +724,16 @@ fn paint_menu_rows(
                         palette.secondary_text
                     };
                     let icon_y =
-                        item_rect.y + (item_rect.height.saturating_sub(MENU_ICON_SIZE)) / 2;
-                    let check_x = item_rect.x + MENU_PADDING_X;
-                    let icon_x = check_x + MENU_CHECK_SLOT;
+                        item_rect.y + (item_rect.height.saturating_sub(term.ui_px(MENU_ICON_SIZE))) / 2;
+                    let check_x = item_rect.x + term.ui_px(MENU_PADDING_X);
+                    let icon_x = check_x + term.ui_px(MENU_CHECK_SLOT);
                     if *checked {
                         term.paint_sidebar_icon(
                             layers,
                             SvgIcon::Check,
                             check_x,
                             icon_y,
-                            MENU_ICON_SIZE,
+                            term.ui_px(MENU_ICON_SIZE),
                             foreground,
                         )?;
                     }
@@ -735,18 +743,18 @@ fn paint_menu_rows(
                             icon,
                             icon_x,
                             icon_y,
-                            MENU_ICON_SIZE,
+                            term.ui_px(MENU_ICON_SIZE),
                             foreground,
                         )?;
                     }
 
                     let label_x = item_rect.x
-                        + MENU_PADDING_X
-                        + MENU_CHECK_SLOT
-                        + MENU_ICON_SLOT
-                        + MENU_LABEL_GAP;
+                        + term.ui_px(MENU_PADDING_X)
+                        + term.ui_px(MENU_CHECK_SLOT)
+                        + term.ui_px(MENU_ICON_SLOT)
+                        + term.ui_px(MENU_LABEL_GAP);
                     let arrow_width = if ContextMenuState::has_renderable_items(submenu) {
-                        MENU_ARROW_SLOT
+                        term.ui_px(MENU_ARROW_SLOT)
                     } else {
                         0
                     };
@@ -754,7 +762,7 @@ fn paint_menu_rows(
                         .width
                         .saturating_sub(label_x.saturating_sub(item_rect.x))
                         .saturating_sub(arrow_width)
-                        .saturating_sub(MENU_PADDING_X);
+                        .saturating_sub(term.ui_px(MENU_PADDING_X));
                     let text_y = item_rect.y
                         + (item_rect
                             .height
@@ -775,14 +783,14 @@ fn paint_menu_rows(
                         let arrow_x = item_rect
                             .x
                             .saturating_add(item_rect.width)
-                            .saturating_sub(MENU_PADDING_X)
-                            .saturating_sub(MENU_ICON_SIZE);
+                            .saturating_sub(term.ui_px(MENU_PADDING_X))
+                            .saturating_sub(term.ui_px(MENU_ICON_SIZE));
                         term.paint_sidebar_icon(
                             layers,
                             SvgIcon::ChevronRight,
                             arrow_x,
                             icon_y,
-                            MENU_ICON_SIZE,
+                            term.ui_px(MENU_ICON_SIZE),
                             foreground,
                         )?;
                     }
