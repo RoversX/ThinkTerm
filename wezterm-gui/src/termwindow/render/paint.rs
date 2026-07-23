@@ -1,4 +1,4 @@
-use crate::quad::TripleLayerQuadAllocator;
+use crate::quad::{QuadTrait, TripleLayerQuadAllocator};
 use crate::termwindow::{RenderFrame, TermWindowNotif};
 use crate::ui::{DrawContext, UiPalette};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
@@ -380,35 +380,136 @@ impl crate::TermWindow {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| state.path.to_string_lossy().into_owned());
+        let anchor = state.current;
+        self.paint_drag_ghost_pill(&label, anchor)
+    }
+
+    /// Translucent preview of where a dragged level-2 pane tab would land
+    /// (full pane = move into its stack, half pane = split), plus the
+    /// floating tab-title pill. Registers no UIItem (hit-transparent).
+    fn paint_pane_tab_drag_overlay(&mut self) -> anyhow::Result<()> {
+        let Some(state) = self.pane_tab_drag.as_ref() else {
+            return Ok(());
+        };
+        if !state.active {
+            return Ok(());
+        }
+        let label = state.title.clone();
+        let anchor = state.current;
+        let target_rect = state.target.as_ref().map(|target| target.rect);
+
+        if let Some(rect) = target_rect {
+            let chrome =
+                UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let fill = chrome.selected_bg.mul_alpha(0.28);
+            let border = chrome.selected_bg.mul_alpha(0.8);
+
+            let gl_state = self.render_state.as_ref().unwrap();
+            let layer = gl_state
+                .layer_for_zindex(0)
+                .context("pane drag overlay layer")?;
+            let mut layers = layer.quad_allocator();
+
+            // Keep the radius on the same integral grid the corner sprites
+            // snap to (and clamped the same way), so the ring corners meet
+            // the fill's corners exactly even on short strips.
+            let radius = self
+                .ui_f32(crate::termwindow::ui::tokens::PANE_DROP_PREVIEW_RADIUS)
+                .min(rect.size.width / 2.0)
+                .min(rect.size.height / 2.0)
+                .floor()
+                .max(1.0);
+            self.fill_rounded_rectangle(&mut layers, 0, rect, fill, radius)
+                .context("pane drag overlay fill")?;
+            // The translucent fill can't occlude an underlying border rect,
+            // so build the outline from edge strips plus quarter-ring
+            // corner sprites of the same thickness (radius / 5).
+            let b = (radius / 5.0).max(1.0);
+            let (x, y) = (rect.origin.x, rect.origin.y);
+            let (w, h) = (rect.size.width, rect.size.height);
+            let span_w = (w - radius * 2.0).max(0.0);
+            let span_h = (h - radius * 2.0).max(0.0);
+            for edge in [
+                euclid::rect(x + radius, y, span_w, b),
+                euclid::rect(x + radius, y + h - b, span_w, b),
+                euclid::rect(x, y + radius, b, span_h),
+                euclid::rect(x + w - b, y + radius, b, span_h),
+            ] {
+                self.filled_rectangle(&mut layers, 0, edge, border)
+                    .context("pane drag overlay border")?;
+            }
+            let corner_size = euclid::size2(radius, radius);
+            for (cx, cy, poly) in [
+                (x, y, super::corners::TOP_LEFT_ROUNDED_CORNER_RING),
+                (
+                    x + w - radius,
+                    y,
+                    super::corners::TOP_RIGHT_ROUNDED_CORNER_RING,
+                ),
+                (
+                    x,
+                    y + h - radius,
+                    super::corners::BOTTOM_LEFT_ROUNDED_CORNER_RING,
+                ),
+                (
+                    x + w - radius,
+                    y + h - radius,
+                    super::corners::BOTTOM_RIGHT_ROUNDED_CORNER_RING,
+                ),
+            ] {
+                self.poly_quad(
+                    &mut layers,
+                    0,
+                    euclid::point2(cx, cy),
+                    poly,
+                    0,
+                    corner_size,
+                    border,
+                )
+                .context("pane drag overlay corner")?
+                .set_grayscale();
+            }
+        }
+
+        self.paint_drag_ghost_pill(&label, anchor)
+    }
+
+    /// Floating label that follows the cursor during a drag. Painted after
+    /// everything else so it stays on top; registers no UIItem.
+    fn paint_drag_ghost_pill(
+        &mut self,
+        label: &str,
+        anchor: ::window::Point,
+    ) -> anyhow::Result<()> {
         if label.is_empty() {
             return Ok(());
         }
-        let anchor = state.current;
-
         let settings = crate::native_settings::load();
         let font_size = crate::native_settings::home_font_size(&settings);
         let ui_font = self
             .fonts
             .title_font_with_size(font_size)
-            .context("file drag ghost font")?;
+            .context("drag ghost font")?;
         let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&ui_font.metrics());
         let line_height = metrics.cell_size.height as f32;
 
-        let (bg, fg) = match crate::native_settings::effective_appearance() {
+        let (bg, fg, pill_border) = match crate::native_settings::effective_appearance() {
             window::Appearance::Light | window::Appearance::LightHighContrast => (
                 LinearRgba::with_srgba(245, 245, 248, 235),
                 LinearRgba::with_srgba(40, 40, 48, 255),
+                LinearRgba::with_srgba(60, 60, 67, 70),
             ),
             window::Appearance::Dark | window::Appearance::DarkHighContrast => (
                 LinearRgba::with_srgba(58, 58, 66, 235),
                 LinearRgba::with_srgba(235, 235, 240, 255),
+                LinearRgba::with_srgba(255, 255, 255, 60),
             ),
         };
 
         let gl_state = self.render_state.as_ref().unwrap();
         let layer = gl_state
             .layer_for_zindex(0)
-            .context("file drag ghost layer")?;
+            .context("drag ghost layer")?;
         let mut layers = layer.quad_allocator();
 
         let ctx = DrawContext::new(gl_state, self.dimensions, &metrics);
@@ -429,8 +530,16 @@ impl crate::TermWindow {
             .min(self.dimensions.pixel_height as f32 - pill_h)
             .max(0.0);
 
-        self.filled_rectangle(&mut layers, 0, euclid::rect(x, y, pill_w, pill_h), bg)
-            .context("file drag ghost background")?;
+        self.fill_rounded_rectangle_with_border(
+            &mut layers,
+            0,
+            euclid::rect(x, y, pill_w, pill_h),
+            bg,
+            pill_border,
+            pill_h / 2.0,
+            1.0,
+        )
+        .context("drag ghost background")?;
         ctx.draw_text_on_layer(
             &mut layers,
             2,
@@ -441,7 +550,7 @@ impl crate::TermWindow {
             fg,
             max_width,
         )
-        .context("file drag ghost label")?;
+        .context("drag ghost label")?;
 
         Ok(())
     }
@@ -610,6 +719,8 @@ impl crate::TermWindow {
         drop(layers);
         self.paint_modal().context("paint_modal")?;
         self.paint_context_menu().context("paint_context_menu")?;
+        self.paint_pane_tab_drag_overlay()
+            .context("paint_pane_tab_drag_overlay")?;
         self.paint_file_drag_ghost()
             .context("paint_file_drag_ghost")?;
 

@@ -584,6 +584,182 @@ struct FileDragState {
     active: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaneDropZone {
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaneDropKind {
+    MoveIntoStack,
+    Split,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PaneTabDropTarget {
+    pub target_pane_id: PaneId,
+    pub zone: PaneDropZone,
+    pub kind: PaneDropKind,
+    /// Preview rectangle in window pixels; painted as the drop overlay.
+    pub rect: RectF,
+}
+
+/// A level-2 pane tab being dragged toward another pane to move or split.
+#[derive(Clone, Debug)]
+pub(crate) struct PaneTabDragState {
+    pub pane_id: PaneId,
+    pub title: String,
+    pub start: ::window::Point,
+    pub current: ::window::Point,
+    pub active: bool,
+    pub target: Option<PaneTabDropTarget>,
+}
+
+/// Split the target pane into a hit grid: an inner box maps to "move into
+/// this pane's stack", the border bands map to the nearest edge.
+pub(crate) fn pane_drop_zone(fx: f32, fy: f32) -> PaneDropZone {
+    if fx > 0.28 && fx < 0.72 && fy > 0.28 && fy < 0.72 {
+        return PaneDropZone::Center;
+    }
+    let mut best = (fx, PaneDropZone::Left);
+    for cand in [
+        (1.0 - fx, PaneDropZone::Right),
+        (fy, PaneDropZone::Top),
+        (1.0 - fy, PaneDropZone::Bottom),
+    ] {
+        if cand.0 < best.0 {
+            best = cand;
+        }
+    }
+    best.1
+}
+
+pub(crate) fn zone_split_request(zone: PaneDropZone) -> SplitRequest {
+    SplitRequest {
+        direction: match zone {
+            PaneDropZone::Left | PaneDropZone::Right => SplitDirection::Horizontal,
+            PaneDropZone::Top | PaneDropZone::Bottom => SplitDirection::Vertical,
+            PaneDropZone::Center => unreachable!("center zone does not split"),
+        },
+        target_is_second: matches!(zone, PaneDropZone::Right | PaneDropZone::Bottom),
+        top_level: false,
+        size: MuxSplitSize::Percent(50),
+    }
+}
+
+/// Decide what dropping onto `zone` would do, or None when the drop is a
+/// no-op (moving a pane onto the stack it is already in, or splitting a
+/// single-pane stack against itself).
+pub(crate) fn pane_drop_action(
+    zone: PaneDropZone,
+    src_in_target_stack: bool,
+    target_stack_len: usize,
+) -> Option<PaneDropKind> {
+    match zone {
+        PaneDropZone::Center => {
+            if src_in_target_stack {
+                None
+            } else {
+                Some(PaneDropKind::MoveIntoStack)
+            }
+        }
+        _ => {
+            if src_in_target_stack && target_stack_len <= 1 {
+                None
+            } else {
+                Some(PaneDropKind::Split)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pane_drop_tests {
+    use super::*;
+
+    #[test]
+    fn drop_zone_center_box_and_edges() {
+        assert_eq!(pane_drop_zone(0.5, 0.5), PaneDropZone::Center);
+        assert_eq!(pane_drop_zone(0.29, 0.29), PaneDropZone::Center);
+        assert_eq!(pane_drop_zone(0.71, 0.71), PaneDropZone::Center);
+        // On/outside the inner box: nearest edge wins
+        assert_eq!(pane_drop_zone(0.1, 0.5), PaneDropZone::Left);
+        assert_eq!(pane_drop_zone(0.9, 0.5), PaneDropZone::Right);
+        assert_eq!(pane_drop_zone(0.5, 0.1), PaneDropZone::Top);
+        assert_eq!(pane_drop_zone(0.5, 0.9), PaneDropZone::Bottom);
+        // Corners resolve to whichever edge is closest
+        assert_eq!(pane_drop_zone(0.05, 0.2), PaneDropZone::Left);
+        assert_eq!(pane_drop_zone(0.2, 0.05), PaneDropZone::Top);
+        assert_eq!(pane_drop_zone(0.98, 0.9), PaneDropZone::Right);
+        assert_eq!(pane_drop_zone(0.9, 0.98), PaneDropZone::Bottom);
+        // Extremes
+        assert_eq!(pane_drop_zone(0.0, 0.5), PaneDropZone::Left);
+        assert_eq!(pane_drop_zone(1.0, 0.5), PaneDropZone::Right);
+    }
+
+    #[test]
+    fn zone_to_split_request_mapping() {
+        let left = zone_split_request(PaneDropZone::Left);
+        assert_eq!(left.direction, SplitDirection::Horizontal);
+        assert!(!left.target_is_second);
+
+        let right = zone_split_request(PaneDropZone::Right);
+        assert_eq!(right.direction, SplitDirection::Horizontal);
+        assert!(right.target_is_second);
+
+        let top = zone_split_request(PaneDropZone::Top);
+        assert_eq!(top.direction, SplitDirection::Vertical);
+        assert!(!top.target_is_second);
+
+        let bottom = zone_split_request(PaneDropZone::Bottom);
+        assert_eq!(bottom.direction, SplitDirection::Vertical);
+        assert!(bottom.target_is_second);
+
+        for zone in [
+            PaneDropZone::Left,
+            PaneDropZone::Right,
+            PaneDropZone::Top,
+            PaneDropZone::Bottom,
+        ] {
+            let request = zone_split_request(zone);
+            assert!(!request.top_level);
+            assert_eq!(request.size, MuxSplitSize::Percent(50));
+        }
+    }
+
+    #[test]
+    fn drop_action_table() {
+        // Moving into a stack the pane already lives in is a no-op
+        assert_eq!(pane_drop_action(PaneDropZone::Center, true, 2), None);
+        assert_eq!(
+            pane_drop_action(PaneDropZone::Center, false, 1),
+            Some(PaneDropKind::MoveIntoStack)
+        );
+        // Splitting a single-pane stack against itself is a no-op
+        assert_eq!(pane_drop_action(PaneDropZone::Left, true, 1), None);
+        // ...but a background tab can split out of its own stack
+        assert_eq!(
+            pane_drop_action(PaneDropZone::Bottom, true, 2),
+            Some(PaneDropKind::Split)
+        );
+        for zone in [
+            PaneDropZone::Left,
+            PaneDropZone::Right,
+            PaneDropZone::Top,
+            PaneDropZone::Bottom,
+        ] {
+            assert_eq!(
+                pane_drop_action(zone, false, 1),
+                Some(PaneDropKind::Split)
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum InlineTabRenameTarget {
     WindowTab(TabId),
@@ -1068,6 +1244,8 @@ pub struct TermWindow {
     // active once the pointer moves past a small threshold so plain clicks
     // still open the file.
     right_sidebar_file_drag: Option<FileDragState>,
+    /// In-flight drag of a level-2 pane tab toward a move/split drop.
+    pane_tab_drag: Option<PaneTabDragState>,
     /// Content views (e.g. SSH hosts) shown as synthetic tabs.
     content_views: Vec<ContentViewTab>,
     active_content_view_id: Option<ContentViewId>,
@@ -1403,6 +1581,7 @@ impl TermWindow {
             // clicking away) and abandons any in-flight file drag.
             self.finish_inline_tab_rename(true);
             self.right_sidebar_file_drag = None;
+            self.pane_tab_drag = None;
             self.dragging = None;
         }
 
@@ -1735,6 +1914,7 @@ impl TermWindow {
             context_menu_suppressed_release: None,
             dragging: None,
             right_sidebar_file_drag: None,
+            pane_tab_drag: None,
             content_views: vec![],
             active_content_view_id: None,
             content_view_response_tab_id: None,

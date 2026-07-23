@@ -56,7 +56,7 @@ pub(crate) fn client_pane_lag_ms(pane: &dyn mux::pane::Pane) -> Option<u64> {
 impl crate::TermWindow {
     /// Height of the nav bar for this pane: the metric height, clamped so
     /// that at least one terminal row of the pane's cell remains visible.
-    fn pane_nav_bar_height_for_pane(&self, pos: &PositionedPane) -> usize {
+    pub(crate) fn pane_nav_bar_height_for_pane(&self, pos: &PositionedPane) -> usize {
         self.pane_nav_bar_height().min(
             pos.pixel_height
                 .saturating_sub(self.render_metrics.cell_size.height.max(1) as usize),
@@ -87,7 +87,7 @@ impl crate::TermWindow {
         ))
     }
 
-    fn pane_frame_rect(&self, pos: &PositionedPane) -> anyhow::Result<RectF> {
+    pub(crate) fn pane_frame_rect(&self, pos: &PositionedPane) -> anyhow::Result<RectF> {
         let (content_pane_x, pane_y) = self.pane_content_origin(pos)?;
         let content_pane_width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
         let content_pane_right = content_pane_x + content_pane_width;

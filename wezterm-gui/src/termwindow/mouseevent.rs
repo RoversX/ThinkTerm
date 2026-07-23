@@ -8,8 +8,9 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{
-    GuiWin, MouseCapture, PaneNavAction, PositionedSplit, ScrollHit, TabWheelSurface,
-    TermWindowNotif, UIItem, UIItemType, TMB,
+    pane_drop_action, pane_drop_zone, zone_split_request, GuiWin, MouseCapture, PaneDropKind,
+    PaneDropZone, PaneNavAction, PaneTabDragState, PaneTabDropTarget, PositionedSplit, ScrollHit,
+    TabWheelSurface, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
     ContextMenuIcon, ContextMenuItem, IntegratedTitleButtonStyle, MouseButtons as WMB, MouseCursor,
@@ -20,11 +21,12 @@ use config::keyassignment::{
     PaneDirection, SpawnCommand, SpawnTabDomain, SplitPane, SplitSize,
 };
 use config::{MouseEventAltScreen, TermConfig};
+use mux::domain::SplitSource;
 use mux::pane::{Pane, WithPaneLines};
 use mux::ssh::{RemoteSshDomain, SshConnectionStatus};
 use mux::tab::{PositionedPane, SplitDirection};
 use mux::window::WindowId as MuxWindowId;
-use mux::Mux;
+use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
 use std::convert::TryInto;
 use std::ops::Sub;
@@ -1257,6 +1259,26 @@ impl super::TermWindow {
                         }
                         return;
                     }
+                    if completed_drag
+                        .as_ref()
+                        .is_some_and(|(item, _)| matches!(item.item_type, UIItemType::PaneNav { .. }))
+                    {
+                        // Release coordinates can differ from the last move
+                        // event (coalesced/fast motion); recompute the drop
+                        // target from where the button actually went up.
+                        if self.pane_tab_drag.as_ref().is_some_and(|state| state.active) {
+                            self.update_pane_tab_drag_target(&event);
+                        }
+                        if let Some(state) = self.pane_tab_drag.take() {
+                            if state.active {
+                                self.drop_pane_tab_drag(state);
+                            }
+                            // A plain click (never crossed the threshold)
+                            // was already handled on press.
+                            context.invalidate();
+                        }
+                        return;
+                    }
                     if completed_drag.is_some() {
                         // Completed a drag
                         return;
@@ -1824,7 +1846,9 @@ impl super::TermWindow {
                 self.drag_workspace_sidebar_scroll_thumb(item, start_event, event, context);
             }
             UIItemType::ContextMenuBackdrop | UIItemType::ContextMenuItem(_) => {}
-            UIItemType::PaneNav { .. } => {}
+            UIItemType::PaneNav { .. } => {
+                self.drag_pane_nav_tab(item, start_event, event, context);
+            }
             UIItemType::RightSidebarFileRow(_) => {
                 self.drag_right_sidebar_file_row(item, start_event, event, context);
             }
@@ -1904,6 +1928,303 @@ impl super::TermWindow {
         text.push(' ');
         if let Err(err) = pane.send_paste(&text) {
             log::error!("failed to paste dropped file path: {err:#}");
+        }
+    }
+
+    /// Whether a pane can participate in a drag move/split. Remote mux
+    /// panes are excluded because the client's SplitPane move path does
+    /// not translate pane ids yet; tmux panes because the tmux domain
+    /// ignores SplitSource::MovePane and would spawn instead.
+    fn pane_tab_is_movable(pane: &Arc<dyn Pane>) -> bool {
+        if pane
+            .downcast_ref::<wezterm_client::pane::ClientPane>()
+            .is_some()
+        {
+            return false;
+        }
+        if let Some(domain) = Mux::get().get_domain(pane.domain_id()) {
+            if domain.downcast_ref::<mux::tmux::TmuxDomain>().is_some() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Prime a level-2 pane tab for a potential move/split drag. It only
+    /// becomes a real drag once the pointer travels past the threshold, so
+    /// plain clicks keep their press-time activation behavior.
+    fn arm_pane_tab_drag(&mut self, item: UIItem, pane_id: mux::pane::PaneId, event: MouseEvent) {
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        // A zoomed tab shows a single pane: there is nowhere to drop.
+        if tab.get_zoomed_pane().is_some() {
+            return;
+        }
+        if tab
+            .pane_stack_id(pane_id)
+            .is_some_and(|stack_id| self.collapsed_pane_layouts.contains_key(&stack_id))
+        {
+            return;
+        }
+        let Some(pane) = mux.get_pane(pane_id) else {
+            return;
+        };
+        if !Self::pane_tab_is_movable(&pane) {
+            return;
+        }
+        let title = self.pane_nav_tab_title(pane_id, &pane.get_title());
+        self.pane_tab_drag = Some(PaneTabDragState {
+            pane_id,
+            title,
+            start: event.coords,
+            current: event.coords,
+            active: false,
+            target: None,
+        });
+        self.dragging.replace((item, event));
+    }
+
+    fn drag_pane_nav_tab(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let mut dragging_active = false;
+        if let Some(state) = self.pane_tab_drag.as_mut() {
+            if !state.active {
+                let dx = event.coords.x - state.start.x;
+                let dy = event.coords.y - state.start.y;
+                // ~5px of travel turns the pending click into a drag
+                if dx * dx + dy * dy >= 25 {
+                    state.active = true;
+                }
+            }
+            state.current = event.coords;
+            dragging_active = state.active;
+        }
+        if dragging_active {
+            self.update_pane_tab_drag_target(&event);
+            context.set_cursor(Some(MouseCursor::Hand));
+            context.invalidate();
+        }
+        // drag_ui_item takes `dragging` on every move; keep the drag armed
+        self.dragging.replace((item, start_event));
+    }
+
+    /// Hit-test the pointer against the rendered panes and record which
+    /// drop (move-into-stack or directional split) releasing here would
+    /// perform, along with the preview rectangle to paint.
+    fn update_pane_tab_drag_target(&mut self, event: &MouseEvent) {
+        let Some(src_pane_id) = self.pane_tab_drag.as_ref().map(|state| state.pane_id) else {
+            return;
+        };
+        let mut target = None;
+        let mux = Mux::get();
+        if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+            let x = event.coords.x as f32;
+            let y = event.coords.y as f32;
+            for pos in self.get_panes_to_render() {
+                if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
+                    continue;
+                }
+                let Ok(rect) = self.pane_frame_rect(&pos) else {
+                    continue;
+                };
+                if x < rect.min_x() || x >= rect.max_x() || y < rect.min_y() || y >= rect.max_y()
+                {
+                    continue;
+                }
+                // Remote mux / tmux panes cannot be split/moved into (v1)
+                if !Self::pane_tab_is_movable(&pos.pane) {
+                    break;
+                }
+                let stack_tabs = tab.pane_stack_tabs(pos.pane.pane_id());
+                let src_in_target_stack =
+                    stack_tabs.iter().any(|entry| entry.pane_id == src_pane_id);
+                let fx = (x - rect.min_x()) / rect.size.width.max(1.0);
+                let fy = (y - rect.min_y()) / rect.size.height.max(1.0);
+                // Hovering the target pane's own level-2 tab bar reads as
+                // "join this stack", like dropping a browser tab onto
+                // another window's tab strip.
+                let nav_bar_h = self.pane_nav_bar_height_for_pane(&pos) as f32;
+                let zone = if y < rect.min_y() + nav_bar_h {
+                    PaneDropZone::Center
+                } else {
+                    pane_drop_zone(fx, fy)
+                };
+                let Some(kind) = pane_drop_action(zone, src_in_target_stack, stack_tabs.len())
+                else {
+                    break;
+                };
+                let preview = match zone {
+                    // Joining the stack highlights the target's level-2 tab
+                    // bar, like dropping a browser tab onto a tab strip.
+                    PaneDropZone::Center => euclid::rect(
+                        rect.origin.x,
+                        rect.origin.y,
+                        rect.size.width,
+                        nav_bar_h.max(1.0),
+                    ),
+                    PaneDropZone::Left => euclid::rect(
+                        rect.origin.x,
+                        rect.origin.y,
+                        rect.size.width / 2.0,
+                        rect.size.height,
+                    ),
+                    PaneDropZone::Right => euclid::rect(
+                        rect.origin.x + rect.size.width / 2.0,
+                        rect.origin.y,
+                        rect.size.width / 2.0,
+                        rect.size.height,
+                    ),
+                    PaneDropZone::Top => euclid::rect(
+                        rect.origin.x,
+                        rect.origin.y,
+                        rect.size.width,
+                        rect.size.height / 2.0,
+                    ),
+                    PaneDropZone::Bottom => euclid::rect(
+                        rect.origin.x,
+                        rect.origin.y + rect.size.height / 2.0,
+                        rect.size.width,
+                        rect.size.height / 2.0,
+                    ),
+                };
+                target = Some(PaneTabDropTarget {
+                    target_pane_id: pos.pane.pane_id(),
+                    zone,
+                    kind,
+                    rect: preview,
+                });
+                break;
+            }
+        }
+        if let Some(state) = self.pane_tab_drag.as_mut() {
+            state.target = target;
+        }
+    }
+
+    fn drop_pane_tab_drag(&mut self, state: PaneTabDragState) {
+        let Some(target) = state.target else {
+            return;
+        };
+        let src_pane_id = state.pane_id;
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        // Re-validate against the live tree: the target was computed on a
+        // prior frame and panes may have closed or collapsed since.
+        if tab.get_zoomed_pane().is_some() {
+            return;
+        }
+        if tab.pane_index_for_pane(src_pane_id).is_none()
+            || tab.pane_index_for_pane(target.target_pane_id).is_none()
+        {
+            return;
+        }
+        if tab
+            .pane_stack_id(target.target_pane_id)
+            .is_some_and(|stack_id| self.collapsed_pane_layouts.contains_key(&stack_id))
+        {
+            return;
+        }
+
+        match target.kind {
+            PaneDropKind::MoveIntoStack => {
+                if let Err(err) = tab.move_pane_to_stack(src_pane_id, target.target_pane_id) {
+                    log::error!("pane tab drop move failed: {err:#}");
+                    return;
+                }
+                self.persist_workspace_layout_after_mutation("pane tab drop move");
+            }
+            PaneDropKind::Split => {
+                let stack_tabs = tab.pane_stack_tabs(target.target_pane_id);
+                let src_in_target_stack =
+                    stack_tabs.iter().any(|entry| entry.pane_id == src_pane_id);
+                // Splitting relative to the source's own stack must target
+                // another pane in that stack: MovePane removes the source
+                // first and would then fail to find it, orphaning the pane.
+                let effective_target = if src_in_target_stack {
+                    match stack_tabs.iter().find(|entry| entry.pane_id != src_pane_id) {
+                        Some(other) => other.pane_id,
+                        None => return,
+                    }
+                } else {
+                    target.target_pane_id
+                };
+                let request = zone_split_request(target.zone);
+                // Preflight the geometry: compute_split_size hands back
+                // zero-sized halves for tiny panes without complaining, and
+                // split_and_insert would then reject the split only after
+                // MovePane has already detached the source.
+                let Some(target_index) = tab.pane_index_for_pane(effective_target) else {
+                    return;
+                };
+                match tab.compute_split_size(target_index, request) {
+                    Some(split)
+                        if split.first.rows > 0
+                            && split.first.cols > 0
+                            && split.second.rows > 0
+                            && split.second.cols > 0 => {}
+                    _ => {
+                        log::debug!(
+                            "pane tab drop split: no room to split pane {effective_target}"
+                        );
+                        return;
+                    }
+                }
+                let dest_tab_id = tab.tab_id();
+                let workspace = self.current_mux_workspace();
+                let window = GuiWin::new(self);
+                promise::spawn::spawn(async move {
+                    match Mux::get()
+                        .split_pane(
+                            effective_target,
+                            request,
+                            SplitSource::MovePane(src_pane_id),
+                            SpawnTabDomain::CurrentPaneDomain,
+                        )
+                        .await
+                    {
+                        Ok((moved, _size)) => {
+                            // MovePane reuses an already-registered pane, so
+                            // observers get no PaneAdded; tell them the tab's
+                            // structure changed.
+                            Mux::get().notify(MuxNotification::TabResized(dest_tab_id));
+                            window
+                                .window
+                                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                                    // Look up the destination tab by id: the
+                                    // window's active tab may have changed
+                                    // while the split was in flight.
+                                    if let Some(tab) = Mux::get().get_tab(dest_tab_id) {
+                                        // split_and_insert only activates
+                                        // right/bottom targets; make all four
+                                        // directions end focused on the moved
+                                        // pane.
+                                        tab.set_active_pane(&moved);
+                                    }
+                                    if term_window.current_mux_workspace() == workspace {
+                                        term_window.persist_workspace_layout_after_mutation(
+                                            "pane tab drop split",
+                                        );
+                                    }
+                                    term_window.update_title();
+                                    if let Some(window) = term_window.window.as_ref() {
+                                        window.invalidate();
+                                    }
+                                })));
+                        }
+                        Err(err) => log::error!("pane tab drop split failed: {err:#}"),
+                    }
+                })
+                .detach();
+            }
         }
     }
 
@@ -2019,7 +2340,7 @@ impl super::TermWindow {
                 pane_index,
                 action,
             } => {
-                self.mouse_event_pane_nav(pane_id, pane_index, action, event, context);
+                self.mouse_event_pane_nav(item, pane_id, pane_index, action, event, context);
             }
             UIItemType::ProjectNew => {
                 self.mouse_event_project_new(event, context);
@@ -4798,6 +5119,7 @@ impl super::TermWindow {
 
     pub fn mouse_event_pane_nav(
         &mut self,
+        item: UIItem,
         pane_id: mux::pane::PaneId,
         pane_index: usize,
         action: PaneNavAction,
@@ -4878,6 +5200,7 @@ impl super::TermWindow {
                         client_pane.activate_in_stack_on_server();
                     }
                 }
+                self.arm_pane_tab_drag(item, target_pane_id, event);
             }
             PaneNavAction::Close(target_pane_id) => {
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {

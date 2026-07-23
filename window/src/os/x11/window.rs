@@ -116,6 +116,42 @@ pub(crate) struct XWindowInner {
 const _NET_WM_MOVERESIZE_MOVE: u32 = 8;
 const _NET_WM_MOVERESIZE_CANCEL: u32 = 11;
 
+// `_MOTIF_WM_HINTS` uses a different bit layout for decorations than it does
+// for window functions. Keep the decoration values explicit so that asking
+// for resize handles cannot accidentally ask the window manager for a title.
+const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
+const MWM_DECOR_ALL: u32 = 1 << 0;
+const MWM_DECOR_BORDER: u32 = 1 << 1;
+const MWM_DECOR_RESIZEH: u32 = 1 << 2;
+const MWM_DECOR_TITLE: u32 = 1 << 3;
+const MWM_DECOR_MENU: u32 = 1 << 4;
+const MWM_DECOR_MINIMIZE: u32 = 1 << 5;
+const MWM_DECOR_MAXIMIZE: u32 = 1 << 6;
+
+fn motif_decorations_for(decorations: WindowDecorations) -> u32 {
+    if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS) {
+        // ThinkTerm draws the complete window header. Some X11 window
+        // managers, including xfwm4, promote a partial resize-only Motif
+        // request back to a complete frame, so integrated mode must request
+        // no window-manager decorations at all.
+        0
+    } else if decorations == WindowDecorations::TITLE | WindowDecorations::RESIZE {
+        MWM_DECOR_ALL
+    } else if decorations == WindowDecorations::RESIZE {
+        MWM_DECOR_BORDER | MWM_DECOR_RESIZEH
+    } else if decorations == WindowDecorations::TITLE {
+        MWM_DECOR_BORDER
+            | MWM_DECOR_TITLE
+            | MWM_DECOR_MENU
+            | MWM_DECOR_MINIMIZE
+            | MWM_DECOR_MAXIMIZE
+    } else if decorations == WindowDecorations::NONE {
+        0
+    } else {
+        MWM_DECOR_ALL
+    }
+}
+
 impl Drop for XWindowInner {
     fn drop(&mut self) {
         if self.window_id != xcb::x::Window::none() {
@@ -1276,7 +1312,6 @@ impl XWindowInner {
         )
     }
 
-    #[allow(clippy::identity_op)]
     fn adjust_decorations(&mut self, decorations: WindowDecorations) -> anyhow::Result<()> {
         // Set the motif hints to disable decorations.
         // See https://stackoverflow.com/a/1909708
@@ -1289,36 +1324,10 @@ impl XWindowInner {
             status: u32,
         }
 
-        const HINTS_DECORATIONS: u32 = 1 << 1;
-        const FUNC_ALL: u32 = 1 << 0;
-        const FUNC_RESIZE: u32 = 1 << 1;
-        // const HINTS_FUNCTIONS: u32 = 1 << 0;
-        const FUNC_MOVE: u32 = 1 << 2;
-        const FUNC_MINIMIZE: u32 = 1 << 3;
-        const FUNC_MAXIMIZE: u32 = 1 << 4;
-        const FUNC_CLOSE: u32 = 1 << 5;
-
-        let decorations = if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS) {
-            // Integrated title buttons live in ThinkTerm's own header.  Never
-            // ask the window manager for another title bar, even if a legacy
-            // configuration also contains TITLE.
-            FUNC_RESIZE
-        } else if decorations == WindowDecorations::TITLE | WindowDecorations::RESIZE {
-            FUNC_ALL
-        } else if decorations == WindowDecorations::RESIZE {
-            FUNC_RESIZE
-        } else if decorations == WindowDecorations::TITLE {
-            FUNC_MOVE | FUNC_MINIMIZE | FUNC_MAXIMIZE | FUNC_CLOSE
-        } else if decorations == WindowDecorations::NONE {
-            0
-        } else {
-            FUNC_ALL
-        };
-
         let hints = MwmHints {
-            flags: HINTS_DECORATIONS,
+            flags: MWM_HINTS_DECORATIONS,
             functions: 0,
-            decorations,
+            decorations: motif_decorations_for(decorations),
             input_mode: 0,
             status: 0,
         };
@@ -2259,5 +2268,38 @@ impl NetWmStateAction {
         } else {
             Self::Remove
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integrated_buttons_never_request_a_native_title_bar() {
+        for decorations in [
+            WindowDecorations::INTEGRATED_BUTTONS,
+            WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE,
+            WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::TITLE,
+            WindowDecorations::INTEGRATED_BUTTONS
+                | WindowDecorations::TITLE
+                | WindowDecorations::RESIZE,
+        ] {
+            assert_eq!(motif_decorations_for(decorations) & MWM_DECOR_TITLE, 0);
+        }
+    }
+
+    #[test]
+    fn integrated_buttons_disable_the_native_frame() {
+        assert_eq!(
+            motif_decorations_for(
+                WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE
+            ),
+            0
+        );
+        assert_eq!(
+            motif_decorations_for(WindowDecorations::INTEGRATED_BUTTONS),
+            0
+        );
     }
 }

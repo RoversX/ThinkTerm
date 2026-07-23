@@ -111,6 +111,13 @@ impl PaneStack {
         self.panes.iter().any(|pane| pane.pane_id() == pane_id)
     }
 
+    fn pane_by_id(&self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
+        self.panes
+            .iter()
+            .find(|pane| pane.pane_id() == pane_id)
+            .map(Arc::clone)
+    }
+
     fn pane_index(&self, pane_id: PaneId) -> Option<usize> {
         self.panes.iter().position(|pane| pane.pane_id() == pane_id)
     }
@@ -1069,6 +1076,27 @@ impl Tab {
         pane: Arc<dyn Pane>,
     ) -> anyhow::Result<usize> {
         self.inner.lock().add_pane_to_stack(base_pane_id, pane)
+    }
+
+    /// Move an existing pane out of its current stack and into the stack
+    /// that contains `target_pane_id`, activating it there. The fallible
+    /// resize happens before the tree is mutated so a failure cannot leave
+    /// the pane detached from the tab.
+    pub fn move_pane_to_stack(
+        &self,
+        src_pane_id: PaneId,
+        target_pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .move_pane_to_stack(src_pane_id, target_pane_id)
+    }
+
+    /// Re-attach a live pane that was detached mid-operation (e.g. a
+    /// MovePane split that failed after removal): push it into the first
+    /// leaf stack so it never ends up outside every tab.
+    pub fn rehome_orphan_pane(&self, pane: &Arc<dyn Pane>) {
+        self.inner.lock().push_pane_into_first_stack(pane)
     }
 
     pub fn activate_pane_in_stack(&self, pane_id: PaneId) -> anyhow::Result<usize> {
@@ -2835,6 +2863,185 @@ impl TabInner {
         Ok(pane_index)
     }
 
+    fn move_pane_to_stack(
+        &mut self,
+        src_pane_id: PaneId,
+        target_pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        if src_pane_id == target_pane_id {
+            anyhow::bail!("cannot move pane {src_pane_id} onto itself");
+        }
+
+        // Validation pass: locate both panes without mutating the tree.
+        let mut src_pane: Option<Arc<dyn Pane>> = None;
+        let mut target_dims: Option<TerminalSize> = None;
+        let mut target_found = false;
+        let mut same_stack = false;
+        {
+            let mut cursor = self.pane.take().unwrap().cursor();
+            loop {
+                if cursor.is_leaf() {
+                    let stack = cursor.leaf_mut().unwrap();
+                    let has_src = stack.contains_pane(src_pane_id);
+                    let has_target = stack.contains_pane(target_pane_id);
+                    if has_src {
+                        src_pane = stack.pane_by_id(src_pane_id);
+                    }
+                    if has_target {
+                        target_found = true;
+                        if let Some(active) = stack.active_pane() {
+                            let dims = active.get_dimensions();
+                            target_dims = Some(TerminalSize {
+                                rows: dims.viewport_rows,
+                                cols: dims.cols,
+                                pixel_height: dims.pixel_height,
+                                pixel_width: dims.pixel_width,
+                                dpi: dims.dpi,
+                            });
+                        }
+                    }
+                    if has_src && has_target {
+                        same_stack = true;
+                    }
+                }
+                match cursor.preorder_next() {
+                    Ok(c) => cursor = c,
+                    Err(c) => {
+                        self.pane.replace(c.tree());
+                        break;
+                    }
+                }
+            }
+        }
+
+        let src_pane = src_pane
+            .ok_or_else(|| anyhow::anyhow!("pane {src_pane_id} not found in tab"))?;
+        if !target_found {
+            anyhow::bail!("pane {target_pane_id} not found in tab");
+        }
+        if same_stack {
+            anyhow::bail!(
+                "panes {src_pane_id} and {target_pane_id} are already in the same stack"
+            );
+        }
+
+        // The only fallible step happens before the tree is touched: if the
+        // pane refuses to resize we bail with the layout intact.
+        if let Some(dims) = target_dims {
+            src_pane.resize(dims)?;
+        }
+
+        // Detach: remove_pane handles emptied-stack pruning and geometry.
+        let removed = self.remove_pane(src_pane_id).ok_or_else(|| {
+            anyhow::anyhow!("pane {src_pane_id} vanished while moving between stacks")
+        })?;
+
+        // Attach: walk the (possibly restructured) tree and push into the
+        // target stack. No fallible steps; resize after the removal's
+        // rebalance is best-effort.
+        let prior = self.get_active_pane();
+        let mut pane_index = 0;
+        let mut found = false;
+        {
+            let mut cursor = self.pane.take().unwrap().cursor();
+            loop {
+                if cursor.is_leaf() {
+                    let stack = cursor.leaf_mut().unwrap();
+                    if stack.contains_pane(target_pane_id) {
+                        if let Some(base) = stack.active_pane() {
+                            let dims = base.get_dimensions();
+                            if let Err(err) = removed.resize(TerminalSize {
+                                rows: dims.viewport_rows,
+                                cols: dims.cols,
+                                pixel_height: dims.pixel_height,
+                                pixel_width: dims.pixel_width,
+                                dpi: dims.dpi,
+                            }) {
+                                log::error!(
+                                    "move_pane_to_stack: resize after rebalance failed: {err:#}"
+                                );
+                            }
+                        }
+                        stack.push_and_activate(Arc::clone(&removed));
+                        found = true;
+                    }
+                    if !found {
+                        pane_index += 1;
+                    }
+                }
+                match cursor.preorder_next() {
+                    Ok(c) if !found => cursor = c,
+                    Ok(c) | Err(c) => {
+                        self.pane.replace(c.tree());
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !found {
+            // Should be unreachable: the target lives in a different stack
+            // which survives the removal above. Whatever happened, never
+            // leave a live pane detached from the tab.
+            log::error!(
+                "move_pane_to_stack: target pane {target_pane_id} vanished; re-homing pane {src_pane_id}"
+            );
+            self.push_pane_into_first_stack(&removed);
+            anyhow::bail!("pane {target_pane_id} vanished while moving between stacks");
+        }
+
+        self.active = pane_index;
+        self.recency.tag(pane_index);
+
+        // Mirror add_pane_to_stack: a zoomed stack hands the zoom to the
+        // newly arrived pane.
+        if let Some(prior_zoomed) = self.zoomed.take() {
+            prior_zoomed.set_zoomed(false);
+            removed.set_zoomed(true);
+            if let Err(err) = removed.resize(self.size) {
+                log::error!("failed to resize zoomed pane: {err:#}");
+            }
+            self.zoomed.replace(removed);
+        }
+
+        self.advise_focus_change(prior);
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+
+        Ok(())
+    }
+
+    /// Last-resort re-homing used when the attach phase of a pane move
+    /// cannot find its target: push the pane into the first leaf stack so
+    /// it never ends up detached from every tab.
+    fn push_pane_into_first_stack(&mut self, pane: &Arc<dyn Pane>) {
+        let Some(tree) = self.pane.take() else {
+            // The tree was left poisoned by an earlier failure; start over
+            // with this pane as the root rather than losing it.
+            self.assign_pane(pane);
+            return;
+        };
+        let mut done = false;
+        {
+            let mut cursor = tree.cursor();
+            loop {
+                if cursor.is_leaf() {
+                    cursor.leaf_mut().unwrap().push_and_activate(Arc::clone(pane));
+                    done = true;
+                }
+                match cursor.preorder_next() {
+                    Ok(c) if !done => cursor = c,
+                    Ok(c) | Err(c) => {
+                        self.pane.replace(c.tree());
+                        break;
+                    }
+                }
+            }
+        }
+        if !done {
+            self.assign_pane(pane);
+        }
+    }
+
     fn assign_pane(&mut self, pane: &Arc<dyn Pane>) {
         match Tree::new()
             .cursor()
@@ -3608,7 +3815,10 @@ mod test {
 
     impl Drop for MuxTestGuard {
         fn drop(&mut self) {
-            Mux::shutdown();
+            // Deliberately keep the global Mux installed: tests run in
+            // parallel and share it, so shutting it down here makes
+            // Mux::get() panic in whichever test is still mid-flight.
+            // Each install_mux() swaps in a fresh instance anyway.
         }
     }
 
@@ -3679,6 +3889,168 @@ mod test {
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].pane.pane_id(), 100);
         assert!(panes[0].is_zoomed);
+    }
+
+    #[test]
+    fn move_pane_to_stack_between_stacks() {
+        let _mux = install_mux();
+        let size = test_size();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        let horz_size = tab
+            .compute_split_size(0, SplitRequest::default())
+            .unwrap();
+        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(2, horz_size.second))
+            .unwrap();
+        tab.add_pane_to_stack(1, FakePane::new(3, size)).unwrap();
+        assert_eq!(tab.count_panes(), Some(3));
+
+        tab.move_pane_to_stack(3, 2).unwrap();
+
+        assert_eq!(tab.count_panes(), Some(3));
+        assert_eq!(tab.pane_index_for_pane(1), Some(0));
+        assert_eq!(tab.pane_index_for_pane(2), Some(1));
+        assert_eq!(tab.pane_index_for_pane(3), Some(1));
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 3);
+
+        let tabs = tab.pane_stack_tabs(2);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].pane_id, 2);
+        assert!(!tabs[0].is_active);
+        assert_eq!(tabs[1].pane_id, 3);
+        assert!(tabs[1].is_active);
+
+        // Source stack survives with its remaining pane
+        assert_eq!(tab.pane_stack_tabs(1).len(), 1);
+        assert_eq!(tab.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn move_pane_to_stack_prunes_empty_source() {
+        let _mux = install_mux();
+        let size = test_size();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        let horz_size = tab
+            .compute_split_size(0, SplitRequest::default())
+            .unwrap();
+        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(2, horz_size.second))
+            .unwrap();
+
+        tab.move_pane_to_stack(1, 2).unwrap();
+
+        assert_eq!(tab.count_panes(), Some(2));
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane.pane_id(), 1);
+        assert!(panes[0].is_active);
+        // The surviving stack regains the full tab width
+        assert_eq!(panes[0].width, 80);
+
+        let tabs = tab.pane_stack_tabs(2);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].pane_id, 2);
+        assert_eq!(tabs[1].pane_id, 1);
+        assert!(tabs[1].is_active);
+    }
+
+    #[test]
+    fn move_pane_to_stack_same_stack_bails() {
+        let _mux = install_mux();
+        let size = test_size();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        tab.add_pane_to_stack(1, FakePane::new(3, size)).unwrap();
+
+        assert!(tab.move_pane_to_stack(3, 1).is_err());
+        assert!(tab.move_pane_to_stack(1, 1).is_err());
+        assert!(tab.move_pane_to_stack(99, 1).is_err());
+        assert!(tab.move_pane_to_stack(1, 99).is_err());
+
+        // Tree unchanged in every failure case
+        assert_eq!(tab.count_panes(), Some(2));
+        let tabs = tab.pane_stack_tabs(1);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].pane_id, 1);
+        assert_eq!(tabs[1].pane_id, 3);
+        assert!(tabs[1].is_active);
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 3);
+    }
+
+    /// A split that fails after the source pane was detached (MovePane
+    /// style) must be able to re-home the pane instead of orphaning it.
+    #[test]
+    fn rehome_orphan_pane_after_failed_split() {
+        let _mux = install_mux();
+        let size = test_size();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        tab.add_pane_to_stack(1, FakePane::new(2, size)).unwrap();
+
+        let removed = tab.remove_pane(2).unwrap();
+        // Absurd split size: compute_split_size yields a zero-sized half,
+        // which split_and_insert rejects with "No space for split".
+        let request = SplitRequest {
+            direction: SplitDirection::Horizontal,
+            target_is_second: true,
+            top_level: false,
+            size: SplitSize::Cells(1000),
+        };
+        let target_index = tab.pane_index_for_pane(1).unwrap();
+        assert!(tab
+            .split_and_insert(target_index, request, Arc::clone(&removed))
+            .is_err());
+
+        tab.rehome_orphan_pane(&removed);
+        assert_eq!(tab.count_panes(), Some(2));
+        assert!(tab.pane_index_for_pane(2).is_some());
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 2);
+    }
+
+    /// Regression for the same-stack edge drop: dragging the active pane B
+    /// out of a stack [A, B] to a split edge must target A (not B itself),
+    /// and both panes must remain reachable as two splits afterwards.
+    #[test]
+    fn split_background_pane_out_of_own_stack() {
+        for (direction, target_is_second) in [
+            (SplitDirection::Horizontal, true),
+            (SplitDirection::Horizontal, false),
+            (SplitDirection::Vertical, true),
+            (SplitDirection::Vertical, false),
+        ] {
+            let _mux = install_mux();
+            let size = test_size();
+            let tab = Tab::new(&size);
+            tab.assign_pane(&FakePane::new(1, size));
+            tab.add_pane_to_stack(1, FakePane::new(2, size)).unwrap();
+            assert_eq!(tab.get_active_pane().unwrap().pane_id(), 2);
+
+            // Emulate the drop: effective target is A (pane 1), the only
+            // non-source pane in the stack.
+            let removed = tab.remove_pane(2).unwrap();
+            let request = SplitRequest {
+                direction,
+                target_is_second,
+                top_level: false,
+                size: Default::default(),
+            };
+            let target_index = tab.pane_index_for_pane(1).unwrap();
+            tab.split_and_insert(target_index, request, removed).unwrap();
+
+            assert_eq!(tab.count_panes(), Some(2));
+            assert!(tab.pane_index_for_pane(1).is_some());
+            assert!(tab.pane_index_for_pane(2).is_some());
+            let panes = tab.iter_panes();
+            assert_eq!(panes.len(), 2, "{direction:?} second={target_is_second}");
+
+            let moved = tab
+                .iter_panes()
+                .into_iter()
+                .find(|p| p.pane.pane_id() == 2)
+                .unwrap();
+            tab.set_active_pane(&moved.pane);
+            assert_eq!(tab.get_active_pane().unwrap().pane_id(), 2);
+        }
     }
 
     fn pane_entry(pane_id: PaneId, size: TerminalSize, is_active_pane: bool) -> PaneEntry {

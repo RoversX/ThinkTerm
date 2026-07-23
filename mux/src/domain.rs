@@ -94,6 +94,7 @@ pub trait Domain: Downcast + Send + Sync {
             None => anyhow::bail!("invalid pane index {}", pane_index),
         };
 
+        let moved_existing_pane = matches!(&source, SplitSource::MovePane(_));
         let pane = match source {
             SplitSource::Spawn {
                 command,
@@ -126,10 +127,23 @@ pub trait Domain: Downcast + Send + Sync {
         // pane_index may have changed if src_pane was also in the same tab
         let final_pane_index = match tab.pane_index_for_pane(pane_id) {
             Some(index) => index,
-            None => anyhow::bail!("invalid pane id {}", pane_id),
+            None => {
+                if moved_existing_pane {
+                    tab.rehome_orphan_pane(&pane);
+                }
+                anyhow::bail!("invalid pane id {}", pane_id);
+            }
         };
 
-        tab.split_and_insert(final_pane_index, split_request, Arc::clone(&pane))?;
+        if let Err(err) = tab.split_and_insert(final_pane_index, split_request, Arc::clone(&pane))
+        {
+            // A moved pane was already detached from its tab; never let a
+            // failed insertion leave it orphaned.
+            if moved_existing_pane {
+                tab.rehome_orphan_pane(&pane);
+            }
+            return Err(err);
+        }
         Ok(pane)
     }
 
