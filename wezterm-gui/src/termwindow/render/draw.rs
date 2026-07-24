@@ -12,7 +12,7 @@ use ::window::color::LinearRgba;
 use ::window::{Appearance, Dimensions, WindowDecorations, WindowState};
 use config::FreeTypeLoadTarget;
 
-const LINUX_WINDOW_CORNER_RADIUS: f32 = 12.0;
+const LINUX_WINDOW_CORNER_RADIUS: f32 = 16.0;
 const LINUX_WINDOW_BORDER_WIDTH: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -436,7 +436,7 @@ mod tests {
         let radius =
             effective_window_corner_radius(decorations, WindowState::COMPOSITED, 96);
         if cfg!(target_os = "linux") {
-            assert_eq!(radius, 12.0);
+            assert_eq!(radius, LINUX_WINDOW_CORNER_RADIUS);
         } else {
             assert_eq!(radius, 0.0);
         }

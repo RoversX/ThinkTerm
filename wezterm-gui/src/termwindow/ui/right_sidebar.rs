@@ -1554,6 +1554,8 @@ impl crate::TermWindow {
         let old = self.right_sidebar_file_preview_horizontal_offset;
         let max = self.right_sidebar_file_preview_horizontal_scroll_max();
         let steps = amount.unsigned_abs().max(1) as usize;
+        // The horizontal offset is measured in character columns (the cell
+        // width already tracks DPI), so the step stays unscaled.
         let delta = steps.saturating_mul(4).min(32);
         if amount < 0 {
             self.right_sidebar_file_preview_horizontal_offset = self
@@ -4842,7 +4844,7 @@ impl crate::TermWindow {
 
     fn right_sidebar_file_preview_font_size(&self) -> f64 {
         let settings = crate::native_settings::load();
-        let base_font_size = crate::native_settings::home_font_size(&settings);
+        let base_font_size = crate::native_settings::right_sidebar_font_size(&settings);
         (base_font_size + 2.0).max(FILE_FONT_MIN_SIZE)
     }
 
@@ -5250,7 +5252,7 @@ impl crate::TermWindow {
         let muted_fg = chrome.secondary_text;
         let sidebar_bg = chrome.workspace_sidebar_bg;
         let settings = crate::native_settings::load();
-        let base_font_size = crate::native_settings::home_font_size(&settings);
+        let base_font_size = crate::native_settings::right_sidebar_font_size(&settings);
         let ui_font = self
             .fonts
             .title_font_with_size(base_font_size)
@@ -5477,7 +5479,7 @@ impl crate::TermWindow {
             });
             let close_icon_size = self
                 .ui_px(RIGHT_SIDEBAR_CLOSE_ICON_SIZE)
-                .min(close_visual_size.saturating_sub(4))
+                .min(close_visual_size.saturating_sub(self.ui_px(4)))
                 .max(1);
             self.paint_sidebar_icon(
                 layers,
@@ -5531,7 +5533,7 @@ impl crate::TermWindow {
         let active_label_target_width = self
             .sidebar_text_width(&ui_font, self.right_sidebar_mode.label())?
             .ceil() as usize
-            + MODE_LABEL_CLIP_SLOP;
+            + self.ui_px(MODE_LABEL_CLIP_SLOP);
         let inactive_segment_min_width = (mode_icon_size + self.ui_px(SIDEBAR_INSET) * 4)
             .max(self.ui_px(70))
             .min((content_width / modes.len()).max(1));
@@ -5590,7 +5592,7 @@ impl crate::TermWindow {
             });
 
             if active {
-                let inner_inset = 5;
+                let inner_inset = self.ui_px(5);
                 self.fill_rounded_rectangle_with_border(
                     layers,
                     2,
@@ -5611,10 +5613,10 @@ impl crate::TermWindow {
                     layers,
                     2,
                     euclid::rect(
-                        (segment_x + 5) as f32,
-                        (mode_y + 5) as f32,
-                        segment_width.saturating_sub(10) as f32,
-                        mode_height.saturating_sub(10) as f32,
+                        (segment_x + self.ui_px(5)) as f32,
+                        (mode_y + self.ui_px(5)) as f32,
+                        segment_width.saturating_sub(self.ui_px(10)) as f32,
+                        mode_height.saturating_sub(self.ui_px(10)) as f32,
                     ),
                     chrome.sidebar_button_hover_bg,
                     WINDOW_TAB_ADD_BUTTON_RADIUS,
@@ -7725,7 +7727,7 @@ impl crate::TermWindow {
                         euclid::rect(
                             caret_x.clamp(clip_left, clip_right),
                             caret_y,
-                            NOTE_CARET_WIDTH.max(1.0),
+                            self.ui_f32(NOTE_CARET_WIDTH).max(1.0),
                             caret_height,
                         ),
                         foreground,
@@ -9169,9 +9171,9 @@ impl crate::TermWindow {
             });
         }
 
-        if main_width >= 28 {
-            let text_x = x + 12;
-            let text_right = x + main_width.saturating_sub(10);
+        if main_width >= self.ui_px(28) {
+            let text_x = x + self.ui_px(12);
+            let text_right = x + main_width.saturating_sub(self.ui_px(10));
             let text_width = text_right.saturating_sub(text_x);
             self.paint_sidebar_text(
                 layers,
@@ -10253,8 +10255,8 @@ impl crate::TermWindow {
         icon_size: usize,
     ) -> anyhow::Result<()> {
         let header_y = content_top;
-        let back_size = 44;
-        let header_top = header_y + 8;
+        let back_size = self.ui_px(44);
+        let header_top = header_y + self.ui_px(8);
         self.paint_snippet_icon_button(
             layers,
             chrome,
@@ -10330,7 +10332,7 @@ impl crate::TermWindow {
             content_width,
             muted_fg,
         )?;
-        let title_y = title_label_y + field_label_height + 8;
+        let title_y = title_label_y + field_label_height + self.ui_px(8);
         let title_input = self.right_sidebar_snippet_title.clone();
         self.paint_snippet_text_box(
             layers,
@@ -10363,7 +10365,7 @@ impl crate::TermWindow {
             content_width,
             muted_fg,
         )?;
-        let body_y = body_label_y + field_label_height + 8;
+        let body_y = body_label_y + field_label_height + self.ui_px(8);
         let body_height = self
             .ui_px(SNIPPET_BODY_FIELD_HEIGHT)
             .min(content_bottom.saturating_sub(body_y));

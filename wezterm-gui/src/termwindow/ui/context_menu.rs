@@ -17,22 +17,22 @@ use wezterm_font::LoadedFont;
 // Design pixels (2x macOS backing), scaled via ui_px/ui_f32 like the rest
 // of the chrome. The fallback menu only shows on non-mac (and behind a
 // debug flag on mac).
-const MENU_MIN_WIDTH: usize = 440;
+const MENU_MIN_WIDTH: usize = 400;
 const MENU_MAX_WIDTH: usize = 1000;
 const MENU_WINDOW_MARGIN: usize = 24;
-const MENU_PADDING_X: usize = 28;
-const MENU_PADDING_Y: usize = 20;
-const MENU_LABEL_GAP: usize = 24;
-const MENU_ICON_SIZE: usize = 42;
-const MENU_ICON_SLOT: usize = 64;
-const MENU_CHECK_SLOT: usize = 56;
-const MENU_ARROW_SLOT: usize = 56;
-const MENU_ROW_EXTRA_HEIGHT: usize = 44;
-const MENU_SEPARATOR_HEIGHT: usize = 18;
+const MENU_PADDING_X: usize = 22;
+const MENU_PADDING_Y: usize = 12;
+const MENU_LABEL_GAP: usize = 16;
+const MENU_ICON_SIZE: usize = 32;
+const MENU_ICON_SLOT: usize = 48;
+const MENU_CHECK_SLOT: usize = 40;
+const MENU_ARROW_SLOT: usize = 44;
+const MENU_ROW_EXTRA_HEIGHT: usize = 24;
+const MENU_SEPARATOR_HEIGHT: usize = 14;
 const MENU_BORDER_WIDTH: f32 = 2.0;
-const MENU_RADIUS: f32 = 44.0;
-const MENU_ROW_RADIUS: f32 = 30.0;
-const MENU_ROW_HOVER_INSET_X: usize = 16;
+const MENU_RADIUS: f32 = 28.0;
+const MENU_ROW_RADIUS: f32 = 18.0;
+const MENU_ROW_HOVER_INSET_X: usize = 10;
 const MENU_ROW_HOVER_INSET_Y: usize = 4;
 
 pub(crate) fn reveal_in_folder_label() -> &'static str {
@@ -364,7 +364,7 @@ impl crate::TermWindow {
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let row_height = (ui_metrics.cell_size.height as usize
             + self.ui_px(MENU_ROW_EXTRA_HEIGHT))
-        .max(self.ui_px(56));
+        .max(self.ui_px(44));
         let palette = context_menu_palette(crate::native_settings::effective_appearance());
 
         let gl_state = self.render_state.as_ref().unwrap();

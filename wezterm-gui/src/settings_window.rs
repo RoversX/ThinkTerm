@@ -690,16 +690,30 @@ impl MemorySnapshot {
 enum ChromeFontArea {
     Settings,
     Home,
+    RightSidebar,
     Sidebar,
     TabBar,
     PaneHeader,
 }
+
+/// Order of the font-size stepper rows in the Typography card. The card's
+/// row count derives from this list (plus the trailing font-weight row),
+/// so adding an area here automatically grows the card background.
+const TYPOGRAPHY_FONT_AREAS: [ChromeFontArea; 6] = [
+    ChromeFontArea::Settings,
+    ChromeFontArea::Home,
+    ChromeFontArea::RightSidebar,
+    ChromeFontArea::Sidebar,
+    ChromeFontArea::TabBar,
+    ChromeFontArea::PaneHeader,
+];
 
 impl ChromeFontArea {
     fn label(self) -> &'static str {
         match self {
             Self::Settings => "Settings UI Font Size",
             Self::Home => "Home Font Size",
+            Self::RightSidebar => "Right Sidebar Font Size",
             Self::Sidebar => "Workspace Sidebar Font Size",
             Self::TabBar => "Tab Bar Font Size",
             Self::PaneHeader => "Pane Header Font Size",
@@ -710,6 +724,9 @@ impl ChromeFontArea {
         match self {
             Self::Settings => "Controls the Settings window chrome and content text.",
             Self::Home => "Controls the main home/content view text.",
+            Self::RightSidebar => {
+                "Follows Home Font Size until set — files, notes and snippets panel."
+            }
             Self::Sidebar => "Saved separately for the main workspace sidebar.",
             Self::TabBar => "Saved separately for the top terminal tab bar.",
             Self::PaneHeader => "Saved separately for split-pane header labels.",
@@ -720,6 +737,7 @@ impl ChromeFontArea {
         match self {
             Self::Settings => DEFAULT_SETTINGS_FONT_SIZE,
             Self::Home => DEFAULT_HOME_FONT_SIZE,
+            Self::RightSidebar => DEFAULT_HOME_FONT_SIZE,
             Self::Sidebar => DEFAULT_SIDEBAR_FONT_SIZE,
             Self::TabBar => DEFAULT_TAB_FONT_SIZE,
             Self::PaneHeader => DEFAULT_PANE_HEADER_FONT_SIZE,
@@ -2128,17 +2146,29 @@ impl SettingsWindow {
         let value = match area {
             ChromeFontArea::Settings => self.native_settings.chrome.settings_font_size,
             ChromeFontArea::Home => self.native_settings.chrome.home_font_size,
+            ChromeFontArea::RightSidebar => self.native_settings.chrome.right_sidebar_font_size,
             ChromeFontArea::Sidebar => self.native_settings.chrome.sidebar_font_size,
             ChromeFontArea::TabBar => self.native_settings.chrome.tab_font_size,
             ChromeFontArea::PaneHeader => self.native_settings.chrome.pane_header_font_size,
         };
-        value.unwrap_or_else(|| area.default_size())
+        value.unwrap_or_else(|| match area {
+            // An unset Right Sidebar size follows the resolved Home size;
+            // show and step from what is actually rendered, not the
+            // platform default.
+            ChromeFontArea::RightSidebar => {
+                crate::native_settings::home_font_size(&self.native_settings)
+            }
+            _ => area.default_size(),
+        })
     }
 
     fn set_chrome_font_size_value(&mut self, area: ChromeFontArea, value: Option<f64>) {
         match area {
             ChromeFontArea::Settings => self.native_settings.chrome.settings_font_size = value,
             ChromeFontArea::Home => self.native_settings.chrome.home_font_size = value,
+            ChromeFontArea::RightSidebar => {
+                self.native_settings.chrome.right_sidebar_font_size = value
+            }
             ChromeFontArea::Sidebar => self.native_settings.chrome.sidebar_font_size = value,
             ChromeFontArea::TabBar => self.native_settings.chrome.tab_font_size = value,
             ChromeFontArea::PaneHeader => self.native_settings.chrome.pane_header_font_size = value,
@@ -3616,7 +3646,8 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let theme_row_count = 4;
-        let typography_row_count = 6;
+        // The font-size steppers plus the trailing font-weight stepper.
+        let typography_row_count = TYPOGRAPHY_FONT_AREAS.len() + 1;
         let app_icon_note_space = self.metrics.cell_size.height as f32 + self.ui_px(10.0);
         let (theme_card_y, mut y) = self.settings_card_geometry(section_y, theme_row_count);
         let theme_card_height = self.settings_card_height(theme_row_count) + app_icon_note_space;
@@ -3707,13 +3738,7 @@ impl SettingsWindow {
             typography_card_height,
         )?;
         y = typography_first_row_y;
-        for area in [
-            ChromeFontArea::Settings,
-            ChromeFontArea::Home,
-            ChromeFontArea::Sidebar,
-            ChromeFontArea::TabBar,
-            ChromeFontArea::PaneHeader,
-        ] {
+        for area in TYPOGRAPHY_FONT_AREAS {
             self.paint_font_size_stepper_row(
                 layers,
                 row_x,

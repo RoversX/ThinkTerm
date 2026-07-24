@@ -206,7 +206,7 @@ impl super::TermWindow {
             .ceil()
     }
 
-    fn window_tab_chrome_params(&self) -> WindowTabChromeParams {
+    pub(crate) fn window_tab_chrome_params(&self) -> WindowTabChromeParams {
         WindowTabChromeParams {
             use_fancy_tab_bar: self.config.use_fancy_tab_bar,
             workspace_sidebar_width: self.workspace_sidebar_width(),
@@ -216,6 +216,17 @@ impl super::TermWindow {
             integrated_title_button_style: self.config.integrated_title_button_style,
             cell_width: self.render_metrics.cell_size.width.max(1) as f32,
             dpi: self.dimensions.dpi,
+            top_fancy_row_height: if self.show_tab_bar
+                && self.config.use_fancy_tab_bar
+                && !self.config.tab_bar_at_bottom
+            {
+                self.tab_bar_pixel_height()
+                    .ok()
+                    .map(|h| h.ceil() as usize)
+                    .filter(|h| *h > 0)
+            } else {
+                None
+            },
         }
     }
 

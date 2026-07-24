@@ -385,6 +385,9 @@ impl crate::TermWindow {
             return Ok(());
         }
 
+        // The rounded-corner clearance is folded into
+        // leading_action_start_pixels so layout reservation, painting and
+        // hit-testing share the same origin.
         let mut button_x = row_x + self.window_tab_leading_action_start_pixels().ceil() as usize;
         for action_idx in 0..action_slot_count {
             let is_sidebar_toggle =
@@ -401,10 +404,16 @@ impl crate::TermWindow {
             } else {
                 self.ui_px(WINDOW_TAB_LEADING_ACTION_ICON_SIZE)
             };
+            // action_button_size already comes from the shared
+            // sidebar_toggle_size_px geometry (capsule height on non-mac
+            // top fancy bars, fixed size otherwise); row_height here is
+            // the content row (top spacer removed by the caller).
             let button_size = if is_fullscreen_sidebar_toggle {
                 action_button_size
             } else {
-                action_button_size.min(row_height.saturating_sub(4)).max(1)
+                action_button_size
+                    .min(row_height.saturating_sub(self.ui_px(4)))
+                    .max(1)
             };
             let icon_size = action_icon_size.min(button_size.saturating_sub(2));
 
@@ -415,10 +424,8 @@ impl crate::TermWindow {
                     row_y.saturating_sub(self.ui_px(WINDOW_TAB_TOP_SPACER))
                         + self.ui_px(SIDEBAR_INSET)
                         + self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET)
-                } else if !cfg!(target_os = "macos") {
-                    row_y.saturating_sub(self.ui_px(WINDOW_TAB_TOP_SPACER))
-                        + self.ui_px(SIDEBAR_INSET)
                 } else {
+                    // Center like the window tab capsules (all platforms).
                     row_y + (row_height.saturating_sub(button_size) / 2)
                 };
                 self.paint_window_sidebar_toggle_button(
@@ -554,7 +561,6 @@ impl crate::TermWindow {
         let close_button = button == IntegratedTitleButton::Close;
 
         if hovered {
-            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
             let fill = if close_button {
                 let mut red = LinearRgba::with_srgba(232, 17, 35, 255);
                 if pressed {
@@ -562,9 +568,12 @@ impl crate::TermWindow {
                 }
                 red
             } else if pressed {
-                chrome.control_pressed_bg
+                // Foreground-tinted overlay reads correctly on both themes;
+                // the palette's control_hover_bg is near-white and washes
+                // out on the light tab bar.
+                foreground.mul_alpha(0.16)
             } else {
-                chrome.control_hover_bg
+                foreground.mul_alpha(0.10)
             };
             let border = if close_button {
                 LinearRgba::TRANSPARENT

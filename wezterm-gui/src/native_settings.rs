@@ -198,6 +198,9 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) settings_font_weight: Option<u16>,
     pub(crate) home_font_size: Option<f64>,
     pub(crate) sidebar_font_size: Option<f64>,
+    /// Right sidebar (files / notes / snippets) text size; None follows
+    /// home_font_size.
+    pub(crate) right_sidebar_font_size: Option<f64>,
     pub(crate) workspace_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_file_preview_width: Option<usize>,
@@ -449,6 +452,16 @@ pub(crate) fn sidebar_font_size() -> f64 {
         .chrome
         .sidebar_font_size
         .unwrap_or(DEFAULT_SIDEBAR_FONT_SIZE)
+        .clamp(10.0, 28.0)
+}
+
+/// Right sidebar (files / notes / snippets) text size; follows the
+/// resolved Home Font Size until explicitly set.
+pub(crate) fn right_sidebar_font_size(settings: &ThinkTermNativeSettings) -> f64 {
+    settings
+        .chrome
+        .right_sidebar_font_size
+        .unwrap_or_else(|| home_font_size(settings))
         .clamp(10.0, 28.0)
 }
 

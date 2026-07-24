@@ -52,13 +52,28 @@ impl crate::TermWindow {
                 item_type: UIItemType::Split(split.clone()),
             });
         } else {
+            // Match the pane chrome span: nav bars extend to the sidebar
+            // and window edges (pane_chrome_span), and this divider is
+            // drawn over the lower pane's top strip row, so it must cover
+            // the same extended width or the strip peeks out beside it.
+            let mut line_left = pos_x - (cell_width / 2.0);
+            let mut line_right = line_left + (1.0 + split.size as f32) * cell_width;
+            if split.left == 0 {
+                line_left = self.tab_bar_left_edge() as f32;
+            }
+            if split.left + split.size >= self.terminal_size.cols {
+                line_right = (self.dimensions.pixel_width as f32
+                    - border.right.get() as f32
+                    - self.right_sidebar_width() as f32)
+                    .max(line_right);
+            }
             self.filled_rectangle(
                 layers,
                 2,
                 euclid::rect(
-                    pos_x - (cell_width / 2.0),
+                    line_left,
                     pos_y + (cell_height / 2.0),
-                    (1.0 + split.size as f32) * cell_width,
+                    (line_right - line_left).max(1.0),
                     self.render_metrics.underline_height as f32,
                 ),
                 foreground,

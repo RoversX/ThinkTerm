@@ -11,6 +11,7 @@ use crate::termwindow::ui::tokens::{
     SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP, SIDEBAR_ROW_RADIUS, SIDEBAR_WIDTH_CELLS,
     WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT, WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET,
     WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
+    WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{UIItem, UIItemType};
 use crate::ui::{scale_ui_f32, scale_ui_usize, unscale_ui_usize, UiPalette};
@@ -471,6 +472,14 @@ impl crate::TermWindow {
         .context("sidebar thread status dot")
     }
 
+    /// Visual size of the expanded-sidebar toggle button; shares
+    /// sidebar_toggle_size_px with the collapsed-state painter and the tab
+    /// layout reservation so the control never changes size when the
+    /// sidebar opens or closes.
+    fn workspace_sidebar_toggle_visual_size(&self) -> usize {
+        self.window_tab_chrome_params().sidebar_toggle_button_size()
+    }
+
     fn workspace_sidebar_content_top(&self, panel_y: usize) -> usize {
         let tab_row_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
         platform_chrome::workspace_sidebar_content_top(
@@ -507,9 +516,7 @@ impl crate::TermWindow {
             .max(self.ui_px(SESSION_ROW_MIN_HEIGHT));
         let mut y = self.workspace_sidebar_content_top(panel_y);
         if show_sidebar_toolbar {
-            y += self.ui_px(platform_chrome::workspace_sidebar_toolbar_button_size(
-                self.window_state,
-            )) + self.ui_px(SIDEBAR_INSET);
+            y += self.workspace_sidebar_toggle_visual_size() + self.ui_px(SIDEBAR_INSET);
         }
         let top_action_height = row_height
             .min(self.ui_px(48))
@@ -875,21 +882,42 @@ impl crate::TermWindow {
         let show_sidebar_toolbar = layout.show_sidebar_toolbar;
         let sidebar_toolbar_uses_fullscreen_style =
             platform_chrome::workspace_sidebar_toolbar_uses_fullscreen_style(self.window_state);
-        let sidebar_toggle_size = self.ui_px(
-            platform_chrome::workspace_sidebar_toolbar_button_size(self.window_state),
-        );
-        let sidebar_toggle_x = panel_x
-            + if sidebar_toolbar_uses_fullscreen_style {
-                self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X)
-            } else {
-                self.ui_px(SIDEBAR_INSET)
-            };
-        let sidebar_toggle_y = header_y
-            + if sidebar_toolbar_uses_fullscreen_style {
-                self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET)
-            } else {
-                0
-            };
+        let sidebar_toggle_size = self.workspace_sidebar_toggle_visual_size();
+        // Mirror the collapsed-state toggle exactly: same left inset from
+        // the window content edge (independent of the sidebar width — the
+        // tab-bar path's leading_action_start_pixels returns 0 while the
+        // sidebar is open, so it must not be used here) and the same
+        // centering within the tab bar's content row.
+        let border = self.get_os_border();
+        let sidebar_toggle_x = if sidebar_toolbar_uses_fullscreen_style {
+            panel_x + self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X)
+        } else {
+            border.left.get() as usize
+                + platform_chrome::sidebar_toggle_left_inset_px(
+                    self.dimensions.dpi,
+                    self.window_state,
+                )
+        };
+        let top_fancy_row = if self.show_tab_bar
+            && self.config.use_fancy_tab_bar
+            && !self.config.tab_bar_at_bottom
+        {
+            self.tab_bar_pixel_height().ok().map(|h| h.ceil() as usize)
+        } else {
+            None
+        };
+        let sidebar_toggle_y = if sidebar_toolbar_uses_fullscreen_style {
+            header_y + self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET)
+        } else if let Some(row_h) = top_fancy_row {
+            // Same formula as the collapsed painter: centered within the
+            // content row (full row minus the top spacer).
+            let spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_h);
+            border.top.get() as usize
+                + spacer
+                + (row_h - spacer).saturating_sub(sidebar_toggle_size) / 2
+        } else {
+            header_y
+        };
         let sidebar_toggle_icon_size = self
             .ui_px(platform_chrome::workspace_sidebar_toolbar_icon_size(
                 self.window_state,
