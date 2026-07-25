@@ -1269,6 +1269,67 @@ impl Mux {
         })
     }
 
+    /// Move an already-registered pane into a new split without ever
+    /// leaving it detached if the insertion fails.
+    pub fn move_pane_to_split(
+        &self,
+        src_pane_id: PaneId,
+        target_tab_id: TabId,
+        target_pane_id: PaneId,
+        request: SplitRequest,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        if src_pane_id == target_pane_id {
+            anyhow::bail!("cannot split pane {src_pane_id} relative to itself");
+        }
+
+        let target_tab = self
+            .get_tab(target_tab_id)
+            .ok_or_else(|| anyhow!("tab_id {target_tab_id} is invalid"))?;
+        let target_index = target_tab
+            .pane_index_for_pane(target_pane_id)
+            .ok_or_else(|| anyhow!("pane_id {target_pane_id} is not in tab {target_tab_id}"))?;
+        target_tab
+            .validate_split_request(target_index, request)
+            .with_context(|| format!("cannot split pane {target_pane_id}"))?;
+
+        // This is a local topology primitive and does not require either tab
+        // to be attached to a window yet.
+        let src_tab = self
+            .tabs
+            .read()
+            .values()
+            .find(|tab| tab.pane_index_for_pane(src_pane_id).is_some())
+            .cloned()
+            .ok_or_else(|| anyhow!("pane {src_pane_id} not found in any tab"))?;
+        let src_tab_id = src_tab.tab_id();
+        let pane = src_tab.remove_pane(src_pane_id).ok_or_else(|| {
+            anyhow!("pane {src_pane_id} not found in its containing tab {src_tab_id}")
+        })?;
+
+        // Removing a pane can renumber the destination leaves when source
+        // and target are in the same tab.
+        let final_target_index = match target_tab.pane_index_for_pane(target_pane_id) {
+            Some(index) => index,
+            None => {
+                src_tab.rehome_orphan_pane(&pane);
+                anyhow::bail!("target pane {target_pane_id} vanished while moving pane");
+            }
+        };
+
+        if let Err(err) =
+            target_tab.split_and_insert(final_target_index, request, Arc::clone(&pane))
+        {
+            src_tab.rehome_orphan_pane(&pane);
+            return Err(err);
+        }
+
+        if src_tab.is_dead() {
+            self.remove_tab(src_tab_id);
+        }
+
+        Ok(pane)
+    }
+
     pub async fn split_pane(
         &self,
         // TODO: disambiguate with TabId
@@ -1311,6 +1372,10 @@ impl Mux {
         };
 
         let pane = domain.split_pane(source, tab_id, pane_id, request).await?;
+        // A moved pane is already registered, so PaneAdded cannot advertise
+        // the changed tree to mux clients. Always publish the structural
+        // mutation; clients coalesce it into an authoritative resync.
+        self.notify(MuxNotification::TabResized(tab_id));
         if let Some(config) = term_config {
             pane.set_config(config);
         }

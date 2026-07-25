@@ -26,7 +26,7 @@ use mux::pane::{Pane, WithPaneLines};
 use mux::ssh::{RemoteSshDomain, SshConnectionStatus};
 use mux::tab::{PositionedPane, SplitDirection};
 use mux::window::WindowId as MuxWindowId;
-use mux::{Mux, MuxNotification};
+use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
 use std::ops::Sub;
@@ -1942,16 +1942,10 @@ impl super::TermWindow {
     }
 
     /// Whether a pane can participate in a drag move/split. Remote mux
-    /// panes are excluded because the client's SplitPane move path does
-    /// not translate pane ids yet; tmux panes because the tmux domain
-    /// ignores SplitSource::MovePane and would spawn instead.
+    /// panes are supported by ClientDomain's translated MovePane path;
+    /// tmux panes remain excluded because that domain ignores
+    /// SplitSource::MovePane and would spawn instead.
     fn pane_tab_is_movable(pane: &Arc<dyn Pane>) -> bool {
-        if pane
-            .downcast_ref::<wezterm_client::pane::ClientPane>()
-            .is_some()
-        {
-            return false;
-        }
         if let Some(domain) = Mux::get().get_domain(pane.domain_id()) {
             if domain.downcast_ref::<mux::tmux::TmuxDomain>().is_some() {
                 return false;
@@ -2202,13 +2196,8 @@ impl super::TermWindow {
                         .await
                     {
                         Ok((moved, _size)) => {
-                            // MovePane reuses an already-registered pane, so
-                            // observers get no PaneAdded; tell them the tab's
-                            // structure changed.
-                            Mux::get().notify(MuxNotification::TabResized(dest_tab_id));
-                            window
-                                .window
-                                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            window.window.notify(TermWindowNotif::Apply(Box::new(
+                                move |term_window| {
                                     // Look up the destination tab by id: the
                                     // window's active tab may have changed
                                     // while the split was in flight.
@@ -2228,7 +2217,8 @@ impl super::TermWindow {
                                     if let Some(window) = term_window.window.as_ref() {
                                         window.invalidate();
                                     }
-                                })));
+                                },
+                            )));
                         }
                         Err(err) => log::error!("pane tab drop split failed: {err:#}"),
                     }

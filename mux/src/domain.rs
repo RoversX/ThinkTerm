@@ -84,6 +84,10 @@ pub trait Domain: Downcast + Send + Sync {
             None => anyhow::bail!("Invalid tab id {}", tab),
         };
 
+        if let SplitSource::MovePane(src_pane_id) = &source {
+            return mux.move_pane_to_split(*src_pane_id, tab.tab_id(), pane_id, split_request);
+        }
+
         let pane_index = match tab.pane_index_for_pane(pane_id) {
             Some(index) => index,
             None => anyhow::bail!("invalid pane id {}", pane_id),
@@ -94,7 +98,6 @@ pub trait Domain: Downcast + Send + Sync {
             None => anyhow::bail!("invalid pane index {}", pane_index),
         };
 
-        let moved_existing_pane = matches!(&source, SplitSource::MovePane(_));
         let pane = match source {
             SplitSource::Spawn {
                 command,
@@ -103,47 +106,10 @@ pub trait Domain: Downcast + Send + Sync {
                 self.spawn_pane(split_size.second, command, command_dir)
                     .await?
             }
-            SplitSource::MovePane(src_pane_id) => {
-                let (_domain, _window, src_tab) = mux
-                    .resolve_pane_id(src_pane_id)
-                    .ok_or_else(|| anyhow::anyhow!("pane {} not found", src_pane_id))?;
-                let src_tab = match mux.get_tab(src_tab) {
-                    Some(t) => t,
-                    None => anyhow::bail!("Invalid tab id {}", src_tab),
-                };
-
-                let pane = src_tab.remove_pane(src_pane_id).ok_or_else(|| {
-                    anyhow::anyhow!("pane {} not found in its containing tab!?", src_pane_id)
-                })?;
-
-                if src_tab.is_dead() {
-                    mux.remove_tab(src_tab.tab_id());
-                }
-
-                pane
-            }
+            SplitSource::MovePane(_) => unreachable!("MovePane handled above"),
         };
 
-        // pane_index may have changed if src_pane was also in the same tab
-        let final_pane_index = match tab.pane_index_for_pane(pane_id) {
-            Some(index) => index,
-            None => {
-                if moved_existing_pane {
-                    tab.rehome_orphan_pane(&pane);
-                }
-                anyhow::bail!("invalid pane id {}", pane_id);
-            }
-        };
-
-        if let Err(err) = tab.split_and_insert(final_pane_index, split_request, Arc::clone(&pane))
-        {
-            // A moved pane was already detached from its tab; never let a
-            // failed insertion leave it orphaned.
-            if moved_existing_pane {
-                tab.rehome_orphan_pane(&pane);
-            }
-            return Err(err);
-        }
+        tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))?;
         Ok(pane)
     }
 

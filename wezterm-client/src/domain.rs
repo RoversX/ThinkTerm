@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
@@ -80,6 +80,32 @@ impl Drop for StructureMutationGuard {
             .detach();
         }
     }
+}
+
+fn remote_move_pane_id(
+    target_local_pane_id: PaneId,
+    target_remote_pane_id: PaneId,
+    source_local_pane_id: PaneId,
+    source_remote_pane_id: PaneId,
+    expected_domain_id: DomainId,
+    source_domain_id: DomainId,
+) -> anyhow::Result<PaneId> {
+    if source_local_pane_id == target_local_pane_id {
+        bail!("cannot split pane {source_local_pane_id} relative to itself");
+    }
+    if source_domain_id != expected_domain_id {
+        bail!(
+            "cannot move pane {source_local_pane_id} from domain {source_domain_id} \
+             into domain {expected_domain_id}"
+        );
+    }
+    if source_remote_pane_id == target_remote_pane_id {
+        bail!(
+            "local panes {source_local_pane_id} and {target_local_pane_id} \
+             both refer to remote pane {source_remote_pane_id}"
+        );
+    }
+    Ok(source_remote_pane_id)
 }
 
 impl ClientInner {
@@ -751,7 +777,12 @@ impl ClientDomain {
                     remote_panes_to_forget.remove(&entry.pane_id);
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
                         match mux.get_pane(pane_id) {
-                            Some(pane) => pane,
+                            Some(pane) => {
+                                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                                    client_pane.set_remote_tab_id(entry.tab_id);
+                                }
+                                pane
+                            }
                             None => {
                                 // We likely decided that we hit EOF on the tab and
                                 // removed it from the mux.  Let's add it back, but
@@ -935,6 +966,27 @@ impl ClientDomain {
         Self::process_pane_list(inner, panes, primary_window_id)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_move_pane_id;
+
+    #[test]
+    fn remote_move_uses_the_remote_source_id() {
+        assert_eq!(remote_move_pane_id(41, 901, 42, 7, 3, 3).unwrap(), 7);
+    }
+
+    #[test]
+    fn remote_move_rejects_self_and_cross_domain_moves() {
+        assert!(remote_move_pane_id(42, 901, 42, 7, 3, 3).is_err());
+        assert!(remote_move_pane_id(41, 901, 42, 7, 3, 4).is_err());
+    }
+
+    #[test]
+    fn remote_move_rejects_duplicate_local_mirrors() {
+        assert!(remote_move_pane_id(41, 7, 42, 7, 3, 3).is_err());
     }
 }
 
@@ -1141,26 +1193,98 @@ impl Domain for ClientDomain {
         let pane = local_pane
             .downcast_ref::<ClientPane>()
             .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", pane_id))?;
+        if !pane.belongs_to_client(&inner) {
+            bail!("pane_id {pane_id} belongs to a stale client connection");
+        }
+        let target_remote_pane_id = pane.remote_pane_id();
 
-        let (command, command_dir, move_pane_id) = match source {
+        let (command, command_dir, move_pane_id, moved_local_pane) = match source {
             SplitSource::Spawn {
                 command,
                 command_dir,
-            } => (command, command_dir, None),
-            SplitSource::MovePane(move_pane_id) => (None, None, Some(move_pane_id)),
+            } => (command, command_dir, None, None),
+            SplitSource::MovePane(source_local_pane_id) => {
+                let source_pane = mux
+                    .get_pane(source_local_pane_id)
+                    .ok_or_else(|| anyhow!("source pane_id {source_local_pane_id} is invalid"))?;
+                let source_client_pane =
+                    source_pane.downcast_ref::<ClientPane>().ok_or_else(|| {
+                        anyhow!("source pane_id {source_local_pane_id} is not a ClientPane")
+                    })?;
+                if !source_client_pane.belongs_to_client(&inner) {
+                    bail!(
+                        "source pane_id {source_local_pane_id} belongs to a different client connection"
+                    );
+                }
+                let remote_source_pane_id = remote_move_pane_id(
+                    pane_id,
+                    target_remote_pane_id,
+                    source_local_pane_id,
+                    source_client_pane.remote_pane_id(),
+                    inner.local_domain_id,
+                    source_pane.domain_id(),
+                )?;
+
+                let target_index = tab
+                    .pane_index_for_pane(pane_id)
+                    .ok_or_else(|| anyhow!("pane_id {pane_id} is not in tab {tab_id}"))?;
+                tab.validate_split_request(target_index, split_request)
+                    .context("remote MovePane split preflight failed")?;
+
+                (
+                    None,
+                    None,
+                    Some(remote_source_pane_id),
+                    Some((source_pane, remote_source_pane_id)),
+                )
+            }
         };
 
         let result = inner
             .client
             .split_pane(SplitPane {
                 domain: SpawnTabDomain::CurrentPaneDomain,
-                pane_id: pane.remote_pane_id,
+                pane_id: target_remote_pane_id,
                 split_request,
                 command,
                 command_dir,
                 move_pane_id,
             })
             .await?;
+
+        if let Some((moved_pane, expected_remote_pane_id)) = moved_local_pane {
+            // The server must return the identity of the pane that it moved.
+            // Treat anything else as a protocol/topology mismatch rather
+            // than creating a second local mirror for that remote pane.
+            if result.pane_id != expected_remote_pane_id {
+                inner.defer_resync();
+                bail!(
+                    "remote MovePane returned pane {}, expected {}",
+                    result.pane_id,
+                    expected_remote_pane_id
+                );
+            }
+
+            let moved_client_pane = moved_pane
+                .downcast_ref::<ClientPane>()
+                .expect("MovePane source was validated as ClientPane");
+            moved_client_pane.set_remote_tab_id(result.tab_id);
+
+            if let Err(err) =
+                mux.move_pane_to_split(moved_pane.pane_id(), tab_id, pane_id, split_request)
+            {
+                // The server has already committed the move. The mux helper
+                // guarantees that the local pane remains attached; force an
+                // authoritative tree sync to converge on the remote result.
+                inner.defer_resync();
+                return Err(err).context("mirroring remote MovePane locally");
+            }
+
+            // Always converge with the server tree after the optimistic
+            // local update, even if its TabResized notification was delayed.
+            inner.defer_resync();
+            return Ok(moved_pane);
+        }
 
         let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
             &inner,
@@ -1179,8 +1303,10 @@ impl Domain for ClientDomain {
             None => anyhow::bail!("invalid pane id {}", pane_id),
         };
 
-        tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))
-            .ok();
+        if let Err(err) = tab.split_and_insert(pane_index, split_request, Arc::clone(&pane)) {
+            inner.defer_resync();
+            return Err(err).context("mirroring remote split locally");
+        }
 
         mux.add_pane(&pane)?;
 

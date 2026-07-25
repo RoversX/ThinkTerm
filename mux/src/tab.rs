@@ -1130,6 +1130,27 @@ impl Tab {
         self.inner.lock().compute_split_size(pane_index, request)
     }
 
+    pub fn validate_split_request(
+        &self,
+        pane_index: usize,
+        request: SplitRequest,
+    ) -> anyhow::Result<()> {
+        let split = self
+            .compute_split_size(pane_index, request)
+            .ok_or_else(|| anyhow::anyhow!("invalid pane index {pane_index}"))?;
+        let tab_size = self.get_size();
+        if split.first.rows == 0
+            || split.first.cols == 0
+            || split.second.rows == 0
+            || split.second.cols == 0
+            || split.top_of_second() + split.second.rows > tab_size.rows
+            || split.left_of_second() + split.second.cols > tab_size.cols
+        {
+            anyhow::bail!("no space for split");
+        }
+        Ok(())
+    }
+
     /// Split the pane that has pane_index in the given direction and assign
     /// the right/bottom pane of the newly created split to the provided Pane
     /// instance.  Returns the resultant index of the newly inserted pane.
@@ -4005,6 +4026,111 @@ mod test {
         assert_eq!(tab.count_panes(), Some(2));
         assert!(tab.pane_index_for_pane(2).is_some());
         assert_eq!(tab.get_active_pane().unwrap().pane_id(), 2);
+    }
+
+    #[test]
+    fn mux_move_pane_to_split_reuses_registered_pane() {
+        let _guard = install_mux();
+        let mux = Mux::get();
+        let size = test_size();
+
+        let src_tab = Arc::new(Tab::new(&size));
+        let src = FakePane::new(10_001, size);
+        src_tab.assign_pane(&src);
+        mux.add_tab_no_panes(&src_tab);
+        mux.add_pane(&src).unwrap();
+
+        let target_tab = Arc::new(Tab::new(&size));
+        let target = FakePane::new(10_002, size);
+        target_tab.assign_pane(&target);
+        mux.add_tab_no_panes(&target_tab);
+        mux.add_pane(&target).unwrap();
+
+        let moved = mux
+            .move_pane_to_split(
+                src.pane_id(),
+                target_tab.tab_id(),
+                target.pane_id(),
+                SplitRequest::default(),
+            )
+            .unwrap();
+
+        assert_eq!(moved.pane_id(), src.pane_id());
+        let src_dyn: Arc<dyn Pane> = src.clone();
+        assert!(Arc::ptr_eq(&moved, &src_dyn));
+        assert!(mux.get_tab(src_tab.tab_id()).is_none());
+        assert_eq!(target_tab.count_panes(), Some(2));
+        assert!(target_tab.pane_index_for_pane(src.pane_id()).is_some());
+        assert_eq!(
+            mux.get_pane(src.pane_id()).unwrap().pane_id(),
+            src.pane_id()
+        );
+    }
+
+    #[test]
+    fn mux_move_pane_to_split_recomputes_same_tab_target() {
+        let _guard = install_mux();
+        let mux = Mux::get();
+        let size = test_size();
+
+        let tab = Arc::new(Tab::new(&size));
+        let target = FakePane::new(10_021, size);
+        let src = FakePane::new(10_022, size);
+        tab.assign_pane(&target);
+        tab.add_pane_to_stack(target.pane_id(), Arc::clone(&src))
+            .unwrap();
+        mux.add_tab_no_panes(&tab);
+        mux.add_pane(&target).unwrap();
+        mux.add_pane(&src).unwrap();
+
+        let moved = mux
+            .move_pane_to_split(
+                src.pane_id(),
+                tab.tab_id(),
+                target.pane_id(),
+                SplitRequest::default(),
+            )
+            .unwrap();
+
+        assert_eq!(moved.pane_id(), src.pane_id());
+        assert_eq!(tab.count_panes(), Some(2));
+        assert_eq!(tab.iter_panes().len(), 2);
+        assert!(tab.pane_index_for_pane(target.pane_id()).is_some());
+        assert!(tab.pane_index_for_pane(src.pane_id()).is_some());
+    }
+
+    #[test]
+    fn mux_move_pane_to_split_preflight_keeps_source_attached() {
+        let _guard = install_mux();
+        let mux = Mux::get();
+        let size = test_size();
+
+        let src_tab = Arc::new(Tab::new(&size));
+        let src = FakePane::new(10_011, size);
+        src_tab.assign_pane(&src);
+        mux.add_tab_no_panes(&src_tab);
+        mux.add_pane(&src).unwrap();
+
+        let tiny_size = TerminalSize { cols: 1, ..size };
+        let target_tab = Arc::new(Tab::new(&tiny_size));
+        let target = FakePane::new(10_012, tiny_size);
+        target_tab.assign_pane(&target);
+        mux.add_tab_no_panes(&target_tab);
+        mux.add_pane(&target).unwrap();
+
+        assert!(mux
+            .move_pane_to_split(
+                src.pane_id(),
+                target_tab.tab_id(),
+                target.pane_id(),
+                SplitRequest::default(),
+            )
+            .is_err());
+
+        assert!(mux.get_tab(src_tab.tab_id()).is_some());
+        assert!(src_tab.pane_index_for_pane(src.pane_id()).is_some());
+        assert_eq!(src_tab.count_panes(), Some(1));
+        assert_eq!(target_tab.count_panes(), Some(1));
     }
 
     /// Regression for the same-stack edge drop: dragging the active pane B
