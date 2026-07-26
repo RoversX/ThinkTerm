@@ -781,6 +781,14 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::MovePaneToStack(request) => {
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    schedule_move_pane_to_stack(request, send_response, client_id);
+                })
+                .detach();
+            }
+
             Pdu::MovePaneToNewTab(request) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
@@ -1106,6 +1114,25 @@ fn schedule_spawn_pane_in_stack<SND>(
     promise::spawn::spawn(
         async move { send_response(spawn_pane_in_stack(request, client_id).await) },
     )
+    .detach();
+}
+
+fn schedule_move_pane_to_stack<SND>(
+    request: MovePaneToStack,
+    send_response: SND,
+    client_id: Option<Arc<ClientId>>,
+) where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+{
+    promise::spawn::spawn(async move {
+        let mux = Mux::get();
+        let _identity = mux.with_identity(client_id);
+        send_response(
+            mux.move_pane_to_stack(request.source_pane_id, request.target_pane_id)
+                .await
+                .map(|_| Pdu::UnitResponse(UnitResponse {})),
+        );
+    })
     .detach();
 }
 

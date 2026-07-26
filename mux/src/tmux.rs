@@ -379,11 +379,14 @@ impl Domain for TmuxDomain {
 
     async fn split_pane(
         &self,
-        _source: SplitSource,
+        source: SplitSource,
         tab: TabId,
         pane_id: PaneId,
         split_request: SplitRequest,
     ) -> anyhow::Result<Arc<dyn Pane>> {
+        if matches!(source, SplitSource::MovePane(_)) {
+            anyhow::bail!("moving an existing pane is not supported by TmuxDomain");
+        }
         let mut promise = promise::Promise::new();
         if let Some(future) = promise.get_future() {
             {
@@ -399,6 +402,15 @@ impl Domain for TmuxDomain {
         }
 
         anyhow::bail!("Split_pane failed");
+    }
+
+    async fn move_pane_to_stack(
+        &self,
+        _src_pane_id: PaneId,
+        _target_tab_id: TabId,
+        _target_pane_id: PaneId,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        anyhow::bail!("moving an existing pane is not supported by TmuxDomain")
     }
 
     async fn spawn_pane(

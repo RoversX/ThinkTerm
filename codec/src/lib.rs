@@ -442,7 +442,8 @@ macro_rules! pdu {
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
 /// 47: PaneStackEntry gained pane_stack_id; stack operation PDUs.
-pub const CODEC_VERSION: usize = 47;
+/// 48: MovePaneToStack moves an existing pane into another pane stack.
+pub const CODEC_VERSION: usize = 48;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -505,6 +506,7 @@ pdu! {
     AdjustPaneSize: 62,
     SpawnPaneInStack: 63,
     ActivatePaneInStack: 64,
+    MovePaneToStack: 65,
 }
 
 impl Pdu {
@@ -522,7 +524,8 @@ impl Pdu {
             | Self::SetPaneZoomed(_)
             | Self::SpawnV2(_)
             | Self::SpawnPaneInStack(_)
-            | Self::ActivatePaneInStack(_) => true,
+            | Self::ActivatePaneInStack(_)
+            | Self::MovePaneToStack(_) => true,
             _ => false,
         }
     }
@@ -681,6 +684,15 @@ pub struct SpawnPaneInStack {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct ActivatePaneInStack {
     pub pane_id: PaneId,
+}
+
+/// Move an existing pane into the stack containing `target_pane_id`.
+/// Both ids are in the mux server's pane-id space. Responds with
+/// UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct MovePaneToStack {
+    pub source_pane_id: PaneId,
+    pub target_pane_id: PaneId,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1206,6 +1218,28 @@ mod test {
                 pdu: Pdu::Ping(Ping {})
             },
             Pdu::decode(encoded.as_slice()).unwrap()
+        );
+    }
+
+    #[test]
+    fn move_pane_to_stack_round_trip() {
+        let request = MovePaneToStack {
+            source_pane_id: 17,
+            target_pane_id: 29,
+        };
+        let mut encoded = Vec::new();
+        Pdu::MovePaneToStack(request)
+            .encode(&mut encoded, 0x41)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x41,
+                pdu: Pdu::MovePaneToStack(MovePaneToStack {
+                    source_pane_id: 17,
+                    target_pane_id: 29,
+                }),
+            }
         );
     }
 

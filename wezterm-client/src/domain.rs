@@ -1060,6 +1060,97 @@ impl Domain for ClientDomain {
         Ok(pane)
     }
 
+    async fn move_pane_to_stack(
+        &self,
+        source_local_pane_id: PaneId,
+        target_tab_id: TabId,
+        target_local_pane_id: PaneId,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let _mutation = inner.begin_structure_mutation();
+        let mux = Mux::get();
+
+        let tab = mux
+            .get_tab(target_tab_id)
+            .ok_or_else(|| anyhow!("tab_id {target_tab_id} is invalid"))?;
+        if tab.pane_index_for_pane(source_local_pane_id).is_none()
+            || tab.pane_index_for_pane(target_local_pane_id).is_none()
+        {
+            bail!(
+                "remote stack move requires source pane {source_local_pane_id} and \
+                 target pane {target_local_pane_id} to be in tab {target_tab_id}"
+            );
+        }
+
+        let source_pane = mux
+            .get_pane(source_local_pane_id)
+            .ok_or_else(|| anyhow!("source pane_id {source_local_pane_id} is invalid"))?;
+        let target_pane = mux
+            .get_pane(target_local_pane_id)
+            .ok_or_else(|| anyhow!("target pane_id {target_local_pane_id} is invalid"))?;
+        let source_client_pane =
+            source_pane
+                .downcast_ref::<ClientPane>()
+                .ok_or_else(|| {
+                    anyhow!("source pane_id {source_local_pane_id} is not a ClientPane")
+                })?;
+        let target_client_pane =
+            target_pane
+                .downcast_ref::<ClientPane>()
+                .ok_or_else(|| {
+                    anyhow!("target pane_id {target_local_pane_id} is not a ClientPane")
+                })?;
+        if !source_client_pane.belongs_to_client(&inner)
+            || !target_client_pane.belongs_to_client(&inner)
+        {
+            bail!("remote stack move panes belong to different client connections");
+        }
+
+        let source_remote_pane_id = remote_move_pane_id(
+            target_local_pane_id,
+            target_client_pane.remote_pane_id(),
+            source_local_pane_id,
+            source_client_pane.remote_pane_id(),
+            inner.local_domain_id,
+            source_pane.domain_id(),
+        )?;
+        let target_remote_pane_id = target_client_pane.remote_pane_id();
+        let target_remote_tab_id = target_client_pane.remote_tab_id();
+        if source_client_pane.remote_tab_id() != target_remote_tab_id {
+            inner.defer_resync();
+            bail!(
+                "remote stack move panes do not belong to the same remote tab: \
+                 source={}, target={target_remote_tab_id}",
+                source_client_pane.remote_tab_id()
+            );
+        }
+
+        // This feature is restricted to one top-level tab. Apply the
+        // already-validated move locally before the network round-trip so
+        // dropping the drag preview does not reveal the old layout for one
+        // RTT. A failed RPC schedules an authoritative resync, which restores
+        // the server tree.
+        tab.move_pane_to_stack(source_local_pane_id, target_local_pane_id)?;
+
+        if let Err(err) = inner
+            .client
+            .move_pane_to_stack(codec::MovePaneToStack {
+                source_pane_id: source_remote_pane_id,
+                target_pane_id: target_remote_pane_id,
+            })
+            .await
+        {
+            inner.defer_resync();
+            return Err(err).context("moving remote pane into stack");
+        }
+
+        source_client_pane.set_remote_tab_id(target_remote_tab_id);
+        inner.defer_resync();
+        Ok(source_pane)
+    }
+
     /// Forward the request to the remote; we need to translate the local ids
     /// to those that match the remote for the request, resync the changed
     /// structure, and then translate the results back to local
@@ -1197,12 +1288,13 @@ impl Domain for ClientDomain {
             bail!("pane_id {pane_id} belongs to a stale client connection");
         }
         let target_remote_pane_id = pane.remote_pane_id();
+        let target_remote_tab_id = pane.remote_tab_id();
 
-        let (command, command_dir, move_pane_id, moved_local_pane) = match source {
+        let (command, command_dir, move_pane_id, moved_local_pane, source_tab_id) = match source {
             SplitSource::Spawn {
                 command,
                 command_dir,
-            } => (command, command_dir, None, None),
+            } => (command, command_dir, None, None, None),
             SplitSource::MovePane(source_local_pane_id) => {
                 let source_pane = mux
                     .get_pane(source_local_pane_id)
@@ -1230,17 +1322,42 @@ impl Domain for ClientDomain {
                     .ok_or_else(|| anyhow!("pane_id {pane_id} is not in tab {tab_id}"))?;
                 tab.validate_split_request(target_index, split_request)
                     .context("remote MovePane split preflight failed")?;
+                let (_, _, source_tab_id) = mux
+                    .resolve_pane_id(source_local_pane_id)
+                    .ok_or_else(|| anyhow!("source pane_id {source_local_pane_id} is invalid"))?;
 
                 (
                     None,
                     None,
                     Some(remote_source_pane_id),
                     Some((source_pane, remote_source_pane_id)),
+                    Some(source_tab_id),
                 )
             }
         };
 
-        let result = inner
+        // Pane-tab dragging is currently restricted to one top-level tab.
+        // Mirror that common case before waiting for the RPC so the old
+        // layout is never exposed between the drag overlay disappearing and
+        // the server response. Cross-tab callers retain the conservative
+        // post-response update below.
+        let optimistic_move_applied = if let Some((moved_pane, _)) = moved_local_pane.as_ref() {
+            if source_tab_id == Some(tab_id) {
+                mux.move_pane_to_split(
+                    moved_pane.pane_id(),
+                    tab_id,
+                    pane_id,
+                    split_request,
+                )?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let result = match inner
             .client
             .split_pane(SplitPane {
                 domain: SpawnTabDomain::CurrentPaneDomain,
@@ -1250,7 +1367,17 @@ impl Domain for ClientDomain {
                 command_dir,
                 move_pane_id,
             })
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                // The transport may have failed after the server committed
+                // the mutation. Always fetch the authoritative tree instead
+                // of assuming that an RPC error means no structural change.
+                inner.defer_resync();
+                return Err(err);
+            }
+        };
 
         if let Some((moved_pane, expected_remote_pane_id)) = moved_local_pane {
             // The server must return the identity of the pane that it moved.
@@ -1264,20 +1391,31 @@ impl Domain for ClientDomain {
                     expected_remote_pane_id
                 );
             }
+            if result.tab_id != target_remote_tab_id {
+                inner.defer_resync();
+                bail!(
+                    "remote MovePane returned tab {}, expected {}",
+                    result.tab_id,
+                    target_remote_tab_id
+                );
+            }
 
             let moved_client_pane = moved_pane
                 .downcast_ref::<ClientPane>()
                 .expect("MovePane source was validated as ClientPane");
             moved_client_pane.set_remote_tab_id(result.tab_id);
 
-            if let Err(err) =
-                mux.move_pane_to_split(moved_pane.pane_id(), tab_id, pane_id, split_request)
-            {
-                // The server has already committed the move. The mux helper
-                // guarantees that the local pane remains attached; force an
-                // authoritative tree sync to converge on the remote result.
-                inner.defer_resync();
-                return Err(err).context("mirroring remote MovePane locally");
+            if !optimistic_move_applied {
+                if let Err(err) =
+                    mux.move_pane_to_split(moved_pane.pane_id(), tab_id, pane_id, split_request)
+                {
+                    // The server has already committed the move. The mux
+                    // helper guarantees that the local pane remains attached;
+                    // force an authoritative tree sync to converge on the
+                    // remote result.
+                    inner.defer_resync();
+                    return Err(err).context("mirroring remote MovePane locally");
+                }
             }
 
             // Always converge with the server tree after the optimistic

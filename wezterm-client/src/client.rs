@@ -1615,6 +1615,7 @@ impl Client {
     rpc!(split_pane, SplitPane, SpawnResponse);
     rpc!(spawn_pane_in_stack, SpawnPaneInStack, SpawnResponse);
     rpc!(activate_pane_in_stack, ActivatePaneInStack, UnitResponse);
+    rpc!(move_pane_to_stack, MovePaneToStack, UnitResponse);
     rpc!(
         move_pane_to_new_tab,
         MovePaneToNewTab,

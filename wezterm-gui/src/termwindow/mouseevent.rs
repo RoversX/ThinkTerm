@@ -2042,7 +2042,8 @@ impl super::TermWindow {
                 {
                     continue;
                 }
-                // Remote mux / tmux panes cannot be split/moved into (v1)
+                // TmuxDomain cannot move existing panes; remote mux panes
+                // are supported by ClientDomain.
                 if !Self::pane_tab_is_movable(&pos.pane) {
                     break;
                 }
@@ -2140,11 +2141,37 @@ impl super::TermWindow {
 
         match target.kind {
             PaneDropKind::MoveIntoStack => {
-                if let Err(err) = tab.move_pane_to_stack(src_pane_id, target.target_pane_id) {
-                    log::error!("pane tab drop move failed: {err:#}");
-                    return;
-                }
-                self.persist_workspace_layout_after_mutation("pane tab drop move");
+                let target_pane_id = target.target_pane_id;
+                let dest_tab_id = tab.tab_id();
+                let workspace = self.current_mux_workspace();
+                let window = GuiWin::new(self);
+                promise::spawn::spawn(async move {
+                    match Mux::get()
+                        .move_pane_to_stack(src_pane_id, target_pane_id)
+                        .await
+                    {
+                        Ok(moved) => {
+                            window.window.notify(TermWindowNotif::Apply(Box::new(
+                                move |term_window| {
+                                    if let Some(tab) = Mux::get().get_tab(dest_tab_id) {
+                                        tab.set_active_pane(&moved);
+                                    }
+                                    if term_window.current_mux_workspace() == workspace {
+                                        term_window.persist_workspace_layout_after_mutation(
+                                            "pane tab drop move",
+                                        );
+                                    }
+                                    term_window.update_title();
+                                    if let Some(window) = term_window.window.as_ref() {
+                                        window.invalidate();
+                                    }
+                                },
+                            )));
+                        }
+                        Err(err) => log::error!("pane tab drop move failed: {err:#}"),
+                    }
+                })
+                .detach();
             }
             PaneDropKind::Split => {
                 let stack_tabs = tab.pane_stack_tabs(target.target_pane_id);

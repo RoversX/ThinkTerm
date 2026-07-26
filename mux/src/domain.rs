@@ -135,6 +135,26 @@ pub trait Domain: Downcast + Send + Sync {
         self.spawn_pane(size, command, command_dir).await
     }
 
+    /// Move an existing pane into the stack containing `target_pane_id`.
+    /// The default implementation mutates the local mux tree. Proxy domains
+    /// override this so the authoritative remote tree is changed as well.
+    async fn move_pane_to_stack(
+        &self,
+        src_pane_id: PaneId,
+        target_tab_id: TabId,
+        target_pane_id: PaneId,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let mux = Mux::get();
+        let tab = mux
+            .get_tab(target_tab_id)
+            .ok_or_else(|| anyhow::anyhow!("Invalid tab id {target_tab_id}"))?;
+        let pane = mux
+            .get_pane(src_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {src_pane_id} not found"))?;
+        tab.move_pane_to_stack(src_pane_id, target_pane_id)?;
+        Ok(pane)
+    }
+
     /// The mux will call this method on the domain of the pane that
     /// is being moved to give the domain a chance to handle the movement.
     /// If this method returns Ok(None), then the mux will handle the

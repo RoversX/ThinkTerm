@@ -2948,7 +2948,7 @@ impl TabInner {
 
         // The only fallible step happens before the tree is touched: if the
         // pane refuses to resize we bail with the layout intact.
-        if let Some(dims) = target_dims {
+        if let Some(dims) = target_dims.filter(|_| !src_pane.is_remote_mirror()) {
             src_pane.resize(dims)?;
         }
 
@@ -2969,7 +2969,10 @@ impl TabInner {
                 if cursor.is_leaf() {
                     let stack = cursor.leaf_mut().unwrap();
                     if stack.contains_pane(target_pane_id) {
-                        if let Some(base) = stack.active_pane() {
+                        if let Some(base) = stack
+                            .active_pane()
+                            .filter(|_| !removed.is_remote_mirror())
+                        {
                             let dims = base.get_dimensions();
                             if let Err(err) = removed.resize(TerminalSize {
                                 rows: dims.viewport_rows,
@@ -4097,6 +4100,51 @@ mod test {
         assert_eq!(tab.iter_panes().len(), 2);
         assert!(tab.pane_index_for_pane(target.pane_id()).is_some());
         assert!(tab.pane_index_for_pane(src.pane_id()).is_some());
+    }
+
+    #[test]
+    fn mux_move_pane_to_split_activates_moved_pane_in_all_directions() {
+        for (direction, target_is_second) in [
+            (SplitDirection::Horizontal, false),
+            (SplitDirection::Horizontal, true),
+            (SplitDirection::Vertical, false),
+            (SplitDirection::Vertical, true),
+        ] {
+            let _guard = install_mux();
+            let mux = Mux::get();
+            let size = test_size();
+
+            let src_tab = Arc::new(Tab::new(&size));
+            let src = FakePane::new(10_031, size);
+            src_tab.assign_pane(&src);
+            mux.add_tab_no_panes(&src_tab);
+            mux.add_pane(&src).unwrap();
+
+            let target_tab = Arc::new(Tab::new(&size));
+            let target = FakePane::new(10_032, size);
+            target_tab.assign_pane(&target);
+            mux.add_tab_no_panes(&target_tab);
+            mux.add_pane(&target).unwrap();
+
+            mux.move_pane_to_split(
+                src.pane_id(),
+                target_tab.tab_id(),
+                target.pane_id(),
+                SplitRequest {
+                    direction,
+                    target_is_second,
+                    top_level: false,
+                    size: Default::default(),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                target_tab.get_active_pane().unwrap().pane_id(),
+                src.pane_id(),
+                "{direction:?} second={target_is_second}"
+            );
+        }
     }
 
     #[test]

@@ -1323,6 +1323,13 @@ impl Mux {
             return Err(err);
         }
 
+        // split_and_insert only selects the inserted pane when it is the
+        // right/bottom half. A move is an explicit user action, so make the
+        // moved pane active for all four directions. Doing this here also
+        // makes the server's authoritative tree agree with client mirrors
+        // before it is serialized for a resync.
+        target_tab.set_active_pane(&pane);
+
         if src_tab.is_dead() {
             self.remove_tab(src_tab_id);
         }
@@ -1454,6 +1461,46 @@ impl Mux {
         tab.add_pane_to_stack(pane_id, Arc::clone(&pane))?;
 
         Ok(pane)
+    }
+
+    /// Move an existing pane into another pane stack in the same tab.
+    /// The domain owns the mutation so proxy domains can update their
+    /// authoritative server before the next resync.
+    pub async fn move_pane_to_stack(
+        &self,
+        src_pane_id: PaneId,
+        target_pane_id: PaneId,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        if src_pane_id == target_pane_id {
+            anyhow::bail!("cannot move pane {src_pane_id} onto itself");
+        }
+
+        let (src_domain_id, _src_window_id, src_tab_id) = self
+            .resolve_pane_id(src_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {src_pane_id} not found"))?;
+        let (target_domain_id, _target_window_id, target_tab_id) = self
+            .resolve_pane_id(target_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {target_pane_id} not found"))?;
+
+        if src_domain_id != target_domain_id {
+            anyhow::bail!(
+                "cannot move pane {src_pane_id} from domain {src_domain_id} \
+                 into domain {target_domain_id}"
+            );
+        }
+        if src_tab_id != target_tab_id {
+            anyhow::bail!(
+                "cannot move pane {src_pane_id} from tab {src_tab_id} \
+                 into stack in tab {target_tab_id}"
+            );
+        }
+
+        let domain = self
+            .get_domain(target_domain_id)
+            .ok_or_else(|| anyhow::anyhow!("domain {target_domain_id} not found"))?;
+        domain
+            .move_pane_to_stack(src_pane_id, target_tab_id, target_pane_id)
+            .await
     }
 
     pub async fn move_pane_to_new_tab(
