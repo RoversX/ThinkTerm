@@ -72,6 +72,12 @@ const RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST: usize = 8;
 const RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST: usize = 16;
 const RIGHT_SIDEBAR_MODE_HEIGHT: usize = 72;
 const RIGHT_SIDEBAR_EMPTY_HEIGHT: usize = 88;
+/// Empty-state geometry for the remote Files panel, in design pixels.
+const REMOTE_EMPTY_ICON_SIZE: usize = 40;
+const REMOTE_EMPTY_ICON_GAP: usize = 18;
+const REMOTE_EMPTY_DETAIL_GAP: usize = 6;
+const REMOTE_EMPTY_BUTTON_GAP: usize = 22;
+const REMOTE_EMPTY_BUTTON_HEIGHT: usize = 44;
 const SNIPPET_TOOLBAR_HEIGHT: usize = 58;
 const SNIPPET_SEARCH_HEIGHT: usize = 58;
 const SNIPPET_CARD_HEIGHT: usize = 116;
@@ -8506,7 +8512,6 @@ impl crate::TermWindow {
                 content_top,
                 content_width,
                 content_bottom,
-                icon_size,
             );
         }
 
@@ -8544,75 +8549,65 @@ impl crate::TermWindow {
         content_top: usize,
         content_width: usize,
         content_bottom: usize,
-        icon_size: usize,
     ) -> anyhow::Result<()> {
         let phase = self.right_sidebar_remote_files.phase.clone();
+        // Which host the panel is talking about; shown under the title so the
+        // user knows what they are about to connect to.
+        let target_label = self
+            .right_sidebar_remote_files
+            .target
+            .as_ref()
+            .map(|target| target.project_name.clone());
         match phase {
-            RemoteFilesPhase::Disconnected => {
-                self.paint_files_message(
-                    layers,
-                    ui_font,
-                    ui_metrics,
-                    chrome,
-                    muted_fg,
-                    content_x,
-                    content_top,
-                    content_width,
-                    content_bottom,
-                    icon_size,
-                    "Connect to browse this remote project",
-                )?;
-                self.paint_remote_files_connect_button(
-                    layers,
-                    ui_font,
-                    ui_metrics,
-                    chrome,
-                    foreground,
-                    content_x,
-                    content_top + self.ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT + 12),
-                    content_width,
-                    "Connect to Remote Files",
-                )
-            }
-            RemoteFilesPhase::Connecting => self.paint_files_message(
+            RemoteFilesPhase::Disconnected => self.paint_remote_files_empty_state(
                 layers,
                 ui_font,
                 ui_metrics,
                 chrome,
-                muted_fg,
                 content_x,
                 content_top,
                 content_width,
                 content_bottom,
-                icon_size,
-                "Connecting to Remote Files...",
+                // A neutral state, not a fault: CircleAlert here reads as
+                // "something broke" the first time the panel is opened.
+                SvgIcon::Server,
+                false,
+                "Not connected",
+                target_label.as_deref(),
+                Some(("Connect", true)),
             ),
-            RemoteFilesPhase::Failed(message) => {
-                self.paint_files_message(
-                    layers,
-                    ui_font,
-                    ui_metrics,
-                    chrome,
-                    muted_fg,
-                    content_x,
-                    content_top,
-                    content_width,
-                    content_bottom,
-                    icon_size,
-                    &message,
-                )?;
-                self.paint_remote_files_connect_button(
-                    layers,
-                    ui_font,
-                    ui_metrics,
-                    chrome,
-                    foreground,
-                    content_x,
-                    content_top + self.ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT + 12),
-                    content_width,
-                    "Retry",
-                )
-            }
+            RemoteFilesPhase::Connecting => self.paint_remote_files_empty_state(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                content_x,
+                content_top,
+                content_width,
+                content_bottom,
+                SvgIcon::LoaderCircle,
+                // Spinning also drives the repaint schedule, so the panel keeps
+                // animating instead of freezing for the length of the connect.
+                true,
+                "Connecting…",
+                target_label.as_deref(),
+                Some(("Connecting…", false)),
+            ),
+            RemoteFilesPhase::Failed(message) => self.paint_remote_files_empty_state(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                content_x,
+                content_top,
+                content_width,
+                content_bottom,
+                SvgIcon::CircleAlert,
+                false,
+                "Connection failed",
+                Some(message.as_str()),
+                Some(("Retry", true)),
+            ),
             RemoteFilesPhase::Connected => self.paint_remote_files_tree(
                 layers,
                 ui_font,
@@ -8628,42 +8623,173 @@ impl crate::TermWindow {
         }
     }
 
+    /// Centred icon / title / detail / action block for the remote Files panel
+    /// when there is no tree to show.
+    ///
+    /// Deliberately not `paint_files_message`: that draws a bordered card meant
+    /// for transient status ("Indexing files…") pinned to the top of the panel.
+    /// Stacking it above a same-coloured button produced two identical-looking
+    /// boxes where only the lower one was clickable, and its icon slot squeezed
+    /// the text until it ellipsized mid-sentence.
     #[allow(clippy::too_many_arguments)]
+    fn paint_remote_files_empty_state(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        icon: SvgIcon,
+        spinning: bool,
+        title: &str,
+        detail: Option<&str>,
+        action: Option<(&str, bool)>,
+    ) -> anyhow::Result<()> {
+        let line_h = ui_metrics.cell_size.height as usize;
+        let icon_size = self.ui_px(REMOTE_EMPTY_ICON_SIZE);
+        let mut block_h = icon_size + self.ui_px(REMOTE_EMPTY_ICON_GAP) + line_h;
+        if detail.is_some() {
+            block_h += self.ui_px(REMOTE_EMPTY_DETAIL_GAP) + line_h;
+        }
+        if action.is_some() {
+            block_h += self.ui_px(REMOTE_EMPTY_BUTTON_GAP) + self.ui_px(REMOTE_EMPTY_BUTTON_HEIGHT);
+        }
+
+        // Centre in the panel, but never above the top edge when it is short.
+        let available = content_bottom.saturating_sub(content_top);
+        let mut y = content_top + available.saturating_sub(block_h) / 2;
+
+        let icon_x = content_x + content_width.saturating_sub(icon_size) / 2;
+        if spinning {
+            self.paint_spinning_ui_icon(
+                layers,
+                1,
+                icon,
+                icon_x,
+                y,
+                icon_size,
+                chrome.secondary_text,
+            )?;
+        } else {
+            self.paint_sidebar_icon(layers, icon, icon_x, y, icon_size, chrome.secondary_text)?;
+        }
+        y += icon_size + self.ui_px(REMOTE_EMPTY_ICON_GAP);
+
+        self.paint_remote_files_centered_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            title,
+            content_x,
+            y,
+            content_width,
+            chrome.text,
+        )?;
+        y += line_h;
+
+        if let Some(detail) = detail {
+            y += self.ui_px(REMOTE_EMPTY_DETAIL_GAP);
+            self.paint_remote_files_centered_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                detail,
+                content_x,
+                y,
+                content_width,
+                chrome.muted_text,
+            )?;
+            y += line_h;
+        }
+
+        if let Some((label, enabled)) = action {
+            y += self.ui_px(REMOTE_EMPTY_BUTTON_GAP);
+            self.paint_remote_files_connect_button(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                content_x,
+                y,
+                content_width,
+                label,
+                enabled,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Horizontally centre a single line, falling back to the full width (and
+    /// therefore ellipsizing) only when the text cannot fit.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_remote_files_centered_text(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        text: &str,
+        content_x: usize,
+        y: usize,
+        content_width: usize,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let text_w = self
+            .sidebar_text_width(ui_font, text)
+            .unwrap_or(content_width as f32)
+            .ceil() as usize;
+        let width = text_w.min(content_width);
+        let x = content_x + content_width.saturating_sub(width) / 2;
+        self.paint_sidebar_text(layers, ui_font, ui_metrics, text, x, y, width, color)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// The single call to action in an otherwise empty panel, so it is styled
+    /// as a primary button (accent fill) rather than reusing the neutral
+    /// `sidebar_button_bg` that the surrounding message cards use — otherwise
+    /// the only clickable thing on screen looks exactly like the text above it.
     fn paint_remote_files_connect_button(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
         ui_metrics: RenderMetrics,
         chrome: UiPalette,
-        foreground: LinearRgba,
         x: usize,
         y: usize,
         width: usize,
         label: &str,
+        enabled: bool,
     ) -> anyhow::Result<()> {
-        let height = self.ui_px(44);
-        let hovered = self.is_pointer_over_ui_rect(x, y, width, height);
+        let height = self.ui_px(REMOTE_EMPTY_BUTTON_HEIGHT);
+        let hovered = enabled && self.is_pointer_over_ui_rect(x, y, width, height);
+        let (fill, text_color) = if !enabled {
+            (chrome.sidebar_button_bg, chrome.muted_text)
+        } else if hovered {
+            (chrome.selected_bg.mul_alpha(0.85), chrome.selected_text)
+        } else {
+            (chrome.selected_bg, chrome.selected_text)
+        };
         self.fill_rounded_rectangle_with_border(
             layers,
             1,
             euclid::rect(x as f32, y as f32, width as f32, height as f32),
-            if hovered {
-                chrome.control_hover_bg
-            } else {
-                chrome.sidebar_button_bg
-            },
-            chrome.control_border,
+            fill,
+            if enabled { fill } else { chrome.control_border },
             self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
             CAPSULE_BORDER_WIDTH,
         )
         .context("remote Files connect button")?;
-        self.ui_items.push(UIItem {
-            x,
-            y,
-            width,
-            height,
-            item_type: UIItemType::RightSidebarRemoteFileConnect,
-        });
+        if enabled {
+            self.ui_items.push(UIItem {
+                x,
+                y,
+                width,
+                height,
+                item_type: UIItemType::RightSidebarRemoteFileConnect,
+            });
+        }
         let label_width = self
             .sidebar_text_width(ui_font, label)
             .unwrap_or(width as f32)
@@ -8677,7 +8803,7 @@ impl crate::TermWindow {
             text_x,
             y + height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
             width.saturating_sub(text_x.saturating_sub(x)),
-            foreground,
+            text_color,
         )
     }
 
@@ -8706,12 +8832,13 @@ impl crate::TermWindow {
             .target
             .as_ref()
             .map(|target| target.project_name.as_str())
-            .unwrap_or("Remote Files");
+            .unwrap_or("Remote Files")
+            .to_string();
         self.paint_sidebar_text(
             layers,
             ui_font,
             ui_metrics,
-            label,
+            &label,
             content_x,
             content_top
                 + self
@@ -8735,12 +8862,14 @@ impl crate::TermWindow {
 
         let mut tree_top =
             content_top + self.ui_px(FILE_FILTER_HEIGHT) + self.ui_px(FILE_TREE_TOP_GAP);
-        if let Some(message) = self.right_sidebar_remote_files.error_message.clone() {
+        let error_y = tree_top;
+        let error_message = self.right_sidebar_remote_files.error_message.clone();
+        if let Some(message) = error_message.as_deref() {
             self.paint_sidebar_text(
                 layers,
                 ui_font,
                 ui_metrics,
-                &message,
+                message,
                 content_x,
                 tree_top,
                 content_width,
@@ -8812,6 +8941,70 @@ impl crate::TermWindow {
                 tree_top,
                 viewport_bottom,
                 row_metrics,
+            )?;
+        }
+        if max_scroll > 0.0 && scroll > 0.0 {
+            // Rows retain their true origin so a partly scrolled first row has
+            // the correct visible height and hit target. Mask the portion above
+            // the viewport, then restore the fixed header content on top, just
+            // like the local file tree does below.
+            self.paint_right_sidebar_file_mask(
+                layers,
+                chrome,
+                content_x,
+                content_top,
+                content_width,
+                tree_top.saturating_sub(content_top),
+            )?;
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                &label,
+                content_x,
+                content_top
+                    + self
+                        .ui_px(FILE_FILTER_HEIGHT)
+                        .saturating_sub(ui_metrics.cell_size.height as usize)
+                        / 2,
+                label_width,
+                foreground,
+            )?;
+            self.paint_files_preview_header_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                refresh_x,
+                refresh_y,
+                refresh_size,
+                SvgIcon::RotateCcw,
+                UIItemType::RightSidebarRemoteFileRefresh,
+            )?;
+            if let Some(message) = error_message.as_deref() {
+                self.paint_sidebar_text(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    message,
+                    content_x,
+                    error_y,
+                    content_width,
+                    muted_fg,
+                )?;
+            }
+            let fade_top = tree_top.saturating_sub(self.ui_px(FILE_TREE_TOP_GAP));
+            let fade_height = self
+                .ui_px(FILE_TREE_TOP_GAP)
+                .saturating_add(self.ui_px(FILE_SCROLL_FADE_HEIGHT))
+                .min(viewport_bottom.saturating_sub(fade_top));
+            self.paint_right_sidebar_file_top_fade(
+                layers,
+                chrome,
+                content_x,
+                fade_top,
+                content_width,
+                fade_height,
             )?;
         }
         if footer_height > 0 {

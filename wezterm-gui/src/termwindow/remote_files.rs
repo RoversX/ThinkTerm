@@ -76,6 +76,60 @@ impl RemotePath {
     }
 }
 
+/// Whether `requested` needs the remote home resolved before it can be used.
+/// Absolute roots do not: asking the server to canonicalize `.` first is both
+/// pointless and a needless failure point, since a server that cannot answer
+/// that request would break a project whose path was fully specified.
+fn requested_root_needs_home(requested: &str) -> bool {
+    requested == "~" || requested.starts_with("~/")
+}
+
+/// Validate a stored project path for use as a browse root. Kept separate from
+/// [`RemotePath::from_server_absolute`] so the diagnostics distinguish "the
+/// server answered with something odd" from "this project's stored path cannot
+/// be browsed", and so traversal components never reach the server.
+fn remote_root_from_absolute(requested: &str) -> Result<RemotePath, String> {
+    if !requested.starts_with('/') {
+        return Err(format!(
+            "Unsupported remote project path {requested:?}: expected an absolute path or ~"
+        ));
+    }
+    if requested.split('/').any(|component| component == "..") {
+        return Err(format!(
+            "Unsupported remote project path {requested:?}: `..` is not allowed"
+        ));
+    }
+    RemotePath::from_server_absolute(requested)
+}
+
+/// Flatten an error and everything it wraps into one line. libssh and ssh2
+/// failures surface through `SftpChannelError` as the near-useless
+/// "Library-specific error", with the real reason one or more levels down.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    parts.join(": ")
+}
+
+/// The deepest, most specific message in the chain — the part worth putting in
+/// front of the user when the full chain is too long for a sidebar.
+fn error_summary(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut deepest = err.to_string();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        if !text.is_empty() {
+            deepest = text;
+        }
+        source = inner.source();
+    }
+    deepest
+}
+
 fn resolve_requested_root(home: RemotePath, requested: &str) -> Result<RemotePath, String> {
     if requested == "~" {
         return Ok(home);
@@ -168,12 +222,36 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
     fn resolve_root(&self, requested: String) -> RemoteFuture<RemotePath> {
         let sftp = self.sftp.clone();
         Box::pin(async move {
-            let home = sftp
-                .canonicalize(".")
-                .await
-                .map_err(|err| format!("Unable to resolve remote home: {err}"))?;
-            let home = RemotePath::from_server_absolute(home.as_str())?;
-            resolve_requested_root(home, &requested)
+            if !requested_root_needs_home(&requested) {
+                // Already absolute (or invalid): no server round-trip needed.
+                return remote_root_from_absolute(&requested);
+            }
+
+            // SFTP has no concept of `~`; the home directory is whatever the
+            // server canonicalizes the session's starting directory to. `.` is
+            // the usual spelling, but not every server answers it, so fall back
+            // to the empty path before giving up.
+            let mut failures = Vec::new();
+            for probe in [".", ""] {
+                match sftp.canonicalize(probe.to_string()).await {
+                    Ok(home) => {
+                        return resolve_requested_root(
+                            RemotePath::from_server_absolute(home.as_str())?,
+                            &requested,
+                        )
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "remote files: sftp canonicalize({probe:?}) failed: {}",
+                            error_chain(&err)
+                        );
+                        failures.push(error_summary(&err));
+                    }
+                }
+            }
+            let detail = failures.last().cloned().unwrap_or_default();
+            log::error!("remote files: unable to resolve remote home: {failures:?}");
+            Err(format!("Can't read the remote home directory: {detail}"))
         })
     }
 
@@ -665,10 +743,15 @@ pub(crate) fn update_remote_connection_idle_timeout(minutes: u32) {
 
 pub(crate) fn invalidate_remote_connection_if_dead(key: &str, message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
+    // Matches both the wrapper text (`SftpChannelError`) and the innermost
+    // cause, because a concise user-facing message carries only the latter.
+    // "closed channel" covers async-channel's own wording on both ends:
+    // "sending into a closed channel" and "receiving from an empty and closed
+    // channel" — the previous "sending on a closed" never matched either.
     let dead = lower.contains("session is dead")
         || lower.contains("channel is closed")
         || lower.contains("channel closed")
-        || lower.contains("sending on a closed")
+        || lower.contains("closed channel")
         || lower.contains("no connection has been set up")
         || lower.contains("connection, but we lost it")
         || lower.contains("failed to send request")
@@ -1117,6 +1200,175 @@ impl RemoteFilesState {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records how many times the remote home was asked for, so a test can
+    /// prove an absolute root never pays for that round-trip.
+    #[derive(Default)]
+    struct HomeProbeCounter {
+        calls: AtomicUsize,
+        home: Option<&'static str>,
+    }
+
+    impl HomeProbeCounter {
+        /// Mirrors `SftpRemoteFileBackend::resolve_root` without a server: the
+        /// closure stands in for `sftp.canonicalize`.
+        fn resolve(&self, requested: &str) -> Result<RemotePath, String> {
+            if !requested_root_needs_home(requested) {
+                return remote_root_from_absolute(requested);
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let home = self
+                .home
+                .ok_or_else(|| "Can't read the remote home directory: denied".to_string())?;
+            resolve_requested_root(RemotePath::from_server_absolute(home)?, requested)
+        }
+    }
+
+    fn with_home() -> HomeProbeCounter {
+        HomeProbeCounter {
+            calls: AtomicUsize::new(0),
+            home: Some("/home/ada"),
+        }
+    }
+
+    #[test]
+    fn absolute_root_never_resolves_the_remote_home() {
+        // The bug this pins: `resolve_root` used to canonicalize `.` first, so a
+        // project with a fully specified path still broke on any server that
+        // could not answer that request.
+        let probe = with_home();
+        assert_eq!(probe.resolve("/srv/app").unwrap().as_str(), "/srv/app");
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+
+        // Even with no home available at all, an absolute root still works.
+        let no_home = HomeProbeCounter::default();
+        assert_eq!(no_home.resolve("/srv/app").unwrap().as_str(), "/srv/app");
+        assert_eq!(no_home.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tilde_resolves_to_the_remote_home() {
+        let probe = with_home();
+        assert_eq!(probe.resolve("~").unwrap().as_str(), "/home/ada");
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tilde_child_joins_beneath_the_home() {
+        let probe = with_home();
+        assert_eq!(
+            probe.resolve("~/code/thinkterm").unwrap().as_str(),
+            "/home/ada/code/thinkterm"
+        );
+        // Redundant separators and `.` segments collapse rather than escaping.
+        assert_eq!(
+            probe.resolve("~/code//./thinkterm").unwrap().as_str(),
+            "/home/ada/code/thinkterm"
+        );
+    }
+
+    #[test]
+    fn traversal_is_rejected_on_both_paths() {
+        let probe = with_home();
+        // `~/..` goes through join_name, which refuses `..`.
+        assert!(probe.resolve("~/../etc").is_err());
+        // An absolute root is checked before it can ever reach the server.
+        let err = probe.resolve("/srv/../etc").unwrap_err();
+        assert!(err.contains(".."), "{err}");
+    }
+
+    #[test]
+    fn relative_roots_are_rejected_with_a_clear_message() {
+        let probe = with_home();
+        for bad in ["relative/path", "", "C:/windows"] {
+            let err = probe.resolve(bad).unwrap_err();
+            assert!(
+                err.contains("absolute path or ~"),
+                "{bad:?} produced {err:?}"
+            );
+        }
+        // The failure is decided locally; no home lookup was attempted.
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn remote_paths_stay_slash_only() {
+        // Guards the Windows client: joining must never introduce a `\`, and a
+        // backslash is an ordinary character in a POSIX name.
+        let root = RemotePath::from_server_absolute("/srv").unwrap();
+        let child = root.join_name("a b").unwrap();
+        assert_eq!(child.as_str(), "/srv/a b");
+        assert_eq!(root.join_name("we\\ird").unwrap().as_str(), "/srv/we\\ird");
+        assert!(root.join_name("nested/name").is_err());
+        assert!(root.join_name("..").is_err());
+        // A trailing slash from the server is normalized away, but root stays "/".
+        assert_eq!(
+            RemotePath::from_server_absolute("/srv/app/")
+                .unwrap()
+                .as_str(),
+            "/srv/app"
+        );
+        assert_eq!(RemotePath::from_server_absolute("/").unwrap().as_str(), "/");
+    }
+
+    #[test]
+    fn a_dead_transport_is_detected_from_the_concise_message_too() {
+        // `resolve_root` hands the UI only the innermost cause, so invalidation
+        // must recognise the transport failure from that alone — otherwise
+        // Retry keeps handing back the same dead cached connection.
+        for message in [
+            "sending into a closed channel",
+            "receiving from an empty and closed channel",
+            "Failed to send request: sending into a closed channel",
+            "session is dead",
+            "Broken pipe",
+        ] {
+            assert!(
+                invalidate_remote_connection_if_dead("unused-key", message),
+                "{message:?} should invalidate"
+            );
+        }
+        // A server-side refusal is not a dead connection: keep the session.
+        for message in ["Permission denied", "No such file or directory"] {
+            assert!(
+                !invalidate_remote_connection_if_dead("unused-key", message),
+                "{message:?} should not invalidate"
+            );
+        }
+    }
+
+    #[test]
+    fn error_chain_keeps_the_specific_cause() {
+        // "Library-specific error" alone is what made the UI message useless.
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "Permission denied")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "Library-specific error")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err = Outer(Inner);
+        assert_eq!(
+            error_chain(&err),
+            "Library-specific error: Permission denied"
+        );
+        assert_eq!(error_summary(&err), "Permission denied");
+    }
 
     fn target(source: &str) -> RemoteFilesTarget {
         RemoteFilesTarget {
