@@ -96,6 +96,7 @@ pub mod onboarding;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
+pub(crate) mod remote_files;
 pub mod remote_thread_view;
 pub mod render;
 pub mod resize;
@@ -369,6 +370,11 @@ pub enum UIItemType {
     RightSidebarFileOpenMenu,
     RightSidebarFileReveal,
     RightSidebarFileCopyText,
+    RightSidebarRemoteFileConnect,
+    RightSidebarRemoteFileRefresh,
+    RightSidebarRemoteFileRow(remote_files::RemotePath),
+    RightSidebarRemoteFileBack,
+    RightSidebarRemoteFileCopyText,
     ContextMenuBackdrop,
     ContextMenuItem(Vec<usize>),
     AboveScrollThumb,
@@ -752,10 +758,7 @@ mod pane_drop_tests {
             PaneDropZone::Top,
             PaneDropZone::Bottom,
         ] {
-            assert_eq!(
-                pane_drop_action(zone, false, 1),
-                Some(PaneDropKind::Split)
-            );
+            assert_eq!(pane_drop_action(zone, false, 1), Some(PaneDropKind::Split));
         }
     }
 }
@@ -1374,6 +1377,9 @@ pub struct TermWindow {
     // re-scan don't lose where you were. Only a few KB of paths each; LRU-bounded.
     right_sidebar_file_view_state_by_root: HashMap<(PathBuf, String), RightSidebarFileViewState>,
     right_sidebar_file_view_state_order: VecDeque<(PathBuf, String)>,
+    right_sidebar_remote_files: remote_files::RemoteFilesState,
+    right_sidebar_remote_files_lease: Option<remote_files::RemoteConnectionLease>,
+    right_sidebar_remote_file_tree_scroll_offset: f32,
     // Bumped to invalidate a pending periodic-rescan timer tick.
     right_sidebar_file_rescan_token: u64,
     // True while a keep-showing refresh build is in flight (drives the Refresh
@@ -2017,6 +2023,9 @@ impl TermWindow {
             right_sidebar_file_preview_restore_scroll: None,
             right_sidebar_file_view_state_by_root: HashMap::new(),
             right_sidebar_file_view_state_order: VecDeque::new(),
+            right_sidebar_remote_files: remote_files::RemoteFilesState::default(),
+            right_sidebar_remote_files_lease: None,
+            right_sidebar_remote_file_tree_scroll_offset: 0.0,
             right_sidebar_file_rescan_token: 0,
             right_sidebar_file_refreshing: false,
             right_sidebar_open_with_generation: 0,
@@ -3640,7 +3649,6 @@ impl TermWindow {
     }
 
     pub(crate) fn content_view_area(&self) -> RectF {
-        let (padding_left, padding_top) = self.padding_left_top();
         let border = self.get_os_border();
         let top_tab_h = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
             self.tab_bar_pixel_height().unwrap_or(0.0)
@@ -3652,8 +3660,13 @@ impl TermWindow {
         } else {
             0.0
         };
-        let left = padding_left + border.left.get() as f32;
-        let top = border.top.get() as f32 + top_tab_h + padding_top;
+        // Deliberately *not* inset by `window_padding`: that padding belongs to
+        // the terminal grid, and content views are UI panels that own the whole
+        // area. Applying it only added a left/top gap (the right/bottom edges
+        // never subtracted it) that nothing painted, so the window background
+        // showed through as an L-shaped border.
+        let left = self.workspace_sidebar_width() as f32 + border.left.get() as f32;
+        let top = border.top.get() as f32 + top_tab_h;
         let right = self
             .dimensions
             .pixel_width
@@ -6621,6 +6634,12 @@ impl TermWindow {
 
 impl Drop for TermWindow {
     fn drop(&mut self) {
+        // WindowEvent::Destroyed normally releases this claim, but a mux
+        // window can disappear first (for example during an asynchronous
+        // remote attach) and tear down TermWindow without delivering that
+        // native event. Release is idempotent and prevents a vanished window
+        // from leaving its Space permanently marked as occupied.
+        crate::workspace_threads::release_window_space(self.space_owner_id);
         crate::input_diagnostics::remove_gauges_for_source(self.space_owner_id);
         gpu_debug(format!(
             "drop main_window backend={} size={}x{} dpi={}",

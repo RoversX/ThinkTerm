@@ -255,9 +255,7 @@ mod tests {
         let px = |v: usize| scale_ui_usize(v, 96);
         let fixed = px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE);
         // Capsule = row - spacer - 2 * vertical padding
-        let capsule = |row: usize| {
-            row - px(WINDOW_TAB_TOP_SPACER) - px(TAB_VERTICAL_PADDING) * 2
-        };
+        let capsule = |row: usize| row - px(WINDOW_TAB_TOP_SPACER) - px(TAB_VERTICAL_PADDING) * 2;
         // Normal and large tab fonts follow the row height
         assert_eq!(
             sidebar_toggle_size_px(96, WindowState::default(), Some(38)),
@@ -268,7 +266,10 @@ mod tests {
             capsule(58)
         );
         // Hidden, retro or bottom tab bars keep the fixed usable size
-        assert_eq!(sidebar_toggle_size_px(96, WindowState::default(), None), fixed);
+        assert_eq!(
+            sidebar_toggle_size_px(96, WindowState::default(), None),
+            fixed
+        );
         // Tiny rows never shrink the control below the fixed size
         assert_eq!(
             sidebar_toggle_size_px(96, WindowState::default(), Some(8)),
@@ -291,7 +292,10 @@ mod tests {
         for row in [38, 58, 90] {
             let params = test_params(0, WindowState::default(), Some(row));
             let painted = params.sidebar_toggle_button_size();
-            assert_eq!(painted, sidebar_toggle_size_px(96, WindowState::default(), Some(row)));
+            assert_eq!(
+                painted,
+                sidebar_toggle_size_px(96, WindowState::default(), Some(row))
+            );
             assert!(
                 params.leading_action_area_width_pixels() >= painted as f32,
                 "row {row}: reserved {} < painted {painted}",

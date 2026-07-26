@@ -60,12 +60,15 @@ pub(crate) struct ScrollbarSpec {
 }
 
 impl ScrollbarSpec {
+    /// Every measurement here comes from `tokens`, which is already scaled for
+    /// the target DPI (`UiTokens::for_dpi`). Do not reintroduce raw literals:
+    /// mixing them with the scaled width breaks non-1.0 displays.
     pub(crate) fn from_area(area: window::RectF, tokens: UiTokens) -> Self {
         Self {
-            x: area.origin.x + area.size.width - tokens.scrollbar_width - 4.0,
-            y: area.origin.y + 8.0,
+            x: area.origin.x + area.size.width - tokens.scrollbar_width - tokens.scrollbar_inset,
+            y: area.origin.y + tokens.scrollbar_margin_y,
             width: tokens.scrollbar_width,
-            height: (area.size.height - 16.0).max(0.0),
+            height: (area.size.height - tokens.scrollbar_margin_y * 2.0).max(0.0),
         }
     }
 }

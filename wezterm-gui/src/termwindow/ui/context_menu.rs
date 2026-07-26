@@ -362,9 +362,8 @@ impl crate::TermWindow {
             .title_font_with_size(menu_font_size)
             .context("context menu ui font")?;
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
-        let row_height = (ui_metrics.cell_size.height as usize
-            + self.ui_px(MENU_ROW_EXTRA_HEIGHT))
-        .max(self.ui_px(44));
+        let row_height = (ui_metrics.cell_size.height as usize + self.ui_px(MENU_ROW_EXTRA_HEIGHT))
+            .max(self.ui_px(44));
         let palette = context_menu_palette(crate::native_settings::effective_appearance());
 
         let gl_state = self.render_state.as_ref().unwrap();
@@ -695,11 +694,21 @@ fn paint_menu_rows(
                         layers,
                         2,
                         euclid::rect(
-                            item_rect.x.saturating_add(term.ui_px(MENU_ROW_HOVER_INSET_X)) as f32,
-                            item_rect.y.saturating_add(term.ui_px(MENU_ROW_HOVER_INSET_Y)) as f32,
-                            item_rect.width.saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_X) * 2)
+                            item_rect
+                                .x
+                                .saturating_add(term.ui_px(MENU_ROW_HOVER_INSET_X))
                                 as f32,
-                            item_rect.height.saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_Y) * 2)
+                            item_rect
+                                .y
+                                .saturating_add(term.ui_px(MENU_ROW_HOVER_INSET_Y))
+                                as f32,
+                            item_rect
+                                .width
+                                .saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_X) * 2)
+                                as f32,
+                            item_rect
+                                .height
+                                .saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_Y) * 2)
                                 as f32,
                         ),
                         palette.control_hover_bg,
@@ -723,8 +732,8 @@ fn paint_menu_rows(
                     } else {
                         palette.secondary_text
                     };
-                    let icon_y =
-                        item_rect.y + (item_rect.height.saturating_sub(term.ui_px(MENU_ICON_SIZE))) / 2;
+                    let icon_y = item_rect.y
+                        + (item_rect.height.saturating_sub(term.ui_px(MENU_ICON_SIZE))) / 2;
                     let check_x = item_rect.x + term.ui_px(MENU_PADDING_X);
                     let icon_x = check_x + term.ui_px(MENU_CHECK_SLOT);
                     if *checked {

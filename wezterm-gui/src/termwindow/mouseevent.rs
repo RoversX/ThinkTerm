@@ -89,11 +89,37 @@ fn trailing_action_reserved_width(
         })
 }
 
+fn remote_connect_can_reveal(
+    status: Option<&SshConnectionStatus>,
+    workspace_has_window: bool,
+) -> bool {
+    workspace_has_window
+        && matches!(
+            status,
+            Some(SshConnectionStatus::Authenticating | SshConnectionStatus::Connected)
+        )
+}
+
+fn remote_thread_uses_ssh_connection_view(is_remote: bool, space_has_client_domain: bool) -> bool {
+    is_remote && !space_has_client_domain
+}
+
+fn missing_ssh_host_blocks_activation(
+    project_is_remote: bool,
+    has_ssh_host: bool,
+    space_has_client_domain: bool,
+) -> bool {
+    project_is_remote && !has_ssh_host && !space_has_client_domain
+}
+
 #[cfg(test)]
 mod window_tab_layout_tests {
     use super::{
-        note_drag_scroll_delta, note_horizontal_scroll_offset, trailing_action_reserved_width,
+        missing_ssh_host_blocks_activation, note_drag_scroll_delta, note_horizontal_scroll_offset,
+        remote_connect_can_reveal, remote_thread_uses_ssh_connection_view,
+        trailing_action_reserved_width,
     };
+    use mux::ssh::SshConnectionStatus;
 
     #[test]
     fn trailing_actions_keep_tabs_before_the_new_tab_button() {
@@ -128,6 +154,49 @@ mod window_tab_layout_tests {
         assert_eq!(note_horizontal_scroll_offset(95.0, 15.0, 100.0), 100.0);
         assert_eq!(note_horizontal_scroll_offset(5.0, -15.0, 100.0), 0.0);
         assert_eq!(note_horizontal_scroll_offset(5.0, 15.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn remote_connect_reveals_only_after_the_target_workspace_exists() {
+        assert!(!remote_connect_can_reveal(
+            Some(&SshConnectionStatus::Authenticating),
+            false
+        ));
+        assert!(remote_connect_can_reveal(
+            Some(&SshConnectionStatus::Authenticating),
+            true
+        ));
+        assert!(!remote_connect_can_reveal(
+            Some(&SshConnectionStatus::Connected),
+            false
+        ));
+        assert!(remote_connect_can_reveal(
+            Some(&SshConnectionStatus::Connected),
+            true
+        ));
+        assert!(!remote_connect_can_reveal(
+            Some(&SshConnectionStatus::Connecting),
+            true
+        ));
+        assert!(!remote_connect_can_reveal(
+            Some(&SshConnectionStatus::Failed("failed".to_string())),
+            true
+        ));
+    }
+
+    #[test]
+    fn mux_domain_threads_bypass_the_ssh_connection_view() {
+        assert!(remote_thread_uses_ssh_connection_view(true, false));
+        assert!(!remote_thread_uses_ssh_connection_view(true, true));
+        assert!(!remote_thread_uses_ssh_connection_view(false, false));
+    }
+
+    #[test]
+    fn mux_domain_threads_do_not_require_an_ssh_host_record() {
+        assert!(missing_ssh_host_blocks_activation(true, false, false));
+        assert!(!missing_ssh_host_blocks_activation(true, false, true));
+        assert!(!missing_ssh_host_blocks_activation(true, true, false));
+        assert!(!missing_ssh_host_blocks_activation(false, false, false));
     }
 }
 
@@ -935,6 +1004,11 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFileOpenMenu
             | UIItemType::RightSidebarFileReveal
             | UIItemType::RightSidebarFileCopyText
+            | UIItemType::RightSidebarRemoteFileConnect
+            | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileRow(_)
+            | UIItemType::RightSidebarRemoteFileBack
+            | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::AboveScrollThumb
@@ -1010,6 +1084,11 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFileOpenMenu
             | UIItemType::RightSidebarFileReveal
             | UIItemType::RightSidebarFileCopyText
+            | UIItemType::RightSidebarRemoteFileConnect
+            | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileRow(_)
+            | UIItemType::RightSidebarRemoteFileBack
+            | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::AboveScrollThumb
@@ -1269,14 +1348,17 @@ impl super::TermWindow {
                         }
                         return;
                     }
-                    if completed_drag
-                        .as_ref()
-                        .is_some_and(|(item, _)| matches!(item.item_type, UIItemType::PaneNav { .. }))
-                    {
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        matches!(item.item_type, UIItemType::PaneNav { .. })
+                    }) {
                         // Release coordinates can differ from the last move
                         // event (coalesced/fast motion); recompute the drop
                         // target from where the button actually went up.
-                        if self.pane_tab_drag.as_ref().is_some_and(|state| state.active) {
+                        if self
+                            .pane_tab_drag
+                            .as_ref()
+                            .is_some_and(|state| state.active)
+                        {
                             self.update_pane_tab_drag_target(&event);
                         }
                         if let Some(state) = self.pane_tab_drag.take() {
@@ -2038,8 +2120,7 @@ impl super::TermWindow {
                 let Ok(rect) = self.pane_frame_rect(&pos) else {
                     continue;
                 };
-                if x < rect.min_x() || x >= rect.max_x() || y < rect.min_y() || y >= rect.max_y()
-                {
+                if x < rect.min_x() || x >= rect.max_x() || y < rect.min_y() || y >= rect.max_y() {
                     continue;
                 }
                 // TmuxDomain cannot move existing panes; remote mux panes
@@ -2497,6 +2578,13 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFileReveal
             | UIItemType::RightSidebarFileCopyText => {
                 self.mouse_event_right_sidebar_file(item.clone(), event, context);
+            }
+            UIItemType::RightSidebarRemoteFileConnect
+            | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileRow(_)
+            | UIItemType::RightSidebarRemoteFileBack
+            | UIItemType::RightSidebarRemoteFileCopyText => {
+                self.mouse_event_right_sidebar_remote_file(item.clone(), event, context);
             }
             UIItemType::WorkspaceSidebarSettings => {
                 self.mouse_event_workspace_sidebar_settings(event, context);
@@ -2986,6 +3074,13 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFileCopyText => {
                 self.mouse_event_right_sidebar_file(item.clone(), event, context);
             }
+            UIItemType::RightSidebarRemoteFileConnect
+            | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileRow(_)
+            | UIItemType::RightSidebarRemoteFileBack
+            | UIItemType::RightSidebarRemoteFileCopyText => {
+                self.mouse_event_right_sidebar_remote_file(item.clone(), event, context);
+            }
             UIItemType::ContentViewClose(id) => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
@@ -3251,7 +3346,9 @@ impl super::TermWindow {
                 self.dragging.replace((item, event));
                 context.invalidate();
             }
-            WMEK::Press(MousePress::Right) => {
+            WMEK::Press(MousePress::Right)
+                if self.right_sidebar_remote_files.selected.is_none() =>
+            {
                 self.show_right_sidebar_file_open_with_menu(context, event.coords);
             }
             _ => {}
@@ -3293,8 +3390,10 @@ impl super::TermWindow {
             // (re)starts the periodic re-scan.
             if self.right_sidebar_file_view_active() {
                 self.kick_right_sidebar_file_rescan_cycle();
+                self.request_right_sidebar_remote_files_connect(false);
             } else {
                 self.schedule_right_sidebar_file_memory_release();
+                self.release_right_sidebar_remote_files_if_hidden();
             }
             self.invalidate_or_reflow_right_sidebar(previous_width, context);
         }
@@ -3472,6 +3571,38 @@ impl super::TermWindow {
             (UIItemType::RightSidebarFileCopyText, WMEK::Press(MousePress::Left)) => {
                 self.clear_right_sidebar_text_focus();
                 self.copy_right_sidebar_selected_file_preview_text()
+            }
+            _ => {}
+        }
+        self.invalidate_or_reflow_right_sidebar(previous_width, context);
+    }
+
+    pub fn mouse_event_right_sidebar_remote_file(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+        let previous_width = self.right_sidebar_width();
+        match item.item_type {
+            UIItemType::RightSidebarRemoteFileConnect => {
+                self.request_right_sidebar_remote_files_connect(true);
+            }
+            UIItemType::RightSidebarRemoteFileRefresh => {
+                self.refresh_right_sidebar_remote_files();
+            }
+            UIItemType::RightSidebarRemoteFileRow(path) => {
+                self.open_right_sidebar_remote_file(path);
+            }
+            UIItemType::RightSidebarRemoteFileBack => {
+                self.close_right_sidebar_remote_file_preview();
+            }
+            UIItemType::RightSidebarRemoteFileCopyText => {
+                self.copy_right_sidebar_selected_file_preview_text();
             }
             _ => {}
         }
@@ -3952,8 +4083,8 @@ impl super::TermWindow {
     }
 
     fn workspace_sidebar_view_options_menu_items(&mut self) -> Vec<ContextMenuItem> {
-        use config::keyassignment::KeyAssignment;
         use crate::workspace_threads::WorkspaceThreadWorkStatus;
+        use config::keyassignment::KeyAssignment;
 
         self.begin_context_menu_application_actions();
         let hidden = crate::native_settings::workspace_sidebar_hidden_statuses();
@@ -4117,6 +4248,14 @@ impl super::TermWindow {
         else {
             return false;
         };
+        let space_has_client_domain =
+            crate::workspace_threads::client_domain_for_space(&state.space_id).is_some();
+        if !remote_thread_uses_ssh_connection_view(state.is_remote, space_has_client_domain) {
+            // A mux-domain Space already has its transport. Its threads are
+            // materialized directly through that ClientDomain and must never
+            // be sent through the disconnected SSH-host content view.
+            return false;
+        }
 
         if !state.is_remote || (!force_disconnected && state.is_live) {
             if !state.is_remote {
@@ -4668,7 +4807,11 @@ impl super::TermWindow {
         let remote_host_id =
             crate::workspace_threads::remote_host_id_for_project_id(&plan.project_id).to_string();
         let remote_spec = crate::ssh_hosts::host_spec(&remote_host_id);
-        if remote_spec.is_none() && crate::workspace_threads::project_is_remote(&plan.project_id) {
+        if missing_ssh_host_blocks_activation(
+            crate::workspace_threads::project_is_remote(&plan.project_id),
+            remote_spec.is_some(),
+            space_client_domain.is_some(),
+        ) {
             log::warn!(
                 "refusing to connect remote thread {:?}: SSH host {:?} no longer exists",
                 plan.thread_id,
@@ -4987,6 +5130,8 @@ impl super::TermWindow {
         }
 
         let materialize_workspace = workspace_name;
+        let materialize_workspace_for_error = materialize_workspace.clone();
+        let materialize_window = self.window.clone();
         promise::spawn::spawn(async move {
             if let Err(err) = crate::workspace_threads::materialize_thread(
                 materialize_workspace,
@@ -5000,6 +5145,20 @@ impl super::TermWindow {
             .await
             {
                 log::error!("failed to materialize connecting SSH thread: {err:#}");
+                let message = format!("Unable to open the remote terminal: {err:#}");
+                if let Some(window) = materialize_window {
+                    window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        let is_current = term_window
+                            .remote_connects
+                            .get(&view_id)
+                            .is_some_and(|state| state.generation == generation);
+                        if !is_current {
+                            return;
+                        }
+                        term_window.kill_remote_connect_workspace(&materialize_workspace_for_error);
+                        term_window.fail_remote_connect(view_id, &message);
+                    })));
+                }
             }
         })
         .detach();
@@ -5040,9 +5199,15 @@ impl super::TermWindow {
                     .downcast_ref::<RemoteSshDomain>()
                     .map(|ssh| ssh.connection_status())
             });
+        let workspace_has_window = !Mux::get()
+            .iter_windows_in_workspace(&workspace_name)
+            .is_empty();
+        let can_reveal = remote_connect_can_reveal(status.as_ref(), workspace_has_window);
 
         match status {
-            Some(SshConnectionStatus::Authenticating) | Some(SshConnectionStatus::Connected) => {
+            Some(SshConnectionStatus::Authenticating | SshConnectionStatus::Connected)
+                if can_reveal =>
+            {
                 self.reveal_remote_connect(view_id, generation);
             }
             Some(SshConnectionStatus::Failed(message)) => {

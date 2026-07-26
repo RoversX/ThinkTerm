@@ -4,7 +4,8 @@ use crate::termwindow::content_view::{ContentView, ContentViewResponse, RemoteCo
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::TermWindow;
 use crate::ui::{
-    rect, ControlState, DrawContext, InteractionState, UiContext, UiPalette, WidgetKind,
+    draw_scrollbar, rect, wheel_delta_pixels, ControlState, DrawContext, InteractionState,
+    ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads::{self, ThreadConnectionState};
 use mux::Mux;
@@ -48,6 +49,9 @@ pub(crate) struct RemoteThreadView {
     phase: ViewPhase,
     widgets: UiContext<RemoteThreadAction>,
     interaction: InteractionState<RemoteThreadAction>,
+    scroll: ScrollState,
+    /// UI scale captured at paint time; mouse handlers get no `DrawContext`.
+    last_ui_scale: f32,
 }
 
 struct RemoteThreadSnapshot {
@@ -69,6 +73,8 @@ impl RemoteThreadView {
             phase: ViewPhase::Idle,
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
+            scroll: ScrollState::new(),
+            last_ui_scale: 1.0,
         }
     }
 
@@ -105,6 +111,7 @@ impl RemoteThreadView {
         title_font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
         self.widgets.clear();
+        self.last_ui_scale = ctx.scale();
         ctx.draw_rect(
             layers,
             0,
@@ -115,11 +122,30 @@ impl RemoteThreadView {
             palette.window_bg,
         )?;
 
-        let shell_w = (area.size.width - PAD * 2.0).min(CONTENT_MAX_W).max(0.0);
-        let x = area.origin.x + ((area.size.width - shell_w) / 2.0).max(PAD);
-        let mut y = area.origin.y + (area.size.height * 0.12).clamp(PAD, 112.0);
+        let pad = ctx.px(PAD);
+        let shell_w = (area.size.width - pad * 2.0)
+            .min(ctx.px(CONTENT_MAX_W))
+            .max(0.0);
+        let x = area.origin.x + ((area.size.width - shell_w) / 2.0).max(pad);
         let width = shell_w;
-        let line_h = (ctx.metrics.cell_size.height as f32 + 8.0).max(34.0);
+        // cell_size already tracks the window DPI; only the padding and the
+        // floor are design pixels.
+        let line_h = (ctx.metrics.cell_size.height as f32 + ctx.px(8.0)).max(ctx.px(34.0));
+
+        // Lay the stack out first so the scroll extents are known before
+        // anything is drawn.
+        let top_margin = (area.size.height * 0.12).clamp(pad, ctx.px(112.0));
+        let hero_h = ctx.px(112.0);
+        let info_h = ctx.px(214.0);
+        let info_gap = ctx.px(22.0);
+        let note_h = line_h * 2.0 + ctx.px(34.0);
+        let note_gap = ctx.px(28.0);
+        let button_h = (line_h + ctx.px(22.0)).max(ctx.px(BUTTON_MIN_H));
+        let content_h =
+            top_margin + hero_h + info_h + info_gap + note_h + note_gap + button_h + pad;
+        self.scroll.set_extents(area.size.height, content_h);
+
+        let mut y = area.origin.y + top_margin - self.scroll.offset;
 
         let is_error =
             matches!(self.phase, ViewPhase::Failed { .. }) || self.stale_message.is_some();
@@ -128,31 +154,32 @@ impl RemoteThreadView {
         } else {
             SvgIcon::Server
         };
+        let hero_icon_size = ctx.px(HERO_ICON_SIZE);
         ctx.draw_rounded_frame(
             layers,
             0,
             x,
-            y + 4.0,
-            HERO_ICON_SIZE,
-            HERO_ICON_SIZE,
+            y + ctx.px(4.0),
+            hero_icon_size,
+            hero_icon_size,
             palette.control_bg,
             palette.control_border,
-            20.0,
+            ctx.px(20.0),
         )?;
         ctx.draw_svg_icon(
             layers,
             hero_icon,
-            x + 18.0,
-            y + 22.0,
-            28.0,
+            x + ctx.px(18.0),
+            y + ctx.px(22.0),
+            ctx.px(28.0),
             if is_error {
                 palette.secondary_text
             } else {
                 palette.text
             },
         )?;
-        let hero_text_x = x + HERO_ICON_SIZE + 22.0;
-        let hero_text_w = (width - HERO_ICON_SIZE - 22.0).max(0.0);
+        let hero_text_x = x + hero_icon_size + ctx.px(22.0);
+        let hero_text_w = (width - hero_icon_size - ctx.px(22.0)).max(0.0);
         ctx.draw_text(
             layers,
             title_font,
@@ -175,23 +202,46 @@ impl RemoteThreadView {
             layers,
             font,
             hero_text_x,
-            y + line_h + 16.0,
+            y + line_h + ctx.px(16.0),
             &status,
             palette.muted_text,
             hero_text_w,
         )?;
-        y += 112.0;
+        y += hero_h;
 
-        let info_h = 214.0;
         self.paint_info_panel(ctx, layers, font, palette, x, y, width, info_h, line_h)?;
-        y += info_h + 22.0;
+        y += info_h + info_gap;
 
-        let note_h = line_h * 2.0 + 34.0;
         self.paint_status_panel(ctx, layers, font, palette, x, y, width, note_h, line_h)?;
-        y += note_h + 28.0;
+        y += note_h + note_gap;
 
-        let button_h = (line_h + 22.0).max(BUTTON_MIN_H);
         self.paint_phase_buttons(ctx, layers, font, palette, x, y, button_h)?;
+
+        // Nothing here can clip, so scrolled-away content would bleed into the
+        // window chrome above. Repaint that strip in the chrome colour; the
+        // tab bar / window buttons are drawn after content views and land on
+        // top of it again.
+        if self.scroll.offset > 0.0 && area.origin.y > 0.0 {
+            ctx.draw_rect(
+                layers,
+                2,
+                area.origin.x,
+                0.0,
+                area.size.width,
+                area.origin.y,
+                palette.sidebar_bg,
+            )?;
+        }
+        if self.scroll.has_overflow() {
+            draw_scrollbar(
+                ctx,
+                layers,
+                palette,
+                UiTokens::for_dpi(ctx.dimensions.dpi),
+                area,
+                self.scroll,
+            )?;
+        }
 
         Ok(())
     }
@@ -218,27 +268,27 @@ impl RemoteThreadView {
             height,
             palette.control_bg,
             palette.control_border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
-        let pad = 24.0;
+        let pad = ctx.px(24.0);
         ctx.draw_text(
             layers,
             font,
             x + pad,
-            y + 22.0,
+            y + ctx.px(22.0),
             "Connection",
             palette.text,
             width - pad * 2.0,
         )?;
-        let row_y = y + 70.0;
-        let label_w = (width * 0.32).clamp(118.0, 168.0);
+        let row_y = y + ctx.px(70.0);
+        let label_w = (width * 0.32).clamp(ctx.px(118.0), ctx.px(168.0));
         let details = [
             ("Project", self.state.project_name.as_str()),
             ("Endpoint", self.endpoint.as_str()),
             ("Thread", self.state.thread_name.as_str()),
         ];
         for (idx, (label, value)) in details.iter().enumerate() {
-            let y = row_y + idx as f32 * (line_h + 6.0);
+            let y = row_y + idx as f32 * (line_h + ctx.px(6.0));
             ctx.draw_text(layers, font, x + pad, y, label, palette.muted_text, label_w)?;
             ctx.draw_text(
                 layers,
@@ -275,9 +325,9 @@ impl RemoteThreadView {
             height,
             palette.control_bg,
             palette.control_border,
-            CARD_RADIUS,
+            ctx.px(CARD_RADIUS),
         )?;
-        let pad = 20.0;
+        let pad = ctx.px(20.0);
         let text_w = width - pad * 2.0;
         let (line_one, line_two) = match &self.phase {
             ViewPhase::Connecting { started } => {
@@ -316,7 +366,7 @@ impl RemoteThreadView {
             layers,
             font,
             x + pad,
-            y + 16.0,
+            y + ctx.px(16.0),
             &line_one,
             palette.text,
             text_w,
@@ -325,7 +375,7 @@ impl RemoteThreadView {
             layers,
             font,
             x + pad,
-            y + 16.0 + line_h,
+            y + ctx.px(16.0) + line_h,
             &line_two,
             palette.muted_text,
             text_w,
@@ -389,7 +439,7 @@ impl RemoteThreadView {
         };
         let mut bx = x;
         for (label, icon, action, primary, enabled) in buttons {
-            let w = (ctx.measure_text_width(font, label) + 92.0).max(168.0);
+            let w = (ctx.measure_text_width(font, label) + ctx.px(92.0)).max(ctx.px(168.0));
             self.paint_action_button(
                 ctx,
                 layers,
@@ -402,7 +452,7 @@ impl RemoteThreadView {
                 primary,
                 enabled,
             )?;
-            bx += w + 16.0;
+            bx += w + ctx.px(16.0);
         }
         Ok(())
     }
@@ -446,13 +496,13 @@ impl RemoteThreadView {
             area.size.height,
             bg,
             border,
-            BUTTON_RADIUS,
+            ctx.px(BUTTON_RADIUS),
         )?;
-        let icon_size = 22.0;
-        let icon_x = area.origin.x + 18.0;
+        let icon_size = ctx.px(22.0);
+        let icon_x = area.origin.x + ctx.px(18.0);
         let icon_y = area.origin.y + (area.size.height - icon_size) / 2.0;
         ctx.draw_svg_icon(layers, icon, icon_x, icon_y, icon_size, text)?;
-        let text_x = icon_x + icon_size + 12.0;
+        let text_x = icon_x + icon_size + ctx.px(12.0);
         ctx.draw_text(
             layers,
             font,
@@ -460,7 +510,7 @@ impl RemoteThreadView {
             Self::centered_text_y(ctx, area),
             label,
             text,
-            area.size.width - (text_x - area.origin.x) - 16.0,
+            area.size.width - (text_x - area.origin.x) - ctx.px(16.0),
         )?;
         Ok(())
     }
@@ -468,6 +518,16 @@ impl RemoteThreadView {
     fn on_mouse_impl(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         let hit = self.widgets.hit_test(x, y).map(|target| target.action);
         match kind {
+            WMEK::VertWheel(amount) => {
+                let old = self.scroll.offset;
+                self.scroll
+                    .scroll_by(wheel_delta_pixels(amount, self.last_ui_scale));
+                if (self.scroll.offset - old).abs() > 0.01 {
+                    ContentViewResponse::Redraw
+                } else {
+                    ContentViewResponse::Ignored
+                }
+            }
             WMEK::Move => {
                 if self.interaction.hovered != hit {
                     self.interaction.hovered = hit;

@@ -235,8 +235,11 @@ pub fn estimate_shaped_entry_bytes(key: &ShapeCacheKey, value: &UiShapedValue) -
         .saturating_add(key.text.capacity())
         .saturating_add(estimate_text_style_heap_bytes(&key.style));
     let value_bytes = match value {
-        Ok(shaped) => std::mem::size_of::<Vec<ShapedInfo>>()
-            .saturating_add(shaped.capacity().saturating_mul(std::mem::size_of::<ShapedInfo>())),
+        Ok(shaped) => std::mem::size_of::<Vec<ShapedInfo>>().saturating_add(
+            shaped
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ShapedInfo>()),
+        ),
         Err(_) => SHAPE_ERR_ENTRY_BYTES,
     };
     SHAPE_ENTRY_FIXED_OVERHEAD
@@ -478,13 +481,9 @@ mod ui_shape_cache_tests {
         let mut caches = caches();
         let chrome = caches.domain_mut(UiTextDomain::Chrome);
         let probe = key("label");
-        assert!(chrome
-            .get(&probe as &dyn ShapeCacheKeyTrait)
-            .is_none());
+        assert!(chrome.get(&probe as &dyn ShapeCacheKeyTrait).is_none());
         chrome.put(key("label"), Ok(Rc::new(vec![])));
-        assert!(chrome
-            .get(&probe as &dyn ShapeCacheKeyTrait)
-            .is_some());
+        assert!(chrome.get(&probe as &dyn ShapeCacheKeyTrait).is_some());
         let stats = chrome.stats();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 1);

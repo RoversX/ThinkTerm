@@ -10,9 +10,10 @@ use crate::termwindow::content_view::{ContentView, ContentViewResponse};
 use crate::termwindow::ui::icons::{distro_to_icon, SvgIcon};
 use crate::termwindow::TermWindow;
 use crate::ui::{
-    draw_button, draw_icon_button, draw_scrollbar, draw_text_input, draw_toggle, rect,
-    wheel_delta_pixels, ButtonSpec, ControlState, DrawContext, InteractionState, ScrollState,
-    TextInputSpec, UiContext, UiPalette, UiTokens, WidgetKind,
+    char_index_for_x, contains, draw_button, draw_icon_button, draw_scrollbar, draw_text_input,
+    draw_toggle, rect, text_width_to_char, wheel_delta_pixels, ButtonSpec, ControlState,
+    DrawContext, EditModifiers, InputCaret, InteractionState, ScrollState, TextInputSpec,
+    TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads;
 use std::rc::Rc;
@@ -41,6 +42,59 @@ const FIELD_LABELS: [&str; BASE_FIELD_COUNT] = [
     "Password",
     "Identity file",
     "Workspace",
+];
+
+/// Heading emitted before the field at the given index, so the form reads as
+/// Connection / Authentication / Session rather than one flat column.
+/// Where focus lands when the Advanced section is collapsed. Rows inside it
+/// stop being drawn, so a focus still pointing at one would silently edit an
+/// invisible field; anything else keeps its place.
+fn focus_after_collapsing_advanced(focus: Focus) -> Focus {
+    match focus {
+        Focus::OptionKey(_) | Focus::OptionValue(_) => Focus::Field(FIELD_HOST),
+        other => other,
+    }
+}
+
+/// Tab order: the regular fields, then each visible `ssh_options` row as a
+/// key/value pair.
+fn tab_stops_for(form: &HostForm) -> Vec<Focus> {
+    let mut stops: Vec<Focus> = (0..SshHostsView::visible_field_count(form))
+        .map(Focus::Field)
+        .collect();
+    if form.advanced_open {
+        for index in 0..form.options.len() {
+            stops.push(Focus::OptionKey(index));
+            stops.push(Focus::OptionValue(index));
+        }
+    }
+    stops
+}
+
+/// Collapse the edited rows into the map the ssh layer consumes. Rows whose
+/// key is blank are still being typed and are dropped rather than written as a
+/// nameless option.
+fn ssh_options_from_rows(
+    rows: &[(TextInputState, TextInputState)],
+) -> std::collections::HashMap<String, String> {
+    rows.iter()
+        .filter_map(|(key, value)| {
+            let key = key.text().trim();
+            (!key.is_empty()).then(|| (key.to_string(), value.text().trim().to_string()))
+        })
+        .collect()
+}
+
+fn text_input_with(text: String) -> TextInputState {
+    let mut input = TextInputState::new();
+    input.set_text_end(text);
+    input
+}
+
+const FIELD_GROUP_HEADINGS: [(usize, &str); 3] = [
+    (FIELD_NAME, "Connection"),
+    (FIELD_PASSWORD, "Authentication"),
+    (FIELD_WORKSPACE, "Session"),
 ];
 
 const PAD: f32 = 20.0;
@@ -78,19 +132,33 @@ enum SshViewAction {
     Cancel,
     ToggleSystemHosts,
     ResizeLeftPane,
+    ToggleAdvanced,
+    FocusOptionKey(usize),
+    FocusOptionValue(usize),
+    RemoveOption(usize),
+    AddOption,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Search,
     Field(usize),
+    /// `ssh_options` row `n`, key column.
+    OptionKey(usize),
+    /// `ssh_options` row `n`, value column.
+    OptionValue(usize),
 }
 
 #[derive(Default, Clone)]
 struct HostForm {
     editing: Option<String>,
     original: Option<SshHostSpec>,
-    fields: [String; FIELD_COUNT],
+    fields: [TextInputState; FIELD_COUNT],
+    /// Free-form `ssh_config` overrides, edited as key/value rows. Kept as a
+    /// Vec (not a map) so a half-typed key does not collide or reorder while
+    /// the user is still typing.
+    options: Vec<(TextInputState, TextInputState)>,
+    advanced_open: bool,
     detect_os: bool,
     use_mosh: bool,
     multiplexing: bool,
@@ -98,7 +166,7 @@ struct HostForm {
 }
 
 pub(crate) struct SshHostsView {
-    search: String,
+    search: TextInputState,
     selected: usize,
     focus: Focus,
     form: Option<HostForm>,
@@ -114,8 +182,18 @@ pub(crate) struct SshHostsView {
     /// can convert pointer pixels back into design pixels.
     last_ui_scale: f32,
     list_area: RectF,
-    /// When true the focused field is "select-all"; the next edit replaces it.
-    select_all: bool,
+    /// Absolute x of a click that should become a caret position. Mouse
+    /// handlers have no `DrawContext`, so glyph measurement is deferred to the
+    /// next paint, which knows the font and the field's text origin.
+    pending_caret_click: Option<(Focus, f32)>,
+    /// Independent scroll for the right-hand form column; the left host list
+    /// has its own `scroll`.
+    form_scroll: ScrollState,
+    /// Height the form needed on the previous frame. Immediate-mode layout
+    /// only learns it after drawing, so extents lag by one frame and settle.
+    form_content_h: f32,
+    /// Bounds of the form column, remembered for wheel hit-testing.
+    form_area: RectF,
     widgets: UiContext<SshViewAction>,
     interaction: InteractionState<SshViewAction>,
     scroll: ScrollState,
@@ -124,7 +202,7 @@ pub(crate) struct SshHostsView {
 impl SshHostsView {
     pub(crate) fn new() -> Self {
         let mut view = Self {
-            search: String::new(),
+            search: TextInputState::new(),
             selected: 0,
             focus: Focus::Search,
             form: None,
@@ -137,7 +215,10 @@ impl SshHostsView {
             last_area_w: 0.0,
             last_ui_scale: 1.0,
             list_area: rect(0.0, 0.0, 0.0, 0.0),
-            select_all: false,
+            pending_caret_click: None,
+            form_scroll: ScrollState::new(),
+            form_content_h: 0.0,
+            form_area: rect(0.0, 0.0, 0.0, 0.0),
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
             scroll: ScrollState::new(),
@@ -147,7 +228,7 @@ impl SshHostsView {
     }
 
     fn refresh(&mut self) {
-        let needle = self.search.trim().to_ascii_lowercase();
+        let needle = self.search.text().trim().to_ascii_lowercase();
         let show_system_hosts = !self.system_hosts_collapsed || !needle.is_empty();
         self.system_host_count = 0;
         self.filtered = ssh_hosts::list_all_hosts()
@@ -193,11 +274,13 @@ impl SshHostsView {
 
     fn open_new_form(&mut self) {
         let mut form = HostForm::default();
-        form.fields[FIELD_PORT] = "22".to_string();
-        form.fields[FIELD_MOSH_SERVER] = ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string();
+        form.fields[FIELD_PORT].set_text_end("22".to_string());
+        form.fields[FIELD_MOSH_SERVER]
+            .set_text_end(ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string());
         form.detect_os = true;
         self.form = Some(form);
         self.focus = Focus::Field(FIELD_HOST);
+        self.reset_form_scroll();
     }
 
     fn open_edit_form(&mut self, project_id: &str) {
@@ -220,36 +303,65 @@ impl SshHostsView {
         fields[FIELD_IDENTITY] = spec.identity_file.clone().unwrap_or_default();
         fields[FIELD_WORKSPACE] = spec.default_workspace.clone().unwrap_or_default();
         fields[FIELD_MOSH_SERVER] = spec.mosh_server_command.clone();
+        let fields = fields.map(|text| {
+            let mut input = TextInputState::new();
+            input.set_text_end(text);
+            input
+        });
         let detect_os = spec.detect_os;
         let use_mosh = spec.use_mosh;
         let multiplexing = spec.multiplexing;
+        // Sorted so the rows keep a stable order between opens.
+        let mut option_pairs: Vec<(String, String)> = spec
+            .ssh_options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        option_pairs.sort();
+        let options = option_pairs
+            .into_iter()
+            .map(|(key, value)| (text_input_with(key), text_input_with(value)))
+            .collect::<Vec<_>>();
+        let advanced_open = !options.is_empty();
         self.form = Some(HostForm {
             editing: Some(project_id.to_string()),
             original: Some(spec),
             fields,
+            options,
+            advanced_open,
             detect_os,
             use_mosh,
             multiplexing,
             error: None,
         });
         self.focus = Focus::Field(FIELD_HOST);
+        self.reset_form_scroll();
     }
 
     fn close_form(&mut self) {
         self.form = None;
         self.focus = Focus::Search;
+        self.reset_form_scroll();
+    }
+
+    /// A newly installed form must start at the top. `form_content_h` is the
+    /// previous frame's measurement, so it has to go too — otherwise the first
+    /// frame sizes the scroll extents from the old form's height.
+    fn reset_form_scroll(&mut self) {
+        self.form_scroll.reset();
+        self.form_content_h = 0.0;
     }
 
     /// Validate + create/update. On success returns the project id and closes
     /// the form; on error records the message and keeps the form open.
     fn persist_form(&mut self) -> Option<String> {
         let form = self.form.as_mut()?;
-        let host = form.fields[FIELD_HOST].trim().to_string();
+        let host = form.fields[FIELD_HOST].text().trim().to_string();
         if host.is_empty() {
             form.error = Some("Host is required".to_string());
             return None;
         }
-        let port = match form.fields[FIELD_PORT].trim() {
+        let port = match form.fields[FIELD_PORT].text().trim() {
             "" => None,
             value => match value.parse::<u16>() {
                 Ok(p) => Some(p),
@@ -263,7 +375,7 @@ impl SshHostsView {
             let t = s.trim();
             (!t.is_empty()).then(|| t.to_string())
         };
-        let label = opt(&form.fields[FIELD_NAME]).unwrap_or_else(|| host.clone());
+        let label = opt(&form.fields[FIELD_NAME].text()).unwrap_or_else(|| host.clone());
 
         let mut spec = form.original.clone().unwrap_or_else(|| SshHostSpec {
             label: label.clone(),
@@ -283,10 +395,10 @@ impl SshHostsView {
         spec.label = label;
         spec.host = host;
         spec.port = port;
-        spec.username = opt(&form.fields[FIELD_USER]);
+        spec.username = opt(&form.fields[FIELD_USER].text());
         // Encrypt the password before it is persisted to ssh_hosts.json. Never
         // fall back to plaintext: if encryption fails, keep the form open.
-        spec.password = match opt(&form.fields[FIELD_PASSWORD]) {
+        spec.password = match opt(&form.fields[FIELD_PASSWORD].text()) {
             Some(password) => match crate::secret::encrypt(&password) {
                 Ok(encrypted) => Some(encrypted),
                 Err(err) => {
@@ -297,12 +409,15 @@ impl SshHostsView {
             },
             None => None,
         };
-        spec.identity_file = opt(&form.fields[FIELD_IDENTITY]);
-        spec.default_workspace = opt(&form.fields[FIELD_WORKSPACE]);
+        spec.identity_file = opt(&form.fields[FIELD_IDENTITY].text());
+        spec.default_workspace = opt(&form.fields[FIELD_WORKSPACE].text());
+        // Rows with an empty key are still being typed; drop them rather than
+        // writing a nameless option the ssh layer would ignore.
+        spec.ssh_options = ssh_options_from_rows(&form.options);
         spec.detect_os = form.detect_os;
         spec.use_mosh = form.use_mosh;
         spec.multiplexing = form.multiplexing;
-        let mosh_server_command = form.fields[FIELD_MOSH_SERVER].trim();
+        let mosh_server_command = form.fields[FIELD_MOSH_SERVER].text().trim();
         if spec.use_mosh && mosh_server_command.is_empty() {
             form.error = Some("Mosh server command is required".to_string());
             return None;
@@ -344,14 +459,20 @@ impl SshHostsView {
         let hit = self.widgets.hit_test(x, y).map(|t| t.action);
         match kind {
             WMEK::VertWheel(amount) => {
-                if self.point_in_host_list(x, y) {
-                    let old = self.scroll.offset;
-                    self.scroll.scroll_by(wheel_delta_pixels(amount));
-                    if (self.scroll.offset - old).abs() > 0.01 {
-                        ContentViewResponse::Redraw
-                    } else {
-                        ContentViewResponse::Ignored
-                    }
+                let scroll = if self.point_in_host_list(x, y) {
+                    Some(&mut self.scroll)
+                } else if contains(self.form_area, x, y) {
+                    Some(&mut self.form_scroll)
+                } else {
+                    None
+                };
+                let Some(scroll) = scroll else {
+                    return ContentViewResponse::Ignored;
+                };
+                let old = scroll.offset;
+                scroll.scroll_by(wheel_delta_pixels(amount, self.last_ui_scale));
+                if (scroll.offset - old).abs() > 0.01 {
+                    ContentViewResponse::Redraw
                 } else {
                     ContentViewResponse::Ignored
                 }
@@ -359,11 +480,10 @@ impl SshHostsView {
             WMEK::Move => {
                 if self.dragging_left_pane {
                     let scale = self.last_ui_scale.max(0.01);
-                    self.left_width =
-                        Self::clamp_left_width(
-                            (x - self.last_area_x) / scale,
-                            self.last_area_w / scale,
-                        );
+                    self.left_width = Self::clamp_left_width(
+                        (x - self.last_area_x) / scale,
+                        self.last_area_w / scale,
+                    );
                     return ContentViewResponse::Redraw;
                 }
                 if self.interaction.hovered != hit {
@@ -389,6 +509,13 @@ impl SshHostsView {
                 let pressed = self.interaction.pressed.take();
                 if let (Some(a), Some(b)) = (hit, pressed) {
                     if a == b {
+                        self.pending_caret_click = match a {
+                            SshViewAction::Search => Some((Focus::Search, x)),
+                            SshViewAction::FocusField(n) => Some((Focus::Field(n), x)),
+                            SshViewAction::FocusOptionKey(n) => Some((Focus::OptionKey(n), x)),
+                            SshViewAction::FocusOptionValue(n) => Some((Focus::OptionValue(n), x)),
+                            _ => None,
+                        };
                         return self.apply(a);
                     }
                 }
@@ -406,10 +533,50 @@ impl SshHostsView {
     }
 
     fn apply(&mut self, action: SshViewAction) -> ContentViewResponse {
-        self.select_all = false;
+        self.clear_focused_selection();
         match action {
             SshViewAction::Search => {
                 self.focus = Focus::Search;
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::ToggleAdvanced => {
+                if let Some(form) = self.form.as_mut() {
+                    form.advanced_open = !form.advanced_open;
+                    if !form.advanced_open {
+                        // Leaving focus on a row that is no longer drawn would
+                        // let the next keystroke edit an invisible field.
+                        self.focus = focus_after_collapsing_advanced(self.focus);
+                    }
+                }
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::FocusOptionKey(n) => {
+                self.focus = Focus::OptionKey(n);
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::FocusOptionValue(n) => {
+                self.focus = Focus::OptionValue(n);
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::AddOption => {
+                if let Some(form) = self.form.as_mut() {
+                    form.advanced_open = true;
+                    form.options
+                        .push((TextInputState::new(), TextInputState::new()));
+                    self.focus = Focus::OptionKey(form.options.len() - 1);
+                }
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::RemoveOption(n) => {
+                if let Some(form) = self.form.as_mut() {
+                    if n < form.options.len() {
+                        form.options.remove(n);
+                    }
+                }
+                // The removed row's index would now point at its neighbour.
+                if matches!(self.focus, Focus::OptionKey(_) | Focus::OptionValue(_)) {
+                    self.focus = Focus::Field(FIELD_HOST);
+                }
                 ContentViewResponse::Redraw
             }
             SshViewAction::New => {
@@ -462,9 +629,9 @@ impl SshHostsView {
                         // transports; only one can drive the connection.
                         form.multiplexing = false;
                     }
-                    if form.use_mosh && form.fields[FIELD_MOSH_SERVER].trim().is_empty() {
-                        form.fields[FIELD_MOSH_SERVER] =
-                            ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string();
+                    if form.use_mosh && form.fields[FIELD_MOSH_SERVER].text().trim().is_empty() {
+                        form.fields[FIELD_MOSH_SERVER]
+                            .set_text_end(ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string());
                     }
                     if !form.use_mosh && self.focus == Focus::Field(FIELD_MOSH_SERVER) {
                         self.focus = Focus::Field(FIELD_WORKSPACE);
@@ -510,6 +677,14 @@ impl SshHostsView {
     }
 
     fn on_key_impl(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse {
+        // Up/Down drive the host list, so they must reach the navigation match
+        // below even while a field has focus.
+        if !matches!(key, KeyCode::UpArrow | KeyCode::DownArrow) {
+            if let Some(response) = self.handle_text_editing_key(key, mods) {
+                return response;
+            }
+        }
+
         let in_form = self.form.is_some();
         match (key, mods) {
             (KeyCode::Escape, _) => {
@@ -548,107 +723,260 @@ impl SshHostsView {
                 }
                 ContentViewResponse::Redraw
             }
-            // Select-all of the focused field (⌘A): next edit replaces it.
-            (KeyCode::Char('a'), m) if m.contains(KeyModifiers::SUPER) => {
-                self.select_all = true;
-                ContentViewResponse::Redraw
-            }
-            (KeyCode::Backspace, _) => {
-                if self.select_all {
-                    self.clear_focused();
-                    self.select_all = false;
-                } else {
-                    self.edit_focused(|s| {
-                        s.pop();
-                    });
-                }
-                ContentViewResponse::Redraw
-            }
-            (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
-                if self.select_all {
-                    self.clear_focused();
-                    self.select_all = false;
-                }
-                self.edit_focused(|s| s.push(c));
-                if matches!(self.focus, Focus::Search) {
-                    self.selected = 0;
-                    self.refresh();
-                }
-                ContentViewResponse::Redraw
-            }
             _ => ContentViewResponse::Ignored,
+        }
+    }
+
+    /// Text-editing keys shared by the search box and every form field.
+    /// Returns `None` when the key is not an editing key, so the caller falls
+    /// through to view-level navigation (Tab / Enter / Escape / list arrows).
+    ///
+    /// Chords are resolved through [`EditModifiers`] rather than testing raw
+    /// modifiers, so ⌘ on macOS and Ctrl on Windows/Linux behave identically.
+    fn handle_text_editing_key(
+        &mut self,
+        key: KeyCode,
+        mods: KeyModifiers,
+    ) -> Option<ContentViewResponse> {
+        let edit = EditModifiers::from(mods);
+        let shift = edit.shift;
+        let macos = cfg!(target_os = "macos");
+
+        if edit.command {
+            match key {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.edit_focused(|input| input.caret_select_all());
+                    return Some(ContentViewResponse::Redraw);
+                }
+                // Clipboard lives on TermWindow (it owns the window handle), so
+                // hand the work back rather than duplicating it here.
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    return Some(ContentViewResponse::Run(Box::new(|term_window| {
+                        term_window.content_view_copy()
+                    })));
+                }
+                KeyCode::Char('x') | KeyCode::Char('X') => {
+                    return Some(ContentViewResponse::Run(Box::new(|term_window| {
+                        term_window.content_view_cut()
+                    })));
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    return Some(ContentViewResponse::Run(Box::new(|term_window| {
+                        term_window.content_view_paste()
+                    })));
+                }
+                // ⌘←/→/⌫ are line-start/end/delete-to-start on macOS. Elsewhere
+                // the same physical chord is the word modifier, handled below.
+                KeyCode::LeftArrow if macos => {
+                    self.edit_focused(|input| input.caret_move_home(shift));
+                    return Some(ContentViewResponse::Redraw);
+                }
+                KeyCode::RightArrow if macos => {
+                    self.edit_focused(|input| input.caret_move_end(shift));
+                    return Some(ContentViewResponse::Redraw);
+                }
+                KeyCode::Backspace if macos => {
+                    self.edit_focused(|input| input.caret_delete_to_start());
+                    return Some(ContentViewResponse::Redraw);
+                }
+                _ => {}
+            }
+        }
+
+        if edit.word {
+            match key {
+                KeyCode::LeftArrow => {
+                    self.edit_focused(|input| input.caret_word_left(shift));
+                    return Some(ContentViewResponse::Redraw);
+                }
+                KeyCode::RightArrow => {
+                    self.edit_focused(|input| input.caret_word_right(shift));
+                    return Some(ContentViewResponse::Redraw);
+                }
+                KeyCode::Backspace => {
+                    self.edit_focused(|input| input.caret_delete_word_back());
+                    return Some(ContentViewResponse::Redraw);
+                }
+                _ => {}
+            }
+        }
+
+        if !edit.plain() {
+            return None;
+        }
+
+        match key {
+            KeyCode::LeftArrow => {
+                self.edit_focused(|input| input.caret_move_left(shift));
+                Some(ContentViewResponse::Redraw)
+            }
+            KeyCode::RightArrow => {
+                self.edit_focused(|input| input.caret_move_right(shift));
+                Some(ContentViewResponse::Redraw)
+            }
+            KeyCode::Home => {
+                self.edit_focused(|input| input.caret_move_home(shift));
+                Some(ContentViewResponse::Redraw)
+            }
+            KeyCode::End => {
+                self.edit_focused(|input| input.caret_move_end(shift));
+                Some(ContentViewResponse::Redraw)
+            }
+            KeyCode::Backspace => {
+                self.edit_focused(|input| input.caret_backspace());
+                Some(ContentViewResponse::Redraw)
+            }
+            KeyCode::Delete => {
+                self.edit_focused(|input| input.caret_delete_forward());
+                Some(ContentViewResponse::Redraw)
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.edit_focused(|input| input.caret_insert(&c.to_string(), false));
+                Some(ContentViewResponse::Redraw)
+            }
+            _ => None,
         }
     }
 
     fn on_paste_impl(&mut self, text: &str) -> ContentViewResponse {
         let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
-        if self.select_all {
-            self.clear_focused();
-            self.select_all = false;
-        }
-        self.edit_focused(|s| s.push_str(&cleaned));
-        if matches!(self.focus, Focus::Search) {
-            self.selected = 0;
-            self.refresh();
-        }
+        self.edit_focused(|input| input.caret_insert(&cleaned, false));
         ContentViewResponse::Redraw
     }
 
+    /// Tab order: the regular fields, then each visible `ssh_options` row as a
+    /// key/value pair. Wraps in both directions.
+    fn form_tab_stops(&self) -> Vec<Focus> {
+        self.form.as_ref().map(tab_stops_for).unwrap_or_default()
+    }
+
     fn step_field(&mut self, delta: isize) {
-        self.select_all = false;
-        if let Focus::Field(n) = self.focus {
-            let count = self
-                .form
-                .as_ref()
-                .map(Self::visible_field_count)
-                .unwrap_or(BASE_FIELD_COUNT);
-            let next = (n.min(count - 1) as isize + delta).rem_euclid(count as isize) as usize;
-            self.focus = Focus::Field(next);
-        } else {
+        self.clear_focused_selection();
+        let stops = self.form_tab_stops();
+        if stops.is_empty() {
             self.focus = Focus::Field(FIELD_HOST);
+            return;
+        }
+        let current = stops.iter().position(|stop| *stop == self.focus);
+        self.focus = match current {
+            Some(index) => {
+                let next = (index as isize + delta).rem_euclid(stops.len() as isize) as usize;
+                stops[next]
+            }
+            // Coming from the search box (or a row that just disappeared).
+            None => Focus::Field(FIELD_HOST),
+        };
+    }
+
+    /// Turn a recorded click into a caret position now that a `DrawContext`
+    /// and the field's laid-out text origin are available. `text` is what is
+    /// actually drawn (the password field passes its mask, which is one glyph
+    /// per character, so indices still line up).
+    fn resolve_pending_caret_click(
+        &mut self,
+        ctx: &DrawContext,
+        font: &Rc<LoadedFont>,
+        focus: Focus,
+        text: &str,
+        text_left: f32,
+    ) {
+        let Some((target, x)) = self.pending_caret_click else {
+            return;
+        };
+        if target != focus {
+            return;
+        }
+        self.pending_caret_click = None;
+        let index = char_index_for_x(ctx, font, text, x - text_left);
+        if let Some(input) = self.focused_input_mut() {
+            input.caret_set(index, false);
         }
     }
 
-    fn edit_focused(&mut self, f: impl FnOnce(&mut String)) {
+    fn clear_focused_selection(&mut self) {
+        if let Some(input) = self.focused_input_mut() {
+            input.clear_selection();
+        }
+    }
+
+    /// Caret + selection to render for `focus`, or `None` when that field is
+    /// not the focused one (an unfocused field never shows a caret).
+    fn caret_for(&self, focus: Focus) -> Option<InputCaret> {
+        if self.focus != focus {
+            return None;
+        }
+        let input = self.focused_input()?;
+        Some(InputCaret {
+            cursor: input.cursor,
+            selection: input.caret_selection_range(),
+        })
+    }
+
+    fn focused_input(&self) -> Option<&TextInputState> {
         match self.focus {
-            Focus::Search => f(&mut self.search),
-            Focus::Field(n) => {
-                if let Some(form) = self.form.as_mut() {
-                    if n >= FIELD_COUNT {
-                        return;
-                    }
-                    form.error = None;
-                    f(&mut form.fields[n]);
-                }
+            Focus::Search => Some(&self.search),
+            Focus::Field(n) => self.form.as_ref()?.fields.get(n),
+            Focus::OptionKey(n) => {
+                let form = self.form.as_ref()?;
+                form.advanced_open
+                    .then(|| form.options.get(n).map(|(key, _)| key))
+                    .flatten()
+            }
+            Focus::OptionValue(n) => {
+                let form = self.form.as_ref()?;
+                form.advanced_open
+                    .then(|| form.options.get(n).map(|(_, value)| value))
+                    .flatten()
             }
         }
     }
 
-    fn clear_focused(&mut self) {
-        self.edit_focused(|s| s.clear());
-    }
-
-    fn take_focused_selection(&mut self) -> Option<String> {
-        if !self.select_all {
-            return None;
-        }
-        self.select_all = false;
-        let text = match self.focus {
-            Focus::Search => std::mem::take(&mut self.search),
+    /// Mutable access to whatever field currently has focus. Clears the form's
+    /// error banner, since any edit invalidates the last validation result.
+    fn focused_input_mut(&mut self) -> Option<&mut TextInputState> {
+        match self.focus {
+            Focus::Search => Some(&mut self.search),
             Focus::Field(n) => {
                 let form = self.form.as_mut()?;
-                if n >= FIELD_COUNT {
+                form.error = None;
+                form.fields.get_mut(n)
+            }
+            Focus::OptionKey(n) => {
+                let form = self.form.as_mut()?;
+                if !form.advanced_open {
                     return None;
                 }
                 form.error = None;
-                std::mem::take(&mut form.fields[n])
+                form.options.get_mut(n).map(|(key, _)| key)
             }
+            Focus::OptionValue(n) => {
+                let form = self.form.as_mut()?;
+                if !form.advanced_open {
+                    return None;
+                }
+                form.error = None;
+                form.options.get_mut(n).map(|(_, value)| value)
+            }
+        }
+    }
+
+    /// Run `f` against the focused field, then re-filter the host list if the
+    /// search box was the one edited.
+    fn edit_focused(&mut self, f: impl FnOnce(&mut TextInputState)) {
+        let Some(input) = self.focused_input_mut() else {
+            return;
         };
+        f(input);
         if matches!(self.focus, Focus::Search) {
             self.selected = 0;
             self.refresh();
         }
-        (!text.is_empty()).then_some(text)
+    }
+
+    fn take_focused_selection(&mut self) -> Option<String> {
+        let mut taken = None;
+        self.edit_focused(|input| taken = input.caret_take_selected_text());
+        taken
     }
 
     // ---- paint ------------------------------------------------------------
@@ -719,7 +1047,7 @@ impl SshHostsView {
                 .filter(|entry| entry.source == SshHostSource::ThinkTerm)
                 .count();
             let visible_system_count =
-                if !self.system_hosts_collapsed || !self.search.trim().is_empty() {
+                if !self.system_hosts_collapsed || !self.search.text().trim().is_empty() {
                     filtered
                         .iter()
                         .filter(|entry| entry.source == SshHostSource::System)
@@ -783,7 +1111,7 @@ impl SshHostsView {
                     )?;
                     row_y += ctx.px(GROUP_ROW_H + 10.0);
                 }
-                if !self.system_hosts_collapsed || !self.search.trim().is_empty() {
+                if !self.system_hosts_collapsed || !self.search.text().trim().is_empty() {
                     for (i, entry) in filtered
                         .iter()
                         .enumerate()
@@ -881,6 +1209,7 @@ impl SshHostsView {
         );
 
         if self.form.is_some() {
+            let form_top = oy + ctx.px(PAD);
             self.paint_form(
                 ctx,
                 layers,
@@ -889,8 +1218,9 @@ impl SshHostsView {
                 tokens,
                 cursor_on,
                 right_x,
-                oy + ctx.px(PAD),
+                form_top,
                 right_w,
+                (oy + h) - form_top,
             )?;
         } else {
             ctx.draw_text(
@@ -960,23 +1290,38 @@ impl SshHostsView {
             tokens.control_radius,
         )?;
 
+        // Hand-rolled rather than `draw_text_input` because this box sits on
+        // layer 2, above the list's scroll fade. Geometry mirrors that widget,
+        // including the design-pixel conversions.
         let text_pad = ctx.px(12.0);
-        let (search_text, search_color) = if self.search.is_empty() && !search_focused {
+        let text_left = search_rect.origin.x + text_pad;
+        let text_area = (search_rect.size.width - text_pad * 2.0).max(0.0);
+        let inset_y = ctx.px(5.0);
+        let highlight_y = search_rect.origin.y + inset_y;
+        let highlight_h = (search_rect.size.height - inset_y * 2.0).max(0.0);
+        // Must run before anything borrows `self.search` for the rest of the
+        // frame, since it may move the caret.
+        let search_text_owned = self.search.text().to_string();
+        self.resolve_pending_caret_click(ctx, font, Focus::Search, &search_text_owned, text_left);
+        let (search_text, search_color) = if search_text_owned.is_empty() && !search_focused {
             ("Search hosts...", palette.muted_text)
         } else {
-            (self.search.as_str(), palette.text)
+            (search_text_owned.as_str(), palette.text)
         };
-        if search_focused && self.select_all && !self.search.is_empty() {
-            let selection_width = ctx
-                .measure_text_width(font, &self.search)
-                .min((search_rect.size.width - text_pad * 2.0).max(0.0));
+        let selection = search_focused
+            .then(|| self.search.caret_selection_range())
+            .flatten()
+            .filter(|(start, end)| start != end);
+        if let Some((start, end)) = selection {
+            let start_x = text_width_to_char(ctx, font, &search_text_owned, start).min(text_area);
+            let end_x = text_width_to_char(ctx, font, &search_text_owned, end).min(text_area);
             ctx.draw_rounded_rect(
                 layers,
                 2,
-                search_rect.origin.x + text_pad - ctx.px(4.0),
-                search_rect.origin.y + ctx.px(5.0),
-                selection_width + ctx.px(8.0),
-                search_rect.size.height - 10.0,
+                text_left + start_x - ctx.px(4.0),
+                highlight_y,
+                (end_x - start_x) + ctx.px(8.0),
+                highlight_h,
                 palette.selected_bg.mul_alpha(0.56),
                 (tokens.control_radius - ctx.px(5.0)).max(ctx.px(3.0)),
             )?;
@@ -985,25 +1330,23 @@ impl SshHostsView {
             layers,
             2,
             font,
-            search_rect.origin.x + text_pad,
+            text_left,
             Self::control_text_y(ctx, search_rect.origin.y, search_rect.size.height),
             search_text,
             search_color,
-            (search_rect.size.width - text_pad * 2.0).max(0.0),
+            text_area,
         )?;
-        if search_focused && !self.select_all && cursor_on {
-            let caret_x = search_rect.origin.x
-                + text_pad
-                + ctx
-                    .measure_text_width(font, &self.search)
-                    .min((search_rect.size.width - text_pad * 2.0).max(0.0));
+        if search_focused && selection.is_none() && cursor_on {
+            let caret_dx = text_width_to_char(ctx, font, &search_text_owned, self.search.cursor)
+                .min(text_area);
+            let caret_width = ctx.px(3.0);
             ctx.draw_rect(
                 layers,
                 2,
-                caret_x - 1.0,
-                search_rect.origin.y + ctx.px(5.0),
-                ctx.px(3.0),
-                search_rect.size.height - 10.0,
+                text_left + caret_dx - caret_width / 3.0,
+                highlight_y,
+                caret_width,
+                highlight_h,
                 palette.selected_bg,
             )?;
         }
@@ -1165,7 +1508,7 @@ impl SshHostsView {
                 10.0,
             )?;
         }
-        let icon = if self.system_hosts_collapsed && self.search.trim().is_empty() {
+        let icon = if self.system_hosts_collapsed && self.search.text().trim().is_empty() {
             SvgIcon::ChevronRight
         } else {
             SvgIcon::ChevronDown
@@ -1349,6 +1692,7 @@ impl SshHostsView {
         x: f32,
         y: f32,
         width: f32,
+        height: f32,
     ) -> anyhow::Result<()> {
         let form = self.form.as_ref().unwrap();
         let editing = form.editing.is_some();
@@ -1356,44 +1700,57 @@ impl SshHostsView {
         let use_mosh = form.use_mosh;
         let multiplexing = form.multiplexing;
         let fields = form.fields.clone();
+        let options = form.options.clone();
+        let advanced_open = form.advanced_open;
         let error = form.error.clone();
         let focus = self.focus;
+
+        // A form pinned to the left of a wide column reads badly, so cap the
+        // width and centre what is left over.
+        let field_w = width.min(ctx.px(560.0));
+        let x = x + ((width - field_w) / 2.0).max(0.0);
+        self.form_area = rect(x, y, field_w, height);
+        self.form_scroll.set_extents(height, self.form_content_h);
+        let top = y - self.form_scroll.offset;
+        let mut cur_y = top;
 
         ctx.draw_text(
             layers,
             font,
             x,
-            y,
+            cur_y,
             if editing { "Edit Host" } else { "New Host" },
             palette.text,
-            width,
+            field_w,
         )?;
+        cur_y += ctx.metrics.cell_size.height as f32 + ctx.px(18.0);
 
         let line_h = ctx.metrics.cell_size.height as f32;
-        let field_w = width.min(ctx.px(560.0));
-        let mut cur_y = y + line_h + ctx.px(18.0);
-        for i in 0..BASE_FIELD_COUNT {
-            ctx.draw_text(
-                layers,
-                font,
-                x,
-                cur_y,
-                FIELD_LABELS[i],
-                palette.muted_text,
-                field_w,
-            )?;
+        for (i, label) in FIELD_LABELS.iter().enumerate() {
+            if let Some(heading) = FIELD_GROUP_HEADINGS
+                .iter()
+                .find_map(|(at, heading)| (*at == i).then_some(*heading))
+            {
+                cur_y += ctx.px(if i == 0 { 0.0 } else { 10.0 });
+                ctx.draw_text(layers, font, x, cur_y, heading, palette.text, field_w)?;
+                cur_y += line_h + ctx.px(10.0);
+            }
+            ctx.draw_text(layers, font, x, cur_y, label, palette.muted_text, field_w)?;
             let input_y = cur_y + line_h + ctx.px(6.0);
             // Mask the password field.
             let masked = if i == FIELD_PASSWORD {
-                "•".repeat(fields[i].chars().count())
+                "•".repeat(fields[i].text().chars().count())
             } else {
                 String::new()
             };
             let shown: &str = if i == FIELD_PASSWORD {
                 &masked
             } else {
-                &fields[i]
+                &fields[i].text()
             };
+            // Resolved up front: the call below borrows `self.widgets` mutably.
+            self.resolve_pending_caret_click(ctx, font, Focus::Field(i), shown, x + ctx.px(12.0));
+            let field_caret = self.caret_for(Focus::Field(i));
             draw_text_input(
                 ctx,
                 layers,
@@ -1409,9 +1766,10 @@ impl SshHostsView {
                     text: shown,
                     rect: rect(x, input_y, field_w, ctx.px(INPUT_H)),
                     focused: focus == Focus::Field(i),
-                    selected_all: focus == Focus::Field(i) && self.select_all,
+                    selected_all: false,
                     action: SshViewAction::FocusField(i),
                 },
+                field_caret,
             )?;
             cur_y = input_y + ctx.px(INPUT_H + 18.0);
         }
@@ -1462,6 +1820,14 @@ impl SshHostsView {
         cur_y += toggle_h + ctx.px(24.0);
 
         if use_mosh {
+            self.resolve_pending_caret_click(
+                ctx,
+                font,
+                Focus::Field(FIELD_MOSH_SERVER),
+                &fields[FIELD_MOSH_SERVER].text(),
+                x + ctx.px(12.0),
+            );
+            let mosh_caret = self.caret_for(Focus::Field(FIELD_MOSH_SERVER));
             draw_text_input(
                 ctx,
                 layers,
@@ -1474,12 +1840,13 @@ impl SshHostsView {
                 cursor_on,
                 TextInputSpec {
                     placeholder: ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND,
-                    text: &fields[FIELD_MOSH_SERVER],
+                    text: &fields[FIELD_MOSH_SERVER].text(),
                     rect: rect(x, cur_y, field_w, ctx.px(INPUT_H)),
                     focused: focus == Focus::Field(FIELD_MOSH_SERVER),
-                    selected_all: focus == Focus::Field(FIELD_MOSH_SERVER) && self.select_all,
+                    selected_all: false,
                     action: SshViewAction::FocusField(FIELD_MOSH_SERVER),
                 },
+                mosh_caret,
             )?;
             cur_y += ctx.px(INPUT_H + 24.0);
         }
@@ -1506,6 +1873,128 @@ impl SshHostsView {
             SshViewAction::ToggleMux,
         )?;
         cur_y += toggle_h + ctx.px(24.0);
+
+        // Advanced: raw ssh_config overrides (ProxyJump, ServerAliveInterval,
+        // …). `build_ssh_domain` already feeds these straight into the ssh
+        // config, so nothing downstream needs to change.
+        let disclosure = if advanced_open { "▾" } else { "▸" };
+        let advanced_h = line_h + ctx.px(12.0);
+        self.widgets.push(
+            rect(x, cur_y, field_w, advanced_h),
+            WidgetKind::Button,
+            SshViewAction::ToggleAdvanced,
+        );
+        ctx.draw_text(
+            layers,
+            font,
+            x,
+            cur_y + (advanced_h - line_h) / 2.0,
+            &format!("{disclosure}  Advanced (ssh_config options)"),
+            palette.text,
+            field_w,
+        )?;
+        cur_y += advanced_h + ctx.px(8.0);
+
+        if advanced_open {
+            let remove_w = ctx.px(INPUT_H);
+            let gap = ctx.px(8.0);
+            let pair_w = (field_w - remove_w - gap * 2.0).max(0.0);
+            let key_w = pair_w * 0.42;
+            let value_w = pair_w - key_w;
+            for (index, (key, value)) in options.iter().enumerate() {
+                let key_x = x;
+                let value_x = key_x + key_w + gap;
+                self.resolve_pending_caret_click(
+                    ctx,
+                    font,
+                    Focus::OptionKey(index),
+                    &key.text(),
+                    key_x + ctx.px(12.0),
+                );
+                let key_caret = self.caret_for(Focus::OptionKey(index));
+                draw_text_input(
+                    ctx,
+                    layers,
+                    font,
+                    &mut self.widgets,
+                    &self.interaction,
+                    palette,
+                    tokens,
+                    ctx.px(12.0),
+                    cursor_on,
+                    TextInputSpec {
+                        placeholder: "ProxyJump",
+                        text: &key.text(),
+                        rect: rect(key_x, cur_y, key_w, ctx.px(INPUT_H)),
+                        focused: focus == Focus::OptionKey(index),
+                        selected_all: false,
+                        action: SshViewAction::FocusOptionKey(index),
+                    },
+                    key_caret,
+                )?;
+                self.resolve_pending_caret_click(
+                    ctx,
+                    font,
+                    Focus::OptionValue(index),
+                    &value.text(),
+                    value_x + ctx.px(12.0),
+                );
+                let value_caret = self.caret_for(Focus::OptionValue(index));
+                draw_text_input(
+                    ctx,
+                    layers,
+                    font,
+                    &mut self.widgets,
+                    &self.interaction,
+                    palette,
+                    tokens,
+                    ctx.px(12.0),
+                    cursor_on,
+                    TextInputSpec {
+                        placeholder: "user@bastion",
+                        text: &value.text(),
+                        rect: rect(value_x, cur_y, value_w, ctx.px(INPUT_H)),
+                        focused: focus == Focus::OptionValue(index),
+                        selected_all: false,
+                        action: SshViewAction::FocusOptionValue(index),
+                    },
+                    value_caret,
+                )?;
+                draw_icon_button(
+                    ctx,
+                    layers,
+                    &mut self.widgets,
+                    &self.interaction,
+                    palette,
+                    value_x + value_w + gap,
+                    cur_y,
+                    remove_w,
+                    SvgIcon::Trash2,
+                    SshViewAction::RemoveOption(index),
+                )?;
+                cur_y += ctx.px(INPUT_H) + gap;
+            }
+
+            let add_label = "+ Add option";
+            let add_w = ctx.measure_text_width(font, add_label) + ctx.px(36.0);
+            // Resolved before `self.widgets` is borrowed mutably below.
+            let add_state = self.button_state(SshViewAction::AddOption, false);
+            draw_button(
+                ctx,
+                layers,
+                font,
+                &mut self.widgets,
+                palette,
+                ButtonSpec {
+                    label: add_label,
+                    action: SshViewAction::AddOption,
+                    rect: rect(x, cur_y, add_w, ctx.px(BTN_H)),
+                    state: add_state,
+                    kind: WidgetKind::Button,
+                },
+            )?;
+            cur_y += ctx.px(BTN_H) + ctx.px(24.0);
+        }
 
         if let Some(err) = &error {
             ctx.draw_text(
@@ -1539,6 +2028,32 @@ impl SshHostsView {
             };
             draw_button(ctx, layers, font, &mut self.widgets, palette, spec)?;
             bx += w + gap;
+        }
+        cur_y += ctx.px(BTN_H) + ctx.px(PAD);
+
+        self.form_content_h = cur_y - top;
+        // These draws cannot clip, so hide anything that scrolled above the
+        // column by repainting the strip over it (still inside our own area).
+        if self.form_scroll.offset > 0.0 {
+            ctx.draw_rect(
+                layers,
+                2,
+                x,
+                y - ctx.px(PAD),
+                field_w,
+                ctx.px(PAD),
+                palette.window_bg,
+            )?;
+        }
+        if self.form_scroll.has_overflow() {
+            draw_scrollbar(
+                ctx,
+                layers,
+                palette,
+                tokens,
+                self.form_area,
+                self.form_scroll,
+            )?;
         }
         Ok(())
     }
@@ -1609,14 +2124,106 @@ impl ContentView for SshHostsView {
     }
 
     fn copy_text(&self) -> Option<String> {
-        let text = match self.focus {
-            Focus::Search => self.search.clone(),
-            Focus::Field(n) => self.form.as_ref()?.fields.get(n)?.clone(),
-        };
+        let input = self.focused_input()?;
+        let text = input
+            .caret_selected_text()
+            .unwrap_or_else(|| input.text().to_string());
         (!text.is_empty()).then_some(text)
     }
 
     fn cut_text(&mut self) -> Option<String> {
         self.take_focused_selection()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        focus_after_collapsing_advanced, ssh_options_from_rows, tab_stops_for, text_input_with,
+        Focus, HostForm, BASE_FIELD_COUNT, FIELD_HOST, FIELD_WORKSPACE,
+    };
+
+    fn row(key: &str, value: &str) -> (super::TextInputState, super::TextInputState) {
+        (
+            text_input_with(key.to_string()),
+            text_input_with(value.to_string()),
+        )
+    }
+
+    #[test]
+    fn ssh_options_are_trimmed_and_blank_keys_dropped() {
+        let rows = vec![
+            row("  ProxyJump ", " user@bastion "),
+            row("", "orphaned-value"),
+            row("   ", ""),
+            row("ServerAliveInterval", "30"),
+        ];
+        let options = ssh_options_from_rows(&rows);
+        assert_eq!(options.len(), 2);
+        assert_eq!(
+            options.get("ProxyJump").map(String::as_str),
+            Some("user@bastion")
+        );
+        assert_eq!(
+            options.get("ServerAliveInterval").map(String::as_str),
+            Some("30")
+        );
+    }
+
+    #[test]
+    fn a_present_key_with_an_empty_value_is_kept() {
+        // `Option=` is meaningful to ssh_config; only a blank *key* is noise.
+        let options = ssh_options_from_rows(&[row("Compression", "")]);
+        assert_eq!(options.get("Compression").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn collapsing_advanced_pulls_focus_out_of_hidden_rows() {
+        // Rows inside Advanced stop being drawn, so focus must not stay on one:
+        // `focused_input_mut` would otherwise keep routing keystrokes into an
+        // invisible field.
+        assert_eq!(
+            focus_after_collapsing_advanced(Focus::OptionKey(2)),
+            Focus::Field(FIELD_HOST)
+        );
+        assert_eq!(
+            focus_after_collapsing_advanced(Focus::OptionValue(0)),
+            Focus::Field(FIELD_HOST)
+        );
+        // Anything already visible keeps its place.
+        assert_eq!(
+            focus_after_collapsing_advanced(Focus::Field(FIELD_WORKSPACE)),
+            Focus::Field(FIELD_WORKSPACE)
+        );
+        assert_eq!(
+            focus_after_collapsing_advanced(Focus::Search),
+            Focus::Search
+        );
+    }
+
+    #[test]
+    fn hidden_option_rows_are_not_reachable_for_editing() {
+        let mut form = HostForm::default();
+        form.options = vec![row("ProxyJump", "bastion")];
+        form.advanced_open = false;
+        // Tab order is the visible surface; a collapsed section contributes
+        // nothing, which is the same invariant `focused_input_mut` enforces.
+        assert_eq!(tab_stops_for(&form).len(), BASE_FIELD_COUNT);
+    }
+
+    #[test]
+    fn tab_order_covers_option_rows_only_while_advanced_is_open() {
+        let mut form = HostForm::default();
+        form.options = vec![row("A", "1"), row("B", "2")];
+
+        form.advanced_open = false;
+        assert_eq!(tab_stops_for(&form).len(), BASE_FIELD_COUNT);
+
+        form.advanced_open = true;
+        let stops = tab_stops_for(&form);
+        assert_eq!(stops.len(), BASE_FIELD_COUNT + 4);
+        assert_eq!(stops[BASE_FIELD_COUNT], Focus::OptionKey(0));
+        assert_eq!(stops[BASE_FIELD_COUNT + 1], Focus::OptionValue(0));
+        assert_eq!(stops[BASE_FIELD_COUNT + 3], Focus::OptionValue(1));
     }
 }

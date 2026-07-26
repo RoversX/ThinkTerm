@@ -549,6 +549,19 @@ impl ClientDomain {
         self.config.connect_automatically()
     }
 
+    /// Return the SSH transport configuration for callers that need to open a
+    /// separate, non-mux SSH channel (for example, ThinkTerm's opt-in SFTP
+    /// file browser).  Unix and TLS client domains intentionally return None.
+    ///
+    /// The clone keeps `ClientDomain`'s live transport private: consumers
+    /// cannot accidentally share the mux Session and stall terminal traffic.
+    pub fn ssh_domain_config(&self) -> Option<SshDomain> {
+        match &self.config {
+            ClientDomainConfig::Ssh(ssh) => Some(ssh.clone()),
+            ClientDomainConfig::Unix(_) | ClientDomainConfig::Tls(_) => None,
+        }
+    }
+
     /// The transport died and the background reconnect loop is trying to
     /// get back; authoritative connection-health signal for indicators
     /// (pane tardiness only trips after something is sent on the pane).
@@ -682,6 +695,11 @@ impl ClientDomain {
         mut primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
+        // A native/mux window can disappear while an attach or structural RPC
+        // is in flight. Never trust mappings retained by the prior resync:
+        // remove entries whose local objects no longer exist before using
+        // them below.
+        inner.expire_stale_mappings();
         log::debug!(
             "domain {}: ListPanes result {:#?}",
             inner.local_domain_id,
@@ -824,21 +842,29 @@ impl ClientDomain {
                         inner.local_domain_id,
                         local_window_id
                     );
-                    let needs_add = mux
-                        .get_window(local_window_id)
-                        .expect("no such window!?")
-                        .idx_by_id(tab.tab_id())
-                        .is_none();
-                    if needs_add {
-                        // Use add_tab_to_window rather than window.push so
-                        // that MuxNotification::TabAddedToWindow reaches the
-                        // GUI: it relies on that event to impose the local
-                        // window geometry on tabs that arrive via resync
-                        // (their wire size is the server's, which sits below
-                        // the local size by the pane nav bar reservation).
-                        mux.add_tab_to_window(&tab, local_window_id)?;
+                    if let Some(window) = mux.get_window(local_window_id) {
+                        let needs_add = window.idx_by_id(tab.tab_id()).is_none();
+                        drop(window);
+                        if needs_add {
+                            // Use add_tab_to_window rather than window.push so
+                            // that MuxNotification::TabAddedToWindow reaches
+                            // the GUI: it relies on that event to impose the
+                            // local window geometry on tabs that arrive via
+                            // resync (their wire size is the server's, which
+                            // sits below the local size by the pane nav bar
+                            // reservation).
+                            mux.add_tab_to_window(&tab, local_window_id)?;
+                        }
+                        continue;
                     }
-                    continue;
+                    // The mapping went stale after the initial sweep. Fall
+                    // through and adopt/create a live local window instead of
+                    // panicking on an asynchronous resync.
+                    inner
+                        .remote_to_local_window
+                        .lock()
+                        .unwrap()
+                        .remove(&remote_window_id);
                 }
 
                 if let Some(local_window_id) = primary_window_id {
@@ -890,10 +916,15 @@ impl ClientDomain {
 
         for (remote_window_id, window_title) in panes.window_titles {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                let mut window = mux
-                    .get_window_mut(local_window_id)
-                    .expect("no such window!?");
-                window.set_title(&window_title);
+                if let Some(mut window) = mux.get_window_mut(local_window_id) {
+                    window.set_title(&window_title);
+                } else {
+                    inner
+                        .remote_to_local_window
+                        .lock()
+                        .unwrap()
+                        .remove(&remote_window_id);
+                }
             }
         }
 

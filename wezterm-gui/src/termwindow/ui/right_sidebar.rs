@@ -1,14 +1,19 @@
 use crate::markdown_editor::{
-    AutosaveWakeAction, BlockKind, EditorMode, NoteCodeBlockLayout, NoteLineGeometry,
-    NoteLineLayout, NoteRunLayout, NoteSpellingIssue, ProjectedCodeBlock, ProjectedObject,
-    SaveState, SourceSelection, TableAlignment, VisualLineKind, build_spell_check_chunks_in_range,
-    build_visual_document, fit_table_columns, load_remote_image, open_vault_document,
-    resolve_local_image, save_document_revision, vault_file_paths, vault_markdown_paths,
-    wrap_visual_document_by_width_cached,
+    build_spell_check_chunks_in_range, build_visual_document, fit_table_columns, load_remote_image,
+    open_vault_document, resolve_local_image, save_document_revision, vault_file_paths,
+    vault_markdown_paths, wrap_visual_document_by_width_cached, AutosaveWakeAction, BlockKind,
+    EditorMode, NoteCodeBlockLayout, NoteLineGeometry, NoteLineLayout, NoteRunLayout,
+    NoteSpellingIssue, ProjectedCodeBlock, ProjectedObject, SaveState, SourceSelection,
+    TableAlignment, VisualLineKind,
 };
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::termwindow::remote_files::{
+    invalidate_remote_connection_if_dead, remote_connection_key, remote_connection_manager,
+    RemoteAcquireError, RemoteFileBytes, RemoteFileKind, RemoteFileRow, RemoteFilesEffect,
+    RemoteFilesEvent, RemoteFilesPhase, RemotePath,
+};
 use crate::termwindow::ui::icons::{
-    MaterialIcon, SvgIcon, material_file_icon_for_name, material_folder_icon_for_name,
+    material_file_icon_for_name, material_folder_icon_for_name, MaterialIcon, SvgIcon,
 };
 use crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons;
 use crate::termwindow::ui::tokens::{
@@ -27,7 +32,7 @@ use crate::termwindow::{
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
     TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup,
 };
-use crate::ui::{TextInputState, UiPalette, scale_ui_usize, unscale_ui_usize};
+use crate::ui::{scale_ui_usize, unscale_ui_usize, EditModifiers, TextInputState, UiPalette};
 use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use anyhow::Context;
@@ -110,7 +115,11 @@ const NOTE_VAULT_RESCAN_SECS: u64 = 10;
 // Points render 4/3 larger at 96dpi than on macOS, so the floor follows
 // the same 0.75x rule as the default font sizes; otherwise it pins the
 // Files panel above any reasonable Home Font Size setting on Linux.
-const FILE_FONT_MIN_SIZE: f64 = if cfg!(target_os = "macos") { 14.0 } else { 10.5 };
+const FILE_FONT_MIN_SIZE: f64 = if cfg!(target_os = "macos") {
+    14.0
+} else {
+    10.5
+};
 const FILE_FILTER_HEIGHT: usize = 66;
 const FILE_TREE_TOP_GAP: usize = 14;
 const FILE_SCROLL_FADE_HEIGHT: usize = 32;
@@ -786,8 +795,7 @@ struct NotePaintProfile {
 impl NotePaintProfile {
     fn new() -> Self {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        let enabled =
-            *ENABLED.get_or_init(|| std::env::var_os("THINKTERM_PROFILE_NOTE").is_some());
+        let enabled = *ENABLED.get_or_init(|| std::env::var_os("THINKTERM_PROFILE_NOTE").is_some());
         Self {
             enabled,
             start: enabled.then(Instant::now),
@@ -928,7 +936,8 @@ impl crate::TermWindow {
         !self.right_sidebar_collapsed
             && self.right_sidebar_mode == RightSidebarMode::Chat
             && self.right_sidebar_file_view == RightSidebarFileView::Preview
-            && self.right_sidebar_file_selected.is_some()
+            && (self.right_sidebar_file_selected.is_some()
+                || self.right_sidebar_remote_files.selected.is_some())
     }
 
     fn right_sidebar_tree_width(&self) -> usize {
@@ -968,7 +977,8 @@ impl crate::TermWindow {
         if self.right_sidebar_collapsed
             || self.right_sidebar_mode != RightSidebarMode::Chat
             || self.right_sidebar_file_view != RightSidebarFileView::Preview
-            || self.right_sidebar_file_selected.is_none()
+            || (self.right_sidebar_file_selected.is_none()
+                && self.right_sidebar_remote_files.selected.is_none())
         {
             return None;
         }
@@ -1159,9 +1169,11 @@ impl crate::TermWindow {
                 self.clear_right_sidebar_text_focus();
             }
             self.schedule_right_sidebar_file_memory_release();
+            self.release_right_sidebar_remote_files_if_hidden();
             self.schedule_right_sidebar_note_memory_release();
         } else {
             self.kick_right_sidebar_file_rescan_cycle();
+            self.request_right_sidebar_remote_files_connect(false);
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
                 self.right_sidebar_note_memory_release_token =
                     self.right_sidebar_note_memory_release_token.wrapping_add(1);
@@ -1172,6 +1184,7 @@ impl crate::TermWindow {
     pub fn expand_right_sidebar(&mut self) {
         self.right_sidebar_collapsed = false;
         self.kick_right_sidebar_file_rescan_cycle();
+        self.request_right_sidebar_remote_files_connect(false);
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             self.right_sidebar_note_memory_release_token =
                 self.right_sidebar_note_memory_release_token.wrapping_add(1);
@@ -1463,12 +1476,12 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn save_snippet_editor(&mut self) {
-        let body = self.right_sidebar_snippet_body.text.trim().to_string();
+        let body = self.right_sidebar_snippet_body.text().trim().to_string();
         if body.is_empty() {
             self.right_sidebar_snippet_focus = Some(RightSidebarSnippetField::Body);
             return;
         }
-        let title = self.right_sidebar_snippet_title.text.trim().to_string();
+        let title = self.right_sidebar_snippet_title.text().trim().to_string();
         let result = match self.right_sidebar_snippet_view.clone() {
             RightSidebarSnippetView::List => return,
             RightSidebarSnippetView::EditNew => {
@@ -1527,10 +1540,14 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn scroll_right_sidebar_files_by(&mut self, delta: f32) -> bool {
-        let old = self.right_sidebar_file_tree_scroll_offset;
-        self.right_sidebar_file_tree_scroll_offset =
-            (self.right_sidebar_file_tree_scroll_offset + delta).max(0.0);
-        (old - self.right_sidebar_file_tree_scroll_offset).abs() > f32::EPSILON
+        let offset = if self.right_sidebar_remote_files.target.is_some() {
+            &mut self.right_sidebar_remote_file_tree_scroll_offset
+        } else {
+            &mut self.right_sidebar_file_tree_scroll_offset
+        };
+        let old = *offset;
+        *offset = (*offset + delta).max(0.0);
+        (old - *offset).abs() > f32::EPSILON
     }
 
     pub(crate) fn scroll_right_sidebar_file_preview_by(&mut self, delta: f32) -> bool {
@@ -1545,7 +1562,8 @@ impl crate::TermWindow {
         if self.right_sidebar_collapsed
             || self.right_sidebar_mode != RightSidebarMode::Chat
             || self.right_sidebar_file_view != RightSidebarFileView::Preview
-            || self.right_sidebar_file_selected.is_none()
+            || (self.right_sidebar_file_selected.is_none()
+                && self.right_sidebar_remote_files.selected.is_none())
             || amount == 0
         {
             return false;
@@ -2331,7 +2349,11 @@ impl crate::TermWindow {
                 text.push_str(&preview_text_range(&line.plain, line_start, line_end));
             }
         }
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     fn right_sidebar_file_preview_selection_range(
@@ -2440,7 +2462,7 @@ impl crate::TermWindow {
 
     fn mark_right_sidebar_file_filter_changed(&mut self) {
         self.right_sidebar_file_tree_scroll_offset = 0.0;
-        if self.right_sidebar_file_filter.text == self.right_sidebar_file_applied_filter {
+        if self.right_sidebar_file_filter.text() == self.right_sidebar_file_applied_filter {
             self.right_sidebar_file_filter_debounce_until = None;
         } else {
             self.right_sidebar_file_filter_debounce_until =
@@ -2449,7 +2471,7 @@ impl crate::TermWindow {
     }
 
     fn right_sidebar_file_filter_for_tree(&mut self) -> String {
-        let current = self.right_sidebar_file_filter.text.clone();
+        let current = self.right_sidebar_file_filter.text().to_string();
         if current == self.right_sidebar_file_applied_filter {
             self.right_sidebar_file_filter_debounce_until = None;
             return self.right_sidebar_file_applied_filter.clone();
@@ -2661,6 +2683,9 @@ impl crate::TermWindow {
     /// keeping the tree + view state on screen. Used by the periodic timer,
     /// window/panel focus, and the manual Refresh button.
     pub(crate) fn force_right_sidebar_file_rescan(&mut self) {
+        if matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
+            return;
+        }
         if !self.right_sidebar_file_view_active() || self.right_sidebar_file_refreshing {
             return;
         }
@@ -2686,6 +2711,9 @@ impl crate::TermWindow {
     /// re-scan cycle. Called on window focus and when entering the file view; a
     /// fresh open builds via the normal index path, so we only force when Ready.
     pub(crate) fn kick_right_sidebar_file_rescan_cycle(&mut self) {
+        if matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
+            return;
+        }
         if !(self.right_sidebar_file_view_active() && self.focused.is_some()) {
             return;
         }
@@ -2707,6 +2735,9 @@ impl crate::TermWindow {
     /// Schedule the next periodic re-scan tick (token-guarded so close / blur /
     /// root change makes a pending tick a no-op and the cycle stops).
     pub(crate) fn schedule_right_sidebar_file_rescan(&mut self) {
+        if matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
+            return;
+        }
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
@@ -2728,6 +2759,9 @@ impl crate::TermWindow {
             || !self.right_sidebar_file_view_active()
             || self.focused.is_none()
         {
+            return;
+        }
+        if matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
             return;
         }
         self.force_right_sidebar_file_rescan();
@@ -2895,7 +2929,7 @@ impl crate::TermWindow {
         };
         let text = input
             .caret_selected_text()
-            .unwrap_or_else(|| input.text.clone());
+            .unwrap_or_else(|| input.text().to_string());
         if !text.is_empty() {
             self.copy_to_clipboard(destination, text);
         }
@@ -3334,7 +3368,7 @@ impl crate::TermWindow {
         let text = if let Some(text) = input.caret_take_selected_text() {
             text
         } else {
-            let text = input.text.clone();
+            let text = input.text().to_string();
             input.clear();
             text
         };
@@ -3389,87 +3423,93 @@ impl crate::TermWindow {
             return false;
         }
 
-        let shift = mods.contains(TermModifiers::SHIFT);
-        let super_ = mods.contains(TermModifiers::SUPER);
-        let alt = mods.contains(TermModifiers::ALT);
-        let ctrl = mods.contains(TermModifiers::CTRL);
+        // Resolved once, platform-normalized: ⌘ on macOS, Ctrl on
+        // Windows/Linux. Testing raw modifiers here is what left these inputs
+        // macOS-only while the Note editor next door worked everywhere.
+        let edit = EditModifiers::from(mods);
+        let shift = edit.shift;
         let multiline = self.right_sidebar_focused_is_multiline();
 
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             return self.handle_right_sidebar_note_key(key, mods);
         }
 
-        // Cmd shortcuts (macOS): clipboard, select-all, jump to line start/end.
-        if super_ && !alt && !ctrl {
-            return match key {
+        // Clipboard and select-all. Deliberately falls through rather than
+        // returning on an unhandled key: off macOS the same Ctrl chord is also
+        // the word modifier, which is handled just below.
+        if edit.command {
+            match key {
                 TermKeyCode::Char('a') | TermKeyCode::Char('A') => {
                     if let Some(input) = self.right_sidebar_focused_input_mut() {
                         input.caret_select_all();
                     }
-                    true
+                    return true;
                 }
                 TermKeyCode::Char('c') | TermKeyCode::Char('C') => {
                     self.copy_right_sidebar_focused_input(ClipboardCopyDestination::Clipboard);
-                    true
+                    return true;
                 }
                 TermKeyCode::Char('x') | TermKeyCode::Char('X') => {
                     self.cut_right_sidebar_focused_input();
-                    true
+                    return true;
                 }
                 TermKeyCode::Char('v') | TermKeyCode::Char('V') => {
                     self.paste_into_right_sidebar_from_clipboard(ClipboardPasteSource::Clipboard);
-                    true
+                    return true;
                 }
-                TermKeyCode::LeftArrow if !multiline => {
+                // ⌘←/→/⌫ are line-start/end/delete-to-start on macOS only;
+                // elsewhere Home/End cover it and Ctrl means word-wise.
+                TermKeyCode::LeftArrow if !multiline && cfg!(target_os = "macos") => {
                     if let Some(input) = self.right_sidebar_focused_input_mut() {
                         input.caret_move_home(shift);
                     }
-                    true
+                    return true;
                 }
-                TermKeyCode::RightArrow if !multiline => {
+                TermKeyCode::RightArrow if !multiline && cfg!(target_os = "macos") => {
                     if let Some(input) = self.right_sidebar_focused_input_mut() {
                         input.caret_move_end(shift);
                     }
-                    true
+                    return true;
                 }
-                TermKeyCode::Backspace if !multiline => {
+                TermKeyCode::Backspace if !multiline && cfg!(target_os = "macos") => {
                     if let Some(input) = self.right_sidebar_focused_input_mut() {
                         input.caret_delete_to_start();
                     }
                     self.after_right_sidebar_text_edit();
-                    true
+                    return true;
                 }
-                _ => false,
-            };
+                _ => {}
+            }
         }
 
-        // Option/Alt shortcuts (macOS): word navigation / deletion.
-        if alt && !super_ && !ctrl {
-            return match key {
+        // Word navigation / deletion (⌥ on macOS, Ctrl elsewhere).
+        if edit.word {
+            match key {
                 TermKeyCode::LeftArrow if !multiline => {
                     if let Some(input) = self.right_sidebar_focused_input_mut() {
                         input.caret_word_left(shift);
                     }
-                    true
+                    return true;
                 }
                 TermKeyCode::RightArrow if !multiline => {
                     if let Some(input) = self.right_sidebar_focused_input_mut() {
                         input.caret_word_right(shift);
                     }
-                    true
+                    return true;
                 }
                 TermKeyCode::Backspace if !multiline => {
                     if let Some(input) = self.right_sidebar_focused_input_mut() {
                         input.caret_delete_word_back();
                     }
                     self.after_right_sidebar_text_edit();
-                    true
+                    return true;
                 }
-                _ => false,
-            };
+                _ => {}
+            }
         }
 
-        if ctrl {
+        // Any chord we did not claim belongs to the app, not to this input.
+        if !edit.plain() {
             return false;
         }
 
@@ -3630,16 +3670,18 @@ impl crate::TermWindow {
         // begin_live_editing() is deliberately deferred until a key is known
         // to be handled: an unrelated key must not flip the display source to
         // Live and invalidate the projection caches.
-        let shift = mods.contains(TermModifiers::SHIFT);
+        // This handler is where the correct cross-platform rule was first
+        // written; it now lives in `EditModifiers` so every text surface shares
+        // it. `command` stays slightly looser than the shared flag here because
+        // the editor also accepts ⌘ chords that arrive alongside other
+        // modifiers.
+        let edit = EditModifiers::from(mods);
+        let shift = edit.shift;
         let super_ = mods.contains(TermModifiers::SUPER);
         let ctrl = mods.contains(TermModifiers::CTRL);
         let alt = mods.contains(TermModifiers::ALT);
         let command = super_ || (ctrl && !cfg!(target_os = "macos"));
-        let word_modifier = if cfg!(target_os = "macos") {
-            alt && !super_ && !ctrl
-        } else {
-            ctrl && !super_ && !alt
-        };
+        let word_modifier = edit.word;
 
         if word_modifier
             && matches!(
@@ -4543,7 +4585,7 @@ impl crate::TermWindow {
             .find(|layout| &layout.item_type == item_type)?;
         let input = self.right_sidebar_input_for_item(item_type)?;
         let font = layout.font.clone();
-        let chars: Vec<char> = input.text.chars().collect();
+        let chars: Vec<char> = input.text().chars().collect();
         let first = layout.first_char.min(chars.len());
         let relative = (x as f32 - layout.text_x).clamp(0.0, layout.text_width.max(0.0));
         let mut best_idx = first;
@@ -4860,7 +4902,8 @@ impl crate::TermWindow {
         preview_metrics: RenderMetrics,
     ) -> Option<RightSidebarFilePreviewBodyMetrics> {
         if self.right_sidebar_file_view != RightSidebarFileView::Preview
-            || self.right_sidebar_file_selected.is_none()
+            || (self.right_sidebar_file_selected.is_none()
+                && self.right_sidebar_remote_files.selected.is_none())
         {
             return None;
         }
@@ -5223,7 +5266,7 @@ impl crate::TermWindow {
     fn filtered_snippet_count(&self) -> usize {
         let needle = self
             .right_sidebar_snippet_search
-            .text
+            .text()
             .trim()
             .to_ascii_lowercase();
         crate::snippets::list_snippets()
@@ -5262,7 +5305,9 @@ impl crate::TermWindow {
         let icon_size = (ui_cell_height + self.ui_px(6)).clamp(self.ui_px(20), self.ui_px(24));
 
         if self.right_sidebar_mode == RightSidebarMode::Chat {
-            let _ = self.sync_right_sidebar_file_root_for_current_workspace();
+            if !matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
+                let _ = self.sync_right_sidebar_file_root_for_current_workspace();
+            }
         }
 
         if let Some(preview_rect) = self.right_sidebar_file_preview_rect() {
@@ -6924,10 +6969,9 @@ impl crate::TermWindow {
             let mut top = padding;
             // Reuse the previous geometry allocation when this host holds the
             // only reference (paint-local clones are dropped each frame).
-            let mut geometry = Arc::try_unwrap(std::mem::take(
-                &mut self.right_sidebar_note.line_geometry,
-            ))
-            .unwrap_or_default();
+            let mut geometry =
+                Arc::try_unwrap(std::mem::take(&mut self.right_sidebar_note.line_geometry))
+                    .unwrap_or_default();
             geometry.clear();
             geometry.reserve(visual.lines.len());
             for (line_index, line) in visual.lines.iter().enumerate() {
@@ -7044,7 +7088,8 @@ impl crate::TermWindow {
         // frame and the capacities are stable.
         let mut layouts = std::mem::take(&mut self.right_sidebar_note.line_layouts);
         layouts.clear();
-        let mut code_block_layouts = std::mem::take(&mut self.right_sidebar_note.code_block_layouts);
+        let mut code_block_layouts =
+            std::mem::take(&mut self.right_sidebar_note.code_block_layouts);
         code_block_layouts.clear();
         let mut table_layouts = std::mem::take(&mut self.right_sidebar_note_table_layouts);
         table_layouts.clear();
@@ -8431,6 +8476,46 @@ impl crate::TermWindow {
         content_bottom: usize,
         icon_size: usize,
     ) -> anyhow::Result<()> {
+        if let Some(target) = self
+            .active_remote_project_for_files()
+            .map_err(anyhow::Error::msg)?
+        {
+            let changed = self.right_sidebar_remote_files.target.as_ref() != Some(&target);
+            if changed {
+                self.clear_right_sidebar_text_focus();
+                self.right_sidebar_remote_file_tree_scroll_offset = 0.0;
+            }
+            let effects = self
+                .right_sidebar_remote_files
+                .transition(RemoteFilesEvent::TargetChanged(Some(target)));
+            self.apply_right_sidebar_remote_files_effects(effects);
+            if changed && self.right_sidebar_remote_files.can_resume_current() {
+                let effects = self
+                    .right_sidebar_remote_files
+                    .transition(RemoteFilesEvent::ResumeRequested);
+                self.apply_right_sidebar_remote_files_effects(effects);
+            }
+            return self.paint_remote_files_sidebar(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                content_bottom,
+                icon_size,
+            );
+        }
+
+        if self.right_sidebar_remote_files.target.is_some() {
+            let effects = self
+                .right_sidebar_remote_files
+                .transition(RemoteFilesEvent::TargetChanged(None));
+            self.apply_right_sidebar_remote_files_effects(effects);
+        }
         self.paint_files_tree(
             layers,
             ui_font,
@@ -8446,7 +8531,894 @@ impl crate::TermWindow {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn paint_remote_files_sidebar(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        icon_size: usize,
+    ) -> anyhow::Result<()> {
+        let phase = self.right_sidebar_remote_files.phase.clone();
+        match phase {
+            RemoteFilesPhase::Disconnected => {
+                self.paint_files_message(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    muted_fg,
+                    content_x,
+                    content_top,
+                    content_width,
+                    content_bottom,
+                    icon_size,
+                    "Connect to browse this remote project",
+                )?;
+                self.paint_remote_files_connect_button(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    content_x,
+                    content_top + self.ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT + 12),
+                    content_width,
+                    "Connect to Remote Files",
+                )
+            }
+            RemoteFilesPhase::Connecting => self.paint_files_message(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                content_bottom,
+                icon_size,
+                "Connecting to Remote Files...",
+            ),
+            RemoteFilesPhase::Failed(message) => {
+                self.paint_files_message(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    muted_fg,
+                    content_x,
+                    content_top,
+                    content_width,
+                    content_bottom,
+                    icon_size,
+                    &message,
+                )?;
+                self.paint_remote_files_connect_button(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    content_x,
+                    content_top + self.ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT + 12),
+                    content_width,
+                    "Retry",
+                )
+            }
+            RemoteFilesPhase::Connected => self.paint_remote_files_tree(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                content_bottom,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_remote_files_connect_button(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+        label: &str,
+    ) -> anyhow::Result<()> {
+        let height = self.ui_px(44);
+        let hovered = self.is_pointer_over_ui_rect(x, y, width, height);
+        self.fill_rounded_rectangle_with_border(
+            layers,
+            1,
+            euclid::rect(x as f32, y as f32, width as f32, height as f32),
+            if hovered {
+                chrome.control_hover_bg
+            } else {
+                chrome.sidebar_button_bg
+            },
+            chrome.control_border,
+            self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+            CAPSULE_BORDER_WIDTH,
+        )
+        .context("remote Files connect button")?;
+        self.ui_items.push(UIItem {
+            x,
+            y,
+            width,
+            height,
+            item_type: UIItemType::RightSidebarRemoteFileConnect,
+        });
+        let label_width = self
+            .sidebar_text_width(ui_font, label)
+            .unwrap_or(width as f32)
+            .ceil() as usize;
+        let text_x = x + width.saturating_sub(label_width) / 2;
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            label,
+            text_x,
+            y + height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
+            width.saturating_sub(text_x.saturating_sub(x)),
+            foreground,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_remote_files_tree(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+    ) -> anyhow::Result<()> {
+        let refresh_size = (ui_metrics.cell_size.height as usize + self.ui_px(12))
+            .clamp(self.ui_px(28), self.ui_px(38));
+        let refresh_x = content_x + content_width.saturating_sub(refresh_size);
+        let refresh_y =
+            content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
+        let label_width = content_width.saturating_sub(refresh_size + self.ui_px(SIDEBAR_INSET));
+        let label = self
+            .right_sidebar_remote_files
+            .target
+            .as_ref()
+            .map(|target| target.project_name.as_str())
+            .unwrap_or("Remote Files");
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            label,
+            content_x,
+            content_top
+                + self
+                    .ui_px(FILE_FILTER_HEIGHT)
+                    .saturating_sub(ui_metrics.cell_size.height as usize)
+                    / 2,
+            label_width,
+            foreground,
+        )?;
+        self.paint_files_preview_header_icon_button(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            refresh_x,
+            refresh_y,
+            refresh_size,
+            SvgIcon::RotateCcw,
+            UIItemType::RightSidebarRemoteFileRefresh,
+        )?;
+
+        let mut tree_top =
+            content_top + self.ui_px(FILE_FILTER_HEIGHT) + self.ui_px(FILE_TREE_TOP_GAP);
+        if let Some(message) = self.right_sidebar_remote_files.error_message.clone() {
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                &message,
+                content_x,
+                tree_top,
+                content_width,
+                muted_fg,
+            )?;
+            tree_top += ui_metrics.cell_size.height as usize + self.ui_px(8);
+        }
+        let rows = self.right_sidebar_remote_files.rows();
+        if rows.is_empty() {
+            return self.paint_files_message(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                muted_fg,
+                content_x,
+                tree_top,
+                content_width,
+                content_bottom,
+                self.ui_px(22),
+                "Loading remote directory...",
+            );
+        }
+
+        let row_metrics = right_sidebar_file_row_metrics(ui_metrics);
+        let footer_height = if self.right_sidebar_remote_files.has_truncated_directory() {
+            row_metrics.row_height
+        } else {
+            0
+        };
+        let viewport_bottom = content_bottom
+            .saturating_sub(self.ui_px(SIDEBAR_INSET))
+            .saturating_sub(footer_height);
+        let visible_height = viewport_bottom.saturating_sub(tree_top);
+        let total_height = rows.len().saturating_mul(row_metrics.row_height);
+        let max_scroll = total_height.saturating_sub(visible_height) as f32;
+        self.right_sidebar_remote_file_tree_scroll_offset = self
+            .right_sidebar_remote_file_tree_scroll_offset
+            .clamp(0.0, max_scroll);
+        let scroll = self.right_sidebar_remote_file_tree_scroll_offset;
+        let visible =
+            visible_file_row_range(rows.len(), scroll, visible_height, row_metrics.row_height);
+        let selected = self.right_sidebar_remote_files.selected.clone();
+        for (offset, row) in rows.get(visible.clone()).unwrap_or(&[]).iter().enumerate() {
+            let index = visible.start + offset;
+            let row_top = match file_row_placement(
+                index,
+                row_metrics.row_height,
+                tree_top as f32,
+                viewport_bottom as f32,
+                scroll,
+            ) {
+                FileRowPlacement::Above => continue,
+                FileRowPlacement::Below => break,
+                FileRowPlacement::Visible(row_top) => row_top,
+            };
+            self.paint_remote_file_tree_row(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                row_top.floor().max(0.0) as usize,
+                content_width,
+                row,
+                selected.as_ref(),
+                tree_top,
+                viewport_bottom,
+                row_metrics,
+            )?;
+        }
+        if footer_height > 0 {
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                "More entries are not shown",
+                content_x,
+                viewport_bottom,
+                content_width,
+                muted_fg,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_remote_file_tree_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+        row: &RemoteFileRow,
+        selected: Option<&RemotePath>,
+        clip_top: usize,
+        clip_bottom: usize,
+        row_metrics: RightSidebarFileRowMetrics,
+    ) -> anyhow::Result<()> {
+        let row_bottom = y.saturating_add(row_metrics.row_height);
+        let visible_y = y.max(clip_top);
+        let visible_bottom = row_bottom.min(clip_bottom);
+        let visible_height = visible_bottom.saturating_sub(visible_y);
+        if visible_height == 0 {
+            return Ok(());
+        }
+        let hovered = self.is_pointer_over_ui_rect(x, visible_y, width, visible_height);
+        let is_selected = selected == Some(&row.entry.path);
+        if hovered || is_selected {
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    x as f32,
+                    visible_y as f32,
+                    width as f32,
+                    visible_height as f32,
+                ),
+                if is_selected {
+                    chrome.selected_bg.mul_alpha(0.46)
+                } else {
+                    chrome.sidebar_button_hover_bg
+                },
+                self.ui_f32(SIDEBAR_ROW_RADIUS),
+            )
+            .context("remote Files row hover")?;
+        }
+        self.ui_items.push(UIItem {
+            x,
+            y: visible_y,
+            width,
+            height: visible_height,
+            item_type: UIItemType::RightSidebarRemoteFileRow(row.entry.path.clone()),
+        });
+
+        let indent = row
+            .depth
+            .saturating_mul(row_metrics.indent_step)
+            .min(width.saturating_sub(24));
+        let chevron_x = x + self.ui_px(SIDEBAR_INSET) + indent;
+        let chevron_y = y + row_metrics
+            .row_height
+            .saturating_sub(row_metrics.chevron_size)
+            / 2;
+        if row.entry.is_directory() {
+            self.paint_sidebar_icon(
+                layers,
+                if row.expanded {
+                    SvgIcon::ChevronDown
+                } else {
+                    SvgIcon::ChevronRight
+                },
+                chevron_x,
+                chevron_y,
+                row_metrics.chevron_size,
+                muted_fg,
+            )?;
+        }
+        let icon_x = chevron_x + row_metrics.chevron_size + row_metrics.icon_gap;
+        let icon_y = y + row_metrics.row_height.saturating_sub(row_metrics.icon_size) / 2;
+        let icon = remote_file_icon(row);
+        match icon {
+            RightSidebarFileIcon::Material(icon) => {
+                self.paint_sidebar_material_icon(
+                    layers,
+                    icon,
+                    icon_x,
+                    icon_y,
+                    row_metrics.icon_size,
+                )?;
+            }
+            RightSidebarFileIcon::Svg(icon) => {
+                self.paint_sidebar_icon(
+                    layers,
+                    icon,
+                    icon_x,
+                    icon_y,
+                    row_metrics.icon_size,
+                    if row.entry.is_directory() {
+                        muted_fg
+                    } else {
+                        foreground
+                    },
+                )?;
+            }
+        }
+        let text_x = icon_x + row_metrics.icon_size + row_metrics.icon_gap;
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            &row.entry.name,
+            text_x,
+            y + row_metrics
+                .row_height
+                .saturating_sub(ui_metrics.cell_size.height as usize)
+                / 2,
+            x.saturating_add(width)
+                .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET)),
+            if row.entry.is_directory() || is_selected {
+                foreground
+            } else {
+                muted_fg
+            },
+        )
+    }
+
+    fn active_remote_project_for_files(
+        &self,
+    ) -> Result<Option<workspace_threads::RemoteFilesTarget>, String> {
+        let mux = Mux::get();
+        let active_workspace = self
+            .current_mux_workspace()
+            .unwrap_or_else(|| mux.active_workspace());
+        let workspaces = mux.iter_workspaces();
+        let view = workspace_threads::view_for_current_project(
+            &self.active_space_id,
+            &active_workspace,
+            &workspaces,
+        );
+        let project = view
+            .projects
+            .iter()
+            .find(|project| project.is_active)
+            .or_else(|| view.projects.first())
+            .ok_or_else(|| "No active project".to_string())?;
+        if !project.is_remote {
+            return Ok(None);
+        }
+        if let Some(target) =
+            workspace_threads::remote_files_target(&self.active_space_id, &project.id)
+        {
+            return Ok(Some(target));
+        }
+        let Some(domain) = workspace_threads::client_domain_for_space(&self.active_space_id) else {
+            return Err("Remote Files source is unavailable".to_string());
+        };
+        Ok(Some(workspace_threads::RemoteFilesTarget {
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
+            source: workspace_threads::RemoteFilesSource::ClientDomain(domain),
+            requested_root: "~".to_string(),
+        }))
+    }
+
+    fn ssh_config_for_remote_files_target(
+        target: &workspace_threads::RemoteFilesTarget,
+    ) -> Result<config::SshDomain, String> {
+        match &target.source {
+            workspace_threads::RemoteFilesSource::SshHost(host_id) => {
+                let spec = crate::ssh_hosts::host_spec(host_id)
+                    .ok_or_else(|| format!("SSH host {host_id} is unavailable"))?;
+                let mut domain = crate::ssh_hosts::build_ssh_domain(&spec);
+                domain.stored_password = spec
+                    .password
+                    .as_deref()
+                    .map(crate::secret::reveal)
+                    .filter(|password| !password.is_empty());
+                Ok(domain)
+            }
+            workspace_threads::RemoteFilesSource::ClientDomain(domain_name) => {
+                let domain = Mux::get()
+                    .get_domain_by_name(domain_name)
+                    .ok_or_else(|| format!("Mux domain {domain_name} is unavailable"))?;
+                let client = domain
+                    .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                    .ok_or_else(|| {
+                        "Remote Files supports only SSH-backed mux domains".to_string()
+                    })?;
+                client.ssh_domain_config().ok_or_else(|| {
+                    "Remote Files does not support Unix or TLS mux domains".to_string()
+                })
+            }
+        }
+    }
+
+    fn apply_right_sidebar_remote_files_effects(&mut self, effects: Vec<RemoteFilesEffect>) {
+        for effect in effects {
+            match effect {
+                RemoteFilesEffect::ReleaseLease => {
+                    self.right_sidebar_remote_files_lease.take();
+                    self.close_right_sidebar_file_preview();
+                }
+                RemoteFilesEffect::Connect {
+                    generation,
+                    target,
+                    allow_connect,
+                } => {
+                    let config = match Self::ssh_config_for_remote_files_target(&target) {
+                        Ok(config) => config,
+                        Err(message) => {
+                            self.right_sidebar_remote_files.transition(
+                                RemoteFilesEvent::ConnectionFailed {
+                                    generation,
+                                    message,
+                                },
+                            );
+                            continue;
+                        }
+                    };
+                    let Some(window) = self.window.as_ref().cloned() else {
+                        self.right_sidebar_remote_files.transition(
+                            RemoteFilesEvent::ConnectionFailed {
+                                generation,
+                                message: "Window is unavailable".to_string(),
+                            },
+                        );
+                        continue;
+                    };
+                    let source_key = crate::termwindow::remote_files::RemoteFilesState::source_key(
+                        &target.source,
+                    );
+                    let connection_key = remote_connection_key(&source_key, &config);
+                    let requested_root = target.requested_root.clone();
+                    promise::spawn::spawn(async move {
+                        let manager = remote_connection_manager();
+                        let result = match manager
+                            .acquire(connection_key.clone(), config, allow_connect)
+                            .await
+                        {
+                            Ok(lease) => {
+                                let backend = lease.backend();
+                                match backend.resolve_root(requested_root).await {
+                                    Ok(root) => match backend
+                                        .list_directory(
+                                            root.clone(),
+                                            crate::termwindow::remote_files::REMOTE_FILE_TREE_ROW_LIMIT,
+                                        )
+                                        .await
+                                    {
+                                        Ok(listing) => Ok((lease, root, listing)),
+                                        Err(err) => {
+                                            invalidate_remote_connection_if_dead(
+                                                &connection_key,
+                                                &err,
+                                            );
+                                            Err(RemoteAcquireError::Failed(err))
+                                        }
+                                    },
+                                    Err(err) => {
+                                        invalidate_remote_connection_if_dead(
+                                            &connection_key,
+                                            &err,
+                                        );
+                                        Err(RemoteAcquireError::Failed(err))
+                                    }
+                                }
+                            }
+                            Err(err) => Err(err),
+                        };
+                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            match result {
+                                Ok((lease, root, listing)) => {
+                                    let current = term_window
+                                        .right_sidebar_remote_files
+                                        .current_source_key();
+                                    if current.as_deref() != Some(source_key.as_str())
+                                        || term_window.right_sidebar_remote_files.generation
+                                            != generation
+                                    {
+                                        drop(lease);
+                                        return;
+                                    }
+                                    term_window.right_sidebar_remote_files_lease = Some(lease);
+                                    let effects = term_window.right_sidebar_remote_files.transition(
+                                        RemoteFilesEvent::Connected {
+                                            generation,
+                                            root,
+                                            listing,
+                                        },
+                                    );
+                                    term_window
+                                        .apply_right_sidebar_remote_files_effects(effects);
+                                }
+                                Err(RemoteAcquireError::NotConnected) => {
+                                    term_window.right_sidebar_remote_files.transition(
+                                        RemoteFilesEvent::ResumeUnavailable { generation },
+                                    );
+                                }
+                                Err(RemoteAcquireError::Failed(message)) => {
+                                    term_window.right_sidebar_remote_files.transition(
+                                        RemoteFilesEvent::ConnectionFailed {
+                                            generation,
+                                            message,
+                                        },
+                                    );
+                                }
+                            }
+                            term_window.invalidate_window();
+                        })));
+                    })
+                    .detach();
+                }
+                RemoteFilesEffect::ListDirectory {
+                    generation,
+                    source_key,
+                    path,
+                    limit,
+                } => {
+                    let Some(lease) = self.right_sidebar_remote_files_lease.as_ref() else {
+                        self.right_sidebar_remote_files_lease.take();
+                        self.close_right_sidebar_file_preview();
+                        self.right_sidebar_remote_files.transition(
+                            RemoteFilesEvent::ConnectionFailed {
+                                generation,
+                                message: "Remote Files connection is no longer available"
+                                    .to_string(),
+                            },
+                        );
+                        continue;
+                    };
+                    let Some(operation_lease) = lease.operation_lease() else {
+                        self.right_sidebar_remote_files_lease.take();
+                        self.close_right_sidebar_file_preview();
+                        self.right_sidebar_remote_files.transition(
+                            RemoteFilesEvent::ConnectionFailed {
+                                generation,
+                                message: "Remote Files connection is no longer available"
+                                    .to_string(),
+                            },
+                        );
+                        continue;
+                    };
+                    let backend = lease.backend();
+                    let connection_key = lease.connection_key().to_string();
+                    let Some(window) = self.window.as_ref().cloned() else {
+                        continue;
+                    };
+                    promise::spawn::spawn(async move {
+                        let result = backend.list_directory(path.clone(), limit).await;
+                        drop(operation_lease);
+                        let connection_died = result.as_ref().is_err_and(|message| {
+                            invalidate_remote_connection_if_dead(&connection_key, message)
+                        });
+                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            if term_window
+                                .right_sidebar_remote_files
+                                .current_source_key()
+                                .as_deref()
+                                != Some(source_key.as_str())
+                            {
+                                return;
+                            }
+                            let event = match result {
+                                Ok(listing) => RemoteFilesEvent::DirectoryLoaded {
+                                    generation,
+                                    path,
+                                    listing,
+                                },
+                                Err(message) if connection_died => {
+                                    term_window.right_sidebar_remote_files_lease.take();
+                                    term_window.close_right_sidebar_file_preview();
+                                    RemoteFilesEvent::ConnectionFailed {
+                                        generation,
+                                        message,
+                                    }
+                                }
+                                Err(message) => RemoteFilesEvent::DirectoryFailed {
+                                    generation,
+                                    path,
+                                    message,
+                                },
+                            };
+                            let effects = term_window.right_sidebar_remote_files.transition(event);
+                            term_window.apply_right_sidebar_remote_files_effects(effects);
+                            term_window.invalidate_window();
+                        })));
+                    })
+                    .detach();
+                }
+                RemoteFilesEffect::LoadPreview {
+                    generation,
+                    source_key,
+                    path,
+                } => {
+                    self.spawn_right_sidebar_remote_file_preview(generation, source_key, path);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn request_right_sidebar_remote_files_connect(&mut self, explicit: bool) {
+        let event = if explicit {
+            RemoteFilesEvent::ConnectRequested
+        } else {
+            RemoteFilesEvent::ResumeRequested
+        };
+        let effects = self.right_sidebar_remote_files.transition(event);
+        self.apply_right_sidebar_remote_files_effects(effects);
+    }
+
+    pub(crate) fn refresh_right_sidebar_remote_files(&mut self) {
+        self.close_right_sidebar_file_preview();
+        let effects = self
+            .right_sidebar_remote_files
+            .transition(RemoteFilesEvent::Refresh);
+        self.apply_right_sidebar_remote_files_effects(effects);
+    }
+
+    pub(crate) fn open_right_sidebar_remote_file(&mut self, path: RemotePath) {
+        match self.right_sidebar_remote_files.kind_for_path(&path) {
+            Some(RemoteFileKind::Directory) => {
+                let effects = self
+                    .right_sidebar_remote_files
+                    .transition(RemoteFilesEvent::ToggleDirectory(path));
+                self.apply_right_sidebar_remote_files_effects(effects);
+            }
+            Some(RemoteFileKind::File) => {
+                if !self.right_sidebar_file_preview_active() {
+                    let max_tree_for_preview = self
+                        .right_sidebar_pane_total_max_width()
+                        .saturating_sub(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH))
+                        .max(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
+                    self.right_sidebar_file_tree_width = self
+                        .right_sidebar_width
+                        .clamp(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH), max_tree_for_preview);
+                }
+                self.close_right_sidebar_file_preview();
+                self.right_sidebar_file_view = RightSidebarFileView::Preview;
+                self.right_sidebar_file_preview_message =
+                    Some("Loading remote file preview...".to_string());
+                let effects = self
+                    .right_sidebar_remote_files
+                    .transition(RemoteFilesEvent::SelectFile(path));
+                self.apply_right_sidebar_remote_files_effects(effects);
+            }
+            Some(RemoteFileKind::Symlink) | Some(RemoteFileKind::Other) | None => {}
+        }
+    }
+
+    pub(crate) fn close_right_sidebar_remote_file_preview(&mut self) {
+        self.close_right_sidebar_file_preview();
+        self.right_sidebar_remote_files
+            .transition(RemoteFilesEvent::ClosePreview);
+    }
+
+    pub(crate) fn release_right_sidebar_remote_files_if_hidden(&mut self) {
+        if self.right_sidebar_file_view_active() {
+            return;
+        }
+        let effects = self
+            .right_sidebar_remote_files
+            .transition(RemoteFilesEvent::PanelHidden);
+        self.apply_right_sidebar_remote_files_effects(effects);
+    }
+
+    fn spawn_right_sidebar_remote_file_preview(
+        &mut self,
+        generation: u64,
+        source_key: String,
+        path: RemotePath,
+    ) {
+        let Some(lease) = self.right_sidebar_remote_files_lease.as_ref() else {
+            self.right_sidebar_remote_files_lease.take();
+            self.close_right_sidebar_file_preview();
+            self.right_sidebar_remote_files
+                .transition(RemoteFilesEvent::ConnectionFailed {
+                    generation,
+                    message: "Remote Files connection is no longer available".to_string(),
+                });
+            return;
+        };
+        let Some(operation_lease) = lease.operation_lease() else {
+            self.right_sidebar_remote_files_lease.take();
+            self.close_right_sidebar_file_preview();
+            self.right_sidebar_remote_files
+                .transition(RemoteFilesEvent::ConnectionFailed {
+                    generation,
+                    message: "Remote Files connection is no longer available".to_string(),
+                });
+            return;
+        };
+        let backend = lease.backend();
+        let connection_key = lease.connection_key().to_string();
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let is_image = is_preview_image_extension(path.extension());
+        let limit = if is_image {
+            FILE_PREVIEW_IMAGE_MAX_BYTES
+        } else {
+            FILE_PREVIEW_MAX_BYTES
+        };
+        let use_dark_syntax_theme = matches!(
+            crate::native_settings::effective_appearance(),
+            window::Appearance::Dark | window::Appearance::DarkHighContrast
+        );
+        promise::spawn::spawn(async move {
+            let bytes = backend.read_file(path.clone(), limit).await;
+            drop(operation_lease);
+            let connection_died = bytes.as_ref().is_err_and(|message| {
+                invalidate_remote_connection_if_dead(&connection_key, message)
+            });
+            let preview_path = path.clone();
+            let result = match bytes {
+                Ok(bytes) => promise::spawn::spawn_into_new_thread(move || {
+                    Ok(remote_preview_from_bytes(
+                        &preview_path,
+                        bytes,
+                        use_dark_syntax_theme,
+                    ))
+                })
+                .await
+                .unwrap_or_else(|err| RightSidebarLoadedFilePreview {
+                    lines: Vec::new(),
+                    image: None,
+                    message: Some(format!("Unable to prepare remote preview: {err}")),
+                    truncated: false,
+                }),
+                Err(err) => RightSidebarLoadedFilePreview {
+                    lines: Vec::new(),
+                    image: None,
+                    message: Some(err),
+                    truncated: false,
+                },
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                if term_window
+                    .right_sidebar_remote_files
+                    .current_source_key()
+                    .as_deref()
+                    != Some(source_key.as_str())
+                    || term_window.right_sidebar_remote_files.generation != generation
+                    || term_window.right_sidebar_remote_files.selected.as_ref() != Some(&path)
+                {
+                    return;
+                }
+                let error = result.message.clone();
+                if connection_died {
+                    term_window.right_sidebar_remote_files_lease.take();
+                    term_window.close_right_sidebar_file_preview();
+                    term_window.right_sidebar_remote_files.transition(
+                        RemoteFilesEvent::ConnectionFailed {
+                            generation,
+                            message: error
+                                .clone()
+                                .unwrap_or_else(|| "Remote Files connection was lost".to_string()),
+                        },
+                    );
+                    term_window.invalidate_window();
+                    return;
+                }
+                term_window.right_sidebar_file_preview_lines = result.lines;
+                term_window.right_sidebar_file_preview_max_columns = term_window
+                    .right_sidebar_file_preview_lines
+                    .iter()
+                    .map(|line| line.char_count)
+                    .max()
+                    .unwrap_or(0);
+                term_window.right_sidebar_file_preview_image = result.image;
+                term_window.right_sidebar_file_preview_message = result.message;
+                term_window.right_sidebar_file_preview_truncated = result.truncated;
+                term_window.clear_right_sidebar_file_preview_slice_cache();
+                term_window.right_sidebar_remote_files.transition(
+                    RemoteFilesEvent::PreviewFinished {
+                        generation,
+                        path,
+                        error,
+                    },
+                );
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
     fn active_local_project_for_files(&self) -> Result<RightSidebarFileRoot, String> {
+        if workspace_threads::client_domain_for_space(&self.active_space_id).is_some() {
+            return Err("Remote file browsing is not supported yet".to_string());
+        }
+
         let mux = Mux::get();
         let active_workspace = self
             .current_mux_workspace()
@@ -8684,14 +9656,17 @@ impl crate::TermWindow {
         };
         for (offset, row) in rows.iter().enumerate() {
             let idx = visible_rows.start + offset;
-            let row_top = tree_top_f + (idx * row_metrics.row_height) as f32 - scroll_offset;
-            let row_bottom = row_top + row_metrics.row_height as f32;
-            if row_bottom <= tree_top_f {
-                continue;
-            }
-            if row_top >= viewport_bottom_f {
-                break;
-            }
+            let row_top = match file_row_placement(
+                idx,
+                row_metrics.row_height,
+                tree_top_f,
+                viewport_bottom_f,
+                scroll_offset,
+            ) {
+                FileRowPlacement::Above => continue,
+                FileRowPlacement::Below => break,
+                FileRowPlacement::Visible(row_top) => row_top,
+            };
             self.paint_file_tree_row(
                 layers,
                 ui_font,
@@ -9124,6 +10099,113 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn paint_remote_files_preview_header(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        path: &RemotePath,
+    ) -> anyhow::Result<()> {
+        let header_top = content_top + 4;
+        let button_size = 44.min(content_width);
+        self.paint_files_preview_header_icon_button(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            header_top,
+            button_size,
+            SvgIcon::X,
+            UIItemType::RightSidebarRemoteFileBack,
+        )?;
+        let can_copy = self.right_sidebar_file_preview_image.is_none()
+            && !self.right_sidebar_file_preview_lines.is_empty();
+        let actions_x = content_x + content_width.saturating_sub(button_size);
+        if can_copy {
+            self.paint_files_preview_header_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                actions_x,
+                header_top,
+                button_size,
+                SvgIcon::Copy,
+                UIItemType::RightSidebarRemoteFileCopyText,
+            )?;
+        }
+        let title_x = content_x + button_size + self.ui_px(SIDEBAR_INSET);
+        let title_right = if can_copy {
+            actions_x.saturating_sub(self.ui_px(SIDEBAR_INSET))
+        } else {
+            content_x + content_width
+        };
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            path.file_name(),
+            title_x,
+            header_top + button_size.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
+            title_right.saturating_sub(title_x),
+            foreground,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_current_files_preview_header(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        local_path: Option<&Path>,
+        remote_path: Option<&RemotePath>,
+    ) -> anyhow::Result<()> {
+        if let Some(path) = remote_path {
+            self.paint_remote_files_preview_header(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                path,
+            )
+        } else if let Some(path) = local_path {
+            self.paint_files_preview_header(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                path,
+            )
+        } else {
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn paint_files_preview_header_open_with_button(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -9258,15 +10340,17 @@ impl crate::TermWindow {
         content_width: usize,
         _content_bottom: usize,
     ) -> anyhow::Result<()> {
-        let Some(path) = self.right_sidebar_file_selected.clone() else {
+        let local_path = self.right_sidebar_file_selected.clone();
+        let remote_path = self.right_sidebar_remote_files.selected.clone();
+        if local_path.is_none() && remote_path.is_none() {
             return Ok(());
-        };
+        }
         let mut profile = FilePreviewPaintProfile::new();
         let mut profile_scroll_offset = 0.0;
         let mut profile_horizontal_offset = 0usize;
 
         let Some(metrics) = self.right_sidebar_file_preview_body_metrics(ui_metrics) else {
-            self.paint_files_preview_header(
+            self.paint_current_files_preview_header(
                 layers,
                 ui_font,
                 ui_metrics,
@@ -9276,7 +10360,8 @@ impl crate::TermWindow {
                 content_x,
                 content_top,
                 content_width,
-                &path,
+                local_path.as_deref(),
+                remote_path.as_ref(),
             )?;
             return Ok(());
         };
@@ -9441,7 +10526,7 @@ impl crate::TermWindow {
                     .min(body_bottom.saturating_sub(metrics.y)),
             )?;
         }
-        self.paint_files_preview_header(
+        self.paint_current_files_preview_header(
             layers,
             ui_font,
             ui_metrics,
@@ -9451,7 +10536,8 @@ impl crate::TermWindow {
             content_x,
             content_top,
             content_width,
-            &path,
+            local_path.as_deref(),
+            remote_path.as_ref(),
         )?;
         if show_scrollbars {
             self.paint_right_sidebar_file_preview_scrollbar(layers, chrome)?;
@@ -9998,7 +11084,7 @@ impl crate::TermWindow {
         let toolbar_gap = self.ui_px(SNIPPET_ROW_GAP);
         let search_is_active = self.right_sidebar_snippet_focus
             == Some(RightSidebarSnippetField::Search)
-            || !self.right_sidebar_snippet_search.text.is_empty();
+            || !self.right_sidebar_snippet_search.text().is_empty();
         let full_new_button_width = new_button_icon_size
             + self.ui_px(SIDEBAR_ICON_GAP)
             + new_button_label_width
@@ -10067,7 +11153,7 @@ impl crate::TermWindow {
             + self.ui_px(SNIPPET_LIST_TOP_GAP);
         let needle = self
             .right_sidebar_snippet_search
-            .text
+            .text()
             .trim()
             .to_ascii_lowercase();
         let snippets: Vec<_> = crate::snippets::list_snippets()
@@ -10622,15 +11708,15 @@ impl crate::TermWindow {
             text_x += icon_size + self.ui_px(SIDEBAR_ICON_GAP);
         }
 
-        let text_color = if input.text.is_empty() && !focused {
+        let text_color = if input.text().is_empty() && !focused {
             muted_fg.mul_alpha(0.72)
         } else {
             chrome.text
         };
-        let text = if input.text.is_empty() && !focused {
+        let text = if input.text().is_empty() && !focused {
             placeholder
         } else {
-            input.text.as_str()
+            input.text()
         };
         if multiline {
             let line_height = ui_metrics.cell_size.height as usize + 4;
@@ -10679,7 +11765,7 @@ impl crate::TermWindow {
             let text_area_width = width.saturating_sub((text_x - x) + text_pad);
             let baseline_y = y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2;
 
-            if input.text.is_empty() && !focused {
+            if input.text().is_empty() && !focused {
                 self.paint_sidebar_text(
                     layers,
                     ui_font,
@@ -10691,7 +11777,7 @@ impl crate::TermWindow {
                     text_color,
                 )?;
             } else {
-                let chars: Vec<char> = input.text.chars().collect();
+                let chars: Vec<char> = input.text().chars().collect();
                 let cursor = input.cursor.min(chars.len());
                 let avail = text_area_width as f32;
                 let caret_margin = self.ui_f32(SNIPPET_CARET_WIDTH) + 2.0;
@@ -11253,7 +12339,11 @@ fn syntax_color(kind: HighlightKind, use_dark_theme: bool) -> LinearRgba {
 }
 
 fn preview_line_count(lines: &[RightSidebarFilePreviewLine]) -> usize {
-    if lines.is_empty() { 1 } else { lines.len() }
+    if lines.is_empty() {
+        1
+    } else {
+        lines.len()
+    }
 }
 
 fn decimal_digit_count(mut value: usize) -> usize {
@@ -11523,6 +12613,39 @@ fn open_with_candidate_rank(candidate: &wezterm_open_url::OpenWithCandidate) -> 
     (rank, candidate.label.to_lowercase())
 }
 
+/// Where a tree row lands once the viewport is scrolled, or that it is outside
+/// the viewport entirely.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FileRowPlacement {
+    /// Scrolled off the top; skip it and keep going.
+    Above,
+    /// Paint at this y. May sit above `tree_top` when the row is only partly
+    /// scrolled out — the row painters clip against `tree_top`/`viewport_bottom`
+    /// themselves, and they need the *true* origin to do it. Clamping the origin
+    /// instead keeps a full row height below `tree_top`, which overlaps the next
+    /// row by the scroll remainder and drags an oversized hit rect along.
+    Visible(f32),
+    /// Past the bottom; every later row is too, so the caller can stop.
+    Below,
+}
+
+fn file_row_placement(
+    index: usize,
+    row_height: usize,
+    tree_top: f32,
+    viewport_bottom: f32,
+    scroll: f32,
+) -> FileRowPlacement {
+    let row_top = tree_top + (index * row_height) as f32 - scroll;
+    if row_top + row_height as f32 <= tree_top {
+        FileRowPlacement::Above
+    } else if row_top >= viewport_bottom {
+        FileRowPlacement::Below
+    } else {
+        FileRowPlacement::Visible(row_top)
+    }
+}
+
 fn visible_file_row_range(
     row_count: usize,
     scroll_offset: f32,
@@ -11586,6 +12709,102 @@ fn is_preview_image_path(path: &Path) -> bool {
             .as_deref(),
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff")
     )
+}
+
+fn is_preview_image_extension(extension: Option<&str>) -> bool {
+    matches!(
+        extension.map(str::to_ascii_lowercase).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff")
+    )
+}
+
+fn remote_preview_from_bytes(
+    path: &RemotePath,
+    mut remote: RemoteFileBytes,
+    use_dark_syntax_theme: bool,
+) -> RightSidebarLoadedFilePreview {
+    if is_preview_image_extension(path.extension()) {
+        if remote.truncated {
+            return RightSidebarLoadedFilePreview {
+                lines: Vec::new(),
+                image: None,
+                message: Some(format!(
+                    "image is larger than {} MiB",
+                    FILE_PREVIEW_IMAGE_MAX_BYTES / 1024 / 1024
+                )),
+                truncated: true,
+            };
+        }
+        let encoded_bytes = remote.bytes.len();
+        let image_data = ImageDataType::EncodedFile(remote.bytes);
+        return match image_data.dimensions() {
+            Ok((width, height)) if image_pixels_within_preview_budget(width, height) => {
+                RightSidebarLoadedFilePreview {
+                    lines: Vec::new(),
+                    image: Some(RightSidebarFilePreviewImage {
+                        data: Arc::new(ImageData::with_data(image_data)),
+                        width,
+                        height,
+                        encoded_bytes,
+                    }),
+                    message: None,
+                    truncated: false,
+                }
+            }
+            Ok((width, height)) => RightSidebarLoadedFilePreview {
+                lines: Vec::new(),
+                image: None,
+                message: Some(format!(
+                    "image is too large to preview ({width}×{height}, over {} megapixels)",
+                    FILE_PREVIEW_IMAGE_MAX_PIXELS / 1_000_000
+                )),
+                truncated: false,
+            },
+            Err(err) => RightSidebarLoadedFilePreview {
+                lines: Vec::new(),
+                image: None,
+                message: Some(format!("Unable to decode image dimensions: {err:#}")),
+                truncated: false,
+            },
+        };
+    }
+
+    if remote.truncated {
+        truncate_preview_bytes_to_utf8_boundary(&mut remote.bytes);
+    }
+    let (text, message) = if remote.bytes.contains(&0) {
+        (
+            String::new(),
+            Some("Preview unavailable for binary file".to_string()),
+        )
+    } else {
+        match String::from_utf8(remote.bytes) {
+            Ok(text) if text.is_empty() => (String::new(), Some("Empty file".to_string())),
+            Ok(text) => (text, None),
+            Err(_) => (
+                String::new(),
+                Some("Preview unavailable for non-UTF-8 text".to_string()),
+            ),
+        }
+    };
+    let lines = if message.is_none() {
+        // The highlighter only uses the basename/extension; never pass the
+        // remote path through local filesystem operations.
+        preview_lines_from_text_with_cancellation(
+            Path::new(path.file_name()),
+            &text,
+            use_dark_syntax_theme,
+            None,
+        )
+    } else {
+        Vec::new()
+    };
+    RightSidebarLoadedFilePreview {
+        lines,
+        image: None,
+        message,
+        truncated: remote.truncated,
+    }
 }
 
 fn load_file_preview_image(path: &Path) -> anyhow::Result<RightSidebarFilePreviewImage> {
@@ -11707,8 +12926,8 @@ impl RightSidebarFileCharBag {
 /// `Arc<RightSidebarFileIndex>` instead of each scanning and holding its own
 /// copy. Only weak refs live here, so an index is freed the moment the last
 /// window drops its strong ref (e.g. via the idle-release path).
-fn shared_file_index_registry()
--> &'static Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>> {
+fn shared_file_index_registry(
+) -> &'static Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>>> =
         OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -12099,6 +13318,40 @@ fn file_icon_for_row(row: &RightSidebarFileTreeRow) -> RightSidebarFileIcon {
     }
 }
 
+fn remote_file_icon(row: &RemoteFileRow) -> RightSidebarFileIcon {
+    if row.entry.is_directory() {
+        if let Some(icon) =
+            material_folder_icon_for_name(&row.entry.name, row.expanded, row.depth == 0)
+        {
+            return RightSidebarFileIcon::Material(icon);
+        }
+        return RightSidebarFileIcon::Svg(if row.expanded {
+            SvgIcon::FolderOpen
+        } else {
+            SvgIcon::Folder
+        });
+    }
+    if let Some(icon) = material_file_icon_for_name(&row.entry.name) {
+        return RightSidebarFileIcon::Material(icon);
+    }
+    let icon = match row
+        .entry
+        .path
+        .extension()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some(
+            "rs" | "toml" | "lua" | "js" | "jsx" | "ts" | "tsx" | "json" | "css" | "html" | "sh"
+            | "py" | "rb" | "go" | "swift" | "kt" | "java" | "c" | "cc" | "cpp" | "h" | "hpp" | "m"
+            | "mm",
+        ) => SvgIcon::FileCode,
+        Some("md" | "txt" | "log" | "yaml" | "yml" | "xml") => SvgIcon::FileText,
+        _ => SvgIcon::File,
+    };
+    RightSidebarFileIcon::Svg(icon)
+}
+
 fn snippet_preview(body: &str) -> String {
     body.lines()
         .find_map(|line| {
@@ -12317,21 +13570,21 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileReleaseAction, NoteReleaseAction, file_release_action, note_release_action,
-        FILE_PREVIEW_MAX_BYTES, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
-        NoteApproximateTextMetrics, NoteCodeHighlightEntry, NoteCodeHighlightState,
         approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
-        full_line_colors_by_byte,
+        file_release_action, file_row_placement, full_line_colors_by_byte,
         image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
         naturalish_cmp, note_code_highlight_key, note_code_highlight_lines, note_code_row_height,
-        note_image_display_size, note_open_pending_for_vault, open_with_candidate_allowed,
-        path_key, preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
-        preview_text_range, preview_visible_colored, preview_visible_line_range,
-        right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
-        right_sidebar_open_with_cache_key, scrollable_note_table_columns,
-        search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
-        sorted_open_with_candidates, virtual_note_line_range, visible_code_block_rounded_edges,
-        visible_file_row_range, wrap_snippet_text_for_width,
+        note_image_display_size, note_open_pending_for_vault, note_release_action,
+        open_with_candidate_allowed, path_key, preview_line_count, preview_lines_from_text,
+        preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
+        preview_visible_line_range, right_sidebar_file_browse_rows_from_index,
+        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key,
+        scrollable_note_table_columns, search_right_sidebar_file_index, snippet_cursor_visible,
+        snippet_run_buffer, sorted_open_with_candidates, virtual_note_line_range,
+        visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
+        FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
+        NoteCodeHighlightState, NoteReleaseAction, FILE_PREVIEW_MAX_BYTES, NOTE_CODE_BLOCK_RADIUS,
+        NOTE_CODE_HEADER_HEIGHT,
     };
     use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
     use crate::termwindow::{RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan};
@@ -12339,11 +13592,11 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use std::io::Cursor;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use wezterm_font::units::PixelLength;
-    use window::Size;
     use window::color::LinearRgba;
+    use window::Size;
 
     fn test_render_metrics(cell_height: isize, cell_width: isize) -> RenderMetrics {
         RenderMetrics {
@@ -12535,21 +13788,17 @@ mod tests {
         state.remember_block(python.source.start, Arc::clone(&entry));
         assert!(state.cached(key, &python.text).is_some());
         assert!(state.cached(key, "hash collision guard").is_none());
-        assert!(
-            state
-                .previous_for_block(python.source.start, changed_key.language)
-                .is_some()
-        );
+        assert!(state
+            .previous_for_block(python.source.start, changed_key.language)
+            .is_some());
 
         let generation = state
             .schedule_block(python.source.start, changed_key)
             .unwrap();
         assert!(generation > 0);
-        assert!(
-            state
-                .schedule_block(python.source.start, changed_key)
-                .is_none()
-        );
+        assert!(state
+            .schedule_block(python.source.start, changed_key)
+            .is_none());
     }
 
     #[test]
@@ -12802,6 +14051,66 @@ mod tests {
     }
 
     #[test]
+    fn partly_scrolled_row_keeps_its_true_origin() {
+        // Scroll by a third of a row: the first row is still partly visible and
+        // must report an origin *above* tree_top so the painter can clip it.
+        // Clamping it to tree_top (the bug this pins) would draw a full-height
+        // row starting at tree_top, overlapping row 1 by the remainder and
+        // handing it an oversized hit rect.
+        let row_height = 30usize;
+        let tree_top = 100.0;
+        let viewport_bottom = 400.0;
+        let scroll = 10.0;
+
+        assert_eq!(
+            file_row_placement(0, row_height, tree_top, viewport_bottom, scroll),
+            FileRowPlacement::Visible(90.0)
+        );
+        // Rows never overlap: each sits exactly one row height below the last.
+        assert_eq!(
+            file_row_placement(1, row_height, tree_top, viewport_bottom, scroll),
+            FileRowPlacement::Visible(120.0)
+        );
+    }
+
+    #[test]
+    fn rows_outside_the_viewport_are_classified() {
+        let row_height = 30usize;
+        let tree_top = 100.0;
+        let viewport_bottom = 400.0;
+
+        // Scrolled a full row: row 0 is exactly flush with the top edge and
+        // contributes nothing.
+        assert_eq!(
+            file_row_placement(0, row_height, tree_top, viewport_bottom, 30.0),
+            FileRowPlacement::Above
+        );
+        // One pixel less and it is still (barely) on screen.
+        assert_eq!(
+            file_row_placement(0, row_height, tree_top, viewport_bottom, 29.0),
+            FileRowPlacement::Visible(71.0)
+        );
+        // A row starting exactly at the bottom edge is out, and so is anything
+        // after it — the caller stops there.
+        assert_eq!(
+            file_row_placement(10, row_height, tree_top, viewport_bottom, 0.0),
+            FileRowPlacement::Below
+        );
+        assert_eq!(
+            file_row_placement(9, row_height, tree_top, viewport_bottom, 0.0),
+            FileRowPlacement::Visible(370.0)
+        );
+    }
+
+    #[test]
+    fn unscrolled_first_row_starts_at_the_tree_top() {
+        assert_eq!(
+            file_row_placement(0, 30, 100.0, 400.0, 0.0),
+            FileRowPlacement::Visible(100.0)
+        );
+    }
+
+    #[test]
     fn visible_file_row_range_only_returns_rows_near_viewport() {
         let row_height = 44;
         assert_eq!(visible_file_row_range(0, 0.0, 400, row_height), 0..0);
@@ -12845,7 +14154,7 @@ mod tests {
         assert!(image_pixels_within_preview_budget(1920, 1080)); // 2 MP
         assert!(image_pixels_within_preview_budget(4096, 2160)); // ~8.8 MP (4K)
         assert!(image_pixels_within_preview_budget(4000, 4000)); // 16 MP (== budget)
-        // Bombs are rejected, and the u64 product cannot overflow.
+                                                                 // Bombs are rejected, and the u64 product cannot overflow.
         assert!(!image_pixels_within_preview_budget(8000, 8000)); // 64 MP
         assert!(!image_pixels_within_preview_budget(100_000, 100_000));
         assert!(!image_pixels_within_preview_budget(u32::MAX, u32::MAX));

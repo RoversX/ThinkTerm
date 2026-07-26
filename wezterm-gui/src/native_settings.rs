@@ -8,18 +8,33 @@ use window::{Appearance, Connection, ConnectionOps};
 
 // One point is one logical pixel on macOS but 4/3 px at 96dpi, so the
 // non-mac size is 0.75x for the same visual size (14px UI text).
-pub(crate) const DEFAULT_SETTINGS_FONT_SIZE: f64 =
-    if cfg!(target_os = "macos") { 14.0 } else { 10.5 };
+pub(crate) const DEFAULT_SETTINGS_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
+    14.0
+} else {
+    10.5
+};
 pub(crate) const DEFAULT_SETTINGS_FONT_WEIGHT: u16 =
     if cfg!(target_os = "macos") { 600 } else { 500 };
-pub(crate) const DEFAULT_HOME_FONT_SIZE: f64 =
-    if cfg!(target_os = "macos") { 15.0 } else { 11.25 };
-pub(crate) const DEFAULT_SIDEBAR_FONT_SIZE: f64 =
-    if cfg!(target_os = "macos") { 15.0 } else { 11.25 };
-pub(crate) const DEFAULT_TAB_FONT_SIZE: f64 =
-    if cfg!(target_os = "macos") { 14.0 } else { 10.5 };
-pub(crate) const DEFAULT_PANE_HEADER_FONT_SIZE: f64 =
-    if cfg!(target_os = "macos") { 14.0 } else { 10.5 };
+pub(crate) const DEFAULT_HOME_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
+    15.0
+} else {
+    11.25
+};
+pub(crate) const DEFAULT_SIDEBAR_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
+    15.0
+} else {
+    11.25
+};
+pub(crate) const DEFAULT_TAB_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
+    14.0
+} else {
+    10.5
+};
+pub(crate) const DEFAULT_PANE_HEADER_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
+    14.0
+} else {
+    10.5
+};
 pub(crate) const DEFAULT_BOTTOM_QUOTE_INTERVAL_MINUTES: u32 = 60;
 pub(crate) const DEFAULT_BOTTOM_QUOTE_FONT_SIZE: f64 =
     if cfg!(target_os = "macos") { 10.0 } else { 7.5 };
@@ -270,6 +285,22 @@ impl Default for NativeWindowSettings {
     }
 }
 
+pub(crate) const DEFAULT_REMOTE_SFTP_IDLE_MINUTES: u32 = 15;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeWorkspaceSettings {
+    pub(crate) remote_sftp_idle_minutes: u32,
+}
+
+impl Default for NativeWorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            remote_sftp_idle_minutes: DEFAULT_REMOTE_SFTP_IDLE_MINUTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct ThinkTermNativeSettings {
@@ -281,6 +312,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) onboarding: NativeOnboardingSettings,
     pub(crate) compatibility: NativeCompatibilitySettings,
     pub(crate) window: NativeWindowSettings,
+    pub(crate) workspaces: NativeWorkspaceSettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -294,8 +326,13 @@ impl Default for ThinkTermNativeSettings {
             onboarding: NativeOnboardingSettings::default(),
             compatibility: NativeCompatibilitySettings::default(),
             window: NativeWindowSettings::default(),
+            workspaces: NativeWorkspaceSettings::default(),
         }
     }
+}
+
+pub(crate) fn remote_sftp_idle_minutes() -> u32 {
+    load().workspaces.remote_sftp_idle_minutes.clamp(1, 120)
 }
 
 pub(crate) fn settings_path() -> PathBuf {
@@ -633,5 +670,14 @@ mod tests {
         mark_onboarding_seen(&mut settings);
 
         assert_eq!(settings.onboarding.seen_version, ONBOARDING_VERSION);
+    }
+
+    #[test]
+    fn older_settings_default_remote_sftp_idle_timeout() {
+        let settings: ThinkTermNativeSettings = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert_eq!(
+            settings.workspaces.remote_sftp_idle_minutes,
+            DEFAULT_REMOTE_SFTP_IDLE_MINUTES
+        );
     }
 }

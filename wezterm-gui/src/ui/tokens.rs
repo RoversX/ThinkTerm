@@ -93,6 +93,12 @@ pub(crate) struct UiTokens {
     pub icon_size: f32,
     pub resize_handle_width: f32,
     pub scrollbar_width: f32,
+    /// Gap between the scrollbar and the right edge of its area.
+    pub scrollbar_inset: f32,
+    /// Gap above and below the scrollbar track inside its area.
+    pub scrollbar_margin_y: f32,
+    /// Shortest the scrollbar thumb is allowed to get.
+    pub scrollbar_min_thumb: f32,
 }
 
 impl Default for UiTokens {
@@ -110,6 +116,9 @@ impl Default for UiTokens {
             icon_size: 26.0,
             resize_handle_width: 24.0,
             scrollbar_width: 5.0,
+            scrollbar_inset: 4.0,
+            scrollbar_margin_y: 8.0,
+            scrollbar_min_thumb: 32.0,
         }
     }
 }
@@ -135,6 +144,9 @@ impl UiTokens {
             icon_size: base.icon_size * scale,
             resize_handle_width: base.resize_handle_width * scale,
             scrollbar_width: base.scrollbar_width * scale,
+            scrollbar_inset: base.scrollbar_inset * scale,
+            scrollbar_margin_y: base.scrollbar_margin_y * scale,
+            scrollbar_min_thumb: base.scrollbar_min_thumb * scale,
         }
     }
 }

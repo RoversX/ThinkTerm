@@ -301,8 +301,7 @@ impl NoteHostState {
         // multi-megabyte note paints useful first-screen text immediately.
         // The full background parse installs honest metrics right after.
         self.refresh_wrap_work_metrics(snapshot.source.len());
-        self.background_wrap_preferred =
-            self.wrap_work_estimate >= BACKGROUND_WRAP_THRESHOLD_BYTES;
+        self.background_wrap_preferred = self.wrap_work_estimate >= BACKGROUND_WRAP_THRESHOLD_BYTES;
         self.visual_key = Some((snapshot.revision, self.view.mode, active_start));
         // This is deliberately not the complete revision.  The regular
         // background parse path will replace it with the full projection.
@@ -562,9 +561,7 @@ impl NoteHostState {
             return false;
         }
         self.parse_in_flight_revision = None;
-        let display_revision = self
-            .display_snapshot()
-            .map(|snapshot| snapshot.revision);
+        let display_revision = self.display_snapshot().map(|snapshot| snapshot.revision);
         if display_revision != Some(revision)
             || self.view.mode != mode
             || self.view.selection.focus.byte != caret
@@ -658,8 +655,7 @@ impl NoteHostState {
         self.wrap_work_estimate = self.visual.estimated_wrap_work_bytes();
         self.displayed_source_bytes = displayed_source_bytes;
         self.visual_line_count = self.visual.lines.len();
-        self.background_wrap_preferred = self.wrap_work_estimate
-            >= BACKGROUND_WRAP_THRESHOLD_BYTES
+        self.background_wrap_preferred = self.wrap_work_estimate >= BACKGROUND_WRAP_THRESHOLD_BYTES
             || self.displayed_source_bytes > PRIMED_SYNC_WRAP_MAX_SOURCE_BYTES
             || self.visual_line_count > PRIMED_SYNC_WRAP_MAX_LINES;
     }
@@ -1035,9 +1031,8 @@ impl NoteHostState {
                 let (right_x, right_byte) = pair[1];
                 let min_x = left_x.min(right_x);
                 let max_x = left_x.max(right_x);
-                (x >= min_x && x < max_x).then(|| {
-                    left_byte.min(right_byte)..left_byte.max(right_byte)
-                })
+                (x >= min_x && x < max_x)
+                    .then(|| left_byte.min(right_byte)..left_byte.max(right_byte))
             })
             .unwrap_or_else(|| run.source.clone());
         self.projection
@@ -1225,7 +1220,9 @@ mod state_tests {
         let mut other_view = EditorViewState::default();
         let end = session.lock().source().len();
         session.lock().set_caret(&mut other_view, end, false);
-        assert!(session.lock().insert_text(&mut other_view, " and [[Extra]]"));
+        assert!(session
+            .lock()
+            .insert_text(&mut other_view, " and [[Extra]]"));
 
         // The Published host must request its displayed (published) snapshot,
         // not the newer dirty session text.
@@ -1414,10 +1411,7 @@ mod state_tests {
         );
 
         // Table-heavy note: same rule via the table rows.
-        let table_source = format!(
-            "| A | B |\n| - | - |\n{}",
-            "| aa | bb |\n".repeat(5_000)
-        );
+        let table_source = format!("| A | B |\n| - | - |\n{}", "| aa | bb |\n".repeat(5_000));
         let mut table_host = host_with_source(&table_source);
         assert!(table_host.visual_line_count > PRIMED_SYNC_WRAP_MAX_LINES);
         assert!(table_host.prefers_background_wrap());

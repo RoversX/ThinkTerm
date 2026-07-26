@@ -507,7 +507,10 @@ impl MarkdownDocumentSession {
                 .saturating_sub(1);
             let (line_start, delta) = deltas[index];
             let shifted_start: isize = line_start as isize
-                + deltas[..index].iter().map(|(_, delta)| *delta).sum::<isize>();
+                + deltas[..index]
+                    .iter()
+                    .map(|(_, delta)| *delta)
+                    .sum::<isize>();
             let relative = position - line_start;
             let relative = if delta >= 0 {
                 relative + delta as usize
@@ -753,9 +756,7 @@ impl MarkdownDocumentSession {
             && (self.undo.len() > MAX_UNDO_RECORDS || self.undo_bytes > MAX_UNDO_BYTES)
         {
             let evicted = self.undo.remove(0);
-            self.undo_bytes = self
-                .undo_bytes
-                .saturating_sub(edit_record_bytes(&evicted));
+            self.undo_bytes = self.undo_bytes.saturating_sub(edit_record_bytes(&evicted));
         }
     }
 
@@ -1141,9 +1142,12 @@ mod tests {
             session.select_all(&mut view);
             session.insert_text(&mut view, &big);
         }
-        assert!(session.undo_bytes <= MAX_UNDO_BYTES.max(edit_record_bytes(
-            session.undo.last().expect("newest record retained")
-        )));
+        assert!(
+            session.undo_bytes
+                <= MAX_UNDO_BYTES.max(edit_record_bytes(
+                    session.undo.last().expect("newest record retained")
+                ))
+        );
         // Older records were evicted to honor the byte cap...
         assert!(session.undo.len() < 4);
         // ...but the newest edit is always undoable.

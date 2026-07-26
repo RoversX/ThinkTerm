@@ -8,9 +8,9 @@ use crate::termwindow::render::corners::{
 use crate::termwindow::render::draw::draw_webgpu_layers;
 use crate::termwindow::webgpu::WebGpuState;
 use crate::ui::{
-    rect, scale_ui_f32, scale_ui_usize, ButtonSpec, ControlState, InteractionState,
-    ResizablePaneState, ScrollState, ScrollbarSpec, SettingsIcon, SvgIcon, TextInputSpec,
-    TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
+    rect, scale_ui_f32, scale_ui_usize, ButtonSpec, ControlState, EditModifiers, InputCaret,
+    InteractionState, ResizablePaneState, ScrollState, ScrollbarSpec, SettingsIcon, SvgIcon,
+    TextInputSpec, TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
@@ -239,7 +239,15 @@ impl SettingsSection {
                 "Reset Quotes JSON",
                 "Terminal",
             ],
-            Self::Workspaces => &["Workspace", "Sidebar", "Session", "Layout"],
+            Self::Workspaces => &[
+                "Workspace",
+                "Sidebar",
+                "Session",
+                "Layout",
+                "Remote Files",
+                "SFTP",
+                "Idle Timeout",
+            ],
             Self::Keymap => &["Keymap", "Keyboard", "Shortcut", "Command Palette"],
             Self::Compatibility => &[
                 "ThinkTerm Config",
@@ -337,6 +345,9 @@ enum SettingsAction {
     DecreaseBottomQuoteInterval,
     IncreaseBottomQuoteInterval,
     ResetBottomQuoteInterval,
+    DecreaseRemoteSftpIdle,
+    IncreaseRemoteSftpIdle,
+    ResetRemoteSftpIdle,
     OpenBottomQuotesJson,
     ResetBottomQuotesJson,
     SearchInput,
@@ -1064,10 +1075,7 @@ mod config_candidate_tests {
                 settings_window_pixel_size(96, Some((1366, 768))),
                 (920, 603)
             );
-            assert_eq!(
-                settings_window_pixel_size(96, Some((900, 620))),
-                (810, 558)
-            );
+            assert_eq!(settings_window_pixel_size(96, Some((900, 620))), (810, 558));
         }
     }
 }
@@ -1273,6 +1281,11 @@ impl SettingsWindow {
         scale_ui_f32(value, self.dimensions.dpi)
     }
 
+    /// Design-pixel -> physical-pixel ratio for this window.
+    fn ui_scale(&self) -> f32 {
+        crate::ui::ui_scale_for_dpi(self.dimensions.dpi)
+    }
+
     fn ui_usize(&self, value: usize) -> usize {
         scale_ui_usize(value, self.dimensions.dpi)
     }
@@ -1310,8 +1323,7 @@ impl SettingsWindow {
                     )
                 })
         };
-        let (pixel_width, pixel_height) =
-            settings_window_pixel_size(dpi, active_screen_size);
+        let (pixel_width, pixel_height) = settings_window_pixel_size(dpi, active_screen_size);
         let dimensions = Dimensions {
             pixel_width,
             pixel_height,
@@ -1319,16 +1331,23 @@ impl SettingsWindow {
         };
 
         let mut ui = SettingsUiState::new(dpi);
-        ui.font_size_input.text = native_settings
-            .terminal
-            .font_size
-            .map(|value| format!("{value:.1}"))
-            .unwrap_or_else(|| format!("{:.1}", config.font_size));
-        ui.font_family_input.text = native_settings
-            .terminal
-            .font_family
-            .clone()
-            .unwrap_or_else(|| Self::effective_font_family(&config));
+        // Must go through `set_text_end`: assigning `.text` leaves the caret at
+        // 0, so typing into a prefilled field would insert at the front and
+        // Backspace would do nothing.
+        ui.font_size_input.set_text_end(
+            native_settings
+                .terminal
+                .font_size
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| format!("{:.1}", config.font_size)),
+        );
+        ui.font_family_input.set_text_end(
+            native_settings
+                .terminal
+                .font_family
+                .clone()
+                .unwrap_or_else(|| Self::effective_font_family(&config)),
+        );
 
         let settings = Rc::new(RefCell::new(Self {
             instance_id,
@@ -1662,11 +1681,22 @@ impl SettingsWindow {
             self.dimensions.pixel_width as f32 - sidebar_width - 1.0,
             (self.content_bottom() - content_top).max(0.0),
         );
-        if crate::ui::apply_wheel_to_area(event, sidebar_area, &mut self.ui.sidebar_scroll) {
+        let ui_scale = self.ui_scale();
+        if crate::ui::apply_wheel_to_area(
+            event,
+            sidebar_area,
+            &mut self.ui.sidebar_scroll,
+            ui_scale,
+        ) {
             self.show_sidebar_scrollbar(window);
             return true;
         }
-        if crate::ui::apply_wheel_to_area(event, content_area, &mut self.ui.content_scroll) {
+        if crate::ui::apply_wheel_to_area(
+            event,
+            content_area,
+            &mut self.ui.content_scroll,
+            ui_scale,
+        ) {
             self.show_content_scrollbar(window);
             return true;
         }
@@ -1840,20 +1870,8 @@ impl SettingsWindow {
             return false;
         };
 
-        if event
-            .modifiers
-            .intersects(Modifiers::SUPER | Modifiers::CTRL)
-            && !event.modifiers.intersects(Modifiers::ALT)
-        {
-            return match event.key {
-                KeyCode::Char('a') | KeyCode::Char('A') => self.select_all_focused_input(focused),
-                KeyCode::Char('c') | KeyCode::Char('C') => self.copy_focused_input(focused, window),
-                KeyCode::Char('x') | KeyCode::Char('X') => self.cut_focused_input(focused, window),
-                KeyCode::Char('v') | KeyCode::Char('V') => {
-                    self.paste_focused_input_from_clipboard(focused, window)
-                }
-                _ => false,
-            };
+        if let Some(handled) = self.handle_focused_input_key(focused, &event, window) {
+            return handled;
         }
 
         if event
@@ -1883,54 +1901,30 @@ impl SettingsWindow {
         }
     }
 
-    fn focused_input_text(&self, focused: SettingsAction) -> Option<&str> {
-        match focused {
-            SettingsAction::SearchInput => Some(&self.ui.search.text),
-            SettingsAction::FontFamilyInput => Some(&self.ui.font_family_input.text),
-            _ => None,
-        }
-    }
-
-    fn select_all_focused_input(&mut self, focused: SettingsAction) -> bool {
-        match focused {
-            SettingsAction::SearchInput => {
-                self.ui.search.select_all();
-                true
-            }
-            SettingsAction::FontFamilyInput => {
-                self.ui.font_family_input.select_all();
-                true
-            }
-            _ => false,
-        }
-    }
-
+    /// Copies the selection when there is one, otherwise the whole field —
+    /// matching `SshHostsView::copy_text`.
     fn copy_focused_input(&mut self, focused: SettingsAction, window: &Window) -> bool {
-        let Some(text) = self.focused_input_text(focused) else {
+        let Some(input) = self.input_state_for(focused) else {
             return false;
         };
-        window.set_clipboard(Clipboard::Clipboard, text.to_string());
+        let text = input
+            .caret_selected_text()
+            .unwrap_or_else(|| input.text().to_string());
+        if text.is_empty() {
+            return false;
+        }
+        window.set_clipboard(Clipboard::Clipboard, text);
         true
     }
 
+    /// Cut only ever acts on a real selection, like every native text field.
+    /// Routed through `edit_focused_input` so each field's side effects (search
+    /// re-filter, font-family dirty flag) still run.
     fn cut_focused_input(&mut self, focused: SettingsAction, window: &Window) -> bool {
-        let text = match focused {
-            SettingsAction::SearchInput => {
-                let Some(text) = self.ui.search.take_selected_text() else {
-                    return false;
-                };
-                self.ui.sidebar_scroll.reset();
-                self.sync_selected_section_with_search();
-                text
-            }
-            SettingsAction::FontFamilyInput => {
-                let Some(text) = self.ui.font_family_input.take_selected_text() else {
-                    return false;
-                };
-                self.ui.font_family_input_dirty = true;
-                text
-            }
-            _ => return false,
+        let mut taken = None;
+        self.edit_focused_input(focused, |input| taken = input.caret_take_selected_text());
+        let Some(text) = taken.filter(|text| !text.is_empty()) else {
+            return false;
         };
         window.set_clipboard(Clipboard::Clipboard, text);
         true
@@ -1963,16 +1957,59 @@ impl SettingsWindow {
         true
     }
 
+    /// Width of `text[..char_idx]` using the same measurement the renderer
+    /// uses, so a caret never drifts from the glyphs it sits between.
+    fn text_width_to_char(&self, font: &Rc<LoadedFont>, text: &str, char_idx: usize) -> f32 {
+        let byte_idx = text
+            .char_indices()
+            .nth(char_idx)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len());
+        self.measure_text_width(font, &text[..byte_idx])
+    }
+
+    fn input_state_for(&self, action: SettingsAction) -> Option<&TextInputState> {
+        match action {
+            SettingsAction::SearchInput => Some(&self.ui.search),
+            SettingsAction::FontFamilyInput => Some(&self.ui.font_family_input),
+            _ => None,
+        }
+    }
+
+    /// Caret + selection to draw for `action`, or `None` when it is not focused.
+    fn caret_for_input(&self, action: SettingsAction) -> Option<InputCaret> {
+        if self.ui.interaction.focused != Some(action) {
+            return None;
+        }
+        let input = self.input_state_for(action)?;
+        Some(InputCaret {
+            cursor: input.cursor,
+            selection: input.caret_selection_range(),
+        })
+    }
+
     fn backspace_focused_input(&mut self, focused: SettingsAction) -> bool {
+        self.edit_focused_input(focused, |input| input.caret_backspace())
+    }
+
+    /// Run `f` against the focused field's caret model, then apply that
+    /// field's side effects (search re-filter / font-family dirty flag).
+    /// Every editing key routes through here so the two inputs can never
+    /// drift apart again.
+    fn edit_focused_input(
+        &mut self,
+        focused: SettingsAction,
+        f: impl FnOnce(&mut TextInputState),
+    ) -> bool {
         match focused {
             SettingsAction::SearchInput => {
-                self.ui.search.backspace();
+                f(&mut self.ui.search);
                 self.ui.sidebar_scroll.reset();
                 self.sync_selected_section_with_search();
                 true
             }
             SettingsAction::FontFamilyInput => {
-                self.ui.font_family_input.backspace();
+                f(&mut self.ui.font_family_input);
                 self.ui.font_family_input_dirty = true;
                 true
             }
@@ -1980,21 +2017,88 @@ impl SettingsWindow {
         }
     }
 
-    fn push_focused_input(&mut self, focused: SettingsAction, text: &str) -> bool {
-        match focused {
-            SettingsAction::SearchInput => {
-                self.ui.search.push_text(text);
-                self.ui.sidebar_scroll.reset();
-                self.sync_selected_section_with_search();
-                true
+    /// Editing keys for the focused input. `None` means "not an editing key",
+    /// so the caller can fall through to its own handling.
+    fn handle_focused_input_key(
+        &mut self,
+        focused: SettingsAction,
+        event: &KeyEvent,
+        window: &Window,
+    ) -> Option<bool> {
+        let edit = EditModifiers::from(event.modifiers);
+        let shift = edit.shift;
+        let macos = cfg!(target_os = "macos");
+
+        if edit.command {
+            match event.key {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    return Some(
+                        self.edit_focused_input(focused, |input| input.caret_select_all()),
+                    );
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    return Some(self.copy_focused_input(focused, window));
+                }
+                KeyCode::Char('x') | KeyCode::Char('X') => {
+                    return Some(self.cut_focused_input(focused, window));
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    return Some(self.paste_focused_input_from_clipboard(focused, window));
+                }
+                KeyCode::LeftArrow if macos => {
+                    return Some(
+                        self.edit_focused_input(focused, |input| input.caret_move_home(shift)),
+                    );
+                }
+                KeyCode::RightArrow if macos => {
+                    return Some(
+                        self.edit_focused_input(focused, |input| input.caret_move_end(shift)),
+                    );
+                }
+                _ => {}
             }
-            SettingsAction::FontFamilyInput => {
-                self.ui.font_family_input.push_text(text);
-                self.ui.font_family_input_dirty = true;
-                true
-            }
-            _ => false,
         }
+
+        if edit.word {
+            match event.key {
+                KeyCode::LeftArrow => {
+                    return Some(
+                        self.edit_focused_input(focused, |input| input.caret_word_left(shift)),
+                    );
+                }
+                KeyCode::RightArrow => {
+                    return Some(
+                        self.edit_focused_input(focused, |input| input.caret_word_right(shift)),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        if !edit.plain() {
+            return None;
+        }
+
+        match event.key {
+            KeyCode::LeftArrow => {
+                Some(self.edit_focused_input(focused, |input| input.caret_move_left(shift)))
+            }
+            KeyCode::RightArrow => {
+                Some(self.edit_focused_input(focused, |input| input.caret_move_right(shift)))
+            }
+            KeyCode::Home => {
+                Some(self.edit_focused_input(focused, |input| input.caret_move_home(shift)))
+            }
+            KeyCode::End => {
+                Some(self.edit_focused_input(focused, |input| input.caret_move_end(shift)))
+            }
+            _ => None,
+        }
+    }
+
+    fn push_focused_input(&mut self, focused: SettingsAction, text: &str) -> bool {
+        let text = text.to_string();
+        self.edit_focused_input(focused, move |input| input.caret_insert(&text, false))
     }
 
     fn set_focused_input(&mut self, focused: Option<SettingsAction>) {
@@ -2018,7 +2122,7 @@ impl SettingsWindow {
         }
         self.ui.font_family_input_dirty = false;
 
-        let family = self.ui.font_family_input.text.trim();
+        let family = self.ui.font_family_input.text().trim();
         let next = if family.is_empty() {
             None
         } else {
@@ -2042,7 +2146,7 @@ impl SettingsWindow {
     fn current_terminal_font_size_value(&self) -> f64 {
         self.ui
             .font_size_input
-            .text
+            .text()
             .trim()
             .parse::<f64>()
             .ok()
@@ -2052,14 +2156,16 @@ impl SettingsWindow {
 
     fn step_terminal_font_size(&mut self, delta: f64) {
         let value = (self.current_terminal_font_size_value() + delta).clamp(8.0, 48.0);
-        self.ui.font_size_input.text = format!("{value:.1}");
+        self.ui.font_size_input.set_text_end(format!("{value:.1}"));
         self.native_settings.terminal.font_size = Some(value);
         self.save_and_apply_native_terminal_settings();
     }
 
     fn reset_terminal_font_size(&mut self) {
         let config = configuration();
-        self.ui.font_size_input.text = format!("{:.1}", config.font_size);
+        self.ui
+            .font_size_input
+            .set_text_end(format!("{:.1}", config.font_size));
         self.native_settings.terminal.font_size = None;
         self.save_and_apply_native_terminal_settings();
     }
@@ -2090,6 +2196,37 @@ impl SettingsWindow {
                 crate::native_settings::DEFAULT_BOTTOM_QUOTE_INTERVAL_MINUTES
             )
         ));
+    }
+
+    fn current_remote_sftp_idle_minutes(&self) -> u32 {
+        self.native_settings
+            .workspaces
+            .remote_sftp_idle_minutes
+            .clamp(1, 120)
+    }
+
+    fn step_remote_sftp_idle(&mut self, delta: i32) {
+        let value = (self.current_remote_sftp_idle_minutes() as i32 + delta).clamp(1, 120) as u32;
+        self.native_settings.workspaces.remote_sftp_idle_minutes = value;
+        self.save_remote_sftp_idle(value);
+    }
+
+    fn reset_remote_sftp_idle(&mut self) {
+        let value = crate::native_settings::DEFAULT_REMOTE_SFTP_IDLE_MINUTES;
+        self.native_settings.workspaces.remote_sftp_idle_minutes = value;
+        self.save_remote_sftp_idle(value);
+    }
+
+    fn save_remote_sftp_idle(&mut self, value: u32) {
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                crate::termwindow::remote_files::update_remote_connection_idle_timeout(value);
+                self.status = format!("Remote Files idle timeout is now {value} minutes.");
+            }
+            Err(err) => {
+                self.status = format!("Unable to save Remote Files idle timeout: {err:#}");
+            }
+        }
     }
 
     fn format_bottom_quote_interval(minutes: u32) -> String {
@@ -2630,6 +2767,9 @@ impl SettingsWindow {
             SettingsAction::DecreaseBottomQuoteInterval => self.step_bottom_quote_interval(-5),
             SettingsAction::IncreaseBottomQuoteInterval => self.step_bottom_quote_interval(5),
             SettingsAction::ResetBottomQuoteInterval => self.reset_bottom_quote_interval(),
+            SettingsAction::DecreaseRemoteSftpIdle => self.step_remote_sftp_idle(-5),
+            SettingsAction::IncreaseRemoteSftpIdle => self.step_remote_sftp_idle(5),
+            SettingsAction::ResetRemoteSftpIdle => self.reset_remote_sftp_idle(),
             SettingsAction::OpenBottomQuotesJson => {
                 self.ui.open_dropdown = None;
                 match crate::bottom_quotes::ensure_quotes_file() {
@@ -2968,12 +3108,11 @@ impl SettingsWindow {
             }
         }
 
-        let corner_radius =
-            crate::termwindow::render::draw::effective_window_corner_radius(
-                configuration().window_decorations,
-                self.window_state,
-                self.dimensions.dpi,
-            );
+        let corner_radius = crate::termwindow::render::draw::effective_window_corner_radius(
+            configuration().window_decorations,
+            self.window_state,
+            self.dimensions.dpi,
+        );
         let window_border = crate::termwindow::render::draw::effective_window_border(
             configuration().window_decorations,
             self.window_state,
@@ -3271,7 +3410,7 @@ impl SettingsWindow {
             sidebar_width - tokens.sidebar_padding * 2.0,
             tokens.control_height,
         );
-        let search_text = self.ui.search.text.clone();
+        let search_text = self.ui.search.text().to_string();
         self.paint_text_input(
             layers,
             TextInputSpec {
@@ -3495,13 +3634,7 @@ impl SettingsWindow {
             SettingsSection::Compatibility => self.paint_compatibility(layers, x, max_width)?,
             SettingsSection::General => self.paint_general(layers, x, max_width)?,
             SettingsSection::Terminal => self.paint_terminal(layers, x, max_width)?,
-            SettingsSection::Workspaces => self.paint_placeholder(
-                layers,
-                &ui_font,
-                x,
-                "Workspace list, default workspace, sidebar behavior, and saved layouts.",
-                max_width,
-            )?,
+            SettingsSection::Workspaces => self.paint_workspaces(layers, x, max_width)?,
             SettingsSection::Keymap => self.paint_placeholder(
                 layers,
                 &ui_font,
@@ -3773,6 +3906,55 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn paint_workspaces(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        let row_count = 1;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
+        let card_height = self.settings_card_height(row_count);
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(card_y + scroll + card_height),
+        );
+
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            section_y,
+            "Remote Files",
+            palette.muted_text,
+            max_width,
+        )?;
+        let padding = 36.0;
+        let row_x = x + padding;
+        let row_width = max_width - padding * 2.0;
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        let minutes = self.current_remote_sftp_idle_minutes();
+        let value_label = format!("{minutes} min");
+        self.paint_font_size_stepper_row(
+            layers,
+            row_x,
+            first_row_y,
+            row_width,
+            "Remote Files Connection Idle Timeout",
+            "Disconnects an unused SFTP session; directory and preview data are released immediately.",
+            minutes as f64,
+            Some(&value_label),
+            SettingsAction::ResetRemoteSftpIdle,
+            SettingsAction::DecreaseRemoteSftpIdle,
+            SettingsAction::IncreaseRemoteSftpIdle,
+            false,
+        )
+    }
+
     fn paint_terminal(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -3858,7 +4040,7 @@ impl SettingsWindow {
             SettingsAction::IncreaseFontSize,
             true,
         )?;
-        let native_font_family = self.ui.font_family_input.text.clone();
+        let native_font_family = self.ui.font_family_input.text().to_string();
         self.paint_text_setting_row(
             layers,
             row_x,
@@ -4594,7 +4776,8 @@ impl SettingsWindow {
             .memory_snapshot_copied_until
             .is_some_and(|until| Instant::now() < until);
         let copy_label = if copied { "Copied" } else { "Copy" };
-        let copy_x = refresh_x + self.button_width_for_label("Refresh Now", 210.0) + self.ui_px(16.0);
+        let copy_x =
+            refresh_x + self.button_width_for_label("Refresh Now", 210.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             copy_x,
@@ -4616,7 +4799,8 @@ impl SettingsWindow {
             input_primary_label,
             SettingsAction::ToggleInputDiagnostics,
         )?;
-        let reset_input_x = x + self.button_width_for_label(input_primary_label, 250.0) + self.ui_px(16.0);
+        let reset_input_x =
+            x + self.button_width_for_label(input_primary_label, 250.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             reset_input_x,
@@ -4630,7 +4814,8 @@ impl SettingsWindow {
             .input_diagnostics_copied_until
             .is_some_and(|until| Instant::now() < until);
         let input_copy_label = if input_copied { "Copied" } else { "Copy Input" };
-        let copy_input_x = reset_input_x + self.button_width_for_label("Reset Input", 190.0) + self.ui_px(16.0);
+        let copy_input_x =
+            reset_input_x + self.button_width_for_label("Reset Input", 190.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             copy_input_x,
@@ -5078,7 +5263,8 @@ impl SettingsWindow {
             "Load WezTerm Source",
             SettingsAction::LoadWezTermSource,
         )?;
-        let second_x = x + self.button_width_for_label("Load WezTerm Source", 290.0) + self.ui_px(16.0);
+        let second_x =
+            x + self.button_width_for_label("Load WezTerm Source", 290.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             second_x,
@@ -5087,7 +5273,8 @@ impl SettingsWindow {
             "Select All",
             SettingsAction::SelectAllImportFields,
         )?;
-        let third_x = second_x + self.button_width_for_label("Select All", 180.0) + self.ui_px(16.0);
+        let third_x =
+            second_x + self.button_width_for_label("Select All", 180.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             third_x,
@@ -5114,7 +5301,8 @@ impl SettingsWindow {
             "Open WezTerm Source",
             SettingsAction::OpenWezTermConfigFile,
         )?;
-        let fifth_x = x + self.button_width_for_label("Open WezTerm Source", 300.0) + self.ui_px(16.0);
+        let fifth_x =
+            x + self.button_width_for_label("Open WezTerm Source", 300.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             fifth_x,
@@ -5515,7 +5703,8 @@ impl SettingsWindow {
             palette.control_border,
             self.ui_px(CONTROL_RADIUS),
         )?;
-        let preview = self.text_with_ellipsis(&ui_font, &field.preview, value_width - self.ui_px(28.0));
+        let preview =
+            self.text_with_ellipsis(&ui_font, &field.preview, value_width - self.ui_px(28.0));
         self.draw_text(
             layers,
             &ui_font,
@@ -5781,47 +5970,58 @@ impl SettingsWindow {
         } else {
             palette.text
         };
-        let selected_all = match action {
-            SettingsAction::FontFamilyInput => self.ui.font_family_input.selected_all,
-            _ => false,
-        };
-        if focused && selected_all && !value.is_empty() {
-            let selection_width = self
-                .measure_text_width(&ui_font, value)
-                .min((control_width - 32.0).max(0.0));
-            self.draw_rounded_rect(
-                layers,
-                1,
-                control_x + 12.0,
-                control_y + self.ui_px(6.0),
-                selection_width + self.ui_px(8.0),
-                self.ui_px(CONTROL_HEIGHT) - 12.0,
-                palette.nav_selected_bg.mul_alpha(0.56),
-                self.ui_px(CONTROL_RADIUS - 4.0),
-            )?;
+        let text_left = control_x + self.ui_px(16.0);
+        let text_area = (control_width - self.ui_px(32.0)).max(0.0);
+        let selection = self
+            .caret_for_input(action)
+            .and_then(|caret| caret.selection)
+            .filter(|(start, end)| start != end)
+            .or_else(|| {
+                let selected_all = self
+                    .input_state_for(action)
+                    .is_some_and(|input| input.selected_all);
+                (selected_all && !value.is_empty()).then(|| (0, value.chars().count()))
+            });
+        if focused && !value.is_empty() {
+            if let Some((start, end)) = selection {
+                let start_x = self
+                    .text_width_to_char(&ui_font, value, start)
+                    .min(text_area);
+                let end_x = self.text_width_to_char(&ui_font, value, end).min(text_area);
+                self.draw_rounded_rect(
+                    layers,
+                    1,
+                    text_left + start_x - self.ui_px(4.0),
+                    control_y + self.ui_px(6.0),
+                    (end_x - start_x) + self.ui_px(8.0),
+                    self.ui_px(CONTROL_HEIGHT - 12.0),
+                    palette.nav_selected_bg.mul_alpha(0.56),
+                    self.ui_px(CONTROL_RADIUS - 4.0),
+                )?;
+            }
         }
         self.draw_text(
             layers,
             &ui_font,
-            control_x + self.ui_px(16.0),
+            text_left,
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
             display,
             text_color,
-            control_width - 32.0,
+            text_area,
         )?;
-        if focused && !selected_all {
+        if focused && selection.is_none() {
             let caret_text = if value.trim().is_empty() { "" } else { value };
-            let caret_x = control_x
-                + self.ui_px(18.0)
-                + self
-                    .measure_text_width(&ui_font, caret_text)
-                    .min(control_width - 42.0);
+            let caret_dx = match self.caret_for_input(action) {
+                Some(caret) => self.text_width_to_char(&ui_font, caret_text, caret.cursor),
+                None => self.measure_text_width(&ui_font, caret_text),
+            };
+            let caret_width = self.ui_px(3.0).max(1.0);
             self.draw_rect(
                 layers,
                 1,
-                caret_x - 1.0,
+                text_left + caret_dx.min(text_area) - caret_width / 3.0,
                 control_y + self.ui_px(8.0),
-                self.ui_px(3.0).max(1.0),
+                caret_width,
                 self.ui_px(CONTROL_HEIGHT - 16.0),
                 palette.nav_selected_bg,
             )?;
@@ -5978,7 +6178,9 @@ impl SettingsWindow {
             layers,
             &ui_font,
             x,
-            self.settings_row_description_y(y) + self.metrics.cell_size.height as f32 + self.ui_px(4.0),
+            self.settings_row_description_y(y)
+                + self.metrics.cell_size.height as f32
+                + self.ui_px(4.0),
             note,
             palette.muted_text,
             text_width,
@@ -6125,7 +6327,9 @@ impl SettingsWindow {
         } else {
             "Restart"
         };
-        let button_width = self.button_width_for_label(button_label, 0.0).max(self.ui_px(220.0));
+        let button_width = self
+            .button_width_for_label(button_label, 0.0)
+            .max(self.ui_px(220.0));
         let button_x = x + width - button_width;
         let text_width = (button_x - x - 24.0).max(width * 0.45);
         let value = if self.main_renderer_restart_required() {
@@ -6165,7 +6369,11 @@ impl SettingsWindow {
         } else {
             220.0_f32.min(width * 0.44)
         };
-        (x + width - control_width, y + self.ui_px(4.0), control_width)
+        (
+            x + width - control_width,
+            y + self.ui_px(4.0),
+            control_width,
+        )
     }
 
     fn paint_open_dropdown_overlay(
@@ -6337,7 +6545,12 @@ impl SettingsWindow {
 
         let mut row_y = y + menu_padding;
         for (label, action, selected) in options.iter().copied() {
-            let row_rect = rect(x + self.ui_px(8.0), row_y, width - self.ui_px(16.0), row_height);
+            let row_rect = rect(
+                x + self.ui_px(8.0),
+                row_y,
+                width - self.ui_px(16.0),
+                row_height,
+            );
             self.ui_context.push(row_rect, WidgetKind::Button, action);
             let hovered = self.ui.interaction.hovered == Some(action);
             let pressed = self.ui.interaction.pressed == Some(action);
@@ -6419,7 +6632,7 @@ impl SettingsWindow {
     }
 
     fn filtered_sections(&self) -> Vec<SettingsSection> {
-        let query = self.ui.search.text.trim().to_lowercase();
+        let query = self.ui.search.text().trim().to_lowercase();
         let sections = self.visible_sections();
         if query.is_empty() {
             return sections;
@@ -6485,42 +6698,57 @@ impl SettingsWindow {
         } else {
             palette.text
         };
-        if spec.focused && spec.selected_all && !spec.text.is_empty() {
-            let selection_width = self
-                .measure_text_width(&Rc::clone(&self.ui_font), spec.text)
-                .min((spec.rect.size.width - self.ui_px(116.0)).max(0.0));
-            self.draw_rounded_rect(
-                layers,
-                1,
-                spec.rect.origin.x + self.ui_px(54.0),
-                spec.rect.origin.y + self.ui_px(6.0),
-                selection_width + self.ui_px(8.0),
-                spec.rect.size.height - 12.0,
-                palette.nav_selected_bg.mul_alpha(0.56),
-                self.ui.tokens.control_radius - self.ui_px(4.0),
-            )?;
+        let font = Rc::clone(&self.ui_font);
+        let text_left = spec.rect.origin.x + self.ui_px(58.0);
+        let text_area = (spec.rect.size.width - self.ui_px(116.0)).max(0.0);
+        let selection = self
+            .caret_for_input(spec.action)
+            .and_then(|caret| caret.selection)
+            .filter(|(start, end)| start != end)
+            .or_else(|| {
+                (spec.selected_all && !spec.text.is_empty()).then(|| (0, spec.text.chars().count()))
+            });
+        if spec.focused && !spec.text.is_empty() {
+            if let Some((start, end)) = selection {
+                let start_x = self
+                    .text_width_to_char(&font, spec.text, start)
+                    .min(text_area);
+                let end_x = self
+                    .text_width_to_char(&font, spec.text, end)
+                    .min(text_area);
+                self.draw_rounded_rect(
+                    layers,
+                    1,
+                    text_left + start_x - self.ui_px(4.0),
+                    spec.rect.origin.y + self.ui_px(6.0),
+                    (end_x - start_x) + self.ui_px(8.0),
+                    spec.rect.size.height - self.ui_px(12.0),
+                    palette.nav_selected_bg.mul_alpha(0.56),
+                    self.ui.tokens.control_radius - self.ui_px(4.0),
+                )?;
+            }
         }
         self.draw_text(
             layers,
-            &Rc::clone(&self.ui_font),
-            spec.rect.origin.x + self.ui_px(58.0),
+            &font,
+            text_left,
             self.control_text_y(spec.rect.origin.y, spec.rect.size.height),
             text,
             color,
-            spec.rect.size.width - self.ui_px(116.0),
+            text_area,
         )?;
-        if spec.focused && !spec.selected_all {
-            let caret_x = spec.rect.origin.x
-                + self.ui_px(60.0)
-                + self
-                    .measure_text_width(&Rc::clone(&self.ui_font), spec.text)
-                    .min((spec.rect.size.width - 124.0).max(0.0));
+        if spec.focused && selection.is_none() {
+            let caret_dx = match self.caret_for_input(spec.action) {
+                Some(caret) => self.text_width_to_char(&font, spec.text, caret.cursor),
+                None => self.measure_text_width(&font, spec.text),
+            };
+            let caret_width = self.ui_px(3.0).max(1.0);
             self.draw_rect(
                 layers,
                 1,
-                caret_x - 1.0,
+                text_left + caret_dx.min(text_area) - caret_width / 3.0,
                 spec.rect.origin.y + self.ui_px(8.0),
-                self.ui_px(3.0).max(1.0),
+                caret_width,
                 spec.rect.size.height - self.ui_px(16.0),
                 palette.nav_selected_bg,
             )?;

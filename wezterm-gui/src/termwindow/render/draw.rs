@@ -3,12 +3,12 @@ use crate::renderstate::{LoggedSrgbTexture2d, RenderState};
 use crate::termwindow::webgpu::{ShaderUniform, WebGpuState, WebGpuTexture};
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
+use ::window::color::LinearRgba;
 use ::window::glium;
 use ::window::glium::uniforms::{
     MagnifySamplerFilter, MinifySamplerFilter, Sampler, SamplerWrapFunction,
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
-use ::window::color::LinearRgba;
 use ::window::{Appearance, Dimensions, WindowDecorations, WindowState};
 use config::FreeTypeLoadTarget;
 
@@ -69,9 +69,7 @@ pub(crate) fn effective_window_border(
         Appearance::Light | Appearance::LightHighContrast => {
             LinearRgba::with_srgba(199, 199, 204, 255)
         }
-        Appearance::Dark | Appearance::DarkHighContrast => {
-            LinearRgba::with_srgba(68, 68, 76, 255)
-        }
+        Appearance::Dark | Appearance::DarkHighContrast => LinearRgba::with_srgba(68, 68, 76, 255),
     };
     WindowBorder {
         width: LINUX_WINDOW_BORDER_WIDTH * dpi.max(1) as f32 / 96.0,
@@ -433,8 +431,7 @@ mod tests {
     #[test]
     fn linux_corner_radius_only_applies_to_floating_client_chrome() {
         let decorations = WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE;
-        let radius =
-            effective_window_corner_radius(decorations, WindowState::COMPOSITED, 96);
+        let radius = effective_window_corner_radius(decorations, WindowState::COMPOSITED, 96);
         if cfg!(target_os = "linux") {
             assert_eq!(radius, LINUX_WINDOW_CORNER_RADIUS);
         } else {
@@ -448,11 +445,7 @@ mod tests {
             WindowState::SERVER_DECORATED,
         ] {
             assert_eq!(
-                effective_window_corner_radius(
-                    decorations,
-                    state | WindowState::COMPOSITED,
-                    96,
-                ),
+                effective_window_corner_radius(decorations, state | WindowState::COMPOSITED, 96,),
                 0.0
             );
         }
@@ -473,18 +466,10 @@ mod tests {
     #[test]
     fn linux_window_border_tracks_appearance_and_floating_state() {
         let decorations = WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE;
-        let dark = effective_window_border(
-            decorations,
-            WindowState::COMPOSITED,
-            96,
-            Appearance::Dark,
-        );
-        let light = effective_window_border(
-            decorations,
-            WindowState::COMPOSITED,
-            96,
-            Appearance::Light,
-        );
+        let dark =
+            effective_window_border(decorations, WindowState::COMPOSITED, 96, Appearance::Dark);
+        let light =
+            effective_window_border(decorations, WindowState::COMPOSITED, 96, Appearance::Light);
         if cfg!(target_os = "linux") {
             assert_eq!(dark.width, 1.0);
             assert_eq!(light.width, 1.0);

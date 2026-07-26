@@ -445,11 +445,19 @@ impl GuiFrontEnd {
                 }
 
                 let mux = Mux::get();
-                let Some(mux_window) = mux.get_window(mux_window_id) else {
-                    continue;
+                let (is_domain_owned, window_workspace) = {
+                    let Some(mux_window) = mux.get_window(mux_window_id) else {
+                        continue;
+                    };
+                    (
+                        mux_window.origin_domain().is_some(),
+                        mux_window.get_workspace().to_string(),
+                    )
                 };
-                let is_domain_owned = mux_window.origin_domain().is_some();
-                let window_workspace = mux_window.get_workspace();
+                // `get_window` holds a read guard for the mux's complete
+                // window map. Drop it before awaiting native window creation:
+                // startup content views register a UI surface, which needs the
+                // write side of the same lock.
 
                 // Client domains mirror every remote mux window locally when
                 // they attach. That includes the server's own startup
@@ -459,7 +467,7 @@ impl GuiFrontEnd {
                 // giving them a GUI window creates the stray "local Space with
                 // a remote terminal" window and tangles its lifecycle with the
                 // real thread window.
-                if !should_spawn_reconciled_gui_window(is_domain_owned, window_workspace) {
+                if !should_spawn_reconciled_gui_window(is_domain_owned, &window_workspace) {
                     log::debug!(
                         "reconcile: leaving background domain window {} in workspace {:?} hidden",
                         mux_window_id,

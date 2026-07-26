@@ -48,6 +48,13 @@ impl<'a> DrawContext<'a> {
         crate::ui::scale_ui_f32(value, self.dimensions.dpi)
     }
 
+    /// Design-pixel -> physical-pixel ratio for this surface. Use it when a
+    /// helper needs the raw factor (e.g. to stay unit-testable); prefer
+    /// [`Self::px`] for one-off conversions.
+    pub(crate) fn scale(&self) -> f32 {
+        crate::ui::ui_scale_for_dpi(self.dimensions.dpi)
+    }
+
     pub(crate) fn draw_rect(
         &self,
         layers: &mut TripleLayerQuadAllocator<'_>,

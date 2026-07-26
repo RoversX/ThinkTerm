@@ -1,6 +1,10 @@
 use std::time::Instant;
 use window::ScrollPhase;
 
+/// Shortest scrollbar thumb, in design pixels, used by the legacy
+/// [`ScrollState::thumb`] entry point. Scaled callers pass their own minimum.
+const DEFAULT_MIN_THUMB_EXTENT: f32 = 32.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct WidgetId(pub u64);
 
@@ -67,9 +71,12 @@ impl<A: Copy + PartialEq> Default for InteractionState<A> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct TextInputState {
-    pub text: String,
+    /// Private on purpose. Assigning this directly leaves `cursor` stale, which
+    /// silently breaks typing and Backspace in a prefilled field; go through
+    /// [`Self::set_text_end`] or the caret methods instead.
+    text: String,
     /// Cached "whole text selected" flag. Kept in sync by every mutator so the
     /// simple consumers (settings window, widgets) can keep reading it, while
     /// the sidebar uses the richer caret/selection model below.
@@ -137,6 +144,10 @@ impl TextInputState {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
     }
 
     pub(crate) fn select_all(&mut self) {
@@ -502,12 +513,24 @@ impl ScrollState {
         self.max_offset() > 0.5
     }
 
+    /// Legacy entry point that assumes an unscaled minimum thumb length.
+    /// Prefer [`Self::thumb_with_min`] and pass `UiTokens::scrollbar_min_thumb`
+    /// so the thumb keeps its proportions on non-1.0 displays.
     pub(crate) fn thumb(&self, track_start: f32, track_extent: f32) -> Option<(f32, f32)> {
+        self.thumb_with_min(track_start, track_extent, DEFAULT_MIN_THUMB_EXTENT)
+    }
+
+    pub(crate) fn thumb_with_min(
+        &self,
+        track_start: f32,
+        track_extent: f32,
+        min_extent: f32,
+    ) -> Option<(f32, f32)> {
         if !self.has_overflow() || track_extent <= 0.0 || self.content_extent <= 0.0 {
             return None;
         }
         let ratio = (self.viewport_extent / self.content_extent).clamp(0.08, 1.0);
-        let thumb_extent = (track_extent * ratio).max(32.0).min(track_extent);
+        let thumb_extent = (track_extent * ratio).max(min_extent).min(track_extent);
         let travel = (track_extent - thumb_extent).max(0.0);
         let progress = if self.max_offset() <= 0.0 {
             0.0
@@ -655,5 +678,29 @@ mod text_input_tests {
         let mut i = input("ab");
         i.caret_set(99, false);
         assert_eq!(i.cursor, 2);
+    }
+
+    #[test]
+    fn set_text_end_leaves_the_caret_after_the_text() {
+        // Prefilling a field by assigning `.text` used to leave the caret at 0,
+        // so typing inserted at the front and Backspace did nothing. Every
+        // prefill must go through here instead.
+        let mut input = TextInputState::new();
+        input.set_text_end("Fira Code".to_string());
+        assert_eq!(input.cursor, input.char_len());
+        assert_eq!(input.caret_selection_range(), None);
+        assert!(!input.selected_all);
+
+        input.caret_backspace();
+        assert_eq!(input.text, "Fira Cod");
+    }
+
+    #[test]
+    fn set_text_end_handles_multibyte_text() {
+        let mut input = TextInputState::new();
+        input.set_text_end("字体名称".to_string());
+        assert_eq!(input.cursor, 4);
+        input.caret_backspace();
+        assert_eq!(input.text, "字体名");
     }
 }

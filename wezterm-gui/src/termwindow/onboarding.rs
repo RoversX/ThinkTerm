@@ -203,6 +203,8 @@ impl PendingProject {
 }
 
 pub(crate) struct OnboardingView {
+    /// UI scale captured at paint time; mouse handlers get no `DrawContext`.
+    last_ui_scale: f32,
     step: Step,
     widgets: UiContext<OnboardingAction>,
     interaction: InteractionState<OnboardingAction>,
@@ -237,6 +239,7 @@ impl OnboardingView {
             show_left_sidebar: settings.onboarding.show_left_sidebar_by_default,
             status: None,
             transition: None,
+            last_ui_scale: 1.0,
         }
     }
 
@@ -314,7 +317,8 @@ impl OnboardingView {
         match kind {
             WMEK::VertWheel(amount) if self.step == Step::ReviewProjects => {
                 let old = self.review_scroll.offset;
-                self.review_scroll.scroll_by(wheel_delta_pixels(amount));
+                self.review_scroll
+                    .scroll_by(wheel_delta_pixels(amount, self.last_ui_scale));
                 if (self.review_scroll.offset - old).abs() > 0.01 {
                     ContentViewResponse::Redraw
                 } else {
@@ -615,6 +619,7 @@ impl OnboardingView {
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
         self.widgets.clear();
+        self.last_ui_scale = ctx.scale();
         let tokens = UiTokens::for_dpi(ctx.dimensions.dpi);
         ctx.draw_rect(
             layers,
@@ -1171,7 +1176,9 @@ impl OnboardingView {
             area.size.width * 0.42,
         )?;
 
-        let track_w = (area.size.width * 0.46).min(ctx.px(520.0)).max(ctx.px(280.0));
+        let track_w = (area.size.width * 0.46)
+            .min(ctx.px(520.0))
+            .max(ctx.px(280.0));
         let track_x = area.origin.x + area.size.width - track_w;
         let center_y = area.origin.y + area.size.height / 2.0;
         let segment_w = track_w / steps.len().max(1) as f32;
@@ -1713,7 +1720,8 @@ impl OnboardingView {
         )?;
         let text_w = ctx.measure_text_width(font, label);
         let max_text_w = (area.size.width - 24.0).max(0.0);
-        let x = area.origin.x + ((area.size.width - text_w.min(max_text_w)) / 2.0).max(ctx.px(12.0));
+        let x =
+            area.origin.x + ((area.size.width - text_w.min(max_text_w)) / 2.0).max(ctx.px(12.0));
         ctx.draw_text(
             layers,
             font,

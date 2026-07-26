@@ -15,10 +15,43 @@ use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::RectF;
 
+/// Geometry below is authored in *design pixels* (the 2x macOS backing grid)
+/// and must be converted with [`DrawContext::px`] at the point of use, exactly
+/// like the callers size their rects. Mixing a scaled rect with an unscaled
+/// inset silently breaks every display whose scale is not 1.0 — see
+/// `ui::tokens::ui_scale_for_dpi`.
+///
+/// Horizontal inset for a button label; the available text width is the button
+/// width minus this on *both* sides. Callers size buttons as
+/// `measure_text_width(label) + px(36)`, which leaves 8 design px of slack.
+const BUTTON_TEXT_PAD: f32 = 14.0;
+const BUTTON_RADIUS: f32 = 8.0;
+const ICON_BUTTON_RADIUS: f32 = 8.0;
+/// Icon side length is derived from the (already DPI-aware) cell height, so
+/// only the padding and the clamp bounds are design pixels.
+const ICON_CELL_PADDING: f32 = 4.0;
+const ICON_MIN_SIZE: f32 = 20.0;
+const ICON_MAX_SIZE: f32 = 30.0;
+/// Selection highlight bleeds this far outside the text box's text area.
+const INPUT_SELECTION_BLEED_X: f32 = 4.0;
+/// Vertical inset of the selection highlight / caret inside the text box.
+const INPUT_SELECTION_INSET_Y: f32 = 5.0;
+const INPUT_SELECTION_RADIUS_INSET: f32 = 5.0;
+const INPUT_SELECTION_MIN_RADIUS: f32 = 3.0;
+const CARET_WIDTH: f32 = 3.0;
+/// Gap between the toggle track edge and its knob.
+const TOGGLE_KNOB_INSET: f32 = 2.0;
+
 /// Vertically center single-line text of the UI font within `height`.
 fn control_text_y(ctx: &DrawContext, y: f32, height: f32) -> f32 {
     let cell_height = ctx.metrics.cell_size.height as f32;
     y + ((height - cell_height) / 2.0).max(0.0)
+}
+
+/// Width available for a button's label inside `button_width`. Split out so the
+/// pairing with [`BUTTON_TEXT_PAD`] can be unit-tested without a GPU context.
+pub(crate) fn button_label_width(button_width: f32, scale: f32) -> f32 {
+    button_width - BUTTON_TEXT_PAD * 2.0 * scale
 }
 
 /// A filled, rounded button with a centered-left label. The caller fills
@@ -42,16 +75,16 @@ pub(crate) fn draw_button<A: Copy + PartialEq>(
         spec.rect.size.height,
         background,
         border,
-        8.0,
+        ctx.px(BUTTON_RADIUS),
     )?;
     ctx.draw_text(
         layers,
         font,
-        spec.rect.origin.x + 14.0,
+        spec.rect.origin.x + ctx.px(BUTTON_TEXT_PAD),
         control_text_y(ctx, spec.rect.origin.y, spec.rect.size.height),
         spec.label,
         palette.text,
-        spec.rect.size.width - 28.0,
+        button_label_width(spec.rect.size.width, ctx.scale()),
     )?;
     Ok(())
 }
@@ -82,9 +115,12 @@ pub(crate) fn draw_icon_button<A: Copy + PartialEq>(
         LinearRgba::TRANSPARENT
     };
     if bg.3 > 0.0 {
-        ctx.draw_rounded_rect(layers, 0, x, y, size, size, bg, 8.0)?;
+        ctx.draw_rounded_rect(layers, 0, x, y, size, size, bg, ctx.px(ICON_BUTTON_RADIUS))?;
     }
-    let icon_size = (ctx.metrics.cell_size.height as f32 + 4.0).clamp(20.0, 30.0);
+    // cell_size already tracks the window DPI, so only the padding and the
+    // clamp bounds need converting from design pixels.
+    let icon_size = (ctx.metrics.cell_size.height as f32 + ctx.px(ICON_CELL_PADDING))
+        .clamp(ctx.px(ICON_MIN_SIZE), ctx.px(ICON_MAX_SIZE));
     ctx.draw_svg_icon(
         layers,
         icon,
@@ -99,8 +135,74 @@ pub(crate) fn draw_icon_button<A: Copy + PartialEq>(
     )
 }
 
+/// Caret and selection to render inside a text field, in char indices into the
+/// field's text. `None` at the call site keeps the legacy behaviour: the caret
+/// pins to the end of the text and only whole-text selection can be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct InputCaret {
+    pub cursor: usize,
+    /// Ordered `(start, end)` char range; empty ranges are treated as no
+    /// selection.
+    pub selection: Option<(usize, usize)>,
+}
+
+/// Width of `text[..char_idx]` as it will actually be drawn. Shares
+/// [`DrawContext::measure_text_width`] with the renderer so caret placement can
+/// never drift from the glyphs.
+pub(crate) fn text_width_to_char(
+    ctx: &DrawContext,
+    font: &Rc<LoadedFont>,
+    text: &str,
+    char_idx: usize,
+) -> f32 {
+    let byte_idx = text
+        .char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    ctx.measure_text_width(font, &text[..byte_idx])
+}
+
+/// Char index nearest to `dx` (an offset from the start of the text). Rounds to
+/// the closer boundary so clicking the right half of a glyph lands after it,
+/// which is what every native text field does.
+pub(crate) fn char_index_for_x(
+    ctx: &DrawContext,
+    font: &Rc<LoadedFont>,
+    text: &str,
+    dx: f32,
+) -> usize {
+    if text.is_empty() || dx <= 0.0 {
+        return 0;
+    }
+    let char_len = text.chars().count();
+    // Binary search for the last boundary that still starts before `dx`, then
+    // pick whichever of the two neighbouring boundaries is closer.
+    let (mut low, mut high) = (0usize, char_len);
+    while low < high {
+        let mid = (low + high + 1) / 2;
+        if text_width_to_char(ctx, font, text, mid) <= dx {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    if low >= char_len {
+        return char_len;
+    }
+    let before = text_width_to_char(ctx, font, text, low);
+    let after = text_width_to_char(ctx, font, text, low + 1);
+    if dx - before > (after - before) / 2.0 {
+        low + 1
+    } else {
+        low
+    }
+}
+
 /// A single-line text field with placeholder, focus ring and caret. `text_pad`
-/// is the horizontal inset for the text (left/right).
+/// is the horizontal inset for the text (left/right). Pass `caret` to render a
+/// real caret position and partial selection; see [`InputCaret`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_text_input<A: Copy + PartialEq>(
     ctx: &DrawContext,
     layers: &mut TripleLayerQuadAllocator<'_>,
@@ -112,6 +214,7 @@ pub(crate) fn draw_text_input<A: Copy + PartialEq>(
     text_pad: f32,
     cursor_on: bool,
     spec: TextInputSpec<'_, A>,
+    caret: Option<InputCaret>,
 ) -> anyhow::Result<()> {
     widgets.push(spec.rect, WidgetKind::TextInput, spec.action);
     let border = if spec.focused {
@@ -143,43 +246,63 @@ pub(crate) fn draw_text_input<A: Copy + PartialEq>(
     } else {
         palette.text
     };
-    if spec.focused && spec.selected_all && !spec.text.is_empty() {
-        let selection_width = ctx
-            .measure_text_width(font, spec.text)
-            .min((spec.rect.size.width - text_pad * 2.0).max(0.0));
-        ctx.draw_rounded_rect(
-            layers,
-            1,
-            spec.rect.origin.x + text_pad - 4.0,
-            spec.rect.origin.y + 5.0,
-            selection_width + 8.0,
-            spec.rect.size.height - 10.0,
-            palette.selected_bg.mul_alpha(0.56),
-            (tokens.control_radius - 5.0).max(3.0),
-        )?;
+    let text_left = spec.rect.origin.x + text_pad;
+    let text_area = (spec.rect.size.width - text_pad * 2.0).max(0.0);
+    let bleed_x = ctx.px(INPUT_SELECTION_BLEED_X);
+    let inset_y = ctx.px(INPUT_SELECTION_INSET_Y);
+    let highlight_y = spec.rect.origin.y + inset_y;
+    let highlight_h = (spec.rect.size.height - inset_y * 2.0).max(0.0);
+    let highlight_radius = (tokens.control_radius - ctx.px(INPUT_SELECTION_RADIUS_INSET))
+        .max(ctx.px(INPUT_SELECTION_MIN_RADIUS));
+
+    // Explicit range wins; `selected_all` is the legacy whole-text fallback.
+    let selection = caret
+        .and_then(|caret| caret.selection)
+        .filter(|(start, end)| start != end)
+        .or_else(|| {
+            (spec.selected_all && !spec.text.is_empty()).then(|| (0, spec.text.chars().count()))
+        });
+
+    if spec.focused && !spec.text.is_empty() {
+        if let Some((start, end)) = selection {
+            let start_x = text_width_to_char(ctx, font, spec.text, start).min(text_area);
+            let end_x = text_width_to_char(ctx, font, spec.text, end).min(text_area);
+            ctx.draw_rounded_rect(
+                layers,
+                1,
+                text_left + start_x - bleed_x,
+                highlight_y,
+                (end_x - start_x) + bleed_x * 2.0,
+                highlight_h,
+                palette.selected_bg.mul_alpha(0.56),
+                highlight_radius,
+            )?;
+        }
     }
     ctx.draw_text(
         layers,
         font,
-        spec.rect.origin.x + text_pad,
+        text_left,
         control_text_y(ctx, spec.rect.origin.y, spec.rect.size.height),
         text,
         color,
-        (spec.rect.size.width - text_pad * 2.0).max(0.0),
+        text_area,
     )?;
-    if spec.focused && !spec.selected_all && cursor_on {
-        let caret_x = spec.rect.origin.x
-            + text_pad
-            + ctx
-                .measure_text_width(font, spec.text)
-                .min((spec.rect.size.width - text_pad * 2.0).max(0.0));
+    if spec.focused && selection.is_none() && cursor_on {
+        // Without an explicit caret the field can only pin to the end of the
+        // text, which is the pre-caret behaviour.
+        let caret_dx = match caret {
+            Some(caret) => text_width_to_char(ctx, font, spec.text, caret.cursor),
+            None => ctx.measure_text_width(font, spec.text),
+        };
+        let caret_width = ctx.px(CARET_WIDTH);
         ctx.draw_rect(
             layers,
             1,
-            caret_x - 1.0,
-            spec.rect.origin.y + 5.0,
-            3.0,
-            spec.rect.size.height - 10.0,
+            text_left + caret_dx.min(text_area) - caret_width / 3.0,
+            highlight_y,
+            caret_width,
+            highlight_h,
             palette.selected_bg,
         )?;
     }
@@ -213,17 +336,18 @@ pub(crate) fn draw_toggle<A: Copy + PartialEq>(
         track,
         h / 2.0,
     )?;
-    let knob = (h - 4.0).max(2.0);
+    let inset = ctx.px(TOGGLE_KNOB_INSET);
+    let knob = (h - inset * 2.0).max(inset);
     let knob_x = if on {
-        rect.origin.x + rect.size.width - knob - 2.0
+        rect.origin.x + rect.size.width - knob - inset
     } else {
-        rect.origin.x + 2.0
+        rect.origin.x + inset
     };
     ctx.draw_rounded_rect(
         layers,
         1,
         knob_x,
-        rect.origin.y + 2.0,
+        rect.origin.y + inset,
         knob,
         knob,
         LinearRgba::with_components(1.0, 1.0, 1.0, 1.0),
@@ -243,7 +367,9 @@ pub(crate) fn draw_scrollbar(
     scroll: ScrollState,
 ) -> anyhow::Result<()> {
     let spec = ScrollbarSpec::from_area(area, tokens);
-    if let Some((thumb_y, thumb_h)) = scroll.thumb(spec.y, spec.height) {
+    if let Some((thumb_y, thumb_h)) =
+        scroll.thumb_with_min(spec.y, spec.height, tokens.scrollbar_min_thumb)
+    {
         ctx.draw_rounded_rect(
             layers,
             0,
@@ -256,4 +382,39 @@ pub(crate) fn draw_scrollbar(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{button_label_width, BUTTON_TEXT_PAD};
+
+    /// Callers size buttons as `measure_text_width(label) + px(36)`. The label
+    /// must still fit after the widget subtracts its own insets, at *every*
+    /// scale — mixing a scaled width with unscaled insets is what truncated
+    /// "Save & Open" into "Save & O..." on 96dpi displays.
+    #[test]
+    fn label_always_fits_the_button_the_caller_sized() {
+        const CALLER_PAD: f32 = 36.0;
+        for scale in [0.25, 0.5, 0.75, 1.0, 2.0] {
+            for measured in [0.0, 12.5, 61.0, 168.0] {
+                let button_width = measured + CALLER_PAD * scale;
+                let available = button_label_width(button_width, scale);
+                assert!(
+                    available >= measured,
+                    "scale {scale}: {available} < {measured}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insets_are_symmetric() {
+        // 8 design px of slack at scale 1.0, matching the settings window's
+        // own 44/36 pairing.
+        assert_eq!(
+            button_label_width(100.0, 1.0),
+            100.0 - BUTTON_TEXT_PAD * 2.0
+        );
+        assert_eq!(button_label_width(100.0, 0.5), 100.0 - BUTTON_TEXT_PAD);
+    }
 }

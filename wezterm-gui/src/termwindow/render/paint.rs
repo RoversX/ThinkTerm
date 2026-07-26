@@ -515,9 +515,7 @@ impl crate::TermWindow {
         };
 
         let gl_state = self.render_state.as_ref().unwrap();
-        let layer = gl_state
-            .layer_for_zindex(0)
-            .context("drag ghost layer")?;
+        let layer = gl_state.layer_for_zindex(0).context("drag ghost layer")?;
         let mut layers = layer.quad_allocator();
 
         let ctx = DrawContext::new(gl_state, self.dimensions, &metrics);

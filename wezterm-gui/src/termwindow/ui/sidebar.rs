@@ -287,9 +287,7 @@ impl crate::TermWindow {
     ) -> workspace_threads::WorkspaceThreadsView {
         let hidden = crate::native_settings::workspace_sidebar_hidden_statuses()
             .iter()
-            .filter_map(|key| {
-                workspace_threads::WorkspaceThreadWorkStatus::from_settings_key(key)
-            })
+            .filter_map(|key| workspace_threads::WorkspaceThreadWorkStatus::from_settings_key(key))
             .collect::<Vec<_>>();
         if !hidden.is_empty() {
             workspace_threads::filter_threads_view_by_status(&mut view, &hidden);
@@ -599,13 +597,12 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view = self.apply_workspace_thread_status_filter(
-            workspace_threads::view_for_current_project(
+        let view =
+            self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
                 &self.active_space_id,
                 &active_workspace,
                 &workspaces,
-            ),
-        );
+            ));
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
             &view,
@@ -648,13 +645,12 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view = self.apply_workspace_thread_status_filter(
-            workspace_threads::view_for_current_project(
+        let view =
+            self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
                 &self.active_space_id,
                 &active_workspace,
                 &workspaces,
-            ),
-        );
+            ));
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
             &view,
@@ -868,13 +864,12 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view = self.apply_workspace_thread_status_filter(
-            workspace_threads::view_for_current_project(
+        let view =
+            self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
                 &self.active_space_id,
                 &active_workspace,
                 &workspaces,
-            ),
-        );
+            ));
 
         let header_icon_size = icon_size.min(self.ui_px(32));
         let button_size = (header_icon_size + self.ui_px(8)).clamp(self.ui_px(32), self.ui_px(40));
@@ -898,14 +893,13 @@ impl crate::TermWindow {
                     self.window_state,
                 )
         };
-        let top_fancy_row = if self.show_tab_bar
-            && self.config.use_fancy_tab_bar
-            && !self.config.tab_bar_at_bottom
-        {
-            self.tab_bar_pixel_height().ok().map(|h| h.ceil() as usize)
-        } else {
-            None
-        };
+        let top_fancy_row =
+            if self.show_tab_bar && self.config.use_fancy_tab_bar && !self.config.tab_bar_at_bottom
+            {
+                self.tab_bar_pixel_height().ok().map(|h| h.ceil() as usize)
+            } else {
+                None
+            };
         let sidebar_toggle_y = if sidebar_toolbar_uses_fullscreen_style {
             header_y + self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET)
         } else if let Some(row_h) = top_fancy_row {

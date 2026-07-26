@@ -475,6 +475,13 @@ pub(crate) async fn connect_domain_into_space(
     let config = config::configuration();
     config.update_ulimit()?;
 
+    // Keep the claimed connect window alive from the authentication UI all
+    // the way through creation of its first remote pane. ClientDomain::attach
+    // has its own Activity, but drops it before returning; closing the
+    // ConnectionUI can then prune this still-empty window before spawn()
+    // installs the first tab.
+    let connect_activity = mux::activity::Activity::new();
+
     // The ConnectionUI (auth prompts) appears as a tab inside this window.
     // Transient network failures (VPN egress rotation, sleepy wifi) are
     // common on the way to a remote mux; keep retrying with backoff instead
@@ -534,6 +541,7 @@ pub(crate) async fn connect_domain_into_space(
             )
             .await?;
     }
+    drop(connect_activity);
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
 
     // No explicit workspace rename AFTER attach: the window was created in

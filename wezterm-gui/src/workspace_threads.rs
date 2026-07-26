@@ -891,7 +891,8 @@ pub fn view_for_current_project(
         return store.view_for_project(space_id, &project_id, live_workspaces);
     }
 
-    current_project_for_workspace(space_id, active_workspace).view(live_workspaces)
+    let is_remote = store.is_client_domain_space(space_id);
+    current_project_for_workspace(space_id, active_workspace).view(live_workspaces, is_remote)
 }
 
 pub fn sync_current_project(space_id: &str, active_workspace: &str) -> bool {
@@ -1030,7 +1031,7 @@ pub fn project_is_remote(project_id: &str) -> bool {
         .projects
         .iter()
         .find(|project| project.id == project_id)
-        .is_some_and(is_remote_project)
+        .is_some_and(|project| is_remote_project(project, &store.spaces))
 }
 
 pub fn refresh_thread_work_for_pane(pane_id: PaneId) -> bool {
@@ -1509,6 +1510,67 @@ pub fn project_reveal_path(project_id: &str) -> Option<PathBuf> {
     store.project_reveal_path(project_id)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteFilesSource {
+    SshHost(String),
+    ClientDomain(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteFilesTarget {
+    pub project_id: String,
+    pub project_name: String,
+    pub source: RemoteFilesSource,
+    /// Remote spelling as stored by the workspace model.  This is deliberately
+    /// a String rather than PathBuf: joining is performed by the slash-only
+    /// RemotePath type in the SFTP layer.
+    pub requested_root: String,
+}
+
+/// Resolve the remote file source and root for the active project without
+/// consulting the local filesystem.
+pub fn remote_files_target(space_id: &str, project_id: &str) -> Option<RemoteFilesTarget> {
+    let store = THREAD_STORE.lock();
+    store.remote_files_target(space_id, project_id)
+}
+
+impl WorkspaceThreadStore {
+    fn remote_files_target(&self, space_id: &str, project_id: &str) -> Option<RemoteFilesTarget> {
+        let project = self
+            .projects
+            .iter()
+            .find(|project| project.space_id == space_id && project.id == project_id)?;
+        if !is_remote_project(project, &self.spaces) {
+            return None;
+        }
+
+        let source = if let Some(domain) = self
+            .spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .and_then(|space| space.client_domain.clone())
+        {
+            RemoteFilesSource::ClientDomain(domain)
+        } else {
+            RemoteFilesSource::SshHost(remote_host_id_for_project_id(&project.id).to_string())
+        };
+        let stored = project.path.to_string_lossy();
+        let requested_root = if stored.starts_with("wezterm-mux://") || stored.starts_with("ssh://")
+        {
+            "~".to_string()
+        } else {
+            stored.into_owned()
+        };
+
+        Some(RemoteFilesTarget {
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
+            source,
+            requested_root,
+        })
+    }
+}
+
 pub fn workspace_pane_font_scales(
     workspace: &str,
     window_id: MuxWindowId,
@@ -1668,7 +1730,7 @@ fn thread_views_for_project(
 }
 
 impl Project {
-    fn view(&self, live_workspaces: &[String]) -> WorkspaceThreadsView {
+    fn view(&self, live_workspaces: &[String], is_remote: bool) -> WorkspaceThreadsView {
         WorkspaceThreadsView {
             pinned_threads: vec![],
             projects: vec![ProjectView {
@@ -1677,7 +1739,7 @@ impl Project {
                 is_active: true,
                 threads_collapsed: self.threads_collapsed,
                 threads: thread_views_for_project(self, Some(&self.id), live_workspaces),
-                is_remote: is_remote_project(self),
+                is_remote,
                 distro: None,
             }],
         }
@@ -1962,7 +2024,7 @@ impl WorkspaceThreadStore {
             .iter()
             .filter(|project| project.space_id == space_id)
             .map(|project| {
-                let is_remote = is_remote_project(project);
+                let is_remote = is_remote_project(project, &self.spaces);
                 ProjectView {
                     id: project.id.clone(),
                     name: project.name.clone(),
@@ -1997,7 +2059,7 @@ impl WorkspaceThreadStore {
             .projects
             .iter()
             .find(|project| project.id == project_id)?;
-        if is_remote_project(project) || !project.path.is_dir() {
+        if is_remote_project(project, &self.spaces) || !project.path.is_dir() {
             return None;
         }
         Some(project.path.clone())
@@ -2125,8 +2187,9 @@ impl WorkspaceThreadStore {
 
     fn repair_cross_space_local_workspace_bindings(&mut self) -> bool {
         let mut changed = false;
+        let spaces = &self.spaces;
         for project in &mut self.projects {
-            if is_remote_project(project) {
+            if is_remote_project(project, spaces) {
                 continue;
             }
             for session in &mut project.threads {
@@ -2390,6 +2453,9 @@ impl WorkspaceThreadStore {
 
     fn restorable_thread_id_for_project(&self, project_index: usize) -> Option<WorkspaceThreadId> {
         let project = self.projects.get(project_index)?;
+        if self.is_client_domain_space(&project.space_id) {
+            return None;
+        }
         project
             .active_thread_id
             .as_ref()
@@ -2494,7 +2560,7 @@ impl WorkspaceThreadStore {
             project_name: project.name.clone(),
             thread_name: session.name.clone(),
             workspace_name: workspace_name.clone(),
-            is_remote: is_remote_project(project),
+            is_remote: is_remote_project(project, &self.spaces),
             is_live: live_workspaces.iter().any(|live| live == &workspace_name),
         })
     }
@@ -2521,7 +2587,7 @@ impl WorkspaceThreadStore {
         // Never write a local layout for mux-domain threads; the remote mux
         // server owns the layout truth (second layer under the window-origin
         // tag guard in snapshot_active_space_thread_layout_with_font_scales).
-        if is_mux_domain_project_id(&project_id) {
+        if self.is_client_domain_space(space_id) || is_mux_domain_project_id(&project_id) {
             return false;
         }
         let Some(project) = self
@@ -2895,7 +2961,7 @@ impl WorkspaceThreadStore {
             return EndWorkspaceThreadResult::Noop;
         };
 
-        if !is_remote_project(&self.projects[project_index]) {
+        if !is_remote_project(&self.projects[project_index], &self.spaces) {
             return EndWorkspaceThreadResult::Noop;
         }
 
@@ -2935,7 +3001,7 @@ impl WorkspaceThreadStore {
             return (None, false);
         };
 
-        if !is_remote_project(&self.projects[project_index]) {
+        if !is_remote_project(&self.projects[project_index], &self.spaces) {
             return (None, false);
         }
 
@@ -3726,10 +3792,13 @@ fn scan_workspace_work_status(workspace: &str) -> WorkspaceThreadWorkStatus {
     }
 }
 
-fn is_remote_project(project: &Project) -> bool {
+fn is_remote_project(project: &Project, spaces: &[Space]) -> bool {
     project.id.starts_with("ssh-")
         || project.id.starts_with("system-ssh-")
         || project.path.to_string_lossy().starts_with("ssh://")
+        || spaces
+            .iter()
+            .any(|space| space.id == project.space_id && space.client_domain.is_some())
 }
 
 fn thread_has_restorable_workspace(thread: &WorkspaceThread) -> bool {
@@ -4739,6 +4808,71 @@ mod tests {
     }
 
     #[test]
+    fn mux_domain_path_project_is_remote_even_when_path_exists_locally() {
+        let space_id = default_space_id();
+        let dir = tempdir().unwrap();
+        let mut store = test_store();
+        store.spaces[0].client_domain = Some("remote-mux".to_string());
+
+        let materialized_workspace = "thinkterm:other-project:thread-other".to_string();
+        let thread = WorkspaceThread::new(
+            "project-path".to_string(),
+            "main".to_string(),
+            Some(materialized_workspace.clone()),
+        );
+        let thread_id = thread.id.clone();
+        let mut project = test_project(
+            "project-path",
+            "Remote path",
+            dir.path().to_path_buf(),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-path".to_string());
+
+        assert_eq!(
+            store
+                .remote_files_target(&space_id, "project-path")
+                .expect("remote Files target"),
+            RemoteFilesTarget {
+                project_id: "project-path".to_string(),
+                project_name: "Remote path".to_string(),
+                source: RemoteFilesSource::ClientDomain("remote-mux".to_string()),
+                requested_root: dir.path().to_string_lossy().into_owned(),
+            }
+        );
+        let view = store.view_for_project(&space_id, "project-path", &[]);
+        assert!(view.projects[0].is_remote);
+        assert!(store.project_reveal_path("project-path").is_none());
+        assert!(!store.snapshot_active_space_thread_layout(
+            &space_id,
+            &materialized_workspace,
+            WorkspaceThreadLayoutSnapshot {
+                active_tab: 0,
+                tabs: vec![serde_json::json!({"kind": "must-not-be-saved"})],
+                terminal_specs: vec![],
+            },
+        ));
+        assert!(store.projects[0].threads[0].layout.is_none());
+
+        let state = store
+            .thread_connection_state(&thread_id, &[])
+            .expect("mux-domain thread state");
+        assert!(state.is_remote);
+        assert_eq!(state.space_id, space_id);
+        assert_eq!(store.thread_to_restore_for_space(&space_id), (None, false));
+
+        assert!(!store.repair_cross_space_local_workspace_bindings());
+        assert_eq!(
+            store.projects[0].threads[0]
+                .materialized_workspace_name
+                .as_deref(),
+            Some(materialized_workspace.as_str())
+        );
+    }
+
+    #[test]
     fn activation_plan_for_thread_does_not_select_or_materialize() {
         let space_id = default_space_id();
         let mut store = test_store();
@@ -5606,6 +5740,36 @@ mod tests {
     }
 
     #[test]
+    fn end_workspace_thread_removes_mux_domain_path_project() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        store.spaces[0].client_domain = Some("remote-mux".to_string());
+
+        let thread =
+            WorkspaceThread::new("project-path".to_string(), "Session 1".to_string(), None);
+        let thread_id = thread.id.clone();
+        let mut project = test_project(
+            "project-path",
+            "Remote path",
+            PathBuf::from("/remote/project"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-path".to_string());
+
+        let result = store.end_workspace_thread_record(&thread_id);
+        let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
+            panic!("expected mux-domain project removal");
+        };
+        assert!(removed.was_active);
+        assert!(store
+            .projects
+            .iter()
+            .all(|project| project.id != "project-path"));
+    }
+
+    #[test]
     fn end_workspace_thread_noops_for_last_local_thread() {
         let space_id = default_space_id();
         let mut store = test_store();
@@ -5723,6 +5887,38 @@ mod tests {
         assert_eq!(
             store.disconnect_workspace_thread_record(&remote_id, &[]),
             (None, false)
+        );
+    }
+
+    #[test]
+    fn disconnect_mux_domain_path_thread_uses_remote_flow() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        store.spaces[0].client_domain = Some("remote-mux".to_string());
+
+        let thread =
+            WorkspaceThread::new("project-path".to_string(), "Session 1".to_string(), None);
+        let thread_id = thread.id.clone();
+        let workspace = workspace_name_for_thread("project-path", &thread_id);
+        let mut project = test_project(
+            "project-path",
+            "Remote path",
+            PathBuf::from("/remote/project"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-path".to_string());
+
+        let (disconnected, changed) =
+            store.disconnect_workspace_thread_record(&thread_id, &[workspace.clone()]);
+        let disconnected = disconnected.expect("disconnected mux-domain thread");
+        assert!(changed);
+        assert!(disconnected.was_active);
+        assert_eq!(disconnected.workspace_name, workspace);
+        assert_ne!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some("project-path")
         );
     }
 
