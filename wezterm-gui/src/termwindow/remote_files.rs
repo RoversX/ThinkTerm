@@ -741,6 +741,15 @@ pub(crate) fn update_remote_connection_idle_timeout(minutes: u32) {
     remote_connection_manager().set_idle_timeout(Duration::from_secs(minutes as u64 * 60));
 }
 
+/// Drop a cached connection unconditionally. Used when a connection fails the
+/// checks that bring the panel up (resolving the root, listing it): whatever
+/// went wrong, a session that cannot complete its own handshake is worthless,
+/// and keeping it means every Retry replays the same failure against the same
+/// broken session instead of dialling afresh.
+pub(crate) fn invalidate_remote_connection(key: &str) {
+    remote_connection_manager().invalidate(key);
+}
+
 pub(crate) fn invalidate_remote_connection_if_dead(key: &str, message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     // Matches both the wrapper text (`SftpChannelError`) and the innermost
@@ -1312,6 +1321,49 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_startup_drops_the_cached_connection_so_retry_redials() {
+        // The reported symptom: after one good session, reconnecting fails and
+        // Retry keeps failing. Whatever broke the session, the panel must not
+        // hand the same one back on the next attempt.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let manager = RemoteConnectionManager::new(
+            Arc::new(FakeConnector {
+                calls: Arc::clone(&calls),
+            }),
+            Duration::from_secs(30),
+        );
+        let key = "host".to_string();
+
+        let lease = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+            .expect("first acquire");
+        drop(lease);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Still cached: a plain reconnect reuses the session without dialling.
+        let reused = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+            .expect("cached acquire");
+        drop(reused);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Startup failed on that cached session, so it is thrown away and the
+        // next attempt dials a fresh one instead of replaying the failure.
+        manager.invalidate(&key);
+        let fresh = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+            .expect("acquire after invalidation");
+        drop(fresh);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // And a resume (which must never dial on its own) correctly reports
+        // that there is nothing to resume once the entry is gone.
+        manager.invalidate(&key);
+        assert!(matches!(
+            smol::block_on(manager.acquire(key, SshDomain::default(), false)),
+            Err(RemoteAcquireError::NotConnected)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn a_dead_transport_is_detected_from_the_concise_message_too() {
         // `resolve_root` hands the UI only the innermost cause, so invalidation
         // must recognise the transport failure from that alone — otherwise
@@ -1596,6 +1648,96 @@ mod tests {
         let mut changed_password = first;
         changed_password.stored_password = Some("secret".to_string());
         assert_ne!(base, remote_connection_key("source", &changed_password));
+    }
+
+    /// Exactly the reported repro: connect, close the sidebar, reopen, connect
+    /// again. Every step is driven the way `paint_files_sidebar` drives it,
+    /// including the idempotent `TargetChanged` that fires on every frame.
+    #[test]
+    fn reconnecting_after_hiding_the_panel_reaches_connected_again() {
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let mut state = RemoteFilesState::default();
+
+        let connect_once = |state: &mut RemoteFilesState| {
+            let effects = state.transition(RemoteFilesEvent::ConnectRequested);
+            let generation = match effects.as_slice() {
+                [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+                other => panic!("expected a Connect effect, got {:?}", other),
+            };
+            state.transition(RemoteFilesEvent::Connected {
+                generation,
+                root: root.clone(),
+                listing: listing(&root, &[]),
+            });
+            generation
+        };
+
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+        connect_once(&mut state);
+        assert_eq!(state.phase, RemoteFilesPhase::Connected);
+
+        // Sidebar closed.
+        assert_eq!(
+            state.transition(RemoteFilesEvent::PanelHidden),
+            vec![RemoteFilesEffect::ReleaseLease]
+        );
+        assert_eq!(state.phase, RemoteFilesPhase::Disconnected);
+
+        // Reopened: the paint path re-announces the same target every frame and
+        // must not disturb anything.
+        for _ in 0..3 {
+            assert!(state
+                .transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))))
+                .is_empty());
+        }
+        assert_eq!(state.phase, RemoteFilesPhase::Disconnected);
+
+        // Second connect must behave exactly like the first.
+        connect_once(&mut state);
+        assert_eq!(state.phase, RemoteFilesPhase::Connected);
+        assert_eq!(state.root.as_ref(), Some(&root));
+    }
+
+    /// A stale reply from the *first* connection must not be able to knock the
+    /// second one back into Failed — the generation guard is what prevents the
+    /// "reconnect immediately errors" symptom.
+    #[test]
+    fn a_late_failure_from_the_previous_attempt_is_ignored() {
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let mut state = RemoteFilesState::default();
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+
+        let first_generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::PanelHidden);
+
+        let second_generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        assert_ne!(first_generation, second_generation);
+
+        // The abandoned attempt finally fails; it must not touch the live one.
+        state.transition(RemoteFilesEvent::ConnectionFailed {
+            generation: first_generation,
+            message: "stale".to_string(),
+        });
+        assert_eq!(state.phase, RemoteFilesPhase::Connecting);
+
+        state.transition(RemoteFilesEvent::Connected {
+            generation: second_generation,
+            root: root.clone(),
+            listing: listing(&root, &[]),
+        });
+        assert_eq!(state.phase, RemoteFilesPhase::Connected);
     }
 
     #[test]

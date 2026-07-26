@@ -8,9 +8,9 @@ use crate::markdown_editor::{
 };
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::remote_files::{
-    invalidate_remote_connection_if_dead, remote_connection_key, remote_connection_manager,
-    RemoteAcquireError, RemoteFileBytes, RemoteFileKind, RemoteFileRow, RemoteFilesEffect,
-    RemoteFilesEvent, RemoteFilesPhase, RemotePath,
+    invalidate_remote_connection, invalidate_remote_connection_if_dead, remote_connection_key,
+    remote_connection_manager, RemoteAcquireError, RemoteFileBytes, RemoteFileKind, RemoteFileRow,
+    RemoteFilesEffect, RemoteFilesEvent, RemoteFilesPhase, RemotePath,
 };
 use crate::termwindow::ui::icons::{
     material_file_icon_for_name, material_folder_icon_for_name, MaterialIcon, SvgIcon,
@@ -9272,19 +9272,21 @@ impl crate::TermWindow {
                                         .await
                                     {
                                         Ok(listing) => Ok((lease, root, listing)),
+                                        // Bringing the panel up failed on an
+                                        // established session, so the session
+                                        // is not usable no matter why. Drop it
+                                        // rather than letting Retry replay the
+                                        // same failure against the same cached
+                                        // connection forever.
                                         Err(err) => {
-                                            invalidate_remote_connection_if_dead(
-                                                &connection_key,
-                                                &err,
-                                            );
+                                            drop(lease);
+                                            invalidate_remote_connection(&connection_key);
                                             Err(RemoteAcquireError::Failed(err))
                                         }
                                     },
                                     Err(err) => {
-                                        invalidate_remote_connection_if_dead(
-                                            &connection_key,
-                                            &err,
-                                        );
+                                        drop(lease);
+                                        invalidate_remote_connection(&connection_key);
                                         Err(RemoteAcquireError::Failed(err))
                                     }
                                 }
