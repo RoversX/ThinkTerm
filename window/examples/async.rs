@@ -83,8 +83,9 @@ impl MyWindow {
             | WindowEvent::AdviseModifiersLedStatus(_, _)
             | WindowEvent::Notification(_)
             | WindowEvent::FocusChanged(_)
-            | WindowEvent::DraggedFile(_)
-            | WindowEvent::DroppedFile(_)
+            | WindowEvent::DraggedFile { .. }
+            | WindowEvent::DragLeave
+            | WindowEvent::DroppedFile { .. }
             | WindowEvent::DroppedUrl(_)
             | WindowEvent::DroppedString(_)
             | WindowEvent::PerformKeyAssignment(_)

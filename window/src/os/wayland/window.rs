@@ -875,7 +875,13 @@ impl WaylandWindowInner {
     }
 
     pub(super) fn dispatch_dropped_files(&mut self, paths: Vec<PathBuf>) {
-        self.events.dispatch(WindowEvent::DroppedFile(paths));
+        // The Wayland data-device plumbing here does not carry the drop
+        // position through to this point, so the drop keeps its long-standing
+        // behaviour of pasting the paths into the terminal.
+        self.events.dispatch(WindowEvent::DroppedFile {
+            paths,
+            coords: None,
+        });
     }
 
     pub(crate) fn dispatch_pending_mouse(&mut self) {

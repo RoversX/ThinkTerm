@@ -9,8 +9,9 @@ use crate::markdown_editor::{
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::remote_files::{
     invalidate_remote_connection, invalidate_remote_connection_if_dead, remote_connection_key,
-    remote_connection_manager, RemoteAcquireError, RemoteFileBytes, RemoteFileKind, RemoteFileRow,
-    RemoteFilesEffect, RemoteFilesEvent, RemoteFilesPhase, RemotePath,
+    remote_connection_manager, reserve_download_path, RemoteAcquireError, RemoteFileBytes,
+    RemoteFileKind, RemoteFileRow, RemoteFilesEffect, RemoteFilesEvent, RemoteFilesPhase,
+    RemotePath, RemoteTransfer, RemoteTransferKind, RemoteTransferProgress, RemoteTransferStatus,
 };
 use crate::termwindow::ui::icons::{
     material_file_icon_for_name, material_folder_icon_for_name, MaterialIcon, SvgIcon,
@@ -145,6 +146,12 @@ const FILE_FILTER_HEIGHT: usize = 66;
 const FILE_TREE_TOP_GAP: usize = 14;
 const FILE_SCROLL_FADE_HEIGHT: usize = 32;
 const FILE_PREVIEW_HEADER_HEIGHT: usize = 64;
+/// How many transfer rows the strip shows before it starts dropping the
+/// oldest finished ones. The strip eats into the tree, so it stays small;
+/// running transfers are never dropped, however many there are.
+const REMOTE_TRANSFER_STRIP_MAX: usize = 3;
+/// Thickness of the progress line under a running transfer's label.
+const REMOTE_TRANSFER_PROGRESS_HEIGHT: usize = 3;
 const FILE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 const FILE_PREVIEW_TRUNCATED_LABEL: &str = "Preview truncated to 256 KiB";
 const FILE_PREVIEW_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -956,6 +963,14 @@ pub fn right_sidebar_note_pane_width_for_dpi(dpi: usize) -> usize {
         .max(min_width)
 }
 
+fn file_preview_close_requires_reflow(
+    preview_was_visible: bool,
+    previous_width: usize,
+    current_width: usize,
+) -> bool {
+    preview_was_visible || previous_width != current_width
+}
+
 impl crate::TermWindow {
     fn right_sidebar_file_preview_active(&self) -> bool {
         !self.right_sidebar_collapsed
@@ -1725,9 +1740,21 @@ impl crate::TermWindow {
     /// only two remembered to do it, and the ones that forgot were exactly the
     /// remote paths — hence the pane's width surviving a workspace switch.
     pub(crate) fn close_right_sidebar_file_preview(&mut self) {
+        // RemoteFilesState::TargetChanged clears its selection before the
+        // ReleaseLease effect reaches this method. In that interval
+        // right_sidebar_width() already reports the narrow tree-only width,
+        // even though the terminal is still laid out for the Preview view.
+        // Preserve the view marker so closing still forces a reflow.
+        let preview_was_visible = !self.right_sidebar_collapsed
+            && self.right_sidebar_mode == RightSidebarMode::Chat
+            && self.right_sidebar_file_view == RightSidebarFileView::Preview;
         let previous_width = self.right_sidebar_width();
         self.close_right_sidebar_file_preview_without_reflow();
-        if self.right_sidebar_width() != previous_width {
+        if file_preview_close_requires_reflow(
+            preview_was_visible,
+            previous_width,
+            self.right_sidebar_width(),
+        ) {
             self.schedule_right_sidebar_reflow();
         }
     }
@@ -8602,6 +8629,11 @@ impl crate::TermWindow {
             .target
             .as_ref()
             .map(|target| target.project_name.clone());
+        // Anything the panel needs to say while it has no tree — such as a file
+        // being dropped on it before it is connected — has to ride in as the
+        // detail line, since only the tree view paints `error_message`.
+        let notice = self.right_sidebar_remote_files.error_message.clone();
+        let disconnected_detail = notice.as_deref().or(target_label.as_deref());
         match phase {
             RemoteFilesPhase::Disconnected => self.paint_remote_files_empty_state(
                 layers,
@@ -8617,7 +8649,7 @@ impl crate::TermWindow {
                 SvgIcon::Server,
                 false,
                 "Not connected",
-                target_label.as_deref(),
+                disconnected_detail,
                 Some(("Connect", true)),
             ),
             RemoteFilesPhase::Connecting => self.paint_remote_files_empty_state(
@@ -8939,11 +8971,38 @@ impl crate::TermWindow {
         }
 
         let row_metrics = right_sidebar_file_row_metrics(ui_metrics);
-        let footer_height = if self.right_sidebar_remote_files.has_truncated_directory() {
+        let truncated_height = if self.right_sidebar_remote_files.has_truncated_directory() {
             row_metrics.row_height
         } else {
             0
         };
+        // The strip eats into the tree, so it is capped twice: by a fixed row
+        // count, and by never taking more than half of what is left. Dropping
+        // thirty files at once must not collapse the tree to nothing or push
+        // rows up over the header.
+        let strip_budget = content_bottom
+            .saturating_sub(tree_top)
+            .saturating_sub(self.ui_px(SIDEBAR_INSET))
+            .saturating_sub(truncated_height)
+            / 2;
+        let strip_rows = self
+            .right_sidebar_remote_transfers
+            .len()
+            .min(REMOTE_TRANSFER_STRIP_MAX)
+            .min(strip_budget / row_metrics.row_height.max(1));
+        // When some are hidden, the last visible row reports how many rather
+        // than letting them vanish silently.
+        let hidden_transfers = self
+            .right_sidebar_remote_transfers
+            .len()
+            .saturating_sub(strip_rows);
+        let painted_transfers = if hidden_transfers > 0 {
+            strip_rows.saturating_sub(1)
+        } else {
+            strip_rows
+        };
+        let footer_height =
+            truncated_height.saturating_add(strip_rows.saturating_mul(row_metrics.row_height));
         let viewport_bottom = content_bottom
             .saturating_sub(self.ui_px(SIDEBAR_INSET))
             .saturating_sub(footer_height);
@@ -9051,17 +9110,191 @@ impl crate::TermWindow {
                 fade_height,
             )?;
         }
-        if footer_height > 0 {
+        let mut footer_y = viewport_bottom;
+        if truncated_height > 0 {
             self.paint_sidebar_text(
                 layers,
                 ui_font,
                 ui_metrics,
                 "More entries are not shown",
                 content_x,
-                viewport_bottom,
+                footer_y,
                 content_width,
                 muted_fg,
             )?;
+            footer_y += truncated_height;
+        }
+        for index in 0..painted_transfers {
+            self.paint_remote_transfer_row(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                footer_y,
+                content_width,
+                index,
+                row_metrics,
+            )?;
+            footer_y += row_metrics.row_height;
+        }
+        if hidden_transfers > 0 && strip_rows > 0 {
+            let more = if hidden_transfers == 1 {
+                "1 more transfer".to_string()
+            } else {
+                format!("{hidden_transfers} more transfers")
+            };
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                &more,
+                content_x + self.ui_px(SIDEBAR_INSET),
+                footer_y
+                    + row_metrics
+                        .row_height
+                        .saturating_sub(ui_metrics.cell_size.height as usize)
+                        / 2,
+                content_width.saturating_sub(self.ui_px(SIDEBAR_INSET)),
+                muted_fg,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// One line in the transfer strip: an icon telling running from finished
+    /// from failed, the file name, a short status, and — while it runs — a
+    /// progress line beneath.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_remote_transfer_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+        index: usize,
+        row_metrics: RightSidebarFileRowMetrics,
+    ) -> anyhow::Result<()> {
+        let Some(transfer) = self.right_sidebar_remote_transfers.get(index) else {
+            return Ok(());
+        };
+        let id = transfer.id;
+        let running = transfer.is_running();
+        let (icon, tint) = match &transfer.status {
+            RemoteTransferStatus::Running => (SvgIcon::LoaderCircle, foreground),
+            RemoteTransferStatus::Done(_) => (SvgIcon::CircleCheck, chrome.selected_bg),
+            // Muted rather than red, matching the panel's existing
+            // "Connection failed" state.
+            RemoteTransferStatus::Failed(_) => (SvgIcon::CircleAlert, muted_fg),
+        };
+        let arrow = match transfer.kind {
+            RemoteTransferKind::Upload => "Uploading",
+            RemoteTransferKind::Download => "Downloading",
+        };
+        let detail = match &transfer.status {
+            RemoteTransferStatus::Running => match transfer.progress.fraction() {
+                Some(fraction) => format!("{arrow} {}%", (fraction * 100.0).round() as u32),
+                None => arrow.to_string(),
+            },
+            RemoteTransferStatus::Done(detail) => detail.clone(),
+            RemoteTransferStatus::Failed(message) => message.clone(),
+        };
+        let label = format!("{} — {detail}", transfer.name);
+        let fraction = transfer.progress.fraction();
+
+        let hovered = self.is_pointer_over_ui_rect(x, y, width, row_metrics.row_height);
+        if hovered {
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    x as f32,
+                    y as f32,
+                    width as f32,
+                    row_metrics.row_height as f32,
+                ),
+                chrome.sidebar_button_hover_bg,
+                self.ui_f32(SIDEBAR_ROW_RADIUS),
+            )
+            .context("remote transfer row hover")?;
+        }
+        self.ui_items.push(UIItem {
+            x,
+            y,
+            width,
+            height: row_metrics.row_height,
+            item_type: UIItemType::RightSidebarRemoteTransfer(id),
+        });
+
+        let icon_x = x + self.ui_px(SIDEBAR_INSET);
+        let icon_y = y + row_metrics.row_height.saturating_sub(row_metrics.icon_size) / 2;
+        if running {
+            self.paint_spinning_ui_icon(
+                layers,
+                1,
+                icon,
+                icon_x,
+                icon_y,
+                row_metrics.icon_size,
+                tint,
+            )?;
+        } else {
+            self.paint_ui_icon(layers, 1, icon, icon_x, icon_y, row_metrics.icon_size, tint)?;
+        }
+
+        let text_x = icon_x + row_metrics.icon_size + row_metrics.icon_gap;
+        let text_width = width.saturating_sub(text_x.saturating_sub(x));
+        let text_y = y + row_metrics
+            .row_height
+            .saturating_sub(ui_metrics.cell_size.height as usize)
+            / 2;
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            &label,
+            text_x,
+            text_y,
+            text_width,
+            if running { foreground } else { muted_fg },
+        )?;
+
+        if let (true, Some(fraction)) = (running, fraction) {
+            let bar_height = self.ui_px(REMOTE_TRANSFER_PROGRESS_HEIGHT).max(1);
+            let bar_y = y + row_metrics.row_height.saturating_sub(bar_height);
+            let radius = (bar_height as f32) / 2.0;
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    text_x as f32,
+                    bar_y as f32,
+                    text_width as f32,
+                    bar_height as f32,
+                ),
+                chrome.sidebar_button_hover_bg,
+                radius,
+            )
+            .context("remote transfer progress track")?;
+            let filled = (text_width as f32 * fraction).max(radius * 2.0);
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(text_x as f32, bar_y as f32, filled, bar_height as f32),
+                chrome.selected_bg,
+                radius,
+            )
+            .context("remote transfer progress fill")?;
+            // A running transfer must keep repainting even when nothing else
+            // changes, or the percentage freezes until the next event.
+            self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(100)));
         }
         Ok(())
     }
@@ -9093,7 +9326,11 @@ impl crate::TermWindow {
         }
         let hovered = self.is_pointer_over_ui_rect(x, visible_y, width, visible_height);
         let is_selected = selected == Some(&row.entry.path);
-        if hovered || is_selected {
+        // A drag hovering here is about to drop into this directory; make that
+        // unmistakable, and let it outrank the ordinary selection tint.
+        let is_drop_target =
+            self.right_sidebar_remote_drop_target.as_ref() == Some(&row.entry.path);
+        if hovered || is_selected || is_drop_target {
             self.fill_rounded_rectangle(
                 layers,
                 1,
@@ -9103,7 +9340,9 @@ impl crate::TermWindow {
                     width as f32,
                     visible_height as f32,
                 ),
-                if is_selected {
+                if is_drop_target {
+                    chrome.selected_bg
+                } else if is_selected {
                     chrome.selected_bg.mul_alpha(0.46)
                 } else {
                     chrome.sidebar_button_hover_bg
@@ -9494,6 +9733,408 @@ impl crate::TermWindow {
                 }
             }
         }
+    }
+
+    /// The right sidebar's background item spans the whole panel and is
+    /// painted first, so anything inside the panel sits on top of it.
+    fn pointer_is_over_right_sidebar(&self, x: isize, y: isize) -> bool {
+        self.ui_items.iter().any(|item| {
+            matches!(item.item_type, UIItemType::RightSidebarBackground) && item.hit_test(x, y)
+        })
+    }
+
+    /// Which remote directory a pointer at `coords` is aiming at, if the
+    /// remote Files panel is showing a connected tree there.
+    pub(crate) fn remote_drop_target_at(&self, x: isize, y: isize) -> Option<RemotePath> {
+        if !self.right_sidebar_file_view_active()
+            || !matches!(
+                self.right_sidebar_remote_files.phase,
+                RemoteFilesPhase::Connected
+            )
+        {
+            return None;
+        }
+        let root = self.right_sidebar_remote_files.root.as_ref()?;
+        resolve_remote_drop_target(&self.ui_items, x, y, root, |path| {
+            self.right_sidebar_remote_files.kind_for_path(path)
+        })
+    }
+
+    pub(crate) fn update_right_sidebar_remote_drop_target(&mut self, coords: Option<Point>) {
+        let target = coords.and_then(|coords| self.remote_drop_target_at(coords.x, coords.y));
+        if self.right_sidebar_remote_drop_target != target {
+            self.right_sidebar_remote_drop_target = target;
+            self.invalidate_window();
+        }
+    }
+
+    pub(crate) fn clear_right_sidebar_remote_drop_target(&mut self) {
+        if self.right_sidebar_remote_drop_target.take().is_some() {
+            self.invalidate_window();
+        }
+    }
+
+    /// Take files dropped onto the remote tree and upload them. Returns false
+    /// when the drop was not aimed at the panel, so the caller can fall back
+    /// to its usual handling.
+    pub(crate) fn upload_dropped_files_to_remote(
+        &mut self,
+        paths: &[PathBuf],
+        coords: Option<Point>,
+    ) -> bool {
+        self.clear_right_sidebar_remote_drop_target();
+        let Some(coords) = coords else {
+            return false;
+        };
+        // Aimed at the panel but not usable: say so rather than silently
+        // pasting the paths into the terminal behind it.
+        if self.pointer_is_over_right_sidebar(coords.x, coords.y)
+            && self.right_sidebar_file_view_active()
+            && self.right_sidebar_remote_files.target.is_some()
+            && !matches!(
+                self.right_sidebar_remote_files.phase,
+                RemoteFilesPhase::Connected
+            )
+        {
+            self.right_sidebar_remote_files.error_message =
+                Some("Connect before dropping files here".to_string());
+            self.invalidate_window();
+            return true;
+        }
+        let Some(directory) = self.remote_drop_target_at(coords.x, coords.y) else {
+            return false;
+        };
+
+        let mut skipped_directories = 0usize;
+        let mut queued = 0usize;
+        for path in paths {
+            // Only files: a directory needs recursive creation and a way to
+            // report partial failure, which this does not have yet.
+            if path.is_dir() {
+                skipped_directories += 1;
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                self.push_remote_transfer_failure(
+                    RemoteTransferKind::Upload,
+                    path.to_string_lossy().to_string(),
+                    "That file name is not valid UTF-8".to_string(),
+                );
+                continue;
+            };
+            // Build the destination from the *name* only: a local path could
+            // carry separators (or a drive letter) that must never be spliced
+            // into a remote path.
+            let remote = match directory.join_name(name) {
+                Ok(remote) => remote,
+                Err(err) => {
+                    self.push_remote_transfer_failure(
+                        RemoteTransferKind::Upload,
+                        name.to_string(),
+                        err,
+                    );
+                    continue;
+                }
+            };
+            self.start_remote_upload(path.clone(), remote, directory.clone());
+            queued += 1;
+        }
+
+        if skipped_directories > 0 && queued == 0 {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                if skipped_directories == 1 {
+                    "Folder".to_string()
+                } else {
+                    format!("{skipped_directories} folders")
+                },
+                "Only files can be uploaded".to_string(),
+            );
+        }
+        self.invalidate_window();
+        true
+    }
+
+    fn next_remote_transfer_id(&mut self) -> u64 {
+        self.right_sidebar_remote_transfer_next_id = self
+            .right_sidebar_remote_transfer_next_id
+            .wrapping_add(1)
+            .max(1);
+        self.right_sidebar_remote_transfer_next_id
+    }
+
+    fn push_remote_transfer_failure(
+        &mut self,
+        kind: RemoteTransferKind,
+        name: String,
+        message: String,
+    ) {
+        let id = self.next_remote_transfer_id();
+        self.right_sidebar_remote_transfers.push(RemoteTransfer {
+            id,
+            kind,
+            name,
+            progress: RemoteTransferProgress::default(),
+            status: RemoteTransferStatus::Failed(message),
+        });
+        self.trim_remote_transfers();
+    }
+
+    /// Keep the strip from growing without bound: finished entries are the
+    /// only ones ever dropped, and the oldest go first.
+    fn trim_remote_transfers(&mut self) {
+        while self.right_sidebar_remote_transfers.len() > REMOTE_TRANSFER_STRIP_MAX {
+            let Some(index) = self
+                .right_sidebar_remote_transfers
+                .iter()
+                .position(|transfer| !transfer.is_running())
+            else {
+                break;
+            };
+            self.right_sidebar_remote_transfers.remove(index);
+        }
+    }
+
+    fn start_remote_upload(&mut self, local: PathBuf, remote: RemotePath, directory: RemotePath) {
+        let name = remote.file_name().to_string();
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles()
+        else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                "Remote Files connection is no longer available".to_string(),
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+
+        let id = self.next_remote_transfer_id();
+        let progress = RemoteTransferProgress::default();
+        self.right_sidebar_remote_transfers.push(RemoteTransfer {
+            id,
+            kind: RemoteTransferKind::Upload,
+            name,
+            progress: progress.clone(),
+            status: RemoteTransferStatus::Running,
+        });
+        self.trim_remote_transfers();
+
+        promise::spawn::spawn(async move {
+            let result = backend.upload_file(local, remote, progress).await;
+            drop(operation_lease);
+            let connection_died = result.as_ref().is_err_and(|message| {
+                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let status = match &result {
+                    Ok(_) => RemoteTransferStatus::Done("Uploaded".to_string()),
+                    Err(message) => RemoteTransferStatus::Failed(message.clone()),
+                };
+                term_window.finish_remote_transfer(id, status);
+                if result.is_ok() {
+                    // Show the new file without collapsing the rest of the tree.
+                    let effects = term_window
+                        .right_sidebar_remote_files
+                        .transition(RemoteFilesEvent::DirectoryInvalidated(directory));
+                    term_window.apply_right_sidebar_remote_files_effects(effects);
+                } else if connection_died {
+                    term_window.right_sidebar_remote_files_lease.take();
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    /// Right-clicking a remote row. Only a file offers anything so far, so a
+    /// directory gets no menu rather than an empty one.
+    pub(crate) fn show_right_sidebar_remote_file_context_menu(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: Point,
+        path: RemotePath,
+    ) {
+        if self.right_sidebar_remote_files.kind_for_path(&path) != Some(RemoteFileKind::File) {
+            return;
+        }
+        // A transfer needs a live lease; offering Download without one would
+        // only produce a failure row.
+        let enabled = self.right_sidebar_remote_files_lease.is_some();
+        self.begin_context_menu_application_actions();
+        let item = self.context_menu_application_item_with_icon(
+            "Download",
+            // No dedicated download glyph in the shared icon set; Save is the
+            // closest fit and already maps on every platform.
+            ContextMenuIcon::Save,
+            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile(path),
+            enabled,
+        );
+        self.show_term_context_menu(context, anchor, vec![item]);
+    }
+
+    pub(crate) fn download_right_sidebar_remote_file(&mut self, remote: RemotePath) {
+        let name = remote.file_name().to_string();
+        let Some(directory) = dirs_next::download_dir()
+            .or_else(|| dirs_next::home_dir().map(|home| home.join("Downloads")))
+        else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Download,
+                name,
+                "Unable to locate a Downloads folder".to_string(),
+            );
+            return;
+        };
+        if let Err(err) = fs::create_dir_all(&directory) {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Download,
+                name,
+                format!("Unable to use {}: {err}", directory.display()),
+            );
+            return;
+        }
+        // Claim the destination and its staging file together, by creating the
+        // staging file exclusively. Two downloads that would land on the same
+        // name therefore take different ones, and an unrelated `X.part` that
+        // happens to be sitting there is never truncated or deleted.
+        let Some((local, partial)) = reserve_download_path(
+            &directory,
+            &name,
+            |path| path.exists(),
+            |partial| {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(partial)
+                    .is_ok()
+            },
+        ) else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Download,
+                name,
+                format!("Unable to find a free name in {}", directory.display()),
+            );
+            return;
+        };
+
+        // From here on the staging file exists, so every early return has to
+        // take it back down.
+        let release_reservation = |partial: &Path| {
+            if let Err(err) = fs::remove_file(partial) {
+                log::warn!(
+                    "remote files: unable to release the download reservation {}: {err:#}",
+                    partial.display()
+                );
+            }
+        };
+
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles()
+        else {
+            release_reservation(&partial);
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Download,
+                name,
+                "Remote Files connection is no longer available".to_string(),
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            release_reservation(&partial);
+            return;
+        };
+
+        let id = self.next_remote_transfer_id();
+        let progress = RemoteTransferProgress::default();
+        self.right_sidebar_remote_transfers.push(RemoteTransfer {
+            id,
+            kind: RemoteTransferKind::Download,
+            name,
+            progress: progress.clone(),
+            status: RemoteTransferStatus::Running,
+        });
+        self.trim_remote_transfers();
+        self.invalidate_window();
+
+        promise::spawn::spawn(async move {
+            let landed = local.clone();
+            let result = backend.download_file(remote, local, progress).await;
+            drop(operation_lease);
+            let connection_died = result.as_ref().is_err_and(|message| {
+                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let status = match &result {
+                    Ok(_) => RemoteTransferStatus::Done(format!(
+                        "Saved to {}",
+                        landed
+                            .parent()
+                            .map(|parent| parent.display().to_string())
+                            .unwrap_or_else(|| landed.display().to_string())
+                    )),
+                    Err(message) => RemoteTransferStatus::Failed(message.clone()),
+                };
+                term_window.finish_remote_transfer(id, status);
+                if connection_died {
+                    term_window.right_sidebar_remote_files_lease.take();
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    /// Everything a transfer worker needs from the panel's lease. Takes an
+    /// operation lease so the pooled connection cannot expire mid-transfer.
+    fn remote_transfer_handles(
+        &self,
+    ) -> Option<(
+        Arc<dyn crate::termwindow::remote_files::RemoteFileBackend>,
+        crate::termwindow::remote_files::RemoteConnectionLease,
+        String,
+        u64,
+    )> {
+        let lease = self.right_sidebar_remote_files_lease.as_ref()?;
+        let operation_lease = lease.operation_lease()?;
+        Some((
+            lease.backend(),
+            operation_lease,
+            lease.connection_key().to_string(),
+            lease.connection_id(),
+        ))
+    }
+
+    fn finish_remote_transfer(&mut self, id: u64, status: RemoteTransferStatus) {
+        if let Some(transfer) = self
+            .right_sidebar_remote_transfers
+            .iter_mut()
+            .find(|transfer| transfer.id == id)
+        {
+            transfer.status = status;
+        }
+        self.trim_remote_transfers();
+    }
+
+    /// Clicking a transfer row: stop it if it is still going, otherwise clear
+    /// the notice away.
+    pub(crate) fn dismiss_or_cancel_remote_transfer(&mut self, id: u64) {
+        let Some(index) = self
+            .right_sidebar_remote_transfers
+            .iter()
+            .position(|transfer| transfer.id == id)
+        else {
+            return;
+        };
+        if self.right_sidebar_remote_transfers[index].is_running() {
+            self.right_sidebar_remote_transfers[index]
+                .progress
+                .request_cancel();
+        } else {
+            self.right_sidebar_remote_transfers.remove(index);
+        }
+        self.invalidate_window();
     }
 
     pub(crate) fn request_right_sidebar_remote_files_connect(&mut self, explicit: bool) {
@@ -12978,6 +13619,42 @@ fn file_row_placement(
     }
 }
 
+/// Where a drop at `(x, y)` would land, given the UI items from the last
+/// paint. A directory row takes the file itself; a file row takes the
+/// directory holding it, which is what "drop it next to this" means; anywhere
+/// else inside the panel takes the root.
+///
+/// Split out from the window so the rule can be tested against a handful of
+/// rectangles instead of a rendered frame.
+fn resolve_remote_drop_target(
+    items: &[UIItem],
+    x: isize,
+    y: isize,
+    root: &RemotePath,
+    kind_for_path: impl Fn(&RemotePath) -> Option<RemoteFileKind>,
+) -> Option<RemotePath> {
+    // Last painted wins, matching how a click resolves.
+    let item = items.iter().rev().find(|item| item.hit_test(x, y))?;
+    match &item.item_type {
+        UIItemType::RightSidebarRemoteFileRow(path) => match kind_for_path(path) {
+            Some(RemoteFileKind::Directory) => Some(path.clone()),
+            // A symlink could point anywhere; treat it as an ordinary entry
+            // and aim at the directory it is listed in.
+            Some(_) => Some(path.parent().unwrap_or_else(|| root.clone())),
+            None => None,
+        },
+        // Empty space inside the panel, or its chrome: the root is the only
+        // directory the whole panel unambiguously refers to. The transfer
+        // strip counts too — it sits inside the panel, so a drop landing on it
+        // must not fall through and paste into the terminal behind.
+        UIItemType::RightSidebarBackground
+        | UIItemType::RightSidebarRemoteFileRefresh
+        | UIItemType::RightSidebarRemoteFileConnect
+        | UIItemType::RightSidebarRemoteTransfer(_) => Some(root.clone()),
+        _ => None,
+    }
+}
+
 fn visible_file_row_range(
     row_count: usize,
     scroll_offset: f32,
@@ -13913,13 +14590,14 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 mod tests {
     use super::{
         approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
-        file_release_action, file_row_placement, full_line_colors_by_byte,
-        image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
-        naturalish_cmp, note_code_highlight_key, note_code_highlight_lines, note_code_row_height,
-        note_image_display_size, note_open_pending_for_vault, note_release_action,
-        open_with_candidate_allowed, path_key, preview_line_count, preview_lines_from_text,
-        preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
-        preview_visible_line_range, right_sidebar_file_browse_rows_from_index,
+        file_preview_close_requires_reflow, file_release_action, file_row_placement,
+        full_line_colors_by_byte, image_pixels_within_preview_budget, load_file_preview,
+        load_file_preview_image, naturalish_cmp, note_code_highlight_key,
+        note_code_highlight_lines, note_code_row_height, note_image_display_size,
+        note_open_pending_for_vault, note_release_action, open_with_candidate_allowed, path_key,
+        preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
+        preview_text_range, preview_visible_colored, preview_visible_line_range,
+        resolve_remote_drop_target, right_sidebar_file_browse_rows_from_index,
         right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key, sanitize_preview_text,
         scrollable_note_table_columns, search_right_sidebar_file_index, snippet_cursor_visible,
         snippet_run_buffer, sorted_open_with_candidates, virtual_note_line_range,
@@ -13929,7 +14607,10 @@ mod tests {
         NOTE_CODE_HEADER_HEIGHT,
     };
     use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
-    use crate::termwindow::{RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan};
+    use crate::termwindow::remote_files::{RemoteFileKind, RemotePath};
+    use crate::termwindow::{
+        RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan, UIItem, UIItemType,
+    };
     use crate::utilsprites::RenderMetrics;
     use std::collections::HashSet;
     use std::fs;
@@ -13939,6 +14620,97 @@ mod tests {
     use wezterm_font::units::PixelLength;
     use window::color::LinearRgba;
     use window::Size;
+
+    #[test]
+    fn preview_close_reflows_after_remote_selection_was_cleared() {
+        // TargetChanged clears the remote selection before ReleaseLease closes
+        // the pane, so both width reads are already tree-only. The Preview view
+        // marker must still force the terminal to reclaim the old pane width.
+        assert!(file_preview_close_requires_reflow(true, 320, 320));
+    }
+
+    #[test]
+    fn preview_close_skips_a_tree_only_noop_but_tracks_width_changes() {
+        assert!(!file_preview_close_requires_reflow(false, 320, 320));
+        assert!(file_preview_close_requires_reflow(false, 640, 320));
+    }
+
+    fn drop_target_items() -> Vec<UIItem> {
+        // Painted back to front, the way a frame builds up: the panel
+        // background first, then the rows on top of it.
+        vec![
+            UIItem {
+                x: 100,
+                y: 0,
+                width: 300,
+                height: 500,
+                item_type: UIItemType::RightSidebarBackground,
+            },
+            UIItem {
+                x: 100,
+                y: 0,
+                width: 300,
+                height: 20,
+                item_type: UIItemType::RightSidebarRemoteFileRow(
+                    RemotePath::from_server_absolute("/home/me/src").unwrap(),
+                ),
+            },
+            UIItem {
+                x: 100,
+                y: 20,
+                width: 300,
+                height: 20,
+                item_type: UIItemType::RightSidebarRemoteFileRow(
+                    RemotePath::from_server_absolute("/home/me/src/main.rs").unwrap(),
+                ),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_drop_lands_in_the_directory_it_is_aimed_at() {
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let items = drop_target_items();
+        let kind = |path: &RemotePath| match path.as_str() {
+            "/home/me/src" => Some(RemoteFileKind::Directory),
+            "/home/me/src/main.rs" => Some(RemoteFileKind::File),
+            _ => None,
+        };
+
+        // A directory row takes the upload itself.
+        assert_eq!(
+            resolve_remote_drop_target(&items, 200, 10, &root, kind).as_ref(),
+            Some(&RemotePath::from_server_absolute("/home/me/src").unwrap())
+        );
+        // A file row means "next to this", i.e. the directory holding it.
+        assert_eq!(
+            resolve_remote_drop_target(&items, 200, 30, &root, kind).as_ref(),
+            Some(&RemotePath::from_server_absolute("/home/me/src").unwrap())
+        );
+        // Empty space inside the panel falls back to the root.
+        assert_eq!(
+            resolve_remote_drop_target(&items, 200, 400, &root, kind).as_ref(),
+            Some(&root)
+        );
+        // Outside the panel entirely: not ours, so the terminal keeps its
+        // long-standing paste behaviour.
+        assert_eq!(
+            resolve_remote_drop_target(&items, 50, 10, &root, kind),
+            None
+        );
+    }
+
+    #[test]
+    fn a_drop_onto_a_row_of_unknown_kind_is_refused() {
+        // A row painted from a listing the state has since dropped: guessing
+        // a destination here could put the file somewhere unintended.
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let items = drop_target_items();
+        assert_eq!(
+            resolve_remote_drop_target(&items, 200, 10, &root, |_| None),
+            None
+        );
+    }
 
     fn test_render_metrics(cell_height: isize, cell_width: isize) -> RenderMetrics {
         RenderMetrics {

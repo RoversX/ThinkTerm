@@ -296,7 +296,10 @@ mod ssh2_impl {
             }
 
             match opts.write {
-                Some(WriteMode::Write) => flags |= Self::WRITE | Self::TRUNCATE,
+                // CREATE is required for the file to come into existence:
+                // WRITE|TRUNCATE alone fails outright on a path that is not
+                // already there, which made `Sftp::create` unable to create.
+                Some(WriteMode::Write) => flags |= Self::WRITE | Self::TRUNCATE | Self::CREATE,
                 Some(WriteMode::Append) => flags |= Self::WRITE | Self::APPEND | Self::CREATE,
                 None => {}
             }

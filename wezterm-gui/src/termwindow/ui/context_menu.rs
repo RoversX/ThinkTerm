@@ -221,6 +221,9 @@ impl crate::TermWindow {
             ) => {
                 self.toggle_workspace_sidebar_status_filter(status);
             }
+            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile(path) => {
+                self.download_right_sidebar_remote_file(path);
+            }
         }
     }
 

@@ -68,6 +68,16 @@ struct DragAndDrop {
     time: u32,
     target_type: Atom,
     target_action: Atom,
+    /// The window's origin in root coordinates, resolved once when the drag
+    /// enters. XdndPosition reports root coordinates, but handlers hit-test
+    /// against window coordinates; resolving this per position event would
+    /// mean a synchronous round trip per mouse move, and a window does not
+    /// move while the user is dragging files onto it.
+    window_origin: Option<(i16, i16)>,
+    /// Where the pointer was at the last XdndPosition, in window
+    /// coordinates. XDND delivers the payload separately from the position,
+    /// so the drop has to reuse the position reported just before it.
+    last_coords: Option<Point>,
 }
 
 impl Default for DragAndDrop {
@@ -79,6 +89,8 @@ impl Default for DragAndDrop {
             time: 0,
             target_type: xcb::x::ATOM_NONE,
             target_action: xcb::x::ATOM_NONE,
+            window_origin: None,
+            last_coords: None,
         }
     }
 }
@@ -746,6 +758,22 @@ impl XWindowInner {
         let srcwin = unsafe { xcb::x::Window::new(data[0]) };
         if msgtype == conn.atom_xdndenter {
             self.drag_and_drop.src_window = Some(srcwin);
+            self.drag_and_drop.last_coords = None;
+            self.drag_and_drop.window_origin =
+                match conn.send_and_wait_request(&xcb::x::TranslateCoordinates {
+                    src_window: self.window_id,
+                    dst_window: conn.root,
+                    src_x: 0,
+                    src_y: 0,
+                }) {
+                    Ok(coords) => Some((coords.dst_x(), coords.dst_y())),
+                    Err(err) => {
+                        // Without an origin the drop still works, it just cannot
+                        // be aimed at anything in particular.
+                        log::warn!("xdnd: unable to resolve the window origin: {err:#}");
+                        None
+                    }
+                };
             let moretypes = data[1] & 0x01 != 0;
             let xdndversion = data[1] >> 24 as u8;
             log::trace!(
@@ -809,6 +837,26 @@ impl XWindowInner {
                 self.drag_and_drop.time,
                 conn.atom_name(self.drag_and_drop.src_action)
             );
+            self.drag_and_drop.last_coords =
+                self.drag_and_drop
+                    .window_origin
+                    .map(|(origin_x, origin_y)| {
+                        Point::new(
+                            x as isize - origin_x as isize,
+                            y as isize - origin_y as isize,
+                        )
+                    });
+            // XDND only transfers the payload on drop, so the hover event
+            // reports the position without yet knowing what is being carried.
+            // Only announce it for a drag that will actually arrive as files:
+            // a text or URL drag ends in DroppedString/DroppedUrl, which no
+            // drop target can accept, and advertising one would be a lie.
+            if self.drag_and_drop.target_type == conn.atom_texturilist {
+                self.events.dispatch(WindowEvent::DraggedFile {
+                    paths: Vec::new(),
+                    coords: self.drag_and_drop.last_coords,
+                });
+            }
             conn.send_request_no_reply_log(&xcb::x::SendEvent {
                 propagate: false,
                 destination: xcb::x::SendEventDest::Window(srcwin),
@@ -827,7 +875,10 @@ impl XWindowInner {
             });
         } else if msgtype == conn.atom_xdndleave {
             self.drag_and_drop.src_window = None;
+            self.drag_and_drop.window_origin = None;
+            self.drag_and_drop.last_coords = None;
             log::trace!("ClientMessage {msgtype_name}");
+            self.events.dispatch(WindowEvent::DragLeave);
         } else if msgtype == conn.atom_xdnddrop {
             self.drag_and_drop.time = data[2];
             log::trace!(
@@ -844,6 +895,7 @@ impl XWindowInner {
                 });
             } else {
                 log::warn!("XdndDrop received, but no target type selected. Ignoring.");
+                self.events.dispatch(WindowEvent::DragLeave);
                 conn.send_request_no_reply_log(&xcb::x::SendEvent {
                     propagate: false,
                     destination: xcb::x::SendEventDest::Window(srcwin),
@@ -1322,6 +1374,10 @@ impl XWindowInner {
             && selection.property() == conn.atom_xsel_data
         {
             if let Some(srcwin) = self.drag_and_drop.src_window {
+                // Where the pointer was at the last XdndPosition: the payload
+                // arrives here, long after the position that aimed it.
+                let coords = self.drag_and_drop.last_coords.take();
+                self.drag_and_drop.window_origin = None;
                 match conn.send_and_wait_request(&xcb::x::GetProperty {
                     delete: true,
                     window: selection.requestor(),
@@ -1331,20 +1387,28 @@ impl XWindowInner {
                     long_length: u32::max_value(),
                 }) {
                     Ok(prop) => {
-                        if selection.target() == conn.atom_utf8_string {
-                            let text = String::from_utf8_lossy(prop.value()).to_string();
-                            self.events.dispatch(WindowEvent::DroppedString(text));
-                        } else if selection.target() == conn.atom_xmozurl {
-                            let data = decode_dropped_url_string(prop.value());
-                            let urls = parse_xmozurl_list(&data);
-                            self.events.dispatch(WindowEvent::DroppedUrl(urls));
-                        } else if selection.target() == conn.atom_texturilist {
+                        if selection.target() == conn.atom_texturilist {
                             let paths = parse_texturi_list(prop.value());
-                            self.events.dispatch(WindowEvent::DroppedFile(paths));
+                            self.events
+                                .dispatch(WindowEvent::DroppedFile { paths, coords });
+                        } else {
+                            // Not files, so no drop target could have accepted
+                            // it: end the drag before delivering the payload so
+                            // nothing is left showing an armed target.
+                            self.events.dispatch(WindowEvent::DragLeave);
+                            if selection.target() == conn.atom_utf8_string {
+                                let text = String::from_utf8_lossy(prop.value()).to_string();
+                                self.events.dispatch(WindowEvent::DroppedString(text));
+                            } else if selection.target() == conn.atom_xmozurl {
+                                let data = decode_dropped_url_string(prop.value());
+                                let urls = parse_xmozurl_list(&data);
+                                self.events.dispatch(WindowEvent::DroppedUrl(urls));
+                            }
                         }
                     }
                     Err(err) => {
                         log::error!("clipboard: err while getting clipboard property: {err:#}");
+                        self.events.dispatch(WindowEvent::DragLeave);
                     }
                 }
                 conn.send_request_no_reply_log(&xcb::x::SendEvent {

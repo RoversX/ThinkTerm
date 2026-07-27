@@ -536,11 +536,31 @@ pub enum WindowEvent {
 
     Notification(Box<dyn Any + Send + Sync>),
 
-    // Called when the files are being dragged into the window
-    DraggedFile(Vec<PathBuf>),
+    // Called while files are being dragged over the window.
+    //
+    // `coords` is window-relative, in the same space as `MouseEvent::coords`,
+    // so a handler can hit-test it against whatever it painted. It is `None`
+    // on platforms that do not report a position (Wayland, Windows), and a
+    // handler that needs a position must fall back to its no-position
+    // behaviour rather than guessing.
+    //
+    // `paths` may be empty here even when the drag does carry files: X11's
+    // XDND only transfers the payload on drop, so the hover events know a
+    // drag is happening without yet knowing what it holds.
+    DraggedFile {
+        paths: Vec<PathBuf>,
+        coords: Option<Point>,
+    },
+
+    // Called when a file drag leaves the window or is cancelled, so any
+    // drop-target affordance can be taken down.
+    DragLeave,
 
     // Called when the files are dropped into the window
-    DroppedFile(Vec<PathBuf>),
+    DroppedFile {
+        paths: Vec<PathBuf>,
+        coords: Option<Point>,
+    },
 
     // Called when urls are dropped into the window
     DroppedUrl(Vec<Url>),

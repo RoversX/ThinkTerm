@@ -70,6 +70,12 @@ const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_GAP: f64 = 8.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE: f64 = 30.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG: NSInteger = 0x7474_7362;
 
+/// `NSDragOperation` values. The dragging entered/updated methods return this
+/// mask, not a BOOL: the runtime reads a full word, so returning a byte-wide
+/// BOOL leaves the rest of the value undefined.
+const NS_DRAG_OPERATION_NONE: NSUInteger = 0;
+const NS_DRAG_OPERATION_COPY: NSUInteger = 1;
+
 static THINKTERM_PERF_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn thinkterm_perf_enabled() -> bool {
@@ -4247,54 +4253,93 @@ impl WindowView {
         }
     }
 
-    extern "C" fn dragging_entered(this: &mut Object, _: Sel, sender: id) -> BOOL {
-        if let Some(this) = Self::get_this(this) {
-            let mut inner = this.inner.borrow_mut();
-
-            let pb: id = unsafe { msg_send![sender, draggingPasteboard] };
-            if pb.is_null() {
-                return NO;
-            }
-
-            let filenames =
-                unsafe { NSPasteboard::propertyListForType(pb, appkit::NSFilenamesPboardType) };
-            if filenames.is_null() {
-                return NO;
-            }
-
-            let paths = unsafe { filenames.iter() }
-                .map(|file| unsafe {
-                    let path = nsstring_to_str(file);
-                    PathBuf::from(path)
-                })
-                .collect::<Vec<_>>();
-            inner.events.dispatch(WindowEvent::DraggedFile(paths));
+    /// Where the drag is, in the same window-relative backing pixels as
+    /// `MouseEvent::coords`. `draggingLocation` is in window coordinates just
+    /// like `locationInWindow`, so this mirrors `mouse_common` exactly; the
+    /// view is flipped, so no y adjustment is needed.
+    fn dragging_coords(this: &mut Object, sender: id) -> Point {
+        let view = this as id;
+        unsafe {
+            let location: NSPoint = msg_send![sender, draggingLocation];
+            let point = NSView::convertPoint_fromView_(view, location, nil);
+            let rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(point.x, point.y));
+            let backing_rect = NSView::convertRectToBacking(view, rect);
+            // backing_rect computes abs() values, so restore the sign from
+            // the original point.
+            Point::new(
+                f64::copysign(backing_rect.size.width, point.x) as isize,
+                f64::copysign(backing_rect.size.height, point.y) as isize,
+            )
         }
-        YES
+    }
+
+    fn dragged_paths(sender: id) -> Option<Vec<PathBuf>> {
+        let pb: id = unsafe { msg_send![sender, draggingPasteboard] };
+        if pb.is_null() {
+            return None;
+        }
+        let filenames =
+            unsafe { NSPasteboard::propertyListForType(pb, appkit::NSFilenamesPboardType) };
+        if filenames.is_null() {
+            return None;
+        }
+        Some(
+            unsafe { filenames.iter() }
+                .map(|file| unsafe { PathBuf::from(nsstring_to_str(file)) })
+                .collect(),
+        )
+    }
+
+    fn dragging_hover(this: &mut Object, sender: id) -> NSUInteger {
+        let Some(paths) = Self::dragged_paths(sender) else {
+            return NS_DRAG_OPERATION_NONE;
+        };
+        let coords = Self::dragging_coords(this, sender);
+        if let Some(this) = Self::get_this(this) {
+            this.inner
+                .borrow_mut()
+                .events
+                .dispatch(WindowEvent::DraggedFile {
+                    paths,
+                    coords: Some(coords),
+                });
+        }
+        NS_DRAG_OPERATION_COPY
+    }
+
+    extern "C" fn dragging_entered(this: &mut Object, _: Sel, sender: id) -> NSUInteger {
+        Self::dragging_hover(this, sender)
+    }
+
+    /// Registered so the hover position keeps arriving as the pointer moves.
+    /// Without it AppKit reuses `draggingEntered:`'s answer for the whole
+    /// drag and never reports where the pointer went.
+    extern "C" fn dragging_updated(this: &mut Object, _: Sel, sender: id) -> NSUInteger {
+        Self::dragging_hover(this, sender)
+    }
+
+    extern "C" fn dragging_exited(this: &mut Object, _: Sel, _sender: id) {
+        if let Some(this) = Self::get_this(this) {
+            this.inner
+                .borrow_mut()
+                .events
+                .dispatch(WindowEvent::DragLeave);
+        }
     }
 
     extern "C" fn perform_drag_operation(this: &mut Object, _: Sel, sender: id) -> BOOL {
+        let Some(paths) = Self::dragged_paths(sender) else {
+            return NO;
+        };
+        let coords = Self::dragging_coords(this, sender);
         if let Some(this) = Self::get_this(this) {
-            let mut inner = this.inner.borrow_mut();
-
-            let pb: id = unsafe { msg_send![sender, draggingPasteboard] };
-            if pb.is_null() {
-                return NO;
-            }
-
-            let filenames =
-                unsafe { NSPasteboard::propertyListForType(pb, appkit::NSFilenamesPboardType) };
-            if filenames.is_null() {
-                return NO;
-            }
-
-            let paths = unsafe { filenames.iter() }
-                .map(|file| unsafe {
-                    let path = nsstring_to_str(file);
-                    PathBuf::from(path)
-                })
-                .collect::<Vec<_>>();
-            inner.events.dispatch(WindowEvent::DroppedFile(paths));
+            this.inner
+                .borrow_mut()
+                .events
+                .dispatch(WindowEvent::DroppedFile {
+                    paths,
+                    coords: Some(coords),
+                });
         }
         YES
     }
@@ -4603,7 +4648,15 @@ impl WindowView {
             );
             cls.add_method(
                 sel!(draggingEntered:),
-                Self::dragging_entered as extern "C" fn(&mut Object, Sel, id) -> BOOL,
+                Self::dragging_entered as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
+            );
+            cls.add_method(
+                sel!(draggingUpdated:),
+                Self::dragging_updated as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
+            );
+            cls.add_method(
+                sel!(draggingExited:),
+                Self::dragging_exited as extern "C" fn(&mut Object, Sel, id),
             );
             cls.add_method(
                 sel!(performDragOperation:),

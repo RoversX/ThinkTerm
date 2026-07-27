@@ -1,11 +1,13 @@
 use crate::workspace_threads::{RemoteFilesSource, RemoteFilesTarget};
 use config::SshDomain;
 use smol::channel::Sender;
-use smol::io::AsyncReadExt;
+use smol::io::{AsyncReadExt, AsyncWriteExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use wezterm_ssh::{Session, SessionEvent, SftpChannelError, SftpError};
@@ -41,6 +43,20 @@ impl RemotePath {
 
     pub(crate) fn file_name(&self) -> &str {
         self.0.rsplit('/').next().unwrap_or(&self.0)
+    }
+
+    /// The directory holding this path, or `None` at the root — which has no
+    /// parent rather than being its own.
+    pub(crate) fn parent(&self) -> Option<Self> {
+        if self.0 == "/" {
+            return None;
+        }
+        let (parent, _) = self.0.rsplit_once('/')?;
+        Some(Self(if parent.is_empty() {
+            "/".to_string()
+        } else {
+            parent.to_string()
+        }))
     }
 
     pub(crate) fn extension(&self) -> Option<&str> {
@@ -207,6 +223,176 @@ pub(crate) struct RemoteFileBytes {
     pub truncated: bool,
 }
 
+/// Bytes moved per round trip. SFTP is request/response over a single
+/// channel, so a bigger chunk means fewer round trips; this matches the read
+/// path's buffer and still leaves a cancel responsive on a slow link.
+pub(crate) const REMOTE_TRANSFER_CHUNK: usize = 256 * 1024;
+
+/// Stands in for "we do not know the size yet". A real file cannot be this
+/// large, and it keeps an empty file (a genuine total of 0) distinguishable
+/// from a size that has not been established.
+const TRANSFER_TOTAL_UNKNOWN: u64 = u64::MAX;
+
+/// Shared, lock-free view of one transfer: the worker publishes progress, the
+/// UI reads it every paint, and either side can ask to stop.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteTransferProgress {
+    transferred: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Default for RemoteTransferProgress {
+    fn default() -> Self {
+        Self {
+            transferred: Arc::new(AtomicU64::new(0)),
+            total: Arc::new(AtomicU64::new(TRANSFER_TOTAL_UNKNOWN)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl RemoteTransferProgress {
+    pub(crate) fn transferred(&self) -> u64 {
+        self.transferred.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn total(&self) -> Option<u64> {
+        match self.total.load(Ordering::Relaxed) {
+            TRANSFER_TOTAL_UNKNOWN => None,
+            total => Some(total),
+        }
+    }
+
+    fn set_total(&self, total: u64) {
+        // Clamp so a pathological size cannot be mistaken for "unknown".
+        self.total
+            .store(total.min(TRANSFER_TOTAL_UNKNOWN - 1), Ordering::Relaxed);
+    }
+
+    fn advance(&self, bytes: u64) {
+        self.transferred.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_canceled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// How far along, for a progress bar. `None` while the size is unknown;
+    /// an empty file is complete the moment it is created.
+    pub(crate) fn fraction(&self) -> Option<f32> {
+        let total = self.total()?;
+        if total == 0 {
+            return Some(1.0);
+        }
+        Some((self.transferred() as f64 / total as f64).clamp(0.0, 1.0) as f32)
+    }
+}
+
+/// Reported when a transfer stops because the user asked it to, so callers can
+/// tell "you cancelled this" apart from a real failure.
+pub(crate) const REMOTE_TRANSFER_CANCELED: &str = "Canceled";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteTransferKind {
+    Upload,
+    Download,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteTransferStatus {
+    Running,
+    /// Finished, carrying whatever is worth telling the user afterwards —
+    /// for a download, where the file landed.
+    Done(String),
+    Failed(String),
+}
+
+/// One file in flight, or one that just finished and still has something to
+/// report. Lives on the window rather than in [`RemoteFilesState`] because a
+/// transfer holds its own lease and must survive the panel switching trees.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteTransfer {
+    pub id: u64,
+    pub kind: RemoteTransferKind,
+    pub name: String,
+    pub progress: RemoteTransferProgress,
+    pub status: RemoteTransferStatus,
+}
+
+impl RemoteTransfer {
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self.status, RemoteTransferStatus::Running)
+    }
+}
+
+/// How many ` (n)` variants to try before giving up on finding a free name.
+const DOWNLOAD_NAME_ATTEMPTS: u32 = 1_000;
+
+/// Reduce a server-supplied name to something that can only ever name a file
+/// *inside* the download directory.
+///
+/// Uses `Path::file_name` rather than splitting on separators by hand, so the
+/// host's own path rules apply — which is what catches a Windows drive-
+/// relative name like `C:evil.txt`, where there is no separator to split on
+/// but `directory.join(..)` would still escape.
+fn sanitized_download_name(file_name: &str) -> &str {
+    Path::new(file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        // `.`/`..`/`/` yield no file name at all; anything else that survives
+        // is a single component by construction.
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download")
+}
+
+/// The names a download will try, in order: the file's own name, then
+/// ` (1)`, ` (2)`… inserted before the extension the way a browser does.
+///
+/// Pure, so the naming rule is testable without a filesystem.
+pub(crate) fn download_name_candidates(file_name: &str) -> impl Iterator<Item = String> + '_ {
+    let sanitized = sanitized_download_name(file_name);
+    // Split at the *first* dot after the stem so `tar.gz` survives whole; a
+    // leading dot is a hidden file, not an extension.
+    let (stem, extension) = match sanitized.find('.') {
+        Some(0) | None => (sanitized, ""),
+        Some(index) => (&sanitized[..index], &sanitized[index..]),
+    };
+    std::iter::once(sanitized.to_string()).chain(
+        (1..=DOWNLOAD_NAME_ATTEMPTS).map(move |suffix| format!("{stem} ({suffix}){extension}")),
+    )
+}
+
+/// Claim a destination and its staging file together.
+///
+/// `reserve` must create the staging path *exclusively* and report whether it
+/// won the race; a candidate is only taken when its destination is free and
+/// its staging file did not already exist. Doing both in one step is what
+/// stops two downloads of the same name from sharing a `.part` and stops a
+/// pre-existing `X.part` from being truncated and then deleted on cleanup.
+pub(crate) fn reserve_download_path(
+    directory: &Path,
+    file_name: &str,
+    exists: impl Fn(&Path) -> bool,
+    mut reserve: impl FnMut(&Path) -> bool,
+) -> Option<(PathBuf, PathBuf)> {
+    for name in download_name_candidates(file_name) {
+        let destination = directory.join(&name);
+        if exists(&destination) {
+            continue;
+        }
+        let partial = partial_download_path(&destination);
+        if reserve(&partial) {
+            return Some((destination, partial));
+        }
+    }
+    None
+}
+
 pub(crate) trait RemoteFileBackend: Send + Sync {
     fn resolve_root(&self, requested: String) -> RemoteFuture<RemotePath>;
     fn list_directory(
@@ -221,6 +407,36 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     /// test doubles opt in explicitly.
     fn probe(&self) -> RemoteFuture<()> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Send `local` to `remote`, returning the number of bytes written.
+    /// Refuses rather than overwriting an existing remote file, and tries to
+    /// remove the partial file if it fails or is cancelled — best effort,
+    /// since a transfer that died with the connection has no way to clean up
+    /// after itself.
+    ///
+    /// The default refuses: only a backend that can actually write should
+    /// claim to, and every test double that does not care about transfers
+    /// inherits an honest answer.
+    fn upload_file(
+        &self,
+        local: PathBuf,
+        remote: RemotePath,
+        progress: RemoteTransferProgress,
+    ) -> RemoteFuture<u64> {
+        let _ = (local, remote, progress);
+        Box::pin(async { Err("This connection cannot upload files".to_string()) })
+    }
+
+    /// Fetch `remote` into `local`, returning the number of bytes written.
+    fn download_file(
+        &self,
+        remote: RemotePath,
+        local: PathBuf,
+        progress: RemoteTransferProgress,
+    ) -> RemoteFuture<u64> {
+        let _ = (remote, local, progress);
+        Box::pin(async { Err("This connection cannot download files".to_string()) })
     }
 }
 
@@ -394,6 +610,173 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
             Ok(RemoteFileBytes { bytes, truncated })
         })
     }
+
+    fn upload_file(
+        &self,
+        local: PathBuf,
+        remote: RemotePath,
+        progress: RemoteTransferProgress,
+    ) -> RemoteFuture<u64> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            // Refuse to clobber. SFTP has no exclusive-create, so this is a
+            // check rather than a guarantee — but losing the race needs a
+            // second writer racing for the same path in the same instant,
+            // whereas silently destroying a file needs only a careless drop.
+            if sftp.metadata(remote.as_str().to_string()).await.is_ok() {
+                return Err(format!(
+                    "{} already exists on the server",
+                    remote.file_name()
+                ));
+            }
+
+            let mut source = smol::fs::File::open(&local)
+                .await
+                .map_err(|err| format!("Unable to open {}: {err}", local.display()))?;
+            if let Ok(metadata) = source.metadata().await {
+                progress.set_total(metadata.len());
+            }
+
+            let mut file = sftp
+                .create(remote.as_str().to_string())
+                .await
+                .map_err(|err| format!("Unable to create {}: {err}", remote.as_str()))?;
+
+            let outcome = copy_stream(
+                &mut source,
+                &mut file,
+                &progress,
+                "the local file",
+                "the server",
+            )
+            .await;
+
+            // Close the handle before touching the path: a half-written file
+            // must not survive, and some servers refuse to unlink one that is
+            // still open.
+            drop(file);
+            if outcome.is_err() {
+                if let Err(err) = sftp.remove_file(remote.as_str().to_string()).await {
+                    log::warn!(
+                        "remote files: unable to clean up the partial upload {}: {err:#}",
+                        remote.as_str()
+                    );
+                }
+            }
+            outcome
+        })
+    }
+
+    fn download_file(
+        &self,
+        remote: RemotePath,
+        local: PathBuf,
+        progress: RemoteTransferProgress,
+    ) -> RemoteFuture<u64> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            if let Ok(metadata) = sftp.metadata(remote.as_str().to_string()).await {
+                if let Some(size) = metadata.size {
+                    progress.set_total(size);
+                }
+            }
+
+            let mut file = sftp
+                .open(remote.as_str().to_string())
+                .await
+                .map_err(|err| format!("Unable to open {}: {err}", remote.as_str()))?;
+
+            // The staging file was already claimed exclusively by the caller
+            // (see `reserve_download_path`); opening it for writing here must
+            // not create or truncate anything, or that reservation would mean
+            // nothing.
+            let partial = partial_download_path(&local);
+            let mut sink = smol::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(false)
+                .open(&partial)
+                .await
+                .map_err(|err| format!("Unable to write {}: {err}", partial.display()))?;
+
+            let outcome = copy_stream(
+                &mut file,
+                &mut sink,
+                &progress,
+                "the server",
+                "the local file",
+            )
+            .await;
+            drop(sink);
+
+            match outcome {
+                Ok(written) => match smol::fs::rename(&partial, &local).await {
+                    Ok(()) => Ok(written),
+                    Err(err) => {
+                        let _ = smol::fs::remove_file(&partial).await;
+                        Err(format!("Unable to save {}: {err}", local.display()))
+                    }
+                },
+                Err(err) => {
+                    if let Err(cleanup) = smol::fs::remove_file(&partial).await {
+                        log::warn!(
+                            "remote files: unable to clean up the partial download {}: {cleanup:#}",
+                            partial.display()
+                        );
+                    }
+                    Err(err)
+                }
+            }
+        })
+    }
+}
+
+/// Where an in-flight download accumulates. Kept next to the destination so
+/// the rename that completes it stays on one filesystem.
+fn partial_download_path(local: &Path) -> PathBuf {
+    let mut name = local.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    local.with_file_name(name)
+}
+
+/// Stream `source` into `sink`, publishing progress and honouring a cancel
+/// between chunks. Generic in both directions because the SFTP file type is
+/// private to `wezterm-ssh` and cannot be named here — which is just as well,
+/// since upload and download differ only in which end is which.
+async fn copy_stream<R, W>(
+    source: &mut R,
+    sink: &mut W,
+    progress: &RemoteTransferProgress,
+    source_label: &str,
+    sink_label: &str,
+) -> Result<u64, String>
+where
+    R: smol::io::AsyncRead + Unpin,
+    W: smol::io::AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; REMOTE_TRANSFER_CHUNK];
+    let mut written = 0u64;
+    loop {
+        if progress.is_canceled() {
+            return Err(REMOTE_TRANSFER_CANCELED.to_string());
+        }
+        let read = source
+            .read(&mut buffer)
+            .await
+            .map_err(|err| format!("Unable to read from {source_label}: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        sink.write_all(&buffer[..read])
+            .await
+            .map_err(|err| format!("Unable to write to {sink_label}: {err}"))?;
+        written += read as u64;
+        progress.advance(read as u64);
+    }
+    sink.flush()
+        .await
+        .map_err(|err| format!("Unable to finish writing to {sink_label}: {err}"))?;
+    Ok(written)
 }
 
 fn is_sftp_directory_eof(err: &anyhow::Error) -> bool {
@@ -1128,6 +1511,10 @@ pub(crate) enum RemoteFilesEvent {
         generation: u64,
     },
     ToggleDirectory(RemotePath),
+    /// A directory's contents changed underneath us (an upload landed there),
+    /// so re-list just that directory. Unlike [`RemoteFilesEvent::Refresh`]
+    /// this keeps the rest of the tree and its expansion state intact.
+    DirectoryInvalidated(RemotePath),
     DirectoryLoaded {
         generation: u64,
         path: RemotePath,
@@ -1314,6 +1701,27 @@ impl RemoteFilesState {
                 if self.awaiting_lease {
                     // Recorded in `loading_directories`; `Connected` flushes it
                     // once the lease for the restored tree lands.
+                    return Vec::new();
+                }
+                self.list_directory_effect(path)
+            }
+            RemoteFilesEvent::DirectoryInvalidated(path) => {
+                if !matches!(self.phase, RemoteFilesPhase::Connected)
+                    || !self.expanded.contains(&path)
+                {
+                    // Not on screen: whatever changed will be read fresh
+                    // whenever this directory is expanded next.
+                    return Vec::new();
+                }
+                // Drop the stale listing first so the re-list is budgeted
+                // against the rows that actually remain.
+                self.directories.remove(&path);
+                if !self.loading_directories.insert(path.clone()) {
+                    // Already being fetched; that request will bring the new
+                    // contents with it.
+                    return Vec::new();
+                }
+                if self.awaiting_lease {
                     return Vec::new();
                 }
                 self.list_directory_effect(path)
@@ -2126,6 +2534,301 @@ mod tests {
         assert_eq!(error_summary(&err), "Permission denied");
     }
 
+    /// Yields at most `chunk` bytes per poll, so a test can control how many
+    /// times the copy loop goes round.
+    struct ChunkReader {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl smol::io::AsyncRead for ChunkReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let remaining = self.data.len() - self.pos;
+            let n = remaining.min(self.chunk).min(buf.len());
+            let pos = self.pos;
+            buf[..n].copy_from_slice(&self.data[pos..pos + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(n))
+        }
+    }
+
+    /// Collects everything written, and can trip a cancel after a chosen
+    /// number of writes so the abort lands mid-transfer.
+    struct VecSink {
+        data: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        cancel_after: Option<(usize, RemoteTransferProgress)>,
+    }
+
+    impl VecSink {
+        fn new() -> Self {
+            Self {
+                data: Vec::new(),
+                writes: 0,
+                flushes: 0,
+                cancel_after: None,
+            }
+        }
+    }
+
+    impl smol::io::AsyncWrite for VecSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.data.extend_from_slice(buf);
+            self.writes += 1;
+            if let Some((after, progress)) = self.cancel_after.clone() {
+                if self.writes >= after {
+                    progress.request_cancel();
+                }
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn a_transfer_moves_every_byte_and_reports_progress() {
+        let data: Vec<u8> = (0..10_000u32).map(|index| index as u8).collect();
+        let mut source = ChunkReader {
+            data: data.clone(),
+            pos: 0,
+            chunk: 1_000,
+        };
+        let mut sink = VecSink::new();
+        let progress = RemoteTransferProgress::default();
+        progress.set_total(data.len() as u64);
+
+        let written = smol::block_on(copy_stream(
+            &mut source,
+            &mut sink,
+            &progress,
+            "source",
+            "sink",
+        ))
+        .expect("transfer");
+
+        assert_eq!(written, data.len() as u64);
+        assert_eq!(sink.data, data, "the bytes must arrive unchanged");
+        assert_eq!(progress.transferred(), data.len() as u64);
+        assert_eq!(progress.fraction(), Some(1.0));
+        assert_eq!(sink.flushes, 1, "the sink must be flushed exactly once");
+    }
+
+    #[test]
+    fn canceling_before_the_first_chunk_writes_nothing() {
+        let mut source = ChunkReader {
+            data: vec![7u8; 4_096],
+            pos: 0,
+            chunk: 1_024,
+        };
+        let mut sink = VecSink::new();
+        let progress = RemoteTransferProgress::default();
+        progress.request_cancel();
+
+        let err = smol::block_on(copy_stream(
+            &mut source,
+            &mut sink,
+            &progress,
+            "source",
+            "sink",
+        ))
+        .expect_err("a canceled transfer must fail");
+
+        assert_eq!(err, REMOTE_TRANSFER_CANCELED);
+        assert!(sink.data.is_empty(), "nothing may be sent after a cancel");
+        assert_eq!(progress.transferred(), 0);
+    }
+
+    #[test]
+    fn canceling_mid_transfer_stops_at_the_next_chunk() {
+        let progress = RemoteTransferProgress::default();
+        let mut source = ChunkReader {
+            data: vec![3u8; 4_096],
+            pos: 0,
+            chunk: 1_024,
+        };
+        let mut sink = VecSink::new();
+        // Trip the cancel as the first chunk lands, so the loop aborts on its
+        // next pass rather than running to completion.
+        sink.cancel_after = Some((1, progress.clone()));
+
+        let err = smol::block_on(copy_stream(
+            &mut source,
+            &mut sink,
+            &progress,
+            "source",
+            "sink",
+        ))
+        .expect_err("a canceled transfer must fail");
+
+        assert_eq!(err, REMOTE_TRANSFER_CANCELED);
+        assert_eq!(
+            sink.data.len(),
+            1_024,
+            "the chunk already in flight completes, and no more follow"
+        );
+        assert_eq!(progress.transferred(), 1_024);
+        assert_eq!(sink.flushes, 0, "an aborted transfer is never flushed");
+    }
+
+    #[test]
+    fn transfer_progress_reports_a_usable_fraction() {
+        let progress = RemoteTransferProgress::default();
+        assert_eq!(progress.total(), None);
+        assert_eq!(
+            progress.fraction(),
+            None,
+            "no fraction before the size is known"
+        );
+
+        progress.set_total(0);
+        assert_eq!(
+            progress.fraction(),
+            Some(1.0),
+            "an empty file is complete once it exists"
+        );
+
+        let progress = RemoteTransferProgress::default();
+        progress.set_total(200);
+        progress.advance(50);
+        assert_eq!(progress.fraction(), Some(0.25));
+        // A server that reported a stale size must not push the bar past full.
+        progress.advance(1_000);
+        assert_eq!(progress.fraction(), Some(1.0));
+    }
+
+    /// Reserve helper for tests: `taken` stands in for names already on disk,
+    /// and every reservation attempt succeeds unless the staging file is one
+    /// of them.
+    fn reserve_against(taken: &HashSet<PathBuf>) -> impl Fn(&Path) -> bool + '_ {
+        move |partial: &Path| !taken.contains(partial)
+    }
+
+    #[test]
+    fn a_download_never_overwrites_an_existing_file() {
+        let dir = Path::new("/home/ada/Downloads");
+        let taken: HashSet<PathBuf> = [
+            "/home/ada/Downloads/notes.tar.gz",
+            "/home/ada/Downloads/notes (1).tar.gz",
+            "/home/ada/Downloads/report.pdf",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let exists = |path: &Path| taken.contains(path);
+        let taken_path = |dir: &Path, name: &str| dir.join(name);
+        // Free name: used as-is.
+        assert_eq!(
+            reserve_download_path(dir, "fresh.txt", exists, reserve_against(&taken)),
+            Some((
+                taken_path(dir, "fresh.txt"),
+                taken_path(dir, "fresh.txt.part")
+            ))
+        );
+        // Taken once: the first free suffix wins, and a two-part extension
+        // stays whole rather than becoming "notes.tar (1).gz".
+        assert_eq!(
+            reserve_download_path(dir, "notes.tar.gz", exists, reserve_against(&taken))
+                .map(|(dest, _)| dest),
+            Some(taken_path(dir, "notes (2).tar.gz"))
+        );
+        assert_eq!(
+            reserve_download_path(dir, "report.pdf", exists, reserve_against(&taken))
+                .map(|(dest, _)| dest),
+            Some(taken_path(dir, "report (1).pdf"))
+        );
+    }
+
+    /// The staging file is claimed exclusively, so a `.part` that is already
+    /// there — another download in flight, or just a file with that name — is
+    /// never truncated and never deleted by our cleanup.
+    #[test]
+    fn a_download_skips_a_name_whose_staging_file_is_taken() {
+        let dir = Path::new("/home/ada/Downloads");
+        let taken: HashSet<PathBuf> =
+            std::iter::once(PathBuf::from("/home/ada/Downloads/ubuntu.iso.part")).collect();
+        // The destination itself is free; only its staging file is taken.
+        let (destination, partial) =
+            reserve_download_path(dir, "ubuntu.iso", |_| false, reserve_against(&taken))
+                .expect("a free name exists");
+        assert_eq!(destination, dir.join("ubuntu (1).iso"));
+        assert_eq!(partial, dir.join("ubuntu (1).iso.part"));
+        assert_ne!(
+            partial,
+            PathBuf::from("/home/ada/Downloads/ubuntu.iso.part"),
+            "the pre-existing staging file must be left alone"
+        );
+
+        // Nothing free at all: refuse rather than clobber something.
+        assert_eq!(
+            reserve_download_path(dir, "x.bin", |_| true, |_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_download_name_cannot_escape_the_download_directory() {
+        let dir = Path::new("/home/ada/Downloads");
+        // A server controls these names, so a separator, `..`, or a Windows
+        // drive prefix must not be able to steer the write anywhere else.
+        for hostile in [
+            "../../etc/passwd",
+            "/etc/passwd",
+            "..",
+            ".",
+            "",
+            "C:evil.txt",
+            "a/b/c.txt",
+        ] {
+            let (destination, partial) =
+                reserve_download_path(dir, hostile, |_| false, |_| true).expect("a name");
+            assert_eq!(
+                destination.parent(),
+                Some(dir),
+                "{hostile:?} escaped to {}",
+                destination.display()
+            );
+            assert_eq!(partial.parent(), Some(dir));
+        }
+        // A dotfile keeps its leading dot instead of being read as extension.
+        let mut names = download_name_candidates(".bashrc");
+        assert_eq!(names.next().as_deref(), Some(".bashrc"));
+        assert_eq!(names.next().as_deref(), Some(".bashrc (1)"));
+    }
+
+    #[test]
+    fn a_partial_download_lands_beside_its_destination() {
+        // Same directory, so completing the download is a rename rather than a
+        // cross-filesystem copy.
+        let destination = Path::new("/home/ada/Downloads/notes.tar.gz");
+        let path = partial_download_path(destination);
+        assert_eq!(path, PathBuf::from("/home/ada/Downloads/notes.tar.gz.part"));
+        assert_eq!(path.parent(), destination.parent());
+    }
+
     /// Authorization is a process-wide registry, so tests sharing a source name
     /// would inherit each other's authorization (and race, since they run in
     /// parallel). Every test that cares about the authorized/unauthorized
@@ -2764,6 +3467,75 @@ mod tests {
     /// Two projects can share one host while browsing different roots; the
     /// cache is keyed by (source, requested root) so project B must never be
     /// shown project A's rows just because the connection is the same.
+    /// An upload lands in one directory, so only that directory is re-read.
+    /// A full `Refresh` would collapse the whole tree the user had opened.
+    #[test]
+    fn invalidating_a_directory_relists_only_that_directory() {
+        let source = unique_source("invalidate");
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let dir = root.join_name("src").unwrap();
+        let other = root.join_name("docs").unwrap();
+        let mut state = RemoteFilesState::default();
+
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation,
+            root: root.clone(),
+            listing: listing(
+                &root,
+                &[
+                    ("src", RemoteFileKind::Directory),
+                    ("docs", RemoteFileKind::Directory),
+                ],
+            ),
+        });
+        for path in [dir.clone(), other.clone()] {
+            state.transition(RemoteFilesEvent::ToggleDirectory(path.clone()));
+            state.transition(RemoteFilesEvent::DirectoryLoaded {
+                generation,
+                path: path.clone(),
+                listing: listing(&path, &[("old", RemoteFileKind::File)]),
+            });
+        }
+        assert_eq!(state.rows().len(), 5, "root + 2 dirs + 2 files");
+
+        let effects = state.transition(RemoteFilesEvent::DirectoryInvalidated(dir.clone()));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [RemoteFilesEffect::ListDirectory { path, .. }] if *path == dir
+            ),
+            "expected a re-list of just that directory, got {:?}",
+            effects
+        );
+        // The sibling keeps both its expansion and its rows.
+        assert!(state.expanded.contains(&other));
+        assert!(state.directories.contains_key(&other));
+
+        state.transition(RemoteFilesEvent::DirectoryLoaded {
+            generation,
+            path: dir.clone(),
+            listing: listing(
+                &dir,
+                &[("old", RemoteFileKind::File), ("new", RemoteFileKind::File)],
+            ),
+        });
+        assert_eq!(state.rows().len(), 6, "the uploaded file shows up");
+
+        // A directory that is not open has nothing to re-read.
+        state.transition(RemoteFilesEvent::ToggleDirectory(other.clone()));
+        assert!(state
+            .transition(RemoteFilesEvent::DirectoryInvalidated(other))
+            .is_empty());
+    }
+
     #[test]
     fn trees_are_cached_per_root_not_per_source() {
         let source = unique_source("per-root");

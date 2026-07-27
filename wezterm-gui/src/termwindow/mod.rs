@@ -296,6 +296,8 @@ pub(crate) enum ContextMenuApplicationAction {
     },
     /// Sidebar view-options: show/hide threads with this work status.
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
+    /// Fetch a file from the remote Files panel into the Downloads folder.
+    DownloadRemoteFile(remote_files::RemotePath),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,6 +377,9 @@ pub enum UIItemType {
     RightSidebarRemoteFileRow(remote_files::RemotePath),
     RightSidebarRemoteFileBack,
     RightSidebarRemoteFileCopyText,
+    /// A row in the transfer strip. Clicking cancels it while it runs and
+    /// dismisses it once it has finished.
+    RightSidebarRemoteTransfer(u64),
     ContextMenuBackdrop,
     ContextMenuItem(Vec<usize>),
     AboveScrollThumb,
@@ -1382,6 +1387,14 @@ pub struct TermWindow {
     right_sidebar_file_view_state_order: VecDeque<(PathBuf, String)>,
     right_sidebar_remote_files: remote_files::RemoteFilesState,
     right_sidebar_remote_files_lease: Option<remote_files::RemoteConnectionLease>,
+    /// Transfers in flight, plus recently finished ones still worth showing.
+    /// Deliberately not part of `right_sidebar_remote_files`: a transfer holds
+    /// its own lease and must outlive the panel switching between trees.
+    right_sidebar_remote_transfers: Vec<remote_files::RemoteTransfer>,
+    right_sidebar_remote_transfer_next_id: u64,
+    /// The directory a file drag is currently hovering over, so the row can be
+    /// highlighted and the drop knows where it would land.
+    right_sidebar_remote_drop_target: Option<remote_files::RemotePath>,
     right_sidebar_remote_file_tree_scroll_offset: f32,
     // Bumped to invalidate a pending periodic-rescan timer tick.
     right_sidebar_file_rescan_token: u64,
@@ -2029,6 +2042,9 @@ impl TermWindow {
             right_sidebar_file_view_state_order: VecDeque::new(),
             right_sidebar_remote_files: remote_files::RemoteFilesState::default(),
             right_sidebar_remote_files_lease: None,
+            right_sidebar_remote_transfers: Vec::new(),
+            right_sidebar_remote_transfer_next_id: 0,
+            right_sidebar_remote_drop_target: None,
             right_sidebar_remote_file_tree_scroll_offset: 0.0,
             right_sidebar_file_rescan_token: 0,
             right_sidebar_file_refreshing: false,
@@ -2372,7 +2388,7 @@ impl TermWindow {
                 pane.send_paste(urls.as_str())?;
                 Ok(true)
             }
-            WindowEvent::DroppedFile(paths) => {
+            WindowEvent::DroppedFile { paths, coords } => {
                 if self.right_sidebar_mode == RightSidebarMode::Tasks
                     && self.right_sidebar_note.view.focused
                 {
@@ -2427,6 +2443,11 @@ impl TermWindow {
                     .detach();
                     return Ok(true);
                 }
+                // Aimed at the remote Files tree: upload rather than paste the
+                // local paths into a shell that cannot see them.
+                if self.upload_dropped_files_to_remote(&paths, coords) {
+                    return Ok(true);
+                }
                 let pane = match self.get_active_pane_or_overlay() {
                     Some(pane) => pane,
                     None => return Ok(true),
@@ -2444,7 +2465,14 @@ impl TermWindow {
                 pane.send_paste(&paths)?;
                 Ok(true)
             }
-            WindowEvent::DraggedFile(_) => Ok(true),
+            WindowEvent::DraggedFile { coords, .. } => {
+                self.update_right_sidebar_remote_drop_target(coords);
+                Ok(true)
+            }
+            WindowEvent::DragLeave => {
+                self.clear_right_sidebar_remote_drop_target();
+                Ok(true)
+            }
         }
     }
 

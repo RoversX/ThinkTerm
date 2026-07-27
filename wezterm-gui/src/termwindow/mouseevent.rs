@@ -1009,6 +1009,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
+            | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::AboveScrollThumb
@@ -1089,6 +1090,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
+            | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::AboveScrollThumb
@@ -2583,7 +2585,8 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteFileRefresh
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
-            | UIItemType::RightSidebarRemoteFileCopyText => {
+            | UIItemType::RightSidebarRemoteFileCopyText
+            | UIItemType::RightSidebarRemoteTransfer(_) => {
                 self.mouse_event_right_sidebar_remote_file(item.clone(), event, context);
             }
             UIItemType::WorkspaceSidebarSettings => {
@@ -3078,7 +3081,8 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteFileRefresh
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
-            | UIItemType::RightSidebarRemoteFileCopyText => {
+            | UIItemType::RightSidebarRemoteFileCopyText
+            | UIItemType::RightSidebarRemoteTransfer(_) => {
                 self.mouse_event_right_sidebar_remote_file(item.clone(), event, context);
             }
             UIItemType::ContentViewClose(id) => {
@@ -3584,6 +3588,12 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         context.set_cursor(Some(MouseCursor::Hand));
+        if let (UIItemType::RightSidebarRemoteFileRow(path), WMEK::Press(MousePress::Right)) =
+            (&item.item_type, &event.kind)
+        {
+            self.show_right_sidebar_remote_file_context_menu(context, event.coords, path.clone());
+            return;
+        }
         if event.kind != WMEK::Press(MousePress::Left) {
             return;
         }
@@ -3591,6 +3601,9 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::RightSidebarRemoteFileConnect => {
                 self.request_right_sidebar_remote_files_connect(true);
+            }
+            UIItemType::RightSidebarRemoteTransfer(id) => {
+                self.dismiss_or_cancel_remote_transfer(id);
             }
             UIItemType::RightSidebarRemoteFileRefresh => {
                 self.refresh_right_sidebar_remote_files();

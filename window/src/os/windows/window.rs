@@ -3188,7 +3188,13 @@ unsafe fn drop_files(hwnd: HWND, _msg: UINT, wparam: WPARAM, _lparam: LPARAM) ->
     }
 
     let mut inner = inner.borrow_mut();
-    inner.events.dispatch(WindowEvent::DroppedFile(filenames));
+    // WM_DROPFILES does carry a drop point (DragQueryPoint), but nothing here
+    // is built or tested on Windows; reporting no position keeps the drop on
+    // the long-standing "paste the paths into the terminal" path.
+    inner.events.dispatch(WindowEvent::DroppedFile {
+        paths: filenames,
+        coords: None,
+    });
 
     DragFinish(h_drop);
     Some(0)
