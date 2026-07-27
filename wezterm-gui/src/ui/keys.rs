@@ -135,8 +135,8 @@ mod tests {
             (false, true, true, true),
         ] {
             let mods = m(shift, ctrl, alt, super_);
-            assert!(!mods.command, "command claimed {ctrl}/{alt}/{super_}");
-            assert!(!mods.word, "word claimed {ctrl}/{alt}/{super_}");
+            assert!(!mods.command, "command claimed {}/{}/{}", ctrl, alt, super_);
+            assert!(!mods.word, "word claimed {}/{}/{}", ctrl, alt, super_);
         }
     }
 
@@ -154,7 +154,11 @@ mod tests {
             if mods.command || mods.word {
                 continue; // this one *is* a chord on this platform
             }
-            assert!(!mods.plain(), "{label} must not be treated as plain input");
+            assert!(
+                !mods.plain(),
+                "{} must not be treated as plain input",
+                label
+            );
         }
     }
 
@@ -180,7 +184,8 @@ mod tests {
         ] {
             assert!(
                 !EditModifiers::from(mods).plain(),
-                "{mods:?} must block text input"
+                "{:?} must block text input",
+                mods
             );
         }
         assert!(EditModifiers::from(M::NONE).plain());

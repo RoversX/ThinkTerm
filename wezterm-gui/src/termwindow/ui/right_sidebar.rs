@@ -72,6 +72,21 @@ const RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST: usize = 8;
 const RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST: usize = 16;
 const RIGHT_SIDEBAR_MODE_HEIGHT: usize = 72;
 const RIGHT_SIDEBAR_EMPTY_HEIGHT: usize = 88;
+/// Preview header geometry, in design pixels. These were the last raw literals
+/// left in this file after the scaling sweep: the sweep went file by file and
+/// this block reads like plain arithmetic, so it was missed. On a 0.5-scale
+/// display the buttons ended up twice the size of everything around them.
+const PREVIEW_HEADER_TOP_GAP: usize = 4;
+const PREVIEW_HEADER_BUTTON: usize = 44;
+const PREVIEW_HEADER_ACTION_GAP: usize = 6;
+/// Icon + inner padding + gaps that the "Open With" label sits inside.
+const PREVIEW_OPEN_LABEL_CHROME: usize = 12 + 10 + 36 + 6;
+/// Room kept for the filename before the action buttons may grow.
+const PREVIEW_HEADER_NAME_RESERVE: usize = 72;
+const PREVIEW_OPEN_BUTTON_MIN: usize = 80;
+/// Narrower than this and the "Open With" button drops its dropdown arrow.
+const PREVIEW_OPEN_SPLIT_MIN_WIDTH: usize = 112;
+const PREVIEW_OPEN_ARROW_WIDTH: usize = 36;
 /// Empty-state geometry for the remote Files panel, in design pixels.
 const REMOTE_EMPTY_ICON_SIZE: usize = 40;
 const REMOTE_EMPTY_ICON_GAP: usize = 18;
@@ -875,6 +890,10 @@ struct RightSidebarLoadedFilePreview {
     image: Option<RightSidebarFilePreviewImage>,
     message: Option<String>,
     truncated: bool,
+    /// The preview text exactly as loaded, before display sanitization
+    /// (tab expansion, control stripping). Copying must reproduce this —
+    /// spaces where a Makefile had tabs is a different file.
+    raw_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1260,11 +1279,15 @@ impl crate::TermWindow {
         // `close_right_sidebar_file_preview` only `.clear()`s the preview lines,
         // which keeps the (potentially large) capacity; drop it outright.
         self.right_sidebar_file_preview_lines = Vec::new();
+        self.right_sidebar_file_preview_raw_text = None;
 
         self.right_sidebar_file_index = None;
         self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Empty;
         self.right_sidebar_file_browse_rows = Vec::new();
         self.right_sidebar_file_browse_cache_key = None;
+        // Remote trees survive a panel toggle so switching back is instant, but
+        // a panel left hidden this long should give them back too.
+        self.right_sidebar_remote_files.release_cached_trees();
         self.ui_shape_caches.borrow_mut().clear_file_preview();
         self.publish_ui_shape_cache_diagnostics();
         self.invalidate_window();
@@ -1638,6 +1661,7 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
         let highlight_cancel = Arc::clone(&self.right_sidebar_file_preview_highlight_cancel);
         self.right_sidebar_file_preview_lines.clear();
+        self.right_sidebar_file_preview_raw_text = None;
         self.right_sidebar_file_preview_max_columns = 0;
         self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
@@ -1672,6 +1696,7 @@ impl crate::TermWindow {
                 image: None,
                 message: Some(format!("Unable to load file preview: {err}")),
                 truncated: false,
+                raw_text: None,
             });
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.apply_right_sidebar_file_preview_result(generation, path, result);
@@ -1686,30 +1711,40 @@ impl crate::TermWindow {
             return;
         }
         if self.right_sidebar_file_selected.as_deref() == Some(path) {
-            // Closing the preview narrows the sidebar, so the terminal must
-            // reflow or it keeps rendering under the old, wider sidebar.
-            let previous_width = self.right_sidebar_width();
+            // `close_right_sidebar_file_preview` reflows for us.
             self.close_right_sidebar_file_preview();
-            if let Some(window) = self.window.as_ref().cloned() {
-                if self.right_sidebar_width() != previous_width {
-                    let dimensions = self.dimensions;
-                    self.apply_dimensions(&dimensions, None, &window);
-                }
-                window.invalidate();
-            }
         }
         self.force_right_sidebar_file_rescan();
     }
 
+    /// Close the preview pane and give its width back to the terminal.
+    ///
+    /// The reflow lives here rather than at the call sites: closing narrows the
+    /// sidebar, and without `apply_dimensions` the terminal keeps rendering at
+    /// its old size so the reclaimed strip just sits empty. Of the nine callers
+    /// only two remembered to do it, and the ones that forgot were exactly the
+    /// remote paths — hence the pane's width surviving a workspace switch.
     pub(crate) fn close_right_sidebar_file_preview(&mut self) {
+        let previous_width = self.right_sidebar_width();
+        self.close_right_sidebar_file_preview_without_reflow();
+        if self.right_sidebar_width() != previous_width {
+            self.schedule_right_sidebar_reflow();
+        }
+    }
+
+    fn close_right_sidebar_file_preview_without_reflow(&mut self) {
         self.right_sidebar_file_view = RightSidebarFileView::Tree;
         self.right_sidebar_file_selected = None;
+        // The remote panel has its own selection; leaving it set keeps
+        // `right_sidebar_file_preview_active` true and the pane wide.
+        self.right_sidebar_remote_files.clear_selection();
         self.right_sidebar_file_preview_generation =
             self.right_sidebar_file_preview_generation.wrapping_add(1);
         self.right_sidebar_file_preview_highlight_cancel
             .store(1, AtomicOrdering::Relaxed);
         self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
         self.right_sidebar_file_preview_lines.clear();
+        self.right_sidebar_file_preview_raw_text = None;
         self.right_sidebar_file_preview_max_columns = 0;
         self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
@@ -2002,6 +2037,7 @@ impl crate::TermWindow {
         }
 
         self.right_sidebar_file_preview_lines = result.lines;
+        self.right_sidebar_file_preview_raw_text = result.raw_text;
         self.right_sidebar_file_preview_max_columns = self
             .right_sidebar_file_preview_lines
             .iter()
@@ -2315,6 +2351,14 @@ impl crate::TermWindow {
         }
 
         if self.right_sidebar_file_preview_lines.is_empty() {
+            return;
+        }
+
+        // Whole-buffer copy must reproduce the file, not the display: the
+        // lines have tabs expanded and controls stripped for rendering, which
+        // would corrupt tab-sensitive content like a Makefile.
+        if let Some(raw) = self.right_sidebar_file_preview_raw_text.clone() {
+            self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, raw);
             return;
         }
 
@@ -9186,7 +9230,23 @@ impl crate::TermWindow {
         }))
     }
 
+    /// Seconds between keepalives on the Files connection. Unlike a terminal
+    /// session this one carries no traffic while the panel sits idle, so
+    /// without this the server (or a NAT) reaps it and the next browse fails.
+    const REMOTE_FILES_KEEPALIVE_SECS: &'static str = "30";
+
     fn ssh_config_for_remote_files_target(
+        target: &workspace_threads::RemoteFilesTarget,
+    ) -> Result<config::SshDomain, String> {
+        let mut domain = Self::ssh_config_for_remote_files_source(target)?;
+        domain
+            .ssh_option
+            .entry("serveraliveinterval".to_string())
+            .or_insert_with(|| Self::REMOTE_FILES_KEEPALIVE_SECS.to_string());
+        Ok(domain)
+    }
+
+    fn ssh_config_for_remote_files_source(
         target: &workspace_threads::RemoteFilesTarget,
     ) -> Result<config::SshDomain, String> {
         match &target.source {
@@ -9263,6 +9323,7 @@ impl crate::TermWindow {
                         {
                             Ok(lease) => {
                                 let backend = lease.backend();
+                                let connection_id = lease.connection_id();
                                 match backend.resolve_root(requested_root).await {
                                     Ok(root) => match backend
                                         .list_directory(
@@ -9280,13 +9341,19 @@ impl crate::TermWindow {
                                         // connection forever.
                                         Err(err) => {
                                             drop(lease);
-                                            invalidate_remote_connection(&connection_key);
+                                            invalidate_remote_connection(
+                                                &connection_key,
+                                                connection_id,
+                                            );
                                             Err(RemoteAcquireError::Failed(err))
                                         }
                                     },
                                     Err(err) => {
                                         drop(lease);
-                                        invalidate_remote_connection(&connection_key);
+                                        invalidate_remote_connection(
+                                            &connection_key,
+                                            connection_id,
+                                        );
                                         Err(RemoteAcquireError::Failed(err))
                                     }
                                 }
@@ -9368,6 +9435,7 @@ impl crate::TermWindow {
                     };
                     let backend = lease.backend();
                     let connection_key = lease.connection_key().to_string();
+                    let connection_id = lease.connection_id();
                     let Some(window) = self.window.as_ref().cloned() else {
                         continue;
                     };
@@ -9375,7 +9443,11 @@ impl crate::TermWindow {
                         let result = backend.list_directory(path.clone(), limit).await;
                         drop(operation_lease);
                         let connection_died = result.as_ref().is_err_and(|message| {
-                            invalidate_remote_connection_if_dead(&connection_key, message)
+                            invalidate_remote_connection_if_dead(
+                                &connection_key,
+                                connection_id,
+                                message,
+                            )
                         });
                         window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                             if term_window
@@ -9517,6 +9589,7 @@ impl crate::TermWindow {
         };
         let backend = lease.backend();
         let connection_key = lease.connection_key().to_string();
+        let connection_id = lease.connection_id();
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
@@ -9534,7 +9607,7 @@ impl crate::TermWindow {
             let bytes = backend.read_file(path.clone(), limit).await;
             drop(operation_lease);
             let connection_died = bytes.as_ref().is_err_and(|message| {
-                invalidate_remote_connection_if_dead(&connection_key, message)
+                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
             });
             let preview_path = path.clone();
             let result = match bytes {
@@ -9551,12 +9624,14 @@ impl crate::TermWindow {
                     image: None,
                     message: Some(format!("Unable to prepare remote preview: {err}")),
                     truncated: false,
+                    raw_text: None,
                 }),
                 Err(err) => RightSidebarLoadedFilePreview {
                     lines: Vec::new(),
                     image: None,
                     message: Some(err),
                     truncated: false,
+                    raw_text: None,
                 },
             };
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -9586,6 +9661,7 @@ impl crate::TermWindow {
                     return;
                 }
                 term_window.right_sidebar_file_preview_lines = result.lines;
+                term_window.right_sidebar_file_preview_raw_text = result.raw_text;
                 term_window.right_sidebar_file_preview_max_columns = term_window
                     .right_sidebar_file_preview_lines
                     .iter()
@@ -10200,8 +10276,8 @@ impl crate::TermWindow {
         content_width: usize,
         path: &Path,
     ) -> anyhow::Result<()> {
-        let header_top = content_top + 4;
-        let button_size = 44.min(content_width);
+        let header_top = content_top + self.ui_px(PREVIEW_HEADER_TOP_GAP);
+        let button_size = self.ui_px(PREVIEW_HEADER_BUTTON).min(content_width);
         self.paint_files_preview_header_icon_button(
             layers,
             chrome,
@@ -10214,7 +10290,7 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileBack,
         )?;
 
-        let action_gap = 6;
+        let action_gap = self.ui_px(PREVIEW_HEADER_ACTION_GAP);
         let available_after_back =
             content_width.saturating_sub(button_size + self.ui_px(SIDEBAR_INSET));
         // The label is always shown in full. Size the button to fit it, limited
@@ -10230,11 +10306,13 @@ impl crate::TermWindow {
             .sidebar_text_width(ui_font, &open_label)
             .unwrap_or(0.0)
             .ceil() as usize;
-        let desired_open_width = label_px + 12 + 10 + 36 + 6;
-        let max_open_width =
-            available_after_back.saturating_sub((button_size * 2) + action_gap * 3 + 72);
-        let open_button_width = if max_open_width >= 80 {
-            desired_open_width.min(max_open_width).max(self.ui_px(80))
+        let desired_open_width = label_px + self.ui_px(PREVIEW_OPEN_LABEL_CHROME);
+        let max_open_width = available_after_back.saturating_sub(
+            (button_size * 2) + action_gap * 3 + self.ui_px(PREVIEW_HEADER_NAME_RESERVE),
+        );
+        let open_button_min = self.ui_px(PREVIEW_OPEN_BUTTON_MIN);
+        let open_button_width = if max_open_width >= open_button_min {
+            desired_open_width.min(max_open_width).max(open_button_min)
         } else {
             button_size
         };
@@ -10307,8 +10385,8 @@ impl crate::TermWindow {
         content_width: usize,
         path: &RemotePath,
     ) -> anyhow::Result<()> {
-        let header_top = content_top + 4;
-        let button_size = 44.min(content_width);
+        let header_top = content_top + self.ui_px(PREVIEW_HEADER_TOP_GAP);
+        let button_size = self.ui_px(PREVIEW_HEADER_BUTTON).min(content_width);
         self.paint_files_preview_header_icon_button(
             layers,
             chrome,
@@ -10415,7 +10493,13 @@ impl crate::TermWindow {
         height: usize,
         label: &str,
     ) -> anyhow::Result<()> {
-        let arrow_width = if width >= 112 { 36.min(width / 3) } else { 0 };
+        // Only split off a dropdown arrow once the button is wide enough that
+        // the label still fits beside it.
+        let arrow_width = if width >= self.ui_px(PREVIEW_OPEN_SPLIT_MIN_WIDTH) {
+            self.ui_px(PREVIEW_OPEN_ARROW_WIDTH).min(width / 3)
+        } else {
+            0
+        };
         let main_width = width.saturating_sub(arrow_width);
         let main_hover = self.is_pointer_over_ui_rect(x, y, main_width, height);
         let menu_hover =
@@ -12218,6 +12302,55 @@ fn file_name_for_path(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
+/// Columns a tab advances to. Editor-style rather than the terminal's 8, since
+/// this pane shows source files.
+const PREVIEW_TAB_WIDTH: usize = 4;
+
+/// Make raw file bytes safe to shape.
+///
+/// Nothing here draws a control character sensibly: no font has a glyph for
+/// U+0009, so a tab-indented file renders a row of `.notdef` boxes (and spams
+/// `No fonts contain glyphs for these codepoints: \u{9}` into the log). How
+/// obvious that looks just depends on the font's `.notdef` — blank on some,
+/// a hollow box on others — so it is not a per-platform or per-font problem.
+///
+/// Tabs expand to the next tab stop (not a fixed run of spaces) so indentation
+/// lines up the way the file's author saw it; `\r` is dropped so CRLF files do
+/// not end every line with a box; other controls are dropped outright. Returns
+/// `Cow::Borrowed` when there is nothing to change, which is the common case.
+fn sanitize_preview_text(text: &str) -> Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|ch| ch != '\n' && (ch == '\t' || ch.is_control()))
+    {
+        return Cow::Borrowed(text);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut column = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '\n' => {
+                out.push('\n');
+                column = 0;
+            }
+            '\t' => {
+                let advance = PREVIEW_TAB_WIDTH - (column % PREVIEW_TAB_WIDTH);
+                for _ in 0..advance {
+                    out.push(' ');
+                }
+                column += advance;
+            }
+            ch if ch.is_control() => {}
+            ch => {
+                out.push(ch);
+                column += 1;
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
 #[cfg(test)]
 fn preview_lines_from_text(
     path: &Path,
@@ -12239,6 +12372,10 @@ fn preview_lines_from_text_with_cancellation(
     {
         return Vec::new();
     }
+    // Sanitize before highlighting so byte offsets in the highlight result line
+    // up with what is actually drawn.
+    let text = sanitize_preview_text(text);
+    let text = text.as_ref();
     let mut highlight_end = text
         .len()
         .min(thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT);
@@ -12872,12 +13009,14 @@ fn load_right_sidebar_file_preview_with_cancellation(
                 image: Some(image),
                 message: None,
                 truncated: false,
+                raw_text: None,
             },
             Err(err) => RightSidebarLoadedFilePreview {
                 lines: Vec::new(),
                 image: None,
                 message: Some(format!("Unable to load image preview: {err}")),
                 truncated: false,
+                raw_text: None,
             },
         };
     }
@@ -12888,11 +13027,13 @@ fn load_right_sidebar_file_preview_with_cancellation(
     } else {
         Vec::new()
     };
+    let raw_text = message.is_none().then_some(text);
     RightSidebarLoadedFilePreview {
         lines,
         image: None,
         message,
         truncated,
+        raw_text,
     }
 }
 
@@ -12928,6 +13069,7 @@ fn remote_preview_from_bytes(
                     FILE_PREVIEW_IMAGE_MAX_BYTES / 1024 / 1024
                 )),
                 truncated: true,
+                raw_text: None,
             };
         }
         let encoded_bytes = remote.bytes.len();
@@ -12944,6 +13086,7 @@ fn remote_preview_from_bytes(
                     }),
                     message: None,
                     truncated: false,
+                    raw_text: None,
                 }
             }
             Ok((width, height)) => RightSidebarLoadedFilePreview {
@@ -12954,12 +13097,14 @@ fn remote_preview_from_bytes(
                     FILE_PREVIEW_IMAGE_MAX_PIXELS / 1_000_000
                 )),
                 truncated: false,
+                raw_text: None,
             },
             Err(err) => RightSidebarLoadedFilePreview {
                 lines: Vec::new(),
                 image: None,
                 message: Some(format!("Unable to decode image dimensions: {err:#}")),
                 truncated: false,
+                raw_text: None,
             },
         };
     }
@@ -12994,11 +13139,13 @@ fn remote_preview_from_bytes(
     } else {
         Vec::new()
     };
+    let raw_text = message.is_none().then_some(text);
     RightSidebarLoadedFilePreview {
         lines,
         image: None,
         message,
         truncated: remote.truncated,
+        raw_text,
     }
 }
 
@@ -13773,7 +13920,7 @@ mod tests {
         open_with_candidate_allowed, path_key, preview_line_count, preview_lines_from_text,
         preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
         preview_visible_line_range, right_sidebar_file_browse_rows_from_index,
-        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key,
+        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key, sanitize_preview_text,
         scrollable_note_table_columns, search_right_sidebar_file_index, snippet_cursor_visible,
         snippet_run_buffer, sorted_open_with_candidates, virtual_note_line_range,
         visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
@@ -14597,6 +14744,39 @@ mod tests {
         assert_eq!(highlighted.len(), 1);
         assert_eq!(highlighted[0].plain.chars().count(), line.chars().count());
         assert!(!highlighted[0].plain.contains("..."));
+    }
+
+    #[test]
+    fn tabs_expand_to_tab_stops_and_other_controls_are_dropped() {
+        // No font has a glyph for U+0009, so an unexpanded tab renders as a
+        // `.notdef` box and logs "No fonts contain glyphs for these
+        // codepoints: \u{9}". Expanding to the next stop (not a fixed run of
+        // spaces) is what keeps the file's indentation looking like the author
+        // wrote it.
+        assert_eq!(sanitize_preview_text("\tab"), "    ab");
+        assert_eq!(sanitize_preview_text("a\tb"), "a   b");
+        assert_eq!(sanitize_preview_text("abc\td"), "abc d");
+        assert_eq!(sanitize_preview_text("abcd\te"), "abcd    e");
+        // The column resets on every line.
+        assert_eq!(sanitize_preview_text("ab\n\tc"), "ab\n    c");
+        // CRLF files must not end every line with a box.
+        assert_eq!(sanitize_preview_text("a\r\nb"), "a\nb");
+        // Other controls are dropped outright; newlines always survive.
+        assert_eq!(sanitize_preview_text("a\u{0b}b\n"), "ab\n");
+    }
+
+    #[test]
+    fn text_without_controls_is_not_reallocated() {
+        // The overwhelmingly common case must stay allocation-free.
+        let plain = "fn main() {\n    println!(\"hi\");\n}\n";
+        assert!(matches!(
+            sanitize_preview_text(plain),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            sanitize_preview_text("has\ttab"),
+            std::borrow::Cow::Owned(_)
+        ));
     }
 
     #[test]

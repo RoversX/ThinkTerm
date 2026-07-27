@@ -401,7 +401,10 @@ mod tests {
                 let available = button_label_width(button_width, scale);
                 assert!(
                     available >= measured,
-                    "scale {scale}: {available} < {measured}"
+                    "scale {}: {} < {}",
+                    scale,
+                    available,
+                    measured
                 );
             }
         }

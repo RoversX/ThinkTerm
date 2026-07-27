@@ -2,7 +2,7 @@ use crate::workspace_threads::{RemoteFilesSource, RemoteFilesTarget};
 use config::SshDomain;
 use smol::channel::Sender;
 use smol::io::AsyncReadExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
@@ -82,6 +82,32 @@ impl RemotePath {
 /// that request would break a project whose path was fully specified.
 fn requested_root_needs_home(requested: &str) -> bool {
     requested == "~" || requested.starts_with("~/")
+}
+
+/// The spellings a server may accept when asked to canonicalize the session's
+/// starting directory. SFTP has no `~`; `.` is the usual spelling, but not
+/// every server answers it, so the empty path is tried before giving up.
+/// The liveness probe MUST accept the same spellings as root resolution — a
+/// stricter probe declares sessions dead that the panel could actually use,
+/// forcing a needless redial on every idle reacquire.
+const REMOTE_HOME_SPELLINGS: [&str; 2] = [".", ""];
+
+/// Try each home spelling in order, returning the first success or every
+/// failure (in spelling order). Generic over the canonicalize call so the
+/// fallback contract stays testable without a server.
+async fn canonicalize_remote_home<T, E, F, Fut>(mut canonicalize: F) -> Result<T, Vec<E>>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut failures = Vec::new();
+    for spelling in REMOTE_HOME_SPELLINGS {
+        match canonicalize(spelling).await {
+            Ok(value) => return Ok(value),
+            Err(err) => failures.push(err),
+        }
+    }
+    Err(failures)
 }
 
 /// Validate a stored project path for use as a browse root. Kept separate from
@@ -189,6 +215,13 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
         limit: usize,
     ) -> RemoteFuture<RemoteDirectoryListing>;
     fn read_file(&self, path: RemotePath, limit: usize) -> RemoteFuture<RemoteFileBytes>;
+
+    /// Cheapest possible round-trip, used to confirm a cached connection is
+    /// still alive before it is handed out again. The default is a no-op so
+    /// test doubles opt in explicitly.
+    fn probe(&self) -> RemoteFuture<()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub(crate) trait RemoteFileConnector: Send + Sync {
@@ -227,31 +260,32 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
                 return remote_root_from_absolute(&requested);
             }
 
-            // SFTP has no concept of `~`; the home directory is whatever the
-            // server canonicalizes the session's starting directory to. `.` is
-            // the usual spelling, but not every server answers it, so fall back
-            // to the empty path before giving up.
-            let mut failures = Vec::new();
-            for probe in [".", ""] {
-                match sftp.canonicalize(probe.to_string()).await {
-                    Ok(home) => {
-                        return resolve_requested_root(
-                            RemotePath::from_server_absolute(home.as_str())?,
-                            &requested,
-                        )
-                    }
-                    Err(err) => {
+            // The home directory is whatever the server canonicalizes the
+            // session's starting directory to; see REMOTE_HOME_SPELLINGS.
+            match canonicalize_remote_home(|spelling| {
+                let sftp = sftp.clone();
+                async move { sftp.canonicalize(spelling.to_string()).await }
+            })
+            .await
+            {
+                Ok(home) => resolve_requested_root(
+                    RemotePath::from_server_absolute(home.as_str())?,
+                    &requested,
+                ),
+                Err(errors) => {
+                    let mut failures = Vec::new();
+                    for (spelling, err) in REMOTE_HOME_SPELLINGS.iter().zip(&errors) {
                         log::warn!(
-                            "remote files: sftp canonicalize({probe:?}) failed: {}",
-                            error_chain(&err)
+                            "remote files: sftp canonicalize({spelling:?}) failed: {}",
+                            error_chain(err)
                         );
-                        failures.push(error_summary(&err));
+                        failures.push(error_summary(err));
                     }
+                    let detail = failures.last().cloned().unwrap_or_default();
+                    log::error!("remote files: unable to resolve remote home: {failures:?}");
+                    Err(format!("Can't read the remote home directory: {detail}"))
                 }
             }
-            let detail = failures.last().cloned().unwrap_or_default();
-            log::error!("remote files: unable to resolve remote home: {failures:?}");
-            Err(format!("Can't read the remote home directory: {detail}"))
         })
     }
 
@@ -316,6 +350,27 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
                     .then_with(|| a.name.cmp(&b.name))
             });
             Ok(RemoteDirectoryListing { entries, truncated })
+        })
+    }
+
+    fn probe(&self) -> RemoteFuture<()> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            // Same spellings as resolve_root: a server that only answers the
+            // empty path is alive, and declaring it dead here would force a
+            // redial on every idle reacquire.
+            match canonicalize_remote_home(|spelling| {
+                let sftp = sftp.clone();
+                async move { sftp.canonicalize(spelling.to_string()).await }
+            })
+            .await
+            {
+                Ok(_) => Ok(()),
+                Err(errors) => Err(errors
+                    .last()
+                    .map(|err| error_chain(err))
+                    .unwrap_or_default()),
+            }
         })
     }
 
@@ -418,6 +473,17 @@ enum ManagedConnection {
     Connecting {
         waiters: Vec<Sender<Result<(), String>>>,
     },
+    /// A previously-idle entry whose liveness one acquirer is verifying.
+    /// Everyone else queues: handing the backend out before the verdict would
+    /// let a caller run operations on a session about to be declared dead —
+    /// and that caller's failure report could then tear down the healthy
+    /// replacement the prober dials.
+    Probing {
+        connection_id: u64,
+        backend: Arc<dyn RemoteFileBackend>,
+        idle_generation: u64,
+        waiters: Vec<Sender<Result<(), String>>>,
+    },
     Ready {
         connection_id: u64,
         backend: Arc<dyn RemoteFileBackend>,
@@ -460,6 +526,13 @@ impl RemoteConnectionLease {
         &self.key
     }
 
+    /// Identity of the pooled connection behind this lease. Failure reports
+    /// must carry it so they can only invalidate the connection they actually
+    /// ran on, never a replacement dialled under the same key since.
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.connection_id
+    }
+
     pub(crate) fn operation_lease(&self) -> Option<RemoteConnectionLease> {
         self.manager
             .upgrade()
@@ -496,8 +569,13 @@ impl RemoteConnectionManager {
         config: SshDomain,
         allow_connect: bool,
     ) -> Result<RemoteConnectionLease, RemoteAcquireError> {
+        enum Pending {
+            Dial,
+            Wait(smol::channel::Receiver<Result<(), String>>),
+            Probe(Arc<dyn RemoteFileBackend>, u64),
+        }
         loop {
-            let waiter = {
+            let pending = {
                 let mut inner = self.inner.lock().unwrap();
                 match inner.entries.get_mut(&key) {
                     Some(ManagedConnection::Ready {
@@ -507,20 +585,40 @@ impl RemoteConnectionManager {
                         idle_generation,
                         idle_since,
                     }) => {
-                        *leases = leases.saturating_add(1);
-                        *idle_generation = idle_generation.wrapping_add(1);
-                        *idle_since = None;
-                        return Ok(RemoteConnectionLease {
-                            key,
-                            backend: Arc::clone(backend),
-                            manager: Arc::downgrade(self),
-                            connection_id: *connection_id,
-                        });
+                        if idle_since.is_none() {
+                            // Actively leased: known good, hand it out.
+                            *leases = leases.saturating_add(1);
+                            *idle_generation = idle_generation.wrapping_add(1);
+                            return Ok(RemoteConnectionLease {
+                                key: key.clone(),
+                                backend: Arc::clone(backend),
+                                manager: Arc::downgrade(self),
+                                connection_id: *connection_id,
+                            });
+                        }
+                        // A connection that sat with no leases carried no
+                        // traffic, so the server or a NAT may have reaped it
+                        // without us noticing. Verify before handing it out,
+                        // and park later acquires until the verdict is in.
+                        let connection_id = *connection_id;
+                        let backend = Arc::clone(backend);
+                        let idle_generation = *idle_generation;
+                        inner.entries.insert(
+                            key.clone(),
+                            ManagedConnection::Probing {
+                                connection_id,
+                                backend: Arc::clone(&backend),
+                                idle_generation,
+                                waiters: Vec::new(),
+                            },
+                        );
+                        Pending::Probe(backend, connection_id)
                     }
-                    Some(ManagedConnection::Connecting { waiters }) => {
+                    Some(ManagedConnection::Connecting { waiters })
+                    | Some(ManagedConnection::Probing { waiters, .. }) => {
                         let (tx, rx) = smol::channel::bounded(1);
                         waiters.push(tx);
-                        Some(rx)
+                        Pending::Wait(rx)
                     }
                     None if !allow_connect => return Err(RemoteAcquireError::NotConnected),
                     None => {
@@ -528,13 +626,86 @@ impl RemoteConnectionManager {
                             key.clone(),
                             ManagedConnection::Connecting { waiters: vec![] },
                         );
-                        None
+                        Pending::Dial
                     }
                 }
             };
 
-            if let Some(waiter) = waiter {
-                match waiter.recv().await {
+            match pending {
+                Pending::Probe(backend, connection_id) => {
+                    let probe_result = backend.probe().await;
+                    let (waiters, lease) = {
+                        let mut inner = self.inner.lock().unwrap();
+                        match inner.entries.get_mut(&key) {
+                            Some(ManagedConnection::Probing {
+                                connection_id: current,
+                                backend,
+                                idle_generation,
+                                waiters,
+                            }) if *current == connection_id => {
+                                let waiters = std::mem::take(waiters);
+                                match &probe_result {
+                                    Ok(()) => {
+                                        let backend = Arc::clone(backend);
+                                        let idle_generation = idle_generation.wrapping_add(1);
+                                        inner.entries.insert(
+                                            key.clone(),
+                                            ManagedConnection::Ready {
+                                                connection_id,
+                                                backend: Arc::clone(&backend),
+                                                leases: 1,
+                                                idle_generation,
+                                                idle_since: None,
+                                            },
+                                        );
+                                        (
+                                            waiters,
+                                            Some(RemoteConnectionLease {
+                                                key: key.clone(),
+                                                backend,
+                                                manager: Arc::downgrade(self),
+                                                connection_id,
+                                            }),
+                                        )
+                                    }
+                                    Err(_) => {
+                                        inner.entries.remove(&key);
+                                        (waiters, None)
+                                    }
+                                }
+                            }
+                            // The entry moved on without us; whatever owns the
+                            // key now decides the next iteration.
+                            _ => (Vec::new(), None),
+                        }
+                    };
+                    // Waiters re-examine the map rather than trusting the
+                    // verdict second-hand: on success they find Ready, on
+                    // failure they find nothing (or the prober's redial).
+                    for waiter in waiters {
+                        let _ = waiter.try_send(Ok(()));
+                    }
+                    match probe_result {
+                        Ok(()) => {
+                            if let Some(lease) = lease {
+                                return Ok(lease);
+                            }
+                            continue;
+                        }
+                        Err(err) => {
+                            // Dead after idling: it is already gone from the
+                            // map; dial again on the next turn of the loop
+                            // rather than surfacing a failure the user would
+                            // have to retry by hand.
+                            log::warn!(
+                                "remote files: cached connection failed its liveness probe, \
+                                 reconnecting: {err}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Pending::Wait(waiter) => match waiter.recv().await {
                     Ok(Ok(())) => continue,
                     Ok(Err(err)) => return Err(RemoteAcquireError::Failed(err)),
                     Err(_) => {
@@ -542,7 +713,8 @@ impl RemoteConnectionManager {
                             "Remote Files connection was canceled".to_string(),
                         ))
                     }
-                }
+                },
+                Pending::Dial => {}
             }
 
             let result = self.connector.connect(config.clone()).await;
@@ -722,9 +894,49 @@ impl RemoteConnectionManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn invalidate(&self, key: &str) {
         self.inner.lock().unwrap().entries.remove(key);
     }
+
+    /// Remove `key` only while it still refers to `connection_id`, so a stale
+    /// failure report cannot discard a replacement another task already
+    /// installed. Deliberately never matches `Connecting`/`Probing`: an
+    /// in-flight dial or probe settles on its own verdict, and removing it
+    /// here would strand its waiters.
+    fn invalidate_connection(&self, key: &str, connection_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let matches = matches!(
+            inner.entries.get(key),
+            Some(ManagedConnection::Ready { connection_id: current, .. }) if *current == connection_id
+        );
+        if matches {
+            inner.entries.remove(key);
+        }
+    }
+}
+
+/// Sources the user has explicitly connected at least once in this process.
+///
+/// Deliberately process-wide, matching [`remote_connection_manager`]: the
+/// connection itself is shared between windows, so remembering the click only
+/// per-window meant a second window had to ask again for a session that was
+/// already open. Never persisted — a restart requires a fresh click, which is
+/// what keeps "never dial without being asked" meaningful.
+fn authorized_sources() -> &'static Mutex<HashSet<String>> {
+    static AUTHORIZED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    AUTHORIZED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn authorize_remote_source(source_key: &str) {
+    authorized_sources()
+        .lock()
+        .unwrap()
+        .insert(source_key.to_string());
+}
+
+pub(crate) fn remote_source_is_authorized(source_key: &str) -> bool {
+    authorized_sources().lock().unwrap().contains(source_key)
 }
 
 pub(crate) fn remote_connection_manager() -> Arc<RemoteConnectionManager> {
@@ -741,16 +953,22 @@ pub(crate) fn update_remote_connection_idle_timeout(minutes: u32) {
     remote_connection_manager().set_idle_timeout(Duration::from_secs(minutes as u64 * 60));
 }
 
-/// Drop a cached connection unconditionally. Used when a connection fails the
-/// checks that bring the panel up (resolving the root, listing it): whatever
-/// went wrong, a session that cannot complete its own handshake is worthless,
-/// and keeping it means every Retry replays the same failure against the same
-/// broken session instead of dialling afresh.
-pub(crate) fn invalidate_remote_connection(key: &str) {
-    remote_connection_manager().invalidate(key);
+/// Drop a cached connection. Used when a connection fails the checks that
+/// bring the panel up (resolving the root, listing it): whatever went wrong, a
+/// session that cannot complete its own handshake is worthless, and keeping it
+/// means every Retry replays the same failure against the same broken session
+/// instead of dialling afresh. Guarded by `connection_id` — the failure must
+/// only ever remove the connection it actually happened on, never a healthy
+/// replacement dialled under the same key since.
+pub(crate) fn invalidate_remote_connection(key: &str, connection_id: u64) {
+    remote_connection_manager().invalidate_connection(key, connection_id);
 }
 
-pub(crate) fn invalidate_remote_connection_if_dead(key: &str, message: &str) -> bool {
+pub(crate) fn invalidate_remote_connection_if_dead(
+    key: &str,
+    connection_id: u64,
+    message: &str,
+) -> bool {
     let lower = message.to_ascii_lowercase();
     // Matches both the wrapper text (`SftpChannelError`) and the innermost
     // cause, because a concise user-facing message carries only the latter.
@@ -767,7 +985,7 @@ pub(crate) fn invalidate_remote_connection_if_dead(key: &str, message: &str) -> 
         || lower.contains("failed to receive response")
         || lower.contains("broken pipe");
     if dead {
-        remote_connection_manager().invalidate(key);
+        remote_connection_manager().invalidate_connection(key, connection_id);
     }
     dead
 }
@@ -812,8 +1030,44 @@ pub(crate) struct RemoteFilesState {
     pub preview: RemotePreviewStatus,
     pub error_message: Option<String>,
     pub generation: u64,
-    authorized_sources: HashSet<String>,
+    /// True while a tree restored from cache is on screen but the fresh lease
+    /// for it has not arrived yet. Effects that need the lease are deferred
+    /// (the intent is already recorded in `loading_directories` / `preview`)
+    /// and flushed by the `Connected` event, so a click during that round trip
+    /// cannot reach the effect layer, find no lease, and tear the restored
+    /// tree down as a spurious connection failure.
+    awaiting_lease: bool,
+    /// Trees kept across target switches so returning to a workspace does not
+    /// re-list a directory the connection could still serve from memory.
+    /// Keyed by [`Self::tree_cache_key`] — source *and* requested root —
+    /// because two projects can share one host while browsing different
+    /// directories, and the wrong tree must never appear under a project's
+    /// name.
+    cached_trees: HashMap<TreeCacheKey, CachedTree>,
+    /// LRU order for `cached_trees`, oldest first.
+    cached_tree_order: VecDeque<TreeCacheKey>,
 }
+
+/// Identity of a browsed tree: the connection source plus the requested root.
+/// The source alone is not enough — see `cached_trees`.
+type TreeCacheKey = (String, String);
+
+/// Everything needed to put a previously browsed source straight back on
+/// screen. Small by design: entries are `{ path, name, kind, size }` and the
+/// row budget caps them, so a handful of these cost far less than one decoded
+/// image preview.
+#[derive(Clone, Debug)]
+struct CachedTree {
+    root: RemotePath,
+    directories: HashMap<RemotePath, RemoteDirectory>,
+    expanded: HashSet<RemotePath>,
+    selected: Option<RemotePath>,
+}
+
+/// How many sources keep a cached tree. Much smaller than the local panel's
+/// `FILE_VIEW_STATE_CACHE_CAP` (32) because each entry here holds up to
+/// `REMOTE_FILE_TREE_ROW_LIMIT` rows rather than a scroll offset.
+const REMOTE_TREE_CACHE_CAP: usize = 4;
 
 impl Default for RemoteFilesState {
     fn default() -> Self {
@@ -828,7 +1082,9 @@ impl Default for RemoteFilesState {
             preview: RemotePreviewStatus::None,
             error_message: None,
             generation: 0,
-            authorized_sources: HashSet::new(),
+            awaiting_lease: false,
+            cached_trees: HashMap::new(),
+            cached_tree_order: VecDeque::new(),
         }
     }
 }
@@ -907,9 +1163,20 @@ impl RemoteFilesState {
             .map(|target| Self::source_key(&target.source))
     }
 
+    fn tree_cache_key(target: &RemoteFilesTarget) -> TreeCacheKey {
+        (
+            Self::source_key(&target.source),
+            target.requested_root.clone(),
+        )
+    }
+
+    fn current_tree_cache_key(&self) -> Option<TreeCacheKey> {
+        self.target.as_ref().map(Self::tree_cache_key)
+    }
+
     pub(crate) fn can_resume_current(&self) -> bool {
         self.current_source_key()
-            .is_some_and(|key| self.authorized_sources.contains(&key))
+            .is_some_and(|key| remote_source_is_authorized(&key))
     }
 
     pub(crate) fn transition(&mut self, event: RemoteFilesEvent) -> Vec<RemoteFilesEffect> {
@@ -918,9 +1185,32 @@ impl RemoteFilesState {
                 if self.target == target {
                     return Vec::new();
                 }
-                self.clear_loaded_data();
+                // Switching away is not a teardown: keep this source's tree so
+                // coming back is instant, and drop only what belongs to the
+                // outgoing view.
+                self.stash_current_tree();
+                self.generation = self.generation.wrapping_add(1);
+                self.phase = RemoteFilesPhase::Disconnected;
+                self.root = None;
+                self.directories.clear();
+                self.expanded.clear();
+                self.loading_directories.clear();
+                self.selected = None;
+                self.preview = RemotePreviewStatus::None;
+                self.error_message = None;
+                self.awaiting_lease = false;
                 self.target = target;
-                vec![RemoteFilesEffect::ReleaseLease]
+                // The lease belongs to the old target; the pool keeps the
+                // session warm for whoever asks next.
+                let mut effects = vec![RemoteFilesEffect::ReleaseLease];
+                if self.restore_cached_tree() {
+                    // Already authorized and already browsed: the cached tree
+                    // goes on screen immediately while a lease is re-taken and
+                    // the root re-listed underneath it.
+                    self.awaiting_lease = true;
+                    effects.extend(self.refresh_restored_tree());
+                }
+                effects
             }
             RemoteFilesEvent::ConnectRequested => self.begin_connect(true),
             RemoteFilesEvent::ResumeRequested => self.begin_connect(false),
@@ -933,8 +1223,9 @@ impl RemoteFilesState {
                     return vec![RemoteFilesEffect::ReleaseLease];
                 }
                 if let Some(key) = self.current_source_key() {
-                    self.authorized_sources.insert(key);
+                    authorize_remote_source(&key);
                 }
+                let was_deferred = std::mem::take(&mut self.awaiting_lease);
                 self.phase = RemoteFilesPhase::Connected;
                 self.error_message = None;
                 self.root = Some(root.clone());
@@ -943,14 +1234,50 @@ impl RemoteFilesState {
                     listing.entries.truncate(REMOTE_FILE_TREE_ROW_LIMIT);
                     listing.truncated = true;
                 }
+                // A restored tree may hang off a differently-resolved root
+                // (e.g. the remote home moved); anything not under the fresh
+                // root can never render, so it must not eat the row budget.
+                self.directories
+                    .retain(|path, _| *path == root || path.is_descendant_of(&root));
+                self.expanded
+                    .retain(|path| *path == root || path.is_descendant_of(&root));
+                self.loading_directories
+                    .retain(|path| *path == root || path.is_descendant_of(&root));
                 self.directories.insert(root, RemoteDirectory { listing });
-                Vec::new()
+                self.enforce_row_budget();
+                if !was_deferred {
+                    return Vec::new();
+                }
+                // Flush the operations recorded while the restored tree waited
+                // for its lease. `loading_directories` and a `Loading` preview
+                // are the queue: they captured the user's intent, and the
+                // lease that just arrived is what they were waiting on.
+                let mut effects = Vec::new();
+                let pending: Vec<RemotePath> = self.loading_directories.iter().cloned().collect();
+                for path in pending {
+                    effects.extend(self.list_directory_effect(path));
+                }
+                if let RemotePreviewStatus::Loading(path) = &self.preview {
+                    if let Some(source_key) = self.current_source_key() {
+                        effects.push(RemoteFilesEffect::LoadPreview {
+                            generation: self.generation,
+                            source_key,
+                            path: path.clone(),
+                        });
+                    }
+                }
+                effects
             }
             RemoteFilesEvent::ConnectionFailed {
                 generation,
                 message,
             } => {
                 if generation == self.generation {
+                    // A failed source must not leave a cached tree behind:
+                    // switching away and back would restore rows belonging to a
+                    // connection that is already gone.
+                    self.discard_cached_tree_for_current_target();
+                    self.awaiting_lease = false;
                     self.phase = RemoteFilesPhase::Failed(message);
                     self.error_message = None;
                     self.root = None;
@@ -964,6 +1291,7 @@ impl RemoteFilesState {
             }
             RemoteFilesEvent::ResumeUnavailable { generation } => {
                 if generation == self.generation {
+                    self.awaiting_lease = false;
                     self.phase = RemoteFilesPhase::Disconnected;
                     self.error_message = None;
                 }
@@ -981,6 +1309,11 @@ impl RemoteFilesState {
                 if self.directories.contains_key(&path)
                     || !self.loading_directories.insert(path.clone())
                 {
+                    return Vec::new();
+                }
+                if self.awaiting_lease {
+                    // Recorded in `loading_directories`; `Connected` flushes it
+                    // once the lease for the restored tree lands.
                     return Vec::new();
                 }
                 self.list_directory_effect(path)
@@ -1022,6 +1355,11 @@ impl RemoteFilesState {
             RemoteFilesEvent::SelectFile(path) => {
                 self.selected = Some(path.clone());
                 self.preview = RemotePreviewStatus::Loading(path.clone());
+                if self.awaiting_lease {
+                    // The `Loading` preview is the queue entry; `Connected`
+                    // flushes it once the lease lands.
+                    return Vec::new();
+                }
                 let Some(source_key) = self.current_source_key() else {
                     return Vec::new();
                 };
@@ -1051,6 +1389,12 @@ impl RemoteFilesState {
                 Vec::new()
             }
             RemoteFilesEvent::Refresh => {
+                if self.awaiting_lease {
+                    // A refresh is already in flight: that is literally what
+                    // the restored tree is waiting on. Bumping the generation
+                    // here would orphan it and leave the panel stuck.
+                    return Vec::new();
+                }
                 let Some(root) = self.root.clone() else {
                     return Vec::new();
                 };
@@ -1066,7 +1410,21 @@ impl RemoteFilesState {
                 self.list_directory_effect(root)
             }
             RemoteFilesEvent::PanelHidden => {
-                self.clear_loaded_data();
+                // Hiding keeps the structure (it is small) and gives back the
+                // lease plus the preview, which is where the memory actually
+                // is. `release_cached_trees` frees the rest if the panel stays
+                // hidden long enough.
+                self.stash_current_tree();
+                self.generation = self.generation.wrapping_add(1);
+                self.phase = RemoteFilesPhase::Disconnected;
+                self.root = None;
+                self.directories.clear();
+                self.expanded.clear();
+                self.loading_directories.clear();
+                self.selected = None;
+                self.preview = RemotePreviewStatus::None;
+                self.error_message = None;
+                self.awaiting_lease = false;
                 vec![RemoteFilesEffect::ReleaseLease]
             }
         }
@@ -1077,7 +1435,9 @@ impl RemoteFilesState {
             return Vec::new();
         };
         let source_key = Self::source_key(&target.source);
-        if !allow_connect && !self.authorized_sources.contains(&source_key) {
+        let authorized = remote_source_is_authorized(&source_key);
+        if !allow_connect && !authorized {
+            // Never dial a source the user has not asked for.
             return Vec::new();
         }
         if matches!(
@@ -1091,7 +1451,29 @@ impl RemoteFilesState {
         vec![RemoteFilesEffect::Connect {
             generation: self.generation,
             target,
-            allow_connect,
+            // An already-authorized source may redial: once the pool's 15
+            // minute idle window lapses, silently reconnecting is better than
+            // dropping the user back onto a Connect button they already
+            // pressed for this host.
+            allow_connect: allow_connect || authorized,
+        }]
+    }
+
+    /// Re-acquire a lease and refresh the root for a tree that was restored
+    /// from cache. Unlike [`Self::begin_connect`] this runs while the phase is
+    /// already `Connected`: the user keeps looking at the cached listing
+    /// instead of a spinner, and `Connected` swaps in the fresh root when it
+    /// lands. A failure here is real (the session is gone) and falls through to
+    /// the normal failed state.
+    fn refresh_restored_tree(&mut self) -> Vec<RemoteFilesEffect> {
+        let Some(target) = self.target.clone() else {
+            return Vec::new();
+        };
+        self.generation = self.generation.wrapping_add(1);
+        vec![RemoteFilesEffect::Connect {
+            generation: self.generation,
+            target,
+            allow_connect: true,
         }]
     }
 
@@ -1132,16 +1514,129 @@ impl RemoteFilesState {
         }
     }
 
-    fn clear_loaded_data(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.phase = RemoteFilesPhase::Disconnected;
-        self.root = None;
-        self.directories.clear();
-        self.expanded.clear();
-        self.loading_directories.clear();
+    /// Forget any cached tree for the target currently in view. Used when that
+    /// target is known bad, so the cache cannot resurrect it later.
+    fn discard_cached_tree_for_current_target(&mut self) {
+        let Some(cache_key) = self.current_tree_cache_key() else {
+            return;
+        };
+        self.cached_trees.remove(&cache_key);
+        if let Some(index) = self
+            .cached_tree_order
+            .iter()
+            .position(|key| *key == cache_key)
+        {
+            self.cached_tree_order.remove(index);
+        }
+    }
+
+    /// Move the loaded tree into the cache instead of dropping it, so switching
+    /// back to this target can show it again without re-listing.
+    fn stash_current_tree(&mut self) {
+        let (Some(cache_key), Some(root)) = (self.current_tree_cache_key(), self.root.clone())
+        else {
+            return;
+        };
+        if self.directories.is_empty() {
+            return;
+        }
+        let tree = CachedTree {
+            root,
+            directories: std::mem::take(&mut self.directories),
+            expanded: std::mem::take(&mut self.expanded),
+            selected: self.selected.take(),
+        };
+        if self.cached_trees.insert(cache_key.clone(), tree).is_none() {
+            self.cached_tree_order.push_back(cache_key);
+        } else {
+            self.touch_cached_tree(&cache_key);
+        }
+        while self.cached_tree_order.len() > REMOTE_TREE_CACHE_CAP {
+            if let Some(evicted) = self.cached_tree_order.pop_front() {
+                self.cached_trees.remove(&evicted);
+            }
+        }
+    }
+
+    fn touch_cached_tree(&mut self, cache_key: &TreeCacheKey) {
+        if let Some(index) = self
+            .cached_tree_order
+            .iter()
+            .position(|key| key == cache_key)
+        {
+            self.cached_tree_order.remove(index);
+        }
+        self.cached_tree_order.push_back(cache_key.clone());
+    }
+
+    /// Put a cached tree back on screen. Only legitimate for a source the user
+    /// already authorized — the connection pool's liveness probe makes reusing
+    /// the underlying session safe, and a stale listing is corrected by the
+    /// next expand.
+    fn restore_cached_tree(&mut self) -> bool {
+        let Some(cache_key) = self.current_tree_cache_key() else {
+            return false;
+        };
+        if !remote_source_is_authorized(&cache_key.0) {
+            return false;
+        }
+        let Some(tree) = self.cached_trees.remove(&cache_key) else {
+            return false;
+        };
+        if let Some(index) = self
+            .cached_tree_order
+            .iter()
+            .position(|key| *key == cache_key)
+        {
+            self.cached_tree_order.remove(index);
+        }
+        self.root = Some(tree.root);
+        self.directories = tree.directories;
+        self.expanded = tree.expanded;
+        self.selected = tree.selected;
+        self.phase = RemoteFilesPhase::Connected;
+        self.error_message = None;
+        true
+    }
+
+    /// Trim the tree back under the global row budget. A restored cache can
+    /// hold up to the full budget on its own, and the refreshed root listing
+    /// arrives budgeted only against itself, so their union can exceed the
+    /// bound. Deepest directories collapse first, keeping the shallow
+    /// structure the user is most likely looking at.
+    fn enforce_row_budget(&mut self) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        while self.total_entries() > REMOTE_FILE_TREE_ROW_LIMIT {
+            let Some(victim) = self
+                .directories
+                .keys()
+                .filter(|path| **path != root)
+                .max_by_key(|path| path.as_str().matches('/').count())
+                .cloned()
+            else {
+                break;
+            };
+            self.expanded.remove(&victim);
+            self.remove_descendants(&victim);
+        }
+    }
+
+    /// Forget the selected row and any preview tied to it. Mirrors what
+    /// closing the preview does to the local panel's `file_selected`, and is
+    /// what stops `right_sidebar_file_preview_active` from keeping the pane
+    /// open (and the sidebar wide) after the preview is gone.
+    pub(crate) fn clear_selection(&mut self) {
         self.selected = None;
         self.preview = RemotePreviewStatus::None;
-        self.error_message = None;
+    }
+
+    /// Drop every cached tree. Wired into the sidebar's existing idle-release
+    /// path so a panel left hidden eventually gives the memory back.
+    pub(crate) fn release_cached_trees(&mut self) {
+        self.cached_trees.clear();
+        self.cached_tree_order.clear();
     }
 
     pub(crate) fn rows(&self) -> Vec<RemoteFileRow> {
@@ -1208,7 +1703,7 @@ impl RemoteFilesState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Records how many times the remote home was asked for, so a test can
     /// prove an absolute root never pays for that round-trip.
@@ -1283,7 +1778,7 @@ mod tests {
         assert!(probe.resolve("~/../etc").is_err());
         // An absolute root is checked before it can ever reach the server.
         let err = probe.resolve("/srv/../etc").unwrap_err();
-        assert!(err.contains(".."), "{err}");
+        assert!(err.contains(".."), "{}", err);
     }
 
     #[test]
@@ -1293,7 +1788,9 @@ mod tests {
             let err = probe.resolve(bad).unwrap_err();
             assert!(
                 err.contains("absolute path or ~"),
-                "{bad:?} produced {err:?}"
+                "{:?} produced {:?}",
+                bad,
+                err
             );
         }
         // The failure is decided locally; no home lookup was attempted.
@@ -1318,6 +1815,211 @@ mod tests {
             "/srv/app"
         );
         assert_eq!(RemotePath::from_server_absolute("/").unwrap().as_str(), "/");
+    }
+
+    #[test]
+    fn an_idle_connection_that_died_is_replaced_without_the_user_retrying() {
+        // The reported symptom: the panel occasionally fails with "can't read
+        // the remote home" and works on a second attempt. Reusing a cached
+        // connection that the server reaped while the panel was closed must
+        // redial transparently instead of surfacing that failure.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let manager = RemoteConnectionManager::new(
+            Arc::new(DyingConnector {
+                calls: Arc::clone(&calls),
+                probes: Arc::clone(&probes),
+                first_is_alive: Arc::new(AtomicBool::new(true)),
+            }),
+            Duration::from_secs(300),
+        );
+        let key = "host".to_string();
+
+        let lease = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+            .expect("first acquire");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // A fresh connection is not probed; it was just built.
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+
+        // Panel closed: the connection goes idle and (unknown to us) dies.
+        drop(lease);
+
+        // Panel reopened. The cached entry is probed, found dead, and replaced
+        // — the caller still gets a usable lease on the first try.
+        let lease = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+            .expect("acquire must transparently redial");
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "cached entry must be probed"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "must have redialled");
+
+        // Still leased, so the next acquire skips the probe entirely.
+        let second = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+            .expect("concurrent acquire");
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "live lease must not be probed"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(second);
+        drop(lease);
+    }
+
+    /// Backend whose probe blocks until the test opens the gate, so the test
+    /// can observe what other acquires do while a probe is in flight.
+    struct GatedProbeBackend {
+        probes: Arc<AtomicUsize>,
+        gate: smol::channel::Receiver<()>,
+    }
+
+    impl RemoteFileBackend for GatedProbeBackend {
+        fn resolve_root(&self, _requested: String) -> RemoteFuture<RemotePath> {
+            Box::pin(async { RemotePath::from_server_absolute("/home/test") })
+        }
+
+        fn list_directory(
+            &self,
+            _path: RemotePath,
+            _limit: usize,
+        ) -> RemoteFuture<RemoteDirectoryListing> {
+            Box::pin(async {
+                Ok(RemoteDirectoryListing {
+                    entries: Vec::new(),
+                    truncated: false,
+                })
+            })
+        }
+
+        fn read_file(&self, _path: RemotePath, _limit: usize) -> RemoteFuture<RemoteFileBytes> {
+            Box::pin(async {
+                Ok(RemoteFileBytes {
+                    bytes: Vec::new(),
+                    truncated: false,
+                })
+            })
+        }
+
+        fn probe(&self) -> RemoteFuture<()> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                let _ = gate.recv().await;
+                Ok(())
+            })
+        }
+    }
+
+    struct GatedProbeConnector {
+        probes: Arc<AtomicUsize>,
+        gate: smol::channel::Receiver<()>,
+    }
+
+    impl RemoteFileConnector for GatedProbeConnector {
+        fn connect(&self, _config: SshDomain) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
+            let backend = GatedProbeBackend {
+                probes: Arc::clone(&self.probes),
+                gate: self.gate.clone(),
+            };
+            Box::pin(async move { Ok(Arc::new(backend) as Arc<dyn RemoteFileBackend>) })
+        }
+    }
+
+    /// While one acquire verifies an idle connection, a concurrent acquire
+    /// must wait for the verdict. Handing out the unverified backend meant a
+    /// caller could run operations on a session about to be declared dead —
+    /// and its failure report could then tear down the healthy replacement.
+    #[test]
+    fn acquires_during_a_liveness_probe_wait_for_its_verdict() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (open_gate, gate) = smol::channel::unbounded::<()>();
+        let manager = RemoteConnectionManager::new(
+            Arc::new(GatedProbeConnector {
+                probes: Arc::clone(&probes),
+                gate,
+            }),
+            Duration::from_secs(300),
+        );
+        let key = "host".to_string();
+
+        smol::block_on(async {
+            let lease = manager
+                .acquire(key.clone(), SshDomain::default(), true)
+                .await
+                .expect("first acquire");
+            drop(lease); // idle: the next acquire must probe
+
+            let prober = {
+                let manager = Arc::clone(&manager);
+                let key = key.clone();
+                smol::spawn(async move { manager.acquire(key, SshDomain::default(), true).await })
+            };
+            while probes.load(Ordering::SeqCst) == 0 {
+                smol::Timer::after(Duration::from_millis(1)).await;
+            }
+
+            let (done_tx, done_rx) = smol::channel::bounded::<()>(1);
+            let waiter = {
+                let manager = Arc::clone(&manager);
+                let key = key.clone();
+                smol::spawn(async move {
+                    let lease = manager.acquire(key, SshDomain::default(), true).await;
+                    let _ = done_tx.send(()).await;
+                    lease
+                })
+            };
+            smol::Timer::after(Duration::from_millis(50)).await;
+            assert!(
+                done_rx.try_recv().is_err(),
+                "the second acquire must wait for the probe verdict"
+            );
+            assert_eq!(
+                probes.load(Ordering::SeqCst),
+                1,
+                "the waiter must not start a second probe"
+            );
+
+            open_gate.send(()).await.expect("open the probe gate");
+            let first = prober.await.expect("probing acquire");
+            let second = waiter.await.expect("waiting acquire");
+            assert_eq!(
+                probes.load(Ordering::SeqCst),
+                1,
+                "one probe verdict serves every waiter"
+            );
+            drop(first);
+            drop(second);
+        });
+    }
+
+    /// The liveness probe accepts the same home spellings as root resolution;
+    /// a server that only answers the empty path is alive, and treating it as
+    /// dead forced a redial on every idle reacquire.
+    #[test]
+    fn the_home_probe_falls_back_to_the_empty_spelling() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = smol::block_on(canonicalize_remote_home(|spelling| {
+            calls.borrow_mut().push(spelling);
+            async move {
+                if spelling.is_empty() {
+                    Ok("/home/ada".to_string())
+                } else {
+                    Err("Library-specific error")
+                }
+            }
+        }));
+        assert_eq!(result.expect("fallback must succeed"), "/home/ada");
+        assert_eq!(*calls.borrow(), vec![".", ""]);
+
+        let result: Result<String, Vec<&str>> =
+            smol::block_on(canonicalize_remote_home(|_| async { Err("denied") }));
+        assert_eq!(
+            result.expect_err("every spelling failed"),
+            vec!["denied", "denied"],
+            "failures must be reported in spelling order"
+        );
     }
 
     #[test]
@@ -1376,15 +2078,17 @@ mod tests {
             "Broken pipe",
         ] {
             assert!(
-                invalidate_remote_connection_if_dead("unused-key", message),
-                "{message:?} should invalidate"
+                invalidate_remote_connection_if_dead("unused-key", 0, message),
+                "{:?} should invalidate",
+                message
             );
         }
         // A server-side refusal is not a dead connection: keep the session.
         for message in ["Permission denied", "No such file or directory"] {
             assert!(
-                !invalidate_remote_connection_if_dead("unused-key", message),
-                "{message:?} should not invalidate"
+                !invalidate_remote_connection_if_dead("unused-key", 0, message),
+                "{:?} should not invalidate",
+                message
             );
         }
     }
@@ -1422,12 +2126,25 @@ mod tests {
         assert_eq!(error_summary(&err), "Permission denied");
     }
 
+    /// Authorization is a process-wide registry, so tests sharing a source name
+    /// would inherit each other's authorization (and race, since they run in
+    /// parallel). Every test that cares about the authorized/unauthorized
+    /// distinction must mint its own name through this.
+    fn unique_source(prefix: &str) -> String {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        format!("{prefix}-{}", NEXT.fetch_add(1, Ordering::SeqCst))
+    }
+
     fn target(source: &str) -> RemoteFilesTarget {
+        target_with_root(source, "~")
+    }
+
+    fn target_with_root(source: &str, requested_root: &str) -> RemoteFilesTarget {
         RemoteFilesTarget {
             project_id: "project".to_string(),
             project_name: "Project".to_string(),
             source: RemoteFilesSource::ClientDomain(source.to_string()),
-            requested_root: "~".to_string(),
+            requested_root: requested_root.to_string(),
         }
     }
 
@@ -1478,6 +2195,76 @@ mod tests {
 
     struct FakeConnector {
         calls: Arc<AtomicUsize>,
+    }
+
+    /// Backend that answers once and then behaves like a session the server
+    /// reaped while it sat idle: every later probe fails.
+    struct DiesWhenIdleBackend {
+        probes: Arc<AtomicUsize>,
+        alive: Arc<AtomicBool>,
+    }
+
+    impl RemoteFileBackend for DiesWhenIdleBackend {
+        fn resolve_root(&self, _requested: String) -> RemoteFuture<RemotePath> {
+            Box::pin(async { RemotePath::from_server_absolute("/home/test") })
+        }
+
+        fn list_directory(
+            &self,
+            _path: RemotePath,
+            _limit: usize,
+        ) -> RemoteFuture<RemoteDirectoryListing> {
+            Box::pin(async {
+                Ok(RemoteDirectoryListing {
+                    entries: Vec::new(),
+                    truncated: false,
+                })
+            })
+        }
+
+        fn read_file(&self, _path: RemotePath, _limit: usize) -> RemoteFuture<RemoteFileBytes> {
+            Box::pin(async {
+                Ok(RemoteFileBytes {
+                    bytes: Vec::new(),
+                    truncated: false,
+                })
+            })
+        }
+
+        fn probe(&self) -> RemoteFuture<()> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            let alive = self.alive.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if alive {
+                    Ok(())
+                } else {
+                    Err("Library-specific error: session is gone".to_string())
+                }
+            })
+        }
+    }
+
+    struct DyingConnector {
+        calls: Arc<AtomicUsize>,
+        probes: Arc<AtomicUsize>,
+        /// Flipped false after the first connection is created, so the *next*
+        /// dial produces a healthy backend while the cached one is dead.
+        first_is_alive: Arc<AtomicBool>,
+    }
+
+    impl RemoteFileConnector for DyingConnector {
+        fn connect(&self, _config: SshDomain) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
+            let nth = self.calls.fetch_add(1, Ordering::SeqCst);
+            let alive = Arc::new(AtomicBool::new(nth > 0));
+            if nth == 0 {
+                self.first_is_alive.store(false, Ordering::SeqCst);
+            }
+            let backend = DiesWhenIdleBackend {
+                probes: Arc::clone(&self.probes),
+                alive,
+            };
+            Box::pin(async move { Ok(Arc::new(backend) as Arc<dyn RemoteFileBackend>) })
+        }
     }
 
     impl RemoteFileConnector for FakeConnector {
@@ -1655,6 +2442,7 @@ mod tests {
     /// including the idempotent `TargetChanged` that fires on every frame.
     #[test]
     fn reconnecting_after_hiding_the_panel_reaches_connected_again() {
+        let source = unique_source("reconnecting_after_hiding_the_panel_reaches_connected_again");
         let root = RemotePath::from_server_absolute("/home/me").unwrap();
         let mut state = RemoteFilesState::default();
 
@@ -1672,7 +2460,7 @@ mod tests {
             generation
         };
 
-        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
         connect_once(&mut state);
         assert_eq!(state.phase, RemoteFilesPhase::Connected);
 
@@ -1687,7 +2475,7 @@ mod tests {
         // must not disturb anything.
         for _ in 0..3 {
             assert!(state
-                .transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))))
+                .transition(RemoteFilesEvent::TargetChanged(Some(target(&source))))
                 .is_empty());
         }
         assert_eq!(state.phase, RemoteFilesPhase::Disconnected);
@@ -1703,9 +2491,10 @@ mod tests {
     /// "reconnect immediately errors" symptom.
     #[test]
     fn a_late_failure_from_the_previous_attempt_is_ignored() {
+        let source = unique_source("a_late_failure_from_the_previous_attempt_is_ignored");
         let root = RemotePath::from_server_absolute("/home/me").unwrap();
         let mut state = RemoteFilesState::default();
-        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
 
         let first_generation = match state
             .transition(RemoteFilesEvent::ConnectRequested)
@@ -1740,11 +2529,464 @@ mod tests {
         assert_eq!(state.phase, RemoteFilesPhase::Connected);
     }
 
+    /// Connect one source, switch to another, switch back: the first tree must
+    /// come straight back from cache instead of the panel dropping to "Not
+    /// connected" and asking for a click while the session is still open.
+    /// The preview pane widens the sidebar; leaving `selected` set after the
+    /// preview closes keeps `right_sidebar_file_preview_active` true, so the
+    /// pane's width is never handed back to the terminal.
+    #[test]
+    fn clearing_the_selection_also_drops_the_preview() {
+        let source = unique_source("clear-selection");
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let file = root.join_name("a.txt").unwrap();
+        let mut state = RemoteFilesState::default();
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation,
+            root: root.clone(),
+            listing: listing(&root, &[("a.txt", RemoteFileKind::File)]),
+        });
+        state.transition(RemoteFilesEvent::SelectFile(file.clone()));
+        assert_eq!(state.selected.as_ref(), Some(&file));
+        assert!(!matches!(state.preview, RemotePreviewStatus::None));
+
+        state.clear_selection();
+        assert!(state.selected.is_none());
+        assert!(matches!(state.preview, RemotePreviewStatus::None));
+    }
+
+    #[test]
+    fn switching_between_sources_restores_each_tree_from_cache() {
+        let first_source = unique_source("switch-a");
+        let second_source = unique_source("switch-b");
+        let root_a = RemotePath::from_server_absolute("/home/a").unwrap();
+        let root_b = RemotePath::from_server_absolute("/home/b").unwrap();
+        let mut state = RemoteFilesState::default();
+
+        let connect =
+            |state: &mut RemoteFilesState, root: &RemotePath, names: &[(&str, RemoteFileKind)]| {
+                let generation = match state
+                    .transition(RemoteFilesEvent::ConnectRequested)
+                    .as_slice()
+                {
+                    [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+                    other => panic!("expected Connect, got {:?}", other),
+                };
+                state.transition(RemoteFilesEvent::Connected {
+                    generation,
+                    root: root.clone(),
+                    listing: listing(root, names),
+                });
+            };
+
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&first_source))));
+        connect(&mut state, &root_a, &[("only-in-a", RemoteFileKind::File)]);
+        assert_eq!(state.rows().len(), 2, "root plus its one entry");
+
+        // Switch away: the second source is unauthorized, so it must ask.
+        let effects = state.transition(RemoteFilesEvent::TargetChanged(Some(target(
+            &second_source,
+        ))));
+        assert_eq!(effects, vec![RemoteFilesEffect::ReleaseLease]);
+        assert_eq!(state.phase, RemoteFilesPhase::Disconnected);
+        connect(&mut state, &root_b, &[]);
+
+        // Switch back: cached, authorized, and already connected — no spinner,
+        // no button, and a refresh is kicked off underneath.
+        let effects =
+            state.transition(RemoteFilesEvent::TargetChanged(Some(target(&first_source))));
+        assert_eq!(state.phase, RemoteFilesPhase::Connected);
+        assert_eq!(state.root.as_ref(), Some(&root_a));
+        assert_eq!(state.rows().len(), 2, "the cached tree is back on screen");
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    RemoteFilesEffect::ReleaseLease,
+                    RemoteFilesEffect::Connect { .. }
+                ]
+            ),
+            "expected release + background refresh, got {:?}",
+            effects
+        );
+    }
+
+    /// A source whose connection failed must not keep a cached tree: coming
+    /// back to it should show the failure, not rows from the dead session.
+    #[test]
+    fn a_failed_connection_forgets_that_sources_cached_tree() {
+        let source = unique_source("failed-forgets");
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let mut state = RemoteFilesState::default();
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation,
+            root: root.clone(),
+            listing: listing(&root, &[("f", RemoteFileKind::File)]),
+        });
+
+        // Hide (tree goes to cache), come back, then have the refresh fail.
+        state.transition(RemoteFilesEvent::PanelHidden);
+        state.transition(RemoteFilesEvent::TargetChanged(None));
+        let effects = state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let refresh_generation = match effects.as_slice() {
+            [_, RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected a background refresh, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::ConnectionFailed {
+            generation: refresh_generation,
+            message: "connection lost".to_string(),
+        });
+        assert!(matches!(state.phase, RemoteFilesPhase::Failed(_)));
+        assert!(
+            state.cached_trees.is_empty(),
+            "a dead source must not keep a tree that could be restored later"
+        );
+
+        // Switching away and back shows the disconnected state, not old rows.
+        state.transition(RemoteFilesEvent::TargetChanged(None));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        assert_eq!(state.phase, RemoteFilesPhase::Disconnected);
+        assert!(state.rows().is_empty());
+    }
+
+    #[test]
+    fn the_tree_cache_is_bounded_and_evicts_the_oldest_source() {
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let mut state = RemoteFilesState::default();
+        let sources: Vec<String> = (0..REMOTE_TREE_CACHE_CAP + 1)
+            .map(|_| unique_source("lru"))
+            .collect();
+
+        for source in &sources {
+            state.transition(RemoteFilesEvent::TargetChanged(Some(target(source))));
+            let generation = match state
+                .transition(RemoteFilesEvent::ConnectRequested)
+                .as_slice()
+            {
+                [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+                other => panic!("expected Connect, got {:?}", other),
+            };
+            state.transition(RemoteFilesEvent::Connected {
+                generation,
+                root: root.clone(),
+                listing: listing(&root, &[("f", RemoteFileKind::File)]),
+            });
+        }
+        // The last one is still on screen; the rest are cached up to the cap.
+        state.transition(RemoteFilesEvent::TargetChanged(None));
+        assert_eq!(state.cached_trees.len(), REMOTE_TREE_CACHE_CAP);
+        assert!(
+            !state
+                .cached_trees
+                .contains_key(&(format!("client-domain:{}", sources[0]), "~".to_string())),
+            "the oldest source must have been evicted"
+        );
+    }
+
+    /// Hiding the panel keeps the structure (it is cheap) — the expensive part
+    /// is the preview, which the sidebar releases separately. Only the idle
+    /// release gives the trees back.
+    #[test]
+    fn hiding_keeps_the_tree_but_releasing_drops_it() {
+        let source = unique_source("hide-keeps");
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let mut state = RemoteFilesState::default();
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation,
+            root: root.clone(),
+            listing: listing(&root, &[("f", RemoteFileKind::File)]),
+        });
+
+        assert_eq!(
+            state.transition(RemoteFilesEvent::PanelHidden),
+            vec![RemoteFilesEffect::ReleaseLease]
+        );
+        assert_eq!(state.cached_trees.len(), 1, "hiding must not drop the tree");
+
+        // Reopening the same target restores it without a reconnect prompt.
+        state.transition(RemoteFilesEvent::TargetChanged(None));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        assert_eq!(state.phase, RemoteFilesPhase::Connected);
+        assert_eq!(state.rows().len(), 2);
+
+        // The idle release only ever runs while the panel is hidden, i.e. after
+        // `PanelHidden` has already moved the live tree into the cache. Model
+        // that order: releasing must not yank a tree the user is looking at.
+        state.transition(RemoteFilesEvent::PanelHidden);
+        assert_eq!(state.cached_trees.len(), 1);
+        state.release_cached_trees();
+        assert!(state.cached_trees.is_empty());
+
+        // Reopening now has nothing to restore, so it goes back to asking the
+        // connection layer instead of showing stale rows.
+        state.transition(RemoteFilesEvent::TargetChanged(None));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        assert_eq!(state.phase, RemoteFilesPhase::Disconnected);
+        assert!(state.rows().is_empty());
+        // Still authorized, so the paint path's resume will reconnect without
+        // making the user press anything.
+        assert!(state.can_resume_current());
+        assert!(matches!(
+            state
+                .transition(RemoteFilesEvent::ResumeRequested)
+                .as_slice(),
+            [RemoteFilesEffect::Connect {
+                allow_connect: true,
+                ..
+            }]
+        ));
+    }
+
+    /// Two projects can share one host while browsing different roots; the
+    /// cache is keyed by (source, requested root) so project B must never be
+    /// shown project A's rows just because the connection is the same.
+    #[test]
+    fn trees_are_cached_per_root_not_per_source() {
+        let source = unique_source("per-root");
+        let root_a = RemotePath::from_server_absolute("/srv/a").unwrap();
+        let mut state = RemoteFilesState::default();
+
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target_with_root(
+            &source, "/srv/a",
+        ))));
+        let generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation,
+            root: root_a.clone(),
+            listing: listing(&root_a, &[("only-in-a", RemoteFileKind::File)]),
+        });
+
+        // Same source, different root: authorized, but there is nothing cached
+        // for this root, so nothing may be restored.
+        let effects = state.transition(RemoteFilesEvent::TargetChanged(Some(target_with_root(
+            &source, "/srv/b",
+        ))));
+        assert_eq!(effects, vec![RemoteFilesEffect::ReleaseLease]);
+        assert_eq!(state.phase, RemoteFilesPhase::Disconnected);
+        assert!(
+            state.rows().is_empty(),
+            "must not show the other root's rows"
+        );
+
+        // Back on the original root the stash is legitimate again.
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target_with_root(
+            &source, "/srv/a",
+        ))));
+        assert_eq!(state.phase, RemoteFilesPhase::Connected);
+        assert_eq!(state.rows().len(), 2);
+    }
+
+    /// While a restored tree waits for its lease, clicks are recorded, not
+    /// executed: an effect reaching the handler before the lease exists used
+    /// to be reported as a spurious connection failure that wiped the tree.
+    #[test]
+    fn clicks_on_a_restored_tree_are_deferred_until_the_lease_arrives() {
+        let source = unique_source("deferred");
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let dir = root.join_name("src").unwrap();
+        let file = root.join_name("readme.md").unwrap();
+        let mut state = RemoteFilesState::default();
+
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation,
+            root: root.clone(),
+            listing: listing(
+                &root,
+                &[
+                    ("src", RemoteFileKind::Directory),
+                    ("readme.md", RemoteFileKind::File),
+                ],
+            ),
+        });
+
+        // Stash and restore: the refresh Connect is now in flight.
+        state.transition(RemoteFilesEvent::TargetChanged(None));
+        let effects = state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let refresh_generation = match effects.as_slice() {
+            [_, RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected a background refresh, got {:?}", other),
+        };
+        assert_eq!(state.phase, RemoteFilesPhase::Connected);
+
+        // Interactions during the round trip must emit nothing...
+        assert!(
+            state
+                .transition(RemoteFilesEvent::ToggleDirectory(dir.clone()))
+                .is_empty(),
+            "expanding an uncached directory must wait for the lease"
+        );
+        assert!(
+            state
+                .transition(RemoteFilesEvent::SelectFile(file.clone()))
+                .is_empty(),
+            "opening a preview must wait for the lease"
+        );
+        assert!(
+            state.transition(RemoteFilesEvent::Refresh).is_empty(),
+            "a refresh is already what the restored tree is waiting on"
+        );
+
+        // ...and be flushed, with the current generation, once it lands.
+        let effects = state.transition(RemoteFilesEvent::Connected {
+            generation: refresh_generation,
+            root: root.clone(),
+            listing: listing(
+                &root,
+                &[
+                    ("src", RemoteFileKind::Directory),
+                    ("readme.md", RemoteFileKind::File),
+                ],
+            ),
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RemoteFilesEffect::ListDirectory { path, generation, .. }
+                    if *path == dir && *generation == refresh_generation
+            )),
+            "deferred listing must be flushed, got {:?}",
+            effects
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RemoteFilesEffect::LoadPreview { path, generation, .. }
+                    if *path == file && *generation == refresh_generation
+            )),
+            "deferred preview must be flushed, got {:?}",
+            effects
+        );
+    }
+
+    /// A restored cache can hold up to the whole row budget on its own, and
+    /// the refreshed root listing arrives budgeted only against itself — the
+    /// union must still respect the global bound.
+    #[test]
+    fn a_refreshed_root_rebudgets_the_restored_descendants() {
+        let source = unique_source("rebudget");
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let dir = root.join_name("big").unwrap();
+        let mut state = RemoteFilesState::default();
+
+        let wide_listing = |parent: &RemotePath, prefix: &str, count: usize, extra_dir: bool| {
+            let mut entries: Vec<RemoteFileEntry> = (0..count)
+                .map(|index| {
+                    let name = format!("{prefix}-{index}");
+                    RemoteFileEntry {
+                        path: parent.join_name(&name).unwrap(),
+                        name,
+                        kind: RemoteFileKind::File,
+                        size: None,
+                    }
+                })
+                .collect();
+            if extra_dir {
+                entries.push(RemoteFileEntry {
+                    path: parent.join_name("big").unwrap(),
+                    name: "big".to_string(),
+                    kind: RemoteFileKind::Directory,
+                    size: None,
+                });
+            }
+            RemoteDirectoryListing {
+                entries,
+                truncated: false,
+            }
+        };
+
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let generation = match state
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation,
+            root: root.clone(),
+            listing: wide_listing(&root, "root", 999, true),
+        });
+        state.transition(RemoteFilesEvent::ToggleDirectory(dir.clone()));
+        state.transition(RemoteFilesEvent::DirectoryLoaded {
+            generation,
+            path: dir.clone(),
+            listing: wide_listing(&dir, "nested", 1000, false),
+        });
+        assert_eq!(state.total_entries(), 2000);
+
+        // Stash, restore, and refresh with a root listing that alone fills
+        // the budget.
+        state.transition(RemoteFilesEvent::TargetChanged(None));
+        let effects = state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let refresh_generation = match effects.as_slice() {
+            [_, RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected a background refresh, got {:?}", other),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation: refresh_generation,
+            root: root.clone(),
+            listing: wide_listing(&root, "fresh", REMOTE_FILE_TREE_ROW_LIMIT, false),
+        });
+        assert!(
+            state.total_entries() <= REMOTE_FILE_TREE_ROW_LIMIT,
+            "restored descendants must not defeat the row budget: {} rows",
+            state.total_entries()
+        );
+        assert_eq!(
+            state
+                .directories
+                .get(&root)
+                .map(|directory| directory.listing.entries.len()),
+            Some(REMOTE_FILE_TREE_ROW_LIMIT),
+            "the fresh root listing itself must survive the rebudget"
+        );
+    }
+
     #[test]
     fn no_click_never_connects_and_resume_requires_prior_success() {
+        let source = unique_source("never-clicked");
         let mut state = RemoteFilesState::default();
         assert_eq!(
-            state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux")))),
+            state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source)))),
             vec![RemoteFilesEffect::ReleaseLease]
         );
         assert!(state
@@ -1762,45 +3004,68 @@ mod tests {
         ));
     }
 
+    /// Clicking Connect once authorizes that *source* for the whole process,
+    /// not just the window that did it — the SSH session is shared between
+    /// windows, so making a second window ask again for a session that is
+    /// already open is pure friction.
     #[test]
-    fn successful_connection_authorizes_only_that_window_state() {
+    fn a_successful_connection_authorizes_the_source_for_every_window() {
+        let source = unique_source("shared-auth");
         let root = RemotePath::from_server_absolute("/home/me").unwrap();
+
+        let mut second = RemoteFilesState::default();
+        second.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        assert!(
+            second
+                .transition(RemoteFilesEvent::ResumeRequested)
+                .is_empty(),
+            "an unauthorized source must never connect on its own"
+        );
+
         let mut first = RemoteFilesState::default();
-        first.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
-        let effect = first.transition(RemoteFilesEvent::ConnectRequested);
-        let generation = match effect[0] {
-            RemoteFilesEffect::Connect { generation, .. } => generation,
-            _ => unreachable!(),
+        first.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let generation = match first
+            .transition(RemoteFilesEvent::ConnectRequested)
+            .as_slice()
+        {
+            [RemoteFilesEffect::Connect { generation, .. }] => *generation,
+            other => panic!("expected Connect, got {:?}", other),
         };
         first.transition(RemoteFilesEvent::Connected {
             generation,
             root: root.clone(),
             listing: listing(&root, &[]),
         });
-        first.transition(RemoteFilesEvent::PanelHidden);
+
+        // The other window can now resume the same source without a click, and
+        // is allowed to redial: once the pool's idle window lapses, silently
+        // reconnecting beats demanding a second click for the same host.
         assert!(matches!(
-            first
+            second
                 .transition(RemoteFilesEvent::ResumeRequested)
                 .as_slice(),
             [RemoteFilesEffect::Connect {
-                allow_connect: false,
+                allow_connect: true,
                 ..
             }]
         ));
 
-        let mut second = RemoteFilesState::default();
-        second.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
-        assert!(second
+        // A different, untouched source is still locked down.
+        let other = unique_source("shared-auth-other");
+        let mut third = RemoteFilesState::default();
+        third.transition(RemoteFilesEvent::TargetChanged(Some(target(&other))));
+        assert!(third
             .transition(RemoteFilesEvent::ResumeRequested)
             .is_empty());
     }
 
     #[test]
     fn collapsing_directory_releases_descendants() {
+        let source = unique_source("collapsing_directory_releases_descendants");
         let root = RemotePath::from_server_absolute("/home/me").unwrap();
         let child = root.join_name("src").unwrap();
         let mut state = RemoteFilesState::default();
-        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
         let generation = match state.transition(RemoteFilesEvent::ConnectRequested)[0] {
             RemoteFilesEffect::Connect { generation, .. } => generation,
             _ => unreachable!(),
@@ -1824,9 +3089,10 @@ mod tests {
 
     #[test]
     fn stale_directory_result_is_ignored_after_panel_closes() {
+        let source = unique_source("stale_directory_result_is_ignored_after_panel_closes");
         let path = RemotePath::from_server_absolute("/home/me/src").unwrap();
         let mut state = RemoteFilesState::default();
-        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
         let generation = state.generation;
         state.transition(RemoteFilesEvent::PanelHidden);
         state.transition(RemoteFilesEvent::DirectoryLoaded {
@@ -1839,10 +3105,11 @@ mod tests {
 
     #[test]
     fn stale_directory_result_does_not_clear_a_new_loading_request() {
+        let source = unique_source("stale_directory_result_does_not_clear_a_new_loading_request");
         let root = RemotePath::from_server_absolute("/home/me").unwrap();
         let child = root.join_name("src").unwrap();
         let mut state = RemoteFilesState::default();
-        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
         let first_generation = state.generation;
         state.transition(RemoteFilesEvent::PanelHidden);
         let effect = state.transition(RemoteFilesEvent::ConnectRequested);
@@ -1869,9 +3136,10 @@ mod tests {
 
     #[test]
     fn resume_does_not_reload_an_already_connected_panel() {
+        let source = unique_source("resume_does_not_reload_an_already_connected_panel");
         let root = RemotePath::from_server_absolute("/home/me").unwrap();
         let mut state = RemoteFilesState::default();
-        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
         let generation = match state.transition(RemoteFilesEvent::ConnectRequested)[0] {
             RemoteFilesEffect::Connect { generation, .. } => generation,
             _ => unreachable!(),
@@ -1891,9 +3159,10 @@ mod tests {
 
     #[test]
     fn directory_results_are_capped_to_the_global_row_budget() {
+        let source = unique_source("directory_results_are_capped_to_the_global_row_budget");
         let root = RemotePath::from_server_absolute("/home/me").unwrap();
         let mut state = RemoteFilesState::default();
-        state.transition(RemoteFilesEvent::TargetChanged(Some(target("mux"))));
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
         let generation = match state.transition(RemoteFilesEvent::ConnectRequested)[0] {
             RemoteFilesEffect::Connect { generation, .. } => generation,
             _ => unreachable!(),

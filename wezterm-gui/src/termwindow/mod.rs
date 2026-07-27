@@ -1350,6 +1350,9 @@ pub struct TermWindow {
     right_sidebar_file_preview_generation: u64,
     right_sidebar_file_preview_highlight_cancel: Arc<AtomicUsize>,
     right_sidebar_file_preview_lines: Vec<RightSidebarFilePreviewLine>,
+    /// The preview text before display sanitization (tab expansion, control
+    /// stripping): the display lines are wrong for the clipboard.
+    right_sidebar_file_preview_raw_text: Option<String>,
     right_sidebar_file_preview_max_columns: usize,
     right_sidebar_file_preview_image: Option<RightSidebarFilePreviewImage>,
     right_sidebar_file_preview_message: Option<String>,
@@ -2008,6 +2011,7 @@ impl TermWindow {
             right_sidebar_file_preview_generation: 0,
             right_sidebar_file_preview_highlight_cancel: Arc::new(AtomicUsize::new(0)),
             right_sidebar_file_preview_lines: Vec::new(),
+            right_sidebar_file_preview_raw_text: None,
             right_sidebar_file_preview_max_columns: 0,
             right_sidebar_file_preview_image: None,
             right_sidebar_file_preview_message: None,
