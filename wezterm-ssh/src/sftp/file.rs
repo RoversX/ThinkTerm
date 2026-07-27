@@ -32,12 +32,19 @@ pub(crate) enum FileRequest {
     SetMetadata(SetMetadataFile, Sender<SftpChannelResult<()>>),
     Metadata(FileId, Sender<SftpChannelResult<Metadata>>),
     Fsync(FileId, Sender<SftpChannelResult<()>>),
+    Seek(SeekFile, Sender<SftpChannelResult<u64>>),
 }
 
 #[derive(Debug)]
 pub(crate) struct WriteFile {
     pub file_id: FileId,
     pub data: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SeekFile {
+    pub file_id: FileId,
+    pub position: u64,
 }
 
 #[derive(Debug)]
@@ -119,6 +126,33 @@ impl File {
             .send(SessionRequest::Sftp(SftpRequest::File(
                 FileRequest::Metadata(self.file_id, reply),
             )))
+            .await?;
+        let result = rx.recv().await??;
+        Ok(result)
+    }
+
+    /// Move the read/write position to `position` bytes from the start,
+    /// returning the new position.
+    ///
+    /// Lets a transfer resume from where an interrupted one stopped instead of
+    /// starting over. Note that the caller owns the question of whether the
+    /// bytes already there are the right ones — this only moves the cursor.
+    ///
+    /// Must not be interleaved with an in-flight read or write on the same
+    /// handle: those futures capture their buffer on first poll, so a seek
+    /// landing between poll and completion would apply to the wrong offset.
+    pub async fn seek(&self, position: u64) -> SftpChannelResult<u64> {
+        let (reply, rx) = bounded(1);
+        self.tx
+            .as_ref()
+            .unwrap()
+            .send(SessionRequest::Sftp(SftpRequest::File(FileRequest::Seek(
+                SeekFile {
+                    file_id: self.file_id,
+                    position,
+                },
+                reply,
+            ))))
             .await?;
         let result = rx.recv().await??;
         Ok(result)

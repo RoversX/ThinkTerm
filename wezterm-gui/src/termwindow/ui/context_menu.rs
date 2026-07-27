@@ -224,6 +224,15 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile(path) => {
                 self.download_right_sidebar_remote_file(path);
             }
+            crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewSelection => {
+                self.copy_right_sidebar_selected_file_preview_text();
+            }
+            crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewAll => {
+                self.copy_right_sidebar_file_preview_all_text();
+            }
+            crate::termwindow::ContextMenuApplicationAction::ResolveLocalCopyConflict(choice) => {
+                self.resolve_pending_local_copy(choice);
+            }
         }
     }
 
@@ -304,7 +313,7 @@ impl crate::TermWindow {
                     return true;
                 }
 
-                self.close_fallback_context_menu();
+                self.dismiss_fallback_context_menu();
                 context.invalidate();
                 true
             }
@@ -312,7 +321,7 @@ impl crate::TermWindow {
                 if menu.hit_path(event.coords).is_some() {
                     return true;
                 }
-                self.close_fallback_context_menu();
+                self.dismiss_fallback_context_menu();
                 context.invalidate();
                 false
             }
@@ -332,6 +341,18 @@ impl crate::TermWindow {
             return true;
         }
         false
+    }
+
+    /// Close a menu that the user walked away from.
+    ///
+    /// Distinct from [`Self::close_fallback_context_menu`], which also runs
+    /// immediately *before* a chosen action — cancelling there would swallow
+    /// the very choice being made.
+    pub(crate) fn dismiss_fallback_context_menu(&mut self) {
+        // A copy waiting on an answer takes dismissal as "no". Leaving the
+        // plan behind would keep it alive with no way to reach it again.
+        self.cancel_pending_local_copy();
+        self.close_fallback_context_menu();
     }
 
     pub(crate) fn close_fallback_context_menu(&mut self) {

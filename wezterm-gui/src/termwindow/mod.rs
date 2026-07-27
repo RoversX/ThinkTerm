@@ -103,6 +103,7 @@ pub mod resize;
 mod selection;
 pub mod spawn;
 pub mod ssh_hosts_view;
+pub(crate) mod transfer_walk;
 pub mod ui;
 pub mod webgpu;
 
@@ -298,6 +299,11 @@ pub(crate) enum ContextMenuApplicationAction {
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
     /// Fetch a file from the remote Files panel into the Downloads folder.
     DownloadRemoteFile(remote_files::RemotePath),
+    /// Copy the remote preview's selected text, or the whole buffer.
+    CopyRemotePreviewSelection,
+    CopyRemotePreviewAll,
+    /// Answer to "these files already exist" for a queued local copy.
+    ResolveLocalCopyConflict(transfer_walk::ConflictChoice),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -593,6 +599,22 @@ struct FileDragState {
     start: ::window::Point,
     current: ::window::Point,
     active: bool,
+}
+
+/// A planned local copy held back until the user says what to do about files
+/// that already exist at the destination.
+pub(crate) struct PendingLocalCopy {
+    pub plans: Vec<(PathBuf, transfer_walk::TransferPlan)>,
+    pub directory: PathBuf,
+    /// Destination-relative paths that already exist.
+    pub conflicts: std::collections::HashSet<PathBuf>,
+    /// Where the drop landed, so the prompt appears there rather than at some
+    /// default corner — the walk is asynchronous, so the pointer has moved on
+    /// by the time we can ask.
+    pub anchor: ::window::Point,
+    /// What the walk left out, carried through so the finished row can say so
+    /// rather than reporting a clean success over silently omitted data.
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1395,6 +1417,16 @@ pub struct TermWindow {
     /// The directory a file drag is currently hovering over, so the row can be
     /// highlighted and the drop knows where it would land.
     right_sidebar_remote_drop_target: Option<remote_files::RemotePath>,
+    right_sidebar_local_drop_target: Option<PathBuf>,
+    /// A local copy waiting on the user's answer about existing files.
+    pending_local_copy: Option<PendingLocalCopy>,
+    /// Bumped by every drop. A preflight walk that comes back carrying an old
+    /// value has been superseded — two walks can finish out of order, and the
+    /// slower, older one must not replace the newer prompt.
+    local_copy_generation: u64,
+    /// How many destinations clashed, kept separately so the prompt can be
+    /// worded without borrowing the queued plan.
+    pending_local_copy_conflict_count: usize,
     right_sidebar_remote_file_tree_scroll_offset: f32,
     // Bumped to invalidate a pending periodic-rescan timer tick.
     right_sidebar_file_rescan_token: u64,
@@ -2045,6 +2077,10 @@ impl TermWindow {
             right_sidebar_remote_transfers: Vec::new(),
             right_sidebar_remote_transfer_next_id: 0,
             right_sidebar_remote_drop_target: None,
+            right_sidebar_local_drop_target: None,
+            pending_local_copy: None,
+            local_copy_generation: 0,
+            pending_local_copy_conflict_count: 0,
             right_sidebar_remote_file_tree_scroll_offset: 0.0,
             right_sidebar_file_rescan_token: 0,
             right_sidebar_file_refreshing: false,
@@ -2443,9 +2479,15 @@ impl TermWindow {
                     .detach();
                     return Ok(true);
                 }
-                // Aimed at the remote Files tree: upload rather than paste the
-                // local paths into a shell that cannot see them.
+                // Aimed at the Files tree: transfer rather than paste the
+                // paths into a shell. Remote uploads over SFTP, local copies
+                // straight into the hovered directory.
                 if self.upload_dropped_files_to_remote(&paths, coords) {
+                    return Ok(true);
+                }
+                // The walk runs on a worker, so any conflict prompt is raised
+                // when it comes back rather than here.
+                if self.copy_dropped_files_into_local_panel(&paths, coords) {
                     return Ok(true);
                 }
                 let pane = match self.get_active_pane_or_overlay() {
@@ -2467,10 +2509,12 @@ impl TermWindow {
             }
             WindowEvent::DraggedFile { coords, .. } => {
                 self.update_right_sidebar_remote_drop_target(coords);
+                self.update_right_sidebar_local_drop_target(coords);
                 Ok(true)
             }
             WindowEvent::DragLeave => {
                 self.clear_right_sidebar_remote_drop_target();
+                self.clear_right_sidebar_local_drop_target();
                 Ok(true)
             }
         }

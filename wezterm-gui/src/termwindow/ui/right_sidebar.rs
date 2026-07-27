@@ -11,7 +11,13 @@ use crate::termwindow::remote_files::{
     invalidate_remote_connection, invalidate_remote_connection_if_dead, remote_connection_key,
     remote_connection_manager, reserve_download_path, RemoteAcquireError, RemoteFileBytes,
     RemoteFileKind, RemoteFileRow, RemoteFilesEffect, RemoteFilesEvent, RemoteFilesPhase,
-    RemotePath, RemoteTransfer, RemoteTransferKind, RemoteTransferProgress, RemoteTransferStatus,
+    RemotePath, RemoteTransfer, RemoteTransferKind, RemoteTransferProgress, RemoteTransferSource,
+    RemoteTransferStatus, REMOTE_TRANSFER_CANCELED,
+};
+use crate::termwindow::transfer_walk::{
+    apply_conflict_choice, destination_escapes_source, destination_stays_within, is_same_file,
+    plan_transfer, ConflictChoice, DestinationRoot, OverwritePolicy, TransferEntryKind,
+    TransferPlanError, TRANSFER_CONFIRM_THRESHOLD,
 };
 use crate::termwindow::ui::icons::{
     material_file_icon_for_name, material_folder_icon_for_name, MaterialIcon, SvgIcon,
@@ -23,9 +29,9 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
 use crate::termwindow::{
-    NoteEditorCommand, RightSidebarFileCharBag, RightSidebarFileField, RightSidebarFileIndex,
-    RightSidebarFileIndexEntry, RightSidebarFileIndexStatus, RightSidebarFilePreviewImage,
-    RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
+    NoteEditorCommand, PendingLocalCopy, RightSidebarFileCharBag, RightSidebarFileField,
+    RightSidebarFileIndex, RightSidebarFileIndexEntry, RightSidebarFileIndexStatus,
+    RightSidebarFilePreviewImage, RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
     RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSliceCacheKey,
     RightSidebarFilePreviewSliceCacheValue, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
     RightSidebarFileView, RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
@@ -2371,24 +2377,19 @@ impl crate::TermWindow {
         }
     }
 
-    pub(crate) fn copy_right_sidebar_selected_file_preview_text(&mut self) {
-        if let Some(text) = self.right_sidebar_file_preview_selected_text() {
-            self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
-            return;
-        }
-
+    /// Copy the whole preview, ignoring any selection. The toolbar button and
+    /// the context menu's "Copy" fall back to this when nothing is selected;
+    /// the menu also offers it outright, so it is separated out.
+    pub(crate) fn copy_right_sidebar_file_preview_all_text(&mut self) {
         if self.right_sidebar_file_preview_lines.is_empty() {
             return;
         }
-
         // Whole-buffer copy must reproduce the file, not the display: the
-        // lines have tabs expanded and controls stripped for rendering, which
-        // would corrupt tab-sensitive content like a Makefile.
+        // lines have tabs expanded and controls stripped for rendering.
         if let Some(raw) = self.right_sidebar_file_preview_raw_text.clone() {
             self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, raw);
             return;
         }
-
         let mut text = String::new();
         for (idx, line) in self.right_sidebar_file_preview_lines.iter().enumerate() {
             if idx > 0 {
@@ -2397,6 +2398,15 @@ impl crate::TermWindow {
             text.push_str(&line.plain);
         }
         self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+    }
+
+    pub(crate) fn copy_right_sidebar_selected_file_preview_text(&mut self) {
+        if let Some(text) = self.right_sidebar_file_preview_selected_text() {
+            self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+            return;
+        }
+        // Nothing selected means "copy what I am looking at".
+        self.copy_right_sidebar_file_preview_all_text();
     }
 
     pub(crate) fn right_sidebar_file_preview_selected_text(&self) -> Option<String> {
@@ -2782,6 +2792,18 @@ impl crate::TermWindow {
             return;
         };
         self.spawn_right_sidebar_file_index_build(root, project, true, true);
+    }
+
+    /// Re-scan after we ourselves changed the tree.
+    ///
+    /// [`Self::force_right_sidebar_file_rescan`] gives up when a scan is
+    /// already running or the index is not `Ready` — fine for a timer, wrong
+    /// here: the files we just wrote would then stay invisible until the next
+    /// 90-second tick. Re-arm the periodic cycle so the scan happens either
+    /// way.
+    pub(crate) fn force_right_sidebar_file_rescan_soon(&mut self) {
+        self.force_right_sidebar_file_rescan();
+        self.schedule_right_sidebar_file_rescan();
     }
 
     /// Refresh now (if a tree is already loaded) and (re)start the 90s periodic
@@ -8976,31 +8998,12 @@ impl crate::TermWindow {
         } else {
             0
         };
-        // The strip eats into the tree, so it is capped twice: by a fixed row
-        // count, and by never taking more than half of what is left. Dropping
-        // thirty files at once must not collapse the tree to nothing or push
-        // rows up over the header.
-        let strip_budget = content_bottom
-            .saturating_sub(tree_top)
-            .saturating_sub(self.ui_px(SIDEBAR_INSET))
-            .saturating_sub(truncated_height)
-            / 2;
-        let strip_rows = self
-            .right_sidebar_remote_transfers
-            .len()
-            .min(REMOTE_TRANSFER_STRIP_MAX)
-            .min(strip_budget / row_metrics.row_height.max(1));
-        // When some are hidden, the last visible row reports how many rather
-        // than letting them vanish silently.
-        let hidden_transfers = self
-            .right_sidebar_remote_transfers
-            .len()
-            .saturating_sub(strip_rows);
-        let painted_transfers = if hidden_transfers > 0 {
-            strip_rows.saturating_sub(1)
-        } else {
-            strip_rows
-        };
+        let strip_rows = self.transfer_strip_rows(
+            content_bottom
+                .saturating_sub(tree_top)
+                .saturating_sub(self.ui_px(SIDEBAR_INSET).saturating_add(truncated_height)),
+            row_metrics.row_height,
+        );
         let footer_height =
             truncated_height.saturating_add(strip_rows.saturating_mul(row_metrics.row_height));
         let viewport_bottom = content_bottom
@@ -9124,7 +9127,70 @@ impl crate::TermWindow {
             )?;
             footer_y += truncated_height;
         }
-        for index in 0..painted_transfers {
+        self.paint_transfer_strip(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            footer_y,
+            content_width,
+            strip_rows,
+            row_metrics,
+        )?;
+        Ok(())
+    }
+
+    /// How many strip rows fit in `available` vertical pixels.
+    ///
+    /// Capped twice: by a fixed count, and by never taking more than half of
+    /// what is left. Dropping thirty files at once must not collapse the tree
+    /// to nothing or push rows up over the header.
+    fn transfer_strip_rows(&self, available: usize, row_height: usize) -> usize {
+        if self.right_sidebar_remote_transfers.is_empty() {
+            return 0;
+        }
+        self.right_sidebar_remote_transfers
+            .len()
+            .min(REMOTE_TRANSFER_STRIP_MAX)
+            .min((available / 2) / row_height.max(1))
+    }
+
+    /// Paint the transfer strip. Shared by both trees: a local copy started
+    /// from the local panel has to report itself there, not only in the remote
+    /// one where the rows happen to live.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_transfer_strip(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        mut y: usize,
+        content_width: usize,
+        strip_rows: usize,
+        row_metrics: RightSidebarFileRowMetrics,
+    ) -> anyhow::Result<()> {
+        if strip_rows == 0 {
+            return Ok(());
+        }
+        // When some are hidden, the last visible row reports how many rather
+        // than letting them vanish silently.
+        let hidden = self
+            .right_sidebar_remote_transfers
+            .len()
+            .saturating_sub(strip_rows);
+        let painted = if hidden > 0 {
+            strip_rows.saturating_sub(1)
+        } else {
+            strip_rows
+        };
+        for index in 0..painted {
             self.paint_remote_transfer_row(
                 layers,
                 ui_font,
@@ -9133,18 +9199,18 @@ impl crate::TermWindow {
                 foreground,
                 muted_fg,
                 content_x,
-                footer_y,
+                y,
                 content_width,
                 index,
                 row_metrics,
             )?;
-            footer_y += row_metrics.row_height;
+            y += row_metrics.row_height;
         }
-        if hidden_transfers > 0 && strip_rows > 0 {
-            let more = if hidden_transfers == 1 {
+        if hidden > 0 {
+            let more = if hidden == 1 {
                 "1 more transfer".to_string()
             } else {
-                format!("{hidden_transfers} more transfers")
+                format!("{hidden} more transfers")
             };
             self.paint_sidebar_text(
                 layers,
@@ -9152,11 +9218,10 @@ impl crate::TermWindow {
                 ui_metrics,
                 &more,
                 content_x + self.ui_px(SIDEBAR_INSET),
-                footer_y
-                    + row_metrics
-                        .row_height
-                        .saturating_sub(ui_metrics.cell_size.height as usize)
-                        / 2,
+                y + row_metrics
+                    .row_height
+                    .saturating_sub(ui_metrics.cell_size.height as usize)
+                    / 2,
                 content_width.saturating_sub(self.ui_px(SIDEBAR_INSET)),
                 muted_fg,
             )?;
@@ -9192,19 +9257,25 @@ impl crate::TermWindow {
             RemoteTransferStatus::Done(_) => (SvgIcon::CircleCheck, chrome.selected_bg),
             // Muted rather than red, matching the panel's existing
             // "Connection failed" state.
-            RemoteTransferStatus::Failed(_) => (SvgIcon::CircleAlert, muted_fg),
+            RemoteTransferStatus::Failed(_) | RemoteTransferStatus::FailedWithLeftover { .. } => {
+                (SvgIcon::CircleAlert, muted_fg)
+            }
         };
-        let arrow = match transfer.kind {
-            RemoteTransferKind::Upload => "Uploading",
-            RemoteTransferKind::Download => "Downloading",
-        };
+        let verb = transfer.kind.verb();
         let detail = match &transfer.status {
-            RemoteTransferStatus::Running => match transfer.progress.fraction() {
-                Some(fraction) => format!("{arrow} {}%", (fraction * 100.0).round() as u32),
-                None => arrow.to_string(),
+            RemoteTransferStatus::Running => match transfer.progress.items() {
+                // A folder reads better as "12/300" than as a percentage.
+                Some((done, total)) => format!("{verb} {done}/{total}"),
+                None => match transfer.progress.fraction() {
+                    Some(fraction) => format!("{verb} {}%", (fraction * 100.0).round() as u32),
+                    None => verb.to_string(),
+                },
             },
             RemoteTransferStatus::Done(detail) => detail.clone(),
             RemoteTransferStatus::Failed(message) => message.clone(),
+            RemoteTransferStatus::FailedWithLeftover { message, leftover } => {
+                format!("{message} — {leftover} was left behind")
+            }
         };
         let label = format!("{} — {detail}", transfer.name);
         let fraction = transfer.progress.fraction();
@@ -9774,6 +9845,20 @@ impl crate::TermWindow {
         }
     }
 
+    pub(crate) fn update_right_sidebar_local_drop_target(&mut self, coords: Option<Point>) {
+        let target = coords.and_then(|coords| self.local_drop_target_at(coords.x, coords.y));
+        if self.right_sidebar_local_drop_target != target {
+            self.right_sidebar_local_drop_target = target;
+            self.invalidate_window();
+        }
+    }
+
+    pub(crate) fn clear_right_sidebar_local_drop_target(&mut self) {
+        if self.right_sidebar_local_drop_target.take().is_some() {
+            self.invalidate_window();
+        }
+    }
+
     /// Take files dropped onto the remote tree and upload them. Returns false
     /// when the drop was not aimed at the panel, so the caller can fall back
     /// to its usual handling.
@@ -9805,13 +9890,9 @@ impl crate::TermWindow {
             return false;
         };
 
-        let mut skipped_directories = 0usize;
-        let mut queued = 0usize;
         for path in paths {
-            // Only files: a directory needs recursive creation and a way to
-            // report partial failure, which this does not have yet.
             if path.is_dir() {
-                skipped_directories += 1;
+                self.start_remote_folder_upload(path.clone(), directory.clone());
                 continue;
             }
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -9819,6 +9900,7 @@ impl crate::TermWindow {
                     RemoteTransferKind::Upload,
                     path.to_string_lossy().to_string(),
                     "That file name is not valid UTF-8".to_string(),
+                    None,
                 );
                 continue;
             };
@@ -9832,27 +9914,181 @@ impl crate::TermWindow {
                         RemoteTransferKind::Upload,
                         name.to_string(),
                         err,
+                        None,
                     );
                     continue;
                 }
             };
             self.start_remote_upload(path.clone(), remote, directory.clone());
-            queued += 1;
-        }
-
-        if skipped_directories > 0 && queued == 0 {
-            self.push_remote_transfer_failure(
-                RemoteTransferKind::Upload,
-                if skipped_directories == 1 {
-                    "Folder".to_string()
-                } else {
-                    format!("{skipped_directories} folders")
-                },
-                "Only files can be uploaded".to_string(),
-            );
         }
         self.invalidate_window();
         true
+    }
+
+    /// Walk a dropped folder and upload it as a single transfer.
+    ///
+    /// One row, not one per file: running rows are never evicted from the
+    /// strip, so a thousand-file folder would otherwise bury the panel.
+    fn start_remote_folder_upload(&mut self, source: PathBuf, directory: RemotePath) {
+        // The walk and its metadata calls must not run here: a large or
+        // network-backed tree would freeze the window for as long as it takes,
+        // before even a progress row appears.
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        // Remember which host the drop was aimed at. Walking is slow, and the
+        // panel can be pointed somewhere else in the meantime — uploading to
+        // whatever happens to be connected when the walk finishes would put
+        // the files on the wrong machine, at a path that means something else
+        // there.
+        let aimed_at = self.right_sidebar_remote_files.current_source_key();
+        promise::spawn::spawn(async move {
+            let planned = promise::spawn::spawn_into_new_thread(move || {
+                Ok::<_, anyhow::Error>((source.clone(), plan_transfer(&source)))
+            })
+            .await;
+            let Ok((source, plan)) = planned else {
+                return;
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_remote_folder_plan(source, directory, plan, aimed_at);
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_remote_folder_plan(
+        &mut self,
+        source: PathBuf,
+        directory: RemotePath,
+        plan: Result<
+            crate::termwindow::transfer_walk::TransferPlan,
+            crate::termwindow::transfer_walk::TransferPlanError,
+        >,
+        aimed_at: Option<String>,
+    ) {
+        let name = display_name(&source);
+        if aimed_at.is_none() || self.right_sidebar_remote_files.current_source_key() != aimed_at {
+            // Refuse rather than retarget: the same remote path on a different
+            // host is a different place entirely.
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                "The panel moved to another host while this folder was being read".to_string(),
+                None,
+            );
+            return;
+        }
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.push_remote_transfer_failure(
+                    RemoteTransferKind::Upload,
+                    name,
+                    err.message(),
+                    None,
+                );
+                return;
+            }
+        };
+        if plan.entries.is_empty() {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                "Nothing to upload".to_string(),
+                None,
+            );
+            return;
+        }
+        // Every remote entry costs at least one round trip on a single
+        // serialized session, so a big tree is slow in a way the user cannot
+        // see coming. Say so rather than appearing to hang.
+        if plan.entries.len() > TRANSFER_CONFIRM_THRESHOLD {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                format!(
+                    "That folder holds {} items; upload it in smaller pieces",
+                    plan.entries.len()
+                ),
+                None,
+            );
+            return;
+        }
+
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles()
+        else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                "Remote Files connection is no longer available".to_string(),
+                None,
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+
+        let id = self.next_remote_transfer_id();
+        let progress = RemoteTransferProgress::default();
+        progress.set_item_total(plan.entries.len() as u64);
+        self.right_sidebar_remote_transfers.push(RemoteTransfer {
+            id,
+            kind: RemoteTransferKind::Upload,
+            name,
+            progress: progress.clone(),
+            status: RemoteTransferStatus::Running,
+            source: None,
+        });
+        self.trim_remote_transfers();
+
+        // Symlinks and unreadable nodes were deliberately left out; saying so
+        // is the difference between a truthful success and one that quietly
+        // omitted data.
+        let note = {
+            let mut parts = Vec::new();
+            if plan.skipped_symlinks > 0 {
+                parts.push(format!("{} symlink(s) skipped", plan.skipped_symlinks));
+            }
+            if plan.unreadable > 0 {
+                parts.push(format!("{} unreadable item(s)", plan.unreadable));
+            }
+            (!parts.is_empty()).then(|| parts.join(", "))
+        };
+        let entries = plan.entries;
+        let refresh_dir = directory.clone();
+        promise::spawn::spawn(async move {
+            let result = upload_tree(&*backend, &directory, &entries, &progress).await;
+            drop(operation_lease);
+            let connection_died = result.as_ref().is_err_and(|failure| {
+                invalidate_remote_connection_if_dead(
+                    &connection_key,
+                    connection_id,
+                    &failure.message,
+                )
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let done_detail = match &note {
+                    Some(note) => format!("Uploaded ({note})"),
+                    None => "Uploaded".to_string(),
+                };
+                let status = transfer_status_from_result(&result, &done_detail);
+                term_window.finish_remote_transfer(id, status);
+                // Re-list either way: a partial upload leaves real files the
+                // tree would otherwise never show.
+                let effects = term_window
+                    .right_sidebar_remote_files
+                    .transition(RemoteFilesEvent::DirectoryInvalidated(refresh_dir));
+                term_window.apply_right_sidebar_remote_files_effects(effects);
+                if connection_died {
+                    term_window.right_sidebar_remote_files_lease.take();
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
     }
 
     fn next_remote_transfer_id(&mut self) -> u64 {
@@ -9863,11 +10099,15 @@ impl crate::TermWindow {
         self.right_sidebar_remote_transfer_next_id
     }
 
+    /// A transfer that never got as far as starting. `source` is `Some` only
+    /// when retrying could plausibly do better — a rejected folder or an
+    /// unusable name has nothing to retry.
     fn push_remote_transfer_failure(
         &mut self,
         kind: RemoteTransferKind,
         name: String,
         message: String,
+        source: Option<RemoteTransferSource>,
     ) {
         let id = self.next_remote_transfer_id();
         self.right_sidebar_remote_transfers.push(RemoteTransfer {
@@ -9876,6 +10116,7 @@ impl crate::TermWindow {
             name,
             progress: RemoteTransferProgress::default(),
             status: RemoteTransferStatus::Failed(message),
+            source,
         });
         self.trim_remote_transfers();
     }
@@ -9897,13 +10138,21 @@ impl crate::TermWindow {
 
     fn start_remote_upload(&mut self, local: PathBuf, remote: RemotePath, directory: RemotePath) {
         let name = remote.file_name().to_string();
+        let retry = RemoteTransferSource::Upload {
+            local: local.clone(),
+            remote: remote.clone(),
+            directory: directory.clone(),
+        };
         let Some((backend, operation_lease, connection_key, connection_id)) =
             self.remote_transfer_handles()
         else {
+            // A missing lease is exactly the kind of failure retrying fixes,
+            // once the panel has reconnected.
             self.push_remote_transfer_failure(
                 RemoteTransferKind::Upload,
                 name,
                 "Remote Files connection is no longer available".to_string(),
+                Some(retry),
             );
             return;
         };
@@ -9919,28 +10168,36 @@ impl crate::TermWindow {
             name,
             progress: progress.clone(),
             status: RemoteTransferStatus::Running,
+            source: Some(retry),
         });
         self.trim_remote_transfers();
 
         promise::spawn::spawn(async move {
-            let result = backend.upload_file(local, remote, progress).await;
+            // A single dropped file refuses to clobber; there is no prompt on
+            // this path, so silently replacing would be a choice the user
+            // never made.
+            let result = backend.upload_file(local, remote, progress, false).await;
             drop(operation_lease);
-            let connection_died = result.as_ref().is_err_and(|message| {
-                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            let connection_died = result.as_ref().is_err_and(|failure| {
+                invalidate_remote_connection_if_dead(
+                    &connection_key,
+                    connection_id,
+                    &failure.message,
+                )
             });
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let status = match &result {
-                    Ok(_) => RemoteTransferStatus::Done("Uploaded".to_string()),
-                    Err(message) => RemoteTransferStatus::Failed(message.clone()),
-                };
+                let succeeded = result.is_ok();
+                let status = transfer_status_from_result(&result, "Uploaded");
                 term_window.finish_remote_transfer(id, status);
-                if result.is_ok() {
-                    // Show the new file without collapsing the rest of the tree.
-                    let effects = term_window
-                        .right_sidebar_remote_files
-                        .transition(RemoteFilesEvent::DirectoryInvalidated(directory));
-                    term_window.apply_right_sidebar_remote_files_effects(effects);
-                } else if connection_died {
+                // Re-list either way. On failure the directory may now hold a
+                // partial file the tree would otherwise never show — and the
+                // user would then hit "already exists" on retry with nothing
+                // on screen to explain it.
+                let effects = term_window
+                    .right_sidebar_remote_files
+                    .transition(RemoteFilesEvent::DirectoryInvalidated(directory));
+                term_window.apply_right_sidebar_remote_files_effects(effects);
+                if !succeeded && connection_died {
                     term_window.right_sidebar_remote_files_lease.take();
                 }
                 term_window.invalidate_window();
@@ -9975,15 +10232,360 @@ impl crate::TermWindow {
         self.show_term_context_menu(context, anchor, vec![item]);
     }
 
+    /// Which local directory a pointer at `(x, y)` is aiming at.
+    pub(crate) fn local_drop_target_at(&self, x: isize, y: isize) -> Option<PathBuf> {
+        if !self.right_sidebar_file_view_active()
+            || self.right_sidebar_remote_files.target.is_some()
+        {
+            return None;
+        }
+        let root = self.active_local_project_for_files().ok()?.path;
+        // Look the row up in what was actually painted rather than asking the
+        // filesystem: a syscall per drag event on the GUI thread is wasteful,
+        // and the index's children map has no key for empty directories.
+        let rows = if self.right_sidebar_file_search_rows.is_empty() {
+            &self.right_sidebar_file_browse_rows
+        } else {
+            &self.right_sidebar_file_search_rows
+        };
+        resolve_local_drop_target(&self.ui_items, x, y, &root, |path| {
+            if path == root {
+                return Some(true);
+            }
+            rows.iter()
+                .find(|row| row.path == path)
+                .map(|row| row.is_dir)
+        })
+    }
+
+    /// Copy files or folders dropped from the OS into the local Files panel.
+    /// Returns false when the drop was not aimed here.
+    pub(crate) fn copy_dropped_files_into_local_panel(
+        &mut self,
+        paths: &[PathBuf],
+        coords: Option<Point>,
+    ) -> bool {
+        self.clear_right_sidebar_local_drop_target();
+        let Some(coords) = coords else {
+            return false;
+        };
+        let Some(directory) = self.local_drop_target_at(coords.x, coords.y) else {
+            return false;
+        };
+        // A new drop supersedes any earlier one still waiting on an answer.
+        // The fallback menu clears it on dismissal, but macOS hands the menu
+        // to the system and reports only chosen actions, so a dismissed native
+        // prompt has no other way to release its plan.
+        self.cancel_pending_local_copy();
+        self.local_copy_generation = self.local_copy_generation.wrapping_add(1);
+        let generation = self.local_copy_generation;
+        self.begin_local_copy(paths.to_vec(), directory, coords, generation);
+        true
+    }
+
+    /// Plan the drop on a worker, then come back to ask about conflicts.
+    ///
+    /// The walk and its `metadata` calls must not run on the GUI thread: a
+    /// large or network-backed tree would freeze the window for as long as it
+    /// takes, before even the progress row appears.
+    fn begin_local_copy(
+        &mut self,
+        sources: Vec<PathBuf>,
+        directory: PathBuf,
+        anchor: Point,
+        generation: u64,
+    ) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let plan_dir = directory.clone();
+        promise::spawn::spawn(async move {
+            let preflight = promise::spawn::spawn_into_new_thread(move || {
+                Ok::<_, anyhow::Error>(preflight_local_copy(&sources, &plan_dir))
+            })
+            .await;
+            let Ok(preflight) = preflight else {
+                return;
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_local_copy_preflight(preflight, directory, anchor, generation);
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_local_copy_preflight(
+        &mut self,
+        preflight: crate::termwindow::transfer_walk::TransferPreflight,
+        directory: PathBuf,
+        anchor: Point,
+        generation: u64,
+    ) {
+        // A slower walk from an earlier drop must not replace a newer prompt.
+        if generation != self.local_copy_generation {
+            return;
+        }
+        for (name, reason) in &preflight.rejected {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::LocalCopy,
+                name.clone(),
+                reason.clone(),
+                None,
+            );
+        }
+        if preflight.plans.is_empty() {
+            self.invalidate_window();
+            return;
+        }
+        let note = preflight.omission_note();
+        if preflight.conflicts.is_empty() {
+            // Nothing was in the way when we looked, so nothing may be
+            // replaced: anything there now arrived since, unauthorized.
+            self.run_local_copy(preflight.plans, directory, OverwritePolicy::NoClobber, note);
+        } else {
+            // Show first, then record: opening a menu closes any previous
+            // one, and that teardown is where an unanswered plan is dropped —
+            // so storing the plan beforehand would have it clear itself.
+            let count = preflight.conflicts.len();
+            if let Some(window) = self.window.as_ref().cloned() {
+                self.show_local_copy_conflict_menu(&window, anchor, count);
+            }
+            self.pending_local_copy_conflict_count = count;
+            self.pending_local_copy = Some(PendingLocalCopy {
+                plans: preflight.plans,
+                directory,
+                conflicts: preflight.conflicts,
+                anchor,
+                note,
+            });
+        }
+        self.invalidate_window();
+    }
+    pub(crate) fn show_local_copy_conflict_menu(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: Point,
+        count: usize,
+    ) {
+        // The count goes into each label rather than a heading row: every
+        // option then says exactly what it will do, and there is no inert row
+        // for the user to try clicking.
+        let noun = if count == 1 { "file" } else { "files" };
+
+        // One pass: beginning the block clears the action table, so minting an
+        // item after a second call would leave the earlier ones dead.
+        self.begin_context_menu_application_actions();
+        let overwrite = self.context_menu_application_item_with_icon(
+            format!("Replace {count} existing {noun}"),
+            ContextMenuIcon::Save,
+            crate::termwindow::ContextMenuApplicationAction::ResolveLocalCopyConflict(
+                ConflictChoice::Overwrite,
+            ),
+            true,
+        );
+        let skip = self.context_menu_application_item_with_icon(
+            format!("Skip {count} existing {noun}"),
+            ContextMenuIcon::Check,
+            crate::termwindow::ContextMenuApplicationAction::ResolveLocalCopyConflict(
+                ConflictChoice::Skip,
+            ),
+            true,
+        );
+        let cancel = self.context_menu_application_item_with_icon(
+            "Cancel the copy",
+            ContextMenuIcon::Close,
+            crate::termwindow::ContextMenuApplicationAction::ResolveLocalCopyConflict(
+                ConflictChoice::Cancel,
+            ),
+            true,
+        );
+        self.show_term_context_menu(context, anchor, vec![overwrite, skip, cancel]);
+    }
+
+    /// Resolve a queued copy once the user has answered the conflict prompt.
+    /// Resolve a queued copy once the user has answered the conflict prompt.
+    pub(crate) fn resolve_pending_local_copy(&mut self, choice: ConflictChoice) {
+        let Some(pending) = self.pending_local_copy.take() else {
+            return;
+        };
+        let policy = match choice {
+            ConflictChoice::Cancel => {
+                self.invalidate_window();
+                return;
+            }
+            ConflictChoice::Overwrite => OverwritePolicy::Replace,
+            ConflictChoice::Skip => OverwritePolicy::SkipExisting,
+        };
+        let PendingLocalCopy {
+            plans,
+            directory,
+            conflicts,
+            anchor: _,
+            note,
+        } = pending;
+        let plans = plans
+            .into_iter()
+            .map(|(source, plan)| (source, apply_conflict_choice(plan, &conflicts, choice)))
+            .collect();
+        self.run_local_copy(plans, directory, policy, note);
+    }
+
+    /// Drop a queued copy that was never answered.
+    ///
+    /// A context menu can be dismissed without choosing anything; leaving the
+    /// plan behind means the next, unrelated drop would silently reopen the
+    /// old prompt at the new location.
+    pub(crate) fn cancel_pending_local_copy(&mut self) {
+        if self.pending_local_copy.take().is_some() {
+            self.invalidate_window();
+        }
+    }
+
+    /// Run the whole drop in ONE worker.
+    ///
+    /// One thread for the batch, not one per dropped path: a multi-select of a
+    /// few hundred files would otherwise spawn a few hundred threads, all
+    /// fighting for the same disk.
+    fn run_local_copy(
+        &mut self,
+        plans: Vec<(PathBuf, crate::termwindow::transfer_walk::TransferPlan)>,
+        directory: PathBuf,
+        policy: OverwritePolicy,
+        note: Option<String>,
+    ) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let entries: Vec<_> = plans
+            .into_iter()
+            .flat_map(|(_, plan)| plan.entries.into_iter())
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+
+        let id = self.next_remote_transfer_id();
+        let progress = RemoteTransferProgress::default();
+        progress.set_item_total(entries.len() as u64);
+        self.right_sidebar_remote_transfers.push(RemoteTransfer {
+            id,
+            kind: RemoteTransferKind::LocalCopy,
+            name: display_name(&directory),
+            progress: progress.clone(),
+            status: RemoteTransferStatus::Running,
+            source: None,
+        });
+        self.trim_remote_transfers();
+        self.invalidate_window();
+
+        promise::spawn::spawn(async move {
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                // Pin the destination once for the whole batch. Re-opening it
+                // per entry would leave the root's own ancestors free to be
+                // swapped between operations.
+                let root = match DestinationRoot::open(&directory) {
+                    Ok(root) => root,
+                    Err(err) => {
+                        return Ok::<_, anyhow::Error>(Err(format!(
+                            "Unable to use {}: {err}",
+                            directory.display()
+                        )))
+                    }
+                };
+                Ok(copy_entries_blocking(&entries, &root, policy, &progress))
+            })
+            .await
+            .unwrap_or_else(|err| Err(format!("Copy failed: {err}")));
+
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let status = match result {
+                    Ok(copied) => {
+                        let mut detail = format!("Copied {copied} items");
+                        if let Some(note) = note {
+                            detail.push_str(&format!(" ({note})"));
+                        }
+                        RemoteTransferStatus::Done(detail)
+                    }
+                    Err(message) => RemoteTransferStatus::Failed(message),
+                };
+                term_window.finish_remote_transfer(id, status);
+                term_window.force_right_sidebar_file_rescan_soon();
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    /// Right-clicking inside a *remote* file preview. The local preview offers
+    /// "Open With", which is meaningless for a file that is not on this disk —
+    /// so rather than the previous bail-out (right-click simply did nothing on
+    /// a remote preview), give it a menu of things that do apply.
+    pub(crate) fn show_right_sidebar_remote_file_preview_context_menu(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: Point,
+    ) {
+        let Some(path) = self.right_sidebar_remote_files.selected.clone() else {
+            return;
+        };
+        // Snapshot the gating up front: the item builders below take `&mut
+        // self`, so reading these inline would fight the borrow checker.
+        let has_selection = self.right_sidebar_file_preview_selected_text().is_some();
+        let has_text = self.right_sidebar_file_preview_image.is_none()
+            && !self.right_sidebar_file_preview_lines.is_empty();
+        let can_download = self.right_sidebar_remote_files_lease.is_some();
+        let path_string = path.as_str().to_string();
+
+        // Every application action has to be minted in one pass: beginning the
+        // block clears the whole table, so a second call mid-assembly would
+        // turn the earlier items into dead entries.
+        self.begin_context_menu_application_actions();
+        let copy_selection = self.context_menu_application_item_with_icon(
+            "Copy",
+            ContextMenuIcon::Copy,
+            crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewSelection,
+            has_selection,
+        );
+        let copy_all = self.context_menu_application_item_with_icon(
+            "Copy All",
+            ContextMenuIcon::Copy,
+            crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewAll,
+            has_text,
+        );
+        let download = self.context_menu_application_item_with_icon(
+            "Download",
+            ContextMenuIcon::Save,
+            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile(path),
+            can_download,
+        );
+
+        let items = vec![
+            copy_selection,
+            copy_all,
+            ContextMenuItem::item_with_icon(
+                "Copy Path",
+                ContextMenuIcon::Copy,
+                KeyAssignment::CopyFilePathToClipboard(path_string),
+            ),
+            ContextMenuItem::Separator,
+            download,
+        ];
+        self.show_term_context_menu(context, anchor, items);
+    }
+
     pub(crate) fn download_right_sidebar_remote_file(&mut self, remote: RemotePath) {
         let name = remote.file_name().to_string();
-        let Some(directory) = dirs_next::download_dir()
-            .or_else(|| dirs_next::home_dir().map(|home| home.join("Downloads")))
-        else {
+        let retry = RemoteTransferSource::Download {
+            remote: remote.clone(),
+        };
+        let Some(directory) = crate::native_settings::effective_remote_download_directory() else {
+            // No Downloads folder is an environment problem, not a transient
+            // one; retrying would fail the same way.
             self.push_remote_transfer_failure(
                 RemoteTransferKind::Download,
                 name,
                 "Unable to locate a Downloads folder".to_string(),
+                None,
             );
             return;
         };
@@ -9992,6 +10594,7 @@ impl crate::TermWindow {
                 RemoteTransferKind::Download,
                 name,
                 format!("Unable to use {}: {err}", directory.display()),
+                Some(retry),
             );
             return;
         }
@@ -10015,6 +10618,7 @@ impl crate::TermWindow {
                 RemoteTransferKind::Download,
                 name,
                 format!("Unable to find a free name in {}", directory.display()),
+                Some(retry),
             );
             return;
         };
@@ -10038,6 +10642,7 @@ impl crate::TermWindow {
                 RemoteTransferKind::Download,
                 name,
                 "Remote Files connection is no longer available".to_string(),
+                Some(retry),
             );
             return;
         };
@@ -10054,6 +10659,7 @@ impl crate::TermWindow {
             name,
             progress: progress.clone(),
             status: RemoteTransferStatus::Running,
+            source: Some(retry),
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -10062,20 +10668,19 @@ impl crate::TermWindow {
             let landed = local.clone();
             let result = backend.download_file(remote, local, progress).await;
             drop(operation_lease);
-            let connection_died = result.as_ref().is_err_and(|message| {
-                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            let connection_died = result.as_ref().is_err_and(|failure| {
+                invalidate_remote_connection_if_dead(
+                    &connection_key,
+                    connection_id,
+                    &failure.message,
+                )
             });
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let status = match &result {
-                    Ok(_) => RemoteTransferStatus::Done(format!(
-                        "Saved to {}",
-                        landed
-                            .parent()
-                            .map(|parent| parent.display().to_string())
-                            .unwrap_or_else(|| landed.display().to_string())
-                    )),
-                    Err(message) => RemoteTransferStatus::Failed(message.clone()),
-                };
+                let landed_in = landed
+                    .parent()
+                    .map(|parent| parent.display().to_string())
+                    .unwrap_or_else(|| landed.display().to_string());
+                let status = transfer_status_from_result(&result, &format!("Saved to {landed_in}"));
                 term_window.finish_remote_transfer(id, status);
                 if connection_died {
                     term_window.right_sidebar_remote_files_lease.take();
@@ -10537,7 +11142,17 @@ impl crate::TermWindow {
         }
 
         let row_metrics = right_sidebar_file_row_metrics(ui_metrics);
-        let viewport_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
+        // A copy started here must report itself here; the strip is shared
+        // with the remote tree, so reserve its space the same way.
+        let strip_rows = self.transfer_strip_rows(
+            content_bottom
+                .saturating_sub(tree_top)
+                .saturating_sub(self.ui_px(SIDEBAR_INSET)),
+            row_metrics.row_height,
+        );
+        let viewport_bottom = content_bottom
+            .saturating_sub(self.ui_px(SIDEBAR_INSET))
+            .saturating_sub(strip_rows.saturating_mul(row_metrics.row_height));
         let visible_height = viewport_bottom.saturating_sub(tree_top);
         let total_height = row_count.saturating_mul(row_metrics.row_height);
         let max_scroll = total_height.saturating_sub(visible_height) as f32;
@@ -10649,6 +11264,20 @@ impl crate::TermWindow {
                 fade_height,
             )?;
         }
+
+        self.paint_transfer_strip(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            viewport_bottom,
+            content_width,
+            strip_rows,
+            row_metrics,
+        )?;
 
         Ok(())
     }
@@ -10814,7 +11443,10 @@ impl crate::TermWindow {
         }
         let hovered = self.is_pointer_over_ui_rect(x, visible_y, width, visible_height);
         let is_selected = selected.is_some_and(|path| path == &row.path);
-        if hovered || is_selected {
+        // A drag hovering here is about to copy into this directory; say so
+        // unmistakably, outranking the ordinary selection tint.
+        let is_drop_target = self.right_sidebar_local_drop_target.as_ref() == Some(&row.path);
+        if hovered || is_selected || is_drop_target {
             self.fill_rounded_rectangle(
                 layers,
                 1,
@@ -10824,7 +11456,9 @@ impl crate::TermWindow {
                     width as f32,
                     visible_height as f32,
                 ),
-                if is_selected {
+                if is_drop_target {
+                    chrome.selected_bg
+                } else if is_selected {
                     chrome.selected_bg.mul_alpha(0.46)
                 } else {
                     chrome.sidebar_button_hover_bg
@@ -13619,6 +14253,416 @@ fn file_row_placement(
     }
 }
 
+/// Turn a finished transfer into the status its row will show. Keeps the
+/// "something was left behind" case from being flattened into a plain failure,
+/// which is the difference between the user knowing to go delete a partial
+/// file and finding it months later.
+fn transfer_status_from_result(
+    result: &Result<u64, crate::termwindow::remote_files::TransferFailure>,
+    done_detail: &str,
+) -> RemoteTransferStatus {
+    match result {
+        Ok(_) => RemoteTransferStatus::Done(done_detail.to_string()),
+        Err(failure) => match &failure.leftover {
+            Some(leftover) => RemoteTransferStatus::FailedWithLeftover {
+                message: failure.message.clone(),
+                leftover: leftover.clone(),
+            },
+            None => RemoteTransferStatus::Failed(failure.message.clone()),
+        },
+    }
+}
+
+/// Upload a planned tree, stopping at the first failure.
+///
+/// Entries arrive parents-first, so each directory exists before anything is
+/// placed in it. Cancellation is checked per entry rather than only per 256KiB
+/// chunk: a tree of small files never reaches the chunk check, so a cancel
+/// would otherwise look like a hang.
+async fn upload_tree(
+    backend: &dyn crate::termwindow::remote_files::RemoteFileBackend,
+    directory: &RemotePath,
+    entries: &[crate::termwindow::transfer_walk::TransferEntry],
+    progress: &RemoteTransferProgress,
+) -> Result<u64, crate::termwindow::remote_files::TransferFailure> {
+    use crate::termwindow::remote_files::TransferFailure;
+
+    let mut uploaded = 0u64;
+    for (index, entry) in entries.iter().enumerate() {
+        if progress.is_canceled() {
+            return Err(TransferFailure::new(format!(
+                "{REMOTE_TRANSFER_CANCELED} — stopped after {index} of {}",
+                entries.len()
+            )));
+        }
+        // Rebuild the remote path one component at a time: a local relative
+        // path may hold separators this platform accepts but SFTP must not see
+        // spliced in, and `join_name` rejects `..` and empty components.
+        let mut destination = directory.clone();
+        for component in entry.relative.components() {
+            let Some(name) = component.as_os_str().to_str() else {
+                return Err(TransferFailure::new(format!(
+                    "{} is not a valid name to send",
+                    entry.relative.display()
+                )));
+            };
+            destination = destination
+                .join_name(name)
+                .map_err(|err| TransferFailure::new(err))?;
+        }
+
+        match entry.kind {
+            TransferEntryKind::Directory => {
+                backend
+                    .create_directory(destination)
+                    .await
+                    .map_err(|message| {
+                        TransferFailure::new(format!(
+                            "{message} — stopped after {index} of {}",
+                            entries.len()
+                        ))
+                    })?;
+            }
+            TransferEntryKind::File => {
+                // Overwriting is not offered yet for remote folders, so a name
+                // already in use stops the transfer rather than replacing
+                // something the user never agreed to lose.
+                let written = backend
+                    .upload_file(entry.source.clone(), destination, progress.clone(), false)
+                    .await
+                    .map_err(|mut failure| {
+                        failure.message = format!(
+                            "{} — stopped after {index} of {}",
+                            failure.message,
+                            entries.len()
+                        );
+                        failure
+                    })?;
+                uploaded = uploaded.saturating_add(written);
+            }
+        }
+        progress.finish_item();
+    }
+    Ok(uploaded)
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Walk every dropped path and find what already exists, all off the GUI
+/// thread. Rejections are collected rather than thrown, so one bad source does
+/// not sink the rest of a multi-select.
+fn preflight_local_copy(
+    sources: &[PathBuf],
+    directory: &Path,
+) -> crate::termwindow::transfer_walk::TransferPreflight {
+    use crate::termwindow::transfer_walk::TransferPreflight;
+
+    let mut preflight = TransferPreflight::default();
+    // Two sources in one drop can plan the same destination name; the second
+    // would then silently land on the first.
+    let mut claimed: HashSet<PathBuf> = HashSet::new();
+
+    for source in sources {
+        let name = display_name(source);
+        if source.is_dir() && destination_escapes_source(source, directory) {
+            preflight
+                .rejected
+                .push((name, TransferPlanError::DestinationInsideSource.message()));
+            continue;
+        }
+        match plan_transfer(source) {
+            Ok(plan) if plan.entries.is_empty() => {
+                preflight
+                    .rejected
+                    .push((name, "Nothing to copy".to_string()));
+            }
+            Ok(plan) => {
+                preflight.skipped_symlinks += plan.skipped_symlinks;
+                preflight.unreadable += plan.unreadable;
+                let mut collision = None;
+                for entry in &plan.entries {
+                    // Directories take part in the claim too: a `foo/` from one
+                    // source and a `foo` file from another want the same name,
+                    // and only one of them can have it.
+                    if !claimed.insert(entry.relative.clone()) {
+                        collision = Some(entry.relative.clone());
+                        break;
+                    }
+                    if entry.kind != TransferEntryKind::File {
+                        continue;
+                    }
+                    let destination = directory.join(&entry.relative);
+                    // Dropping a file back into the folder it already lives in
+                    // would have `fs::copy` truncate the shared inode and then
+                    // report success on the resulting empty file.
+                    if is_same_file(&entry.source, &destination) {
+                        collision = Some(entry.relative.clone());
+                        break;
+                    }
+                    if destination.exists() {
+                        preflight.conflicts.insert(entry.relative.clone());
+                    }
+                }
+                if let Some(relative) = collision {
+                    preflight.rejected.push((
+                        name,
+                        format!(
+                            "{} is already where it would be copied to",
+                            relative.display()
+                        ),
+                    ));
+                    continue;
+                }
+                preflight.plans.push((source.clone(), plan));
+            }
+            Err(err) => preflight.rejected.push((name, err.message())),
+        }
+    }
+    preflight
+}
+
+/// Bytes moved per read/write while copying locally. Small enough that a
+/// cancel is noticed promptly even inside one very large file.
+const LOCAL_COPY_CHUNK: usize = 512 * 1024;
+
+/// Copy a planned tree, stopping at the first failure.
+///
+/// Stopping rather than continuing is deliberate: what has already landed is
+/// kept, and the user is told how far it got. Rolling back would mean deleting
+/// files to recover from an error — more dangerous than the error.
+fn copy_entries_blocking(
+    entries: &[crate::termwindow::transfer_walk::TransferEntry],
+    root: &DestinationRoot,
+    policy: OverwritePolicy,
+    progress: &RemoteTransferProgress,
+) -> Result<usize, String> {
+    let mut copied = 0usize;
+    for entry in entries {
+        if progress.is_canceled() {
+            return Err(format!(
+                "{} — stopped after {copied} of {}",
+                REMOTE_TRANSFER_CANCELED,
+                entries.len()
+            ));
+        }
+        let destination = root.join(&entry.relative);
+        // A cheap, clear rejection before any work starts. The guarantee comes
+        // from the handle-based descent below, not from this.
+        if !destination_stays_within(root.path(), &destination) {
+            return Err(format!(
+                "{} would be written outside the destination folder",
+                entry.relative.display()
+            ));
+        }
+
+        match entry.kind {
+            TransferEntryKind::Directory => {
+                // Descends through directory handles, so a symlink planted at
+                // any level fails rather than redirecting the write.
+                root.create_dir(&entry.relative)
+                    .map_err(|err| format!("Unable to create {}: {err}", destination.display()))?;
+            }
+            TransferEntryKind::File => {
+                // Last line of defence against a file copied over itself.
+                // Covers plain paths, symlink aliases, and hard links — any of
+                // which would have the write destroy the source.
+                if is_same_file(&entry.source, &destination) {
+                    return Err(format!(
+                        "{} is already at the destination",
+                        entry.source.display()
+                    ));
+                }
+                // Under NoClobber a file that appeared after the preflight was
+                // never authorized for replacement; under SkipExisting the
+                // user said to leave it. Both come back as a skip, decided by
+                // the filesystem rather than by a check that could be raced.
+                match copy_file_chunked(&entry.source, root, &entry.relative, policy, progress) {
+                    Ok(true) => copied += 1,
+                    Ok(false) => {}
+                    Err(err) => {
+                        return Err(format!(
+                            "{err} — stopped after {copied} of {}",
+                            entries.len()
+                        ))
+                    }
+                }
+            }
+        }
+        progress.finish_item();
+    }
+    Ok(copied)
+}
+
+/// Copy one file, checking for a cancel between chunks.
+///
+/// `fs::copy` would be shorter but blocks until the whole file is done, so a
+/// cancel during a multi-gigabyte file is never seen and the transfer goes on
+/// to report success.
+/// Returns whether the file was actually written; `false` means the
+/// destination was already taken and the policy said to leave it.
+///
+/// `relative` names the file inside `root`; both are needed because the write
+/// descends from `root` through directory handles rather than resolving the
+/// joined path, which is what stops a symlink swapped in mid-copy from
+/// redirecting it.
+fn copy_file_chunked(
+    source: &Path,
+    root: &DestinationRoot,
+    relative: &Path,
+    policy: OverwritePolicy,
+    progress: &RemoteTransferProgress,
+) -> Result<bool, String> {
+    let destination = root.join(relative);
+    let mut reader = fs::File::open(source)
+        .map_err(|err| format!("Unable to read {}: {err}", source.display()))?;
+
+    match policy {
+        // Nothing may be displaced, so let the *filesystem* enforce that: an
+        // exclusive create fails atomically if anything is already there, and
+        // cannot follow a symlink sitting at that name. A check-then-create
+        // would leave a window for a file to appear and be truncated.
+        OverwritePolicy::NoClobber | OverwritePolicy::SkipExisting => {
+            let writer = match root.create_file(relative) {
+                Ok(writer) => writer,
+                // Refusing is the whole point here, and it is reported as a
+                // skip rather than an error — but only for this one reason,
+                // so a permission problem still surfaces.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+                Err(err) => {
+                    return Err(format!("Unable to create {}: {err}", destination.display()))
+                }
+            };
+            stream_into(&mut reader, writer, source, &destination, progress)
+                .inspect_err(|_| {
+                    // Through the handle as well: cleanup runs exactly when
+                    // something has gone wrong, which is the worst moment to
+                    // start trusting a path again.
+                    let _ = root.remove_file(relative);
+                })
+                .map(|()| true)
+        }
+        // The user asked to replace. Build the replacement beside the target
+        // and swap it in at the end: the original survives a failure or a
+        // cancel, and the rename replaces the directory entry rather than
+        // following a symlink that happens to occupy the name.
+        OverwritePolicy::Replace => {
+            let (staging_relative, writer) = create_staging_file(root, relative)?;
+            let staging = root.join(&staging_relative);
+            let outcome =
+                stream_into(&mut reader, writer, source, &staging, progress).and_then(|()| {
+                    root.rename(&staging_relative, relative).map_err(|err| {
+                        format!("Unable to replace {}: {err}", destination.display())
+                    })
+                });
+            if outcome.is_err() {
+                // Through the handle, like every other write: cleanup runs
+                // exactly when something has gone wrong, which is the worst
+                // moment to start trusting a path again.
+                let _ = root.remove_file(&staging_relative);
+            }
+            outcome.map(|()| true)
+        }
+    }
+}
+
+/// Create a uniquely named sibling of the destination to assemble a
+/// replacement in, returning its path relative to `root`. A sibling, not a
+/// temp directory, so the finishing rename stays on one filesystem and is
+/// therefore atomic.
+fn create_staging_file(
+    root: &DestinationRoot,
+    relative: &Path,
+) -> Result<(PathBuf, fs::File), String> {
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let name = relative
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| format!("{} has no file name", relative.display()))?;
+    for attempt in 0..1_000u32 {
+        let candidate = parent.join(format!(".{name}.thinkterm-{attempt}"));
+        match root.create_file(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "Unable to write beside {}: {err}",
+                    relative.display()
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "Unable to find a free staging name beside {}",
+        relative.display()
+    ))
+}
+
+/// Stream `reader` into `writer`, checking for a cancel between chunks.
+fn stream_into(
+    reader: &mut fs::File,
+    mut writer: fs::File,
+    source: &Path,
+    written_to: &Path,
+    progress: &RemoteTransferProgress,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut buffer = vec![0u8; LOCAL_COPY_CHUNK];
+    loop {
+        if progress.is_canceled() {
+            return Err(REMOTE_TRANSFER_CANCELED.to_string());
+        }
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|err| format!("Unable to read {}: {err}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|err| format!("Unable to write {}: {err}", written_to.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("Unable to finish {}: {err}", written_to.display()))
+}
+
+/// The local counterpart of [`resolve_remote_drop_target`]. Same rule, and
+/// deliberately the same shape so the two cannot drift: a directory row takes
+/// the drop itself, a file row hands it to the directory holding it, anywhere
+/// else inside the panel takes the root.
+fn resolve_local_drop_target(
+    items: &[UIItem],
+    x: isize,
+    y: isize,
+    root: &Path,
+    is_dir: impl Fn(&Path) -> Option<bool>,
+) -> Option<PathBuf> {
+    let item = items.iter().rev().find(|item| item.hit_test(x, y))?;
+    match &item.item_type {
+        UIItemType::RightSidebarFileRow(path) => match is_dir(path) {
+            Some(true) => Some(path.clone()),
+            Some(false) => Some(path.parent().map(Path::to_path_buf).unwrap_or_else(|| {
+                // A row with no parent should not exist, but falling back to
+                // the root is better than dropping the file somewhere odd.
+                root.to_path_buf()
+            })),
+            // A row painted from a listing that has since been dropped:
+            // guessing could put the file somewhere unintended.
+            None => None,
+        },
+        UIItemType::RightSidebarBackground
+        | UIItemType::RightSidebarFileFilter
+        | UIItemType::RightSidebarFileRefresh
+        | UIItemType::RightSidebarRemoteTransfer(_) => Some(root.to_path_buf()),
+        _ => None,
+    }
+}
+
 /// Where a drop at `(x, y)` would land, given the UI items from the last
 /// paint. A directory row takes the file itself; a file row takes the
 /// directory holding it, which is what "drop it next to this" means; anywhere
@@ -14590,24 +15634,28 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 mod tests {
     use super::{
         approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
-        file_preview_close_requires_reflow, file_release_action, file_row_placement,
-        full_line_colors_by_byte, image_pixels_within_preview_budget, load_file_preview,
-        load_file_preview_image, naturalish_cmp, note_code_highlight_key,
-        note_code_highlight_lines, note_code_row_height, note_image_display_size,
-        note_open_pending_for_vault, note_release_action, open_with_candidate_allowed, path_key,
-        preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
-        preview_text_range, preview_visible_colored, preview_visible_line_range,
+        copy_entries_blocking, copy_file_chunked, file_preview_close_requires_reflow,
+        file_release_action, file_row_placement, full_line_colors_by_byte,
+        image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
+        naturalish_cmp, note_code_highlight_key, note_code_highlight_lines, note_code_row_height,
+        note_image_display_size, note_open_pending_for_vault, note_release_action,
+        open_with_candidate_allowed, path_key, preflight_local_copy, preview_line_count,
+        preview_lines_from_text, preview_plain_lines_from_text, preview_text_range,
+        preview_visible_colored, preview_visible_line_range, resolve_local_drop_target,
         resolve_remote_drop_target, right_sidebar_file_browse_rows_from_index,
         right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key, sanitize_preview_text,
         scrollable_note_table_columns, search_right_sidebar_file_index, snippet_cursor_visible,
         snippet_run_buffer, sorted_open_with_candidates, virtual_note_line_range,
         visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
         FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
-        NoteCodeHighlightState, NoteReleaseAction, FILE_PREVIEW_MAX_BYTES, NOTE_CODE_BLOCK_RADIUS,
-        NOTE_CODE_HEADER_HEIGHT,
+        NoteCodeHighlightState, NoteReleaseAction, FILE_PREVIEW_MAX_BYTES, LOCAL_COPY_CHUNK,
+        NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
     };
     use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
-    use crate::termwindow::remote_files::{RemoteFileKind, RemotePath};
+    use crate::termwindow::remote_files::{
+        RemoteFileKind, RemotePath, RemoteTransferProgress, REMOTE_TRANSFER_CANCELED,
+    };
+    use crate::termwindow::transfer_walk::{DestinationRoot, OverwritePolicy, TransferEntryKind};
     use crate::termwindow::{
         RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan, UIItem, UIItemType,
     };
@@ -14615,6 +15663,7 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use std::io::Cursor;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use wezterm_font::units::PixelLength;
@@ -14696,6 +15745,343 @@ mod tests {
         // long-standing paste behaviour.
         assert_eq!(
             resolve_remote_drop_target(&items, 50, 10, &root, kind),
+            None
+        );
+    }
+
+    fn file_entry(
+        source: &Path,
+        relative: &str,
+    ) -> crate::termwindow::transfer_walk::TransferEntry {
+        crate::termwindow::transfer_walk::TransferEntry {
+            source: source.to_path_buf(),
+            relative: PathBuf::from(relative),
+            kind: TransferEntryKind::File,
+            size: 0,
+        }
+    }
+
+    /// The check-then-create shape this replaced could be raced: a file
+    /// appearing between the two was truncated under an authorisation the user
+    /// never gave. The exclusive create makes the filesystem decide.
+    #[test]
+    fn a_no_clobber_copy_leaves_an_existing_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.txt");
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(&source, b"new contents").unwrap();
+        fs::write(dest_dir.join("src.txt"), b"do not lose me").unwrap();
+
+        let entries = vec![file_entry(&source, "src.txt")];
+        let progress = RemoteTransferProgress::default();
+        let copied = copy_entries_blocking(
+            &entries,
+            &DestinationRoot::open(&dest_dir).unwrap(),
+            OverwritePolicy::NoClobber,
+            &progress,
+        )
+        .expect("an occupied name is a skip, not a failure");
+
+        assert_eq!(copied, 0, "nothing was copied");
+        assert_eq!(
+            fs::read(dest_dir.join("src.txt")).unwrap(),
+            b"do not lose me"
+        );
+    }
+
+    /// Replace assembles the new file beside the target and swaps it in, so a
+    /// failure or a cancel leaves the original whole. Truncating in place
+    /// destroyed it the moment the write began.
+    #[test]
+    fn a_canceled_replace_leaves_the_original_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.txt");
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(&source, vec![b'x'; LOCAL_COPY_CHUNK * 3]).unwrap();
+        let destination = dest_dir.join("src.txt");
+        fs::write(&destination, b"original").unwrap();
+
+        let entries = vec![file_entry(&source, "src.txt")];
+        let progress = RemoteTransferProgress::default();
+        progress.request_cancel();
+        let err = copy_entries_blocking(
+            &entries,
+            &DestinationRoot::open(&dest_dir).unwrap(),
+            OverwritePolicy::Replace,
+            &progress,
+        )
+        .expect_err("a canceled copy fails");
+        assert!(err.contains(REMOTE_TRANSFER_CANCELED), "{err}");
+
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"original",
+            "the file being replaced must survive a cancel"
+        );
+        // And no staging file is left lying about.
+        let leftovers: Vec<_> = fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "src.txt")
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    /// Goes through the real `copy_file_chunked` Replace path and forces its
+    /// cleanup to run, then checks *where* the delete landed.
+    ///
+    /// The discriminator is the root symlink being repointed after the handle
+    /// was taken: a path-based cleanup resolves the root's name again and so
+    /// deletes from the new target, while a handle-based one stays where it
+    /// started. The earlier tests covered `DestinationRoot::remove_file` on its
+    /// own; this covers the branch actually calling it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_replace_cleans_up_through_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let decoy = dir.path().join("decoy");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&decoy).unwrap();
+        let link = dir.path().join("root");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let source = dir.path().join("src.txt");
+        fs::write(&source, b"replacement").unwrap();
+        fs::write(real.join("target.txt"), b"original").unwrap();
+
+        // Handle taken while the name still points at `real`.
+        let root = DestinationRoot::open(&link).unwrap();
+
+        // The name now points somewhere else, and a file sits at exactly the
+        // staging path a path-based cleanup would compute.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&decoy, &link).unwrap();
+        let bystander = decoy.join(".target.txt.thinkterm-0");
+        fs::write(&bystander, b"not yours to delete").unwrap();
+
+        let progress = RemoteTransferProgress::default();
+        progress.request_cancel();
+        let err = copy_file_chunked(
+            &source,
+            &root,
+            Path::new("target.txt"),
+            OverwritePolicy::Replace,
+            &progress,
+        )
+        .expect_err("a canceled replace fails");
+        assert!(err.contains(REMOTE_TRANSFER_CANCELED), "{err}");
+
+        assert!(
+            bystander.exists(),
+            "cleanup must not follow the root's name to its new target"
+        );
+        assert_eq!(
+            fs::read(real.join("target.txt")).unwrap(),
+            b"original",
+            "the file being replaced survives"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&real)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "target.txt")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the staging file must be removed from where it was made: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn a_replace_swaps_in_the_new_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.txt");
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(&source, b"new contents").unwrap();
+        fs::write(dest_dir.join("src.txt"), b"old").unwrap();
+
+        let entries = vec![file_entry(&source, "src.txt")];
+        let progress = RemoteTransferProgress::default();
+        let copied = copy_entries_blocking(
+            &entries,
+            &DestinationRoot::open(&dest_dir).unwrap(),
+            OverwritePolicy::Replace,
+            &progress,
+        )
+        .expect("replace");
+        assert_eq!(copied, 1);
+        assert_eq!(fs::read(dest_dir.join("src.txt")).unwrap(), b"new contents");
+    }
+
+    /// A symlink occupying the destination name must not be followed: writing
+    /// through it puts the data wherever the link points, outside the folder
+    /// the user chose.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_does_not_write_through_a_symlinked_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src.txt");
+        let dest_dir = dir.path().join("dest");
+        let outside = dir.path().join("outside.txt");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(&source, b"payload").unwrap();
+        fs::write(&outside, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, dest_dir.join("src.txt")).unwrap();
+
+        let entries = vec![file_entry(&source, "src.txt")];
+        let progress = RemoteTransferProgress::default();
+
+        // No-clobber: the name is taken, so it is skipped.
+        copy_entries_blocking(
+            &entries,
+            &DestinationRoot::open(&dest_dir).unwrap(),
+            OverwritePolicy::NoClobber,
+            &progress,
+        )
+        .expect("skip");
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+
+        // Replace: the link itself is replaced, not what it points at.
+        let progress = RemoteTransferProgress::default();
+        copy_entries_blocking(
+            &entries,
+            &DestinationRoot::open(&dest_dir).unwrap(),
+            OverwritePolicy::Replace,
+            &progress,
+        )
+        .expect("replace");
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"untouched",
+            "the file outside the destination must never be written"
+        );
+        assert_eq!(fs::read(dest_dir.join("src.txt")).unwrap(), b"payload");
+    }
+
+    /// Verified empirically: `fs::copy` with one path truncates the shared
+    /// inode and reports success, so an 11-byte file silently becomes empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_refuses_a_hard_linked_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let source = dir.path().join("src.txt");
+        fs::write(&source, b"important data").unwrap();
+        fs::hard_link(&source, dest_dir.join("src.txt")).unwrap();
+
+        let entries = vec![file_entry(&source, "src.txt")];
+        let progress = RemoteTransferProgress::default();
+        let err = copy_entries_blocking(
+            &entries,
+            &DestinationRoot::open(&dest_dir).unwrap(),
+            OverwritePolicy::Replace,
+            &progress,
+        )
+        .expect_err("copying a file over itself must be refused");
+        assert!(err.contains("already at the destination"), "{err}");
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"important data",
+            "the source must not be destroyed"
+        );
+    }
+
+    /// Two sources in one drop wanting the same destination name: whichever
+    /// lands second would otherwise overwrite the first, or half-fail. It does
+    /// not matter that one is a folder and the other a file — a name can only
+    /// belong to one of them.
+    #[test]
+    fn two_sources_claiming_one_name_are_caught_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        // A folder named `foo` and, from elsewhere, a file also named `foo`.
+        let a = dir.path().join("a/foo");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("inner.txt"), b"x").unwrap();
+        let b = dir.path().join("b/foo");
+        fs::create_dir_all(b.parent().unwrap()).unwrap();
+        fs::write(&b, b"y").unwrap();
+
+        let preflight = preflight_local_copy(&[a, b], &dest);
+        assert_eq!(
+            preflight.plans.len(),
+            1,
+            "only the first claim on the name survives"
+        );
+        assert_eq!(preflight.rejected.len(), 1);
+        assert!(
+            preflight.rejected[0]
+                .1
+                .contains("already where it would be copied to"),
+            "{:?}",
+            preflight.rejected[0]
+        );
+    }
+
+    #[test]
+    fn a_local_drop_lands_in_the_directory_it_is_aimed_at() {
+        let root = Path::new("/home/me/proj");
+        let items = vec![
+            UIItem {
+                x: 100,
+                y: 0,
+                width: 300,
+                height: 500,
+                item_type: UIItemType::RightSidebarBackground,
+            },
+            UIItem {
+                x: 100,
+                y: 0,
+                width: 300,
+                height: 20,
+                item_type: UIItemType::RightSidebarFileRow(PathBuf::from("/home/me/proj/src")),
+            },
+            UIItem {
+                x: 100,
+                y: 20,
+                width: 300,
+                height: 20,
+                item_type: UIItemType::RightSidebarFileRow(PathBuf::from(
+                    "/home/me/proj/src/main.rs",
+                )),
+            },
+        ];
+        let is_dir = |path: &Path| match path.to_str() {
+            Some("/home/me/proj/src") => Some(true),
+            Some("/home/me/proj/src/main.rs") => Some(false),
+            _ => None,
+        };
+
+        assert_eq!(
+            resolve_local_drop_target(&items, 200, 10, root, is_dir),
+            Some(PathBuf::from("/home/me/proj/src"))
+        );
+        // A file row means "put it beside this".
+        assert_eq!(
+            resolve_local_drop_target(&items, 200, 30, root, is_dir),
+            Some(PathBuf::from("/home/me/proj/src"))
+        );
+        assert_eq!(
+            resolve_local_drop_target(&items, 200, 400, root, is_dir),
+            Some(root.to_path_buf())
+        );
+        // Outside the panel: the terminal keeps its paste behaviour.
+        assert_eq!(
+            resolve_local_drop_target(&items, 50, 10, root, is_dir),
+            None
+        );
+        // A row the panel no longer knows the kind of resolves to nothing
+        // rather than guessing a destination.
+        assert_eq!(
+            resolve_local_drop_target(&items, 200, 10, root, |_| None),
             None
         );
     }

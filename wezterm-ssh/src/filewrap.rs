@@ -59,6 +59,23 @@ impl FileWrap {
         }
     }
 
+    /// Move the read/write position, so a transfer can pick up where an
+    /// earlier one stopped instead of starting over.
+    ///
+    /// Both backends implement `std::io::Seek`, and neither performs a round
+    /// trip for it: the offset is tracked client-side and applied to the next
+    /// read or write request.
+    pub fn seek(&mut self, position: u64) -> SftpChannelResult<u64> {
+        use std::io::{Seek, SeekFrom};
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(file) => Ok(file.seek(SeekFrom::Start(position))?),
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(file) => Ok(file.seek(SeekFrom::Start(position))?),
+        }
+    }
+
     pub fn fsync(&mut self) -> SftpChannelResult<()> {
         match self {
             #[cfg(feature = "ssh2")]

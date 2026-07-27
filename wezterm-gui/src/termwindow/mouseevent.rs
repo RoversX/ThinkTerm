@@ -3350,9 +3350,15 @@ impl super::TermWindow {
                 self.dragging.replace((item, event));
                 context.invalidate();
             }
+            // A remote preview has no local file to hand to another
+            // application, so "Open With" is meaningless there; it gets its
+            // own menu of things that do apply instead.
             WMEK::Press(MousePress::Right)
-                if self.right_sidebar_remote_files.selected.is_none() =>
+                if self.right_sidebar_remote_files.selected.is_some() =>
             {
+                self.show_right_sidebar_remote_file_preview_context_menu(context, event.coords);
+            }
+            WMEK::Press(MousePress::Right) => {
                 self.show_right_sidebar_file_open_with_menu(context, event.coords);
             }
             _ => {}

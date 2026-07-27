@@ -883,6 +883,19 @@ impl SessionInner {
                             "fsync",
                         )
                     }
+                    SessionRequest::Sftp(SftpRequest::File(FileRequest::Seek(msg, reply))) => {
+                        dispatch(
+                            reply,
+                            || {
+                                let file = self
+                                    .files
+                                    .get_mut(&msg.file_id)
+                                    .ok_or_else(|| anyhow!("invalid file_id"))?;
+                                file.seek(msg.position)
+                            },
+                            "seek",
+                        )
+                    }
 
                     SessionRequest::Sftp(SftpRequest::ReadDir(path, reply)) => {
                         dispatch(reply, || self.init_sftp(sess)?.read_dir(&path), "read_dir")

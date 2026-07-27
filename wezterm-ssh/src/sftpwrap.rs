@@ -12,6 +12,17 @@ pub(crate) enum SftpWrap {
     LibSsh(libssh_rs::Sftp),
 }
 
+/// Narrow a Unix mode to the permission bits libssh takes.
+///
+/// This used to be `mode.try_into().unwrap()`, which panics — and it panics on
+/// the SSH session thread, taking the whole connection down with no error the
+/// caller can see. Masking instead means a nonsensical mode produces a
+/// nonsensical permission rather than a dead session.
+#[cfg(feature = "libssh-rs")]
+fn sftp_mode_bits(mode: i32) -> u32 {
+    (mode as u32) & 0o7777
+}
+
 #[cfg(feature = "ssh2")]
 fn pathconv(path: std::path::PathBuf) -> SftpChannelResult<Utf8PathBuf> {
     use crate::sftp::SftpChannelError;
@@ -37,9 +48,8 @@ impl SftpWrap {
             #[cfg(feature = "libssh-rs")]
             Self::LibSsh(sftp) => {
                 use crate::sftp::types::WriteMode;
-                use libc::{O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
+                use libc::{O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
                 use libssh_rs::OpenFlags;
-                use std::convert::TryInto;
                 // O_CREAT is what lets a write actually bring the file into
                 // existence, and O_TRUNC is the documented meaning of the
                 // non-appending write mode. Without them, opening a path that
@@ -50,13 +60,15 @@ impl SftpWrap {
                     (Some(WriteMode::Append), false) => O_WRONLY | O_APPEND | O_CREAT,
                     (Some(WriteMode::Write), false) => O_WRONLY | O_CREAT | O_TRUNC,
                     (Some(WriteMode::Write), true) => O_RDWR | O_CREAT | O_TRUNC,
+                    (Some(WriteMode::CreateNew), false) => O_WRONLY | O_CREAT | O_EXCL,
+                    (Some(WriteMode::CreateNew), true) => O_RDWR | O_CREAT | O_EXCL,
                     (None, true) => O_RDONLY,
                     (None, false) => 0,
                 };
                 let file = sftp.open(
                     filename.as_str(),
                     OpenFlags::from_bits_truncate(accesstype),
-                    opts.mode.try_into().unwrap(),
+                    sftp_mode_bits(opts.mode),
                 )?;
                 Ok(FileWrap::LibSsh(file))
             }
@@ -119,10 +131,7 @@ impl SftpWrap {
             Self::Ssh2(sftp) => Ok(sftp.mkdir(filename.as_std_path(), mode)?),
 
             #[cfg(feature = "libssh-rs")]
-            Self::LibSsh(sftp) => {
-                use std::convert::TryInto;
-                Ok(sftp.create_dir(filename.as_str(), mode.try_into().unwrap())?)
-            }
+            Self::LibSsh(sftp) => Ok(sftp.create_dir(filename.as_str(), sftp_mode_bits(mode))?),
         }
     }
 

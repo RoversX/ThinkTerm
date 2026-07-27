@@ -120,6 +120,28 @@ impl Sftp {
         .await
     }
 
+    /// Helper to create a file only if it does not already exist.
+    ///
+    /// Prefer this over `metadata()`-then-`create()` when the point is not to
+    /// clobber: the server decides atomically, so there is no window in which
+    /// another writer can slip in between the check and the create.
+    pub async fn create_new<T, E>(&self, filename: T) -> SftpChannelResult<File>
+    where
+        T: TryInto<Utf8PathBuf, Error = E>,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.open_with_mode(
+            filename,
+            OpenOptions {
+                read: false,
+                write: Some(WriteMode::CreateNew),
+                mode: 0o666,
+                ty: OpenFileType::File,
+            },
+        )
+        .await
+    }
+
     /// Helper to open a directory for reading its contents.
     pub async fn open_dir<T, E>(&self, filename: T) -> SftpChannelResult<Dir>
     where

@@ -291,12 +291,17 @@ pub(crate) const DEFAULT_REMOTE_SFTP_IDLE_MINUTES: u32 = 15;
 #[serde(default)]
 pub(crate) struct NativeWorkspaceSettings {
     pub(crate) remote_sftp_idle_minutes: u32,
+    /// Where downloaded remote files land. Empty means "wherever this system
+    /// puts downloads", which is what most people want and what keeps the
+    /// setting meaningful after moving between machines.
+    pub(crate) remote_download_directory: String,
 }
 
 impl Default for NativeWorkspaceSettings {
     fn default() -> Self {
         Self {
             remote_sftp_idle_minutes: DEFAULT_REMOTE_SFTP_IDLE_MINUTES,
+            remote_download_directory: String::new(),
         }
     }
 }
@@ -333,6 +338,38 @@ impl Default for ThinkTermNativeSettings {
 
 pub(crate) fn remote_sftp_idle_minutes() -> u32 {
     load().workspaces.remote_sftp_idle_minutes.clamp(1, 120)
+}
+
+/// Where remote downloads should land, or `None` to use the system's own
+/// Downloads folder.
+///
+/// A configured path that no longer exists returns `None` rather than an
+/// error: falling back to the system folder gets the file saved, whereas
+/// failing the download over a stale setting does not.
+pub(crate) fn remote_download_directory() -> Option<PathBuf> {
+    let configured = load().workspaces.remote_download_directory;
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    path.is_dir().then_some(path)
+}
+
+/// The folder downloads will actually use, for display and for saving into.
+pub(crate) fn effective_remote_download_directory() -> Option<PathBuf> {
+    remote_download_directory().or_else(|| {
+        dirs_next::download_dir()
+            .or_else(|| dirs_next::home_dir().map(|home| home.join("Downloads")))
+    })
+}
+
+pub(crate) fn set_remote_download_directory(path: Option<PathBuf>) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.workspaces.remote_download_directory = path
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    save(&settings)
 }
 
 pub(crate) fn settings_path() -> PathBuf {
@@ -670,6 +707,29 @@ mod tests {
         mark_onboarding_seen(&mut settings);
 
         assert_eq!(settings.onboarding.seen_version, ONBOARDING_VERSION);
+    }
+
+    #[test]
+    fn an_unset_download_directory_defers_to_the_system() {
+        let settings: ThinkTermNativeSettings = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert_eq!(settings.workspaces.remote_download_directory, "");
+    }
+
+    /// A folder that has since been deleted or unmounted must not fail every
+    /// download; falling back to the system folder still saves the file.
+    #[test]
+    fn a_missing_download_directory_is_treated_as_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("no-such-folder");
+        assert!(!gone.is_dir());
+        assert_eq!(gone.is_dir().then_some(gone.clone()), None);
+
+        // An existing folder is used as given.
+        let present = dir.path().to_path_buf();
+        assert_eq!(
+            present.is_dir().then_some(present.clone()),
+            Some(present.clone())
+        );
     }
 
     #[test]

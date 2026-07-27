@@ -223,6 +223,13 @@ pub enum WriteMode {
 
     /// Overwrite an existing file when opening to write it
     Write,
+
+    /// Create the file, failing if it already exists.
+    ///
+    /// The server decides atomically, which is the only way to claim a name
+    /// without a race: checking with `metadata` and then creating leaves a
+    /// window in which someone else can create the same path.
+    CreateNew,
 }
 
 /// Represents options to provide when renaming a file or directory
@@ -301,6 +308,10 @@ mod ssh2_impl {
                 // already there, which made `Sftp::create` unable to create.
                 Some(WriteMode::Write) => flags |= Self::WRITE | Self::TRUNCATE | Self::CREATE,
                 Some(WriteMode::Append) => flags |= Self::WRITE | Self::APPEND | Self::CREATE,
+                // No TRUNCATE: there is by definition nothing to truncate, and
+                // asking for it alongside EXCLUSIVE muddies what the server is
+                // being told.
+                Some(WriteMode::CreateNew) => flags |= Self::WRITE | Self::CREATE | Self::EXCLUSIVE,
                 None => {}
             }
 

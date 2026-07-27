@@ -235,10 +235,17 @@ const TRANSFER_TOTAL_UNKNOWN: u64 = u64::MAX;
 
 /// Shared, lock-free view of one transfer: the worker publishes progress, the
 /// UI reads it every paint, and either side can ask to stop.
+///
+/// Tracks two scales at once. A single file reports bytes; a folder reports
+/// items, because a thousand-file tree's byte total says nothing useful about
+/// how far along it looks, and because the per-file byte counter would have to
+/// be reset constantly. Whichever scale is populated is the one the UI shows.
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteTransferProgress {
     transferred: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
+    items_done: Arc<AtomicU64>,
+    items_total: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -247,6 +254,8 @@ impl Default for RemoteTransferProgress {
         Self {
             transferred: Arc::new(AtomicU64::new(0)),
             total: Arc::new(AtomicU64::new(TRANSFER_TOTAL_UNKNOWN)),
+            items_done: Arc::new(AtomicU64::new(0)),
+            items_total: Arc::new(AtomicU64::new(TRANSFER_TOTAL_UNKNOWN)),
             cancel: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -274,6 +283,31 @@ impl RemoteTransferProgress {
         self.transferred.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn items(&self) -> Option<(u64, u64)> {
+        match self.items_total.load(Ordering::Relaxed) {
+            TRANSFER_TOTAL_UNKNOWN => None,
+            total => Some((self.items_done.load(Ordering::Relaxed), total)),
+        }
+    }
+
+    /// Switch this transfer to item-scale reporting. Called once, after the
+    /// source tree has been walked and the count is actually known.
+    pub(crate) fn set_item_total(&self, total: u64) {
+        self.items_total
+            .store(total.min(TRANSFER_TOTAL_UNKNOWN - 1), Ordering::Relaxed);
+    }
+
+    pub(crate) fn finish_item(&self) {
+        self.items_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Per-file byte counters are meaningless once a folder is in flight: the
+    /// aggregate is the item count, and letting each file overwrite the byte
+    /// total would make the bar jump backwards on every file.
+    fn tracks_items(&self) -> bool {
+        self.items_total.load(Ordering::Relaxed) != TRANSFER_TOTAL_UNKNOWN
+    }
+
     pub(crate) fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -285,6 +319,12 @@ impl RemoteTransferProgress {
     /// How far along, for a progress bar. `None` while the size is unknown;
     /// an empty file is complete the moment it is created.
     pub(crate) fn fraction(&self) -> Option<f32> {
+        if let Some((done, total)) = self.items() {
+            if total == 0 {
+                return Some(1.0);
+            }
+            return Some((done as f64 / total as f64).clamp(0.0, 1.0) as f32);
+        }
         let total = self.total()?;
         if total == 0 {
             return Some(1.0);
@@ -297,10 +337,53 @@ impl RemoteTransferProgress {
 /// tell "you cancelled this" apart from a real failure.
 pub(crate) const REMOTE_TRANSFER_CANCELED: &str = "Canceled";
 
+/// Why a transfer stopped, and whether it managed to tidy up.
+///
+/// A plain error string cannot express "and there is now a half-written file
+/// at this path" — which is exactly the case the user has to be told about,
+/// because it usually happens when the connection died and took the cleanup
+/// with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransferFailure {
+    pub message: String,
+    /// Set when something incomplete was left behind and could not be removed.
+    pub leftover: Option<String>,
+}
+
+impl TransferFailure {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            leftover: None,
+        }
+    }
+
+    pub(crate) fn was_canceled(&self) -> bool {
+        self.message == REMOTE_TRANSFER_CANCELED
+    }
+}
+
+/// Transfers report richer failures than the rest of the backend, so they get
+/// their own future type rather than widening every method's error.
+type TransferFuture = Pin<Box<dyn Future<Output = Result<u64, TransferFailure>> + Send + 'static>>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteTransferKind {
     Upload,
     Download,
+    /// Copying between two local directories — no connection involved, but it
+    /// wants the same progress row, cancel and retry as the remote ones.
+    LocalCopy,
+}
+
+impl RemoteTransferKind {
+    pub(crate) fn verb(self) -> &'static str {
+        match self {
+            Self::Upload => "Uploading",
+            Self::Download => "Downloading",
+            Self::LocalCopy => "Copying",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,11 +393,37 @@ pub(crate) enum RemoteTransferStatus {
     /// for a download, where the file landed.
     Done(String),
     Failed(String),
+    /// Failed *and* could not clean up after itself, so something incomplete
+    /// is still sitting there. Separate from `Failed` because the user has to
+    /// be told where, rather than finding it later and wondering.
+    FailedWithLeftover {
+        message: String,
+        leftover: String,
+    },
 }
 
-/// One file in flight, or one that just finished and still has something to
-/// report. Lives on the window rather than in [`RemoteFilesState`] because a
-/// transfer holds its own lease and must survive the panel switching trees.
+/// What a transfer needs in order to be run again without the user redoing the
+/// drag. Kept on the record from the start: retrofitting it after the futures
+/// have already consumed the paths is far more invasive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteTransferSource {
+    Upload {
+        local: PathBuf,
+        remote: RemotePath,
+        directory: RemotePath,
+    },
+    Download {
+        remote: RemotePath,
+    },
+    LocalCopy {
+        source: PathBuf,
+        destination_dir: PathBuf,
+    },
+}
+
+/// One transfer in flight, or one that just finished and still has something
+/// to report. Lives on the window rather than in [`RemoteFilesState`] because
+/// a transfer holds its own lease and must survive the panel switching trees.
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteTransfer {
     pub id: u64,
@@ -322,11 +431,18 @@ pub(crate) struct RemoteTransfer {
     pub name: String,
     pub progress: RemoteTransferProgress,
     pub status: RemoteTransferStatus,
+    /// Enough to retry. `None` for records that were never a real transfer —
+    /// a rejected folder, say — which have nothing to retry.
+    pub source: Option<RemoteTransferSource>,
 }
 
 impl RemoteTransfer {
     pub(crate) fn is_running(&self) -> bool {
         matches!(self.status, RemoteTransferStatus::Running)
+    }
+
+    pub(crate) fn can_retry(&self) -> bool {
+        !self.is_running() && self.source.is_some()
     }
 }
 
@@ -423,9 +539,23 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
         local: PathBuf,
         remote: RemotePath,
         progress: RemoteTransferProgress,
-    ) -> RemoteFuture<u64> {
-        let _ = (local, remote, progress);
-        Box::pin(async { Err("This connection cannot upload files".to_string()) })
+        overwrite: bool,
+    ) -> TransferFuture {
+        let _ = (local, remote, progress, overwrite);
+        Box::pin(async { Err(TransferFailure::new("This connection cannot upload files")) })
+    }
+
+    /// Create a remote directory, treating "it is already a directory" as
+    /// success — merging into an existing folder is normal, and an existing
+    /// *file* in its place is the only real clash.
+    ///
+    /// Checks with `metadata` rather than trusting mkdir's error: libssh wraps
+    /// its status codes opaquely, and OpenSSH speaks SFTP v3, whose error set
+    /// has no "already exists" — it answers a plain FAILURE that cannot be
+    /// told apart from a permission problem.
+    fn create_directory(&self, remote: RemotePath) -> RemoteFuture<()> {
+        let _ = remote;
+        Box::pin(async { Err("This connection cannot create directories".to_string()) })
     }
 
     /// Fetch `remote` into `local`, returning the number of bytes written.
@@ -434,9 +564,13 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
         remote: RemotePath,
         local: PathBuf,
         progress: RemoteTransferProgress,
-    ) -> RemoteFuture<u64> {
+    ) -> TransferFuture {
         let _ = (remote, local, progress);
-        Box::pin(async { Err("This connection cannot download files".to_string()) })
+        Box::pin(async {
+            Err(TransferFailure::new(
+                "This connection cannot download files",
+            ))
+        })
     }
 }
 
@@ -616,31 +750,47 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
         local: PathBuf,
         remote: RemotePath,
         progress: RemoteTransferProgress,
-    ) -> RemoteFuture<u64> {
+        overwrite: bool,
+    ) -> TransferFuture {
         let sftp = self.sftp.clone();
         Box::pin(async move {
-            // Refuse to clobber. SFTP has no exclusive-create, so this is a
-            // check rather than a guarantee — but losing the race needs a
-            // second writer racing for the same path in the same instant,
-            // whereas silently destroying a file needs only a careless drop.
-            if sftp.metadata(remote.as_str().to_string()).await.is_ok() {
-                return Err(format!(
-                    "{} already exists on the server",
-                    remote.file_name()
-                ));
+            let mut source = smol::fs::File::open(&local).await.map_err(|err| {
+                TransferFailure::new(format!("Unable to open {}: {err}", local.display()))
+            })?;
+            // Only meaningful for a single file; a folder transfer has already
+            // switched the row to item scale, which this must not disturb.
+            if !progress.tracks_items() {
+                if let Ok(metadata) = source.metadata().await {
+                    progress.set_total(metadata.len());
+                }
             }
 
-            let mut source = smol::fs::File::open(&local)
-                .await
-                .map_err(|err| format!("Unable to open {}: {err}", local.display()))?;
-            if let Ok(metadata) = source.metadata().await {
-                progress.set_total(metadata.len());
-            }
-
-            let mut file = sftp
-                .create(remote.as_str().to_string())
-                .await
-                .map_err(|err| format!("Unable to create {}: {err}", remote.as_str()))?;
+            // Refuse to clobber, and let the *server* decide it. The previous
+            // metadata()-then-create left a window in which another writer
+            // could win, and cost a round trip per file — which a folder
+            // upload would have paid thousands of times.
+            //
+            // Everything above this point creates nothing, which is what makes
+            // the cleanup below safe: it can only ever delete a file this
+            // call brought into existence. Do not hoist that cleanup up here —
+            // a failure to create means the file was someone else's.
+            let created = if overwrite {
+                // The user has already been asked and said replace, so the
+                // truncating open is what they chose.
+                sftp.create(remote.as_str().to_string()).await
+            } else {
+                sftp.create_new(remote.as_str().to_string()).await
+            };
+            let mut file = created.map_err(|err| {
+                TransferFailure::new(if overwrite {
+                    format!("Unable to write {}: {err}", remote.as_str())
+                } else {
+                    format!(
+                        "Unable to create {} (it may already exist): {err}",
+                        remote.as_str()
+                    )
+                })
+            })?;
 
             let outcome = copy_stream(
                 &mut source,
@@ -654,16 +804,55 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
             // Close the handle before touching the path: a half-written file
             // must not survive, and some servers refuse to unlink one that is
             // still open.
+            //
+            // On an overwrite the original was already destroyed by the
+            // truncating open, so removal is not what loses it — the failure
+            // is. Removing anyway is still the better of two bad outcomes: a
+            // truncated file wearing the original's name reads as intact.
+            // (Uploading to a temporary name and renaming over would preserve
+            // it, but the libssh backend silently drops rename's overwrite
+            // flag, so that route is not dependable here.)
             drop(file);
-            if outcome.is_err() {
-                if let Err(err) = sftp.remove_file(remote.as_str().to_string()).await {
-                    log::warn!(
-                        "remote files: unable to clean up the partial upload {}: {err:#}",
-                        remote.as_str()
-                    );
+            match outcome {
+                Ok(written) => Ok(written),
+                Err(message) => {
+                    let mut failure = TransferFailure::new(message);
+                    if let Err(err) = sftp.remove_file(remote.as_str().to_string()).await {
+                        // Usually because the connection is what failed, so the
+                        // cleanup rides the same dead session. Say so: a
+                        // half-written file the user does not know about is
+                        // worse than one they can go and delete.
+                        log::warn!(
+                            "remote files: unable to clean up the partial upload {}: {err:#}",
+                            remote.as_str()
+                        );
+                        failure.leftover = Some(remote.as_str().to_string());
+                    }
+                    Err(failure)
                 }
             }
-            outcome
+        })
+    }
+
+    fn create_directory(&self, remote: RemotePath) -> RemoteFuture<()> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            if let Ok(metadata) = sftp.metadata(remote.as_str().to_string()).await {
+                return if metadata.is_dir() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{} already exists and is not a folder",
+                        remote.as_str()
+                    ))
+                };
+            }
+            // 0o755 as a literal: the mode is masked into permission bits and
+            // must never carry anything derived from a local file, whose modes
+            // mean nothing on the far side.
+            sftp.create_dir(remote.as_str().to_string(), 0o755)
+                .await
+                .map_err(|err| format!("Unable to create {}: {err}", remote.as_str()))
         })
     }
 
@@ -672,63 +861,113 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
         remote: RemotePath,
         local: PathBuf,
         progress: RemoteTransferProgress,
-    ) -> RemoteFuture<u64> {
+    ) -> TransferFuture {
         let sftp = self.sftp.clone();
         Box::pin(async move {
-            if let Ok(metadata) = sftp.metadata(remote.as_str().to_string()).await {
-                if let Some(size) = metadata.size {
-                    progress.set_total(size);
-                }
-            }
-
-            let mut file = sftp
-                .open(remote.as_str().to_string())
-                .await
-                .map_err(|err| format!("Unable to open {}: {err}", remote.as_str()))?;
-
-            // The staging file was already claimed exclusively by the caller
-            // (see `reserve_download_path`); opening it for writing here must
-            // not create or truncate anything, or that reservation would mean
-            // nothing.
+            // The caller reserved the staging file by creating it exclusively,
+            // so from this point on EVERY failure path owes it a cleanup —
+            // including the ones before a single byte moves. Leaving one behind
+            // is not merely litter: `reserve_download_path` skips candidates
+            // whose staging file is taken, so an orphan permanently bumps every
+            // later download of that name to ` (1)`, ` (2)`, …
             let partial = partial_download_path(&local);
-            let mut sink = smol::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .create(false)
-                .open(&partial)
-                .await
-                .map_err(|err| format!("Unable to write {}: {err}", partial.display()))?;
-
-            let outcome = copy_stream(
-                &mut file,
-                &mut sink,
-                &progress,
-                "the server",
-                "the local file",
-            )
-            .await;
-            drop(sink);
-
-            match outcome {
-                Ok(written) => match smol::fs::rename(&partial, &local).await {
-                    Ok(()) => Ok(written),
-                    Err(err) => {
-                        let _ = smol::fs::remove_file(&partial).await;
-                        Err(format!("Unable to save {}: {err}", local.display()))
-                    }
-                },
-                Err(err) => {
-                    if let Err(cleanup) = smol::fs::remove_file(&partial).await {
-                        log::warn!(
-                            "remote files: unable to clean up the partial download {}: {cleanup:#}",
-                            partial.display()
-                        );
-                    }
-                    Err(err)
-                }
-            }
+            let outcome = download_into_partial(&sftp, &remote, &partial, &progress).await;
+            finish_download(outcome, &partial, &local).await
         })
     }
+}
+
+/// Put a finished download in place, or clean up after a failed one.
+///
+/// Every exit from a download funnels through here so the reserved staging
+/// file has exactly one disposal site. Split from the transfer itself because
+/// this half touches only the filesystem, and is therefore the half that can
+/// be tested without a server.
+async fn finish_download(
+    outcome: Result<u64, String>,
+    partial: &Path,
+    local: &Path,
+) -> Result<u64, TransferFailure> {
+    let written = match outcome {
+        Ok(written) => written,
+        Err(message) => {
+            let mut failure = TransferFailure::new(message);
+            if let Err(cleanup) = smol::fs::remove_file(partial).await {
+                log::warn!(
+                    "remote files: unable to clean up the partial download {}: {cleanup:#}",
+                    partial.display()
+                );
+                failure.leftover = Some(partial.display().to_string());
+            }
+            return Err(failure);
+        }
+    };
+
+    // `rename` replaces silently, so re-check that nothing appeared at the
+    // destination while the download ran. Uploads refuse to clobber; this side
+    // must match, or a long download quietly destroys a file created in the
+    // meantime.
+    if local.exists() {
+        let _ = smol::fs::remove_file(partial).await;
+        return Err(TransferFailure::new(format!(
+            "{} appeared while downloading, so it was left untouched",
+            local.display()
+        )));
+    }
+
+    match smol::fs::rename(partial, local).await {
+        Ok(()) => Ok(written),
+        Err(err) => {
+            let _ = smol::fs::remove_file(partial).await;
+            Err(TransferFailure::new(format!(
+                "Unable to save {}: {err}",
+                local.display()
+            )))
+        }
+    }
+}
+
+/// Stream `remote` into the already-reserved `partial`. Split out so the
+/// caller has exactly one place to clean up from: every `?` in here becomes a
+/// single `Err` the caller handles, rather than an early return that walks
+/// past the cleanup.
+async fn download_into_partial(
+    sftp: &wezterm_ssh::Sftp,
+    remote: &RemotePath,
+    partial: &Path,
+    progress: &RemoteTransferProgress,
+) -> Result<u64, String> {
+    if let Ok(metadata) = sftp.metadata(remote.as_str().to_string()).await {
+        if let Some(size) = metadata.size {
+            progress.set_total(size);
+        }
+    }
+
+    let mut file = sftp
+        .open(remote.as_str().to_string())
+        .await
+        .map_err(|err| format!("Unable to open {}: {err}", remote.as_str()))?;
+
+    // The staging file already exists by reservation; opening it here must not
+    // create or truncate anything else, or that reservation would mean nothing.
+    let mut sink = smol::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .create(false)
+        .open(partial)
+        .await
+        .map_err(|err| format!("Unable to write {}: {err}", partial.display()))?;
+
+    let written = copy_stream(
+        &mut file,
+        &mut sink,
+        progress,
+        "the server",
+        "the local file",
+    )
+    .await;
+    drop(sink);
+    written
 }
 
 /// Where an in-flight download accumulates. Kept next to the destination so
@@ -2817,6 +3056,183 @@ mod tests {
         let mut names = download_name_candidates(".bashrc");
         assert_eq!(names.next().as_deref(), Some(".bashrc"));
         assert_eq!(names.next().as_deref(), Some(".bashrc (1)"));
+    }
+
+    /// Pins the bug this replaced: a download that failed before moving any
+    /// bytes used to return past the cleanup, leaving the reserved staging
+    /// file behind forever. That orphan is not just litter — reservation skips
+    /// names whose staging file is taken, so it permanently bumps every later
+    /// download of that name to ` (1)`, ` (2)`, …
+    #[test]
+    fn a_failed_download_never_leaves_its_staging_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("report.pdf");
+        let partial = partial_download_path(&local);
+        std::fs::write(&partial, b"partial").unwrap();
+
+        let err = smol::block_on(finish_download(
+            Err("Unable to open /srv/report.pdf: no such file".to_string()),
+            &partial,
+            &local,
+        ))
+        .expect_err("a failed download must stay failed");
+
+        assert!(err.message.contains("no such file"), "{}", err.message);
+        assert!(
+            !partial.exists(),
+            "the staging file must not survive a failure"
+        );
+        assert!(!local.exists(), "and nothing may appear at the destination");
+    }
+
+    /// The reservation checked the destination was free, but a download takes
+    /// time; `rename` would replace silently, so a file that appears in the
+    /// meantime must be left alone — matching the upload side's refusal to
+    /// overwrite.
+    #[test]
+    fn a_download_does_not_clobber_a_file_that_appeared_while_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("notes.txt");
+        let partial = partial_download_path(&local);
+        std::fs::write(&partial, b"downloaded").unwrap();
+        // Something else got there first.
+        std::fs::write(&local, b"do not lose me").unwrap();
+
+        let err = smol::block_on(finish_download(Ok(10), &partial, &local))
+            .expect_err("landing on an occupied name must fail");
+
+        assert!(
+            err.message.contains("appeared while downloading"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            b"do not lose me",
+            "the pre-existing file must be untouched"
+        );
+        assert!(!partial.exists(), "and the staging file is cleaned up");
+    }
+
+    /// When cleanup itself fails — which is the normal case once the
+    /// connection is what died — the failure has to carry where the debris is.
+    /// A log line is not good enough: the user needs to know a partial file is
+    /// sitting there, or they will hit "already exists" on retry with nothing
+    /// on screen explaining why.
+    #[test]
+    fn a_failure_that_could_not_clean_up_says_what_it_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("big.iso");
+        let partial = partial_download_path(&local);
+        // No staging file on disk, so the cleanup below cannot succeed —
+        // standing in for a removal that fails for any reason.
+        let err = smol::block_on(finish_download(
+            Err("connection lost".to_string()),
+            &partial,
+            &local,
+        ))
+        .expect_err("the transfer failed");
+
+        assert_eq!(err.message, "connection lost");
+        assert_eq!(
+            err.leftover.as_deref(),
+            Some(partial.display().to_string().as_str()),
+            "the caller must be able to tell the user where the debris is"
+        );
+
+        // A cleanup that works reports no leftover.
+        std::fs::write(&partial, b"half").unwrap();
+        let err = smol::block_on(finish_download(
+            Err("connection lost".to_string()),
+            &partial,
+            &local,
+        ))
+        .expect_err("the transfer failed");
+        assert_eq!(err.leftover, None);
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn a_successful_download_moves_into_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("archive.tar.gz");
+        let partial = partial_download_path(&local);
+        std::fs::write(&partial, b"payload").unwrap();
+
+        let written = smol::block_on(finish_download(Ok(7), &partial, &local)).expect("download");
+        assert_eq!(written, 7);
+        assert_eq!(std::fs::read(&local).unwrap(), b"payload");
+        assert!(
+            !partial.exists(),
+            "the staging file is consumed by the move"
+        );
+    }
+
+    /// A folder reports items, not bytes. The trap this pins: a walker that
+    /// reuses the single-file upload path lets every file call `set_total`
+    /// with its own size, so the bar reads "100%" on each small file and jumps
+    /// backwards on the next one. Item scale must win once it is established.
+    /// A folder upload rebuilds each destination from the plan's *relative*
+    /// path, one component at a time. Joining the whole thing at once would
+    /// splice a local separator into a remote path — and on Windows a
+    /// backslash is a legal remote filename character, so the mistake would
+    /// silently create a file literally called `a\b\c`.
+    #[test]
+    fn a_relative_path_joins_one_component_at_a_time() {
+        let root = RemotePath::from_server_absolute("/srv/app").unwrap();
+        let mut built = root.clone();
+        for name in ["proj", "src", "main.rs"] {
+            built = built.join_name(name).unwrap();
+        }
+        assert_eq!(built.as_str(), "/srv/app/proj/src/main.rs");
+
+        // The whole-string shortcut is exactly what join_name refuses.
+        assert!(root.join_name("proj/src/main.rs").is_err());
+        assert!(root.join_name("..").is_err());
+        assert!(root.join_name("").is_err());
+    }
+
+    #[test]
+    fn item_progress_is_not_disturbed_by_per_file_byte_totals() {
+        let progress = RemoteTransferProgress::default();
+        progress.set_item_total(4);
+        assert_eq!(progress.items(), Some((0, 4)));
+        assert_eq!(progress.fraction(), Some(0.0));
+
+        // One file of the tree goes by, reporting its own byte size and
+        // finishing it. The fraction must follow items, not those bytes.
+        progress.set_total(1_000);
+        progress.advance(1_000);
+        progress.finish_item();
+        assert_eq!(progress.items(), Some((1, 4)));
+        assert_eq!(
+            progress.fraction(),
+            Some(0.25),
+            "one of four files done, regardless of that file's byte count"
+        );
+
+        for _ in 0..3 {
+            progress.finish_item();
+        }
+        assert_eq!(progress.fraction(), Some(1.0));
+    }
+
+    #[test]
+    fn a_single_file_transfer_still_reports_bytes() {
+        let progress = RemoteTransferProgress::default();
+        assert_eq!(progress.items(), None, "no item scale unless asked for");
+        progress.set_total(200);
+        progress.advance(50);
+        assert_eq!(progress.fraction(), Some(0.25));
+    }
+
+    /// An empty folder is finished the moment it exists, the same way an empty
+    /// file is — otherwise the row would sit at 0% forever.
+    #[test]
+    fn an_empty_folder_reads_as_complete() {
+        let progress = RemoteTransferProgress::default();
+        progress.set_item_total(0);
+        assert_eq!(progress.fraction(), Some(1.0));
     }
 
     #[test]

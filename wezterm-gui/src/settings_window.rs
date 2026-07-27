@@ -27,10 +27,10 @@ use wezterm_font::{FontConfiguration, LoadedFont};
 use window::bitmaps::atlas::OutOfTextureSpace;
 use window::color::LinearRgba;
 use window::{
-    Appearance, Clipboard, Connection, ConnectionOps, Dimensions, IntegratedTitleButton,
-    IntegratedTitleButtonStyle, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor,
-    MouseEvent, MouseEventKind, MousePress, RequestedWindowGeometry, Window, WindowDecorations,
-    WindowEvent, WindowOps, WindowState,
+    Appearance, Clipboard, Connection, ConnectionOps, Dimensions, FolderPickerOptions,
+    IntegratedTitleButton, IntegratedTitleButtonStyle, KeyCode, KeyEvent, Modifiers, MouseButtons,
+    MouseCursor, MouseEvent, MouseEventKind, MousePress, RequestedWindowGeometry, Window,
+    WindowDecorations, WindowEvent, WindowOps, WindowState,
 };
 
 use crate::native_settings::{
@@ -348,6 +348,8 @@ enum SettingsAction {
     DecreaseRemoteSftpIdle,
     IncreaseRemoteSftpIdle,
     ResetRemoteSftpIdle,
+    ChooseRemoteDownloadDirectory,
+    ResetRemoteDownloadDirectory,
     OpenBottomQuotesJson,
     ResetBottomQuotesJson,
     SearchInput,
@@ -2229,6 +2231,71 @@ impl SettingsWindow {
         }
     }
 
+    /// What the download row shows: the chosen folder, or where the system
+    /// would put it, so the row never reads as "unset" when it is in fact
+    /// working.
+    fn remote_download_directory_label(&self) -> String {
+        let configured = self
+            .native_settings
+            .workspaces
+            .remote_download_directory
+            .trim();
+        if !configured.is_empty() {
+            return configured.to_string();
+        }
+        match crate::native_settings::effective_remote_download_directory() {
+            Some(path) => format!("{} (system default)", path.display()),
+            None => "No Downloads folder found".to_string(),
+        }
+    }
+
+    fn choose_remote_download_directory(&mut self) {
+        self.ui.open_dropdown = None;
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let instance_id = self.instance_id;
+        let notify = window.clone();
+        window.pick_folder_async_with_options(
+            FolderPickerOptions {
+                title: "Choose a download folder".to_string(),
+                prompt: "Choose".to_string(),
+            },
+            Box::new(move |path| {
+                // Cancelling the picker must leave the setting alone, so only
+                // a real selection reaches the store.
+                let Some(path) = path else {
+                    return;
+                };
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Some(settings) = settings_window_for_instance(instance_id) {
+                        settings
+                            .borrow_mut()
+                            .set_remote_download_directory(Some(path));
+                        notify.invalidate();
+                    }
+                })
+                .detach();
+            }),
+        );
+    }
+
+    fn set_remote_download_directory(&mut self, path: Option<PathBuf>) {
+        self.ui.open_dropdown = None;
+        match crate::native_settings::set_remote_download_directory(path) {
+            Ok(()) => {
+                self.native_settings = crate::native_settings::load();
+                self.status = format!(
+                    "Downloads are saved to {}",
+                    self.remote_download_directory_label()
+                );
+            }
+            Err(err) => {
+                self.status = format!("Unable to save the download folder: {err:#}");
+            }
+        }
+    }
+
     fn format_bottom_quote_interval(minutes: u32) -> String {
         if minutes < 60 {
             format!("{minutes} min")
@@ -2770,6 +2837,12 @@ impl SettingsWindow {
             SettingsAction::DecreaseRemoteSftpIdle => self.step_remote_sftp_idle(-5),
             SettingsAction::IncreaseRemoteSftpIdle => self.step_remote_sftp_idle(5),
             SettingsAction::ResetRemoteSftpIdle => self.reset_remote_sftp_idle(),
+            SettingsAction::ChooseRemoteDownloadDirectory => {
+                self.choose_remote_download_directory()
+            }
+            SettingsAction::ResetRemoteDownloadDirectory => {
+                self.set_remote_download_directory(None)
+            }
             SettingsAction::OpenBottomQuotesJson => {
                 self.ui.open_dropdown = None;
                 match crate::bottom_quotes::ensure_quotes_file() {
@@ -3916,7 +3989,8 @@ impl SettingsWindow {
         let ui_font = Rc::clone(&self.ui_font);
         let scroll = self.ui.content_scroll.offset;
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
-        let row_count = 1;
+        // Idle timeout, download folder, and the reset beside it.
+        let row_count = 3;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         self.ui.content_scroll.set_extents(
@@ -3952,6 +4026,31 @@ impl SettingsWindow {
             SettingsAction::DecreaseRemoteSftpIdle,
             SettingsAction::IncreaseRemoteSftpIdle,
             false,
+        )?;
+
+        let row_step = self.settings_row_step();
+        let download_label = self.remote_download_directory_label();
+        self.paint_action_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step,
+            row_width,
+            "Download Folder",
+            &download_label,
+            "Choose...",
+            SettingsAction::ChooseRemoteDownloadDirectory,
+            true,
+        )?;
+        self.paint_action_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 2.0,
+            row_width,
+            "Use the System Downloads Folder",
+            "Clears the chosen folder so downloads follow this computer's own setting.",
+            "Reset",
+            SettingsAction::ResetRemoteDownloadDirectory,
+            true,
         )
     }
 
