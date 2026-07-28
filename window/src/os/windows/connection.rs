@@ -52,6 +52,18 @@ pub(crate) fn get_appearance() -> Appearance {
     }
 }
 
+/// The monitor the user is working on: the one holding our focused window,
+/// falling back to the primary when none of ours has focus.
+///
+/// [`Connection::default_dpi`] reports this monitor's scaling, so whatever
+/// sizes a window against that dpi has to open the window here too. Sizing
+/// for a 200% display and opening on a 100% one yields a window at twice its
+/// intended size: the resize that follows re-rasterizes the fonts for the new
+/// dpi but never revisits the dimensions that were asked for.
+pub(crate) fn active_monitor() -> HMONITOR {
+    unsafe { MonitorFromWindow(GetFocus(), MONITOR_DEFAULTTONEAREST) }
+}
+
 impl ConnectionOps for Connection {
     fn terminate_message_loop(&self) {
         unsafe {
@@ -115,6 +127,21 @@ impl ConnectionOps for Connection {
             by_name: info.by_name,
             virtual_rect: info.virtual_rect,
         })
+    }
+
+    /// Windows reports per-monitor dpi, so the 96dpi constant is only ever
+    /// right at 100% scaling. Callers use this before a window exists to
+    /// size it and to pick the pixel size to rasterize fonts at; leaving it
+    /// at 96 on a 150%/200% display opens the window at half the intended
+    /// size and then leaves its chrome on one scale and its text on another
+    /// once the real dpi arrives with the first resize event.
+    /// `enumerate` already folds `dpi_by_screen` and `dpi` from the config
+    /// into `effective_dpi`, so overrides keep working.
+    fn default_dpi(&self) -> f64 {
+        match self.screens() {
+            Ok(screens) => screens.active.effective_dpi.unwrap_or(crate::DEFAULT_DPI),
+            Err(_) => crate::DEFAULT_DPI,
+        }
     }
 }
 
@@ -189,7 +216,7 @@ impl ScreenInfoHelper {
             active: None,
             by_name: HashMap::new(),
             virtual_rect: euclid::rect(0, 0, 0, 0),
-            active_handle: unsafe { MonitorFromWindow(GetFocus(), MONITOR_DEFAULTTONEAREST) },
+            active_handle: active_monitor(),
             friendly_names: gdi_display_name_to_friendly_monitor_names()?,
             gdi_to_adapater: gdi_display_name_to_adapter_names(),
             config: config::configuration(),

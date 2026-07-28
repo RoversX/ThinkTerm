@@ -1406,6 +1406,15 @@ impl SettingsWindow {
                 return Err(err);
             }
         };
+        // `dimensions` is still the pre-window guess: we had to pick a dpi
+        // before there was a window to ask. A Resized event can already have
+        // landed while the window and its gpu surface were being created, and
+        // that handler is what rebuilt the ui tokens and re-rasterized the
+        // fonts. Writing the guess back wholesale would strand the geometry on
+        // the old dpi while the tokens and fonts sit on the new one, which
+        // paints half-size controls around full-size text.
+        let mut dimensions = dimensions;
+        dimensions.dpi = settings.borrow().dimensions.dpi;
         webgpu.resize(dimensions);
         let dimensions = *webgpu.dimensions.borrow();
         {

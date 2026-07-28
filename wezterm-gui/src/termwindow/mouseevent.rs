@@ -223,17 +223,21 @@ impl super::TermWindow {
         }
     }
 
-    fn sidebar_scroll_pixels(amount: i16) -> f32 {
-        let steps = amount.unsigned_abs().max(1) as f32;
-        let delta = (steps * 6.0).min(42.0);
-        if amount < 0 {
-            delta
-        } else {
-            -delta
-        }
+    /// How far one wheel notch moves a sidebar surface, in physical pixels.
+    ///
+    /// This deliberately goes through the same helper the settings window
+    /// uses, because the two have to agree: a notch used to be a flat 6px here
+    /// (capped at 42px no matter how many notches an event carried) while
+    /// settings scrolled 34 *design* pixels per notch. Rows and preview lines
+    /// are laid out in dpi-scaled pixels, so the flat version covered half as
+    /// much ground on a 200% display as on a 100% one - on Windows at 200% a
+    /// notch moved less than half a row while the same notch in settings moved
+    /// three rows.
+    fn sidebar_scroll_pixels(&self, amount: i16) -> f32 {
+        crate::ui::wheel_delta_pixels(amount, crate::ui::ui_scale_for_dpi(self.dimensions.dpi))
     }
 
-    fn sidebar_vertical_scroll_delta(event: &MouseEvent) -> Option<f32> {
+    fn sidebar_vertical_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
         if !matches!(event.kind, WMEK::VertWheel(_)) {
             return None;
         }
@@ -243,13 +247,13 @@ impl super::TermWindow {
             }
         }
         match event.kind {
-            WMEK::VertWheel(amount) if amount != 0 => Some(Self::sidebar_scroll_pixels(amount)),
+            WMEK::VertWheel(amount) if amount != 0 => Some(self.sidebar_scroll_pixels(amount)),
             WMEK::VertWheel(_) => Some(0.0),
             _ => None,
         }
     }
 
-    fn sidebar_horizontal_scroll_delta(event: &MouseEvent) -> Option<f32> {
+    fn sidebar_horizontal_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
         if !matches!(event.kind, WMEK::HorzWheel(_)) {
             return None;
         }
@@ -260,7 +264,7 @@ impl super::TermWindow {
         }
         match event.kind {
             WMEK::HorzWheel(amount) if amount != 0 => {
-                Some(Self::sidebar_scroll_pixels(amount) * 2.0)
+                Some(self.sidebar_scroll_pixels(amount) * 2.0)
             }
             WMEK::HorzWheel(_) => Some(0.0),
             _ => None,
@@ -750,7 +754,7 @@ impl super::TermWindow {
         }
 
         let delta = match event.kind {
-            WMEK::VertWheel(_) => Self::sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
+            WMEK::VertWheel(_) => self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
             // Trackpads often emit a little horizontal inertia while the user is
             // vertically scrolling. Consume it inside the sidebar so it doesn't
             // leak to tab or terminal wheel handlers at the scroll bounds.
@@ -815,10 +819,9 @@ impl super::TermWindow {
                     && y >= rect.y as isize
                     && y < rect.y.saturating_add(rect.height) as isize
                 {
+                    let vert_delta = self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0);
                     let changed = match event.kind {
-                        WMEK::VertWheel(_) => self.scroll_right_sidebar_file_preview_by(
-                            Self::sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
-                        ),
+                        WMEK::VertWheel(_) => self.scroll_right_sidebar_file_preview_by(vert_delta),
                         WMEK::HorzWheel(amount) if amount != 0 => {
                             self.scroll_right_sidebar_file_preview_horizontal(amount)
                         }
@@ -852,9 +855,9 @@ impl super::TermWindow {
                 && event.modifiers.contains(::window::Modifiers::SHIFT);
             if matches!(event.kind, WMEK::HorzWheel(_)) || shift_vertical {
                 let delta = if shift_vertical {
-                    Self::sidebar_vertical_scroll_delta(event).unwrap_or(0.0)
+                    self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0)
                 } else {
-                    Self::sidebar_horizontal_scroll_delta(event).unwrap_or(0.0)
+                    self.sidebar_horizontal_scroll_delta(event).unwrap_or(0.0)
                 };
                 if delta.abs() > f32::EPSILON {
                     let changed = self.scroll_right_sidebar_note_table_at(
@@ -875,7 +878,7 @@ impl super::TermWindow {
         }
 
         let delta = match event.kind {
-            WMEK::VertWheel(_) => Self::sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
+            WMEK::VertWheel(_) => self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
             WMEK::HorzWheel(_) => return true,
             _ => return false,
         };

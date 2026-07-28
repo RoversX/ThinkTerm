@@ -483,27 +483,7 @@ impl WindowInner {
     }
 
     fn get_effective_dpi(&self) -> usize {
-        let actual_dpi = unsafe { GetDpiForWindow(self.hwnd.0) } as f64;
-
-        if self.config.dpi_by_screen.is_empty() {
-            return self.config.dpi.unwrap_or(actual_dpi) as usize;
-        }
-
-        unsafe {
-            let mut mi: MONITORINFOEXW = std::mem::zeroed();
-            mi.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-            let mon = MonitorFromWindow(self.hwnd.0, MONITOR_DEFAULTTONEAREST);
-            GetMonitorInfoW(mon, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO);
-
-            if let Ok(info) = crate::os::windows::connection::ScreenInfoHelper::new() {
-                let name = info.monitor_name(&mi);
-                if let Some(dpi) = self.config.dpi_by_screen.get(&name).copied() {
-                    return dpi as usize;
-                }
-            }
-
-            actual_dpi as usize
-        }
+        effective_dpi_for_window(self.hwnd.0, &self.config)
     }
 
     /// Check if we need to generate a resize callback.
@@ -624,12 +604,125 @@ fn decorations_to_style(decorations: WindowDecorations) -> u32 {
     }
 }
 
-fn get_primary_monitor_dpi() -> u32 {
-    let primary = unsafe { MonitorFromWindow(null_mut(), MONITOR_DEFAULTTOPRIMARY) };
-    assert!(!primary.is_null(), "MonitorFromWindow() returned NULL");
+/// The dpi our layout should use for a window sitting on its current monitor.
+///
+/// Split out of `WindowInner::get_effective_dpi` so that a window that does
+/// not have its `WindowInner` wired up yet - one we have just created - reads
+/// its dpi through exactly the same rules, `dpi` and `dpi_by_screen` overrides
+/// included. Two copies of these rules would be two chances to disagree about
+/// what a window's scale is.
+fn effective_dpi_for_window(hwnd: HWND, config: &ConfigHandle) -> usize {
+    let system_dpi = unsafe { GetDpiForWindow(hwnd) } as f64;
+
+    // Per-monitor override, then the global override, then what the system
+    // reports - the same precedence `ScreenInfoHelper::enumerate` applies when
+    // it fills in `ScreenInfo::effective_dpi`. The two have to agree: sizing a
+    // window reads this side while `default_dpi` reads the enumerate side, so
+    // a disagreement surfaces as a window that resizes itself the moment it
+    // opens. This used to fall straight through to the system dpi whenever
+    // `dpi_by_screen` was non-empty but held no entry for the current monitor,
+    // silently ignoring a global `dpi`.
+    if !config.dpi_by_screen.is_empty() {
+        unsafe {
+            let mut mi: MONITORINFOEXW = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            GetMonitorInfoW(mon, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO);
+
+            if let Ok(info) = crate::os::windows::connection::ScreenInfoHelper::new() {
+                let name = info.monitor_name(&mi);
+                if let Some(dpi) = config.dpi_by_screen.get(&name).copied() {
+                    return dpi as usize;
+                }
+            }
+        }
+    }
+
+    config.dpi.unwrap_or(system_dpi) as usize
+}
+
+/// `geometry` was measured against `creation_dpi` - the dpi of the monitor
+/// [`ConnectionOps::default_dpi`] reported - but a `CW_USEDEFAULT` window opens
+/// wherever Windows decides, which need not be that monitor. On a 200%/100%
+/// pair that is a window at twice or half the size that was asked for, and
+/// nothing later fixes it: the resize that follows re-rasterizes the fonts for
+/// the new dpi but never revisits the dimensions.
+///
+/// Rescale the client area for where the window actually landed, and leave the
+/// position alone (`SWP_NOMOVE`) so Windows keeps cascading new windows
+/// instead of stacking them all in the middle of a monitor.
+///
+/// A pinned `dpi` needs no special case: `default_dpi` and
+/// `effective_dpi_for_window` both return it, so the content scale below comes
+/// out at 1.0 and only the frame is corrected. The window is still hidden at
+/// this point - `ShowWindow` runs later - so there is no maximized or
+/// minimized state to preserve.
+fn resize_client_for_actual_monitor(
+    hwnd: HWND,
+    style: u32,
+    config: &ConfigHandle,
+    geometry: &ResolvedGeometry,
+    creation_dpi: usize,
+) {
+    let content_dpi = effective_dpi_for_window(hwnd, config);
+    if creation_dpi == 0 || content_dpi == 0 {
+        return;
+    }
+
+    let scale = content_dpi as f64 / creation_dpi as f64;
+    let client_width = ((geometry.width as f64 * scale).round() as usize).max(1);
+    let client_height = ((geometry.height as f64 * scale).round() as usize).max(1);
+
+    // The frame is Windows' to draw and it draws it at the monitor's real
+    // scale, whatever dpi we may have pinned for our own layout. Handing
+    // AdjustWindowRectExForDpi a config dpi would size the title bar and
+    // borders for a scale the system is not using.
+    let frame_dpi = unsafe { GetDpiForWindow(hwnd) };
+    let (width, height) =
+        adjust_client_to_window_dimensions(style, client_width, client_height, frame_dpi);
+
+    // Compare against the window we actually got rather than against dpi
+    // equality. With a 96dpi primary and a 192dpi secondary, a window that
+    // lands on the secondary can have a content dpi that already matches while
+    // its frame was still adjusted for the monitor guessed at creation - a
+    // client area short by the frame delta, which dpi equality cannot see.
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return;
+    }
+    if rect_width(&rect) == width && rect_height(&rect) == height {
+        return;
+    }
+
+    log::trace!(
+        "window was sized {}x{} for {creation_dpi}dpi but opened at content dpi \
+         {content_dpi} / frame dpi {frame_dpi}; correcting to client \
+         {client_width}x{client_height} (window {width}x{height})",
+        geometry.width,
+        geometry.height
+    );
+
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+fn monitor_dpi(mon: HMONITOR) -> u32 {
+    // Left at the 96dpi default if the call fails, which is what
+    // GetDpiForMonitor documents for an invalid monitor handle.
     let mut dpi_x = USER_DEFAULT_SCREEN_DPI as u32;
     let mut dpi_y = USER_DEFAULT_SCREEN_DPI as u32;
-    unsafe { GetDpiForMonitor(primary, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    if !mon.is_null() {
+        unsafe { GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    }
     dpi_x
 }
 
@@ -670,26 +763,36 @@ impl Window {
 
         let decorations = config.window_decorations;
         let style = decorations_to_style(decorations);
-        let frame_dpi = get_primary_monitor_dpi();
+
+        // A WS_POPUP window has no system frame to place, so we choose its
+        // position ourselves. Put it on the monitor `active_monitor` picks,
+        // because that is the monitor whose dpi `default_dpi` reported when
+        // the requested size was computed - see the note on `active_monitor`
+        // for what sizing against one monitor and opening on another costs.
+        // Decorated windows get CW_USEDEFAULT below, so the system chooses
+        // the monitor and the primary stays the best guess available.
+        let is_popup = (style & WS_POPUP) != 0;
+        let target_monitor = if is_popup {
+            active_monitor()
+        } else {
+            unsafe { MonitorFromWindow(null_mut(), MONITOR_DEFAULTTOPRIMARY) }
+        };
+        let frame_dpi = monitor_dpi(target_monitor);
         let (width, height) =
             adjust_client_to_window_dimensions(style, geometry.width, geometry.height, frame_dpi);
 
         let (x, y) = match (geometry.x, geometry.y) {
             (Some(x), Some(y)) => (x, y),
             _ => {
-                if (style & WS_POPUP) == 0 {
+                if !is_popup {
                     (CW_USEDEFAULT, CW_USEDEFAULT)
                 } else {
                     // WS_POPUP windows need to specify the initial position.
-                    // We pick the middle of the primary monitor
-
+                    // We pick the middle of the monitor chosen above.
                     unsafe {
                         let mut mi: MONITORINFO = std::mem::zeroed();
                         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-                        GetMonitorInfoW(
-                            MonitorFromWindow(std::ptr::null_mut(), MONITOR_DEFAULTTOPRIMARY),
-                            &mut mi,
-                        );
+                        GetMonitorInfoW(target_monitor, &mut mi);
 
                         let mon_width = mi.rcMonitor.right - mi.rcMonitor.left;
                         let mon_height = mi.rcMonitor.bottom - mi.rcMonitor.top;
@@ -777,21 +880,40 @@ impl Window {
 
         let conn = Connection::get().expect("Connection::init was not called");
 
+        // Captured here, next to the call that consumed it: `resolve_geometry`
+        // measures the requested size against this dpi, and `create_window`
+        // needs to know which monitor's scale the result assumed.
+        let creation_dpi = conn.default_dpi() as usize;
         let geometry = conn.resolve_geometry(geometry);
 
-        let hwnd = match Self::create_window(config, class_name, name, geometry, raw) {
-            Ok(hwnd) => HWindow(hwnd),
-            Err(err) => {
-                // Ensure that we drop the extra ref to raw before we return
-                drop(unsafe { Rc::from_raw(raw) });
-                return Err(err);
-            }
-        };
+        let hwnd =
+            match Self::create_window(config.clone(), class_name, name, geometry.clone(), raw) {
+                Ok(hwnd) => HWindow(hwnd),
+                Err(err) => {
+                    // Ensure that we drop the extra ref to raw before we return
+                    drop(unsafe { Rc::from_raw(raw) });
+                    return Err(err);
+                }
+            };
         let window_handle = Window(hwnd);
         inner
             .borrow_mut()
             .events
             .assign_window(window_handle.clone());
+
+        // Deliberately after `assign_window`, not inside `create_window`.
+        // `WindowEventSender::dispatch` drops events until it has a window to
+        // hand the handler, while `check_and_call_resize_if_needed` records
+        // the new size in `last_size` regardless - so correcting the size any
+        // earlier would leave the owner believing the dimensions it asked for
+        // while the later, real resize deduped itself away as "no change".
+        resize_client_for_actual_monitor(
+            hwnd.0,
+            decorations_to_style(config.window_decorations),
+            &config,
+            &geometry,
+            creation_dpi,
+        );
 
         apply_theme(hwnd.0);
         enable_blur_behind(hwnd.0);
@@ -1809,6 +1931,172 @@ unsafe fn wm_enter_exit_size_move(
     if should_size {
         wm_size(hwnd, 0, 0, 0)?;
     }
+
+    Some(0)
+}
+
+/// Asked just before `WM_DPICHANGED`: `wparam` is the dpi the window is moving
+/// to and `lparam` points at a `SIZE` holding the window size Windows intends
+/// to use, which we may overwrite. Returning FALSE keeps Windows' own scaling.
+///
+/// This is the supported place to ask for a different size, and it is what
+/// lets `wm_dpi_changed` accept every suggested rectangle unconditionally.
+///
+/// The one case where Windows' default is wrong for us is an ordinary
+/// floating window whose `dpi` is pinned globally: its layout deliberately
+/// ignores the monitor, so the client area has to keep its pixel size while
+/// the frame around it follows the new scale. Everything else declines:
+///
+/// - Per-monitor `dpi_by_screen` entries cannot be answered here, because the
+///   message carries a dpi but not the monitor it belongs to. Holding the size
+///   would override a per-screen value we are not able to look up, so these
+///   fall through to Windows' scaling and are settled by the resize that
+///   follows.
+/// - Maximized, minimized and our own full-screen windows do not derive their
+///   size from the client area we are holding on to. Answering for them would
+///   pin the *old* monitor's dimensions over the ones Windows computed for the
+///   new one.
+unsafe fn wm_get_dpi_scaled_size(
+    hwnd: HWND,
+    _msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    let inner = rc_from_hwnd(hwnd)?;
+    let (globally_pinned, has_per_screen, self_drawn_full_screen) = {
+        let inner = inner.borrow();
+        (
+            inner.config.dpi.is_some(),
+            !inner.config.dpi_by_screen.is_empty(),
+            inner.saved_placement.is_some(),
+        )
+    };
+
+    // FALSE anywhere below: scale us the way you were going to.
+    if !globally_pinned || has_per_screen || self_drawn_full_screen {
+        return Some(0);
+    }
+    if get_window_state(hwnd)
+        .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN | WindowState::HIDDEN)
+    {
+        return Some(0);
+    }
+
+    let new_dpi = wparam as u32;
+    let size = lparam as *mut SIZE;
+    if size.is_null() || new_dpi == 0 {
+        return Some(0);
+    }
+
+    let mut client: RECT = std::mem::zeroed();
+    if GetClientRect(hwnd, &mut client) == 0 {
+        return Some(0);
+    }
+
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    let (width, height) = adjust_client_to_window_dimensions(
+        style,
+        rect_width(&client).max(0) as usize,
+        rect_height(&client).max(0) as usize,
+        new_dpi,
+    );
+
+    log::trace!("WM_GETDPISCALEDSIZE: dpi is pinned, holding client size at {new_dpi}dpi -> window {width}x{height}");
+
+    (*size).cx = width;
+    (*size).cy = height;
+    // TRUE: use the size we just wrote.
+    Some(1)
+}
+
+/// Windows sends this when the window lands on a monitor with a different
+/// scale factor, and hands us in `lparam` the rectangle it wants us to occupy
+/// there.
+///
+/// Apply it, always. We are manifested `PerMonitorV2`, which makes scaling a
+/// top-level window the application's job, and the message is documented as
+/// "you will need to resize and reposition your window based on the
+/// suggestions provided by lParam and using SetWindowPos. If you do not do
+/// this, your window will grow or shrink with respect to everything else on
+/// the new monitor."
+///
+/// There is no exemption here for maximized or pinned-dpi windows: Windows
+/// tracks maximized state itself and accounts for it in the rectangle, and a
+/// window that wants a different size says so in `wm_get_dpi_scaled_size`,
+/// which is asked first and whose answer becomes the candidate rectangle we
+/// get here.
+///
+/// Our *own* full-screen mode is the exception, because Windows cannot account
+/// for what it does not know about: `toggle_fullscreen` strips the frame off
+/// the window and covers the monitor by hand, so as far as Windows is
+/// concerned this is an ordinary borderless window and it scales the old
+/// rectangle linearly like any other. That lands near, but not on, the new
+/// monitor's bounds - leaving a full-screen window with a seam or overhanging
+/// an edge. Take the monitor the suggestion points at and use its bounds
+/// instead, exactly as `toggle_fullscreen` does. `saved_placement` is left
+/// untouched so leaving full screen still restores the original geometry.
+///
+/// We only move and size. The `WM_WINDOWPOSCHANGED` that our `SetWindowPos`
+/// triggers is what refreshes the dpi, fonts and gpu surface, and
+/// `check_and_call_resize_if_needed` compares against `last_size` before
+/// dispatching, so a suggestion that changes nothing costs one comparison
+/// rather than a second resize.
+unsafe fn wm_dpi_changed(
+    hwnd: HWND,
+    _msg: UINT,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    let suggested = lparam as *const RECT;
+    if suggested.is_null() {
+        return Some(0);
+    }
+    let suggested = *suggested;
+
+    let self_drawn_full_screen =
+        rc_from_hwnd(hwnd).map_or(false, |inner| inner.borrow().saved_placement.is_some());
+
+    let target = if self_drawn_full_screen {
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let mon = MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST);
+        if GetMonitorInfoW(mon, &mut mi) != 0 {
+            mi.rcMonitor
+        } else {
+            suggested
+        }
+    } else {
+        suggested
+    };
+
+    let width = rect_width(&target);
+    let height = rect_height(&target);
+    if width <= 0 || height <= 0 {
+        return Some(0);
+    }
+
+    log::trace!(
+        "WM_DPICHANGED: taking {} rect {}x{} at {},{}",
+        if self_drawn_full_screen {
+            "target monitor"
+        } else {
+            "suggested"
+        },
+        width,
+        height,
+        target.left,
+        target.top
+    );
+
+    SetWindowPos(
+        hwnd,
+        null_mut(),
+        target.left,
+        target.top,
+        width,
+        height,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
 
     Some(0)
 }
@@ -3208,6 +3496,8 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_NCHITTEST => wm_nchittest(hwnd, msg, wparam, lparam),
         WM_PAINT => wm_paint(hwnd, msg, wparam, lparam),
         WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE => wm_enter_exit_size_move(hwnd, msg, wparam, lparam),
+        WM_GETDPISCALEDSIZE => wm_get_dpi_scaled_size(hwnd, msg, wparam, lparam),
+        WM_DPICHANGED => wm_dpi_changed(hwnd, msg, wparam, lparam),
         WM_WINDOWPOSCHANGED => wm_windowposchanged(hwnd, msg, wparam, lparam),
         WM_SETFOCUS => wm_set_focus(hwnd, msg, wparam, lparam),
         WM_KILLFOCUS => wm_kill_focus(hwnd, msg, wparam, lparam),
