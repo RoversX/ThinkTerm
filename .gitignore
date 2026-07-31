@@ -71,3 +71,9 @@ __pycache__/
 /docs/
 ThinkTerm-macos-v0.1.0.zip
 *.md
+
+# Keep ThinkTerm-specific design documentation under version control.
+!/docs/
+/docs/*
+!/docs/thinkterm/
+!/docs/thinkterm/*.md
