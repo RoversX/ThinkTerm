@@ -1703,7 +1703,7 @@ impl WindowInner {
         // pop-up until after our caller releases the borrow.
         let view = self.view.clone();
         promise::spawn::spawn(async move {
-            unsafe {
+            let selected = unsafe {
                 let frame = NSView::frame(*view as *mut _);
                 let backing_frame = NSView::convertRectToBacking(*view as *mut _, frame);
                 let scale = if frame.size.width > 0.0 {
@@ -1712,7 +1712,21 @@ impl WindowInner {
                     1.0
                 };
 
-                menu.pop_up_at(*view, coords.x as f64 / scale, coords.y as f64 / scale);
+                menu.pop_up_at(*view, coords.x as f64 / scale, coords.y as f64 / scale)
+            };
+            // Cocoa dispatches a selected action synchronously while tracking
+            // the menu. That action may open another native menu and install
+            // new pending confirmation state before this call returns, so the
+            // original menu must only cancel state when it closed *without*
+            // a selection (Escape or a click outside).
+            if !selected {
+                if let Some(window_view) = WindowView::get_this(unsafe { &**view }) {
+                    window_view
+                        .inner
+                        .borrow_mut()
+                        .events
+                        .dispatch(WindowEvent::ContextMenuDismissed);
+                }
             }
         })
         .detach();

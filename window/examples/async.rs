@@ -90,6 +90,7 @@ impl MyWindow {
             | WindowEvent::DroppedString(_)
             | WindowEvent::PerformKeyAssignment(_)
             | WindowEvent::PerformContextMenuAction(_)
+            | WindowEvent::ContextMenuDismissed
             | WindowEvent::NativeTextInputReplace { .. }
             | WindowEvent::ToggleWorkspaceSidebar
             | WindowEvent::MouseLeave

@@ -949,7 +949,7 @@ impl Tab {
     /// this algorithm biases towards adjusting the left/top nodes
     /// first.  For large resizes this tends to proportionally adjust
     /// the relative sizes of the elements in a split.
-    pub fn resize(&self, size: TerminalSize) {
+    pub fn resize(&self, size: TerminalSize) -> bool {
         self.inner.lock().resize(size)
     }
 
@@ -1788,10 +1788,10 @@ impl TabInner {
         self.size
     }
 
-    fn resize(&mut self, size: TerminalSize) {
+    fn resize(&mut self, size: TerminalSize) -> bool {
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
-            return;
+            return false;
         }
 
         // No-op resizes must not emit TabResized: for mux client tabs the
@@ -1800,7 +1800,7 @@ impl TabInner {
         // transient client/server size disagreement into an endless
         // resize/resync storm that visibly flickers the window contents.
         if size == self.size {
-            return;
+            return false;
         }
 
         if let Some(zoomed) = &self.zoomed {
@@ -1826,6 +1826,15 @@ impl TabInner {
                 dpi: dims.dpi,
             };
 
+            // The requested size can be smaller than the split tree's
+            // minimum. In that case it clamps back to the size we already
+            // hold; treat that as the same no-op as an exact request. Without
+            // this second check, a GUI recovery pass can emit TabResized on
+            // every frame even though no geometry can change.
+            if size == self.size {
+                return false;
+            }
+
             // Update the split nodes with adjusted sizes
             adjust_x_size(
                 self.pane.as_mut().unwrap(),
@@ -1847,6 +1856,7 @@ impl TabInner {
         }
 
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        true
     }
 
     fn apply_pane_size(&mut self, pane_size: TerminalSize, cursor: &mut Cursor) {
@@ -3849,6 +3859,37 @@ mod test {
     fn install_mux() -> MuxTestGuard {
         Mux::set_mux(&Arc::new(Mux::new(None)));
         MuxTestGuard
+    }
+
+    #[test]
+    fn resize_clamped_to_the_split_minimum_becomes_a_noop() {
+        let _mux = install_mux();
+        let size = test_size();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        let split_size = tab
+            .compute_split_size(0, SplitRequest::default())
+            .expect("initial tab can split");
+        tab.split_and_insert(
+            0,
+            SplitRequest::default(),
+            FakePane::new(2, split_size.second),
+        )
+        .expect("split succeeds");
+
+        let tiny = TerminalSize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 10,
+            pixel_height: 25,
+            dpi: 96,
+        };
+        assert!(tab.inner.lock().resize(tiny));
+        assert!(tab.get_size().cols > tiny.cols);
+        assert!(
+            !tab.inner.lock().resize(tiny),
+            "the same clamped result must not emit another TabResized"
+        );
     }
 
     #[test]

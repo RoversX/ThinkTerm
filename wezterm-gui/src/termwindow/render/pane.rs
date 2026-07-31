@@ -36,6 +36,72 @@ use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 use window::MouseEventKind as WMEK;
 
+fn clamp_pane_horizontal_span(
+    pane_left: f32,
+    candidate_right: f32,
+    viewport_right: f32,
+) -> (f32, f32) {
+    let viewport_right = viewport_right.max(0.0);
+    if viewport_right <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    // Leave a one-pixel span even for corrupt/stale geometry whose left edge
+    // is already beyond the viewport. Normal pane layouts never need this,
+    // but it keeps every caller's rectangle valid without allowing it to
+    // cross into the sidebar.
+    let pane_left = pane_left.max(0.0).min((viewport_right - 1.0).max(0.0));
+    let pane_right = candidate_right.max(pane_left + 1.0).min(viewport_right);
+    (pane_left, (pane_right - pane_left).max(0.0))
+}
+
+fn visible_render_columns(
+    requested_cols: usize,
+    content_left: f32,
+    viewport_right: f32,
+    cell_width: f32,
+) -> usize {
+    if requested_cols == 0 || cell_width <= 0.0 {
+        return 0;
+    }
+    let visible_width = (viewport_right - content_left).max(0.0);
+    requested_cols.min((visible_width / cell_width).floor().max(0.0) as usize)
+}
+
+#[cfg(test)]
+mod pane_geometry_tests {
+    use super::{clamp_pane_horizontal_span, visible_render_columns};
+
+    #[test]
+    fn stale_pane_geometry_stops_at_the_sidebar_edge() {
+        let (left, width) = clamp_pane_horizontal_span(354.0, 1_210.0, 802.0);
+        assert_eq!(left, 354.0);
+        assert_eq!(left + width, 802.0);
+    }
+
+    #[test]
+    fn valid_split_spans_still_meet_without_a_gap() {
+        let (left_x, left_width) = clamp_pane_horizontal_span(0.0, 354.0, 802.0);
+        let (right_x, right_width) = clamp_pane_horizontal_span(354.0, 802.0, 802.0);
+        assert_eq!(left_x + left_width, right_x);
+        assert_eq!(right_x + right_width, 802.0);
+    }
+
+    #[test]
+    fn a_pane_starting_beyond_the_viewport_cannot_escape_it() {
+        let (left, width) = clamp_pane_horizontal_span(900.0, 1_210.0, 802.0);
+        assert!(left >= 0.0);
+        assert_eq!(left + width, 802.0);
+    }
+
+    #[test]
+    fn terminal_columns_are_clipped_while_old_geometry_is_being_repaired() {
+        assert_eq!(visible_render_columns(100, 354.0, 802.0, 10.0), 44);
+        assert_eq!(visible_render_columns(30, 354.0, 802.0, 10.0), 30);
+        assert_eq!(visible_render_columns(100, 900.0, 802.0, 10.0), 0);
+    }
+}
+
 /// Milliseconds since the mux server last responded, when the pane's
 /// connection looks unhealthy (a reconnect is pending or in progress).
 /// None for local panes and for healthy client panes.
@@ -61,6 +127,14 @@ impl crate::TermWindow {
             pos.pixel_height
                 .saturating_sub(self.render_metrics.cell_size.height.max(1) as usize),
         )
+    }
+
+    pub(crate) fn terminal_viewport_right(&self) -> f32 {
+        let border = self.get_os_border();
+        self.dimensions
+            .pixel_width
+            .saturating_sub(border.right.get() as usize)
+            .saturating_sub(self.right_sidebar_width()) as f32
     }
 
     fn pane_content_origin(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {
@@ -102,16 +176,16 @@ impl crate::TermWindow {
             content_pane_x - cell_w / 2.0
         };
         let is_rightmost = pos.left + pos.width >= self.terminal_size.cols;
-        let right = if is_rightmost {
-            let border = self.get_os_border();
-            (self.dimensions.pixel_width as f32
-                - border.right.get() as f32
-                - self.right_sidebar_width() as f32)
-                .max(content_pane_right)
+        let candidate_right = if is_rightmost {
+            self.terminal_viewport_right()
         } else {
             content_pane_right + cell_w / 2.0
         };
-        Ok((pane_x, (right - pane_x).max(1.0)))
+        Ok(clamp_pane_horizontal_span(
+            pane_x,
+            candidate_right,
+            self.terminal_viewport_right(),
+        ))
     }
 
     pub(crate) fn pane_frame_rect(&self, pos: &PositionedPane) -> anyhow::Result<RectF> {
@@ -1057,7 +1131,19 @@ impl crate::TermWindow {
                 let (fonts, metrics) = self.pane_font_resources(pane_font_scale)?;
                 (Some(fonts), metrics)
             };
-        let render_dims = dims;
+        let content_left = padding_left
+            + border.left.get() as f32
+            + pos.left as f32 * global_render_metrics.cell_size.width as f32;
+        let visible_cols = visible_render_columns(
+            dims.cols,
+            content_left,
+            self.terminal_viewport_right(),
+            pane_render_metrics.cell_size.width.max(1) as f32,
+        );
+        let mut render_dims = dims;
+        render_dims.cols = visible_cols;
+        render_dims.pixel_width =
+            visible_cols.saturating_mul(pane_render_metrics.cell_size.width.max(1) as usize);
 
         let gl_state = self.render_state.as_ref().unwrap();
 
@@ -1112,15 +1198,17 @@ impl crate::TermWindow {
                     cell_height,
                 )
             };
+            let candidate_right = if pos.left + pos.width >= self.terminal_size.cols as usize {
+                self.terminal_viewport_right()
+            } else {
+                x + (pos.width as f32 * cell_width) + width_delta
+            };
+            let (x, width) =
+                clamp_pane_horizontal_span(x, candidate_right, self.terminal_viewport_right());
             euclid::rect(
                 x,
                 y,
-                // Go all the way to the right edge if we're right-most
-                if pos.left + pos.width >= self.terminal_size.cols as usize {
-                    self.dimensions.pixel_width as f32 - x
-                } else {
-                    (pos.width as f32 * cell_width) + width_delta
-                },
+                width,
                 // Go all the way to the bottom if we're bottom-most
                 if pos.top + pos.height >= self.terminal_size.rows as usize {
                     self.dimensions.pixel_height as f32 - y
@@ -1328,9 +1416,7 @@ impl crate::TermWindow {
                 error: Option<anyhow::Error>,
             }
 
-            let left_pixel_x = padding_left
-                + border.left.get() as f32
-                + (pos.left as f32 * global_render_metrics.cell_size.width as f32);
+            let left_pixel_x = content_left;
             let pane_top_pixel_y = top_pixel_y
                 + (pos.top as f32 * global_render_metrics.cell_size.height as f32)
                 + pane_nav_height as f32;
@@ -1631,15 +1717,21 @@ impl crate::TermWindow {
             )
         };
 
-        let background_rect = euclid::rect(
+        let candidate_background_right = if pos.left + pos.width >= self.terminal_size.cols as usize
+        {
+            self.terminal_viewport_right()
+        } else {
+            x + (pos.width as f32 * cell_width) + width_delta
+        };
+        let (background_x, background_width) = clamp_pane_horizontal_span(
             x,
+            candidate_background_right,
+            self.terminal_viewport_right(),
+        );
+        let background_rect = euclid::rect(
+            background_x,
             y,
-            // Go all the way to the right edge if we're right-most
-            if pos.left + pos.width >= self.terminal_size.cols as usize {
-                self.dimensions.pixel_width as f32 - x
-            } else {
-                (pos.width as f32 * cell_width) + width_delta
-            },
+            background_width,
             // Go all the way to the bottom if we're bottom-most
             if pos.top + pos.height >= self.terminal_size.rows as usize {
                 self.dimensions.pixel_height as f32 - y
@@ -1649,11 +1741,17 @@ impl crate::TermWindow {
         );
 
         // Bounds for the terminal cells
+        let content_x = padding_left + border.left.get() as f32 - (cell_width / 2.0)
+            + (pos.left as f32 * cell_width);
+        let (content_x, content_width) = clamp_pane_horizontal_span(
+            content_x,
+            content_x + pos.width as f32 * cell_width,
+            self.terminal_viewport_right(),
+        );
         let content_rect = euclid::rect(
-            padding_left + border.left.get() as f32 - (cell_width / 2.0)
-                + (pos.left as f32 * cell_width),
+            content_x,
             top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
-            pos.width as f32 * cell_width,
+            content_width,
             pos.height as f32 * cell_height,
         );
 

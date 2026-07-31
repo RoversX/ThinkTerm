@@ -98,6 +98,7 @@ pub mod paneselect;
 mod prevcursor;
 pub(crate) mod remote_files;
 pub mod remote_thread_view;
+pub(crate) mod remote_walk;
 pub mod render;
 pub mod resize;
 mod selection;
@@ -298,7 +299,45 @@ pub(crate) enum ContextMenuApplicationAction {
     /// Sidebar view-options: show/hide threads with this work status.
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
     /// Fetch a file from the remote Files panel into the Downloads folder.
-    DownloadRemoteFile(remote_files::RemotePath),
+    DownloadRemoteFile {
+        path: remote_files::RemotePath,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+    /// Fetch a whole remote directory. Carries the click position so a
+    /// "really download N items?" prompt can appear where the user is looking
+    /// — the walk is asynchronous, so the pointer has moved on by then.
+    DownloadRemoteFolder {
+        path: remote_files::RemotePath,
+        anchor: ::window::Point,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+    /// Delete a remote file or folder, after a confirmation anchored likewise.
+    DeleteRemoteEntry {
+        path: remote_files::RemotePath,
+        anchor: ::window::Point,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+    /// Begin an inline rename of a remote row.
+    RenameRemoteEntry {
+        path: remote_files::RemotePath,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+    /// Create a fresh `untitled folder` under this remote directory.
+    NewRemoteFolder {
+        parent: remote_files::RemotePath,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+    /// Run a finished transfer again from its recorded source. Carries the
+    /// menu's position so a retried folder download can re-raise its size
+    /// confirmation in place.
+    RetryRemoteTransfer {
+        id: u64,
+        anchor: ::window::Point,
+    },
+    /// Clear a finished transfer row away.
+    DismissRemoteTransfer(u64),
+    /// The user's answer to whatever [`PendingRemoteConfirm`] is waiting.
+    ResolveRemoteConfirm(bool),
     /// Copy the remote preview's selected text, or the whole buffer.
     CopyRemotePreviewSelection,
     CopyRemotePreviewAll,
@@ -608,13 +647,46 @@ pub(crate) struct PendingLocalCopy {
     pub directory: PathBuf,
     /// Destination-relative paths that already exist.
     pub conflicts: std::collections::HashSet<PathBuf>,
-    /// Where the drop landed, so the prompt appears there rather than at some
-    /// default corner — the walk is asynchronous, so the pointer has moved on
-    /// by the time we can ask.
-    pub anchor: ::window::Point,
     /// What the walk left out, carried through so the finished row can say so
     /// rather than reporting a clean success over silently omitted data.
     pub note: Option<String>,
+}
+
+/// A remote operation waiting on an explicit yes from the user before it is
+/// allowed to touch anything. One slot, not one per operation: only one
+/// confirmation menu can be on screen, and starting a new one supersedes (and
+/// cancels) whatever was still waiting.
+pub(crate) enum PendingRemoteConfirm {
+    /// A folder download whose walk finished large enough to ask about.
+    FolderDownload {
+        transfer_id: u64,
+        plan: remote_walk::RemoteWalkPlan,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+    /// A folder delete: always confirmed, whatever its size — there is no
+    /// trash on the far side to undo it from.
+    FolderDelete {
+        transfer_id: u64,
+        remote: remote_files::RemotePath,
+        plan: remote_walk::RemoteWalkPlan,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+    /// A single-file delete. No transfer row: it either happens or reports
+    /// through the panel's notice line.
+    FileDelete {
+        remote: remote_files::RemotePath,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+    /// A folder upload whose plan crossed the confirmation threshold.
+    FolderUpload {
+        transfer_id: u64,
+        directory: remote_files::RemotePath,
+        plan: transfer_walk::TransferPlan,
+        origin: remote_files::RemoteOperationOrigin,
+        /// Terminal drops paste the landed folder's remote path here once the
+        /// upload finishes; panel drops carry `None`.
+        paste_target: Option<(mux::pane::PaneId, remote_files::RemotePath)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -799,40 +871,45 @@ enum InlineTabRenameTarget {
     WorkspaceThread(String),
     /// A file row in the right sidebar Files panel; commits via fs::rename.
     File(PathBuf),
+    /// A row in the REMOTE Files panel; commits via an SFTP rename, so unlike
+    /// every other target the commit is asynchronous and reports its failure
+    /// through the panel's notice line rather than a log.
+    RemoteFile {
+        path: remote_files::RemotePath,
+        source_key: String,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct InlineTabRename {
     target: InlineTabRenameTarget,
-    text: String,
-    cursor: usize,
-    selection_anchor: Option<usize>,
+    input: TextInputState,
 }
 
 impl InlineTabRename {
     fn new(target: InlineTabRenameTarget, text: String) -> Self {
-        let cursor = text.chars().count();
-        Self {
-            target,
-            text,
-            cursor,
-            selection_anchor: Some(0),
-        }
+        let mut input = TextInputState::new();
+        input.set_text_end(text);
+        input.caret_select_all();
+        Self { target, input }
     }
 
+    /// Legacy tab surfaces still paint their inline editor as title text. File
+    /// rows use the real shared text-input painter; keep this adapter for tabs
+    /// until those surfaces move to the same widget.
     fn display_text(&self) -> String {
-        if self.has_selection() {
-            return if self.text.is_empty() {
+        if self.input.caret_selection_range().is_some() {
+            return if self.input.is_empty() {
                 "|".to_string()
             } else {
-                self.text.clone()
+                self.input.text().to_string()
             };
         }
 
         let mut text = String::new();
         let mut inserted_cursor = false;
-        for (idx, ch) in self.text.chars().enumerate() {
-            if idx == self.cursor {
+        for (idx, ch) in self.input.text().chars().enumerate() {
+            if idx == self.input.cursor {
                 text.push('|');
                 inserted_cursor = true;
             }
@@ -842,111 +919,6 @@ impl InlineTabRename {
             text.push('|');
         }
         text
-    }
-
-    fn len(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    fn byte_idx(&self, char_idx: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(char_idx)
-            .map(|(idx, _)| idx)
-            .unwrap_or_else(|| self.text.len())
-    }
-
-    fn selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.selection_anchor?;
-        if anchor == self.cursor {
-            None
-        } else if anchor < self.cursor {
-            Some((anchor, self.cursor))
-        } else {
-            Some((self.cursor, anchor))
-        }
-    }
-
-    fn has_selection(&self) -> bool {
-        self.selection_range().is_some()
-    }
-
-    fn selected_text(&self) -> Option<String> {
-        let (start, end) = self.selection_range()?;
-        Some(
-            self.text
-                .chars()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .collect(),
-        )
-    }
-
-    fn select_all(&mut self) {
-        self.selection_anchor = Some(0);
-        self.cursor = self.len();
-    }
-
-    fn clear_selection(&mut self) {
-        self.selection_anchor = None;
-    }
-
-    fn delete_selection(&mut self) -> bool {
-        let Some((start, end)) = self.selection_range() else {
-            return false;
-        };
-        let start_byte = self.byte_idx(start);
-        let end_byte = self.byte_idx(end);
-        self.text.replace_range(start_byte..end_byte, "");
-        self.cursor = start;
-        self.clear_selection();
-        true
-    }
-
-    fn insert(&mut self, text: &str) {
-        self.delete_selection();
-        for ch in text.chars() {
-            if matches!(ch, '\r' | '\n') {
-                continue;
-            }
-            let byte_idx = self.byte_idx(self.cursor);
-            self.text.insert(byte_idx, ch);
-            self.cursor += 1;
-        }
-    }
-
-    fn backspace(&mut self) {
-        if self.delete_selection() {
-            return;
-        }
-        if self.cursor == 0 {
-            return;
-        }
-        let remove_idx = self.cursor - 1;
-        let byte_idx = self.byte_idx(remove_idx);
-        self.text.remove(byte_idx);
-        self.cursor = remove_idx;
-    }
-
-    fn delete(&mut self) {
-        if self.delete_selection() {
-            return;
-        }
-        let byte_idx = self.byte_idx(self.cursor);
-        if byte_idx == self.text.len() {
-            return;
-        }
-        self.text.remove(byte_idx);
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-        self.clear_selection();
-    }
-
-    fn move_right(&mut self) {
-        self.cursor = self.cursor.saturating_add(1).min(self.len());
-        self.clear_selection();
     }
 }
 
@@ -1420,6 +1392,16 @@ pub struct TermWindow {
     right_sidebar_local_drop_target: Option<PathBuf>,
     /// A local copy waiting on the user's answer about existing files.
     pending_local_copy: Option<PendingLocalCopy>,
+    /// A remote operation waiting on its confirmation menu. Superseded (and
+    /// cancelled) by any newer confirmation, and cleared when its menu is
+    /// dismissed without an answer.
+    pending_remote_confirm: Option<PendingRemoteConfirm>,
+    /// A freshly created remote folder that should drop into an inline rename
+    /// as soon as the re-listed directory actually shows its row.
+    pending_remote_rename: Option<(
+        remote_files::RemotePath,
+        remote_files::RemoteOperationOrigin,
+    )>,
     /// Bumped by every drop. A preflight walk that comes back carrying an old
     /// value has been superseded — two walks can finish out of order, and the
     /// slower, older one must not replace the newer prompt.
@@ -2079,6 +2061,8 @@ impl TermWindow {
             right_sidebar_remote_drop_target: None,
             right_sidebar_local_drop_target: None,
             pending_local_copy: None,
+            pending_remote_confirm: None,
+            pending_remote_rename: None,
             local_copy_generation: 0,
             pending_local_copy_conflict_count: 0,
             right_sidebar_remote_file_tree_scroll_offset: 0.0,
@@ -2295,6 +2279,11 @@ impl TermWindow {
                 window.invalidate();
                 Ok(true)
             }
+            WindowEvent::ContextMenuDismissed => {
+                self.context_menu_was_dismissed();
+                window.invalidate();
+                Ok(true)
+            }
             WindowEvent::FocusChanged(focused) => {
                 self.focus_changed(focused, window);
                 Ok(true)
@@ -2488,6 +2477,12 @@ impl TermWindow {
                 // The walk runs on a worker, so any conflict prompt is raised
                 // when it comes back rather than here.
                 if self.copy_dropped_files_into_local_panel(&paths, coords) {
+                    return Ok(true);
+                }
+                // A drop on the terminal of a REMOTE session: pasting a local
+                // path there would name a file the server does not have, so
+                // upload first and paste the remote path instead.
+                if self.upload_dropped_files_to_remote_terminal(&paths, coords) {
                     return Ok(true);
                 }
                 let pane = match self.get_active_pane_or_overlay() {
@@ -2759,10 +2754,11 @@ impl TermWindow {
                     // reattach) get their persisted per-pane font scales
                     // re-applied; the adopt-time application ran before
                     // these panes existed.
-                    self.apply_workspace_thread_font_scales();
+                    self.stage_workspace_thread_font_scales();
                     // Remote panes are skipped by Tab::resize. A tab can arrive
                     // while the connection content view suppresses paint-time
-                    // pane sync, so impose the actual GUI geometry immediately.
+                    // pane sync, so impose the final font-scaled GUI geometry
+                    // exactly once.
                     self.force_sync_active_mux_tab_pane_sizes();
                     self.persist_workspace_layout_after_mutation("tab added");
                 }
@@ -2909,16 +2905,24 @@ impl TermWindow {
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
 
+        // Restore every destination-side geometry input before sizing panes.
+        // consume_pending_sidebar_reflow can synchronously apply dimensions,
+        // so persisted font scales must already be present before it runs.
+        // Otherwise a remote TUI can receive an intermediate SIGWINCH followed
+        // by the final one and corrupt its redraw.
+        self.stage_workspace_thread_font_scales();
+
         // The destination window is adopted; a Space switch that changed the
         // sidebar width can resize the terminal now without touching the
-        // window being left.
+        // window being left. ClientPane and Tab both no-op the explicit final
+        // sync below if this already imposed exactly the same geometry.
         self.consume_pending_sidebar_reflow();
 
         // Tab::resize updates the local split tree but deliberately skips
-        // remote mirror panes. Force the per-pane GUI-sized resize now rather
-        // than waiting for a later paint (a connection view may still be up).
+        // remote mirror panes. Force the final per-pane GUI-sized resize now
+        // rather than waiting for a later paint (a connection view may still
+        // be up).
         self.resize_mux_tabs_to_current_terminal_size();
-        self.apply_workspace_thread_font_scales();
         self.sync_current_workspace_thread();
 
         // A Space/thread switch can replace the active pane without changing
@@ -4857,6 +4861,10 @@ impl TermWindow {
             (InlineTabRenameTarget::File(path), UIItemType::RightSidebarFileRow(other)) => {
                 path == other
             }
+            (
+                InlineTabRenameTarget::RemoteFile { path, .. },
+                UIItemType::RightSidebarRemoteFileRow(other),
+            ) => path == other,
             _ => false,
         }
     }
@@ -4868,7 +4876,7 @@ impl TermWindow {
         };
 
         if commit {
-            let title = rename.text.trim().to_string();
+            let title = rename.input.text().trim().to_string();
             match rename.target {
                 InlineTabRenameTarget::WindowTab(tab_id) => {
                     if let Some(tab) = Mux::get().get_tab(tab_id) {
@@ -4893,6 +4901,9 @@ impl TermWindow {
                 }
                 InlineTabRenameTarget::File(path) => {
                     self.commit_sidebar_file_rename(path, &title);
+                }
+                InlineTabRenameTarget::RemoteFile { path, source_key } => {
+                    self.commit_sidebar_remote_file_rename(path, source_key, &title);
                 }
             }
         }
@@ -4925,7 +4936,7 @@ impl TermWindow {
             return;
         };
         let new_path = parent.join(new_name);
-        if new_path.exists() {
+        if remote_files::local_path_is_occupied(&new_path) {
             log::warn!(
                 "not renaming {} to {new_name}: target already exists",
                 old_path.display()
@@ -4942,18 +4953,130 @@ impl TermWindow {
         self.force_right_sidebar_file_rescan();
     }
 
+    pub(crate) fn start_sidebar_remote_file_rename(&mut self, path: remote_files::RemotePath) {
+        self.finish_inline_tab_rename(true);
+        let Some(source_key) = self.right_sidebar_remote_files.current_source_key() else {
+            return;
+        };
+        self.inline_tab_rename = Some(InlineTabRename::new(
+            InlineTabRenameTarget::RemoteFile {
+                path: path.clone(),
+                source_key,
+            },
+            path.file_name().to_string(),
+        ));
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    fn commit_sidebar_remote_file_rename(
+        &mut self,
+        old: remote_files::RemotePath,
+        source_key: String,
+        new_name: &str,
+    ) {
+        if new_name.is_empty() || old.file_name() == new_name {
+            return;
+        }
+        if self
+            .right_sidebar_remote_files
+            .current_source_key()
+            .as_deref()
+            != Some(source_key.as_str())
+        {
+            // The editor belonged to a different tree. Never reinterpret its
+            // absolute path against whichever host is visible now.
+            return;
+        }
+        let Some(parent) = old.parent() else {
+            return;
+        };
+        // join_name refuses separators, `..` and NUL; anything else is the
+        // server's to accept or reject.
+        let new = match parent.join_name(new_name) {
+            Ok(new) => new,
+            Err(err) => {
+                self.right_sidebar_remote_files.error_message = Some(err);
+                self.invalidate_window();
+                return;
+            }
+        };
+        let Some(origin) = self.current_remote_operation_origin() else {
+            self.right_sidebar_remote_files.error_message =
+                Some("Remote Files source is no longer available".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles(&origin)
+        else {
+            self.right_sidebar_remote_files.error_message =
+                Some("Remote Files connection is no longer available".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            // No-overwrite by contract: a taken name is the server's failure
+            // to report, and shows up on the panel's notice line.
+            let result = backend.rename(old.clone(), new).await;
+            drop(operation_lease);
+            let connection_died = result.as_ref().is_err_and(|message| {
+                remote_files::invalidate_remote_connection_if_dead(
+                    &connection_key,
+                    connection_id,
+                    message,
+                )
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                // A rename and a delete leave the tree in the same state as
+                // far as the OLD path is concerned: gone. Same tail.
+                term_window.finish_remote_entry_removal(
+                    old,
+                    result,
+                    origin,
+                    connection_key,
+                    connection_id,
+                    connection_died,
+                );
+            })));
+        })
+        .detach();
+    }
+
+    pub(crate) fn is_renaming_sidebar_remote_file(&self, path: &remote_files::RemotePath) -> bool {
+        self.inline_tab_rename.as_ref().is_some_and(
+            |rename| matches!(&rename.target, InlineTabRenameTarget::RemoteFile { path: p, .. } if p == path),
+        )
+    }
+
+    pub(crate) fn sidebar_remote_file_rename_input(
+        &self,
+        path: &remote_files::RemotePath,
+    ) -> Option<&TextInputState> {
+        self.inline_tab_rename.as_ref().and_then(|rename| {
+            matches!(
+                &rename.target,
+                InlineTabRenameTarget::RemoteFile { path: current, .. } if current == path
+            )
+            .then_some(&rename.input)
+        })
+    }
+
     pub(crate) fn is_renaming_sidebar_file(&self, path: &Path) -> bool {
         self.inline_tab_rename.as_ref().is_some_and(
             |rename| matches!(&rename.target, InlineTabRenameTarget::File(p) if p == path),
         )
     }
 
-    pub(crate) fn sidebar_file_row_title(&self, path: &Path, name: &str) -> String {
-        self.inline_tab_rename
-            .as_ref()
-            .filter(|rename| matches!(&rename.target, InlineTabRenameTarget::File(p) if p == path))
-            .map(|rename| rename.display_text())
-            .unwrap_or_else(|| name.to_string())
+    pub(crate) fn sidebar_file_rename_input(&self, path: &Path) -> Option<&TextInputState> {
+        self.inline_tab_rename.as_ref().and_then(|rename| {
+            matches!(&rename.target, InlineTabRenameTarget::File(current) if current == path)
+                .then_some(&rename.input)
+        })
     }
 
     fn inline_window_tab_rename_title(&self, tab_id: TabId) -> Option<String> {
@@ -4972,7 +5095,8 @@ impl TermWindow {
                 | InlineTabRenameTarget::Space(_)
                 | InlineTabRenameTarget::Project(_)
                 | InlineTabRenameTarget::WorkspaceThread(_)
-                | InlineTabRenameTarget::File(_) => None,
+                | InlineTabRenameTarget::File(_)
+                | InlineTabRenameTarget::RemoteFile { .. } => None,
             })
     }
 

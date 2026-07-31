@@ -572,6 +572,11 @@ impl crate::TermWindow {
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
 
+        // The right sidebar is part of the local window geometry. A deferred
+        // content-view resize or an asynchronous remote resync can leave the
+        // active mux tab at its old full width; heal that before any pane
+        // positions, hit targets or quads are derived from it.
+        self.reconcile_active_mux_tab_size_before_paint();
         self.sync_pane_font_sizes();
         let panes = self.get_panes_to_render();
         let focused = self.focused.is_some();

@@ -295,6 +295,10 @@ pub(crate) struct NativeWorkspaceSettings {
     /// puts downloads", which is what most people want and what keeps the
     /// setting meaningful after moving between machines.
     pub(crate) remote_download_directory: String,
+    /// Where files dropped onto a REMOTE terminal are uploaded, as a remote
+    /// path. Empty means [`DEFAULT_REMOTE_DROP_DESTINATION`]; the literal
+    /// `cwd` means the shell's current directory at drop time.
+    pub(crate) remote_drop_destination: String,
 }
 
 impl Default for NativeWorkspaceSettings {
@@ -302,6 +306,7 @@ impl Default for NativeWorkspaceSettings {
         Self {
             remote_sftp_idle_minutes: DEFAULT_REMOTE_SFTP_IDLE_MINUTES,
             remote_download_directory: String::new(),
+            remote_drop_destination: String::new(),
         }
     }
 }
@@ -369,6 +374,41 @@ pub(crate) fn set_remote_download_directory(path: Option<PathBuf>) -> anyhow::Re
     settings.workspaces.remote_download_directory = path
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_default();
+    save(&settings)
+}
+
+/// Default landing folder for files dropped onto a remote terminal. Visible
+/// on purpose: an upload the user cannot `ls` into might as well not exist,
+/// and the branded name says where it came from.
+pub(crate) const DEFAULT_REMOTE_DROP_DESTINATION: &str = "~/ThinkTerm_Uploads";
+
+/// The literal setting value that means "the shell's current directory".
+pub(crate) const REMOTE_DROP_DESTINATION_CWD: &str = "cwd";
+
+/// The configured remote-drop destination, never empty. Not validated here:
+/// only the remote side can judge a remote path, and its refusal surfaces on
+/// the transfer row where the drop's outcome already lives.
+pub(crate) fn remote_drop_destination() -> String {
+    let configured = load().workspaces.remote_drop_destination;
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        DEFAULT_REMOTE_DROP_DESTINATION.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub(crate) fn set_remote_drop_destination(value: &str) -> anyhow::Result<()> {
+    let mut settings = load();
+    let trimmed = value.trim();
+    // Storing the default as emptiness keeps the file clean and lets a future
+    // default change reach everyone who never made a choice.
+    settings.workspaces.remote_drop_destination =
+        if trimmed.is_empty() || trimmed == DEFAULT_REMOTE_DROP_DESTINATION {
+            String::new()
+        } else {
+            trimmed.to_string()
+        };
     save(&settings)
 }
 

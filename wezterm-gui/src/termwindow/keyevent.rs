@@ -191,7 +191,7 @@ enum OnlyKeyBindings {
 impl super::TermWindow {
     fn paste_text_into_inline_tab_rename(&mut self, text: &str) {
         if let Some(rename) = self.inline_tab_rename.as_mut() {
-            rename.insert(text);
+            rename.input.caret_insert(text, false);
             self.update_title_impl();
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
@@ -212,14 +212,13 @@ impl super::TermWindow {
             return true;
         }
 
-        let mut shortcut_mods = window_key.modifiers;
-        shortcut_mods.remove(Modifiers::SHIFT | Modifiers::LEFT_SHIFT | Modifiers::RIGHT_SHIFT);
-        let super_only = shortcut_mods == Modifiers::SUPER;
-        if super_only {
+        let edit = crate::ui::EditModifiers::from(window_key.modifiers);
+        let shift = edit.shift;
+        if edit.command {
             match &window_key.key {
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     if let Some(rename) = self.inline_tab_rename.as_mut() {
-                        rename.select_all();
+                        rename.input.caret_select_all();
                         self.update_title_impl();
                         context.invalidate();
                     }
@@ -228,8 +227,9 @@ impl super::TermWindow {
                 KeyCode::Char('c') | KeyCode::Char('C') => {
                     if let Some(rename) = self.inline_tab_rename.as_ref() {
                         let text = rename
-                            .selected_text()
-                            .unwrap_or_else(|| rename.text.clone());
+                            .input
+                            .caret_selected_text()
+                            .unwrap_or_else(|| rename.input.text().to_string());
                         context.set_clipboard(Clipboard::Clipboard, text);
                     }
                     return true;
@@ -237,14 +237,14 @@ impl super::TermWindow {
                 KeyCode::Char('x') | KeyCode::Char('X') => {
                     if let Some(rename) = self.inline_tab_rename.as_mut() {
                         let text = rename
-                            .selected_text()
-                            .unwrap_or_else(|| rename.text.clone());
+                            .input
+                            .caret_selected_text()
+                            .unwrap_or_else(|| rename.input.text().to_string());
                         context.set_clipboard(Clipboard::Clipboard, text);
-                        if rename.has_selection() {
-                            rename.delete_selection();
+                        if rename.input.caret_selection_range().is_some() {
+                            rename.input.caret_delete_selection();
                         } else {
-                            rename.text.clear();
-                            rename.cursor = 0;
+                            rename.input.clear();
                         }
                         self.update_title_impl();
                         context.invalidate();
@@ -267,18 +267,63 @@ impl super::TermWindow {
                     }
                     return true;
                 }
+                KeyCode::LeftArrow if cfg!(target_os = "macos") => {
+                    if let Some(rename) = self.inline_tab_rename.as_mut() {
+                        rename.input.caret_move_home(shift);
+                    }
+                    self.update_title_impl();
+                    context.invalidate();
+                    return true;
+                }
+                KeyCode::RightArrow if cfg!(target_os = "macos") => {
+                    if let Some(rename) = self.inline_tab_rename.as_mut() {
+                        rename.input.caret_move_end(shift);
+                    }
+                    self.update_title_impl();
+                    context.invalidate();
+                    return true;
+                }
+                KeyCode::Char('\u{8}') if cfg!(target_os = "macos") => {
+                    if let Some(rename) = self.inline_tab_rename.as_mut() {
+                        rename.input.caret_delete_to_start();
+                    }
+                    self.update_title_impl();
+                    context.invalidate();
+                    return true;
+                }
                 _ => {}
             }
         }
 
-        let text_mod_blockers = Modifiers::ALT
-            | Modifiers::CTRL
-            | Modifiers::SUPER
-            | Modifiers::LEADER
-            | Modifiers::LEFT_ALT
-            | Modifiers::RIGHT_ALT
-            | Modifiers::LEFT_CTRL
-            | Modifiers::RIGHT_CTRL;
+        if edit.word {
+            match &window_key.key {
+                KeyCode::LeftArrow => {
+                    if let Some(rename) = self.inline_tab_rename.as_mut() {
+                        rename.input.caret_word_left(shift);
+                    }
+                    self.update_title_impl();
+                    context.invalidate();
+                    return true;
+                }
+                KeyCode::RightArrow => {
+                    if let Some(rename) = self.inline_tab_rename.as_mut() {
+                        rename.input.caret_word_right(shift);
+                    }
+                    self.update_title_impl();
+                    context.invalidate();
+                    return true;
+                }
+                KeyCode::Char('\u{8}') => {
+                    if let Some(rename) = self.inline_tab_rename.as_mut() {
+                        rename.input.caret_delete_word_back();
+                    }
+                    self.update_title_impl();
+                    context.invalidate();
+                    return true;
+                }
+                _ => {}
+            }
+        }
 
         let mut dirty = false;
         match &window_key.key {
@@ -294,51 +339,49 @@ impl super::TermWindow {
             }
             KeyCode::Char('\u{8}') => {
                 if let Some(rename) = self.inline_tab_rename.as_mut() {
-                    rename.backspace();
+                    rename.input.caret_backspace();
                     dirty = true;
                 }
             }
             KeyCode::Char('\u{7f}') => {
                 if let Some(rename) = self.inline_tab_rename.as_mut() {
-                    rename.delete();
+                    rename.input.caret_delete_forward();
                     dirty = true;
                 }
             }
             KeyCode::LeftArrow => {
                 if let Some(rename) = self.inline_tab_rename.as_mut() {
-                    rename.move_left();
+                    rename.input.caret_move_left(shift);
                     dirty = true;
                 }
             }
             KeyCode::RightArrow => {
                 if let Some(rename) = self.inline_tab_rename.as_mut() {
-                    rename.move_right();
+                    rename.input.caret_move_right(shift);
                     dirty = true;
                 }
             }
             KeyCode::Home => {
                 if let Some(rename) = self.inline_tab_rename.as_mut() {
-                    rename.cursor = 0;
+                    rename.input.caret_move_home(shift);
                     dirty = true;
                 }
             }
             KeyCode::End => {
                 if let Some(rename) = self.inline_tab_rename.as_mut() {
-                    rename.cursor = rename.text.chars().count();
+                    rename.input.caret_move_end(shift);
                     dirty = true;
                 }
             }
-            KeyCode::Char(c)
-                if !window_key.modifiers.intersects(text_mod_blockers) && !c.is_control() =>
-            {
+            KeyCode::Char(c) if edit.plain() && !c.is_control() => {
                 if let Some(rename) = self.inline_tab_rename.as_mut() {
-                    rename.insert(&c.to_string());
+                    rename.input.caret_insert(&c.to_string(), false);
                     dirty = true;
                 }
             }
-            KeyCode::Composed(text) if !window_key.modifiers.intersects(text_mod_blockers) => {
+            KeyCode::Composed(text) if edit.plain() => {
                 if let Some(rename) = self.inline_tab_rename.as_mut() {
-                    rename.insert(text);
+                    rename.input.caret_insert(text, false);
                     dirty = true;
                 }
             }

@@ -349,6 +349,7 @@ enum SettingsAction {
     IncreaseRemoteSftpIdle,
     ResetRemoteSftpIdle,
     ChooseRemoteDownloadDirectory,
+    RemoteDropDestinationInput,
     ResetRemoteDownloadDirectory,
     OpenBottomQuotesJson,
     ResetBottomQuotesJson,
@@ -768,6 +769,8 @@ struct SettingsUiState {
     font_size_input: TextInputState,
     font_family_input: TextInputState,
     font_family_input_dirty: bool,
+    remote_drop_input: TextInputState,
+    remote_drop_input_dirty: bool,
     interaction: InteractionState<SettingsAction>,
     drag: Option<SettingsDrag>,
     open_dropdown: Option<SettingsDropdown>,
@@ -797,6 +800,8 @@ impl SettingsUiState {
             font_size_input: TextInputState::new(),
             font_family_input: TextInputState::new(),
             font_family_input_dirty: false,
+            remote_drop_input: TextInputState::new(),
+            remote_drop_input_dirty: false,
             interaction: InteractionState::default(),
             drag: None,
             open_dropdown: None,
@@ -1350,6 +1355,8 @@ impl SettingsWindow {
                 .clone()
                 .unwrap_or_else(|| Self::effective_font_family(&config)),
         );
+        ui.remote_drop_input
+            .set_text_end(crate::native_settings::remote_drop_destination());
 
         let settings = Rc::new(RefCell::new(Self {
             instance_id,
@@ -1610,7 +1617,11 @@ impl SettingsWindow {
                 self.ui.interaction.hovered = action;
                 self.ui.interaction.pressed = action;
                 match action {
-                    Some(SettingsAction::SearchInput | SettingsAction::FontFamilyInput) => {
+                    Some(
+                        SettingsAction::SearchInput
+                        | SettingsAction::FontFamilyInput
+                        | SettingsAction::RemoteDropDestinationInput,
+                    ) => {
                         self.set_focused_input(action);
                         self.ui.open_dropdown = None;
                     }
@@ -1983,6 +1994,7 @@ impl SettingsWindow {
         match action {
             SettingsAction::SearchInput => Some(&self.ui.search),
             SettingsAction::FontFamilyInput => Some(&self.ui.font_family_input),
+            SettingsAction::RemoteDropDestinationInput => Some(&self.ui.remote_drop_input),
             _ => None,
         }
     }
@@ -2022,6 +2034,11 @@ impl SettingsWindow {
             SettingsAction::FontFamilyInput => {
                 f(&mut self.ui.font_family_input);
                 self.ui.font_family_input_dirty = true;
+                true
+            }
+            SettingsAction::RemoteDropDestinationInput => {
+                f(&mut self.ui.remote_drop_input);
+                self.ui.remote_drop_input_dirty = true;
                 true
             }
             _ => false,
@@ -2125,6 +2142,25 @@ impl SettingsWindow {
         {
             self.save_and_apply_native_terminal_settings();
         }
+        if self.ui.interaction.focused == Some(SettingsAction::RemoteDropDestinationInput) {
+            self.commit_remote_drop_destination_from_ui();
+        }
+    }
+
+    fn commit_remote_drop_destination_from_ui(&mut self) {
+        if !self.ui.remote_drop_input_dirty {
+            return;
+        }
+        self.ui.remote_drop_input_dirty = false;
+        let value = self.ui.remote_drop_input.text().to_string();
+        if let Err(err) = crate::native_settings::set_remote_drop_destination(&value) {
+            log::error!("failed to save the remote drop destination: {err:#}");
+        }
+        // Re-read so the field shows what will actually happen — an emptied
+        // field snaps back to the default it now means.
+        self.ui
+            .remote_drop_input
+            .set_text_end(crate::native_settings::remote_drop_destination());
     }
 
     fn commit_native_terminal_inputs_from_ui(&mut self) -> bool {
@@ -3089,6 +3125,9 @@ impl SettingsWindow {
             SettingsAction::FontFamilyInput => {
                 self.set_focused_input(Some(SettingsAction::FontFamilyInput));
             }
+            SettingsAction::RemoteDropDestinationInput => {
+                self.set_focused_input(Some(SettingsAction::RemoteDropDestinationInput));
+            }
             SettingsAction::ClearSearch => {
                 self.ui.search.clear();
                 self.ui.sidebar_scroll.reset();
@@ -3998,8 +4037,8 @@ impl SettingsWindow {
         let ui_font = Rc::clone(&self.ui_font);
         let scroll = self.ui.content_scroll.offset;
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
-        // Idle timeout, download folder, and the reset beside it.
-        let row_count = 3;
+        // Idle timeout, download folder, its reset, and the drop destination.
+        let row_count = 4;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         self.ui.content_scroll.set_extents(
@@ -4059,6 +4098,19 @@ impl SettingsWindow {
             "Clears the chosen folder so downloads follow this computer's own setting.",
             "Reset",
             SettingsAction::ResetRemoteDownloadDirectory,
+            true,
+        )?;
+        let remote_drop_value = self.ui.remote_drop_input.text().to_string();
+        self.paint_text_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 3.0,
+            row_width,
+            "Remote Drop Destination",
+            "Where files dropped onto a remote terminal are uploaded. Use cwd for the shell's current directory.",
+            &remote_drop_value,
+            crate::native_settings::DEFAULT_REMOTE_DROP_DESTINATION,
+            SettingsAction::RemoteDropDestinationInput,
             true,
         )
     }

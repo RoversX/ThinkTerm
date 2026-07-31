@@ -32,6 +32,32 @@ use wezterm_term::{
     TerminalConfiguration, TerminalSize,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResizeDecision {
+    converge_local_surface: bool,
+    send_rpc: bool,
+}
+
+fn render_dimensions_match_size(dimensions: RenderableDimensions, size: TerminalSize) -> bool {
+    dimensions.cols == size.cols
+        && dimensions.viewport_rows == size.rows
+        && dimensions.pixel_width == size.pixel_width
+        && dimensions.pixel_height == size.pixel_height
+        && dimensions.dpi == size.dpi
+}
+
+fn decide_resize(
+    last_requested: Option<TerminalSize>,
+    dimensions: RenderableDimensions,
+    target: TerminalSize,
+) -> ResizeDecision {
+    let converge_local_surface = !render_dimensions_match_size(dimensions, target);
+    ResizeDecision {
+        converge_local_surface,
+        send_rpc: last_requested != Some(target) && converge_local_surface,
+    }
+}
+
 pub struct ClientPane {
     client: Arc<ClientInner>,
     local_pane_id: PaneId,
@@ -450,40 +476,41 @@ impl Pane for ClientPane {
     }
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
-        {
+        let (decision, prior_requested, advertised) = {
             // Dedupe against the last size WE requested, not against the
             // server-advertised dimensions: mid-split (or any server-side
             // relayout) the advertised dims legitimately disagree with the
             // GUI's still-stale layout for a moment, and re-asserting the
             // stale size would revert the server's pane resize and bake a
             // corrupt geometry into its split tree via
-            // rebuild_splits_sizes_from_contained_panes. Only a real local
-            // layout change may produce a new request.
+            // rebuild_splits_sizes_from_contained_panes.
             let mut requested = self.requested_size.lock();
-            if *requested == Some(size) {
-                return Ok(());
-            }
+            let prior_requested = *requested;
+            let render = self.renderable.lock();
+            let mut inner = render.inner.borrow_mut();
+            let advertised = inner.dimensions;
+            let decision = decide_resize(prior_requested, advertised, size);
             requested.replace(size);
-        }
-        let render = self.renderable.lock();
-        let mut inner = render.inner.borrow_mut();
 
-        let cols = size.cols as usize;
-        let rows = size.rows as usize;
+            if decision.converge_local_surface {
+                inner.apply_local_resize(size);
+            }
+            if decision.send_rpc {
+                inner.update_last_send();
+            }
+            (decision, prior_requested, advertised)
+        };
 
-        if inner.dimensions.cols != cols
-            || inner.dimensions.viewport_rows != rows
-            || inner.dimensions.pixel_width != size.pixel_width
-            || inner.dimensions.pixel_height != size.pixel_height
-        {
-            inner.dimensions.cols = cols;
-            inner.dimensions.viewport_rows = rows;
-            inner.dimensions.pixel_width = size.pixel_width;
-            inner.dimensions.pixel_height = size.pixel_height;
+        log::trace!(
+            "pane {} resize {:?}: requested={:?} advertised={:?} target={:?}",
+            self.local_pane_id,
+            decision,
+            prior_requested,
+            advertised,
+            size
+        );
 
-            // Invalidate any cached rows on a resize
-            inner.make_all_stale();
-
+        if decision.send_rpc {
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id();
@@ -498,7 +525,6 @@ impl Pane for ClientPane {
                     .await
             })
             .detach();
-            inner.update_last_send();
         }
         Ok(())
     }
@@ -755,5 +781,85 @@ impl std::io::Write for PaneWriter {
 
     fn flush(&mut self) -> Result<(), std::io::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn size(cols: usize, rows: usize, dpi: u32) -> TerminalSize {
+        TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * 10,
+            pixel_height: rows * 20,
+            dpi,
+        }
+    }
+
+    fn dimensions(size: TerminalSize) -> RenderableDimensions {
+        RenderableDimensions {
+            cols: size.cols,
+            viewport_rows: size.rows,
+            scrollback_rows: size.rows,
+            dpi: size.dpi,
+            pixel_width: size.pixel_width,
+            pixel_height: size.pixel_height,
+            ..RenderableDimensions::default()
+        }
+    }
+
+    #[test]
+    fn resize_decision_separates_local_convergence_from_rpc() {
+        let target = size(120, 40, 96);
+        let old = size(100, 30, 96);
+
+        assert_eq!(
+            decide_resize(Some(target), dimensions(target), target),
+            ResizeDecision {
+                converge_local_surface: false,
+                send_rpc: false,
+            }
+        );
+        assert_eq!(
+            decide_resize(Some(target), dimensions(old), target),
+            ResizeDecision {
+                converge_local_surface: true,
+                send_rpc: false,
+            },
+            "a delayed server surface must be repaired locally without repeating the RPC"
+        );
+        assert_eq!(
+            decide_resize(Some(old), dimensions(target), target),
+            ResizeDecision {
+                converge_local_surface: false,
+                send_rpc: false,
+            },
+            "a server that already reached the target needs no RPC"
+        );
+        assert_eq!(
+            decide_resize(Some(old), dimensions(old), target),
+            ResizeDecision {
+                converge_local_surface: true,
+                send_rpc: true,
+            },
+            "a genuine target change sends exactly one RPC"
+        );
+    }
+
+    #[test]
+    fn resize_decision_includes_dpi() {
+        let target = size(120, 40, 144);
+        let mut advertised = dimensions(target);
+        advertised.dpi = 96;
+
+        assert_eq!(
+            decide_resize(Some(target), advertised, target),
+            ResizeDecision {
+                converge_local_surface: true,
+                send_rpc: false,
+            }
+        );
     }
 }

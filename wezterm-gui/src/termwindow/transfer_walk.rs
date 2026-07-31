@@ -288,6 +288,16 @@ mod unix_root {
             }
         }
 
+        /// Create a directory only if the final name is completely vacant.
+        pub(crate) fn create_dir_exclusive(&self, relative: &Path) -> Result<()> {
+            let (parent, name) = self.parent_of(relative)?;
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) } == 0 {
+                Ok(())
+            } else {
+                Err(Error::last_os_error())
+            }
+        }
+
         /// Create a new file, failing if anything already holds that name —
         /// including a symlink, which is never followed.
         pub(crate) fn create_file(&self, relative: &Path) -> Result<File> {
@@ -341,6 +351,16 @@ mod unix_root {
             }
         }
 
+        pub(crate) fn remove_dir(&self, relative: &Path) -> Result<()> {
+            let (parent, name) = self.parent_of(relative)?;
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0
+            {
+                Ok(())
+            } else {
+                Err(Error::last_os_error())
+            }
+        }
+
         pub(crate) fn join(&self, relative: &Path) -> PathBuf {
             self.path.join(relative)
         }
@@ -349,10 +369,17 @@ mod unix_root {
 
 /// Path-based stand-in for platforms without `openat`.
 ///
-/// Present so the crate builds everywhere; the local copy that uses it is
-/// reachable only on X11 and macOS, because the Windows and Wayland backends
-/// report no drop position. If that ever changes, this needs the same
-/// handle-based treatment before it can be trusted.
+/// Reachable on Windows since remote FOLDER downloads: they start from a
+/// context menu, not from the drag-drop path whose missing drop position kept
+/// this module dead there. Weaker than the unix version — an intermediate
+/// directory component that is a symlink is followed rather than refused —
+/// but the folder-download use keeps the risk small: its whole tree starts
+/// from a freshly, exclusively created directory, and files are created with
+/// `create_new`, which fails if anything (a link included) wears the name.
+/// The local drag-drop copy remains unreachable here (Windows and Wayland
+/// report no drop position); if that changes, this needs the same
+/// handle-based treatment before it can be trusted for arbitrary
+/// destinations.
 #[cfg(not(unix))]
 mod portable_root {
     use super::DestinationRoot;
@@ -401,6 +428,11 @@ mod portable_root {
             }
         }
 
+        pub(crate) fn create_dir_exclusive(&self, relative: &Path) -> Result<()> {
+            checked(relative)?;
+            fs::create_dir(self.join(relative))
+        }
+
         pub(crate) fn create_file(&self, relative: &Path) -> Result<File> {
             checked(relative)?;
             fs::OpenOptions::new()
@@ -418,6 +450,11 @@ mod portable_root {
         pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
             checked(relative)?;
             fs::remove_file(self.join(relative))
+        }
+
+        pub(crate) fn remove_dir(&self, relative: &Path) -> Result<()> {
+            checked(relative)?;
+            fs::remove_dir(self.join(relative))
         }
 
         pub(crate) fn join(&self, relative: &Path) -> PathBuf {
@@ -551,10 +588,6 @@ pub(crate) struct TransferPreflight {
 }
 
 impl TransferPreflight {
-    pub(crate) fn entry_count(&self) -> usize {
-        self.plans.iter().map(|(_, plan)| plan.entries.len()).sum()
-    }
-
     /// What to tell the user about things the walk deliberately left out.
     /// Silence here would mean reporting success while quietly omitting data.
     pub(crate) fn omission_note(&self) -> Option<String> {
@@ -618,7 +651,7 @@ mod tests {
         let plan = plan_transfer(&src).unwrap();
         let names = relatives(&plan);
 
-        assert!(names.contains(&"proj".to_string()), "{names:?}");
+        assert!(names.contains(&"proj".to_string()), "{:?}", names);
         assert_eq!(plan.file_count(), 3);
         assert_eq!(plan.total_bytes, 8);
 
@@ -629,7 +662,10 @@ mod tests {
                 let parent_index = names.iter().position(|other| other == parent);
                 assert!(
                     parent_index.is_some_and(|parent_index| parent_index < index),
-                    "{parent} must precede {name} in {names:?}"
+                    "{} must precede {} in {:?}",
+                    parent,
+                    name,
+                    names
                 );
             }
         }

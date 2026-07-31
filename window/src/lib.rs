@@ -574,6 +574,9 @@ pub enum WindowEvent {
     /// Dispatches an application-private action selected from a native menu.
     PerformContextMenuAction(u64),
 
+    /// A native context menu finished tracking without a selected item.
+    ContextMenuDismissed,
+
     AdviseModifiersLedStatus(Modifiers, KeyboardLedStatus),
 }
 

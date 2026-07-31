@@ -7350,6 +7350,7 @@ dependencies = [
  "openssl",
  "ordered-float 4.6.0",
  "parking_lot",
+ "percent-encoding",
  "phf",
  "phf_codegen 0.10.0",
  "portable-pty",

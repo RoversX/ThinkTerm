@@ -8,11 +8,15 @@ use crate::markdown_editor::{
 };
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::remote_files::{
-    invalidate_remote_connection, invalidate_remote_connection_if_dead, remote_connection_key,
-    remote_connection_manager, reserve_download_path, RemoteAcquireError, RemoteFileBytes,
+    download_name_candidates, invalidate_remote_connection, invalidate_remote_connection_if_dead,
+    local_path_is_occupied, remote_connection_key, remote_connection_manager,
+    reserve_download_directory, reserve_download_path, RemoteAcquireError, RemoteFileBytes,
     RemoteFileKind, RemoteFileRow, RemoteFilesEffect, RemoteFilesEvent, RemoteFilesPhase,
-    RemotePath, RemoteTransfer, RemoteTransferKind, RemoteTransferProgress, RemoteTransferSource,
-    RemoteTransferStatus, REMOTE_TRANSFER_CANCELED,
+    RemoteOperationOrigin, RemotePath, RemoteTransfer, RemoteTransferKind, RemoteTransferProgress,
+    RemoteTransferSource, RemoteTransferStatus, TransferFailure, REMOTE_TRANSFER_CANCELED,
+};
+use crate::termwindow::remote_walk::{
+    plan_remote_walk, RemoteWalkEntry, RemoteWalkMode, RemoteWalkPlan,
 };
 use crate::termwindow::transfer_walk::{
     apply_conflict_choice, destination_escapes_source, destination_stays_within, is_same_file,
@@ -29,12 +33,13 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
 use crate::termwindow::{
-    NoteEditorCommand, PendingLocalCopy, RightSidebarFileCharBag, RightSidebarFileField,
-    RightSidebarFileIndex, RightSidebarFileIndexEntry, RightSidebarFileIndexStatus,
-    RightSidebarFilePreviewImage, RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
-    RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSliceCacheKey,
-    RightSidebarFilePreviewSliceCacheValue, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
-    RightSidebarFileView, RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
+    NoteEditorCommand, PendingLocalCopy, PendingRemoteConfirm, RightSidebarFileCharBag,
+    RightSidebarFileField, RightSidebarFileIndex, RightSidebarFileIndexEntry,
+    RightSidebarFileIndexStatus, RightSidebarFilePreviewImage, RightSidebarFilePreviewLine,
+    RightSidebarFilePreviewSelection, RightSidebarFilePreviewSelectionPoint,
+    RightSidebarFilePreviewSliceCacheKey, RightSidebarFilePreviewSliceCacheValue,
+    RightSidebarFilePreviewSpan, RightSidebarFileTreeRow, RightSidebarFileView,
+    RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
     RightSidebarNoteImageSource, RightSidebarNoteTableLayout, RightSidebarNoteView,
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
     TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup,
@@ -44,6 +49,7 @@ use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use anyhow::Context;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment};
+use mux::pane::PaneId;
 use mux::Mux;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -156,8 +162,36 @@ const FILE_PREVIEW_HEADER_HEIGHT: usize = 64;
 /// oldest finished ones. The strip eats into the tree, so it stays small;
 /// running transfers are never dropped, however many there are.
 const REMOTE_TRANSFER_STRIP_MAX: usize = 3;
-/// Thickness of the progress line under a running transfer's label.
-const REMOTE_TRANSFER_PROGRESS_HEIGHT: usize = 3;
+/// Thickness of the progress track under a running transfer's label. Five
+/// design pixels remains compact while being visible at a glance.
+const REMOTE_TRANSFER_PROGRESS_HEIGHT: usize = 5;
+static REMOTE_TRANSFER_ANIMATION_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteLeaseFailureDisposition {
+    FailedConnectionInstalled,
+    ReplacementForSameTarget,
+    ReplacementForDifferentTarget,
+    NoLease,
+}
+
+fn remote_lease_failure_disposition(
+    current: Option<(&str, u64)>,
+    failed_key: &str,
+    failed_id: u64,
+) -> RemoteLeaseFailureDisposition {
+    match current {
+        Some((key, id)) if key == failed_key && id == failed_id => {
+            RemoteLeaseFailureDisposition::FailedConnectionInstalled
+        }
+        Some((key, _)) if key == failed_key => {
+            RemoteLeaseFailureDisposition::ReplacementForSameTarget
+        }
+        Some(_) => RemoteLeaseFailureDisposition::ReplacementForDifferentTarget,
+        None => RemoteLeaseFailureDisposition::NoLease,
+    }
+}
+
 const FILE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 const FILE_PREVIEW_TRUNCATED_LABEL: &str = "Preview truncated to 256 KiB";
 const FILE_PREVIEW_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -4667,6 +4701,10 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileFilter => Some(&self.right_sidebar_file_filter),
             UIItemType::RightSidebarSnippetSearch => Some(&self.right_sidebar_snippet_search),
             UIItemType::RightSidebarSnippetTitle => Some(&self.right_sidebar_snippet_title),
+            UIItemType::RightSidebarFileRow(path) => self.sidebar_file_rename_input(path),
+            UIItemType::RightSidebarRemoteFileRow(path) => {
+                self.sidebar_remote_file_rename_input(path)
+            }
             _ => None,
         }
     }
@@ -4704,7 +4742,7 @@ impl crate::TermWindow {
         Some(best_idx)
     }
 
-    fn right_sidebar_input_for_item_mut(
+    pub(crate) fn right_sidebar_input_for_item_mut(
         &mut self,
         item_type: &UIItemType,
     ) -> Option<&mut TextInputState> {
@@ -4712,6 +4750,23 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileFilter => Some(&mut self.right_sidebar_file_filter),
             UIItemType::RightSidebarSnippetSearch => Some(&mut self.right_sidebar_snippet_search),
             UIItemType::RightSidebarSnippetTitle => Some(&mut self.right_sidebar_snippet_title),
+            UIItemType::RightSidebarFileRow(path) => {
+                let rename = self.inline_tab_rename.as_mut()?;
+                matches!(
+                    &rename.target,
+                    crate::termwindow::InlineTabRenameTarget::File(current) if current == path
+                )
+                .then_some(&mut rename.input)
+            }
+            UIItemType::RightSidebarRemoteFileRow(path) => {
+                let rename = self.inline_tab_rename.as_mut()?;
+                matches!(
+                    &rename.target,
+                    crate::termwindow::InlineTabRenameTarget::RemoteFile { path: current, .. }
+                        if current == path
+                )
+                .then_some(&mut rename.input)
+            }
             _ => None,
         }
     }
@@ -9337,7 +9392,7 @@ impl crate::TermWindow {
             if running { foreground } else { muted_fg },
         )?;
 
-        if let (true, Some(fraction)) = (running, fraction) {
+        if running {
             let bar_height = self.ui_px(REMOTE_TRANSFER_PROGRESS_HEIGHT).max(1);
             let bar_y = y + row_metrics.row_height.saturating_sub(bar_height);
             let radius = (bar_height as f32) / 2.0;
@@ -9350,19 +9405,38 @@ impl crate::TermWindow {
                     text_width as f32,
                     bar_height as f32,
                 ),
-                chrome.sidebar_button_hover_bg,
+                chrome.separator.mul_alpha(0.72),
                 radius,
             )
             .context("remote transfer progress track")?;
-            let filled = (text_width as f32 * fraction).max(radius * 2.0);
-            self.fill_rounded_rectangle(
-                layers,
-                1,
-                euclid::rect(text_x as f32, bar_y as f32, filled, bar_height as f32),
-                chrome.selected_bg,
-                radius,
-            )
-            .context("remote transfer progress fill")?;
+            let (fill_x, filled) = match fraction {
+                Some(fraction) => (
+                    text_x as f32,
+                    (text_width as f32 * fraction).max(radius * 2.0),
+                ),
+                None => {
+                    // While a remote tree is still being enumerated there is
+                    // no honest denominator. Show a moving segment instead of
+                    // hiding the bar and making the operation look stuck.
+                    let epoch = REMOTE_TRANSFER_ANIMATION_EPOCH.get_or_init(Instant::now);
+                    let phase = epoch.elapsed().as_secs_f32() % 1.2 / 1.2;
+                    let segment = (text_width as f32 * 0.3).max(radius * 2.0);
+                    let raw_start = phase * (text_width as f32 + segment) - segment;
+                    let start = raw_start.max(0.0);
+                    let end = (raw_start + segment).min(text_width as f32);
+                    (text_x as f32 + start, (end - start).max(0.0))
+                }
+            };
+            if filled > 0.0 {
+                self.fill_rounded_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(fill_x, bar_y as f32, filled, bar_height as f32),
+                    chrome.selected_bg,
+                    radius,
+                )
+                .context("remote transfer progress fill")?;
+            }
             // A running transfer must keep repainting even when nothing else
             // changes, or the percentage freezes until the next event.
             self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(100)));
@@ -9482,24 +9556,50 @@ impl crate::TermWindow {
             }
         }
         let text_x = icon_x + row_metrics.icon_size + row_metrics.icon_gap;
-        self.paint_sidebar_text(
-            layers,
-            ui_font,
-            ui_metrics,
-            &row.entry.name,
-            text_x,
-            y + row_metrics
-                .row_height
-                .saturating_sub(ui_metrics.cell_size.height as usize)
-                / 2,
-            x.saturating_add(width)
-                .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET)),
-            if row.entry.is_directory() || is_selected {
-                foreground
-            } else {
-                muted_fg
-            },
-        )
+        let text_width = x
+            .saturating_add(width)
+            .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET));
+        if let Some(input) = self
+            .sidebar_remote_file_rename_input(&row.entry.path)
+            .cloned()
+        {
+            self.paint_snippet_text_box(
+                layers,
+                1,
+                ui_font,
+                ui_metrics,
+                chrome,
+                muted_fg,
+                text_x,
+                y + self.ui_px(2),
+                text_width,
+                row_metrics.row_height.saturating_sub(self.ui_px(4)),
+                None,
+                "",
+                &input,
+                true,
+                UIItemType::RightSidebarRemoteFileRow(row.entry.path.clone()),
+                false,
+            )
+        } else {
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                &row.entry.name,
+                text_x,
+                y + row_metrics
+                    .row_height
+                    .saturating_sub(ui_metrics.cell_size.height as usize)
+                    / 2,
+                text_width,
+                if row.entry.is_directory() || is_selected {
+                    foreground
+                } else {
+                    muted_fg
+                },
+            )
+        }
     }
 
     fn active_remote_project_for_files(
@@ -9683,6 +9783,20 @@ impl crate::TermWindow {
                                         drop(lease);
                                         return;
                                     }
+                                    if term_window
+                                        .current_remote_connection_key()
+                                        .as_deref()
+                                        != Some(lease.connection_key())
+                                    {
+                                        drop(lease);
+                                        term_window
+                                            .reconnect_remote_files_after_connection_change(
+                                                generation,
+                                                "Remote Files configuration changed while connecting"
+                                                    .to_string(),
+                                            );
+                                        return;
+                                    }
                                     term_window.right_sidebar_remote_files_lease = Some(lease);
                                     let effects = term_window.right_sidebar_remote_files.transition(
                                         RemoteFilesEvent::Connected {
@@ -9731,6 +9845,16 @@ impl crate::TermWindow {
                         );
                         continue;
                     };
+                    if self.current_remote_connection_key().as_deref()
+                        != Some(lease.connection_key())
+                    {
+                        self.reconnect_remote_files_after_connection_change(
+                            generation,
+                            "Remote Files configuration changed before loading the folder"
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     let Some(operation_lease) = lease.operation_lease() else {
                         self.right_sidebar_remote_files_lease.take();
                         self.close_right_sidebar_file_preview();
@@ -9765,6 +9889,7 @@ impl crate::TermWindow {
                                 .current_source_key()
                                 .as_deref()
                                 != Some(source_key.as_str())
+                                || term_window.right_sidebar_remote_files.generation != generation
                             {
                                 return;
                             }
@@ -9775,7 +9900,35 @@ impl crate::TermWindow {
                                     listing,
                                 },
                                 Err(message) if connection_died => {
-                                    term_window.right_sidebar_remote_files_lease.take();
+                                    match term_window.remote_files_lease_failure_disposition(
+                                        &connection_key,
+                                        connection_id,
+                                    ) {
+                                        RemoteLeaseFailureDisposition::ReplacementForSameTarget => {
+                                            term_window.apply_right_sidebar_remote_files_effects(
+                                                vec![RemoteFilesEffect::ListDirectory {
+                                                    generation,
+                                                    source_key,
+                                                    path,
+                                                    limit,
+                                                }],
+                                            );
+                                            term_window.invalidate_window();
+                                            return;
+                                        }
+                                        RemoteLeaseFailureDisposition::ReplacementForDifferentTarget => {
+                                            term_window
+                                                .reconnect_remote_files_after_connection_change(
+                                                    generation,
+                                                    "Remote Files connection changed while loading the folder"
+                                                        .to_string(),
+                                                );
+                                            term_window.invalidate_window();
+                                            return;
+                                        }
+                                        RemoteLeaseFailureDisposition::FailedConnectionInstalled
+                                        | RemoteLeaseFailureDisposition::NoLease => {}
+                                    }
                                     term_window.close_right_sidebar_file_preview();
                                     RemoteFilesEvent::ConnectionFailed {
                                         generation,
@@ -9790,6 +9943,9 @@ impl crate::TermWindow {
                             };
                             let effects = term_window.right_sidebar_remote_files.transition(event);
                             term_window.apply_right_sidebar_remote_files_effects(effects);
+                            // A just-created folder waits for its listing to
+                            // land before its inline rename can begin.
+                            term_window.maybe_begin_pending_remote_rename();
                             term_window.invalidate_window();
                         })));
                     })
@@ -9859,6 +10015,280 @@ impl crate::TermWindow {
         }
     }
 
+    /// Files dropped onto the TERMINAL of a remote session: upload them and
+    /// paste the remote paths, where a local session would have pasted local
+    /// ones. Returns false when the active Space is not remote, so the caller
+    /// falls back to the plain local-path paste.
+    pub(crate) fn upload_dropped_files_to_remote_terminal(
+        &mut self,
+        paths: &[PathBuf],
+        coords: Option<Point>,
+    ) -> bool {
+        let Ok(Some(target)) = self.active_remote_project_for_files() else {
+            return false;
+        };
+        let Some(pane) = self.get_active_pane_or_overlay() else {
+            return false;
+        };
+        let pane_id = pane.pane_id();
+        // Align the panel's state machine with this Space's target (idempotent
+        // when it already matches): every origin check downstream reads the
+        // state machine's source key, which is unset until someone sets it.
+        let effects = self
+            .right_sidebar_remote_files
+            .transition(RemoteFilesEvent::TargetChanged(Some(target.clone())));
+        self.apply_right_sidebar_remote_files_effects(effects);
+
+        let source_key =
+            crate::termwindow::remote_files::RemoteFilesState::source_key(&target.source);
+        let config = match Self::ssh_config_for_remote_files_target(&target) {
+            Ok(config) => config,
+            Err(message) => {
+                for path in paths {
+                    self.push_remote_transfer_failure(
+                        RemoteTransferKind::Upload,
+                        display_name(path),
+                        message.clone(),
+                        None,
+                    );
+                }
+                self.invalidate_window();
+                return true;
+            }
+        };
+
+        let setting = crate::native_settings::remote_drop_destination();
+        // The cwd is only consulted when asked for, and only as a hint: a pane
+        // that has not reported OSC 7 yet falls back to the default folder
+        // rather than failing the drop.
+        let cwd = (setting == crate::native_settings::REMOTE_DROP_DESTINATION_CWD)
+            .then(|| {
+                pane.get_current_working_dir(mux::pane::CachePolicy::AllowStale)
+                    .and_then(|url| {
+                        percent_encoding::percent_decode_str(url.path())
+                            .decode_utf8()
+                            .ok()
+                            .map(|path| path.to_string())
+                    })
+            })
+            .flatten();
+        let destination = resolve_drop_destination(&setting, cwd.as_deref());
+
+        let Some(window) = self.window.as_ref().cloned() else {
+            return true;
+        };
+        // A drop is an explicit ask, so dialing is allowed — and a successful
+        // dial authorizes the source exactly as the panel's Connect click
+        // would (the session credentials are the same either way).
+        let connection_key = remote_connection_key(&source_key, &config);
+        let batch: Vec<PathBuf> = paths.to_vec();
+        let anchor = coords.unwrap_or_else(|| Point::new(0, 0));
+        promise::spawn::spawn(async move {
+            let manager = remote_connection_manager();
+            let prepared = match manager.acquire(connection_key, config, true).await {
+                Ok(lease) => {
+                    let backend = lease.backend();
+                    match backend.resolve_root(destination).await {
+                        // Merge-tolerant creation: the folder existing already
+                        // is the normal case after the first drop.
+                        Ok(directory) => match backend.create_directory(directory.clone()).await {
+                            Ok(()) => Ok((lease, directory)),
+                            Err(message) => Err(message),
+                        },
+                        Err(message) => Err(message),
+                    }
+                }
+                Err(RemoteAcquireError::Failed(message)) => Err(message),
+                Err(RemoteAcquireError::NotConnected) => {
+                    Err("Remote Files connection is not available".to_string())
+                }
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.dispatch_terminal_drop(prepared, batch, source_key, pane_id, anchor);
+            })));
+        })
+        .detach();
+        true
+    }
+
+    /// The prepared half of a terminal drop, back on the window thread: adopt
+    /// the connection, then hand every dropped path to the ordinary upload
+    /// machinery with the pane recorded as the paste target.
+    fn dispatch_terminal_drop(
+        &mut self,
+        prepared: Result<
+            (
+                crate::termwindow::remote_files::RemoteConnectionLease,
+                RemotePath,
+            ),
+            String,
+        >,
+        paths: Vec<PathBuf>,
+        source_key: String,
+        pane_id: PaneId,
+        anchor: Point,
+    ) {
+        let (lease, directory) = match prepared {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                for path in &paths {
+                    self.push_remote_transfer_failure(
+                        RemoteTransferKind::Upload,
+                        display_name(path),
+                        message.clone(),
+                        None,
+                    );
+                }
+                self.invalidate_window();
+                return;
+            }
+        };
+        let origin =
+            RemoteOperationOrigin::new(source_key.clone(), lease.connection_key().to_string());
+        if !self.remote_operation_origin_matches(&origin) {
+            for path in &paths {
+                self.push_remote_transfer_failure(
+                    RemoteTransferKind::Upload,
+                    display_name(path),
+                    "The window moved to another host while connecting".to_string(),
+                    None,
+                );
+            }
+            self.invalidate_window();
+            return;
+        }
+        crate::termwindow::remote_files::authorize_remote_source(&source_key);
+        // Lend the fresh connection to the panel's lease slot unless the slot
+        // already holds this exact connection: `remote_transfer_handles` reads
+        // that slot, so every upload below — and the Files panel itself — uses
+        // whatever sits there. A slot left holding a session that died without
+        // any failure callback noticing, or one dialled before this host's
+        // settings changed, would otherwise defeat the reconnect we just did.
+        let already_installed = self
+            .right_sidebar_remote_files_lease
+            .as_ref()
+            .is_some_and(|current| current.is_same_connection(&lease));
+        if !already_installed {
+            self.right_sidebar_remote_files_lease = Some(lease);
+        }
+        for path in paths {
+            if path.is_dir() {
+                self.start_remote_folder_upload(path, directory.clone(), anchor, Some(pane_id));
+                continue;
+            }
+            let Some(name) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+            else {
+                self.push_remote_transfer_failure(
+                    RemoteTransferKind::Upload,
+                    path.to_string_lossy().to_string(),
+                    "That file name is not valid UTF-8".to_string(),
+                    None,
+                );
+                continue;
+            };
+            self.spawn_terminal_drop_file_upload(
+                path,
+                name,
+                directory.clone(),
+                pane_id,
+                origin.clone(),
+            );
+        }
+        self.invalidate_window();
+    }
+
+    /// One dropped file: settle a free remote name off-thread, then run the
+    /// ordinary single-file upload with the pane as paste target.
+    fn spawn_terminal_drop_file_upload(
+        &mut self,
+        local: PathBuf,
+        name: String,
+        directory: RemotePath,
+        pane_id: PaneId,
+        origin: RemoteOperationOrigin,
+    ) {
+        let Some((backend, operation_lease, _connection_key, _connection_id)) =
+            self.remote_transfer_handles(&origin)
+        else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                "Remote Files connection is no longer available".to_string(),
+                None,
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let chosen = pick_free_remote_name(&*backend, &directory, &name).await;
+            drop(operation_lease);
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                // Reserving the name is another round trip, and the window can
+                // be pointed at a different host while it runs:
+                // `start_remote_upload` takes both its origin and its backend
+                // from whatever is displayed NOW, so an unchecked hand-off
+                // would write this host's absolute path onto the other one and
+                // then paste it into a pane where it means something else.
+                if !term_window.remote_operation_origin_matches(&origin) {
+                    term_window.push_remote_transfer_failure(
+                        RemoteTransferKind::Upload,
+                        name,
+                        "The window moved to another host before the upload started".to_string(),
+                        None,
+                    );
+                    term_window.invalidate_window();
+                    return;
+                }
+                match chosen {
+                    Ok(remote) => {
+                        term_window.start_remote_upload(local, remote, directory, Some(pane_id));
+                    }
+                    Err(message) => {
+                        term_window.push_remote_transfer_failure(
+                            RemoteTransferKind::Upload,
+                            name,
+                            message,
+                            None,
+                        );
+                    }
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    /// Put a landed file's remote path on the pane's command line.
+    ///
+    /// Always POSIX-quoted, regardless of `quote_dropped_files`: that setting
+    /// is about the LOCAL platform's shell, while this path is by construction
+    /// on a POSIX server. The distinction bites immediately — the default
+    /// SpacesOnly mode leaves `(` bare, and our collision names (` (1)`) put
+    /// parentheses in every re-dropped screenshot. Verified live: bash chokes
+    /// on the unquoted form.
+    pub(crate) fn paste_remote_path_to_pane(&mut self, pane_id: PaneId, remote: &RemotePath) {
+        let Some(pane) = Mux::get().get_pane(pane_id) else {
+            // The pane closed while the upload ran; the transfer row already
+            // says where the file went.
+            return;
+        };
+        let text = format!(
+            "{} ",
+            config::DroppedFileQuoting::Posix.escape(remote.as_str())
+        );
+        if let Err(err) = pane.send_paste(&text) {
+            log::error!(
+                "failed to paste the uploaded path {}: {err:#}",
+                remote.as_str()
+            );
+        }
+    }
+
     /// Take files dropped onto the remote tree and upload them. Returns false
     /// when the drop was not aimed at the panel, so the caller can fall back
     /// to its usual handling.
@@ -9892,7 +10322,7 @@ impl crate::TermWindow {
 
         for path in paths {
             if path.is_dir() {
-                self.start_remote_folder_upload(path.clone(), directory.clone());
+                self.start_remote_folder_upload(path.clone(), directory.clone(), coords, None);
                 continue;
             }
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -9919,7 +10349,7 @@ impl crate::TermWindow {
                     continue;
                 }
             };
-            self.start_remote_upload(path.clone(), remote, directory.clone());
+            self.start_remote_upload(path.clone(), remote, directory.clone(), None);
         }
         self.invalidate_window();
         true
@@ -9929,7 +10359,13 @@ impl crate::TermWindow {
     ///
     /// One row, not one per file: running rows are never evicted from the
     /// strip, so a thousand-file folder would otherwise bury the panel.
-    fn start_remote_folder_upload(&mut self, source: PathBuf, directory: RemotePath) {
+    fn start_remote_folder_upload(
+        &mut self,
+        source: PathBuf,
+        directory: RemotePath,
+        anchor: Point,
+        paste_to: Option<PaneId>,
+    ) {
         // The walk and its metadata calls must not run here: a large or
         // network-backed tree would freeze the window for as long as it takes,
         // before even a progress row appears.
@@ -9941,7 +10377,7 @@ impl crate::TermWindow {
         // whatever happens to be connected when the walk finishes would put
         // the files on the wrong machine, at a path that means something else
         // there.
-        let aimed_at = self.right_sidebar_remote_files.current_source_key();
+        let aimed_at = self.current_remote_operation_origin();
         promise::spawn::spawn(async move {
             let planned = promise::spawn::spawn_into_new_thread(move || {
                 Ok::<_, anyhow::Error>((source.clone(), plan_transfer(&source)))
@@ -9951,7 +10387,8 @@ impl crate::TermWindow {
                 return;
             };
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.apply_remote_folder_plan(source, directory, plan, aimed_at);
+                term_window
+                    .apply_remote_folder_plan(source, directory, plan, aimed_at, anchor, paste_to);
             })));
         })
         .detach();
@@ -9965,10 +10402,21 @@ impl crate::TermWindow {
             crate::termwindow::transfer_walk::TransferPlan,
             crate::termwindow::transfer_walk::TransferPlanError,
         >,
-        aimed_at: Option<String>,
+        aimed_at: Option<RemoteOperationOrigin>,
+        anchor: Point,
+        paste_to: Option<PaneId>,
     ) {
         let name = display_name(&source);
-        if aimed_at.is_none() || self.right_sidebar_remote_files.current_source_key() != aimed_at {
+        let Some(origin) = aimed_at else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                "The Remote Files connection is no longer available".to_string(),
+                None,
+            );
+            return;
+        };
+        if !self.remote_operation_origin_matches(&origin) {
             // Refuse rather than retarget: the same remote path on a different
             // host is a different place entirely.
             self.push_remote_transfer_failure(
@@ -10000,49 +10448,109 @@ impl crate::TermWindow {
             );
             return;
         }
+
+        // Where the uploaded folder itself will live — the path a terminal
+        // drop wants pasted once the tree has landed.
+        let paste_target = paste_to.and_then(|pane_id| {
+            directory
+                .join_name(&name)
+                .ok()
+                .map(|remote| (pane_id, remote))
+        });
+
+        // The row exists from here whichever way the size question goes, so
+        // the confirmation has something on screen to be about.
+        let id = self.next_remote_transfer_id();
+        let progress = RemoteTransferProgress::default();
+        self.right_sidebar_remote_transfers.push(RemoteTransfer {
+            id,
+            kind: RemoteTransferKind::Upload,
+            name,
+            progress,
+            status: RemoteTransferStatus::Running,
+            source: None,
+            origin: Some(origin.clone()),
+        });
+        self.trim_remote_transfers();
+
         // Every remote entry costs at least one round trip on a single
         // serialized session, so a big tree is slow in a way the user cannot
-        // see coming. Say so rather than appearing to hang.
+        // see coming. Ask, with the number on the table, instead of either
+        // refusing outright or appearing to hang.
         if plan.entries.len() > TRANSFER_CONFIRM_THRESHOLD {
-            self.push_remote_transfer_failure(
-                RemoteTransferKind::Upload,
-                name,
-                format!(
-                    "That folder holds {} items; upload it in smaller pieces",
-                    plan.entries.len()
+            self.set_pending_remote_confirm(
+                PendingRemoteConfirm::FolderUpload {
+                    transfer_id: id,
+                    directory,
+                    plan,
+                    origin,
+                    paste_target,
+                },
+                anchor,
+            );
+            self.invalidate_window();
+            return;
+        }
+        self.start_remote_folder_upload_execution(id, directory, plan, paste_target);
+        self.invalidate_window();
+    }
+
+    /// The planned (and, if it was big, confirmed) folder upload.
+    fn start_remote_folder_upload_execution(
+        &mut self,
+        id: u64,
+        directory: RemotePath,
+        plan: crate::termwindow::transfer_walk::TransferPlan,
+        paste_target: Option<(PaneId, RemotePath)>,
+    ) {
+        let Some(transfer) = self
+            .right_sidebar_remote_transfers
+            .iter()
+            .find(|transfer| transfer.id == id)
+        else {
+            return;
+        };
+        let progress = transfer.progress.clone();
+        let Some(origin) = transfer.origin.clone() else {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "Remote transfer lost its source identity".to_string(),
                 ),
-                None,
+            );
+            return;
+        };
+        if !self.remote_operation_origin_matches(&origin) {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "The panel moved to another host before the upload started".to_string(),
+                ),
             );
             return;
         }
-
+        if progress.is_canceled() {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(REMOTE_TRANSFER_CANCELED.to_string()),
+            );
+            return;
+        }
         let Some((backend, operation_lease, connection_key, connection_id)) =
-            self.remote_transfer_handles()
+            self.remote_transfer_handles(&origin)
         else {
-            self.push_remote_transfer_failure(
-                RemoteTransferKind::Upload,
-                name,
-                "Remote Files connection is no longer available".to_string(),
-                None,
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "Remote Files connection is no longer available".to_string(),
+                ),
             );
             return;
         };
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
-
-        let id = self.next_remote_transfer_id();
-        let progress = RemoteTransferProgress::default();
         progress.set_item_total(plan.entries.len() as u64);
-        self.right_sidebar_remote_transfers.push(RemoteTransfer {
-            id,
-            kind: RemoteTransferKind::Upload,
-            name,
-            progress: progress.clone(),
-            status: RemoteTransferStatus::Running,
-            source: None,
-        });
-        self.trim_remote_transfers();
 
         // Symlinks and unreadable nodes were deliberately left out; saying so
         // is the difference between a truthful success and one that quietly
@@ -10074,16 +10582,25 @@ impl crate::TermWindow {
                     Some(note) => format!("Uploaded ({note})"),
                     None => "Uploaded".to_string(),
                 };
+                let succeeded = result.is_ok();
                 let status = transfer_status_from_result(&result, &done_detail);
                 term_window.finish_remote_transfer(id, status);
+                if succeeded {
+                    if let Some((pane_id, folder_remote)) = paste_target {
+                        term_window.paste_remote_path_to_pane(pane_id, &folder_remote);
+                    }
+                }
                 // Re-list either way: a partial upload leaves real files the
                 // tree would otherwise never show.
-                let effects = term_window
-                    .right_sidebar_remote_files
-                    .transition(RemoteFilesEvent::DirectoryInvalidated(refresh_dir));
-                term_window.apply_right_sidebar_remote_files_effects(effects);
+                if term_window.remote_operation_origin_matches(&origin) {
+                    let effects = term_window
+                        .right_sidebar_remote_files
+                        .transition(RemoteFilesEvent::DirectoryInvalidated(refresh_dir));
+                    term_window.apply_right_sidebar_remote_files_effects(effects);
+                }
                 if connection_died {
-                    term_window.right_sidebar_remote_files_lease.take();
+                    term_window
+                        .release_remote_files_lease_if_connection(&connection_key, connection_id);
                 }
                 term_window.invalidate_window();
             })));
@@ -10110,6 +10627,9 @@ impl crate::TermWindow {
         source: Option<RemoteTransferSource>,
     ) {
         let id = self.next_remote_transfer_id();
+        let origin = source
+            .as_ref()
+            .and_then(|_| self.current_remote_operation_origin());
         self.right_sidebar_remote_transfers.push(RemoteTransfer {
             id,
             kind,
@@ -10117,6 +10637,7 @@ impl crate::TermWindow {
             progress: RemoteTransferProgress::default(),
             status: RemoteTransferStatus::Failed(message),
             source,
+            origin,
         });
         self.trim_remote_transfers();
     }
@@ -10136,15 +10657,30 @@ impl crate::TermWindow {
         }
     }
 
-    fn start_remote_upload(&mut self, local: PathBuf, remote: RemotePath, directory: RemotePath) {
+    fn start_remote_upload(
+        &mut self,
+        local: PathBuf,
+        remote: RemotePath,
+        directory: RemotePath,
+        paste_to: Option<PaneId>,
+    ) {
         let name = remote.file_name().to_string();
+        let Some(origin) = self.current_remote_operation_origin() else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                "Remote Files source is no longer available".to_string(),
+                None,
+            );
+            return;
+        };
         let retry = RemoteTransferSource::Upload {
             local: local.clone(),
             remote: remote.clone(),
             directory: directory.clone(),
         };
         let Some((backend, operation_lease, connection_key, connection_id)) =
-            self.remote_transfer_handles()
+            self.remote_transfer_handles(&origin)
         else {
             // A missing lease is exactly the kind of failure retrying fixes,
             // once the panel has reconnected.
@@ -10169,6 +10705,7 @@ impl crate::TermWindow {
             progress: progress.clone(),
             status: RemoteTransferStatus::Running,
             source: Some(retry),
+            origin: Some(origin.clone()),
         });
         self.trim_remote_transfers();
 
@@ -10176,7 +10713,9 @@ impl crate::TermWindow {
             // A single dropped file refuses to clobber; there is no prompt on
             // this path, so silently replacing would be a choice the user
             // never made.
-            let result = backend.upload_file(local, remote, progress, false).await;
+            let result = backend
+                .upload_file(local, remote.clone(), progress, false)
+                .await;
             drop(operation_lease);
             let connection_died = result.as_ref().is_err_and(|failure| {
                 invalidate_remote_connection_if_dead(
@@ -10189,16 +10728,27 @@ impl crate::TermWindow {
                 let succeeded = result.is_ok();
                 let status = transfer_status_from_result(&result, "Uploaded");
                 term_window.finish_remote_transfer(id, status);
+                if succeeded {
+                    if let Some(pane_id) = paste_to {
+                        // A drop on a remote terminal wants the file's REMOTE
+                        // path on the command line, exactly where a local drop
+                        // would have pasted the local one.
+                        term_window.paste_remote_path_to_pane(pane_id, &remote);
+                    }
+                }
                 // Re-list either way. On failure the directory may now hold a
                 // partial file the tree would otherwise never show — and the
                 // user would then hit "already exists" on retry with nothing
                 // on screen to explain it.
-                let effects = term_window
-                    .right_sidebar_remote_files
-                    .transition(RemoteFilesEvent::DirectoryInvalidated(directory));
-                term_window.apply_right_sidebar_remote_files_effects(effects);
+                if term_window.remote_operation_origin_matches(&origin) {
+                    let effects = term_window
+                        .right_sidebar_remote_files
+                        .transition(RemoteFilesEvent::DirectoryInvalidated(directory));
+                    term_window.apply_right_sidebar_remote_files_effects(effects);
+                }
                 if !succeeded && connection_died {
-                    term_window.right_sidebar_remote_files_lease.take();
+                    term_window
+                        .release_remote_files_lease_if_connection(&connection_key, connection_id);
                 }
                 term_window.invalidate_window();
             })));
@@ -10206,30 +10756,98 @@ impl crate::TermWindow {
         .detach();
     }
 
-    /// Right-clicking a remote row. Only a file offers anything so far, so a
-    /// directory gets no menu rather than an empty one.
+    /// Right-clicking a remote row: the file-operations menu, shaped by what
+    /// the row is. The root gets only what cannot orphan the whole panel —
+    /// no Rename, no Delete.
     pub(crate) fn show_right_sidebar_remote_file_context_menu(
         &mut self,
         context: &dyn WindowOps,
         anchor: Point,
         path: RemotePath,
     ) {
-        if self.right_sidebar_remote_files.kind_for_path(&path) != Some(RemoteFileKind::File) {
+        let Some(kind) = self.right_sidebar_remote_files.kind_for_path(&path) else {
             return;
-        }
-        // A transfer needs a live lease; offering Download without one would
-        // only produce a failure row.
+        };
+        let Some(origin) = self.current_remote_operation_origin() else {
+            return;
+        };
+        let is_root = self.right_sidebar_remote_files.root.as_ref() == Some(&path);
+        // Every operation needs a live lease; offering one without would only
+        // produce a failure row.
         let enabled = self.right_sidebar_remote_files_lease.is_some();
+        let path_string = path.as_str().to_string();
+
+        // One pass: beginning the block clears the action table, so a second
+        // call mid-assembly would turn the earlier items into dead entries.
         self.begin_context_menu_application_actions();
-        let item = self.context_menu_application_item_with_icon(
-            "Download",
-            // No dedicated download glyph in the shared icon set; Save is the
-            // closest fit and already maps on every platform.
-            ContextMenuIcon::Save,
-            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile(path),
-            enabled,
-        );
-        self.show_term_context_menu(context, anchor, vec![item]);
+        let mut items = Vec::new();
+        match kind {
+            RemoteFileKind::File => {
+                items.push(self.context_menu_application_item_with_icon(
+                    "Download",
+                    // No dedicated download glyph in the shared icon set; Save
+                    // is the closest fit and already maps on every platform.
+                    ContextMenuIcon::Save,
+                    crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile {
+                        path: path.clone(),
+                        origin: origin.clone(),
+                    },
+                    enabled,
+                ));
+            }
+            RemoteFileKind::Directory => {
+                items.push(self.context_menu_application_item_with_icon(
+                    "Download",
+                    ContextMenuIcon::Save,
+                    crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFolder {
+                        path: path.clone(),
+                        anchor,
+                        origin: origin.clone(),
+                    },
+                    enabled,
+                ));
+                items.push(self.context_menu_application_item_with_icon(
+                    "New Folder",
+                    ContextMenuIcon::FolderAdd,
+                    crate::termwindow::ContextMenuApplicationAction::NewRemoteFolder {
+                        parent: path.clone(),
+                        origin: origin.clone(),
+                    },
+                    enabled,
+                ));
+            }
+            // A link's target could be anywhere; downloading "it" would really
+            // download something else. Rename and Delete below still apply.
+            RemoteFileKind::Symlink | RemoteFileKind::Other => {}
+        }
+        items.push(ContextMenuItem::item_with_icon(
+            "Copy Path",
+            ContextMenuIcon::Copy,
+            KeyAssignment::CopyFilePathToClipboard(path_string),
+        ));
+        if !is_root {
+            items.push(self.context_menu_application_item_with_icon(
+                "Rename\u{2026}",
+                ContextMenuIcon::Edit,
+                crate::termwindow::ContextMenuApplicationAction::RenameRemoteEntry {
+                    path: path.clone(),
+                    origin: origin.clone(),
+                },
+                enabled,
+            ));
+            items.push(ContextMenuItem::Separator);
+            items.push(self.context_menu_application_item_with_icon(
+                "Delete\u{2026}",
+                ContextMenuIcon::Delete,
+                crate::termwindow::ContextMenuApplicationAction::DeleteRemoteEntry {
+                    path,
+                    anchor,
+                    origin,
+                },
+                enabled,
+            ));
+        }
+        self.show_term_context_menu(context, anchor, items);
     }
 
     /// Which local directory a pointer at `(x, y)` is aiming at.
@@ -10355,7 +10973,6 @@ impl crate::TermWindow {
                 plans: preflight.plans,
                 directory,
                 conflicts: preflight.conflicts,
-                anchor,
                 note,
             });
         }
@@ -10403,7 +11020,6 @@ impl crate::TermWindow {
     }
 
     /// Resolve a queued copy once the user has answered the conflict prompt.
-    /// Resolve a queued copy once the user has answered the conflict prompt.
     pub(crate) fn resolve_pending_local_copy(&mut self, choice: ConflictChoice) {
         let Some(pending) = self.pending_local_copy.take() else {
             return;
@@ -10420,7 +11036,6 @@ impl crate::TermWindow {
             plans,
             directory,
             conflicts,
-            anchor: _,
             note,
         } = pending;
         let plans = plans
@@ -10474,6 +11089,7 @@ impl crate::TermWindow {
             progress: progress.clone(),
             status: RemoteTransferStatus::Running,
             source: None,
+            origin: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -10528,6 +11144,9 @@ impl crate::TermWindow {
         let Some(path) = self.right_sidebar_remote_files.selected.clone() else {
             return;
         };
+        let Some(origin) = self.current_remote_operation_origin() else {
+            return;
+        };
         // Snapshot the gating up front: the item builders below take `&mut
         // self`, so reading these inline would fight the borrow checker.
         let has_selection = self.right_sidebar_file_preview_selected_text().is_some();
@@ -10555,7 +11174,7 @@ impl crate::TermWindow {
         let download = self.context_menu_application_item_with_icon(
             "Download",
             ContextMenuIcon::Save,
-            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile(path),
+            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile { path, origin },
             can_download,
         );
 
@@ -10575,6 +11194,15 @@ impl crate::TermWindow {
 
     pub(crate) fn download_right_sidebar_remote_file(&mut self, remote: RemotePath) {
         let name = remote.file_name().to_string();
+        let Some(origin) = self.current_remote_operation_origin() else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Download,
+                name,
+                "Remote Files source is no longer available".to_string(),
+                None,
+            );
+            return;
+        };
         let retry = RemoteTransferSource::Download {
             remote: remote.clone(),
         };
@@ -10602,18 +11230,15 @@ impl crate::TermWindow {
         // staging file exclusively. Two downloads that would land on the same
         // name therefore take different ones, and an unrelated `X.part` that
         // happens to be sitting there is never truncated or deleted.
-        let Some((local, partial)) = reserve_download_path(
-            &directory,
-            &name,
-            |path| path.exists(),
-            |partial| {
+        let Some((local, partial)) =
+            reserve_download_path(&directory, &name, local_path_is_occupied, |partial| {
                 fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(partial)
                     .is_ok()
-            },
-        ) else {
+            })
+        else {
             self.push_remote_transfer_failure(
                 RemoteTransferKind::Download,
                 name,
@@ -10635,7 +11260,7 @@ impl crate::TermWindow {
         };
 
         let Some((backend, operation_lease, connection_key, connection_id)) =
-            self.remote_transfer_handles()
+            self.remote_transfer_handles(&origin)
         else {
             release_reservation(&partial);
             self.push_remote_transfer_failure(
@@ -10660,6 +11285,7 @@ impl crate::TermWindow {
             progress: progress.clone(),
             status: RemoteTransferStatus::Running,
             source: Some(retry),
+            origin: Some(origin),
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -10683,7 +11309,8 @@ impl crate::TermWindow {
                 let status = transfer_status_from_result(&result, &format!("Saved to {landed_in}"));
                 term_window.finish_remote_transfer(id, status);
                 if connection_died {
-                    term_window.right_sidebar_remote_files_lease.take();
+                    term_window
+                        .release_remote_files_lease_if_connection(&connection_key, connection_id);
                 }
                 term_window.invalidate_window();
             })));
@@ -10691,17 +11318,1021 @@ impl crate::TermWindow {
         .detach();
     }
 
+    /// Right-clicked "Download" on a remote directory: walk it first, ask if
+    /// it is big, then pull the whole tree into the Downloads folder.
+    pub(crate) fn download_right_sidebar_remote_folder(
+        &mut self,
+        remote: RemotePath,
+        anchor: Point,
+    ) {
+        let name = remote.file_name().to_string();
+        let Some(origin) = self.current_remote_operation_origin() else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Download,
+                name,
+                "Remote Files source is no longer available".to_string(),
+                None,
+            );
+            return;
+        };
+        let retry = RemoteTransferSource::DownloadFolder {
+            remote: remote.clone(),
+        };
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles(&origin)
+        else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Download,
+                name,
+                "Remote Files connection is no longer available".to_string(),
+                Some(retry),
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+
+        // The row exists from the walk onwards: listing a big tree takes real
+        // time on a serialized channel, and a click on the row is the only
+        // way to abort it.
+        let id = self.next_remote_transfer_id();
+        let progress = RemoteTransferProgress::default();
+        self.right_sidebar_remote_transfers.push(RemoteTransfer {
+            id,
+            kind: RemoteTransferKind::Download,
+            name,
+            progress: progress.clone(),
+            status: RemoteTransferStatus::Running,
+            source: Some(retry),
+            origin: Some(origin.clone()),
+        });
+        self.trim_remote_transfers();
+        self.invalidate_window();
+
+        // Same guard as folder uploads: the walk is slow, and the panel can
+        // be pointed at another host meanwhile — a plan built against one
+        // server must never execute against another.
+        promise::spawn::spawn(async move {
+            let plan =
+                plan_remote_walk(&*backend, remote, RemoteWalkMode::Download, &progress).await;
+            drop(operation_lease);
+            let connection_died = plan.as_ref().is_err_and(|message| {
+                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_remote_folder_download_plan(
+                    id,
+                    plan,
+                    origin,
+                    anchor,
+                    connection_key,
+                    connection_id,
+                    connection_died,
+                );
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_remote_folder_download_plan(
+        &mut self,
+        id: u64,
+        plan: Result<RemoteWalkPlan, String>,
+        origin: RemoteOperationOrigin,
+        anchor: Point,
+        connection_key: String,
+        connection_id: u64,
+        connection_died: bool,
+    ) {
+        if connection_died {
+            self.release_remote_files_lease_if_connection(&connection_key, connection_id);
+        }
+        if !self.remote_operation_origin_matches(&origin) {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "The panel moved to another host while this folder was being read".to_string(),
+                ),
+            );
+            self.invalidate_window();
+            return;
+        }
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(message) => {
+                self.finish_remote_transfer(id, RemoteTransferStatus::Failed(message));
+                self.invalidate_window();
+                return;
+            }
+        };
+        if plan.entries.len() > TRANSFER_CONFIRM_THRESHOLD {
+            self.set_pending_remote_confirm(
+                PendingRemoteConfirm::FolderDownload {
+                    transfer_id: id,
+                    plan,
+                    origin,
+                },
+                anchor,
+            );
+        } else {
+            self.start_remote_folder_download_execution(id, plan);
+        }
+        self.invalidate_window();
+    }
+
+    /// The plan is final and (if it was big) confirmed: reserve a fresh
+    /// destination folder and stream the tree into it.
+    fn start_remote_folder_download_execution(&mut self, id: u64, plan: RemoteWalkPlan) {
+        let Some(transfer) = self
+            .right_sidebar_remote_transfers
+            .iter()
+            .find(|transfer| transfer.id == id)
+        else {
+            return;
+        };
+        let progress = transfer.progress.clone();
+        let folder_name = transfer.name.clone();
+        let Some(origin) = transfer.origin.clone() else {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "Remote transfer lost its source identity".to_string(),
+                ),
+            );
+            return;
+        };
+        if !self.remote_operation_origin_matches(&origin) {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "The panel moved to another host before the download started".to_string(),
+                ),
+            );
+            return;
+        }
+        if progress.is_canceled() {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(REMOTE_TRANSFER_CANCELED.to_string()),
+            );
+            return;
+        }
+        let Some(directory) = crate::native_settings::effective_remote_download_directory() else {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed("Unable to locate a Downloads folder".to_string()),
+            );
+            return;
+        };
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles(&origin)
+        else {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "Remote Files connection is no longer available".to_string(),
+                ),
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+
+        progress.set_item_total(plan.entries.len() as u64);
+        let note = (plan.skipped > 0).then(|| format!("{} symlink(s) skipped", plan.skipped));
+        promise::spawn::spawn(async move {
+            let result = download_remote_tree(
+                &*backend,
+                &directory,
+                &folder_name,
+                &plan.entries,
+                &progress,
+            )
+            .await;
+            drop(operation_lease);
+            let connection_died = result.as_ref().is_err_and(|failure| {
+                invalidate_remote_connection_if_dead(
+                    &connection_key,
+                    connection_id,
+                    &failure.message,
+                )
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let status = match &result {
+                    Ok(destination) => {
+                        let mut detail = format!("Saved to {}", destination.display());
+                        if let Some(note) = &note {
+                            detail.push_str(&format!(" ({note})"));
+                        }
+                        RemoteTransferStatus::Done(detail)
+                    }
+                    Err(failure) => match &failure.leftover {
+                        Some(leftover) => RemoteTransferStatus::FailedWithLeftover {
+                            message: failure.message.clone(),
+                            leftover: leftover.clone(),
+                        },
+                        None => RemoteTransferStatus::Failed(failure.message.clone()),
+                    },
+                };
+                term_window.finish_remote_transfer(id, status);
+                if connection_died {
+                    term_window
+                        .release_remote_files_lease_if_connection(&connection_key, connection_id);
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    /// Put a confirmation menu on screen and remember what it is asking
+    /// about. Show first, then record — opening a menu tears the previous one
+    /// down, and that teardown is where an unanswered pending is cancelled,
+    /// so recording first would have it cancel itself (the same ordering
+    /// [`Self::apply_local_copy_preflight`] relies on).
+    fn set_pending_remote_confirm(&mut self, pending: PendingRemoteConfirm, anchor: Point) {
+        self.cancel_pending_remote_confirm();
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.finish_pending_remote_confirm_row(&pending);
+            return;
+        };
+        let (proceed_label, proceed_icon) = match &pending {
+            PendingRemoteConfirm::FolderDownload { plan, .. } => (
+                format!("Download {} items", plan.entries.len()),
+                ContextMenuIcon::Save,
+            ),
+            PendingRemoteConfirm::FolderDelete { plan, .. } => (
+                // +1: the folder itself goes too.
+                format!("Delete {} items permanently", plan.entries.len() + 1),
+                ContextMenuIcon::Delete,
+            ),
+            PendingRemoteConfirm::FileDelete { remote, .. } => (
+                format!("Delete \u{201c}{}\u{201d} permanently", remote.file_name()),
+                ContextMenuIcon::Delete,
+            ),
+            PendingRemoteConfirm::FolderUpload { plan, .. } => (
+                format!("Upload {} items", plan.entries.len()),
+                ContextMenuIcon::Save,
+            ),
+        };
+        self.begin_context_menu_application_actions();
+        let proceed = self.context_menu_application_item_with_icon(
+            proceed_label,
+            proceed_icon,
+            crate::termwindow::ContextMenuApplicationAction::ResolveRemoteConfirm(true),
+            true,
+        );
+        let cancel = self.context_menu_application_item_with_icon(
+            "Cancel",
+            ContextMenuIcon::Close,
+            crate::termwindow::ContextMenuApplicationAction::ResolveRemoteConfirm(false),
+            true,
+        );
+        self.show_term_context_menu(&window, anchor, vec![proceed, cancel]);
+        self.pending_remote_confirm = Some(pending);
+    }
+
+    /// Drop a confirmation nobody answered — its menu was dismissed, or a
+    /// newer confirmation is taking the slot.
+    pub(crate) fn cancel_pending_remote_confirm(&mut self) {
+        if let Some(pending) = self.pending_remote_confirm.take() {
+            self.finish_pending_remote_confirm_row(&pending);
+            self.invalidate_window();
+        }
+    }
+
+    /// A pending confirmation that will never run still owns a Running
+    /// transfer row; leave it saying "Canceled" rather than spinning forever.
+    fn finish_pending_remote_confirm_row(&mut self, pending: &PendingRemoteConfirm) {
+        let transfer_id = match pending {
+            PendingRemoteConfirm::FolderDownload { transfer_id, .. }
+            | PendingRemoteConfirm::FolderDelete { transfer_id, .. }
+            | PendingRemoteConfirm::FolderUpload { transfer_id, .. } => Some(*transfer_id),
+            PendingRemoteConfirm::FileDelete { .. } => None,
+        };
+        if let Some(id) = transfer_id {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(REMOTE_TRANSFER_CANCELED.to_string()),
+            );
+        }
+    }
+
+    pub(crate) fn resolve_pending_remote_confirm(&mut self, proceed: bool) {
+        let Some(pending) = self.pending_remote_confirm.take() else {
+            return;
+        };
+        if !proceed {
+            self.finish_pending_remote_confirm_row(&pending);
+            self.invalidate_window();
+            return;
+        }
+        match pending {
+            PendingRemoteConfirm::FolderDownload {
+                transfer_id,
+                plan,
+                origin,
+            } => {
+                if !self.remote_operation_origin_matches(&origin) {
+                    self.finish_remote_transfer(
+                        transfer_id,
+                        RemoteTransferStatus::Failed(
+                            "The panel moved to another host while waiting".to_string(),
+                        ),
+                    );
+                } else {
+                    self.start_remote_folder_download_execution(transfer_id, plan);
+                }
+            }
+            PendingRemoteConfirm::FolderDelete {
+                transfer_id,
+                remote,
+                plan,
+                origin,
+            } => {
+                if !self.remote_operation_origin_matches(&origin) {
+                    self.finish_remote_transfer(
+                        transfer_id,
+                        RemoteTransferStatus::Failed(
+                            "The panel moved to another host while waiting".to_string(),
+                        ),
+                    );
+                } else {
+                    self.start_remote_folder_delete_execution(transfer_id, remote, plan);
+                }
+            }
+            PendingRemoteConfirm::FileDelete { remote, origin } => {
+                if self.remote_operation_origin_matches(&origin) {
+                    self.execute_remote_file_delete(remote, origin);
+                }
+            }
+            PendingRemoteConfirm::FolderUpload {
+                transfer_id,
+                directory,
+                plan,
+                origin,
+                paste_target,
+            } => {
+                if !self.remote_operation_origin_matches(&origin) {
+                    self.finish_remote_transfer(
+                        transfer_id,
+                        RemoteTransferStatus::Failed(
+                            "The panel moved to another host while waiting".to_string(),
+                        ),
+                    );
+                } else {
+                    self.start_remote_folder_upload_execution(
+                        transfer_id,
+                        directory,
+                        plan,
+                        paste_target,
+                    );
+                }
+            }
+        }
+        self.invalidate_window();
+    }
+
+    /// Right-clicked "Delete…" on a remote row. A directory is walked first so
+    /// the confirmation can say how much it is really about to remove; a file
+    /// (or link) goes straight to its confirmation. Everything here confirms —
+    /// there is no trash on the far side to undo from.
+    pub(crate) fn delete_right_sidebar_remote_entry(&mut self, path: RemotePath, anchor: Point) {
+        match self.right_sidebar_remote_files.kind_for_path(&path) {
+            Some(RemoteFileKind::Directory) => self.begin_remote_folder_delete(path, anchor),
+            Some(_) => {
+                if let Some(origin) = self.current_remote_operation_origin() {
+                    self.set_pending_remote_confirm(
+                        PendingRemoteConfirm::FileDelete {
+                            remote: path,
+                            origin,
+                        },
+                        anchor,
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The confirmed single-file delete. No transfer row: it is one round
+    /// trip, and a failure reports through the panel's notice line.
+    fn execute_remote_file_delete(&mut self, remote: RemotePath, origin: RemoteOperationOrigin) {
+        if !self.remote_operation_origin_matches(&origin) {
+            return;
+        }
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles(&origin)
+        else {
+            self.right_sidebar_remote_files.error_message =
+                Some("Remote Files connection is no longer available".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let result = backend.remove_file(remote.clone()).await;
+            drop(operation_lease);
+            let connection_died = result.as_ref().is_err_and(|message| {
+                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.finish_remote_entry_removal(
+                    remote,
+                    result,
+                    origin,
+                    connection_key,
+                    connection_id,
+                    connection_died,
+                );
+            })));
+        })
+        .detach();
+    }
+
+    /// Shared tail of a delete or rename: the entry no longer exists under
+    /// its old path, so forget its subtree, close a preview that was showing
+    /// it, and re-list the directory it lived in.
+    pub(crate) fn finish_remote_entry_removal(
+        &mut self,
+        remote: RemotePath,
+        result: Result<(), String>,
+        origin: RemoteOperationOrigin,
+        connection_key: String,
+        connection_id: u64,
+        connection_died: bool,
+    ) {
+        if connection_died {
+            self.release_remote_files_lease_if_connection(&connection_key, connection_id);
+        }
+        if !self.remote_operation_origin_matches(&origin) {
+            // A different tree is on screen now; neither the error nor the
+            // refresh belongs to it.
+            return;
+        }
+        match result {
+            Ok(()) => self.forget_remote_entry_and_refresh_parent(&remote),
+            Err(message) => {
+                self.right_sidebar_remote_files.error_message = Some(message);
+            }
+        }
+        self.invalidate_window();
+    }
+
+    /// Drop `remote`'s cached subtree, close a preview living under it, and
+    /// re-list its parent so the tree reflects what the server now holds.
+    fn forget_remote_entry_and_refresh_parent(&mut self, remote: &RemotePath) {
+        // Decided BEFORE the transition, which clears the selection.
+        let preview_dies = self
+            .right_sidebar_remote_files
+            .selected
+            .as_ref()
+            .is_some_and(|selected| selected == remote || selected.is_descendant_of(remote));
+        let effects = self
+            .right_sidebar_remote_files
+            .transition(RemoteFilesEvent::EntryForgotten(remote.clone()));
+        self.apply_right_sidebar_remote_files_effects(effects);
+        if preview_dies {
+            self.close_right_sidebar_file_preview();
+        }
+        if let Some(parent) = remote.parent() {
+            let effects = self
+                .right_sidebar_remote_files
+                .transition(RemoteFilesEvent::DirectoryInvalidated(parent));
+            self.apply_right_sidebar_remote_files_effects(effects);
+        }
+    }
+
+    /// Walk a directory that is about to be deleted. The row exists from the
+    /// walk onwards so the listing phase is visible and abortable, exactly
+    /// like a folder download's.
+    fn begin_remote_folder_delete(&mut self, remote: RemotePath, anchor: Point) {
+        let name = remote.file_name().to_string();
+        let Some(origin) = self.current_remote_operation_origin() else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Delete,
+                name,
+                "Remote Files source is no longer available".to_string(),
+                None,
+            );
+            return;
+        };
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles(&origin)
+        else {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Delete,
+                name,
+                "Remote Files connection is no longer available".to_string(),
+                None,
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let id = self.next_remote_transfer_id();
+        let progress = RemoteTransferProgress::default();
+        self.right_sidebar_remote_transfers.push(RemoteTransfer {
+            id,
+            kind: RemoteTransferKind::Delete,
+            name,
+            progress: progress.clone(),
+            status: RemoteTransferStatus::Running,
+            // Deliberately no retry: a delete that half-happened changed the
+            // tree, and "run it again" deserves a fresh look, not a replay.
+            source: None,
+            origin: Some(origin.clone()),
+        });
+        self.trim_remote_transfers();
+        self.invalidate_window();
+
+        promise::spawn::spawn(async move {
+            let plan =
+                plan_remote_walk(&*backend, remote.clone(), RemoteWalkMode::Delete, &progress)
+                    .await;
+            drop(operation_lease);
+            let connection_died = plan.as_ref().is_err_and(|message| {
+                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_remote_folder_delete_plan(
+                    id,
+                    remote,
+                    plan,
+                    origin,
+                    anchor,
+                    connection_key,
+                    connection_id,
+                    connection_died,
+                );
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_remote_folder_delete_plan(
+        &mut self,
+        id: u64,
+        remote: RemotePath,
+        plan: Result<RemoteWalkPlan, String>,
+        origin: RemoteOperationOrigin,
+        anchor: Point,
+        connection_key: String,
+        connection_id: u64,
+        connection_died: bool,
+    ) {
+        if connection_died {
+            self.release_remote_files_lease_if_connection(&connection_key, connection_id);
+        }
+        if !self.remote_operation_origin_matches(&origin) {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "The panel moved to another host while this folder was being read".to_string(),
+                ),
+            );
+            self.invalidate_window();
+            return;
+        }
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(message) => {
+                self.finish_remote_transfer(id, RemoteTransferStatus::Failed(message));
+                self.invalidate_window();
+                return;
+            }
+        };
+        // A folder delete confirms at ANY size — unlike the transfer
+        // threshold, this is about irreversibility, not time.
+        self.set_pending_remote_confirm(
+            PendingRemoteConfirm::FolderDelete {
+                transfer_id: id,
+                remote,
+                plan,
+                origin,
+            },
+            anchor,
+        );
+        self.invalidate_window();
+    }
+
+    /// The confirmed folder delete: children first, the folder itself last.
+    fn start_remote_folder_delete_execution(
+        &mut self,
+        id: u64,
+        remote: RemotePath,
+        plan: RemoteWalkPlan,
+    ) {
+        let Some(transfer) = self
+            .right_sidebar_remote_transfers
+            .iter()
+            .find(|transfer| transfer.id == id)
+        else {
+            return;
+        };
+        let progress = transfer.progress.clone();
+        let Some(origin) = transfer.origin.clone() else {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "Remote transfer lost its source identity".to_string(),
+                ),
+            );
+            return;
+        };
+        if !self.remote_operation_origin_matches(&origin) {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "The panel moved to another host before the delete started".to_string(),
+                ),
+            );
+            return;
+        }
+        if progress.is_canceled() {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(REMOTE_TRANSFER_CANCELED.to_string()),
+            );
+            return;
+        }
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles(&origin)
+        else {
+            self.finish_remote_transfer(
+                id,
+                RemoteTransferStatus::Failed(
+                    "Remote Files connection is no longer available".to_string(),
+                ),
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        // +1: the folder itself is the last deletion.
+        progress.set_item_total(plan.entries.len() as u64 + 1);
+        promise::spawn::spawn(async move {
+            let result = delete_remote_tree(&*backend, &remote, &plan.entries, &progress).await;
+            drop(operation_lease);
+            let connection_died = result.as_ref().is_err_and(|message| {
+                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let status = match &result {
+                    Ok(removed) => RemoteTransferStatus::Done(format!("Deleted {removed} items")),
+                    Err(message) => RemoteTransferStatus::Failed(message.clone()),
+                };
+                term_window.finish_remote_transfer(id, status);
+                if connection_died {
+                    term_window
+                        .release_remote_files_lease_if_connection(&connection_key, connection_id);
+                }
+                // Success or not, the subtree changed underneath the cache:
+                // forget it and re-list the parent. After a partial failure
+                // the directory still exists — the fresh parent listing keeps
+                // it, collapsed, and expanding shows what is left.
+                if term_window.remote_operation_origin_matches(&origin) {
+                    term_window.forget_remote_entry_and_refresh_parent(&remote);
+                }
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    /// "New Folder" on a remote directory: mint `untitled folder` (or the
+    /// first numbered variant that is free) and drop into renaming it once
+    /// its row appears.
+    pub(crate) fn create_right_sidebar_remote_folder(&mut self, parent: RemotePath) {
+        let Some(origin) = self.current_remote_operation_origin() else {
+            self.right_sidebar_remote_files.error_message =
+                Some("Remote Files source is no longer available".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some((backend, operation_lease, connection_key, connection_id)) =
+            self.remote_transfer_handles(&origin)
+        else {
+            self.right_sidebar_remote_files.error_message =
+                Some("Remote Files connection is no longer available".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let mut created: Result<RemotePath, String> =
+                Err("Unable to find a free folder name".to_string());
+            for attempt in 0..100u32 {
+                let name = if attempt == 0 {
+                    "untitled folder".to_string()
+                } else {
+                    format!("untitled folder {}", attempt + 1)
+                };
+                let path = match parent.join_name(&name) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        created = Err(err);
+                        break;
+                    }
+                };
+                match backend.create_directory_exclusive(path.clone()).await {
+                    Ok(()) => {
+                        created = Ok(path);
+                        break;
+                    }
+                    // The exclusive-create contract spells an occupied name
+                    // exactly this way; anything else is a real failure.
+                    Err(message) if message.ends_with("already exists") => continue,
+                    Err(message) => {
+                        created = Err(message);
+                        break;
+                    }
+                }
+            }
+            drop(operation_lease);
+            let connection_died = created.as_ref().is_err_and(|message| {
+                invalidate_remote_connection_if_dead(&connection_key, connection_id, message)
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.finish_remote_folder_creation(
+                    parent,
+                    created,
+                    origin,
+                    connection_key,
+                    connection_id,
+                    connection_died,
+                );
+            })));
+        })
+        .detach();
+    }
+
+    fn finish_remote_folder_creation(
+        &mut self,
+        parent: RemotePath,
+        result: Result<RemotePath, String>,
+        origin: RemoteOperationOrigin,
+        connection_key: String,
+        connection_id: u64,
+        connection_died: bool,
+    ) {
+        if connection_died {
+            self.release_remote_files_lease_if_connection(&connection_key, connection_id);
+        }
+        if !self.remote_operation_origin_matches(&origin) {
+            return;
+        }
+        match result {
+            Ok(path) => {
+                // Open the parent so the new row can appear, re-list it, and
+                // remember to start renaming once the listing lands — the row
+                // does not exist to edit until then.
+                self.right_sidebar_remote_files
+                    .expanded
+                    .insert(parent.clone());
+                self.pending_remote_rename = Some((path, origin));
+                let effects = self
+                    .right_sidebar_remote_files
+                    .transition(RemoteFilesEvent::DirectoryInvalidated(parent));
+                self.apply_right_sidebar_remote_files_effects(effects);
+            }
+            Err(message) => {
+                self.right_sidebar_remote_files.error_message = Some(message);
+            }
+        }
+        self.invalidate_window();
+    }
+
+    /// Fire the deferred rename of a just-created folder once (and only once)
+    /// its row is really on screen. Runs after every remote listing lands.
+    fn maybe_begin_pending_remote_rename(&mut self) {
+        let Some((pending, origin)) = self.pending_remote_rename.clone() else {
+            return;
+        };
+        if !self.remote_operation_origin_matches(&origin) {
+            self.pending_remote_rename = None;
+            return;
+        }
+        match self.right_sidebar_remote_files.kind_for_path(&pending) {
+            Some(RemoteFileKind::Directory) => {
+                self.pending_remote_rename = None;
+                self.start_sidebar_remote_file_rename(pending);
+            }
+            Some(_) => {
+                // Something else wears the name now; renaming it would edit
+                // the wrong thing.
+                self.pending_remote_rename = None;
+            }
+            None => {
+                // Give up once the parent has a fresh listing that does not
+                // hold the row; before that, some other directory just loaded.
+                if pending
+                    .parent()
+                    .is_some_and(|parent| self.right_sidebar_remote_files.has_listing(&parent))
+                {
+                    self.pending_remote_rename = None;
+                }
+            }
+        }
+    }
+
+    /// A click on a transfer row. Running: stop it. Finished with a recorded
+    /// source: ask Retry-or-Dismiss rather than guessing which the click
+    /// meant. Anything else: clear the notice away, as before.
+    pub(crate) fn remote_transfer_row_clicked(&mut self, id: u64, anchor: Point) {
+        let Some(transfer) = self
+            .right_sidebar_remote_transfers
+            .iter()
+            .find(|transfer| transfer.id == id)
+        else {
+            return;
+        };
+        if transfer.is_running() {
+            transfer.progress.request_cancel();
+            self.invalidate_window();
+            return;
+        }
+        if transfer.can_retry() {
+            let Some(window) = self.window.as_ref().cloned() else {
+                return;
+            };
+            self.begin_context_menu_application_actions();
+            let retry = self.context_menu_application_item_with_icon(
+                "Retry",
+                ContextMenuIcon::Refresh,
+                crate::termwindow::ContextMenuApplicationAction::RetryRemoteTransfer { id, anchor },
+                true,
+            );
+            let dismiss = self.context_menu_application_item_with_icon(
+                "Dismiss",
+                ContextMenuIcon::Close,
+                crate::termwindow::ContextMenuApplicationAction::DismissRemoteTransfer(id),
+                true,
+            );
+            self.show_term_context_menu(&window, anchor, vec![retry, dismiss]);
+            return;
+        }
+        self.remove_remote_transfer_row(id);
+    }
+
+    pub(crate) fn remove_remote_transfer_row(&mut self, id: u64) {
+        if let Some(index) = self
+            .right_sidebar_remote_transfers
+            .iter()
+            .position(|transfer| transfer.id == id)
+        {
+            self.right_sidebar_remote_transfers.remove(index);
+            self.invalidate_window();
+        }
+    }
+
+    /// Run a failed transfer again from its recorded source.
+    pub(crate) fn retry_remote_transfer(&mut self, id: u64, anchor: Point) {
+        let Some(index) = self
+            .right_sidebar_remote_transfers
+            .iter()
+            .position(|transfer| transfer.id == id)
+        else {
+            return;
+        };
+        let Some(origin) = self.right_sidebar_remote_transfers[index].origin.clone() else {
+            return;
+        };
+        if !self.remote_operation_origin_matches(&origin) {
+            // Keep the row and its source intact so switching back makes the
+            // same Retry action useful. Never replay an absolute path against
+            // the host that merely happens to be visible now.
+            self.right_sidebar_remote_transfers[index].status = RemoteTransferStatus::Failed(
+                "Switch Files back to the original host to retry".to_string(),
+            );
+            self.invalidate_window();
+            return;
+        }
+        let transfer = self.right_sidebar_remote_transfers.remove(index);
+        let Some(source) = transfer.source else {
+            return;
+        };
+        match source {
+            RemoteTransferSource::Upload {
+                local,
+                remote,
+                directory,
+            } => self.start_remote_upload(local, remote, directory, None),
+            RemoteTransferSource::Download { remote } => {
+                self.download_right_sidebar_remote_file(remote)
+            }
+            RemoteTransferSource::DownloadFolder { remote } => {
+                self.download_right_sidebar_remote_folder(remote, anchor)
+            }
+        }
+        self.invalidate_window();
+    }
+
     /// Everything a transfer worker needs from the panel's lease. Takes an
     /// operation lease so the pooled connection cannot expire mid-transfer.
-    fn remote_transfer_handles(
+    fn current_remote_connection_key(&self) -> Option<String> {
+        let target = self.right_sidebar_remote_files.target.as_ref()?;
+        let source_key =
+            crate::termwindow::remote_files::RemoteFilesState::source_key(&target.source);
+        let config = Self::ssh_config_for_remote_files_target(target).ok()?;
+        Some(remote_connection_key(&source_key, &config))
+    }
+
+    pub(crate) fn current_remote_operation_origin(&self) -> Option<RemoteOperationOrigin> {
+        let source_key = self.right_sidebar_remote_files.current_source_key()?;
+        let connection_key = self.current_remote_connection_key()?;
+        let lease = self.right_sidebar_remote_files_lease.as_ref()?;
+        (lease.connection_key() == connection_key)
+            .then(|| RemoteOperationOrigin::new(source_key, connection_key))
+    }
+
+    pub(crate) fn remote_operation_origin_matches(&self, origin: &RemoteOperationOrigin) -> bool {
+        let current_connection_key = self.current_remote_connection_key();
+        origin.matches(
+            self.right_sidebar_remote_files
+                .current_source_key()
+                .as_deref(),
+            current_connection_key.as_deref(),
+        )
+    }
+
+    /// Drop the panel lease only if it is the exact connection that failed.
+    /// A delayed callback from host A must not disconnect host B, nor a newer
+    /// replacement connection for A.
+    pub(crate) fn release_remote_files_lease_if_connection(
+        &mut self,
+        connection_key: &str,
+        connection_id: u64,
+    ) -> bool {
+        let disposition = remote_lease_failure_disposition(
+            self.right_sidebar_remote_files_lease
+                .as_ref()
+                .map(|lease| (lease.connection_key(), lease.connection_id())),
+            connection_key,
+            connection_id,
+        );
+        let matches = disposition == RemoteLeaseFailureDisposition::FailedConnectionInstalled;
+        if matches {
+            self.right_sidebar_remote_files_lease.take();
+        }
+        matches
+    }
+
+    fn remote_files_lease_failure_disposition(
+        &mut self,
+        connection_key: &str,
+        connection_id: u64,
+    ) -> RemoteLeaseFailureDisposition {
+        let disposition = remote_lease_failure_disposition(
+            self.right_sidebar_remote_files_lease
+                .as_ref()
+                .map(|lease| (lease.connection_key(), lease.connection_id())),
+            connection_key,
+            connection_id,
+        );
+        if disposition == RemoteLeaseFailureDisposition::FailedConnectionInstalled {
+            self.right_sidebar_remote_files_lease.take();
+        }
+        disposition
+    }
+
+    fn reconnect_remote_files_after_connection_change(&mut self, generation: u64, message: String) {
+        self.close_right_sidebar_file_preview();
+        self.right_sidebar_remote_files
+            .transition(RemoteFilesEvent::ConnectionFailed {
+                generation,
+                message,
+            });
+        let effects = self
+            .right_sidebar_remote_files
+            .transition(RemoteFilesEvent::ConnectRequested);
+        self.apply_right_sidebar_remote_files_effects(effects);
+    }
+
+    pub(crate) fn remote_transfer_handles(
         &self,
+        origin: &RemoteOperationOrigin,
     ) -> Option<(
         Arc<dyn crate::termwindow::remote_files::RemoteFileBackend>,
         crate::termwindow::remote_files::RemoteConnectionLease,
         String,
         u64,
     )> {
+        if !self.remote_operation_origin_matches(origin) {
+            return None;
+        }
         let lease = self.right_sidebar_remote_files_lease.as_ref()?;
+        if lease.connection_key() != origin.connection_key() {
+            return None;
+        }
         let operation_lease = lease.operation_lease()?;
         Some((
             lease.backend(),
@@ -10720,26 +12351,6 @@ impl crate::TermWindow {
             transfer.status = status;
         }
         self.trim_remote_transfers();
-    }
-
-    /// Clicking a transfer row: stop it if it is still going, otherwise clear
-    /// the notice away.
-    pub(crate) fn dismiss_or_cancel_remote_transfer(&mut self, id: u64) {
-        let Some(index) = self
-            .right_sidebar_remote_transfers
-            .iter()
-            .position(|transfer| transfer.id == id)
-        else {
-            return;
-        };
-        if self.right_sidebar_remote_transfers[index].is_running() {
-            self.right_sidebar_remote_transfers[index]
-                .progress
-                .request_cancel();
-        } else {
-            self.right_sidebar_remote_transfers.remove(index);
-        }
-        self.invalidate_window();
     }
 
     pub(crate) fn request_right_sidebar_remote_files_connect(&mut self, explicit: bool) {
@@ -10823,6 +12434,13 @@ impl crate::TermWindow {
                 });
             return;
         };
+        if self.current_remote_connection_key().as_deref() != Some(lease.connection_key()) {
+            self.reconnect_remote_files_after_connection_change(
+                generation,
+                "Remote Files configuration changed before loading the preview".to_string(),
+            );
+            return;
+        }
         let Some(operation_lease) = lease.operation_lease() else {
             self.right_sidebar_remote_files_lease.take();
             self.close_right_sidebar_file_preview();
@@ -10893,7 +12511,28 @@ impl crate::TermWindow {
                 }
                 let error = result.message.clone();
                 if connection_died {
-                    term_window.right_sidebar_remote_files_lease.take();
+                    match term_window
+                        .remote_files_lease_failure_disposition(&connection_key, connection_id)
+                    {
+                        RemoteLeaseFailureDisposition::ReplacementForSameTarget => {
+                            term_window.spawn_right_sidebar_remote_file_preview(
+                                generation, source_key, path,
+                            );
+                            term_window.invalidate_window();
+                            return;
+                        }
+                        RemoteLeaseFailureDisposition::ReplacementForDifferentTarget => {
+                            term_window.reconnect_remote_files_after_connection_change(
+                                generation,
+                                "Remote Files connection changed while loading the preview"
+                                    .to_string(),
+                            );
+                            term_window.invalidate_window();
+                            return;
+                        }
+                        RemoteLeaseFailureDisposition::FailedConnectionInstalled
+                        | RemoteLeaseFailureDisposition::NoLease => {}
+                    }
                     term_window.close_right_sidebar_file_preview();
                     term_window.right_sidebar_remote_files.transition(
                         RemoteFilesEvent::ConnectionFailed {
@@ -11516,25 +13155,47 @@ impl crate::TermWindow {
             }
         }
         let text_x = file_icon_x + row_icon_size + row_metrics.icon_gap;
-        let row_title = self.sidebar_file_row_title(&row.path, &row.name);
-        self.paint_sidebar_text(
-            layers,
-            ui_font,
-            ui_metrics,
-            &row_title,
-            text_x,
-            y + (row_metrics
-                .row_height
-                .saturating_sub(ui_metrics.cell_size.height as usize))
-                / 2,
-            x.saturating_add(width)
-                .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET)),
-            if row.is_dir || is_selected {
-                foreground
-            } else {
-                muted_fg
-            },
-        )
+        let text_width = x
+            .saturating_add(width)
+            .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET));
+        if let Some(input) = self.sidebar_file_rename_input(&row.path).cloned() {
+            self.paint_snippet_text_box(
+                layers,
+                1,
+                ui_font,
+                ui_metrics,
+                chrome,
+                muted_fg,
+                text_x,
+                y + self.ui_px(2),
+                text_width,
+                row_metrics.row_height.saturating_sub(self.ui_px(4)),
+                None,
+                "",
+                &input,
+                true,
+                UIItemType::RightSidebarFileRow(row.path.clone()),
+                false,
+            )
+        } else {
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                &row.name,
+                text_x,
+                y + (row_metrics
+                    .row_height
+                    .saturating_sub(ui_metrics.cell_size.height as usize))
+                    / 2,
+                text_width,
+                if row.is_dir || is_selected {
+                    foreground
+                } else {
+                    muted_fg
+                },
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14352,6 +16013,223 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Where a terminal drop should upload, given the setting and (when the
+/// setting asks for it) the pane's reported working directory. Pure, so the
+/// fallback rules stay testable: `cwd` without a usable cwd must degrade to
+/// the default folder, never fail the drop.
+fn resolve_drop_destination(setting: &str, cwd: Option<&str>) -> String {
+    if setting == crate::native_settings::REMOTE_DROP_DESTINATION_CWD {
+        match cwd {
+            Some(cwd) if !cwd.trim().is_empty() => cwd.to_string(),
+            _ => crate::native_settings::DEFAULT_REMOTE_DROP_DESTINATION.to_string(),
+        }
+    } else {
+        setting.to_string()
+    }
+}
+
+/// First free name for an uploaded file, browser-style: the file's own name,
+/// then ` (1)`, ` (2)`… before the extension. The probe is advisory — the
+/// upload's exclusive create remains the authority — but it turns the common
+/// re-drop of the same screenshot into a rename instead of a failure.
+async fn pick_free_remote_name(
+    backend: &dyn crate::termwindow::remote_files::RemoteFileBackend,
+    directory: &RemotePath,
+    file_name: &str,
+) -> Result<RemotePath, String> {
+    for candidate in download_name_candidates(file_name) {
+        let remote = directory.join_name(&candidate)?;
+        if !backend.exists(remote.clone()).await? {
+            return Ok(remote);
+        }
+    }
+    Err(format!(
+        "Unable to find a free name for {file_name} in {}",
+        directory.as_str()
+    ))
+}
+
+/// Delete a planned remote tree — children first, the root folder last —
+/// returning how many things were removed.
+///
+/// Stops at the first failure, keeping the count honest: what was already
+/// deleted is gone, and the message says how far it got. There is no rollback
+/// to offer; inventing one would mean re-creating files whose bytes no longer
+/// exist anywhere.
+async fn delete_remote_tree(
+    backend: &dyn crate::termwindow::remote_files::RemoteFileBackend,
+    root: &RemotePath,
+    entries: &[RemoteWalkEntry],
+    progress: &RemoteTransferProgress,
+) -> Result<u64, String> {
+    let total = entries.len() + 1;
+    let mut removed = 0u64;
+    // The plan is parents-first; deleting must be children-first, or every
+    // rmdir would find its directory still occupied.
+    for entry in entries.iter().rev() {
+        if progress.is_canceled() {
+            return Err(format!(
+                "{REMOTE_TRANSFER_CANCELED} — stopped after {removed} of {total}"
+            ));
+        }
+        let result = if entry.is_directory() {
+            backend.remove_directory(entry.path.clone()).await
+        } else {
+            // Files, symlinks and specials all go through unlink.
+            backend.remove_file(entry.path.clone()).await
+        };
+        if let Err(message) = result {
+            return Err(format!("{message} — stopped after {removed} of {total}"));
+        }
+        removed += 1;
+        progress.finish_item();
+    }
+    if progress.is_canceled() {
+        return Err(format!(
+            "{REMOTE_TRANSFER_CANCELED} — stopped after {removed} of {total}"
+        ));
+    }
+    backend
+        .remove_directory(root.clone())
+        .await
+        .map_err(|message| format!("{message} — stopped after {removed} of {total}"))?;
+    progress.finish_item();
+    Ok(removed + 1)
+}
+
+/// Download a planned remote tree into a freshly reserved folder under
+/// `downloads_dir`, returning where it landed.
+///
+/// The reservation (`fs::create_dir`, exclusive) is what makes the rest
+/// simple: everything under the new folder is new by construction, so files
+/// are created exclusively through the pinned [`DestinationRoot`] handle with
+/// no staging names — a failed file is deleted through that same handle, and
+/// what already landed is kept and reported, matching the local copy's
+/// stop-and-say-how-far semantics.
+async fn download_remote_tree(
+    backend: &dyn crate::termwindow::remote_files::RemoteFileBackend,
+    downloads_dir: &Path,
+    folder_name: &str,
+    entries: &[RemoteWalkEntry],
+    progress: &RemoteTransferProgress,
+) -> Result<PathBuf, TransferFailure> {
+    if let Err(err) = fs::create_dir_all(downloads_dir) {
+        return Err(TransferFailure::new(format!(
+            "Unable to use {}: {err}",
+            downloads_dir.display()
+        )));
+    }
+    let root = DestinationRoot::open(downloads_dir).map_err(|err| {
+        TransferFailure::new(format!("Unable to use {}: {err}", downloads_dir.display()))
+    })?;
+    let Some(destination) = reserve_download_directory(downloads_dir, folder_name, |candidate| {
+        candidate
+            .file_name()
+            .is_some_and(|name| root.create_dir_exclusive(Path::new(name)).is_ok())
+    }) else {
+        return Err(TransferFailure::new(format!(
+            "Unable to find a free name in {}",
+            downloads_dir.display()
+        )));
+    };
+    // The reserved name is a single component by construction. Keeping the
+    // Downloads handle (not reopening the new directory by path) pins every
+    // subsequent operation beneath the same verified root.
+    let top = PathBuf::from(
+        destination
+            .file_name()
+            .expect("a reserved directory always has a name"),
+    );
+
+    let total = entries.len();
+    for (index, entry) in entries.iter().enumerate() {
+        if progress.is_canceled() {
+            return Err(failed_folder_download(
+                &root,
+                &top,
+                &destination,
+                format!("{REMOTE_TRANSFER_CANCELED} — stopped after {index} of {total}"),
+            ));
+        }
+        let mut relative = top.clone();
+        for component in &entry.components {
+            relative.push(component);
+        }
+        if entry.is_directory() {
+            if let Err(err) = root.create_dir(&relative) {
+                return Err(failed_folder_download(
+                    &root,
+                    &top,
+                    &destination,
+                    format!(
+                        "Unable to create {}: {err} — stopped after {index} of {total}",
+                        root.join(&relative).display()
+                    ),
+                ));
+            }
+        } else {
+            // Only plain files reach here: the Download walk skips symlinks
+            // and specials by construction.
+            let sink = match root.create_file(&relative) {
+                Ok(sink) => sink,
+                Err(err) => {
+                    return Err(failed_folder_download(
+                        &root,
+                        &top,
+                        &destination,
+                        format!(
+                            "Unable to create {}: {err} — stopped after {index} of {total}",
+                            root.join(&relative).display()
+                        ),
+                    ))
+                }
+            };
+            if let Err(mut failure) = backend
+                .download_into(entry.path.clone(), sink, progress.clone())
+                .await
+            {
+                failure.message = format!("{} — stopped after {index} of {total}", failure.message);
+                // A half-written file must not survive wearing a whole file's
+                // name. Deleted through the handle — cleanup runs exactly when
+                // something has gone wrong, the worst moment to trust a path.
+                if let Err(err) = root.remove_file(&relative) {
+                    log::warn!(
+                        "remote files: unable to clean up the partial download {}: {err:#}",
+                        root.join(&relative).display()
+                    );
+                }
+                return Err(failed_folder_download(
+                    &root,
+                    &top,
+                    &destination,
+                    failure.message,
+                ));
+            }
+        }
+        progress.finish_item();
+    }
+    Ok(destination)
+}
+
+/// Turn a folder-download error into an honest cleanup result.
+///
+/// Removing the top directory succeeds only while it is still empty. If any
+/// earlier item landed (or cleanup of the current partial failed), keep the
+/// useful partial tree and tell the user exactly where it is.
+fn failed_folder_download(
+    root: &DestinationRoot,
+    top: &Path,
+    destination: &Path,
+    message: String,
+) -> TransferFailure {
+    let _ = root.remove_dir(top);
+    let mut failure = TransferFailure::new(message);
+    if local_path_is_occupied(destination) {
+        failure.leftover = Some(destination.display().to_string());
+    }
+    failure
+}
+
 /// Walk every dropped path and find what already exists, all off the GUI
 /// thread. Rejections are collected rather than thrown, so one bad source does
 /// not sink the rest of a multi-select.
@@ -15634,26 +17512,29 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 mod tests {
     use super::{
         approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
-        copy_entries_blocking, copy_file_chunked, file_preview_close_requires_reflow,
-        file_release_action, file_row_placement, full_line_colors_by_byte,
-        image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
-        naturalish_cmp, note_code_highlight_key, note_code_highlight_lines, note_code_row_height,
-        note_image_display_size, note_open_pending_for_vault, note_release_action,
-        open_with_candidate_allowed, path_key, preflight_local_copy, preview_line_count,
-        preview_lines_from_text, preview_plain_lines_from_text, preview_text_range,
-        preview_visible_colored, preview_visible_line_range, resolve_local_drop_target,
-        resolve_remote_drop_target, right_sidebar_file_browse_rows_from_index,
-        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key, sanitize_preview_text,
-        scrollable_note_table_columns, search_right_sidebar_file_index, snippet_cursor_visible,
-        snippet_run_buffer, sorted_open_with_candidates, virtual_note_line_range,
-        visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
-        FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
-        NoteCodeHighlightState, NoteReleaseAction, FILE_PREVIEW_MAX_BYTES, LOCAL_COPY_CHUNK,
+        copy_entries_blocking, copy_file_chunked, failed_folder_download,
+        file_preview_close_requires_reflow, file_release_action, file_row_placement,
+        full_line_colors_by_byte, image_pixels_within_preview_budget, load_file_preview,
+        load_file_preview_image, naturalish_cmp, note_code_highlight_key,
+        note_code_highlight_lines, note_code_row_height, note_image_display_size,
+        note_open_pending_for_vault, note_release_action, open_with_candidate_allowed, path_key,
+        pick_free_remote_name, preflight_local_copy, preview_line_count, preview_lines_from_text,
+        preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
+        preview_visible_line_range, remote_lease_failure_disposition, resolve_drop_destination,
+        resolve_local_drop_target, resolve_remote_drop_target,
+        right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
+        right_sidebar_open_with_cache_key, sanitize_preview_text, scrollable_note_table_columns,
+        search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
+        sorted_open_with_candidates, virtual_note_line_range, visible_code_block_rounded_edges,
+        visible_file_row_range, wrap_snippet_text_for_width, FileReleaseAction, FileRowPlacement,
+        NoteApproximateTextMetrics, NoteCodeHighlightEntry, NoteCodeHighlightState,
+        NoteReleaseAction, RemoteLeaseFailureDisposition, FILE_PREVIEW_MAX_BYTES, LOCAL_COPY_CHUNK,
         NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
     };
     use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
     use crate::termwindow::remote_files::{
-        RemoteFileKind, RemotePath, RemoteTransferProgress, REMOTE_TRANSFER_CANCELED,
+        RemoteFileBytes, RemoteFileKind, RemotePath, RemoteTransferProgress,
+        REMOTE_TRANSFER_CANCELED,
     };
     use crate::termwindow::transfer_walk::{DestinationRoot, OverwritePolicy, TransferEntryKind};
     use crate::termwindow::{
@@ -15676,6 +17557,34 @@ mod tests {
         // the pane, so both width reads are already tree-only. The Preview view
         // marker must still force the terminal to reclaim the old pane width.
         assert!(file_preview_close_requires_reflow(true, 320, 320));
+    }
+
+    #[test]
+    fn folder_download_failures_clean_empty_reservations_and_report_partial_trees() {
+        let downloads = tempfile::tempdir().unwrap();
+        let root = DestinationRoot::open(downloads.path()).unwrap();
+
+        root.create_dir_exclusive(Path::new("empty")).unwrap();
+        let empty = downloads.path().join("empty");
+        let failure =
+            failed_folder_download(&root, Path::new("empty"), &empty, "stopped".to_string());
+        assert_eq!(failure.leftover, None);
+        assert!(!empty.exists(), "an empty reservation should be removed");
+
+        root.create_dir_exclusive(Path::new("partial")).unwrap();
+        let partial = downloads.path().join("partial");
+        fs::write(partial.join("landed.txt"), b"data").unwrap();
+        let failure = failed_folder_download(
+            &root,
+            Path::new("partial"),
+            &partial,
+            "connection lost".to_string(),
+        );
+        assert_eq!(
+            failure.leftover.as_deref(),
+            Some(partial.display().to_string().as_str())
+        );
+        assert!(partial.join("landed.txt").exists());
     }
 
     #[test]
@@ -15714,6 +17623,124 @@ mod tests {
                 ),
             },
         ]
+    }
+
+    /// The `cwd` setting is a request, not a promise: a pane that has not
+    /// reported its working directory yet must still land the drop somewhere
+    /// stable rather than failing it.
+    #[test]
+    fn a_terminal_drop_destination_degrades_from_cwd_to_the_default() {
+        use crate::native_settings::{
+            DEFAULT_REMOTE_DROP_DESTINATION, REMOTE_DROP_DESTINATION_CWD,
+        };
+        assert_eq!(
+            resolve_drop_destination(DEFAULT_REMOTE_DROP_DESTINATION, None),
+            DEFAULT_REMOTE_DROP_DESTINATION
+        );
+        assert_eq!(
+            resolve_drop_destination(REMOTE_DROP_DESTINATION_CWD, Some("/srv/app")),
+            "/srv/app"
+        );
+        assert_eq!(
+            resolve_drop_destination(REMOTE_DROP_DESTINATION_CWD, None),
+            DEFAULT_REMOTE_DROP_DESTINATION
+        );
+        assert_eq!(
+            resolve_drop_destination(REMOTE_DROP_DESTINATION_CWD, Some("  ")),
+            DEFAULT_REMOTE_DROP_DESTINATION
+        );
+        // A custom path never consults the cwd, even when one is around.
+        assert_eq!(
+            resolve_drop_destination("~/inbox", Some("/srv/app")),
+            "~/inbox"
+        );
+    }
+
+    /// Backend double whose `exists` answers from a fixed set of taken names.
+    struct TakenNamesBackend {
+        taken: std::collections::HashSet<String>,
+    }
+
+    impl crate::termwindow::remote_files::RemoteFileBackend for TakenNamesBackend {
+        fn resolve_root(
+            &self,
+            _requested: String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RemotePath, String>> + Send + 'static>,
+        > {
+            Box::pin(async { RemotePath::from_server_absolute("/srv") })
+        }
+
+        fn list_directory(
+            &self,
+            _path: RemotePath,
+            _limit: usize,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::termwindow::remote_files::RemoteDirectoryListing,
+                            String,
+                        >,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::termwindow::remote_files::RemoteDirectoryListing {
+                    entries: Vec::new(),
+                    truncated: false,
+                })
+            })
+        }
+
+        fn read_file(
+            &self,
+            _path: RemotePath,
+            _limit: usize,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RemoteFileBytes, String>> + Send + 'static>,
+        > {
+            Box::pin(async {
+                Ok(RemoteFileBytes {
+                    bytes: Vec::new(),
+                    truncated: false,
+                })
+            })
+        }
+
+        fn exists(
+            &self,
+            remote: RemotePath,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'static>,
+        > {
+            let taken = self.taken.contains(remote.as_str());
+            Box::pin(async move { Ok(taken) })
+        }
+    }
+
+    /// Re-dropping the same screenshot must become ` (1)`, ` (2)` — the
+    /// browser rule — with the extension kept whole.
+    #[test]
+    fn a_terminal_drop_picks_the_first_free_remote_name() {
+        let directory = RemotePath::from_server_absolute("/home/x/ThinkTerm_Uploads").unwrap();
+        let backend = TakenNamesBackend {
+            taken: [
+                "/home/x/ThinkTerm_Uploads/shot.png",
+                "/home/x/ThinkTerm_Uploads/shot (1).png",
+            ]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        };
+        let chosen =
+            smol::block_on(pick_free_remote_name(&backend, &directory, "shot.png")).unwrap();
+        assert_eq!(chosen.as_str(), "/home/x/ThinkTerm_Uploads/shot (2).png");
+
+        let untouched =
+            smol::block_on(pick_free_remote_name(&backend, &directory, "fresh.txt")).unwrap();
+        assert_eq!(untouched.as_str(), "/home/x/ThinkTerm_Uploads/fresh.txt");
     }
 
     #[test]
@@ -15813,7 +17840,7 @@ mod tests {
             &progress,
         )
         .expect_err("a canceled copy fails");
-        assert!(err.contains(REMOTE_TRANSFER_CANCELED), "{err}");
+        assert!(err.contains(REMOTE_TRANSFER_CANCELED), "{}", err);
 
         assert_eq!(
             fs::read(&destination).unwrap(),
@@ -15827,7 +17854,7 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().to_string())
             .filter(|name| name != "src.txt")
             .collect();
-        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+        assert!(leftovers.is_empty(), "left behind: {:?}", leftovers);
     }
 
     /// Goes through the real `copy_file_chunked` Replace path and forces its
@@ -15873,7 +17900,7 @@ mod tests {
             &progress,
         )
         .expect_err("a canceled replace fails");
-        assert!(err.contains(REMOTE_TRANSFER_CANCELED), "{err}");
+        assert!(err.contains(REMOTE_TRANSFER_CANCELED), "{}", err);
 
         assert!(
             bystander.exists(),
@@ -15892,7 +17919,8 @@ mod tests {
             .collect();
         assert!(
             leftovers.is_empty(),
-            "the staging file must be removed from where it was made: {leftovers:?}"
+            "the staging file must be removed from where it was made: {:?}",
+            leftovers
         );
     }
 
@@ -15984,7 +18012,7 @@ mod tests {
             &progress,
         )
         .expect_err("copying a file over itself must be refused");
-        assert!(err.contains("already at the destination"), "{err}");
+        assert!(err.contains("already at the destination"), "{}", err);
         assert_eq!(
             fs::read(&source).unwrap(),
             b"important data",
@@ -17050,5 +19078,25 @@ mod tests {
         assert!(!snippet_cursor_visible(500, 500));
         assert!(!snippet_cursor_visible(999, 500));
         assert!(snippet_cursor_visible(1000, 500));
+    }
+
+    #[test]
+    fn a_failed_lease_distinguishes_replacements_from_the_connection_that_failed() {
+        assert_eq!(
+            remote_lease_failure_disposition(Some(("host:key", 7)), "host:key", 7),
+            RemoteLeaseFailureDisposition::FailedConnectionInstalled,
+        );
+        assert_eq!(
+            remote_lease_failure_disposition(Some(("host:key", 8)), "host:key", 7),
+            RemoteLeaseFailureDisposition::ReplacementForSameTarget,
+        );
+        assert_eq!(
+            remote_lease_failure_disposition(Some(("host:new-key", 8)), "host:key", 7),
+            RemoteLeaseFailureDisposition::ReplacementForDifferentTarget,
+        );
+        assert_eq!(
+            remote_lease_failure_disposition(None, "host:key", 7),
+            RemoteLeaseFailureDisposition::NoLease,
+        );
     }
 }

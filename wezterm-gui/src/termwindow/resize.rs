@@ -66,10 +66,13 @@ impl super::TermWindow {
         );
     }
 
-    fn apply_font_scales_to_mux_window_panes(&mut self, font_scales: HashMap<PaneId, Option<f64>>) {
+    fn apply_font_scales_to_mux_window_panes(
+        &mut self,
+        font_scales: HashMap<PaneId, Option<f64>>,
+    ) -> bool {
         let mux = Mux::get();
         let Some(mux_window) = mux.get_window(self.mux_window_id) else {
-            return;
+            return false;
         };
 
         let mut changed = false;
@@ -89,10 +92,9 @@ impl super::TermWindow {
         if !changed {
             // Called per TabAddedToWindow during resyncs; skip the cache
             // flush when nothing actually changed.
-            return;
+            return false;
         }
 
-        self.sync_pane_font_sizes();
         self.quad_generation += 1;
         self.shape_generation += 1;
         self.pane_font_cache.borrow_mut().clear();
@@ -105,20 +107,30 @@ impl super::TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+        true
     }
 
-    pub(crate) fn apply_workspace_thread_font_scales(&mut self) {
+    /// Restore the destination thread's per-pane scale state without resizing
+    /// any pane.  Adoption paths use this to stage every geometry input before
+    /// issuing their single, final pane-size synchronization.
+    pub(crate) fn stage_workspace_thread_font_scales(&mut self) -> bool {
         let mux = Mux::get();
         let Some(window) = mux.get_window(self.mux_window_id) else {
-            return;
+            return false;
         };
         let Some(font_scales) = crate::workspace_threads::workspace_pane_font_scales(
             window.get_workspace(),
             self.mux_window_id,
         ) else {
-            return;
+            return false;
         };
-        self.apply_font_scales_to_mux_window_panes(font_scales);
+        self.apply_font_scales_to_mux_window_panes(font_scales)
+    }
+
+    pub(crate) fn apply_workspace_thread_font_scales(&mut self) {
+        if self.stage_workspace_thread_font_scales() {
+            self.sync_pane_font_sizes();
+        }
     }
 
     pub(crate) fn apply_native_terminal_settings(&mut self) {
@@ -354,6 +366,40 @@ impl super::TermWindow {
             for tab in window.iter() {
                 tab.resize(self.terminal_size);
             }
+        }
+        self.reapply_collapsed_panes_for_window();
+        self.force_sync_active_mux_tab_pane_sizes();
+    }
+
+    /// Repair a missed/deferred sidebar reflow before terminal geometry is
+    /// consumed by paint.  Most size changes arrive through
+    /// `apply_dimensions`, but a content-view handoff or remote mux resync can
+    /// briefly leave the active tab carrying the prior full-width geometry.
+    ///
+    /// The comparison is important: `Tab::resize` emits `TabResized`, which a
+    /// client domain answers with a resync.  Only repairing a real mismatch
+    /// keeps this recovery path convergent rather than creating a resize loop.
+    pub(crate) fn reconcile_active_mux_tab_size_before_paint(&mut self) {
+        if self.content_view_foreground() {
+            return;
+        }
+
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        if tab.get_size() == self.terminal_size {
+            return;
+        }
+
+        log::debug!(
+            "repairing active tab {} geometry before paint: {:?} -> {:?}",
+            tab.tab_id(),
+            tab.get_size(),
+            self.terminal_size
+        );
+        if !tab.resize(self.terminal_size) {
+            return;
         }
         self.reapply_collapsed_panes_for_window();
         self.force_sync_active_mux_tab_pane_sizes();

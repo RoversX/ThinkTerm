@@ -357,10 +357,6 @@ impl TransferFailure {
             leftover: None,
         }
     }
-
-    pub(crate) fn was_canceled(&self) -> bool {
-        self.message == REMOTE_TRANSFER_CANCELED
-    }
 }
 
 /// Transfers report richer failures than the rest of the backend, so they get
@@ -371,6 +367,10 @@ type TransferFuture = Pin<Box<dyn Future<Output = Result<u64, TransferFailure>> 
 pub(crate) enum RemoteTransferKind {
     Upload,
     Download,
+    /// Removing a remote folder tree. Rides the transfer strip because it has
+    /// the same shape — many round trips, progress, a cancel — even though no
+    /// bytes move.
+    Delete,
     /// Copying between two local directories — no connection involved, but it
     /// wants the same progress row, cancel and retry as the remote ones.
     LocalCopy,
@@ -381,6 +381,7 @@ impl RemoteTransferKind {
         match self {
             Self::Upload => "Uploading",
             Self::Download => "Downloading",
+            Self::Delete => "Deleting",
             Self::LocalCopy => "Copying",
         }
     }
@@ -415,10 +416,45 @@ pub(crate) enum RemoteTransferSource {
     Download {
         remote: RemotePath,
     },
-    LocalCopy {
-        source: PathBuf,
-        destination_dir: PathBuf,
+    /// A whole remote directory. Retrying re-walks and re-reserves from
+    /// scratch — the tree may have changed, and the old reservation is a
+    /// half-written folder the retry must not resume into.
+    DownloadFolder {
+        remote: RemotePath,
     },
+}
+
+/// The Files source an operation was created against.
+///
+/// Remote paths are only meaningful together with this identity: `/tmp/a` on
+/// host A is not the same object as `/tmp/a` on host B.  Keep the source on
+/// work that can outlive the currently displayed tree (transfers, confirmation
+/// menus and inline edits), then revalidate it immediately before execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteOperationOrigin {
+    source_key: String,
+    connection_key: String,
+}
+
+impl RemoteOperationOrigin {
+    pub(crate) fn new(source_key: String, connection_key: String) -> Self {
+        Self {
+            source_key,
+            connection_key,
+        }
+    }
+
+    pub(crate) fn source_key(&self) -> &str {
+        &self.source_key
+    }
+
+    pub(crate) fn connection_key(&self) -> &str {
+        &self.connection_key
+    }
+
+    pub(crate) fn matches(&self, source_key: Option<&str>, connection_key: Option<&str>) -> bool {
+        source_key == Some(self.source_key()) && connection_key == Some(self.connection_key())
+    }
 }
 
 /// One transfer in flight, or one that just finished and still has something
@@ -434,6 +470,10 @@ pub(crate) struct RemoteTransfer {
     /// Enough to retry. `None` for records that were never a real transfer —
     /// a rejected folder, say — which have nothing to retry.
     pub source: Option<RemoteTransferSource>,
+    /// Host identity for remote work. Local copies deliberately leave this
+    /// empty; every retryable remote transfer must have both `source` and
+    /// `origin`.
+    pub origin: Option<RemoteOperationOrigin>,
 }
 
 impl RemoteTransfer {
@@ -442,7 +482,7 @@ impl RemoteTransfer {
     }
 
     pub(crate) fn can_retry(&self) -> bool {
-        !self.is_running() && self.source.is_some()
+        !self.is_running() && self.source.is_some() && self.origin.is_some()
     }
 }
 
@@ -481,6 +521,36 @@ pub(crate) fn download_name_candidates(file_name: &str) -> impl Iterator<Item = 
     std::iter::once(sanitized.to_string()).chain(
         (1..=DOWNLOAD_NAME_ATTEMPTS).map(move |suffix| format!("{stem} ({suffix}){extension}")),
     )
+}
+
+/// The names a downloaded FOLDER will try, in order: the folder's own name,
+/// then ` (1)`, ` (2)`… appended at the end. Never the file rule — a folder
+/// called `my.folder` has no extension to preserve, and splitting it would
+/// produce `my (1).folder`.
+pub(crate) fn folder_download_name_candidates(name: &str) -> impl Iterator<Item = String> + '_ {
+    let sanitized = sanitized_download_name(name);
+    std::iter::once(sanitized.to_string())
+        .chain((1..=DOWNLOAD_NAME_ATTEMPTS).map(move |suffix| format!("{sanitized} ({suffix})")))
+}
+
+/// Claim a fresh directory for a folder download.
+///
+/// `reserve` must CREATE the candidate exclusively (`fs::create_dir`, which
+/// fails if anything already wears the name) and report whether it won; the
+/// successful candidate is both the reservation and the destination, so
+/// everything written under it afterwards is by construction new.
+pub(crate) fn reserve_download_directory(
+    directory: &Path,
+    name: &str,
+    mut reserve: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    for candidate in folder_download_name_candidates(name) {
+        let destination = directory.join(&candidate);
+        if reserve(&destination) {
+            return Some(destination);
+        }
+    }
+    None
 }
 
 /// Claim a destination and its staging file together.
@@ -572,6 +642,68 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
             ))
         })
     }
+
+    /// Stream `remote` into an already-created local file, returning the bytes
+    /// written. Unlike [`Self::download_file`] there is no staging and no
+    /// rename: the caller created `sink` exclusively (through its pinned
+    /// destination handle) and owns cleaning it up on failure. That is what a
+    /// folder download wants — its whole tree is freshly reserved, and every
+    /// write must stay behind the caller's directory handle.
+    fn download_into(
+        &self,
+        remote: RemotePath,
+        sink: std::fs::File,
+        progress: RemoteTransferProgress,
+    ) -> TransferFuture {
+        let _ = (remote, sink, progress);
+        Box::pin(async {
+            Err(TransferFailure::new(
+                "This connection cannot download files",
+            ))
+        })
+    }
+
+    /// Whether anything currently wears this remote name. Advisory only: a
+    /// `false` may be a transport failure or a race, so a caller choosing a
+    /// free name must still create exclusively and treat THAT as the truth.
+    /// The default says "not there", which makes test doubles optimistic and
+    /// keeps the exclusive create as the single honest gate.
+    fn exists(&self, remote: RemotePath) -> RemoteFuture<bool> {
+        let _ = remote;
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Delete a single remote file (or symlink). The default refuses, like
+    /// `upload_file`: only a backend that can actually delete should claim to.
+    fn remove_file(&self, remote: RemotePath) -> RemoteFuture<()> {
+        let _ = remote;
+        Box::pin(async { Err("This connection cannot delete files".to_string()) })
+    }
+
+    /// Delete an EMPTY remote directory. Recursion is the caller's job: the
+    /// protocol offers only rmdir, and hiding a walk in here would bury both
+    /// its per-directory round trips and its cancellation points.
+    fn remove_directory(&self, remote: RemotePath) -> RemoteFuture<()> {
+        let _ = remote;
+        Box::pin(async { Err("This connection cannot delete folders".to_string()) })
+    }
+
+    /// Rename `from` to `to` WITHOUT overwriting: a `to` that already exists
+    /// is the server's error to report. Implementations must reserve the
+    /// destination atomically rather than relying on an advisory existence
+    /// check followed by a potentially-overwriting rename.
+    fn rename(&self, from: RemotePath, to: RemotePath) -> RemoteFuture<()> {
+        let _ = (from, to);
+        Box::pin(async { Err("This connection cannot rename".to_string()) })
+    }
+
+    /// Create a remote directory, failing if ANYTHING already has that name.
+    /// Unlike [`Self::create_directory`], an existing directory is a failure:
+    /// "New Folder" must mint something new, never adopt a neighbour.
+    fn create_directory_exclusive(&self, remote: RemotePath) -> RemoteFuture<()> {
+        let _ = remote;
+        Box::pin(async { Err("This connection cannot create directories".to_string()) })
+    }
 }
 
 pub(crate) trait RemoteFileConnector: Send + Sync {
@@ -592,6 +724,145 @@ pub(crate) fn remote_connection_key(source_key: &str, config: &SshDomain) -> Str
     // another copy of the secret.
     config.stored_password.hash(&mut hasher);
     format!("{source_key}:{:016x}", hasher.finish())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteRenameEntryKind {
+    Directory,
+    Other,
+}
+
+trait RemoteRenameBackend: Send + Sync {
+    fn inspect(&self, path: String) -> RemoteFuture<Option<RemoteRenameEntryKind>>;
+    fn reserve(&self, path: String, kind: RemoteRenameEntryKind) -> RemoteFuture<()>;
+    fn replace(&self, from: String, to: String) -> RemoteFuture<()>;
+    fn release(&self, path: String, kind: RemoteRenameEntryKind) -> RemoteFuture<()>;
+}
+
+async fn rename_without_overwrite(
+    backend: &dyn RemoteRenameBackend,
+    from: &RemotePath,
+    to: &RemotePath,
+) -> Result<(), String> {
+    let source_kind = backend
+        .inspect(from.as_str().to_string())
+        .await
+        .map_err(|err| format!("Unable to inspect {}: {err}", from.as_str()))?
+        .ok_or_else(|| format!("{} does not exist", from.as_str()))?;
+
+    if let Err(reserve_error) = backend.reserve(to.as_str().to_string(), source_kind).await {
+        return match backend.inspect(to.as_str().to_string()).await {
+            Ok(Some(_)) => Err(format!("{} already exists", to.as_str())),
+            Ok(None) => Err(format!(
+                "Unable to reserve {} for rename: {reserve_error}",
+                to.as_str()
+            )),
+            Err(check) => Err(format!(
+                "Unable to verify why {} could not be reserved: {check}",
+                to.as_str()
+            )),
+        };
+    }
+
+    if let Err(rename_error) = backend
+        .replace(from.as_str().to_string(), to.as_str().to_string())
+        .await
+    {
+        let mut message = format!(
+            "Unable to rename {} to {}: {rename_error}",
+            from.as_str(),
+            to.file_name()
+        );
+        // A transport error can be ambiguous: the server may have completed
+        // the rename before the reply was lost. Only remove the placeholder
+        // after proving the source still exists; otherwise `to` may now be
+        // the user's actual data.
+        match backend.inspect(from.as_str().to_string()).await {
+            Ok(Some(_)) => {
+                if let Err(cleanup_error) =
+                    backend.release(to.as_str().to_string(), source_kind).await
+                {
+                    message.push_str(&format!(
+                        "; the reserved placeholder {} could not be removed: {cleanup_error}",
+                        to.as_str()
+                    ));
+                }
+            }
+            Ok(None) => {
+                message.push_str(&format!(
+                    "; the outcome could not be verified, so {} was left untouched",
+                    to.as_str()
+                ));
+            }
+            Err(check) => {
+                message.push_str(&format!(
+                    "; the outcome could not be verified, so {} was left untouched: {check}",
+                    to.as_str()
+                ));
+            }
+        }
+        return Err(message);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SftpRemoteRenameBackend {
+    sftp: wezterm_ssh::Sftp,
+}
+
+impl RemoteRenameBackend for SftpRemoteRenameBackend {
+    fn inspect(&self, path: String) -> RemoteFuture<Option<RemoteRenameEntryKind>> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            match sftp.symlink_metadata(path).await {
+                Ok(metadata) => Ok(Some(if metadata.is_dir() {
+                    RemoteRenameEntryKind::Directory
+                } else {
+                    RemoteRenameEntryKind::Other
+                })),
+                Err(err) if sftp_error_is_missing(&err) => Ok(None),
+                Err(err) => Err(err.to_string()),
+            }
+        })
+    }
+
+    fn reserve(&self, path: String, kind: RemoteRenameEntryKind) -> RemoteFuture<()> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            match kind {
+                RemoteRenameEntryKind::Directory => sftp
+                    .create_dir(path, 0o700)
+                    .await
+                    .map_err(|err| err.to_string()),
+                RemoteRenameEntryKind::Other => sftp
+                    .create_new(path)
+                    .await
+                    .map(drop)
+                    .map_err(|err| err.to_string()),
+            }
+        })
+    }
+
+    fn replace(&self, from: String, to: String) -> RemoteFuture<()> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            sftp.rename(from, to, wezterm_ssh::RenameOptions::default())
+                .await
+                .map_err(|err| err.to_string())
+        })
+    }
+
+    fn release(&self, path: String, kind: RemoteRenameEntryKind) -> RemoteFuture<()> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            match kind {
+                RemoteRenameEntryKind::Directory => sftp.remove_dir(path).await,
+                RemoteRenameEntryKind::Other => sftp.remove_file(path).await,
+            }
+            .map_err(|err| err.to_string())
+        })
+    }
 }
 
 struct SftpRemoteFileBackend {
@@ -875,6 +1146,99 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
             finish_download(outcome, &partial, &local).await
         })
     }
+
+    fn download_into(
+        &self,
+        remote: RemotePath,
+        sink: std::fs::File,
+        progress: RemoteTransferProgress,
+    ) -> TransferFuture {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            let mut file = sftp
+                .open(remote.as_str().to_string())
+                .await
+                .map_err(|err| {
+                    TransferFailure::new(format!("Unable to open {}: {err}", remote.as_str()))
+                })?;
+            let mut sink = smol::fs::File::from(sink);
+            copy_stream(
+                &mut file,
+                &mut sink,
+                &progress,
+                "the server",
+                "the local file",
+            )
+            .await
+            .map_err(TransferFailure::new)
+        })
+    }
+
+    fn exists(&self, remote: RemotePath) -> RemoteFuture<bool> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            // SFTP v3 cannot distinguish "not found" from other failures, so a
+            // failed stat reads as absent; the exclusive create downstream is
+            // what actually guarantees no clobbering.
+            Ok(sftp.metadata(remote.as_str().to_string()).await.is_ok())
+        })
+    }
+
+    fn remove_file(&self, remote: RemotePath) -> RemoteFuture<()> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            sftp.remove_file(remote.as_str().to_string())
+                .await
+                .map_err(|err| format!("Unable to delete {}: {err}", remote.as_str()))
+        })
+    }
+
+    fn remove_directory(&self, remote: RemotePath) -> RemoteFuture<()> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            sftp.remove_dir(remote.as_str().to_string())
+                .await
+                .map_err(|err| format!("Unable to delete {}: {err}", remote.as_str()))
+        })
+    }
+
+    fn rename(&self, from: RemotePath, to: RemotePath) -> RemoteFuture<()> {
+        let backend = SftpRemoteRenameBackend {
+            sftp: self.sftp.clone(),
+        };
+        Box::pin(async move {
+            // libssh drops RenameOptions and can upgrade a plain rename to
+            // posix-rename@openssh.com, which replaces an occupied target.
+            // Atomically CREATE the target first, then replace only the empty
+            // placeholder owned by this operation. A competing creator either
+            // wins the reservation (and we stop) or encounters ours; there is
+            // no check-then-rename gap in which its data can be destroyed.
+            rename_without_overwrite(&backend, &from, &to).await
+        })
+    }
+
+    fn create_directory_exclusive(&self, remote: RemotePath) -> RemoteFuture<()> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            // Unlike create_directory there is no merge tolerance, but the
+            // failure still deserves a precise message: SFTP v3 answers a
+            // bare FAILURE for "exists", indistinguishable from a permission
+            // problem, so ask metadata which one it was.
+            match sftp.create_dir(remote.as_str().to_string(), 0o755).await {
+                Ok(()) => Ok(()),
+                Err(err) => match sftp.symlink_metadata(remote.as_str().to_string()).await {
+                    Ok(_) => Err(format!("{} already exists", remote.as_str())),
+                    Err(check) if sftp_error_is_missing(&check) => {
+                        Err(format!("Unable to create {}: {err}", remote.as_str()))
+                    }
+                    Err(check) => Err(format!(
+                        "Unable to verify why {} could not be created: {check}",
+                        remote.as_str()
+                    )),
+                },
+            }
+        })
+    }
 }
 
 /// Put a finished download in place, or clean up after a failed one.
@@ -903,28 +1267,57 @@ async fn finish_download(
         }
     };
 
-    // `rename` replaces silently, so re-check that nothing appeared at the
-    // destination while the download ran. Uploads refuse to clobber; this side
-    // must match, or a long download quietly destroys a file created in the
-    // meantime.
-    if local.exists() {
-        let _ = smol::fs::remove_file(partial).await;
-        return Err(TransferFailure::new(format!(
-            "{} appeared while downloading, so it was left untouched",
-            local.display()
-        )));
-    }
-
-    match smol::fs::rename(partial, local).await {
+    // A plain rename replaces silently and a preceding exists() check follows
+    // symlinks (so a dangling link looks vacant) as well as racing with a
+    // creator. TempPath's no-clobber persistence performs the move with
+    // destination-exists protection and treats a dangling link as occupied.
+    match tempfile::TempPath::from_path(partial).persist_noclobber(local) {
         Ok(()) => Ok(written),
         Err(err) => {
-            let _ = smol::fs::remove_file(partial).await;
-            Err(TransferFailure::new(format!(
-                "Unable to save {}: {err}",
-                local.display()
-            )))
+            let message = if local_path_is_occupied(local) {
+                format!(
+                    "{} appeared while downloading, so it was left untouched",
+                    local.display()
+                )
+            } else {
+                format!("Unable to save {}: {}", local.display(), err.error)
+            };
+            let partial = err.path.to_path_buf();
+            // Dropping the TempPath attempts cleanup. Check afterwards so a
+            // failed cleanup remains visible in the transfer row.
+            drop(err.path);
+            let mut failure = TransferFailure::new(message);
+            if local_path_is_occupied(&partial) {
+                failure.leftover = Some(partial.display().to_string());
+            }
+            Err(failure)
         }
     }
+}
+
+/// `true` unless lstat explicitly says the path does not exist.
+///
+/// This is deliberately fail-closed: permission and transient filesystem
+/// errors cannot be interpreted as permission to overwrite.
+pub(crate) fn local_path_is_occupied(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            log::warn!(
+                "remote files: unable to verify whether {} is free: {err:#}",
+                path.display()
+            );
+            true
+        }
+    }
+}
+
+fn sftp_error_is_missing(err: &SftpChannelError) -> bool {
+    matches!(
+        err,
+        SftpChannelError::Sftp(SftpError::NoSuchFile | SftpError::NoSuchPath)
+    )
 }
 
 /// Stream `remote` into the already-reserved `partial`. Split out so the
@@ -1153,6 +1546,14 @@ impl RemoteConnectionLease {
     /// ran on, never a replacement dialled under the same key since.
     pub(crate) fn connection_id(&self) -> u64 {
         self.connection_id
+    }
+
+    /// Whether two leases name the same pooled connection. Identity is the
+    /// (key, id) pair: a key dialled with since-changed host settings hashes
+    /// differently, and a connection redialled under the same key gets a new
+    /// id.
+    pub(crate) fn is_same_connection(&self, other: &RemoteConnectionLease) -> bool {
+        self.key == other.key && self.connection_id == other.connection_id
     }
 
     pub(crate) fn operation_lease(&self) -> Option<RemoteConnectionLease> {
@@ -1765,6 +2166,11 @@ pub(crate) enum RemoteFilesEvent {
         message: String,
     },
     SelectFile(RemotePath),
+    /// An entry stopped existing under its old path (deleted, or renamed
+    /// away): drop its whole cached subtree NOW, not on the next re-list.
+    /// Orphaned listings would keep eating the row budget, and a selection
+    /// under the old path would keep a preview open for a file that is gone.
+    EntryForgotten(RemotePath),
     PreviewFinished {
         generation: u64,
         path: RemotePath,
@@ -2015,6 +2421,18 @@ impl RemoteFilesState {
                     source_key,
                     path,
                 }]
+            }
+            RemoteFilesEvent::EntryForgotten(path) => {
+                // remove_descendants clears everything BELOW the path plus a
+                // selection under it; the path itself needs its own expansion
+                // and selection cleared too.
+                self.remove_descendants(&path);
+                self.expanded.remove(&path);
+                if self.selected.as_ref() == Some(&path) {
+                    self.selected = None;
+                    self.preview = RemotePreviewStatus::None;
+                }
+                Vec::new()
             }
             RemoteFilesEvent::PreviewFinished {
                 generation,
@@ -2335,6 +2753,12 @@ impl RemoteFilesState {
             .any(|directory| directory.listing.truncated)
     }
 
+    /// Whether this directory currently holds a loaded listing. Used to tell
+    /// "the row is not there" apart from "its directory has not loaded yet".
+    pub(crate) fn has_listing(&self, path: &RemotePath) -> bool {
+        self.directories.contains_key(path)
+    }
+
     pub(crate) fn kind_for_path(&self, path: &RemotePath) -> Option<RemoteFileKind> {
         if self.root.as_ref() == Some(path) {
             return Some(RemoteFileKind::Directory);
@@ -2351,6 +2775,165 @@ impl RemoteFilesState {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    enum FakeRenameResult {
+        #[default]
+        Success,
+        FailBeforeMove,
+        FailAfterMove,
+    }
+
+    #[derive(Default)]
+    struct FakeRenameState {
+        entries: HashMap<String, (RemoteRenameEntryKind, &'static str)>,
+        replace_result: FakeRenameResult,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeRenameBackend {
+        state: Arc<Mutex<FakeRenameState>>,
+    }
+
+    impl FakeRenameBackend {
+        fn insert(&self, path: &str, kind: RemoteRenameEntryKind, owner: &'static str) {
+            self.state
+                .lock()
+                .unwrap()
+                .entries
+                .insert(path.to_string(), (kind, owner));
+        }
+
+        fn owner(&self, path: &str) -> Option<&'static str> {
+            self.state
+                .lock()
+                .unwrap()
+                .entries
+                .get(path)
+                .map(|(_, owner)| *owner)
+        }
+
+        fn set_replace_result(&self, result: FakeRenameResult) {
+            self.state.lock().unwrap().replace_result = result;
+        }
+    }
+
+    impl RemoteRenameBackend for FakeRenameBackend {
+        fn inspect(&self, path: String) -> RemoteFuture<Option<RemoteRenameEntryKind>> {
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                Ok(state
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .get(&path)
+                    .map(|(kind, _)| *kind))
+            })
+        }
+
+        fn reserve(&self, path: String, kind: RemoteRenameEntryKind) -> RemoteFuture<()> {
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                if state.entries.contains_key(&path) {
+                    return Err("occupied".to_string());
+                }
+                state.entries.insert(path, (kind, "reservation"));
+                Ok(())
+            })
+        }
+
+        fn replace(&self, from: String, to: String) -> RemoteFuture<()> {
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                if state.replace_result == FakeRenameResult::FailBeforeMove {
+                    return Err("rename refused".to_string());
+                }
+                let source = state
+                    .entries
+                    .remove(&from)
+                    .ok_or_else(|| "source missing".to_string())?;
+                state.entries.insert(to, source);
+                if state.replace_result == FakeRenameResult::FailAfterMove {
+                    Err("reply lost".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn release(&self, path: String, kind: RemoteRenameEntryKind) -> RemoteFuture<()> {
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                match state.entries.get(&path) {
+                    Some((reserved_kind, "reservation")) if *reserved_kind == kind => {
+                        state.entries.remove(&path);
+                        Ok(())
+                    }
+                    _ => Err("not our reservation".to_string()),
+                }
+            })
+        }
+    }
+
+    fn remote_path(path: &str) -> RemotePath {
+        RemotePath::from_server_absolute(path).unwrap()
+    }
+
+    #[test]
+    fn remote_rename_never_replaces_an_existing_target() {
+        let backend = FakeRenameBackend::default();
+        backend.insert("/from", RemoteRenameEntryKind::Other, "source");
+        backend.insert("/to", RemoteRenameEntryKind::Other, "existing");
+
+        let error = smol::block_on(rename_without_overwrite(
+            &backend,
+            &remote_path("/from"),
+            &remote_path("/to"),
+        ))
+        .expect_err("an occupied target must refuse the rename");
+
+        assert!(error.contains("already exists"));
+        assert_eq!(backend.owner("/from"), Some("source"));
+        assert_eq!(backend.owner("/to"), Some("existing"));
+    }
+
+    #[test]
+    fn failed_remote_rename_releases_only_its_own_reservation() {
+        let backend = FakeRenameBackend::default();
+        backend.insert("/from", RemoteRenameEntryKind::Directory, "source");
+        backend.set_replace_result(FakeRenameResult::FailBeforeMove);
+
+        smol::block_on(rename_without_overwrite(
+            &backend,
+            &remote_path("/from"),
+            &remote_path("/to"),
+        ))
+        .expect_err("the fake rejects the move");
+
+        assert_eq!(backend.owner("/from"), Some("source"));
+        assert_eq!(backend.owner("/to"), None);
+    }
+
+    #[test]
+    fn ambiguous_remote_rename_error_never_deletes_the_moved_source() {
+        let backend = FakeRenameBackend::default();
+        backend.insert("/from", RemoteRenameEntryKind::Other, "source");
+        backend.set_replace_result(FakeRenameResult::FailAfterMove);
+
+        let error = smol::block_on(rename_without_overwrite(
+            &backend,
+            &remote_path("/from"),
+            &remote_path("/to"),
+        ))
+        .expect_err("the reply was lost");
+
+        assert!(error.contains("left untouched"));
+        assert_eq!(backend.owner("/from"), None);
+        assert_eq!(backend.owner("/to"), Some("source"));
+    }
 
     /// Records how many times the remote home was asked for, so a test can
     /// prove an absolute root never pays for that round-trip.
@@ -3058,6 +3641,36 @@ mod tests {
         assert_eq!(names.next().as_deref(), Some(".bashrc (1)"));
     }
 
+    /// A folder keeps its dots: the file rule would turn `my.folder` into
+    /// `my (1).folder`, naming a sibling that has nothing to do with it.
+    #[test]
+    fn a_downloaded_folder_is_numbered_at_the_end_of_its_name() {
+        let mut names = folder_download_name_candidates("my.folder");
+        assert_eq!(names.next().as_deref(), Some("my.folder"));
+        assert_eq!(names.next().as_deref(), Some("my.folder (1)"));
+
+        // Server-controlled names are reduced to one component, exactly like
+        // file downloads.
+        let mut hostile = folder_download_name_candidates("../../etc");
+        assert_eq!(hostile.next().as_deref(), Some("etc"));
+
+        let dir = Path::new("/home/ada/Downloads");
+        let taken: HashSet<PathBuf> = std::iter::once(dir.join("proj")).collect();
+        assert_eq!(
+            reserve_download_directory(dir, "proj", |path| !taken.contains(path)),
+            Some(dir.join("proj (1)"))
+        );
+        assert_eq!(
+            reserve_download_directory(dir, "notes", |path| !taken.contains(path)),
+            Some(dir.join("notes"))
+        );
+        assert_eq!(
+            reserve_download_directory(dir, "x", |_| false),
+            None,
+            "when nothing can be created, refuse rather than reuse"
+        );
+    }
+
     /// Pins the bug this replaced: a download that failed before moving any
     /// bytes used to return past the cleanup, leaving the reserved staging
     /// file behind forever. That orphan is not just litter — reservation skips
@@ -3114,6 +3727,40 @@ mod tests {
         assert!(!partial.exists(), "and the staging file is cleaned up");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_download_does_not_clobber_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("notes.txt");
+        let partial = partial_download_path(&local);
+        std::fs::write(&partial, b"downloaded").unwrap();
+        symlink(dir.path().join("missing-target"), &local).unwrap();
+
+        assert!(!local.exists(), "stat follows the link and sees no target");
+        assert!(
+            local_path_is_occupied(&local),
+            "lstat must still reserve the directory entry"
+        );
+        let err = smol::block_on(finish_download(Ok(10), &partial, &local))
+            .expect_err("a dangling link is an occupied destination");
+
+        assert!(
+            err.message.contains("appeared while downloading"),
+            "{}",
+            err.message
+        );
+        assert!(
+            std::fs::symlink_metadata(&local)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link itself must remain untouched"
+        );
+        assert!(!partial.exists(), "and the staging file is cleaned up");
+    }
+
     /// When cleanup itself fails — which is the normal case once the
     /// connection is what died — the failure has to carry where the debris is.
     /// A log line is not good enough: the user needs to know a partial file is
@@ -3166,6 +3813,33 @@ mod tests {
             !partial.exists(),
             "the staging file is consumed by the move"
         );
+    }
+
+    #[test]
+    fn only_explicit_sftp_missing_errors_mean_a_name_is_free() {
+        assert!(sftp_error_is_missing(&SftpChannelError::Sftp(
+            SftpError::NoSuchFile
+        )));
+        assert!(sftp_error_is_missing(&SftpChannelError::Sftp(
+            SftpError::NoSuchPath
+        )));
+        assert!(!sftp_error_is_missing(&SftpChannelError::Sftp(
+            SftpError::PermissionDenied
+        )));
+        assert!(!sftp_error_is_missing(&SftpChannelError::Sftp(
+            SftpError::Failure
+        )));
+    }
+
+    #[test]
+    fn a_remote_operation_origin_matches_only_its_host_configuration() {
+        let origin =
+            RemoteOperationOrigin::new("ssh-host:a".to_string(), "ssh-host:a:key-1".to_string());
+        assert!(origin.matches(Some("ssh-host:a"), Some("ssh-host:a:key-1")));
+        assert!(!origin.matches(Some("ssh-host:b"), Some("ssh-host:a:key-1")));
+        assert!(!origin.matches(Some("ssh-host:a"), Some("ssh-host:a:key-2")));
+        assert!(!origin.matches(None, Some("ssh-host:a:key-1")));
+        assert!(!origin.matches(Some("ssh-host:a"), None));
     }
 
     /// A folder reports items, not bytes. The trap this pins: a walker that
@@ -3532,6 +4206,44 @@ mod tests {
             Some(ManagedConnection::Ready { leases: 1, .. })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn lease_identity_is_the_key_and_id_pair() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let manager = RemoteConnectionManager::new(
+            Arc::new(FakeConnector {
+                calls: Arc::clone(&calls),
+            }),
+            Duration::from_secs(30),
+        );
+        let first =
+            smol::block_on(manager.acquire("source".to_string(), SshDomain::default(), true))
+                .unwrap();
+        let shared =
+            smol::block_on(manager.acquire("source".to_string(), SshDomain::default(), true))
+                .unwrap();
+        assert!(first.is_same_connection(&shared), "one pooled session");
+
+        // What a caller that dialled for itself sees after the pooled session
+        // was replaced: the lease it is holding is NOT the live one.
+        manager.invalidate("source");
+        let redialled =
+            smol::block_on(manager.acquire("source".to_string(), SshDomain::default(), true))
+                .unwrap();
+        assert!(!first.is_same_connection(&redialled));
+
+        // The key half, which the pool cannot produce on its own: changed host
+        // settings hash to a different key while the ids stay whatever they
+        // were.
+        let lease = |key: &str, connection_id| RemoteConnectionLease {
+            key: key.to_string(),
+            backend: Arc::new(FakeBackend) as Arc<dyn RemoteFileBackend>,
+            manager: Weak::new(),
+            connection_id,
+        };
+        assert!(lease("source:aaa", 1).is_same_connection(&lease("source:aaa", 1)));
+        assert!(!lease("source:aaa", 1).is_same_connection(&lease("source:bbb", 1)));
     }
 
     #[test]
@@ -4273,6 +4985,54 @@ mod tests {
         state.transition(RemoteFilesEvent::ToggleDirectory(child));
         assert_eq!(state.rows().len(), 2);
         assert_eq!(state.total_entries(), 1);
+    }
+
+    /// A deleted (or renamed-away) directory must drop its cached subtree
+    /// immediately: orphaned listings keep eating the row budget, and a
+    /// selection under the old path keeps a dead preview open.
+    #[test]
+    fn a_forgotten_entry_takes_its_subtree_and_selection_with_it() {
+        let source = unique_source("forgotten");
+        let root = RemotePath::from_server_absolute("/home/me").unwrap();
+        let dir = root.join_name("src").unwrap();
+        let file = dir.join_name("lib.rs").unwrap();
+        let mut state = RemoteFilesState::default();
+        state.transition(RemoteFilesEvent::TargetChanged(Some(target(&source))));
+        let generation = match state.transition(RemoteFilesEvent::ConnectRequested)[0] {
+            RemoteFilesEffect::Connect { generation, .. } => generation,
+            _ => unreachable!(),
+        };
+        state.transition(RemoteFilesEvent::Connected {
+            generation,
+            root: root.clone(),
+            listing: listing(&root, &[("src", RemoteFileKind::Directory)]),
+        });
+        state.transition(RemoteFilesEvent::ToggleDirectory(dir.clone()));
+        state.transition(RemoteFilesEvent::DirectoryLoaded {
+            generation,
+            path: dir.clone(),
+            listing: listing(&dir, &[("lib.rs", RemoteFileKind::File)]),
+        });
+        state.transition(RemoteFilesEvent::SelectFile(file));
+        assert_eq!(state.rows().len(), 3);
+
+        assert!(state
+            .transition(RemoteFilesEvent::EntryForgotten(dir.clone()))
+            .is_empty());
+        assert!(!state.expanded.contains(&dir));
+        assert!(!state.directories.contains_key(&dir));
+        assert!(
+            state.selected.is_none(),
+            "a selection under the forgotten entry must not survive"
+        );
+        assert!(matches!(state.preview, RemotePreviewStatus::None));
+        assert_eq!(state.total_entries(), 1, "only the root listing remains");
+
+        // Forgetting the selected entry itself clears it too.
+        let sibling = root.join_name("src").unwrap();
+        state.transition(RemoteFilesEvent::SelectFile(sibling.clone()));
+        state.transition(RemoteFilesEvent::EntryForgotten(sibling));
+        assert!(state.selected.is_none());
     }
 
     #[test]

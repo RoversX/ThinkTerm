@@ -221,8 +221,50 @@ impl crate::TermWindow {
             ) => {
                 self.toggle_workspace_sidebar_status_filter(status);
             }
-            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile(path) => {
-                self.download_right_sidebar_remote_file(path);
+            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile {
+                path,
+                origin,
+            } => {
+                if self.remote_operation_origin_matches(&origin) {
+                    self.download_right_sidebar_remote_file(path);
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFolder {
+                path,
+                anchor,
+                origin,
+            } => {
+                if self.remote_operation_origin_matches(&origin) {
+                    self.download_right_sidebar_remote_folder(path, anchor);
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::DeleteRemoteEntry {
+                path,
+                anchor,
+                origin,
+            } => {
+                if self.remote_operation_origin_matches(&origin) {
+                    self.delete_right_sidebar_remote_entry(path, anchor);
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::RenameRemoteEntry { path, origin } => {
+                if self.remote_operation_origin_matches(&origin) {
+                    self.start_sidebar_remote_file_rename(path);
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::NewRemoteFolder { parent, origin } => {
+                if self.remote_operation_origin_matches(&origin) {
+                    self.create_right_sidebar_remote_folder(parent);
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::RetryRemoteTransfer { id, anchor } => {
+                self.retry_remote_transfer(id, anchor);
+            }
+            crate::termwindow::ContextMenuApplicationAction::DismissRemoteTransfer(id) => {
+                self.remove_remote_transfer_row(id);
+            }
+            crate::termwindow::ContextMenuApplicationAction::ResolveRemoteConfirm(proceed) => {
+                self.resolve_pending_remote_confirm(proceed);
             }
             crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewSelection => {
                 self.copy_right_sidebar_selected_file_preview_text();
@@ -349,10 +391,17 @@ impl crate::TermWindow {
     /// immediately *before* a chosen action — cancelling there would swallow
     /// the very choice being made.
     pub(crate) fn dismiss_fallback_context_menu(&mut self) {
-        // A copy waiting on an answer takes dismissal as "no". Leaving the
+        self.context_menu_was_dismissed();
+        self.close_fallback_context_menu();
+    }
+
+    /// Unified tail for native and fallback menus that closed without leaving
+    /// an actionable pending choice behind.
+    pub(crate) fn context_menu_was_dismissed(&mut self) {
+        // Anything waiting on an answer takes dismissal as "no". Leaving the
         // plan behind would keep it alive with no way to reach it again.
         self.cancel_pending_local_copy();
-        self.close_fallback_context_menu();
+        self.cancel_pending_remote_confirm();
     }
 
     pub(crate) fn close_fallback_context_menu(&mut self) {

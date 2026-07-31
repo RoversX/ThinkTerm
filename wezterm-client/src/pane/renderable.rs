@@ -27,30 +27,68 @@ use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FetchToken {
+    epoch: u64,
+    started_at: Instant,
+}
+
 #[derive(Debug)]
 enum LineEntry {
     // Up to date wrt. server and has been rendered at least once
     Line(Line),
     // Currently being downloaded from the server
-    Fetching(Instant),
+    Fetching(FetchToken),
     // We have a version of the line locally and are treating it
     // as needing rendering because we are also in the process of
     // downloading a newer version from the server
-    LineAndFetching(Line, Instant),
+    LineAndFetching(Line, FetchToken),
     // We have a local copy but it is stale and will need to be
     // fetched again
     Stale(Line),
 }
 
 impl LineEntry {
-    fn kind(&self) -> (&'static str, Option<Instant>) {
+    fn kind(&self) -> (&'static str, Option<FetchToken>) {
         match self {
             Self::Line(_) => ("Line", None),
-            Self::Fetching(since) => ("Fetching", Some(*since)),
-            Self::LineAndFetching(_, since) => ("LineAndFetching", Some(*since)),
+            Self::Fetching(token) => ("Fetching", Some(*token)),
+            Self::LineAndFetching(_, token) => ("LineAndFetching", Some(*token)),
             Self::Stale(_) => ("Stale", None),
         }
     }
+}
+
+fn invalidate_line_entries(lines: &mut LruCache<StableRowIndex, LineEntry>, preserve_lines: bool) {
+    if !preserve_lines {
+        lines.clear();
+        return;
+    }
+
+    let mut stale = LruCache::unbounded();
+    while let Some((stable_row, entry)) = lines.pop_lru() {
+        match entry {
+            LineEntry::Stale(line)
+            | LineEntry::Line(line)
+            | LineEntry::LineAndFetching(line, _) => {
+                stale.put(stable_row, LineEntry::Stale(line));
+            }
+            LineEntry::Fetching(_) => {}
+        }
+    }
+    *lines = stale;
+}
+
+fn render_geometry_changed(current: RenderableDimensions, next: RenderableDimensions) -> bool {
+    current.cols != next.cols
+        || current.viewport_rows != next.viewport_rows
+        || current.pixel_width != next.pixel_width
+        || current.pixel_height != next.pixel_height
+        || current.dpi != next.dpi
+}
+
+fn fetch_token_is_current(token: FetchToken, epoch: u64) -> bool {
+    token.epoch == epoch
 }
 
 pub struct RenderableInner {
@@ -66,6 +104,7 @@ pub struct RenderableInner {
     pub dimensions: RenderableDimensions,
 
     lines: LruCache<StableRowIndex, LineEntry>,
+    line_cache_epoch: u64,
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
@@ -108,6 +147,7 @@ impl RenderableInner {
             lines: LruCache::new(
                 NonZeroUsize::new(configuration().scrollback_lines.max(128)).unwrap(),
             ),
+            line_cache_epoch: 0,
             title: title.to_string(),
             working_dir: None,
             fetch_limiter,
@@ -349,7 +389,13 @@ impl RenderableInner {
         {
             self.cursor_position = delta.cursor_position;
         }
-        self.dimensions = delta.dimensions;
+        if render_geometry_changed(self.dimensions, delta.dimensions) {
+            let preserve_lines = self.dimensions.cols == delta.dimensions.cols;
+            self.dimensions = delta.dimensions;
+            self.invalidate_line_cache(preserve_lines);
+        } else {
+            self.dimensions = delta.dimensions;
+        }
         self.title = delta.title;
         self.working_dir = delta.working_dir.map(Into::into);
         log::trace!(
@@ -390,11 +436,12 @@ impl RenderableInner {
                     continue;
                 }
                 to_fetch.add(stable_row);
+                let token = self.fetch_token(now);
                 let entry = match prior {
-                    Some(LineEntry::Fetching(_)) | None => LineEntry::Fetching(now),
+                    Some(LineEntry::Fetching(_)) | None => LineEntry::Fetching(token),
                     Some(LineEntry::LineAndFetching(old, ..))
                     | Some(LineEntry::Stale(old))
-                    | Some(LineEntry::Line(old)) => LineEntry::LineAndFetching(old, now),
+                    | Some(LineEntry::Line(old)) => LineEntry::LineAndFetching(old, token),
                 };
                 log::trace!(
                     "row {} {:?} -> {:?} due to dirty and IN viewport",
@@ -407,7 +454,7 @@ impl RenderableInner {
         }
         if !to_fetch.is_empty() {
             if self.fetch_limiter.non_blocking_admittance_check(1) {
-                self.schedule_fetch_lines(to_fetch, now);
+                self.schedule_fetch_lines(to_fetch, self.fetch_token(now));
             } else {
                 log::warn!(
                     "exceeded fetch throttle, drop {:?} and mark stale",
@@ -423,15 +470,43 @@ impl RenderableInner {
     }
 
     pub fn make_all_stale(&mut self) {
-        let mut lines = LruCache::unbounded();
-        while let Some((stable_row, entry)) = self.lines.pop_lru() {
-            let entry = match entry {
-                LineEntry::Stale(old) | LineEntry::Line(old) => LineEntry::Stale(old),
-                entry => entry,
-            };
-            lines.put(stable_row, entry);
+        self.invalidate_line_cache(true);
+    }
+
+    fn fetch_token(&self, started_at: Instant) -> FetchToken {
+        FetchToken {
+            epoch: self.line_cache_epoch,
+            started_at,
         }
-        self.lines = lines;
+    }
+
+    fn invalidate_line_cache(&mut self, preserve_lines: bool) {
+        self.line_cache_epoch = self.line_cache_epoch.wrapping_add(1);
+        invalidate_line_entries(&mut self.lines, preserve_lines);
+    }
+
+    /// Converge the locally rendered surface to the geometry requested by the
+    /// GUI. This is deliberately separate from deciding whether a Resize RPC
+    /// is needed: a delayed server update can temporarily restore old
+    /// dimensions after the desired size was already requested.
+    pub(crate) fn apply_local_resize(&mut self, size: wezterm_term::TerminalSize) -> bool {
+        if self.dimensions.cols == size.cols
+            && self.dimensions.viewport_rows == size.rows
+            && self.dimensions.pixel_width == size.pixel_width
+            && self.dimensions.pixel_height == size.pixel_height
+            && self.dimensions.dpi == size.dpi
+        {
+            return false;
+        }
+
+        let preserve_lines = self.dimensions.cols == size.cols;
+        self.dimensions.cols = size.cols;
+        self.dimensions.viewport_rows = size.rows;
+        self.dimensions.pixel_width = size.pixel_width;
+        self.dimensions.pixel_height = size.pixel_height;
+        self.dimensions.dpi = size.dpi;
+        self.invalidate_line_cache(preserve_lines);
+        true
     }
 
     fn make_stale(&mut self, stable_row: StableRowIndex) {
@@ -450,11 +525,11 @@ impl RenderableInner {
         stable_row: StableRowIndex,
         mut line: Line,
         config: &ConfigHandle,
-        fetch_start: Option<Instant>,
+        fetch_token: Option<FetchToken>,
     ) {
         line.scan_and_create_hyperlinks(&config.hyperlink_rules);
 
-        let entry = if let Some(fetch_start) = fetch_start {
+        let entry = if let Some(fetch_token) = fetch_token {
             // If we're completing a fetch, only replace entries that were
             // set to fetching as part of our fetch.  If they are now longer
             // tagged that way, then someone came along after us and changed
@@ -462,7 +537,7 @@ impl RenderableInner {
 
             match self.lines.pop(&stable_row) {
                 Some(LineEntry::LineAndFetching(_, then)) | Some(LineEntry::Fetching(then))
-                    if fetch_start == then =>
+                    if fetch_token == then =>
                 {
                     log::trace!(
                         "row {} fetch done -> Line seq={} vs self.seq={}",
@@ -479,7 +554,7 @@ impl RenderableInner {
                         "row {} {:?} changed since fetch started at {:?}, so leave it be",
                         stable_row,
                         e.kind(),
-                        fetch_start
+                        fetch_token
                     );
                     self.lines.put(stable_row, e);
                     return;
@@ -492,7 +567,11 @@ impl RenderableInner {
         self.lines.put(stable_row, entry);
     }
 
-    fn schedule_fetch_lines(&mut self, to_fetch: RangeSet<StableRowIndex>, now: Instant) {
+    fn schedule_fetch_lines(
+        &mut self,
+        to_fetch: RangeSet<StableRowIndex>,
+        fetch_token: FetchToken,
+    ) {
         if to_fetch.is_empty() || self.dead {
             return;
         }
@@ -502,7 +581,7 @@ impl RenderableInner {
             "will fetch lines {:?} for remote tab id {} at {:?}",
             to_fetch,
             self.remote_pane_id,
-            now,
+            fetch_token,
         );
 
         let client = Arc::clone(&self.client);
@@ -525,7 +604,7 @@ impl RenderableInner {
                 }
                 Err(err) => Err(err),
             };
-            Self::apply_lines(local_pane_id, result, to_fetch, now)
+            Self::apply_lines(local_pane_id, result, to_fetch, fetch_token)
         })
         .detach();
     }
@@ -534,7 +613,7 @@ impl RenderableInner {
         local_pane_id: PaneId,
         result: anyhow::Result<Vec<(StableRowIndex, Line)>>,
         to_fetch: RangeSet<StableRowIndex>,
-        now: Instant,
+        fetch_token: FetchToken,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
         let pane = mux
@@ -544,13 +623,23 @@ impl RenderableInner {
             let renderable = client_tab.renderable.lock();
             let mut inner = renderable.inner.borrow_mut();
 
+            if !fetch_token_is_current(fetch_token, inner.line_cache_epoch) {
+                log::trace!(
+                    "discarding line fetch for pane {} from epoch {} because current epoch is {}",
+                    local_pane_id,
+                    fetch_token.epoch,
+                    inner.line_cache_epoch
+                );
+                return Ok(());
+            }
+
             match result {
                 Ok(lines) => {
                     let config = configuration();
 
-                    log::trace!("fetch complete for {:?} at {:?}", to_fetch, now);
+                    log::trace!("fetch complete for {:?} with {:?}", to_fetch, fetch_token);
                     for (stable_row, line) in lines.into_iter() {
-                        inner.put_line(stable_row, line, &config, Some(now));
+                        inner.put_line(stable_row, line, &config, Some(fetch_token));
                     }
                 }
                 Err(err) => {
@@ -558,11 +647,13 @@ impl RenderableInner {
                     for r in to_fetch.iter() {
                         for stable_row in r.clone() {
                             let entry = match inner.lines.pop(&stable_row) {
-                                Some(LineEntry::Fetching(then)) if then == now => {
+                                Some(LineEntry::Fetching(then)) if then == fetch_token => {
                                     // leave it popped
                                     continue;
                                 }
-                                Some(LineEntry::LineAndFetching(line, then)) if then == now => {
+                                Some(LineEntry::LineAndFetching(line, then))
+                                    if then == fetch_token =>
+                                {
                                     // revert to just a line
                                     LineEntry::Line(line)
                                 }
@@ -729,6 +820,7 @@ impl RenderableState {
         let mut result = vec![];
         let mut to_fetch = RangeSet::new();
         let now = Instant::now();
+        let fetch_token = inner.fetch_token(now);
 
         for idx in lines.clone() {
             let entry = match inner.lines.pop(&idx) {
@@ -752,12 +844,12 @@ impl RenderableState {
                 Some(LineEntry::Stale(line)) => {
                     result.push(line.clone());
                     to_fetch.add(idx);
-                    LineEntry::LineAndFetching(line, now)
+                    LineEntry::LineAndFetching(line, fetch_token)
                 }
                 None => {
                     result.push(Line::with_width(inner.dimensions.cols, SEQ_ZERO));
                     to_fetch.add(idx);
-                    LineEntry::Fetching(now)
+                    LineEntry::Fetching(fetch_token)
                 }
             };
 
@@ -794,7 +886,7 @@ impl RenderableState {
             to_fetch
         );
 
-        inner.schedule_fetch_lines(to_fetch, now);
+        inner.schedule_fetch_lines(to_fetch, fetch_token);
         (lines.start, result)
     }
 
@@ -856,5 +948,85 @@ impl RenderableState {
 
     pub fn get_dimensions(&self) -> RenderableDimensions {
         self.inner.borrow().dimensions
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn line(width: usize) -> Line {
+        Line::with_width(width, SEQ_ZERO)
+    }
+
+    fn dimensions(cols: usize, rows: usize, dpi: u32) -> RenderableDimensions {
+        RenderableDimensions {
+            cols,
+            viewport_rows: rows,
+            scrollback_rows: rows,
+            dpi,
+            pixel_width: cols * 10,
+            pixel_height: rows * 20,
+            ..RenderableDimensions::default()
+        }
+    }
+
+    #[test]
+    fn preserving_invalidation_cancels_fetches_and_keeps_stale_lines() {
+        let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
+        let token = FetchToken {
+            epoch: 7,
+            started_at: Instant::now(),
+        };
+        lines.put(1, LineEntry::Line(line(80)));
+        lines.put(2, LineEntry::LineAndFetching(line(80), token));
+        lines.put(3, LineEntry::Fetching(token));
+
+        invalidate_line_entries(&mut lines, true);
+
+        assert!(matches!(lines.get(&1), Some(LineEntry::Stale(_))));
+        assert!(matches!(lines.get(&2), Some(LineEntry::Stale(_))));
+        assert!(
+            lines.get(&3).is_none(),
+            "an in-flight fetch without a line must be canceled"
+        );
+    }
+
+    #[test]
+    fn width_changing_invalidation_clears_every_cached_line() {
+        let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
+        lines.put(1, LineEntry::Line(line(80)));
+        lines.put(2, LineEntry::Stale(line(80)));
+
+        invalidate_line_entries(&mut lines, false);
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn geometry_epoch_ignores_scrollback_motion_but_detects_render_size() {
+        let current = dimensions(80, 24, 96);
+        let mut scrollback_only = current;
+        scrollback_only.scrollback_rows += 1;
+        scrollback_only.physical_top += 1;
+        assert!(!render_geometry_changed(current, scrollback_only));
+
+        let mut new_width = current;
+        new_width.cols += 1;
+        assert!(render_geometry_changed(current, new_width));
+
+        let mut new_dpi = current;
+        new_dpi.dpi += 1;
+        assert!(render_geometry_changed(current, new_dpi));
+    }
+
+    #[test]
+    fn fetch_token_from_prior_epoch_is_not_current() {
+        let token = FetchToken {
+            epoch: 4,
+            started_at: Instant::now(),
+        };
+        assert!(fetch_token_is_current(token, 4));
+        assert!(!fetch_token_is_current(token, 5));
     }
 }

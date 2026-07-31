@@ -97,15 +97,17 @@ impl Menu {
         }
     }
 
-    pub fn pop_up_at(&self, view: id, x: f64, y: f64) {
+    /// Tracks the menu and returns whether the user selected an item.
+    pub fn pop_up_at(&self, view: id, x: f64, y: f64) -> bool {
         unsafe {
             let point = NSPoint::new(x, y);
-            let _: BOOL = msg_send![
+            let selected: BOOL = msg_send![
                 *self.menu,
                 popUpMenuPositioningItem:nil
                 atLocation:point
                 inView:view
             ];
+            selected != NO
         }
     }
 

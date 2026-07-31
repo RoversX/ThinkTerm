@@ -103,6 +103,7 @@ unicode-linebreak = "0.1"
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 uuid = { workspace = true, features = ["v4"] }
+percent-encoding.workspace = true
 url-funcs.workspace = true
 url.workspace = true
 walkdir.workspace = true

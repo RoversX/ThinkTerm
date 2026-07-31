@@ -659,23 +659,16 @@ impl super::TermWindow {
         } else {
             0.0
         };
-        let (padding_left, _) = self.padding_left_top();
-        let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
         let x = event.coords.x as f32;
         let y = event.coords.y as f32;
 
         let nav_height = self.pane_nav_bar_height() as f32;
         for pos in tab.iter_panes_ignoring_zoom() {
-            let content_pane_x =
-                padding_left + border.left.get() as f32 + pos.left as f32 * cell_width;
-            let pane_x = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
-                self.tab_bar_left_edge() as f32
-            } else {
-                content_pane_x
+            let Ok((pane_x, pane_width)) = self.pane_chrome_span(&pos) else {
+                continue;
             };
             let pane_y = top_bar_height + border.top.get() as f32 + pos.top as f32 * cell_height;
-            let pane_width = (content_pane_x + pos.width as f32 * cell_width - pane_x).max(1.0);
             if x >= pane_x && x < pane_x + pane_width && y >= pane_y && y < pane_y + nav_height {
                 return Some(TabWheelSurface::PaneStack(pos.pane_stack_id));
             }
@@ -1946,8 +1939,17 @@ impl super::TermWindow {
             UIItemType::PaneNav { .. } => {
                 self.drag_pane_nav_tab(item, start_event, event, context);
             }
-            UIItemType::RightSidebarFileRow(_) => {
-                self.drag_right_sidebar_file_row(item, start_event, event, context);
+            UIItemType::RightSidebarFileRow(ref path) => {
+                if self.is_renaming_sidebar_file(path) {
+                    self.drag_right_sidebar_input_selection(item, start_event, event, context);
+                } else {
+                    self.drag_right_sidebar_file_row(item, start_event, event, context);
+                }
+            }
+            UIItemType::RightSidebarRemoteFileRow(ref path)
+                if self.is_renaming_sidebar_remote_file(path) =>
+            {
+                self.drag_right_sidebar_input_selection(item, start_event, event, context);
             }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
@@ -3502,7 +3504,8 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         let item_type = item.item_type.clone();
-        let is_input = matches!(item_type, UIItemType::RightSidebarFileFilter);
+        let is_input = matches!(item_type, UIItemType::RightSidebarFileFilter)
+            || matches!(&item_type, UIItemType::RightSidebarFileRow(path) if self.is_renaming_sidebar_file(path));
         context.set_cursor(Some(if is_input {
             MouseCursor::Text
         } else {
@@ -3540,8 +3543,26 @@ impl super::TermWindow {
             }
             (UIItemType::RightSidebarFileRow(path), WMEK::Press(MousePress::Left)) => {
                 if self.is_renaming_sidebar_file(&path) {
-                    // Clicking the row that hosts the inline rename editor
-                    // must not arm a drag or re-open the file.
+                    let double_click = self
+                        .last_mouse_click
+                        .as_ref()
+                        .is_some_and(|click| click.streak >= 2);
+                    if double_click {
+                        if let Some(input) = self.right_sidebar_input_for_item_mut(
+                            &UIItemType::RightSidebarFileRow(path),
+                        ) {
+                            input.caret_select_all();
+                        }
+                    } else {
+                        self.position_right_sidebar_input_caret(
+                            &UIItemType::RightSidebarFileRow(path),
+                            event.coords.x,
+                            false,
+                        );
+                        self.dragging.replace((item, event));
+                    }
+                    context.set_cursor(Some(MouseCursor::Text));
+                    context.invalidate();
                     return;
                 }
                 self.clear_right_sidebar_text_focus();
@@ -3596,7 +3617,16 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        context.set_cursor(Some(MouseCursor::Hand));
+        let rename_input = matches!(
+            &item.item_type,
+            UIItemType::RightSidebarRemoteFileRow(path)
+                if self.is_renaming_sidebar_remote_file(path)
+        );
+        context.set_cursor(Some(if rename_input {
+            MouseCursor::Text
+        } else {
+            MouseCursor::Hand
+        }));
         if let (UIItemType::RightSidebarRemoteFileRow(path), WMEK::Press(MousePress::Right)) =
             (&item.item_type, &event.kind)
         {
@@ -3612,13 +3642,35 @@ impl super::TermWindow {
                 self.request_right_sidebar_remote_files_connect(true);
             }
             UIItemType::RightSidebarRemoteTransfer(id) => {
-                self.dismiss_or_cancel_remote_transfer(id);
+                self.remote_transfer_row_clicked(id, event.coords);
             }
             UIItemType::RightSidebarRemoteFileRefresh => {
                 self.refresh_right_sidebar_remote_files();
             }
-            UIItemType::RightSidebarRemoteFileRow(path) => {
-                self.open_right_sidebar_remote_file(path);
+            UIItemType::RightSidebarRemoteFileRow(ref path) => {
+                if self.is_renaming_sidebar_remote_file(path) {
+                    let double_click = self
+                        .last_mouse_click
+                        .as_ref()
+                        .is_some_and(|click| click.streak >= 2);
+                    if double_click {
+                        if let Some(input) = self.right_sidebar_input_for_item_mut(
+                            &UIItemType::RightSidebarRemoteFileRow(path.clone()),
+                        ) {
+                            input.caret_select_all();
+                        }
+                    } else {
+                        self.position_right_sidebar_input_caret(
+                            &UIItemType::RightSidebarRemoteFileRow(path.clone()),
+                            event.coords.x,
+                            false,
+                        );
+                        self.dragging.replace((item, event));
+                    }
+                    context.invalidate();
+                    return;
+                }
+                self.open_right_sidebar_remote_file(path.clone());
             }
             UIItemType::RightSidebarRemoteFileBack => {
                 self.close_right_sidebar_remote_file_preview();
