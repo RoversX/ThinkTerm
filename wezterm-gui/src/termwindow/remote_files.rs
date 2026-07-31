@@ -506,18 +506,33 @@ fn sanitized_download_name(file_name: &str) -> &str {
         .unwrap_or("download")
 }
 
+/// Where a name's extension begins, for collision numbering. The LAST dot,
+/// not the first: dots inside a stem are ordinary characters (a macOS
+/// screenshot is `… at 12.50.59 PM.png`, and numbering it at the first dot
+/// produced `… at 12 (1).50.59 PM.png` — verified live). Known compound
+/// archive extensions are the exception and stay whole; a leading dot is a
+/// hidden file, not an extension.
+fn extension_split_index(name: &str) -> usize {
+    const COMPOUND: &[&str] = &[".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst"];
+    let lower = name.to_ascii_lowercase();
+    for suffix in COMPOUND {
+        if lower.ends_with(suffix) && name.len() > suffix.len() {
+            return name.len() - suffix.len();
+        }
+    }
+    match name.rfind('.') {
+        Some(0) | None => name.len(),
+        Some(index) => index,
+    }
+}
+
 /// The names a download will try, in order: the file's own name, then
 /// ` (1)`, ` (2)`… inserted before the extension the way a browser does.
 ///
 /// Pure, so the naming rule is testable without a filesystem.
 pub(crate) fn download_name_candidates(file_name: &str) -> impl Iterator<Item = String> + '_ {
     let sanitized = sanitized_download_name(file_name);
-    // Split at the *first* dot after the stem so `tar.gz` survives whole; a
-    // leading dot is a hidden file, not an extension.
-    let (stem, extension) = match sanitized.find('.') {
-        Some(0) | None => (sanitized, ""),
-        Some(index) => (&sanitized[..index], &sanitized[index..]),
-    };
+    let (stem, extension) = sanitized.split_at(extension_split_index(sanitized));
     std::iter::once(sanitized.to_string()).chain(
         (1..=DOWNLOAD_NAME_ATTEMPTS).map(move |suffix| format!("{stem} ({suffix}){extension}")),
     )
@@ -3639,6 +3654,18 @@ mod tests {
         let mut names = download_name_candidates(".bashrc");
         assert_eq!(names.next().as_deref(), Some(".bashrc"));
         assert_eq!(names.next().as_deref(), Some(".bashrc (1)"));
+
+        // Dots inside a stem are ordinary characters: a macOS screenshot must
+        // number before `.png`, not in the middle of its timestamp.
+        let mut names = download_name_candidates("Screenshot 2026-07-31 at 12.50.59 PM.png");
+        names.next();
+        assert_eq!(
+            names.next().as_deref(),
+            Some("Screenshot 2026-07-31 at 12.50.59 PM (1).png")
+        );
+        let mut names = download_name_candidates("no-extension");
+        names.next();
+        assert_eq!(names.next().as_deref(), Some("no-extension (1)"));
     }
 
     /// A folder keeps its dots: the file rule would turn `my.folder` into

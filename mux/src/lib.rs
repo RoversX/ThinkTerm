@@ -869,6 +869,22 @@ impl Mux {
             }
 
             for domain_id in domains_of_window {
+                // Detach only when NO surviving window still references the
+                // domain. One thread's workspace window going away must not
+                // sever a client connection that other threads in the same
+                // Space are still displaying — that detach ripples out as
+                // "every pane of the domain removed", which empties every
+                // window and takes the whole process down with it.
+                let still_referenced = self.windows.read().values().any(|win| {
+                    win.iter().any(|tab| {
+                        tab.iter_all_panes()
+                            .iter()
+                            .any(|pane| pane.domain_id() == domain_id)
+                    })
+                });
+                if still_referenced {
+                    continue;
+                }
                 if let Some(domain) = self.get_domain(domain_id) {
                     if domain.detachable() {
                         log::info!("detaching domain");

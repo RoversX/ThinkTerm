@@ -58,6 +58,77 @@ fn decide_resize(
     }
 }
 
+/// Delivery state of the palette advisory RPC.
+///
+/// A single worker task owns all sending for a pane, and it always sends the
+/// LATEST desired palette — that serialization is what makes stale overwrites
+/// impossible (two concurrent send tasks with retries could land an old color
+/// on the server after a newer one). The state transitions live here, off the
+/// network, so the ordering rules are unit-testable.
+#[derive(Default)]
+struct PaletteDelivery {
+    /// The palette we want the server to hold.
+    desired: Option<ColorPalette>,
+    /// The palette the server last confirmed receiving. `None` means
+    /// unknown: never confirmed, failed, or invalidated by a reconnect.
+    delivered: Option<ColorPalette>,
+    /// Whether the sender worker is alive. At most one ever runs.
+    sender_running: bool,
+}
+
+impl PaletteDelivery {
+    /// Adopt a new target. Returns true when the caller must start the
+    /// worker (none is running); an already-running worker will pick the
+    /// new target up on its next loop.
+    fn adopt_target(&mut self, palette: ColorPalette) -> bool {
+        self.desired = Some(palette);
+        if self.sender_running {
+            false
+        } else {
+            self.sender_running = true;
+            true
+        }
+    }
+
+    /// What the worker should send next, or `None` when it is done — in
+    /// which case the worker slot is released.
+    fn next_to_send(&mut self) -> Option<ColorPalette> {
+        match &self.desired {
+            Some(target) if self.delivered.as_ref() != Some(target) => Some(target.clone()),
+            _ => {
+                self.sender_running = false;
+                None
+            }
+        }
+    }
+
+    fn record_success(&mut self, sent: ColorPalette) {
+        self.delivered = Some(sent);
+    }
+
+    /// The worker gave up (repeated RPC failures). `delivered` stays
+    /// whatever it was — importantly NOT the desired value — so the next
+    /// set_config or resync restarts the worker instead of assuming the
+    /// server heard us.
+    fn give_up_if_still_desired(&mut self, attempted: &ColorPalette) -> bool {
+        if self.desired.as_ref() == Some(attempted) {
+            self.sender_running = false;
+            true
+        } else {
+            // A newer target arrived during the final failed RPC. Keep the
+            // worker slot and let it send that target instead of stranding it
+            // until an unrelated config update or resync happens.
+            false
+        }
+    }
+
+    /// A reconnect happened: whatever we previously confirmed, the server
+    /// may be a fresh process that knows nothing.
+    fn invalidate_delivery(&mut self) {
+        self.delivered = None;
+    }
+}
+
 pub struct ClientPane {
     client: Arc<ClientInner>,
     local_pane_id: PaneId,
@@ -65,6 +136,10 @@ pub struct ClientPane {
     remote_tab_id: AtomicUsize,
     pub renderable: Mutex<RenderableState>,
     configured_palette: Mutex<ColorPalette>,
+    /// Delivery state for the palette advisory: what we want the server to
+    /// hold and what it last confirmed. A single worker task drains it; see
+    /// [`PaletteDelivery`].
+    delivered_palette: Arc<Mutex<PaletteDelivery>>,
     palette: Mutex<ColorPalette>,
     application_palette: Mutex<bool>,
     writer: Mutex<PaneWriter>,
@@ -80,6 +155,93 @@ pub struct ClientPane {
 }
 
 impl ClientPane {
+    /// Ask the (single) sender worker to bring the server to `palette`.
+    /// Starts the worker when none is running; a running worker picks the
+    /// new target up by itself. Re-sends of identical palettes are
+    /// flicker-free: both the server and the receiving side de-duplicate.
+    fn advise_server_palette(
+        client: Arc<ClientInner>,
+        remote_pane_id: PaneId,
+        palette: ColorPalette,
+        delivery: Arc<Mutex<PaletteDelivery>>,
+    ) {
+        if !delivery.lock().adopt_target(palette) {
+            return;
+        }
+        promise::spawn::spawn(async move {
+            let mut failures = 0u32;
+            let mut failed_target: Option<ColorPalette> = None;
+            loop {
+                let Some(target) = delivery.lock().next_to_send() else {
+                    // Delivered everything we wanted; the slot is released.
+                    return;
+                };
+                let result = client
+                    .client
+                    .set_configured_palette_for_pane(SetPalette {
+                        pane_id: remote_pane_id,
+                        palette: target.clone(),
+                    })
+                    .await;
+                match result {
+                    Ok(_) => {
+                        failures = 0;
+                        failed_target = None;
+                        // Desired may have moved on while this was in
+                        // flight; the next loop sends the newer target, so
+                        // an old color can never be the last one standing.
+                        delivery.lock().record_success(target);
+                    }
+                    Err(err) => {
+                        if failed_target.as_ref() == Some(&target) {
+                            failures += 1;
+                        } else {
+                            // A new desired palette gets its own retry budget;
+                            // failures of the superseded value do not count.
+                            failed_target = Some(target.clone());
+                            failures = 1;
+                        }
+                        log::warn!(
+                            "advising palette for remote pane {remote_pane_id} \
+                             (attempt {failures}): {err:#}"
+                        );
+                        if failures >= 3 {
+                            let gave_up = delivery.lock().give_up_if_still_desired(&target);
+                            if gave_up {
+                                // Leave delivery unconfirmed: the next
+                                // set_config or resync restarts the worker
+                                // rather than assuming the server heard us.
+                                return;
+                            }
+                            failures = 0;
+                            failed_target = None;
+                            continue;
+                        }
+                        smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Re-advise the server of the configured palette. Called after a
+    /// resync reattaches this pane: the server may be a fresh process that
+    /// never received the original advisory, and its bare default palette
+    /// is what OSC color queries would keep answering. Previous delivery
+    /// confirmations are meaningless across a reconnect, so they are
+    /// invalidated first.
+    pub fn resend_palette_to_server(&self) {
+        let palette = self.configured_palette.lock().clone();
+        self.delivered_palette.lock().invalidate_delivery();
+        Self::advise_server_palette(
+            Arc::clone(&self.client),
+            self.remote_pane_id,
+            palette,
+            Arc::clone(&self.delivered_palette),
+        );
+    }
+
     pub fn new(
         client: &Arc<ClientInner>,
         remote_tab_id: TabId,
@@ -125,21 +287,18 @@ impl ClientPane {
         let config = configuration();
         let palette: ColorPalette = config.resolved_palette.clone().into();
 
-        // Advise the server of our palette preference
-        promise::spawn::spawn({
-            let palette = palette.clone();
-            let client = Arc::clone(client);
-            async move {
-                client
-                    .client
-                    .set_configured_palette_for_pane(SetPalette {
-                        pane_id: remote_pane_id,
-                        palette,
-                    })
-                    .await
-            }
-        })
-        .detach();
+        // Advise the server of our palette preference. Delivery is tracked:
+        // if this send is lost (attach races, transient RPC failure), the
+        // server would otherwise answer OSC color queries from its bare
+        // defaults forever — and an application that queries-then-restores
+        // the foreground would then paint the pane in those defaults.
+        let delivered_palette = Arc::new(Mutex::new(PaletteDelivery::default()));
+        Self::advise_server_palette(
+            Arc::clone(client),
+            remote_pane_id,
+            palette.clone(),
+            Arc::clone(&delivered_palette),
+        );
 
         Self {
             client: Arc::clone(client),
@@ -151,6 +310,7 @@ impl ClientPane {
             renderable: Mutex::new(render),
             writer: Mutex::new(writer),
             configured_palette: Mutex::new(palette.clone()),
+            delivered_palette,
             palette: Mutex::new(palette),
             clipboard: Mutex::new(None),
             mouse_grabbed: Mutex::new(false),
@@ -725,13 +885,15 @@ impl Pane for ClientPane {
 
     fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
         let palette = config.color_palette();
-        // Only propagate a palette that actually changed. set_config is
-        // invoked for every pane on every config generation bump (which
-        // can be frequent: any write near a watched config path reloads),
-        // and an unconditional send makes the server re-advise the palette
-        // to every attached client, which invalidates their entire render
-        // surface -- a visible full-window flicker.
-        let changed = *self.configured_palette.lock() != palette;
+        // Skip the send only when the SERVER is known to hold this exact
+        // palette. "The value didn't change locally" is not that: the
+        // initial advisory can be lost in attach races, and comparing
+        // against our own memory would then skip the correction forever —
+        // leaving the server answering OSC color queries from its bare
+        // defaults. Identical re-sends stay flicker-free because both the
+        // server and the receiving side de-duplicate them; the skip here
+        // only avoids per-config-bump RPC noise once delivery is confirmed.
+        let send = self.delivered_palette.lock().delivered.as_ref() != Some(&palette);
 
         // If the application running in the pane hasn't changed the
         // palette through escape sequences, speculatively adopt the
@@ -741,20 +903,13 @@ impl Pane for ClientPane {
         }
         *self.configured_palette.lock() = palette.clone();
 
-        if changed {
-            // and now send the color palette to the server
-            let client = Arc::clone(&self.client);
-            let remote_pane_id = self.remote_pane_id;
-            promise::spawn::spawn(async move {
-                client
-                    .client
-                    .set_configured_palette_for_pane(SetPalette {
-                        pane_id: remote_pane_id,
-                        palette,
-                    })
-                    .await
-            })
-            .detach();
+        if send {
+            Self::advise_server_palette(
+                Arc::clone(&self.client),
+                self.remote_pane_id,
+                palette,
+                Arc::clone(&self.delivered_palette),
+            );
         }
         self.config.lock().replace(config);
     }
@@ -861,5 +1016,116 @@ mod test {
                 send_rpc: false,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod palette_delivery_tests {
+    use super::PaletteDelivery;
+    use wezterm_term::color::ColorPalette;
+
+    fn palette(fg: f32) -> ColorPalette {
+        let mut palette = ColorPalette::default();
+        palette.foreground = (fg, fg, fg, 1.0).into();
+        palette
+    }
+
+    #[test]
+    fn a_send_is_confirmed_and_the_worker_stops() {
+        let mut state = PaletteDelivery::default();
+        assert!(
+            state.adopt_target(palette(0.5)),
+            "first adopt starts a worker"
+        );
+        let sent = state.next_to_send().expect("something to send");
+        state.record_success(sent);
+        assert!(state.next_to_send().is_none(), "delivered == desired: done");
+        assert!(!state.sender_running, "the worker slot must be released");
+    }
+
+    /// The bug this design removes: a retry of an OLD palette must never be
+    /// the last thing the server hears. The worker always re-reads the
+    /// latest desired value, so a success for A while B is pending simply
+    /// leads to sending B next.
+    #[test]
+    fn a_stale_color_can_never_be_the_last_one_standing() {
+        let mut state = PaletteDelivery::default();
+        assert!(state.adopt_target(palette(0.1)));
+        let first = state.next_to_send().expect("A to send");
+
+        // B arrives while A's RPC is in flight: same worker, no new task.
+        assert!(!state.adopt_target(palette(0.9)), "worker already running");
+
+        state.record_success(first);
+        let second = state.next_to_send().expect("B still owed to the server");
+        assert_eq!(second, palette(0.9), "the newest target wins");
+        state.record_success(second);
+        assert!(state.next_to_send().is_none());
+    }
+
+    /// The retry path of the same bug: a send FAILS, and while the worker
+    /// waits to retry, a newer palette arrives. The retry must send the
+    /// newer palette — the failed old one is simply abandoned.
+    #[test]
+    fn a_retry_after_failure_sends_the_newest_target() {
+        let mut state = PaletteDelivery::default();
+        assert!(state.adopt_target(palette(0.1)));
+        let _failed = state.next_to_send().expect("A to send");
+        // The RPC for A fails: no record_success. B arrives during the
+        // retry backoff.
+        assert!(!state.adopt_target(palette(0.9)), "worker still running");
+        assert_eq!(
+            state.next_to_send(),
+            Some(palette(0.9)),
+            "the retry must carry the newest target, not replay the old one"
+        );
+    }
+
+    /// Give-up leaves delivery unconfirmed so the next advisory restarts a
+    /// worker rather than assuming the server heard us.
+    #[test]
+    fn giving_up_allows_a_later_restart_with_the_same_value() {
+        let mut state = PaletteDelivery::default();
+        assert!(state.adopt_target(palette(0.5)));
+        let _ = state.next_to_send().expect("initial send");
+        assert!(state.give_up_if_still_desired(&palette(0.5)));
+        assert!(
+            state.adopt_target(palette(0.5)),
+            "same value must restart the worker after a give-up"
+        );
+        assert_eq!(state.next_to_send(), Some(palette(0.5)));
+    }
+
+    /// A newer target arriving during the final failed RPC must keep the
+    /// worker alive; otherwise no caller remains to start delivery for it.
+    #[test]
+    fn giving_up_an_obsolete_target_keeps_the_worker_for_the_newest_value() {
+        let mut state = PaletteDelivery::default();
+        let old = palette(0.1);
+        let new = palette(0.9);
+        assert!(state.adopt_target(old.clone()));
+        assert_eq!(state.next_to_send(), Some(old.clone()));
+        assert!(!state.adopt_target(new.clone()));
+        assert!(!state.give_up_if_still_desired(&old));
+        assert!(state.sender_running);
+        assert_eq!(state.next_to_send(), Some(new));
+    }
+
+    /// A reconnect invalidates old confirmations: the server may be a fresh
+    /// process that never heard the palette we once delivered.
+    #[test]
+    fn a_reconnect_invalidates_the_confirmation() {
+        let mut state = PaletteDelivery::default();
+        assert!(state.adopt_target(palette(0.5)));
+        let sent = state.next_to_send().unwrap();
+        state.record_success(sent);
+        assert!(state.next_to_send().is_none());
+
+        state.invalidate_delivery();
+        assert!(
+            state.adopt_target(palette(0.5)),
+            "resync restarts the worker"
+        );
+        assert_eq!(state.next_to_send(), Some(palette(0.5)));
     }
 }

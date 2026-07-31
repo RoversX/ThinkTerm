@@ -3845,20 +3845,36 @@ mod test {
         }
     }
 
-    struct MuxTestGuard;
+    struct MuxTestGuard {
+        _serial: parking_lot::MutexGuard<'static, ()>,
+    }
 
     impl Drop for MuxTestGuard {
         fn drop(&mut self) {
-            // Deliberately keep the global Mux installed: tests run in
-            // parallel and share it, so shutting it down here makes
-            // Mux::get() panic in whichever test is still mid-flight.
-            // Each install_mux() swaps in a fresh instance anyway.
+            // Deliberately keep the global Mux installed rather than calling
+            // Mux::shutdown(): code outside these tests reaches it via
+            // Mux::try_get() (notifications), and a fresh instance is swapped
+            // in by the next install_mux() anyway.
         }
     }
 
     fn install_mux() -> MuxTestGuard {
+        // Window-level APIs (kill_window et al) schedule follow-up work; give
+        // the promise layer a scheduler so they don't panic. The executor is
+        // never pumped — these tests assert on the synchronous effects only.
+        static SCHEDULER: std::sync::Once = std::sync::Once::new();
+        SCHEDULER.call_once(|| {
+            let _ = promise::spawn::SimpleExecutor::new();
+        });
+        // The Mux is a process-wide singleton, and these tests assert on its
+        // global state (the windows map, domain attach lifecycles). Parallel
+        // test threads would register their windows and panes into whichever
+        // instance is installed at that moment, corrupting each other's
+        // still-referenced scans — so global-Mux tests run one at a time.
+        static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let serial = SERIAL.lock();
         Mux::set_mux(&Arc::new(Mux::new(None)));
-        MuxTestGuard
+        MuxTestGuard { _serial: serial }
     }
 
     #[test]
@@ -4441,5 +4457,115 @@ mod test {
     #[test]
     fn tab_is_send_and_sync() {
         assert!(is_send_and_sync::<Tab>());
+    }
+
+    /// Detachable domain double whose only job is to count detach calls.
+    /// domain_id 1 matches what FakePane reports.
+    struct FakeDetachableDomain {
+        detach_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::domain::Domain for FakeDetachableDomain {
+        async fn spawn(
+            &self,
+            _size: TerminalSize,
+            _command: Option<portable_pty::CommandBuilder>,
+            _command_dir: Option<String>,
+            _window: WindowId,
+        ) -> anyhow::Result<Arc<Tab>> {
+            unimplemented!()
+        }
+
+        async fn split_pane(
+            &self,
+            _source: crate::domain::SplitSource,
+            _tab: TabId,
+            _pane_id: PaneId,
+            _split_request: SplitRequest,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            unimplemented!()
+        }
+
+        async fn spawn_pane(
+            &self,
+            _size: TerminalSize,
+            _command: Option<portable_pty::CommandBuilder>,
+            _command_dir: Option<String>,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            unimplemented!()
+        }
+
+        fn detachable(&self) -> bool {
+            true
+        }
+
+        fn domain_id(&self) -> DomainId {
+            1
+        }
+
+        fn domain_name(&self) -> &str {
+            "fake-detachable"
+        }
+
+        async fn attach(&self, _window_id: Option<WindowId>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn detach(&self) -> anyhow::Result<()> {
+            self.detach_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn state(&self) -> crate::domain::DomainState {
+            crate::domain::DomainState::Attached
+        }
+    }
+
+    /// Pins the fix for "deleting one thread severed the whole connection":
+    /// removing a mux window must NOT detach a detachable domain while other
+    /// windows still hold panes of it, and MUST still detach it when the last
+    /// referencing window goes away.
+    #[test]
+    fn removing_one_window_keeps_a_shared_domain_attached() {
+        let _guard = install_mux();
+        let mux = Mux::get();
+        let size = test_size();
+        let detach_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let domain: Arc<dyn crate::domain::Domain> = Arc::new(FakeDetachableDomain {
+            detach_count: Arc::clone(&detach_count),
+        });
+        mux.add_domain(&domain);
+
+        let mut window_ids = Vec::new();
+        for pane_id in [20_001, 20_002] {
+            let tab = Arc::new(Tab::new(&size));
+            let pane = FakePane::new(pane_id, size);
+            tab.assign_pane(&pane);
+            mux.add_tab_no_panes(&tab);
+            mux.add_pane(&pane).unwrap();
+            let window_id = *mux.new_empty_window(None, None);
+            mux.add_tab_to_window(&tab, window_id).unwrap();
+            window_ids.push(window_id);
+        }
+
+        mux.kill_window(window_ids[0]);
+        assert_eq!(
+            detach_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a domain still shown by another window must survive"
+        );
+        assert!(
+            mux.get_pane(20_002).is_some(),
+            "the surviving window's pane must still exist"
+        );
+
+        mux.kill_window(window_ids[1]);
+        assert_eq!(
+            detach_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the last referencing window going away must still detach"
+        );
     }
 }

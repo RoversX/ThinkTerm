@@ -1326,7 +1326,11 @@ impl super::TermWindow {
                         context.invalidate();
                     }
                     if completed_drag.as_ref().is_some_and(|(item, _)| {
-                        matches!(item.item_type, UIItemType::RightSidebarFileRow(_))
+                        matches!(
+                            item.item_type,
+                            UIItemType::RightSidebarFileRow(_)
+                                | UIItemType::RightSidebarRemoteFileRow(_)
+                        )
                     }) {
                         if let Some(state) = self.right_sidebar_file_drag.take() {
                             if state.active {
@@ -1340,7 +1344,16 @@ impl super::TermWindow {
                                 // press path did or the preview overlaps the
                                 // terminal.
                                 let previous_width = self.right_sidebar_width();
-                                self.open_right_sidebar_file_path(state.path);
+                                match state.payload {
+                                    super::FileDragPayload::Local(path) => {
+                                        self.open_right_sidebar_file_path(path)
+                                    }
+                                    super::FileDragPayload::Remote { path, origin } => {
+                                        if self.remote_operation_origin_matches(&origin) {
+                                            self.open_right_sidebar_remote_file(path)
+                                        }
+                                    }
+                                }
                                 self.invalidate_or_reflow_right_sidebar(previous_width, context);
                             }
                         }
@@ -1946,10 +1959,12 @@ impl super::TermWindow {
                     self.drag_right_sidebar_file_row(item, start_event, event, context);
                 }
             }
-            UIItemType::RightSidebarRemoteFileRow(ref path)
-                if self.is_renaming_sidebar_remote_file(path) =>
-            {
-                self.drag_right_sidebar_input_selection(item, start_event, event, context);
+            UIItemType::RightSidebarRemoteFileRow(ref path) => {
+                if self.is_renaming_sidebar_remote_file(path) {
+                    self.drag_right_sidebar_input_selection(item, start_event, event, context);
+                } else {
+                    self.drag_right_sidebar_file_row(item, start_event, event, context);
+                }
             }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
@@ -2020,13 +2035,31 @@ impl super::TermWindow {
             return;
         };
 
-        let mut text = self
-            .config
-            .quote_dropped_files
-            .escape(&state.path.to_string_lossy());
-        text.push(' ');
-        if let Err(err) = pane.send_paste(&text) {
-            log::error!("failed to paste dropped file path: {err:#}");
+        match state.payload {
+            super::FileDragPayload::Local(path) => {
+                let mut text = self
+                    .config
+                    .quote_dropped_files
+                    .escape(&path.to_string_lossy());
+                text.push(' ');
+                if let Err(err) = pane.send_paste(&text) {
+                    log::error!("failed to paste dropped file path: {err:#}");
+                }
+            }
+            super::FileDragPayload::Remote { path, origin } => {
+                // The tree this path was picked from has to still be the tree
+                // on screen: the same absolute path on another host names a
+                // different object, and a drag that outlived the switch has no
+                // way to know that. Cancelling silently matches a drop onto
+                // any other piece of chrome.
+                if !self.remote_operation_origin_matches_pane(&origin, pane.pane_id()) {
+                    return;
+                }
+                // POSIX-quoted regardless of `quote_dropped_files` — that
+                // setting is about the local shell, and this path is on a
+                // server by construction.
+                self.paste_remote_path_to_pane(pane.pane_id(), &path);
+            }
         }
     }
 
@@ -3570,7 +3603,7 @@ impl super::TermWindow {
                 // If the pointer never crosses the threshold, the release
                 // handler treats it as a click and opens the file.
                 self.right_sidebar_file_drag = Some(super::FileDragState {
-                    path,
+                    payload: super::FileDragPayload::Local(path),
                     start: event.coords,
                     current: event.coords,
                     active: false,
@@ -3670,7 +3703,26 @@ impl super::TermWindow {
                     context.invalidate();
                     return;
                 }
-                self.open_right_sidebar_remote_file(path.clone());
+                // Don't open yet: arm a potential drag toward the terminal,
+                // exactly like the local rows. The release handler opens the
+                // row when the pointer never crossed the threshold. Without a
+                // source to pin the path to there is nothing safe to drag, so
+                // fall back to opening on press.
+                match self.current_remote_operation_origin() {
+                    Some(origin) => {
+                        self.right_sidebar_file_drag = Some(super::FileDragState {
+                            payload: super::FileDragPayload::Remote {
+                                path: path.clone(),
+                                origin,
+                            },
+                            start: event.coords,
+                            current: event.coords,
+                            active: false,
+                        });
+                        self.dragging.replace((item.clone(), event));
+                    }
+                    None => self.open_right_sidebar_remote_file(path.clone()),
+                }
             }
             UIItemType::RightSidebarRemoteFileBack => {
                 self.close_right_sidebar_remote_file_preview();

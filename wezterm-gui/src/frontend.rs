@@ -31,6 +31,13 @@ pub struct GuiFrontEnd {
     switching_workspaces: RefCell<usize>,
     spawned_mux_window: RefCell<HashSet<MuxWindowId>>,
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
+    /// Set when the LAST GUI window closed and we detached whatever client
+    /// domains were attached at that moment. A domain whose attach was still
+    /// in flight shows as Detached then, escapes that sweep, and completes
+    /// later — this flag lets the WindowCreated handler catch that late
+    /// arrival and finish the job instead of leaving an invisible process.
+    /// Cleared as soon as any GUI window exists again.
+    detach_when_windowless: std::cell::Cell<bool>,
     client_id: Arc<ClientId>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
 }
@@ -55,6 +62,7 @@ impl GuiFrontEnd {
             switching_workspaces: RefCell::new(0),
             spawned_mux_window: RefCell::new(HashSet::new()),
             known_windows: RefCell::new(BTreeMap::new()),
+            detach_when_windowless: std::cell::Cell::new(false),
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
         });
@@ -78,6 +86,9 @@ impl GuiFrontEnd {
                 MuxNotification::WindowCreated(window_id) => {
                     promise::spawn::spawn_into_main_thread(async move {
                         let fe = crate::frontend::front_end();
+                        if fe.reap_windowless_late_attach() {
+                            return;
+                        }
                         if fe.spawned_mux_window.borrow().contains(&window_id) {
                             return;
                         }
@@ -628,6 +639,8 @@ impl GuiFrontEnd {
     }
 
     pub fn record_known_window(&self, window: Window, mux_window_id: MuxWindowId) {
+        // A GUI window exists again: any pending last-window cleanup is moot.
+        self.detach_when_windowless.set(false);
         // Mark this mux window as having a GUI window so the additive reconcile
         // never re-creates a window for it (e.g. after the user closes it while
         // its mux window keeps running in the background).
@@ -641,10 +654,62 @@ impl GuiFrontEnd {
     }
 
     pub fn forget_known_window(&self, window: &Window) {
-        self.known_windows.borrow_mut().remove(window);
+        let now_empty = {
+            let mut windows = self.known_windows.borrow_mut();
+            windows.remove(window);
+            windows.is_empty()
+        };
+        // The last GUI window closing is the user's "I'm done": detach any
+        // client domains so their panes drop, the mux empties, and the Empty
+        // notification can actually terminate the process.
+        // Mux::remove_window_internal deliberately no longer detaches while
+        // other windows still reference a domain (deleting one thread must
+        // not sever the connection its siblings are using), so without this
+        // the background workspaces' panes would keep an invisible process
+        // alive after the last window is gone. Gated on the same setting
+        // that governs quitting, so a platform that idles without windows
+        // (macOS) also keeps its connections.
+        if now_empty && config::configuration().quit_when_all_windows_are_closed {
+            self.detach_attached_client_domains();
+            // A domain whose attach is still in flight shows as Detached and
+            // escapes the sweep above; remember to finish the job when its
+            // windows materialize (see the WindowCreated handler).
+            self.detach_when_windowless.set(true);
+        }
         if !self.is_switching_workspace() {
             self.reconcile_workspace();
         }
+    }
+
+    fn detach_attached_client_domains(&self) {
+        let mux = Mux::get();
+        for domain in mux.iter_domains() {
+            if domain.detachable() && domain.state() == mux::domain::DomainState::Attached {
+                if let Err(err) = domain.detach() {
+                    log::error!(
+                        "while detaching domain {} after the last window closed: {err:#}",
+                        domain.domain_name()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A mux window appeared while no GUI window exists and the last-window
+    /// cleanup already ran: this is a connection that was still attaching
+    /// when the user closed everything. Finish what forget_known_window
+    /// started rather than resurrecting an unwanted session. Returns true
+    /// when the event was consumed this way.
+    pub fn reap_windowless_late_attach(&self) -> bool {
+        if !self.detach_when_windowless.get() {
+            return false;
+        }
+        if !self.known_windows.borrow().is_empty() {
+            self.detach_when_windowless.set(false);
+            return false;
+        }
+        self.detach_attached_client_domains();
+        true
     }
 
     /// Re-point an existing GUI window at a different mux window. Used when a

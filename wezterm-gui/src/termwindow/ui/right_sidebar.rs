@@ -10030,6 +10030,16 @@ impl crate::TermWindow {
         let Some(pane) = self.get_active_pane_or_overlay() else {
             return false;
         };
+        // The paste target must live on the SAME host the upload goes to.
+        // The Space being remote is not enough: the active pane can be a
+        // local overlay (the debug pane), or in principle belong to another
+        // domain entirely — pasting host A's path there would name nothing.
+        // Anything that does not match falls back to the local-path paste.
+        // (A mosh thread's pane is a local domain running mosh-client, so
+        // mosh Spaces deliberately keep the old behavior for now.)
+        if !pane_domain_matches_remote_source(pane.domain_id(), &target.source) {
+            return false;
+        }
         let pane_id = pane.pane_id();
         // Align the panel's state machine with this Space's target (idempotent
         // when it already matches): every origin check downstream reads the
@@ -12262,6 +12272,27 @@ impl crate::TermWindow {
                 .as_deref(),
             current_connection_key.as_deref(),
         )
+    }
+
+    /// In addition to the Files panel still showing the same connection,
+    /// require the terminal receiving a dragged remote path to belong to that
+    /// host. A window may contain a local overlay or panes from another
+    /// domain, where the same absolute path would name a different object.
+    pub(crate) fn remote_operation_origin_matches_pane(
+        &self,
+        origin: &RemoteOperationOrigin,
+        pane_id: PaneId,
+    ) -> bool {
+        if !self.remote_operation_origin_matches(origin) {
+            return false;
+        }
+        let Some(target) = self.right_sidebar_remote_files.target.as_ref() else {
+            return false;
+        };
+        let Some(pane) = Mux::get().get_pane(pane_id) else {
+            return false;
+        };
+        pane_domain_matches_remote_source(pane.domain_id(), &target.source)
     }
 
     /// Drop the panel lease only if it is the exact connection that failed.
@@ -16011,6 +16042,27 @@ fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Whether the pane at `domain_id` is a session on the same host that
+/// `source` uploads to — a ClientDomain of the same name, or the SSH domain
+/// registered for the same saved host.
+fn pane_domain_matches_remote_source(
+    domain_id: mux::domain::DomainId,
+    source: &workspace_threads::RemoteFilesSource,
+) -> bool {
+    let Some(domain) = Mux::get().get_domain(domain_id) else {
+        return false;
+    };
+    let name = domain.domain_name();
+    match source {
+        workspace_threads::RemoteFilesSource::ClientDomain(client) => name == client,
+        workspace_threads::RemoteFilesSource::SshHost(host_id) => {
+            crate::ssh_hosts::host_spec(host_id)
+                .map(|spec| crate::ssh_hosts::ssh_domain_name(&spec) == name)
+                .unwrap_or(false)
+        }
+    }
 }
 
 /// Where a terminal drop should upload, given the setting and (when the

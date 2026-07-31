@@ -375,11 +375,7 @@ impl crate::TermWindow {
         if !state.active {
             return Ok(());
         }
-        let label = state
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| state.path.to_string_lossy().into_owned());
+        let label = state.payload.label();
         let anchor = state.current;
         self.paint_drag_ghost_pill(&label, anchor)
     }

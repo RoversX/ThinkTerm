@@ -641,7 +641,7 @@ impl ClientDomain {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
 
         let panes = inner.client.list_panes().await?;
-        Self::process_pane_list(inner, panes, None)?;
+        Self::process_pane_list(inner, panes, None, true)?;
 
         ui.close();
         Ok(())
@@ -664,7 +664,7 @@ impl ClientDomain {
                 inner.defer_resync();
                 return Ok(());
             }
-            Self::process_pane_list(inner, panes, None)?;
+            Self::process_pane_list(inner, panes, None, false)?;
         }
         Ok(())
     }
@@ -693,6 +693,7 @@ impl ClientDomain {
         inner: Arc<ClientInner>,
         panes: ListPanesResponse,
         mut primary_window_id: Option<WindowId>,
+        resend_palette: bool,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
         // A native/mux window can disappear while an attach or structural RPC
@@ -798,6 +799,16 @@ impl ClientDomain {
                             Some(pane) => {
                                 if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
                                     client_pane.set_remote_tab_id(entry.tab_id);
+                                    if resend_palette {
+                                        // A reattach can land on a fresh
+                                        // server process that never received
+                                        // our palette, and its bare defaults
+                                        // are what OSC color queries would
+                                        // otherwise keep answering. Ordinary
+                                        // structural resyncs do not need the
+                                        // extra RPC.
+                                        client_pane.resend_palette_to_server();
+                                    }
                                 }
                                 pane
                             }
@@ -994,7 +1005,7 @@ impl ClientDomain {
             guard.replace(Arc::clone(&inner));
         }
 
-        Self::process_pane_list(inner, panes, primary_window_id)?;
+        Self::process_pane_list(inner, panes, primary_window_id, false)?;
 
         Ok(())
     }

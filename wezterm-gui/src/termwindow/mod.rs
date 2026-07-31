@@ -634,10 +634,44 @@ pub(crate) enum TabWheelSurface {
 
 #[derive(Clone, Debug)]
 struct FileDragState {
-    path: PathBuf,
+    payload: FileDragPayload,
     start: ::window::Point,
     current: ::window::Point,
     active: bool,
+}
+
+/// What a Files-panel drag will paste once it lands on the terminal.
+#[derive(Clone, Debug)]
+enum FileDragPayload {
+    Local(PathBuf),
+    /// A remote path only means something together with the source it was
+    /// picked from — `/tmp/a` on host A is not the object `/tmp/a` names on
+    /// host B — so the drop revalidates that source before pasting.
+    Remote {
+        path: remote_files::RemotePath,
+        origin: remote_files::RemoteOperationOrigin,
+    },
+}
+
+impl FileDragPayload {
+    /// What the floating pill under the cursor says: the file's own name,
+    /// falling back to the whole path when there is no name to show.
+    fn label(&self) -> String {
+        match self {
+            Self::Local(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+            Self::Remote { path, .. } => {
+                let name = path.file_name();
+                if name.is_empty() {
+                    path.as_str().to_string()
+                } else {
+                    name.to_string()
+                }
+            }
+        }
+    }
 }
 
 /// A planned local copy held back until the user says what to do about files
