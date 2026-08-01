@@ -2945,15 +2945,13 @@ impl TabInner {
             }
         }
 
-        let src_pane = src_pane
-            .ok_or_else(|| anyhow::anyhow!("pane {src_pane_id} not found in tab"))?;
+        let src_pane =
+            src_pane.ok_or_else(|| anyhow::anyhow!("pane {src_pane_id} not found in tab"))?;
         if !target_found {
             anyhow::bail!("pane {target_pane_id} not found in tab");
         }
         if same_stack {
-            anyhow::bail!(
-                "panes {src_pane_id} and {target_pane_id} are already in the same stack"
-            );
+            anyhow::bail!("panes {src_pane_id} and {target_pane_id} are already in the same stack");
         }
 
         // The only fallible step happens before the tree is touched: if the
@@ -2979,9 +2977,8 @@ impl TabInner {
                 if cursor.is_leaf() {
                     let stack = cursor.leaf_mut().unwrap();
                     if stack.contains_pane(target_pane_id) {
-                        if let Some(base) = stack
-                            .active_pane()
-                            .filter(|_| !removed.is_remote_mirror())
+                        if let Some(base) =
+                            stack.active_pane().filter(|_| !removed.is_remote_mirror())
                         {
                             let dims = base.get_dimensions();
                             if let Err(err) = removed.resize(TerminalSize {
@@ -3059,7 +3056,10 @@ impl TabInner {
             let mut cursor = tree.cursor();
             loop {
                 if cursor.is_leaf() {
-                    cursor.leaf_mut().unwrap().push_and_activate(Arc::clone(pane));
+                    cursor
+                        .leaf_mut()
+                        .unwrap()
+                        .push_and_activate(Arc::clone(pane));
                     done = true;
                 }
                 match cursor.preorder_next() {
@@ -3978,11 +3978,13 @@ mod test {
         let size = test_size();
         let tab = Tab::new(&size);
         tab.assign_pane(&FakePane::new(1, size));
-        let horz_size = tab
-            .compute_split_size(0, SplitRequest::default())
-            .unwrap();
-        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(2, horz_size.second))
-            .unwrap();
+        let horz_size = tab.compute_split_size(0, SplitRequest::default()).unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest::default(),
+            FakePane::new(2, horz_size.second),
+        )
+        .unwrap();
         tab.add_pane_to_stack(1, FakePane::new(3, size)).unwrap();
         assert_eq!(tab.count_panes(), Some(3));
 
@@ -4012,11 +4014,13 @@ mod test {
         let size = test_size();
         let tab = Tab::new(&size);
         tab.assign_pane(&FakePane::new(1, size));
-        let horz_size = tab
-            .compute_split_size(0, SplitRequest::default())
-            .unwrap();
-        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(2, horz_size.second))
-            .unwrap();
+        let horz_size = tab.compute_split_size(0, SplitRequest::default()).unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest::default(),
+            FakePane::new(2, horz_size.second),
+        )
+        .unwrap();
 
         tab.move_pane_to_stack(1, 2).unwrap();
 
@@ -4266,7 +4270,8 @@ mod test {
                 size: Default::default(),
             };
             let target_index = tab.pane_index_for_pane(1).unwrap();
-            tab.split_and_insert(target_index, request, removed).unwrap();
+            tab.split_and_insert(target_index, request, removed)
+                .unwrap();
 
             assert_eq!(tab.count_panes(), Some(2));
             assert!(tab.pane_index_for_pane(1).is_some());

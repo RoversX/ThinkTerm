@@ -2,12 +2,12 @@ use super::*;
 use crate::connection::ConnectionOps;
 use crate::parameters::{self, Parameters};
 use crate::{
-    Appearance, Clipboard, DeadKeyStatus, Dimensions, FolderPickerOptions, Handled, KeyCode,
-    KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point,
-    RawKeyEvent, Rect, RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength,
-    WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
+    Appearance, Clipboard, ClipboardContents, DeadKeyStatus, Dimensions, FolderPickerOptions,
+    Handled, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind,
+    MousePress, Point, RawKeyEvent, Rect, RequestedWindowGeometry, ResolvedGeometry, ScreenPoint,
+    ScreenRect, ULength, WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
 use lazy_static::lazy_static;
@@ -1348,8 +1348,55 @@ impl WindowOps for Window {
         Future::result(
             clipboard_win::get_clipboard_string()
                 .map(|s| s.replace("\r\n", "\n"))
-                .context("Error getting clipboard"),
+                .map_err(|e| anyhow!("Error getting clipboard: {e}")),
         )
+    }
+
+    fn get_clipboard_contents(&self, _clipboard: Clipboard) -> Future<ClipboardContents> {
+        // Files > text > image: files often travel with a text rendition
+        // and are the intent; spreadsheets offer text plus a bitmap of the
+        // cells and the text is the intent; screenshots are image-only.
+        fn read_contents() -> anyhow::Result<ClipboardContents> {
+            use clipboard_win::Getter;
+
+            // Hold the clipboard open across format negotiation so its owner
+            // cannot change between the files, text, and bitmap probes.
+            let _clipboard = clipboard_win::Clipboard::new_attempts(10)
+                .map_err(|err| anyhow!("Error opening clipboard: {err}"))?;
+
+            let mut files = Vec::<String>::new();
+            if clipboard_win::formats::FileList
+                .read_clipboard(&mut files)
+                .is_ok()
+                && !files.is_empty()
+            {
+                return Ok(ClipboardContents::FilePaths(
+                    files.into_iter().map(PathBuf::from).collect(),
+                ));
+            }
+
+            let mut text = String::new();
+            if clipboard_win::formats::Unicode
+                .read_clipboard(&mut text)
+                .is_ok()
+            {
+                return Ok(ClipboardContents::Text(text.replace("\r\n", "\n")));
+            }
+
+            let mut bytes = Vec::new();
+            if clipboard_win::formats::Bitmap
+                .read_clipboard(&mut bytes)
+                .is_ok()
+            {
+                return Ok(ClipboardContents::Image {
+                    format: crate::ClipboardImageFormat::Bmp,
+                    bytes,
+                });
+            }
+
+            Err(anyhow!("Clipboard has no supported files, text, or bitmap"))
+        }
+        Future::result(read_contents())
     }
 
     fn set_clipboard(&self, _clipboard: Clipboard, text: String) {

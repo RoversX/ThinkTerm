@@ -154,6 +154,7 @@ impl ActivateTab {
         client
             .set_focused_pane_id(codec::SetFocusedPane {
                 pane_id: target_pane,
+                configured_palette: None,
             })
             .await?;
         Ok(())

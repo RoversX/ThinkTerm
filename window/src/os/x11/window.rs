@@ -3,7 +3,8 @@ use crate::bitmaps::*;
 use crate::connection::ConnectionOps;
 use crate::os::{xkeysyms, Connection, Window};
 use crate::{
-    Appearance, Clipboard, DeadKeyStatus, Dimensions, MouseButtons, MouseCursor, MouseEvent,
+    preferred_clipboard_representation, Appearance, Clipboard, ClipboardContents,
+    ClipboardRepresentation, DeadKeyStatus, Dimensions, MouseButtons, MouseCursor, MouseEvent,
     MouseEventKind, MousePress, Point, Rect, RequestedWindowGeometry, ResizeIncrement,
     ResolvedGeometry, ScreenPoint, ScreenRect, WindowDecorations, WindowEvent, WindowEventSender,
     WindowOps, WindowState,
@@ -19,7 +20,6 @@ use raw_window_handle::{
 use std::any::Any;
 use std::convert::TryInto;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,99 @@ struct CopyAndPaste {
     primary_selection_owned: Option<String>,
     clipboard_request: Option<Promise<String>>,
     selection_request: Option<Promise<String>>,
+    /// A typed (files/image/text) read in flight. Runs on its own property
+    /// (`atom_xsel_contents`), independent of the legacy text requests.
+    contents_request: Option<ContentsRequest>,
+    /// The newest typed read requested while an older X11 conversion is still
+    /// outstanding. We do not reuse the property until the old reply (or INCR
+    /// terminator) has been consumed.
+    pending_contents_request: Option<PendingContentsRequest>,
+    /// An INCR transfer feeding the typed read, chunk by chunk.
+    incr_contents: Option<IncrContents>,
     time: u32,
+}
+
+/// How to decode the property bytes once the transfer completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentsKind {
+    UriList,
+    Png,
+    Utf8Text,
+    Latin1Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentsStage {
+    /// We asked the owner which targets it supports.
+    AwaitingTargets,
+    /// We asked for the actual data as `kind`.
+    AwaitingData { kind: ContentsKind },
+}
+
+struct ContentsRequest {
+    clipboard: Clipboard,
+    stage: ContentsStage,
+    /// The conversion target of the outstanding ConvertSelection; a refusal
+    /// (SelectionNotify with property None) is matched against this, since a
+    /// refusal doesn't name the property it was destined for.
+    last_target: Atom,
+    promise: Option<Promise<ClipboardContents>>,
+    canceled: bool,
+    targets_known: bool,
+    utf8_text_available: bool,
+    latin1_text_available: bool,
+    uri_fallback_text: Option<String>,
+}
+
+struct PendingContentsRequest {
+    clipboard: Clipboard,
+    promise: Promise<ClipboardContents>,
+}
+
+struct IncrContents {
+    kind: ContentsKind,
+    buf: Vec<u8>,
+}
+
+fn successful_contents_notify_matches(
+    expected_target: Atom,
+    notification_target: Atom,
+    notification_property: Atom,
+    contents_property: Atom,
+) -> bool {
+    notification_property == contents_property && notification_target == expected_target
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupersededContentsReply {
+    Retire,
+    DrainIncr,
+}
+
+fn superseded_contents_reply(stage: ContentsStage, is_incr: bool) -> SupersededContentsReply {
+    if is_incr && matches!(stage, ContentsStage::AwaitingData { .. }) {
+        SupersededContentsReply::DrainIncr
+    } else {
+        SupersededContentsReply::Retire
+    }
+}
+
+fn latin1_to_string(s: &[u8]) -> String {
+    s.iter().map(|&c| c as char).collect()
+}
+
+fn decode_contents(kind: ContentsKind, bytes: &[u8]) -> ClipboardContents {
+    match kind {
+        ContentsKind::UriList => crate::os::uri_list::clipboard_contents_from_uri_list(bytes, None),
+        ContentsKind::Png => ClipboardContents::Image {
+            format: crate::ClipboardImageFormat::Png,
+            bytes: bytes.to_vec(),
+        },
+        ContentsKind::Utf8Text => {
+            ClipboardContents::Text(String::from_utf8_lossy(bytes).to_string())
+        }
+        ContentsKind::Latin1Text => ClipboardContents::Text(latin1_to_string(bytes)),
+    }
 }
 
 impl CopyAndPaste {
@@ -1054,6 +1146,12 @@ impl XWindowInner {
                 let atom_name = conn.atom_name(msg.atom());
                 log::trace!("PropertyNotifyEvent {atom_name}");
 
+                if msg.atom() == conn.atom_xsel_contents
+                    && msg.state() == xcb::x::Property::NewValue
+                {
+                    self.continue_incr_contents()?;
+                }
+
                 if msg.atom() == conn.atom_gtk_edge_constraints {
                     // "_GTK_EDGE_CONSTRAINTS" property is changed when the
                     // accessibility settings change the text size and thus
@@ -1288,6 +1386,376 @@ impl XWindowInner {
         Ok(())
     }
 
+    /// Begin a typed clipboard read: ask the owner which targets it offers,
+    /// then fetch files (text/uri-list), text, or an image (image/png) in
+    /// that order of preference. A newer request supersedes an unfinished
+    /// one — the old promise resolves to an error.
+    fn request_clipboard_contents(
+        &mut self,
+        clipboard: Clipboard,
+        promise: Promise<ClipboardContents>,
+    ) {
+        if let Some(active) = self.copy_and_paste.contents_request.as_mut() {
+            if let Some(mut old_promise) = active.promise.take() {
+                old_promise.err(anyhow!("clipboard contents request superseded"));
+            }
+            active.canceled = true;
+            if let Some(mut pending) = self.copy_and_paste.pending_contents_request.take() {
+                pending
+                    .promise
+                    .err(anyhow!("clipboard contents request superseded"));
+            }
+            self.copy_and_paste.pending_contents_request =
+                Some(PendingContentsRequest { clipboard, promise });
+            return;
+        }
+
+        self.start_clipboard_contents_request(PendingContentsRequest { clipboard, promise });
+    }
+
+    fn start_clipboard_contents_request(&mut self, request: PendingContentsRequest) {
+        debug_assert!(self.copy_and_paste.contents_request.is_none());
+        let conn = self.conn();
+        let clipboard = request.clipboard;
+        self.copy_and_paste.incr_contents = None;
+        self.copy_and_paste.contents_request = Some(ContentsRequest {
+            clipboard,
+            stage: ContentsStage::AwaitingTargets,
+            last_target: conn.atom_targets,
+            promise: Some(request.promise),
+            canceled: false,
+            targets_known: false,
+            utf8_text_available: false,
+            latin1_text_available: false,
+            uri_fallback_text: None,
+        });
+        conn.send_request_no_reply_log(&xcb::x::ConvertSelection {
+            requestor: self.window_id,
+            selection: match clipboard {
+                Clipboard::Clipboard => conn.atom_clipboard,
+                Clipboard::PrimarySelection => xcb::x::ATOM_PRIMARY,
+            },
+            target: conn.atom_targets,
+            property: conn.atom_xsel_contents,
+            time: self.copy_and_paste.time,
+        });
+    }
+
+    /// Ask for the selection converted to `target`, to be decoded as `kind`.
+    fn convert_contents_target(&mut self, target: Atom, kind: ContentsKind) {
+        let conn = self.conn();
+        let Some(req) = self.copy_and_paste.contents_request.as_mut() else {
+            return;
+        };
+        req.stage = ContentsStage::AwaitingData { kind };
+        req.last_target = target;
+        let selection = match req.clipboard {
+            Clipboard::Clipboard => conn.atom_clipboard,
+            Clipboard::PrimarySelection => xcb::x::ATOM_PRIMARY,
+        };
+        conn.send_request_no_reply_log(&xcb::x::ConvertSelection {
+            requestor: self.window_id,
+            selection,
+            target,
+            property: conn.atom_xsel_contents,
+            time: self.copy_and_paste.time,
+        });
+    }
+
+    fn retire_contents_request(&mut self, contents: Option<ClipboardContents>) {
+        self.copy_and_paste.incr_contents = None;
+        if let Some(mut req) = self.copy_and_paste.contents_request.take() {
+            if !req.canceled {
+                if let Some(mut promise) = req.promise.take() {
+                    match contents {
+                        Some(contents) => promise.ok(contents),
+                        None => promise.err(anyhow!("clipboard contents request canceled")),
+                    };
+                }
+            }
+        }
+        if let Some(pending) = self.copy_and_paste.pending_contents_request.take() {
+            self.start_clipboard_contents_request(pending);
+        }
+    }
+
+    fn finish_contents_request(&mut self, contents: ClipboardContents) {
+        self.retire_contents_request(Some(contents));
+    }
+
+    fn finish_contents_with_uri_fallback(&mut self) {
+        let fallback = self
+            .copy_and_paste
+            .contents_request
+            .as_mut()
+            .and_then(|req| req.uri_fallback_text.take())
+            .unwrap_or_default();
+        self.finish_contents_request(ClipboardContents::Text(fallback));
+    }
+
+    fn finish_contents_text_failure(&mut self) {
+        if self
+            .copy_and_paste
+            .contents_request
+            .as_ref()
+            .is_some_and(|req| req.uri_fallback_text.is_some())
+        {
+            self.finish_contents_with_uri_fallback();
+        } else {
+            self.finish_contents_request(ClipboardContents::Text(String::new()));
+        }
+    }
+
+    fn complete_contents_payload(&mut self, kind: ContentsKind, bytes: &[u8]) {
+        let contents = decode_contents(kind, bytes);
+        if kind == ContentsKind::UriList {
+            if let ClipboardContents::Text(fallback) = contents {
+                let text_target = {
+                    let Some(req) = self.copy_and_paste.contents_request.as_mut() else {
+                        return;
+                    };
+                    req.uri_fallback_text = Some(fallback);
+                    if req.utf8_text_available {
+                        Some((self.conn().atom_utf8_string, ContentsKind::Utf8Text))
+                    } else if req.latin1_text_available {
+                        Some((xcb::x::ATOM_STRING, ContentsKind::Latin1Text))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((target, kind)) = text_target {
+                    self.convert_contents_target(target, kind);
+                } else {
+                    self.finish_contents_with_uri_fallback();
+                }
+                return;
+            }
+        }
+        self.finish_contents_request(contents);
+    }
+
+    /// Handle a SelectionNotify belonging to the typed read, if there is
+    /// one in flight and this event is for it. Returns false to let the
+    /// legacy text path have the event.
+    fn try_handle_contents_notify(
+        &mut self,
+        selection: &xcb::x::SelectionNotifyEvent,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn();
+        let refused = selection.property() == xcb::x::ATOM_NONE;
+        if !refused && selection.property() == conn.atom_xsel_contents {
+            let matches_active = self
+                .copy_and_paste
+                .contents_request
+                .as_ref()
+                .is_some_and(|req| {
+                    self.selection_atom_to_clipboard(selection.selection()) == Some(req.clipboard)
+                        && successful_contents_notify_matches(
+                            req.last_target,
+                            selection.target(),
+                            selection.property(),
+                            conn.atom_xsel_contents,
+                        )
+                });
+            if !matches_active {
+                // A completed request can leave a SelectionNotify queued even
+                // after its promise was superseded. Never let the event advance
+                // a different request or fall through to the legacy text path.
+                conn.send_request_no_reply(&xcb::x::DeleteProperty {
+                    window: selection.requestor(),
+                    property: selection.property(),
+                })?;
+                return Ok(true);
+            }
+        }
+        let Some(req) = self.copy_and_paste.contents_request.as_ref() else {
+            return Ok(false);
+        };
+        if self.selection_atom_to_clipboard(selection.selection()) != Some(req.clipboard) {
+            return Ok(false);
+        }
+        // Success notifies name our dedicated property. A refusal names no
+        // property at all, so match it against the target we asked for —
+        // the legacy path never asks for TARGETS/uri-list/png, and a text
+        // target refusal is matched here first only while a typed request
+        // is actually outstanding.
+        if !refused && selection.property() != conn.atom_xsel_contents {
+            return Ok(false);
+        }
+        if selection.target() != req.last_target {
+            return Ok(false);
+        }
+        let stage = req.stage;
+        let canceled = req.canceled;
+
+        if refused {
+            if canceled {
+                self.retire_contents_request(None);
+                return Ok(true);
+            }
+            match stage {
+                ContentsStage::AwaitingTargets => {
+                    // Owner doesn't answer TARGETS; assume plain text.
+                    self.convert_contents_target(conn.atom_utf8_string, ContentsKind::Utf8Text);
+                }
+                ContentsStage::AwaitingData { kind } => match kind {
+                    ContentsKind::UriList | ContentsKind::Png => {
+                        let text_target =
+                            self.copy_and_paste
+                                .contents_request
+                                .as_ref()
+                                .and_then(|req| {
+                                    if !req.targets_known || req.utf8_text_available {
+                                        Some((conn.atom_utf8_string, ContentsKind::Utf8Text))
+                                    } else if req.latin1_text_available {
+                                        Some((xcb::x::ATOM_STRING, ContentsKind::Latin1Text))
+                                    } else {
+                                        None
+                                    }
+                                });
+                        if let Some((target, kind)) = text_target {
+                            self.convert_contents_target(target, kind);
+                        } else {
+                            self.finish_contents_text_failure();
+                        }
+                    }
+                    ContentsKind::Utf8Text => {
+                        let try_latin1 = self
+                            .copy_and_paste
+                            .contents_request
+                            .as_ref()
+                            .is_some_and(|req| !req.targets_known || req.latin1_text_available);
+                        if try_latin1 {
+                            self.convert_contents_target(
+                                xcb::x::ATOM_STRING,
+                                ContentsKind::Latin1Text,
+                            );
+                        } else {
+                            self.finish_contents_text_failure();
+                        }
+                    }
+                    ContentsKind::Latin1Text => {
+                        self.finish_contents_text_failure();
+                    }
+                },
+            }
+            return Ok(true);
+        }
+
+        let prop = conn
+            .send_and_wait_request(&xcb::x::GetProperty {
+                // Deleting is both our cleanup and, for an INCR
+                // announcement, the signal that we are ready for chunks.
+                delete: true,
+                window: selection.requestor(),
+                property: selection.property(),
+                r#type: xcb::x::ATOM_NONE, // AnyPropertyType: INCR must be visible
+                long_offset: 0,
+                long_length: u32::max_value(),
+            })
+            .context("GetProperty for typed clipboard read")?;
+
+        if canceled {
+            if superseded_contents_reply(stage, prop.r#type() == conn.atom_incr)
+                == SupersededContentsReply::DrainIncr
+            {
+                let ContentsStage::AwaitingData { kind } = stage else {
+                    unreachable!()
+                };
+                // The owner is already in the INCR handshake. Drain its
+                // chunks before reusing the property for the replacement.
+                self.copy_and_paste.incr_contents = Some(IncrContents { kind, buf: vec![] });
+            } else {
+                self.retire_contents_request(None);
+            }
+            return Ok(true);
+        }
+
+        match stage {
+            ContentsStage::AwaitingTargets => {
+                let targets: Vec<Atom> = prop.value::<Atom>().to_vec();
+                let has_utf8 = targets.contains(&conn.atom_utf8_string);
+                let has_latin1 = targets.contains(&xcb::x::ATOM_STRING);
+                if let Some(req) = self.copy_and_paste.contents_request.as_mut() {
+                    req.targets_known = true;
+                    req.utf8_text_available = has_utf8;
+                    req.latin1_text_available = has_latin1;
+                }
+                match preferred_clipboard_representation(
+                    targets.contains(&conn.atom_texturilist),
+                    has_utf8 || has_latin1,
+                    targets.contains(&conn.atom_image_png),
+                ) {
+                    ClipboardRepresentation::UriList => {
+                        self.convert_contents_target(conn.atom_texturilist, ContentsKind::UriList)
+                    }
+                    ClipboardRepresentation::Text if has_utf8 => {
+                        self.convert_contents_target(conn.atom_utf8_string, ContentsKind::Utf8Text)
+                    }
+                    ClipboardRepresentation::Text if has_latin1 => {
+                        self.convert_contents_target(xcb::x::ATOM_STRING, ContentsKind::Latin1Text)
+                    }
+                    ClipboardRepresentation::Text => {
+                        self.convert_contents_target(conn.atom_utf8_string, ContentsKind::Utf8Text)
+                    }
+                    ClipboardRepresentation::Png => {
+                        self.convert_contents_target(conn.atom_image_png, ContentsKind::Png)
+                    }
+                }
+            }
+            ContentsStage::AwaitingData { kind } => {
+                if prop.r#type() == conn.atom_incr {
+                    // INCR transfer: the real data arrives in chunks via
+                    // PropertyNotify on our property; the delete above told
+                    // the owner to start.
+                    self.copy_and_paste.incr_contents = Some(IncrContents { kind, buf: vec![] });
+                } else {
+                    self.complete_contents_payload(kind, prop.value());
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// An INCR chunk (or its terminator) landed on our property.
+    fn continue_incr_contents(&mut self) -> anyhow::Result<()> {
+        let conn = self.conn();
+        if self.copy_and_paste.incr_contents.is_none() {
+            return Ok(());
+        }
+        let prop = conn
+            .send_and_wait_request(&xcb::x::GetProperty {
+                // Deleting each chunk asks the owner for the next one.
+                delete: true,
+                window: self.window_id,
+                property: conn.atom_xsel_contents,
+                r#type: xcb::x::ATOM_NONE,
+                long_offset: 0,
+                long_length: u32::max_value(),
+            })
+            .context("GetProperty for INCR chunk")?;
+        let value = prop.value::<u8>();
+        let Some(incr) = self.copy_and_paste.incr_contents.as_mut() else {
+            return Ok(());
+        };
+        if value.is_empty() {
+            let done = self.copy_and_paste.incr_contents.take().unwrap();
+            let canceled = self
+                .copy_and_paste
+                .contents_request
+                .as_ref()
+                .is_some_and(|req| req.canceled);
+            if canceled {
+                self.retire_contents_request(None);
+            } else {
+                self.complete_contents_payload(done.kind, &done.buf);
+            }
+        } else {
+            incr.buf.extend_from_slice(value);
+        }
+        Ok(())
+    }
+
     fn selection_notify(&mut self, selection: &xcb::x::SelectionNotifyEvent) -> anyhow::Result<()> {
         let conn = self.conn();
         let window_id = self.window_id;
@@ -1298,6 +1766,10 @@ impl XWindowInner {
             "SEL: window_id={window_id:?} SELECTION_NOTIFY received {selection:?} \
             selection.selection={selection_name} selection.target={target_name}"
         );
+
+        if self.try_handle_contents_notify(selection)? {
+            return Ok(());
+        }
 
         if let Some(clipboard) = self.selection_atom_to_clipboard(selection.selection()) {
             if selection.property() == xcb::x::ATOM_NONE {
@@ -1342,10 +1814,6 @@ impl XWindowInner {
             }) {
                 Ok(prop) => {
                     if let Some(mut promise) = self.copy_and_paste.request_mut(clipboard).take() {
-                        fn latin1_to_string(s: &[u8]) -> String {
-                            s.iter().map(|&c| c as char).collect()
-                        }
-
                         let data = if selection.target() == xcb::x::ATOM_STRING {
                             latin1_to_string(prop.value())
                         } else {
@@ -1954,13 +2422,7 @@ impl XWindowInner {
         }
     }
 
-    fn net_wm_moveresize(
-        &mut self,
-        x_root: u32,
-        y_root: u32,
-        direction: u32,
-        button: u32,
-    ) -> bool {
+    fn net_wm_moveresize(&mut self, x_root: u32, y_root: u32, direction: u32, button: u32) -> bool {
         let source_indication = 1;
         let conn = self.conn();
 
@@ -2408,6 +2870,20 @@ impl WindowOps for XWindow {
         future
     }
 
+    /// Initiate typed transfer from the clipboard: negotiate TARGETS so
+    /// file lists and images survive as such.
+    fn get_clipboard_contents(&self, clipboard: Clipboard) -> Future<ClipboardContents> {
+        let window_id = self.0;
+        let mut promise = Promise::new();
+        let future = promise.get_future().unwrap();
+        let mut promise = Some(promise);
+        XConnection::with_window_inner(window_id, move |inner| {
+            inner.request_clipboard_contents(clipboard, promise.take().unwrap());
+            Ok(())
+        });
+        future
+    }
+
     /// Set some text in the clipboard
     fn set_clipboard(&self, clipboard: Clipboard, text: String) {
         let window_id = self.0;
@@ -2426,28 +2902,7 @@ impl WindowOps for XWindow {
     }
 }
 
-fn parse_texturi_list(url_list: &[u8]) -> Vec<PathBuf> {
-    String::from_utf8_lossy(url_list)
-        .lines()
-        .filter_map(|line| {
-            if line.starts_with('#') || line.trim().is_empty() {
-                // text/uri-list: Any lines beginning with the '#' character
-                // are comment lines and are ignored during processing
-                return None;
-            }
-            let url = Url::parse(line)
-                .map_err(|err| {
-                    log::error!("Error parsing dropped file line {line} as url: {err:#}");
-                })
-                .ok()?;
-            url.to_file_path()
-                .map_err(|_| {
-                    log::error!("Error converting url {url:?} from line {line} to pathbuf");
-                })
-                .ok()
-        })
-        .collect()
-}
+use crate::os::uri_list::parse_texturi_list;
 
 fn parse_xmozurl_list(url_list: &str) -> Vec<Url> {
     url_list
@@ -2509,6 +2964,47 @@ impl NetWmStateAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xcb::XidNew;
+
+    #[test]
+    fn stale_typed_selection_notification_does_not_match_replacement_request() {
+        let targets = unsafe { Atom::new(10) };
+        let utf8 = unsafe { Atom::new(11) };
+        let property = unsafe { Atom::new(12) };
+
+        assert!(!successful_contents_notify_matches(
+            utf8, targets, property, property
+        ));
+        assert!(successful_contents_notify_matches(
+            utf8, utf8, property, property
+        ));
+    }
+
+    #[test]
+    fn superseded_x11_incr_is_drained_before_the_property_is_reused() {
+        assert_eq!(
+            superseded_contents_reply(
+                ContentsStage::AwaitingData {
+                    kind: ContentsKind::Png,
+                },
+                true,
+            ),
+            SupersededContentsReply::DrainIncr
+        );
+        assert_eq!(
+            superseded_contents_reply(
+                ContentsStage::AwaitingData {
+                    kind: ContentsKind::Png,
+                },
+                false,
+            ),
+            SupersededContentsReply::Retire
+        );
+        assert_eq!(
+            superseded_contents_reply(ContentsStage::AwaitingTargets, false),
+            SupersededContentsReply::Retire
+        );
+    }
 
     #[test]
     fn integrated_buttons_never_request_a_native_title_bar() {

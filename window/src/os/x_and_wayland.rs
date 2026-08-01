@@ -9,8 +9,8 @@ use crate::os::x11::connection::XConnection;
 use crate::os::x11::window::XWindow;
 use crate::screen::Screens;
 use crate::{
-    Appearance, Clipboard, FolderPickerOptions, MouseCursor, Rect, RequestedWindowGeometry,
-    ResizeIncrement, ScreenPoint, WindowEvent, WindowOps,
+    Appearance, Clipboard, ClipboardContents, FolderPickerOptions, MouseCursor, Rect,
+    RequestedWindowGeometry, ResizeIncrement, ScreenPoint, WindowEvent, WindowOps,
 };
 use async_trait::async_trait;
 use config::ConfigHandle;
@@ -416,6 +416,13 @@ impl WindowOps for Window {
             Self::X11(x) => x.get_clipboard(clipboard),
             #[cfg(feature = "wayland")]
             Self::Wayland(w) => w.get_clipboard(clipboard),
+        }
+    }
+    fn get_clipboard_contents(&self, clipboard: Clipboard) -> Future<ClipboardContents> {
+        match self {
+            Self::X11(x) => x.get_clipboard_contents(clipboard),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(w) => w.get_clipboard_contents(clipboard),
         }
     }
     fn set_clipboard(&self, clipboard: Clipboard, text: String) {

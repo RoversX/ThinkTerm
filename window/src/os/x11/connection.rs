@@ -60,6 +60,9 @@ pub struct XConnection {
     pub atom_delete: Atom,
     pub atom_utf8_string: Atom,
     pub atom_xsel_data: Atom,
+    pub atom_xsel_contents: Atom,
+    pub atom_incr: Atom,
+    pub atom_image_png: Atom,
     pub atom_targets: Atom,
     pub atom_clipboard: Atom,
     pub atom_texturilist: Atom,
@@ -679,6 +682,11 @@ impl XConnection {
         let atom_delete = Self::intern_atom(&conn, "WM_DELETE_WINDOW")?;
         let atom_utf8_string = Self::intern_atom(&conn, "UTF8_STRING")?;
         let atom_xsel_data = Self::intern_atom(&conn, "XSEL_DATA")?;
+        // Typed clipboard reads (files/images) land in their own property so
+        // they can never race a concurrent legacy text read on XSEL_DATA.
+        let atom_xsel_contents = Self::intern_atom(&conn, "_THINKTERM_SEL_CONTENTS")?;
+        let atom_incr = Self::intern_atom(&conn, "INCR")?;
+        let atom_image_png = Self::intern_atom(&conn, "image/png")?;
         let atom_targets = Self::intern_atom(&conn, "TARGETS")?;
         let atom_clipboard = Self::intern_atom(&conn, "CLIPBOARD")?;
         let atom_texturilist = Self::intern_atom(&conn, "text/uri-list")?;
@@ -861,6 +869,9 @@ impl XConnection {
             kbd_ev,
             atom_utf8_string,
             atom_xsel_data,
+            atom_xsel_contents,
+            atom_incr,
+            atom_image_png,
             atom_targets,
             windows: RefCell::new(HashMap::new()),
             child_to_parent_id: RefCell::new(HashMap::new()),

@@ -667,6 +667,15 @@ impl TerminalState {
             .unwrap_or_else(|| self.config.color_palette())
     }
 
+    /// Returns only the palette state established by terminal escape
+    /// sequences. Unlike [`Self::palette`], this does not fall back to the
+    /// configured palette. Remote mux clients use the distinction to decide
+    /// whether application state is authoritative or local configuration
+    /// should be used.
+    pub fn palette_override(&self) -> Option<ColorPalette> {
+        self.palette.clone()
+    }
+
     /// Called in response to dynamic color scheme escape sequences.
     /// Will make a copy of the palette from the config file if this
     /// is the first of these escapes we've seen.

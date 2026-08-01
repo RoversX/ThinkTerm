@@ -9,12 +9,12 @@ use crate::connection::ConnectionOps;
 use crate::os::macos::menu::{Menu, MenuItem, RepresentedItem};
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
-    Clipboard, Connection, ContextMenuItem, DeadKeyStatus, Dimensions, FolderPickerOptions,
-    Handled, Image, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent,
-    MouseEventKind, MousePress, NativeTextInputSnapshot, Point, PreciseScrollDelta, RawKeyEvent,
-    Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint, ScrollPhase,
-    Size, TextCheckCapabilities, TextCheckIssue, TextCheckRequest, TextCheckResponse, ULength,
-    WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
+    Clipboard, ClipboardContents, Connection, ContextMenuItem, DeadKeyStatus, Dimensions,
+    FolderPickerOptions, Handled, Image, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor,
+    MouseEvent, MouseEventKind, MousePress, NativeTextInputSnapshot, Point, PreciseScrollDelta,
+    RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint,
+    ScrollPhase, Size, TextCheckCapabilities, TextCheckIssue, TextCheckRequest, TextCheckResponse,
+    ULength, WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -1214,6 +1214,14 @@ impl WindowOps for Window {
         Future::result(
             ClipboardContext::new()
                 .read()
+                .map_err(|e| anyhow!("Failed to get clipboard:{}", e)),
+        )
+    }
+
+    fn get_clipboard_contents(&self, _clipboard: Clipboard) -> Future<ClipboardContents> {
+        Future::result(
+            ClipboardContext::new()
+                .read_contents()
                 .map_err(|e| anyhow!("Failed to get clipboard:{}", e)),
         )
     }

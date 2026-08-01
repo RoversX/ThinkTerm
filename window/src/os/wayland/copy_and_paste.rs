@@ -10,10 +10,20 @@ use toolkit::primary_selection::selection::PrimarySelectionSourceHandler;
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1;
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1;
 
-use crate::{Clipboard, ConnectionOps};
+use crate::{
+    preferred_clipboard_representation, Clipboard, ClipboardRepresentation, ConnectionOps,
+};
 
-use super::data_device::TEXT_MIME_TYPE;
+use super::data_device::{PNG_MIME_TYPE, TEXT_MIME_TYPE, URI_MIME_TYPE};
 use super::state::WaylandState;
+
+/// Which representation of the clipboard a read pipe carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClipboardOfferKind {
+    Text,
+    UriList,
+    Png,
+}
 
 #[derive(Default)]
 pub struct CopyAndPaste {
@@ -34,6 +44,18 @@ impl CopyAndPaste {
     }
 
     pub(super) fn get_clipboard_data(&mut self, clipboard: Clipboard) -> anyhow::Result<ReadPipe> {
+        Ok(self.get_clipboard_contents_pipe(clipboard, false)?.1)
+    }
+
+    /// Open a read pipe for the best representation the offer has. With
+    /// `typed` set, files (text/uri-list), text, and images (image/png) are
+    /// negotiated in that order; otherwise text is the only representation
+    /// considered, matching the historical behavior.
+    pub(super) fn get_clipboard_contents_pipe(
+        &mut self,
+        clipboard: Clipboard,
+        typed: bool,
+    ) -> anyhow::Result<(ClipboardOfferKind, ReadPipe, Option<ReadPipe>)> {
         let conn = crate::Connection::get().unwrap().wayland();
         let wayland_state = conn.wayland_state.borrow();
         let primary_selection = if let Clipboard::PrimarySelection = clipboard {
@@ -44,20 +66,47 @@ impl CopyAndPaste {
 
         match primary_selection {
             Some(primary_selection) => {
+                // The primary selection is middle-click text territory;
+                // files and images stay on the regular clipboard.
                 let offer = primary_selection
                     .data()
                     .selection_offer()
                     .ok_or_else(|| anyhow!("no primary selection offer"))?;
                 let pipe = offer.receive(TEXT_MIME_TYPE.to_string())?;
-                Ok(pipe)
+                Ok((ClipboardOfferKind::Text, pipe, None))
             }
             None => {
                 let offer = self
                     .data_offer
                     .as_ref()
                     .ok_or_else(|| anyhow!("no data offer"))?;
-                let pipe = offer.receive(TEXT_MIME_TYPE.to_string())?;
-                Ok(pipe)
+                let (kind, has_text) = if typed {
+                    offer.with_mime_types(|mimes| {
+                        let has_text = mimes.iter().any(|mime| mime == TEXT_MIME_TYPE);
+                        let kind = match preferred_clipboard_representation(
+                            mimes.iter().any(|mime| mime == URI_MIME_TYPE),
+                            has_text,
+                            mimes.iter().any(|mime| mime == PNG_MIME_TYPE),
+                        ) {
+                            ClipboardRepresentation::UriList => ClipboardOfferKind::UriList,
+                            ClipboardRepresentation::Text => ClipboardOfferKind::Text,
+                            ClipboardRepresentation::Png => ClipboardOfferKind::Png,
+                        };
+                        (kind, has_text)
+                    })
+                } else {
+                    (ClipboardOfferKind::Text, true)
+                };
+                let mime = match kind {
+                    ClipboardOfferKind::UriList => URI_MIME_TYPE,
+                    ClipboardOfferKind::Png => PNG_MIME_TYPE,
+                    ClipboardOfferKind::Text => TEXT_MIME_TYPE,
+                };
+                let pipe = offer.receive(mime.to_string())?;
+                let text_fallback = (kind == ClipboardOfferKind::UriList && has_text)
+                    .then(|| offer.receive(TEXT_MIME_TYPE.to_string()))
+                    .transpose()?;
+                Ok((kind, pipe, text_fallback))
             }
         }
     }
@@ -96,6 +145,10 @@ impl CopyAndPaste {
 
     pub(super) fn confirm_selection(&mut self, offer: SelectionOffer) {
         self.data_offer.replace(offer);
+    }
+
+    pub(super) fn clear_selection(&mut self) {
+        self.data_offer.take();
     }
 }
 

@@ -252,6 +252,11 @@ pub trait Pane: Downcast + Send + Sync {
     fn is_dead(&self) -> bool;
     fn kill(&self) {}
     fn palette(&self) -> ColorPalette;
+    /// Palette state explicitly established by the application. `None`
+    /// means that consumers should use their configured palette.
+    fn palette_override(&self) -> Option<ColorPalette> {
+        None
+    }
     fn domain_id(&self) -> DomainId;
 
     fn get_keyboard_encoding(&self) -> KeyboardEncoding {

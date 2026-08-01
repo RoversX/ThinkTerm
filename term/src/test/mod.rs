@@ -198,6 +198,29 @@ impl DerefMut for TestTerm {
     }
 }
 
+#[test]
+fn application_palette_override_tracks_osc_set_query_and_reset() {
+    let mut term = TestTerm::new(4, 8, 0);
+    assert!(term.palette_override().is_none());
+
+    // A query is observational and must not make the configured palette
+    // authoritative on remote renderers.
+    term.print("\x1b]10;?\x07");
+    assert!(term.palette_override().is_none());
+
+    term.print("\x1b]10;#ffffff\x07");
+    let override_palette = term.palette_override().expect("OSC 10 override");
+    assert_eq!(override_palette.foreground, (1.0, 1.0, 1.0, 1.0).into());
+
+    term.print("\x1b]110\x07");
+    assert!(term.palette_override().is_none());
+
+    term.print("\x1b]10;#ffffff\x07");
+    assert!(term.palette_override().is_some());
+    term.print("\x1bc");
+    assert!(term.palette_override().is_none());
+}
+
 /// Asserts that both line slices match according to the
 /// selected flags.
 fn assert_lines_equal(

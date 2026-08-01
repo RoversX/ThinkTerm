@@ -278,6 +278,10 @@ impl Pane for TermWizTerminalPane {
         self.terminal.lock().palette()
     }
 
+    fn palette_override(&self) -> Option<ColorPalette> {
+        self.terminal.lock().palette_override()
+    }
+
     fn domain_id(&self) -> DomainId {
         self.domain_id
     }

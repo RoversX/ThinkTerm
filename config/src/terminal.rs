@@ -35,6 +35,10 @@ impl TermConfig {
         self.client_palette.lock().unwrap().replace(palette);
     }
 
+    pub fn clear_client_palette(&self) {
+        self.client_palette.lock().unwrap().take();
+    }
+
     fn configuration(&self) -> ConfigHandle {
         match self.config.lock().unwrap().as_ref() {
             Some(h) => h.clone(),

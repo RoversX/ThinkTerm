@@ -52,6 +52,83 @@ impl Default for Clipboard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardImageFormat {
+    Png,
+    Bmp,
+    Tiff,
+}
+
+/// What the clipboard actually holds, with the type information the
+/// platform gave us. `get_clipboard` collapses everything to text at the
+/// window layer; consumers that can do better with files or images (like
+/// uploading them to a remote session) use `get_clipboard_contents` and
+/// receive them un-flattened.
+///
+/// Priority when a platform offers several representations:
+/// files > text > image. Files usually travel with a text rendition
+/// (Finder adds one) and the files are the intent; spreadsheets offer
+/// text plus a bitmap of the cells and the text is the intent; images
+/// with no text rendition (screenshots) can only be the image.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClipboardContents {
+    Text(String),
+    FilePaths(Vec<PathBuf>),
+    Image {
+        format: ClipboardImageFormat,
+        bytes: Vec<u8>,
+    },
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardRepresentation {
+    UriList,
+    Text,
+    Png,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn preferred_clipboard_representation(
+    has_uri_list: bool,
+    has_text: bool,
+    has_png: bool,
+) -> ClipboardRepresentation {
+    if has_uri_list {
+        ClipboardRepresentation::UriList
+    } else if has_text {
+        ClipboardRepresentation::Text
+    } else if has_png {
+        ClipboardRepresentation::Png
+    } else {
+        // Preserve the historical behavior for an unusual offer with none of
+        // the recognized MIME types: ask for text and let the compositor
+        // report that it cannot provide it.
+        ClipboardRepresentation::Text
+    }
+}
+
+impl ClipboardContents {
+    /// The textual rendition used by the legacy `get_clipboard` path:
+    /// files become a shell-quoted list (the historical macOS behavior),
+    /// an image has no text form.
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::FilePaths(paths) => paths
+                .iter()
+                .map(|path| {
+                    shlex::try_quote(&path.to_string_lossy())
+                        .map(|quoted| quoted.into_owned())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            Self::Image { .. } => String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dimensions {
     pub pixel_width: usize,
     pub pixel_height: usize,
@@ -721,6 +798,20 @@ pub trait WindowOps {
     /// Initiate textual transfer from the clipboard
     fn get_clipboard(&self, clipboard: Clipboard) -> Future<String>;
 
+    /// Initiate typed transfer from the clipboard: file lists and images
+    /// survive as such instead of being flattened to text. Backends that
+    /// don't implement this yet degrade to the textual read.
+    fn get_clipboard_contents(&self, clipboard: Clipboard) -> Future<ClipboardContents> {
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().unwrap();
+        let text = self.get_clipboard(clipboard);
+        promise::spawn::spawn(async move {
+            promise.result(text.await.map(ClipboardContents::Text));
+        })
+        .detach();
+        future
+    }
+
     /// Set some text in the clipboard
     fn set_clipboard(&self, clipboard: Clipboard, text: String);
 
@@ -796,5 +887,52 @@ impl ResizeIncrement {
             base_width: 0,
             base_height: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_contents_tests {
+    use super::*;
+
+    /// The textual degrade keeps the historical macOS behavior on every
+    /// platform: a copied file pastes as its shell-quoted path.
+    #[test]
+    fn contents_flatten_to_text_the_way_the_old_reader_did() {
+        assert_eq!(
+            ClipboardContents::FilePaths(vec![
+                PathBuf::from("/tmp/plain.txt"),
+                PathBuf::from("/tmp/with space (1).png"),
+            ])
+            .to_text(),
+            "/tmp/plain.txt '/tmp/with space (1).png'"
+        );
+        assert_eq!(ClipboardContents::Text("hi".into()).to_text(), "hi");
+        assert_eq!(
+            ClipboardContents::Image {
+                format: ClipboardImageFormat::Png,
+                bytes: vec![1, 2, 3],
+            }
+            .to_text(),
+            "",
+            "an image has no textual rendition"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn typed_offer_prefers_files_then_text_then_image() {
+        assert_eq!(
+            preferred_clipboard_representation(true, true, true),
+            ClipboardRepresentation::UriList
+        );
+        assert_eq!(
+            preferred_clipboard_representation(false, true, true),
+            ClipboardRepresentation::Text,
+            "a spreadsheet-style text+image offer must paste text"
+        );
+        assert_eq!(
+            preferred_clipboard_representation(false, false, true),
+            ClipboardRepresentation::Png
+        );
     }
 }

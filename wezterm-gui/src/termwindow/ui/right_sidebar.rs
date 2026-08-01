@@ -49,14 +49,14 @@ use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use anyhow::Context;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment};
-use mux::pane::PaneId;
+use mux::pane::{Pane, PaneId};
 use mux::Mux;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -162,6 +162,73 @@ const FILE_PREVIEW_HEADER_HEIGHT: usize = 64;
 /// oldest finished ones. The strip eats into the tree, so it stays small;
 /// running transfers are never dropped, however many there are.
 const REMOTE_TRANSFER_STRIP_MAX: usize = 3;
+
+#[derive(Clone)]
+pub(crate) struct TerminalPasteTarget {
+    pane_id: PaneId,
+    remote: Option<Result<RemoteTerminalPasteTarget, String>>,
+}
+
+#[derive(Clone)]
+struct RemoteTerminalPasteTarget {
+    space_id: String,
+    target: workspace_threads::RemoteFilesTarget,
+    source_key: String,
+    connection_key: String,
+    config: config::SshDomain,
+    destination: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalPasteSnapshotMismatch {
+    Space,
+    Project,
+    Connection,
+    Pane,
+}
+
+fn terminal_paste_snapshot_mismatch(
+    captured_space: &str,
+    current_space: &str,
+    captured_target: &workspace_threads::RemoteFilesTarget,
+    current_target: Option<&workspace_threads::RemoteFilesTarget>,
+    captured_connection_key: &str,
+    current_connection_key: Option<&str>,
+    pane_matches_host: bool,
+) -> Option<TerminalPasteSnapshotMismatch> {
+    if captured_space != current_space {
+        Some(TerminalPasteSnapshotMismatch::Space)
+    } else if current_target != Some(captured_target) {
+        Some(TerminalPasteSnapshotMismatch::Project)
+    } else if current_connection_key != Some(captured_connection_key) {
+        Some(TerminalPasteSnapshotMismatch::Connection)
+    } else if !pane_matches_host {
+        Some(TerminalPasteSnapshotMismatch::Pane)
+    } else {
+        None
+    }
+}
+
+impl TerminalPasteTarget {
+    pub(crate) fn pane_id(&self) -> PaneId {
+        self.pane_id
+    }
+}
+
+struct StagedPastedImage {
+    directory: tempfile::TempDir,
+    path: PathBuf,
+    #[cfg(test)]
+    worker_thread_id: std::thread::ThreadId,
+}
+
+impl StagedPastedImage {
+    fn keep(self) -> PathBuf {
+        let path = self.path;
+        let _ = self.directory.keep();
+        path
+    }
+}
 /// Thickness of the progress track under a running transfer's label. Five
 /// design pixels remains compact while being visible at a glance.
 const REMOTE_TRANSFER_PROGRESS_HEIGHT: usize = 5;
@@ -10024,11 +10091,26 @@ impl crate::TermWindow {
         paths: &[PathBuf],
         coords: Option<Point>,
     ) -> bool {
-        let Ok(Some(target)) = self.active_remote_project_for_files() else {
-            return false;
-        };
         let Some(pane) = self.get_active_pane_or_overlay() else {
             return false;
+        };
+        let paste_target = self.capture_terminal_paste_target(&pane);
+        self.upload_files_to_terminal_paste_target(paths, coords, paste_target)
+    }
+
+    /// Resolve everything an asynchronous typed paste is allowed to use while
+    /// the initiating pane and Space are still authoritative. Later callbacks
+    /// carry this snapshot instead of consulting whichever pane is active then.
+    pub(crate) fn capture_terminal_paste_target(
+        &self,
+        pane: &Arc<dyn Pane>,
+    ) -> TerminalPasteTarget {
+        let pane_id = pane.pane_id();
+        let Ok(Some(target)) = self.active_remote_project_for_files() else {
+            return TerminalPasteTarget {
+                pane_id,
+                remote: None,
+            };
         };
         // The paste target must live on the SAME host the upload goes to.
         // The Space being remote is not enough: the active pane can be a
@@ -10038,32 +10120,20 @@ impl crate::TermWindow {
         // (A mosh thread's pane is a local domain running mosh-client, so
         // mosh Spaces deliberately keep the old behavior for now.)
         if !pane_domain_matches_remote_source(pane.domain_id(), &target.source) {
-            return false;
+            return TerminalPasteTarget {
+                pane_id,
+                remote: None,
+            };
         }
-        let pane_id = pane.pane_id();
-        // Align the panel's state machine with this Space's target (idempotent
-        // when it already matches): every origin check downstream reads the
-        // state machine's source key, which is unset until someone sets it.
-        let effects = self
-            .right_sidebar_remote_files
-            .transition(RemoteFilesEvent::TargetChanged(Some(target.clone())));
-        self.apply_right_sidebar_remote_files_effects(effects);
-
         let source_key =
             crate::termwindow::remote_files::RemoteFilesState::source_key(&target.source);
         let config = match Self::ssh_config_for_remote_files_target(&target) {
             Ok(config) => config,
             Err(message) => {
-                for path in paths {
-                    self.push_remote_transfer_failure(
-                        RemoteTransferKind::Upload,
-                        display_name(path),
-                        message.clone(),
-                        None,
-                    );
-                }
-                self.invalidate_window();
-                return true;
+                return TerminalPasteTarget {
+                    pane_id,
+                    remote: Some(Err(message)),
+                };
             }
         };
 
@@ -10083,6 +10153,105 @@ impl crate::TermWindow {
             })
             .flatten();
         let destination = resolve_drop_destination(&setting, cwd.as_deref());
+        let connection_key = remote_connection_key(&source_key, &config);
+        TerminalPasteTarget {
+            pane_id,
+            remote: Some(Ok(RemoteTerminalPasteTarget {
+                space_id: self.active_space_id.clone(),
+                target,
+                source_key,
+                connection_key,
+                config,
+                destination,
+            })),
+        }
+    }
+
+    fn validate_terminal_paste_target(
+        &self,
+        paste_target: &TerminalPasteTarget,
+    ) -> Result<(), String> {
+        let Some(remote) = paste_target.remote.as_ref() else {
+            return Err("The paste did not originate in a remote terminal".to_string());
+        };
+        let remote = remote.as_ref().map_err(Clone::clone)?;
+        let current_target = self
+            .active_remote_project_for_files()
+            .map_err(|message| format!("Paste canceled: {message}"))?;
+        let current_config = Self::ssh_config_for_remote_files_target(&remote.target)
+            .map_err(|message| format!("Paste canceled: {message}"))?;
+        let current_key = remote_connection_key(&remote.source_key, &current_config);
+        let pane = Mux::get()
+            .get_pane(paste_target.pane_id)
+            .ok_or_else(|| "Paste canceled because its pane was closed".to_string())?;
+        let mismatch = terminal_paste_snapshot_mismatch(
+            &remote.space_id,
+            &self.active_space_id,
+            &remote.target,
+            current_target.as_ref(),
+            &remote.connection_key,
+            Some(&current_key),
+            pane_domain_matches_remote_source(pane.domain_id(), &remote.target.source),
+        );
+        if let Some(mismatch) = mismatch {
+            return Err(match mismatch {
+                TerminalPasteSnapshotMismatch::Space => {
+                    "Paste canceled because the window switched Spaces".to_string()
+                }
+                TerminalPasteSnapshotMismatch::Project => {
+                    "Paste canceled because the remote project changed".to_string()
+                }
+                TerminalPasteSnapshotMismatch::Connection => {
+                    "Paste canceled because the remote connection changed".to_string()
+                }
+                TerminalPasteSnapshotMismatch::Pane => {
+                    "Paste canceled because its pane no longer belongs to that host".to_string()
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn push_terminal_paste_failures(&mut self, paths: &[PathBuf], message: String) {
+        for path in paths {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                display_name(path),
+                message.clone(),
+                None,
+            );
+        }
+        self.invalidate_window();
+    }
+
+    pub(crate) fn upload_files_to_terminal_paste_target(
+        &mut self,
+        paths: &[PathBuf],
+        coords: Option<Point>,
+        paste_target: TerminalPasteTarget,
+    ) -> bool {
+        let Some(remote) = paste_target.remote.as_ref() else {
+            return false;
+        };
+        let remote = match remote {
+            Ok(remote) => remote.clone(),
+            Err(message) => {
+                self.push_terminal_paste_failures(paths, message.clone());
+                return true;
+            }
+        };
+        if let Err(message) = self.validate_terminal_paste_target(&paste_target) {
+            self.push_terminal_paste_failures(paths, message);
+            return true;
+        }
+
+        // Align the panel's state machine with the captured Space's target
+        // only after revalidation. A delayed clipboard read must never point
+        // the panel (and its connection lease) at a different host.
+        let effects = self
+            .right_sidebar_remote_files
+            .transition(RemoteFilesEvent::TargetChanged(Some(remote.target.clone())));
+        self.apply_right_sidebar_remote_files_effects(effects);
 
         let Some(window) = self.window.as_ref().cloned() else {
             return true;
@@ -10090,15 +10259,18 @@ impl crate::TermWindow {
         // A drop is an explicit ask, so dialing is allowed — and a successful
         // dial authorizes the source exactly as the panel's Connect click
         // would (the session credentials are the same either way).
-        let connection_key = remote_connection_key(&source_key, &config);
         let batch: Vec<PathBuf> = paths.to_vec();
         let anchor = coords.unwrap_or_else(|| Point::new(0, 0));
+        let dispatch_target = paste_target.clone();
         promise::spawn::spawn(async move {
             let manager = remote_connection_manager();
-            let prepared = match manager.acquire(connection_key, config, true).await {
+            let prepared = match manager
+                .acquire(remote.connection_key, remote.config, true)
+                .await
+            {
                 Ok(lease) => {
                     let backend = lease.backend();
-                    match backend.resolve_root(destination).await {
+                    match backend.resolve_root(remote.destination).await {
                         // Merge-tolerant creation: the folder existing already
                         // is the normal case after the first drop.
                         Ok(directory) => match backend.create_directory(directory.clone()).await {
@@ -10114,11 +10286,89 @@ impl crate::TermWindow {
                 }
             };
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.dispatch_terminal_drop(prepared, batch, source_key, pane_id, anchor);
+                term_window.dispatch_terminal_drop(prepared, batch, dispatch_target, anchor);
             })));
         })
         .detach();
         true
+    }
+
+    /// An image pasted from the clipboard: encode to PNG, park it in the
+    /// session's temp folder under a screenshot-style name, and hand it to
+    /// the ordinary terminal-drop upload (which pastes the remote path).
+    ///
+    /// The temp file deliberately outlives the upload: the transfer row's
+    /// Retry re-reads the local path, so deleting on completion would break
+    /// it. The OS reaps the temp dir between sessions.
+    pub(crate) fn upload_pasted_image_to_remote_terminal(
+        &mut self,
+        paste_target: TerminalPasteTarget,
+        format: window::ClipboardImageFormat,
+        bytes: Vec<u8>,
+    ) {
+        let Some(remote) = paste_target.remote.as_ref() else {
+            return;
+        };
+        let name = pasted_image_file_name(chrono::Local::now());
+        if let Err(message) = remote {
+            self.push_remote_transfer_failure(
+                RemoteTransferKind::Upload,
+                name,
+                message.clone(),
+                None,
+            );
+            self.invalidate_window();
+            return;
+        }
+        if let Err(message) = self.validate_terminal_paste_target(&paste_target) {
+            self.push_remote_transfer_failure(RemoteTransferKind::Upload, name, message, None);
+            self.invalidate_window();
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let worker_name = name.clone();
+            let staged = spawn_pasted_image_staging(format, bytes, worker_name).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                match staged {
+                    Ok(staged) => {
+                        // Revalidate after potentially expensive transcoding.
+                        // Dropping `staged` on failure removes the private temp
+                        // directory before any path can be retained for Retry.
+                        if let Err(message) =
+                            term_window.validate_terminal_paste_target(&paste_target)
+                        {
+                            term_window.push_remote_transfer_failure(
+                                RemoteTransferKind::Upload,
+                                name,
+                                message,
+                                None,
+                            );
+                            term_window.invalidate_window();
+                            return;
+                        }
+                        let path = staged.keep();
+                        term_window.upload_files_to_terminal_paste_target(
+                            &[path],
+                            None,
+                            paste_target,
+                        );
+                    }
+                    Err(err) => {
+                        term_window.push_remote_transfer_failure(
+                            RemoteTransferKind::Upload,
+                            name,
+                            format!("Could not stage the pasted image: {err}"),
+                            None,
+                        );
+                        term_window.invalidate_window();
+                    }
+                }
+            })));
+        })
+        .detach();
     }
 
     /// The prepared half of a terminal drop, back on the window thread: adopt
@@ -10134,10 +10384,22 @@ impl crate::TermWindow {
             String,
         >,
         paths: Vec<PathBuf>,
-        source_key: String,
-        pane_id: PaneId,
+        paste_target: TerminalPasteTarget,
         anchor: Point,
     ) {
+        if let Err(message) = self.validate_terminal_paste_target(&paste_target) {
+            self.push_terminal_paste_failures(&paths, message);
+            return;
+        }
+        let remote = match paste_target.remote.as_ref() {
+            Some(Ok(remote)) => remote.clone(),
+            Some(Err(message)) => {
+                self.push_terminal_paste_failures(&paths, message.clone());
+                return;
+            }
+            None => return,
+        };
+        let pane_id = paste_target.pane_id;
         let (lease, directory) = match prepared {
             Ok(prepared) => prepared,
             Err(message) => {
@@ -10153,8 +10415,10 @@ impl crate::TermWindow {
                 return;
             }
         };
-        let origin =
-            RemoteOperationOrigin::new(source_key.clone(), lease.connection_key().to_string());
+        let origin = RemoteOperationOrigin::new(
+            remote.source_key.clone(),
+            lease.connection_key().to_string(),
+        );
         if !self.remote_operation_origin_matches(&origin) {
             for path in &paths {
                 self.push_remote_transfer_failure(
@@ -10167,7 +10431,7 @@ impl crate::TermWindow {
             self.invalidate_window();
             return;
         }
-        crate::termwindow::remote_files::authorize_remote_source(&source_key);
+        crate::termwindow::remote_files::authorize_remote_source(&remote.source_key);
         // Lend the fresh connection to the panel's lease slot unless the slot
         // already holds this exact connection: `remote_transfer_handles` reads
         // that slot, so every upload below — and the Files panel itself — uses
@@ -16069,6 +16333,87 @@ fn pane_domain_matches_remote_source(
 /// setting asks for it) the pane's reported working directory. Pure, so the
 /// fallback rules stay testable: `cwd` without a usable cwd must degrade to
 /// the default folder, never fail the drop.
+/// Screenshot-style name for an image pasted from the clipboard. The dots in
+/// the timestamp are why the collision logic splits extensions on the LAST
+/// dot; a pasted image re-pasted lands as `… (1).png` like any other file.
+fn pasted_image_file_name(now: chrono::DateTime<chrono::Local>) -> String {
+    format!("Pasted {}.png", now.format("%Y-%m-%d at %H.%M.%S"))
+}
+
+/// Bring a pasted clipboard image to PNG. PNG passes through untouched;
+/// Windows hands us BMP and macOS can hand us TIFF, both of which decode
+/// and re-encode here.
+fn encode_pasted_image_png(
+    format: window::ClipboardImageFormat,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    match format {
+        window::ClipboardImageFormat::Png => Ok(bytes),
+        window::ClipboardImageFormat::Bmp | window::ClipboardImageFormat::Tiff => {
+            let decoded = image::load_from_memory(&bytes)
+                .map_err(|err| format!("Could not decode the pasted image: {err}"))?;
+            let mut png = std::io::Cursor::new(Vec::new());
+            decoded
+                .write_to(&mut png, image::ImageFormat::Png)
+                .map_err(|err| format!("Could not convert the pasted image to PNG: {err}"))?;
+            Ok(png.into_inner())
+        }
+    }
+}
+
+fn stage_pasted_image(
+    format: window::ClipboardImageFormat,
+    bytes: Vec<u8>,
+    name: &str,
+) -> Result<StagedPastedImage, String> {
+    let png = encode_pasted_image_png(format, bytes)?;
+    let directory = tempfile::Builder::new()
+        .prefix("thinkterm-pasted-image-")
+        .tempdir()
+        .map_err(|err| format!("Could not create a private staging directory: {err}"))?;
+
+    #[cfg(unix)]
+    fs::set_permissions(
+        directory.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .map_err(|err| format!("Could not protect the staging directory: {err}"))?;
+
+    let path = directory.path().join(name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|err| format!("Could not create the private staged image: {err}"))?;
+    file.write_all(&png)
+        .map_err(|err| format!("Could not write the staged image: {err}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|err| format!("Could not protect the staged image: {err}"))?;
+
+    Ok(StagedPastedImage {
+        directory,
+        path,
+        #[cfg(test)]
+        worker_thread_id: std::thread::current().id(),
+    })
+}
+
+fn spawn_pasted_image_staging(
+    format: window::ClipboardImageFormat,
+    bytes: Vec<u8>,
+    name: String,
+) -> promise::spawn::Task<anyhow::Result<StagedPastedImage>> {
+    promise::spawn::spawn_into_new_thread(move || {
+        stage_pasted_image(format, bytes, &name).map_err(anyhow::Error::msg)
+    })
+}
+
 fn resolve_drop_destination(setting: &str, cwd: Option<&str>) -> String {
     if setting == crate::native_settings::REMOTE_DROP_DESTINATION_CWD {
         match cwd {
@@ -17564,24 +17909,27 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 mod tests {
     use super::{
         approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
-        copy_entries_blocking, copy_file_chunked, failed_folder_download,
-        file_preview_close_requires_reflow, file_release_action, file_row_placement,
-        full_line_colors_by_byte, image_pixels_within_preview_budget, load_file_preview,
-        load_file_preview_image, naturalish_cmp, note_code_highlight_key,
-        note_code_highlight_lines, note_code_row_height, note_image_display_size,
-        note_open_pending_for_vault, note_release_action, open_with_candidate_allowed, path_key,
-        pick_free_remote_name, preflight_local_copy, preview_line_count, preview_lines_from_text,
+        copy_entries_blocking, copy_file_chunked, download_name_candidates,
+        encode_pasted_image_png, failed_folder_download, file_preview_close_requires_reflow,
+        file_release_action, file_row_placement, full_line_colors_by_byte,
+        image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
+        naturalish_cmp, note_code_highlight_key, note_code_highlight_lines, note_code_row_height,
+        note_image_display_size, note_open_pending_for_vault, note_release_action,
+        open_with_candidate_allowed, pasted_image_file_name, path_key, pick_free_remote_name,
+        preflight_local_copy, preview_line_count, preview_lines_from_text,
         preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
         preview_visible_line_range, remote_lease_failure_disposition, resolve_drop_destination,
         resolve_local_drop_target, resolve_remote_drop_target,
         right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
         right_sidebar_open_with_cache_key, sanitize_preview_text, scrollable_note_table_columns,
         search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
-        sorted_open_with_candidates, virtual_note_line_range, visible_code_block_rounded_edges,
-        visible_file_row_range, wrap_snippet_text_for_width, FileReleaseAction, FileRowPlacement,
-        NoteApproximateTextMetrics, NoteCodeHighlightEntry, NoteCodeHighlightState,
-        NoteReleaseAction, RemoteLeaseFailureDisposition, FILE_PREVIEW_MAX_BYTES, LOCAL_COPY_CHUNK,
-        NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
+        sorted_open_with_candidates, spawn_pasted_image_staging, stage_pasted_image,
+        terminal_paste_snapshot_mismatch, virtual_note_line_range,
+        visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
+        FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
+        NoteCodeHighlightState, NoteReleaseAction, RemoteLeaseFailureDisposition,
+        TerminalPasteSnapshotMismatch, TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES,
+        LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
     };
     use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
     use crate::termwindow::remote_files::{
@@ -17705,6 +18053,194 @@ mod tests {
         assert_eq!(
             resolve_drop_destination("~/inbox", Some("/srv/app")),
             "~/inbox"
+        );
+    }
+
+    /// The timestamp uses dots, like macOS screenshots, so this name is also
+    /// a regression canary for the last-dot extension split: a re-paste must
+    /// collide into `… (1).png`, not `Pasted 2026-08-01 at 14 (1).30.00.png`.
+    #[test]
+    fn a_pasted_image_is_named_like_a_screenshot() {
+        use chrono::TimeZone;
+        let when = chrono::Local
+            .with_ymd_and_hms(2026, 8, 1, 14, 30, 0)
+            .unwrap();
+        let name = pasted_image_file_name(when);
+        assert_eq!(name, "Pasted 2026-08-01 at 14.30.00.png");
+        assert_eq!(
+            download_name_candidates(&name).nth(1).unwrap(),
+            "Pasted 2026-08-01 at 14.30.00 (1).png"
+        );
+    }
+
+    #[test]
+    fn a_pasted_bmp_is_reencoded_as_png_and_png_passes_through() {
+        // A real 1x1 BMP, produced by the same crate that decodes it.
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut bmp, image::ImageFormat::Bmp)
+        .unwrap();
+        let png = encode_pasted_image_png(window::ClipboardImageFormat::Bmp, bmp.into_inner())
+            .expect("bmp converts");
+        assert_eq!(&png[1..4], b"PNG", "the conversion output must be PNG");
+
+        let passthrough =
+            encode_pasted_image_png(window::ClipboardImageFormat::Png, png.clone()).unwrap();
+        assert_eq!(passthrough, png, "png bytes must pass through untouched");
+
+        assert!(
+            encode_pasted_image_png(window::ClipboardImageFormat::Tiff, b"not an image".to_vec())
+                .is_err(),
+            "garbage must surface as an error, not a bogus upload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pasted_image_staging_is_private_and_cleans_up_until_retained() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staged = stage_pasted_image(
+            window::ClipboardImageFormat::Png,
+            b"\x89PNG\r\n\x1a\nprivate".to_vec(),
+            "Pasted test.png",
+        )
+        .expect("stage image");
+        let path = staged.path.clone();
+        let directory = path.parent().unwrap().to_path_buf();
+        assert_ne!(
+            directory,
+            std::env::temp_dir().join("thinkterm-pasted-images"),
+            "the staging directory must be randomized per image"
+        );
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(staged);
+        assert!(!directory.exists(), "unaccepted staging must be cleaned up");
+    }
+
+    #[test]
+    fn pasted_image_staging_runs_off_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 255, 0, 255]),
+        ))
+        .write_to(&mut bmp, image::ImageFormat::Bmp)
+        .unwrap();
+        let executor = promise::spawn::ScopedExecutor::new();
+        let staged = smol::block_on(executor.run(async {
+            spawn_pasted_image_staging(
+                window::ClipboardImageFormat::Bmp,
+                bmp.into_inner(),
+                "Pasted worker.png".to_string(),
+            )
+            .await
+        }))
+        .expect("worker staging");
+        assert_ne!(staged.worker_thread_id, caller);
+        assert_eq!(&fs::read(&staged.path).unwrap()[1..4], b"PNG");
+    }
+
+    #[test]
+    fn typed_paste_keeps_its_originating_pane_when_focus_changes() {
+        let captured = TerminalPasteTarget {
+            pane_id: 17,
+            remote: None,
+        };
+        let active_after_clipboard_read = 29;
+
+        assert_ne!(captured.pane_id(), active_after_clipboard_read);
+        assert_eq!(captured.pane_id(), 17);
+    }
+
+    #[test]
+    fn typed_paste_rejects_space_host_connection_and_pane_changes() {
+        let host_a = crate::workspace_threads::RemoteFilesTarget {
+            project_id: "project-a".to_string(),
+            project_name: "A".to_string(),
+            source: crate::workspace_threads::RemoteFilesSource::SshHost("host-a".to_string()),
+            requested_root: "~".to_string(),
+        };
+        let host_b = crate::workspace_threads::RemoteFilesTarget {
+            project_id: "project-b".to_string(),
+            project_name: "B".to_string(),
+            source: crate::workspace_threads::RemoteFilesSource::SshHost("host-b".to_string()),
+            requested_root: "~".to_string(),
+        };
+
+        assert_eq!(
+            terminal_paste_snapshot_mismatch(
+                "space-a",
+                "space-a",
+                &host_a,
+                Some(&host_a),
+                "connection-a",
+                Some("connection-a"),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_paste_snapshot_mismatch(
+                "space-a",
+                "space-b",
+                &host_a,
+                Some(&host_a),
+                "connection-a",
+                Some("connection-a"),
+                true,
+            ),
+            Some(TerminalPasteSnapshotMismatch::Space)
+        );
+        assert_eq!(
+            terminal_paste_snapshot_mismatch(
+                "space-a",
+                "space-a",
+                &host_a,
+                Some(&host_b),
+                "connection-a",
+                Some("connection-a"),
+                true,
+            ),
+            Some(TerminalPasteSnapshotMismatch::Project)
+        );
+        assert_eq!(
+            terminal_paste_snapshot_mismatch(
+                "space-a",
+                "space-a",
+                &host_a,
+                Some(&host_a),
+                "connection-a",
+                Some("connection-b"),
+                true,
+            ),
+            Some(TerminalPasteSnapshotMismatch::Connection)
+        );
+        assert_eq!(
+            terminal_paste_snapshot_mismatch(
+                "space-a",
+                "space-a",
+                &host_a,
+                Some(&host_a),
+                "connection-a",
+                Some("connection-a"),
+                false,
+            ),
+            Some(TerminalPasteSnapshotMismatch::Pane)
         );
     }
 

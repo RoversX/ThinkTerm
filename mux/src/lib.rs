@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
+use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Clipboard, ClipboardSelection, DownloadHandler, TerminalConfiguration, TerminalSize,
 };
@@ -100,6 +101,118 @@ pub enum MuxNotification {
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
+static PALETTE_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// A single mux-server transport connection. `ClientId` identifies the GUI
+/// process and can be reused when that process reconnects, so it is not
+/// sufficient to reject work queued by an older, disconnected transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PaletteSessionId(usize);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaletteSelectionChange {
+    pub pane_id: PaneId,
+    pub palette: Option<ColorPalette>,
+}
+
+/// Server-side palette advice is scoped to the client that supplied it.
+/// Merely attaching records advice; focus or real input activates it for OSC
+/// queries. Application palette overrides are tracked by the terminal and are
+/// intentionally not represented here.
+#[derive(Default)]
+struct PaletteAdvisoryState {
+    sessions: HashMap<PaletteSessionId, ClientId>,
+    advised: HashMap<(PaletteSessionId, PaneId), ColorPalette>,
+    activity: HashMap<(PaletteSessionId, PaneId), u64>,
+    owners: HashMap<PaneId, PaletteSessionId>,
+    next_activity: u64,
+}
+
+impl PaletteAdvisoryState {
+    fn register(&mut self, client_id: &ClientId) -> PaletteSessionId {
+        let session_id = PaletteSessionId(PALETTE_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+        self.sessions.insert(session_id, client_id.clone());
+        session_id
+    }
+
+    fn advise(
+        &mut self,
+        session_id: PaletteSessionId,
+        pane_id: PaneId,
+        palette: ColorPalette,
+    ) -> Option<ColorPalette> {
+        if !self.sessions.contains_key(&session_id) {
+            return None;
+        }
+        self.advised.insert((session_id, pane_id), palette.clone());
+        (self.owners.get(&pane_id) == Some(&session_id)).then_some(palette)
+    }
+
+    fn activate(&mut self, session_id: PaletteSessionId, pane_id: PaneId) -> Option<ColorPalette> {
+        if !self.sessions.contains_key(&session_id) {
+            return None;
+        }
+        let key = (session_id, pane_id);
+        let palette = self.advised.get(&key)?.clone();
+        self.next_activity = self.next_activity.saturating_add(1).max(1);
+        self.activity.insert(key, self.next_activity);
+
+        if self.owners.get(&pane_id) == Some(&session_id) {
+            return None;
+        }
+        self.owners.insert(pane_id, session_id);
+        Some(palette)
+    }
+
+    fn remove_session(&mut self, session_id: PaletteSessionId) -> Vec<PaletteSelectionChange> {
+        self.sessions.remove(&session_id);
+        self.advised.retain(|(id, _), _| *id != session_id);
+        self.activity.retain(|(id, _), _| *id != session_id);
+
+        let affected: Vec<PaneId> = self
+            .owners
+            .iter()
+            .filter_map(|(pane_id, owner)| (*owner == session_id).then_some(*pane_id))
+            .collect();
+        let mut changes = Vec::with_capacity(affected.len());
+
+        for pane_id in affected {
+            let replacement = self
+                .activity
+                .iter()
+                .filter(|((candidate_session, candidate_pane), _)| {
+                    *candidate_pane == pane_id
+                        && self.sessions.contains_key(candidate_session)
+                        && self.advised.contains_key(&(*candidate_session, pane_id))
+                })
+                .max_by_key(|(_, activity)| **activity)
+                .map(|((id, _), _)| *id);
+
+            let palette = match replacement {
+                Some(id) => {
+                    self.owners.insert(pane_id, id);
+                    self.advised.get(&(id, pane_id)).cloned()
+                }
+                None => {
+                    self.owners.remove(&pane_id);
+                    None
+                }
+            };
+            changes.push(PaletteSelectionChange { pane_id, palette });
+        }
+        changes
+    }
+
+    fn deactivate_session(&mut self, session_id: PaletteSessionId) -> bool {
+        self.sessions.remove(&session_id).is_some()
+    }
+
+    fn remove_pane(&mut self, pane_id: PaneId) {
+        self.advised.retain(|(_, pane), _| *pane != pane_id);
+        self.activity.retain(|(_, pane), _| *pane != pane_id);
+        self.owners.remove(&pane_id);
+    }
+}
 
 pub struct Mux {
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
@@ -111,6 +224,7 @@ pub struct Mux {
     subscribers: RwLock<HashMap<usize, Box<dyn Fn(MuxNotification) -> bool + Send + Sync>>>,
     banner: RwLock<Option<String>>,
     clients: RwLock<HashMap<ClientId, ClientInfo>>,
+    palette_advisories: Mutex<PaletteAdvisoryState>,
     identity: RwLock<Option<Arc<ClientId>>>,
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
     main_thread_id: std::thread::ThreadId,
@@ -451,6 +565,7 @@ impl Mux {
             subscribers: RwLock::new(HashMap::new()),
             banner: RwLock::new(None),
             clients: RwLock::new(HashMap::new()),
+            palette_advisories: Mutex::new(PaletteAdvisoryState::default()),
             identity: RwLock::new(None),
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
@@ -692,8 +807,59 @@ impl Mux {
         self.identity.read().clone()
     }
 
+    /// Remove a client from the ordinary mux client list.
+    /// Palette ownership is connection-scoped and is cleaned independently.
     pub fn unregister_client(&self, client_id: &ClientId) {
         self.clients.write().remove(client_id);
+    }
+
+    /// Register one transport connection for palette advice. The returned
+    /// token must be captured by queued handlers so work from a disconnected
+    /// connection cannot be mistaken for a later connection with the same
+    /// `ClientId`.
+    pub fn register_palette_session(&self, client_id: &ClientId) -> PaletteSessionId {
+        self.palette_advisories.lock().register(client_id)
+    }
+
+    /// Remove exactly one transport connection and return any pane palette
+    /// selections that need to be applied as a result of owner fallback.
+    pub fn unregister_palette_session(
+        &self,
+        session_id: PaletteSessionId,
+    ) -> Vec<PaletteSelectionChange> {
+        self.palette_advisories.lock().remove_session(session_id)
+    }
+
+    /// Immediately reject further queued work from a disconnected transport.
+    /// Final removal and pane fallback are deliberately a separate operation
+    /// so the caller can serialize their application on the mux main thread.
+    pub fn deactivate_palette_session(&self, session_id: PaletteSessionId) -> bool {
+        self.palette_advisories
+            .lock()
+            .deactivate_session(session_id)
+    }
+
+    /// Store a client's configured palette. A return value means that client
+    /// currently owns this pane and the server's OSC query base must update.
+    pub fn advise_client_palette(
+        &self,
+        session_id: PaletteSessionId,
+        pane_id: PaneId,
+        palette: ColorPalette,
+    ) -> Option<ColorPalette> {
+        self.palette_advisories
+            .lock()
+            .advise(session_id, pane_id, palette)
+    }
+
+    /// Mark focus or input from a palette-capable client. Background clients
+    /// that have not supplied advice cannot take ownership.
+    pub fn activate_client_palette(
+        &self,
+        session_id: PaletteSessionId,
+        pane_id: PaneId,
+    ) -> Option<ColorPalette> {
+        self.palette_advisories.lock().activate(session_id, pane_id)
     }
 
     pub fn subscribe<F>(&self, subscriber: F)
@@ -818,6 +984,7 @@ impl Mux {
 
     fn remove_pane_internal(&self, pane_id: PaneId) {
         log::debug!("removing pane {}", pane_id);
+        self.palette_advisories.lock().remove_pane(pane_id);
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);
@@ -1748,6 +1915,169 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client_id(id: usize) -> ClientId {
+        ClientId {
+            hostname: "test-host".to_string(),
+            username: "test-user".to_string(),
+            pid: id as u32,
+            epoch: 1,
+            id,
+            ssh_auth_sock: None,
+        }
+    }
+
+    fn palette(foreground: f32) -> ColorPalette {
+        let mut palette = ColorPalette::default();
+        palette.foreground = (foreground, foreground, foreground, 1.0).into();
+        palette
+    }
+
+    #[test]
+    fn palette_advice_requires_interaction_to_take_ownership() {
+        let mut state = PaletteAdvisoryState::default();
+        let white_client = client_id(1);
+        let gray_client = client_id(2);
+        let white_session = state.register(&white_client);
+        let gray_session = state.register(&gray_client);
+        let white = palette(1.0);
+        let gray = palette(0.7);
+
+        assert_eq!(state.advise(white_session, 9, white.clone()), None);
+        assert_eq!(state.activate(white_session, 9), Some(white.clone()));
+
+        // A background attach records its preference but cannot replace the
+        // active client's OSC query base.
+        assert_eq!(state.advise(gray_session, 9, gray.clone()), None);
+        assert_eq!(state.owners.get(&9), Some(&white_session));
+
+        assert_eq!(state.activate(gray_session, 9), Some(gray));
+        assert_eq!(state.owners.get(&9), Some(&gray_session));
+
+        // A config reload by the inactive client is stored without stealing.
+        let warmer_white = palette(0.95);
+        assert_eq!(state.advise(white_session, 9, warmer_white.clone()), None);
+        assert_eq!(state.owners.get(&9), Some(&gray_session));
+
+        // Removing the current owner falls back to the most recently active
+        // surviving client and its latest advice.
+        assert_eq!(
+            state.remove_session(gray_session),
+            vec![PaletteSelectionChange {
+                pane_id: 9,
+                palette: Some(warmer_white),
+            }]
+        );
+        assert_eq!(state.owners.get(&9), Some(&white_session));
+    }
+
+    #[test]
+    fn disconnect_does_not_promote_a_background_only_advisor() {
+        let mut state = PaletteAdvisoryState::default();
+        let active = client_id(1);
+        let background = client_id(2);
+        let active_session = state.register(&active);
+        let background_session = state.register(&background);
+        assert_eq!(state.advise(active_session, 7, palette(1.0)), None);
+        assert!(state.activate(active_session, 7).is_some());
+        assert_eq!(state.advise(background_session, 7, palette(0.7)), None);
+
+        assert_eq!(
+            state.remove_session(active_session),
+            vec![PaletteSelectionChange {
+                pane_id: 7,
+                palette: None,
+            }]
+        );
+        assert!(!state.owners.contains_key(&7));
+    }
+
+    #[test]
+    fn active_palette_reload_updates_without_new_interaction() {
+        let mut state = PaletteAdvisoryState::default();
+        let client = client_id(1);
+        let session = state.register(&client);
+        assert_eq!(state.advise(session, 4, palette(0.8)), None);
+        assert!(state.activate(session, 4).is_some());
+
+        let updated = palette(1.0);
+        assert_eq!(state.advise(session, 4, updated.clone()), Some(updated));
+        assert_eq!(state.activate(session, 4), None);
+    }
+
+    #[test]
+    fn late_palette_updates_from_a_disconnected_client_are_rejected() {
+        let mut state = PaletteAdvisoryState::default();
+        let client = client_id(1);
+        let session = state.register(&client);
+
+        assert_eq!(state.advise(session, 4, palette(0.8)), None);
+        assert!(state.activate(session, 4).is_some());
+        assert!(state.deactivate_session(session));
+
+        // A SessionHandler can already have this work queued when Drop runs.
+        // Once disconnect cleanup has happened, that stale work must not be
+        // able to recreate advice or ownership for the dead connection.
+        assert_eq!(state.advise(session, 4, palette(0.6)), None);
+        assert_eq!(state.activate(session, 4), None);
+        assert_eq!(state.advised.get(&(session, 4)), Some(&palette(0.8)));
+        assert_eq!(state.owners.get(&4), Some(&session));
+
+        state.remove_session(session);
+        assert!(!state.owners.contains_key(&4));
+    }
+
+    #[test]
+    fn old_disconnect_cannot_remove_or_overwrite_a_reconnected_session() {
+        let mut state = PaletteAdvisoryState::default();
+        let client = client_id(1);
+        let old_session = state.register(&client);
+        assert_eq!(state.advise(old_session, 4, palette(0.6)), None);
+        assert!(state.activate(old_session, 4).is_some());
+
+        // A reconnect legitimately reuses ClientId, but is a distinct
+        // transport whose ownership must survive cleanup of the old one.
+        let new_session = state.register(&client);
+        let new_palette = palette(1.0);
+        assert_eq!(state.advise(new_session, 4, new_palette.clone()), None);
+        assert_eq!(state.activate(new_session, 4), Some(new_palette.clone()));
+
+        assert!(state.deactivate_session(old_session));
+        assert_eq!(state.advise(old_session, 4, palette(0.2)), None);
+        assert_eq!(state.owners.get(&4), Some(&new_session));
+
+        // Final cleanup happens later on the mux thread; it must observe that
+        // the reconnect has already become owner and leave it untouched.
+        assert_eq!(state.remove_session(old_session), vec![]);
+        assert_eq!(state.owners.get(&4), Some(&new_session));
+        assert_eq!(state.advised.get(&(new_session, 4)), Some(&new_palette));
+    }
+
+    #[test]
+    fn fallback_never_promotes_an_already_disconnected_session() {
+        let mut state = PaletteAdvisoryState::default();
+        let first = state.register(&client_id(1));
+        let owner = state.register(&client_id(2));
+
+        assert_eq!(state.advise(first, 4, palette(0.6)), None);
+        assert!(state.activate(first, 4).is_some());
+        assert_eq!(state.advise(owner, 4, palette(1.0)), None);
+        assert!(state.activate(owner, 4).is_some());
+
+        // Both drops can deactivate synchronously before either queued final
+        // cleanup runs. Removing the owner must not temporarily promote the
+        // other disconnected session as the pane's OSC query base.
+        assert!(state.deactivate_session(owner));
+        assert!(state.deactivate_session(first));
+        assert_eq!(
+            state.remove_session(owner),
+            vec![PaletteSelectionChange {
+                pane_id: 4,
+                palette: None,
+            }]
+        );
+        assert!(!state.owners.contains_key(&4));
+    }
 
     #[test]
     fn window_ui_surfaces_are_distinct_prune_anchors() {

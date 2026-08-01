@@ -7,7 +7,7 @@ use mux::domain::SplitSource;
 use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
-use mux::{Mux, MuxNotification};
+use mux::{Mux, PaletteSessionId};
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,14 +43,23 @@ pub(crate) struct PerPane {
     working_dir: Option<Url>,
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
-    sent_initial_palette: bool,
-    last_sent_palette: Option<ColorPalette>,
+    /// Outer None means that this connection has never received application
+    /// palette state for the pane. Inner None is an explicit reset to the
+    /// client's own configured palette.
+    last_sent_application_palette: Option<Option<ColorPalette>>,
     seqno: SequenceNo,
-    config_generation: usize,
     pub(crate) notifications: Vec<Alert>,
 }
 
 impl PerPane {
+    fn needs_application_palette(&self, palette: &Option<ColorPalette>) -> bool {
+        self.last_sent_application_palette.as_ref() != Some(palette)
+    }
+
+    fn record_application_palette(&mut self, palette: Option<ColorPalette>) {
+        self.last_sent_application_palette = Some(palette);
+    }
+
     fn compute_changes(
         &mut self,
         pane: &Arc<dyn Pane>,
@@ -151,6 +160,23 @@ fn maybe_push_pane_changes(
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
     let mut per_pane = per_pane.lock().unwrap();
+
+    // Application palette provenance must arrive even when the state is
+    // `None`: that explicit reset prevents a server's configured/advisory
+    // palette from taking over client rendering. Send it before line changes
+    // so a real application override is installed before those lines paint.
+    let application_palette = pane.palette_override();
+    if per_pane.needs_application_palette(&application_palette) {
+        sender.send(DecodedPdu {
+            pdu: Pdu::SetApplicationPalette(SetApplicationPalette {
+                pane_id: pane.pane_id(),
+                palette: application_palette.clone(),
+            }),
+            serial: 0,
+        })?;
+        per_pane.record_application_palette(application_palette);
+    }
+
     if let Some(resp) = per_pane.compute_changes(pane, None) {
         sender.send(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
@@ -158,42 +184,12 @@ fn maybe_push_pane_changes(
         })?;
     }
 
-    let config = config::configuration();
-    if per_pane.config_generation != config.generation() {
-        per_pane.config_generation = config.generation();
-        // If the config changed, it may have changed colors
-        // in the palette that we need to push down, so we
-        // synthesize a palette change notification to let
-        // the client know
-        per_pane.notifications.push(Alert::PaletteChanged);
-        per_pane.sent_initial_palette = true;
-    }
-
-    if !per_pane.sent_initial_palette {
-        per_pane.notifications.push(Alert::PaletteChanged);
-        per_pane.sent_initial_palette = true;
-    }
     let notifications: Vec<Alert> = per_pane.notifications.drain(..).collect();
     for alert in notifications {
         match alert {
-            Alert::PaletteChanged => {
-                let palette = pane.palette();
-                // Config generation bumps synthesize PaletteChanged even
-                // when the effective palette is unchanged; pushing those
-                // makes every attached client invalidate its entire render
-                // surface for this pane. Only push real changes.
-                if per_pane.last_sent_palette.as_ref() == Some(&palette) {
-                    continue;
-                }
-                per_pane.last_sent_palette = Some(palette.clone());
-                sender.send(DecodedPdu {
-                    pdu: Pdu::SetPalette(SetPalette {
-                        pane_id: pane.pane_id(),
-                        palette,
-                    }),
-                    serial: 0,
-                })?;
-            }
+            // The current application state was sent (and de-duplicated)
+            // above. Never forward this alert as a configured palette.
+            Alert::PaletteChanged => {}
             alert => {
                 sender.send(DecodedPdu {
                     pdu: Pdu::NotifyAlert(NotifyAlert {
@@ -208,18 +204,84 @@ fn maybe_push_pane_changes(
     Ok(())
 }
 
+fn apply_client_palette(pane: &Arc<dyn Pane>, palette: Option<ColorPalette>) -> anyhow::Result<()> {
+    match pane.get_config() {
+        Some(config) => match config.downcast_ref::<TermConfig>() {
+            Some(tc) => match palette {
+                Some(palette) => tc.set_client_palette(palette),
+                None => tc.clear_client_palette(),
+            },
+            None => {
+                log::error!(
+                    "pane {} doesn't have TermConfig as its config; ignoring client palette update",
+                    pane.pane_id()
+                );
+            }
+        },
+        None => {
+            if let Some(palette) = palette {
+                let config = TermConfig::new();
+                config.set_client_palette(palette);
+                pane.set_config(Arc::new(config));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn activate_client_palette(
+    mux: &Mux,
+    pane: &Arc<dyn Pane>,
+    palette_session_id: Option<PaletteSessionId>,
+) -> anyhow::Result<()> {
+    if let Some(palette_session_id) = palette_session_id {
+        if let Some(palette) = mux.activate_client_palette(palette_session_id, pane.pane_id()) {
+            apply_client_palette(pane, Some(palette))?;
+        }
+    }
+    Ok(())
+}
+
+fn schedule_palette_session_cleanup(session_id: PaletteSessionId, reason: &'static str) {
+    let mux = Mux::get();
+    if !mux.deactivate_palette_session(session_id) {
+        return;
+    }
+    // Deactivation above closes the stale-handler gate immediately. Applying
+    // fallback here, behind work already queued by this connection, closes the
+    // TOCTOU where a handler had fetched its palette just before disconnect
+    // and would otherwise apply it after synchronous cleanup.
+    spawn_into_main_thread(async move {
+        let mux = Mux::get();
+        for change in mux.unregister_palette_session(session_id) {
+            if let Some(pane) = mux.get_pane(change.pane_id) {
+                if let Err(err) = apply_client_palette(&pane, change.palette) {
+                    log::error!(
+                        "applying palette fallback for pane {} after {reason}: {err:#}",
+                        change.pane_id
+                    );
+                }
+            }
+        }
+    })
+    .detach();
+}
+
 pub struct SessionHandler {
     to_write_tx: PduSender,
     per_pane: HashMap<TabId, Arc<Mutex<PerPane>>>,
     client_id: Option<Arc<ClientId>>,
+    palette_session_id: Option<PaletteSessionId>,
     proxy_client_id: Option<ClientId>,
 }
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
+        if let Some(session_id) = self.palette_session_id.take() {
+            schedule_palette_session_cleanup(session_id, "client disconnect");
+        }
         if let Some(client_id) = self.client_id.take() {
-            let mux = Mux::get();
-            mux.unregister_client(&client_id);
+            Mux::get().unregister_client(&client_id);
         }
     }
 }
@@ -230,6 +292,7 @@ impl SessionHandler {
             to_write_tx,
             per_pane: HashMap::new(),
             client_id: None,
+            palette_session_id: None,
             proxy_client_id: None,
         }
     }
@@ -260,6 +323,7 @@ impl SessionHandler {
         let start = Instant::now();
         let sender = self.to_write_tx.clone();
         let serial = decoded.serial;
+        let palette_session_id = self.palette_session_id;
         log::trace!("recv {} {}", serial, decoded.pdu.pdu_name());
 
         if let Some(client_id) = &self.client_id {
@@ -332,6 +396,11 @@ impl SessionHandler {
                     }
 
                     let client_id = Arc::new(client_id);
+                    if let Some(old_session_id) = self.palette_session_id.take() {
+                        schedule_palette_session_cleanup(old_session_id, "client identity change");
+                    }
+                    self.palette_session_id =
+                        Some(Mux::get().register_palette_session(client_id.as_ref()));
                     self.client_id.replace(client_id.clone());
                     spawn_into_main_thread(async move {
                         let mux = Mux::get();
@@ -341,17 +410,37 @@ impl SessionHandler {
                 }
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})))
             }
-            Pdu::SetFocusedPane(SetFocusedPane { pane_id }) => {
+            Pdu::SetFocusedPane(SetFocusedPane {
+                pane_id,
+                configured_palette,
+            }) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
-                            let _identity = mux.with_identity(client_id);
+                            let _identity = mux.with_identity(client_id.clone());
 
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
+
+                            if let Some(palette) = configured_palette {
+                                if let Some(palette) = mux.advise_client_palette(
+                                    palette_session_id.ok_or_else(|| {
+                                        anyhow!(
+                                            "palette-bearing focus requires a live client session"
+                                        )
+                                    })?,
+                                    pane_id,
+                                    palette,
+                                ) {
+                                    apply_client_palette(&pane, Some(palette))?;
+                                }
+                            }
+                            // Switch the OSC query base before focus reporting
+                            // can provoke an immediate query from the app.
+                            activate_client_palette(&mux, &pane, palette_session_id)?;
 
                             let (_domain_id, window_id, tab_id) = mux
                                 .resolve_pane_id(pane_id)
@@ -454,6 +543,7 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            activate_client_palette(&mux, &pane, palette_session_id)?;
                             pane.writer().write_all(&data)?;
                             maybe_push_pane_changes(&pane, sender, per_pane)?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
@@ -512,6 +602,7 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            activate_client_palette(&mux, &pane, palette_session_id)?;
                             pane.send_paste(&data)?;
                             maybe_push_pane_changes(&pane, sender, per_pane)?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
@@ -571,6 +662,7 @@ impl SessionHandler {
                             let tab = mux
                                 .get_tab(containing_tab_id)
                                 .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+                            activate_client_palette(&mux, &pane, palette_session_id)?;
                             match tab.get_zoomed_pane() {
                                 Some(p) => {
                                     let is_zoomed = p.pane_id() == pane_id;
@@ -634,6 +726,19 @@ impl SessionHandler {
                             let tab = mux
                                 .get_tab(tab_id)
                                 .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                            // A direction request is a no-op while zoomed when
+                            // the configured policy forbids unzooming. Do not
+                            // transfer ownership to a pane that won't receive
+                            // focus in that case.
+                            if tab.get_zoomed_pane().is_none()
+                                || config::configuration().unzoom_on_switch_pane
+                            {
+                                let panes = tab.iter_panes_ignoring_zoom();
+                                if let Some(pane_index) = tab.get_pane_direction(direction, true) {
+                                    let target = &panes[pane_index].pane;
+                                    activate_client_palette(&mux, target, palette_session_id)?;
+                                }
+                            }
                             tab.activate_pane_direction(direction);
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
@@ -682,6 +787,7 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            activate_client_palette(&mux, &pane, palette_session_id)?;
                             pane.key_down(event.key, event.modifiers)?;
 
                             // For a key press, we want to always send back the
@@ -712,6 +818,7 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            activate_client_palette(&mux, &pane, palette_session_id)?;
                             // The client coalesces rapid wheel motion into a single
                             // event with an accumulated amount, but the terminal
                             // emits one report per event regardless of the amount;
@@ -772,11 +879,28 @@ impl SessionHandler {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
                     let mux = Mux::get();
-                    let _identity = mux.with_identity(client_id);
-                    send_response(
+                    let _identity = mux.with_identity(client_id.clone());
+                    let result = (|| {
+                        let pane = mux
+                            .get_pane(request.pane_id)
+                            .ok_or_else(|| anyhow!("no such pane {}", request.pane_id))?;
+                        let (_domain_id, _window_id, tab_id) = mux
+                            .resolve_pane_id(request.pane_id)
+                            .ok_or_else(|| anyhow!("no such pane {}", request.pane_id))?;
+                        let tab = mux
+                            .get_tab(tab_id)
+                            .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                        if let Some(zoomed) = tab.get_zoomed_pane() {
+                            let zoomed_stack = tab.pane_stack_id(zoomed.pane_id());
+                            let target_stack = tab.pane_stack_id(request.pane_id);
+                            if zoomed_stack.is_none() || zoomed_stack != target_stack {
+                                anyhow::bail!("cannot switch pane tab while zoomed");
+                            }
+                        }
+                        activate_client_palette(&mux, &pane, palette_session_id)?;
                         mux.activate_pane_in_stack(request.pane_id)
-                            .map(|()| Pdu::UnitResponse(UnitResponse {})),
-                    );
+                    })();
+                    send_response(result.map(|()| Pdu::UnitResponse(UnitResponse {})));
                 })
                 .detach();
             }
@@ -987,29 +1111,18 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            let palette_session_id = palette_session_id.ok_or_else(|| {
+                                anyhow!("palette advisory requires a live client session")
+                            })?;
 
-                            match pane.get_config() {
-                                Some(config) => match config.downcast_ref::<TermConfig>() {
-                                    Some(tc) => tc.set_client_palette(palette),
-                                    None => {
-                                        log::error!(
-                                            "pane {pane_id} doesn't \
-                                            have TermConfig as its config! \
-                                            Ignoring client palette update"
-                                        );
-                                    }
-                                },
-                                None => {
-                                    let config = TermConfig::new();
-                                    config.set_client_palette(palette);
-                                    pane.set_config(Arc::new(config));
-                                }
+                            // Advice from a background client is stored only.
+                            // If this client already owns the pane, a config
+                            // reload updates the OSC query base immediately.
+                            if let Some(palette) =
+                                mux.advise_client_palette(palette_session_id, pane_id, palette)
+                            {
+                                apply_client_palette(&pane, Some(palette))?;
                             }
-
-                            mux.notify(MuxNotification::Alert {
-                                pane_id,
-                                alert: Alert::PaletteChanged,
-                            });
 
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
@@ -1054,6 +1167,7 @@ impl SessionHandler {
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
+            | Pdu::SetApplicationPalette { .. }
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
@@ -1263,4 +1377,26 @@ async fn move_pane(
         tab_id: tab.tab_id(),
         window_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PerPane;
+    use wezterm_term::color::ColorPalette;
+
+    #[test]
+    fn application_palette_delivery_distinguishes_unsent_from_reset() {
+        let mut state = PerPane::default();
+        assert!(state.needs_application_palette(&None));
+
+        state.record_application_palette(None);
+        assert!(!state.needs_application_palette(&None));
+
+        let palette = Some(ColorPalette::default());
+        assert!(state.needs_application_palette(&palette));
+        state.record_application_palette(palette.clone());
+        assert!(!state.needs_application_palette(&palette));
+
+        assert!(state.needs_application_palette(&None));
+    }
 }

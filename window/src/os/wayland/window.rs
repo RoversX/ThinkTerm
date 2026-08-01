@@ -53,8 +53,8 @@ use wezterm_input_types::{
 use crate::wayland::WaylandConnection;
 use crate::x11::KeyboardWithFallback;
 use crate::{
-    Appearance, Clipboard, Connection, ConnectionOps, Dimensions, MouseCursor, Point, Rect,
-    RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, Window, WindowEvent,
+    Appearance, Clipboard, ClipboardContents, Connection, ConnectionOps, Dimensions, MouseCursor,
+    Point, Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, Window, WindowEvent,
     WindowEventSender, WindowKeyEvent, WindowOps, WindowState,
 };
 
@@ -83,9 +83,7 @@ impl WaylandDimensions for Dimensions {
 
 const WAYLAND_RESIZE_EDGE_LOGICAL_PIXELS: f64 = 6.0;
 
-fn requested_wayland_decoration_mode(
-    decorations: WindowDecorations,
-) -> Option<DecorationMode> {
+fn requested_wayland_decoration_mode(decorations: WindowDecorations) -> Option<DecorationMode> {
     if decorations == WindowDecorations::NONE {
         None
     } else if decorations.contains(WindowDecorations::INTEGRATED_BUTTONS) {
@@ -147,8 +145,7 @@ fn wayland_surface_resize_edge_at(
     height: usize,
     edge_pixels: usize,
 ) -> Option<WaylandSurfaceResizeEdge> {
-    if x < 0 || y < 0 || x as usize >= width || y as usize >= height || width == 0 || height == 0
-    {
+    if x < 0 || y < 0 || x as usize >= width || y as usize >= height || width == 0 || height == 0 {
         return None;
     }
 
@@ -174,7 +171,7 @@ fn wayland_surface_resize_edge_at(
     }
 }
 
-use super::copy_and_paste::CopyAndPaste;
+use super::copy_and_paste::{ClipboardOfferKind, CopyAndPaste};
 use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
 
@@ -568,6 +565,67 @@ impl WindowOps for WaylandWindow {
         future
     }
 
+    fn get_clipboard_contents(&self, clipboard: Clipboard) -> Future<ClipboardContents> {
+        let mut promise = Promise::new();
+        let future = promise.get_future().unwrap();
+        let promise = Arc::new(Mutex::new(promise));
+        let request = WaylandConnection::with_window_inner(self.0, move |inner| {
+            inner
+                .copy_and_paste
+                .lock()
+                .unwrap()
+                .get_clipboard_contents_pipe(clipboard, true)
+        });
+        promise::spawn::spawn(async move {
+            let result = match request.await {
+                Ok((kind, read, text_fallback)) => {
+                    promise::spawn::spawn_into_new_thread(move || {
+                        // Drain an advertised text fallback concurrently. Some
+                        // clipboard owners do not write the second pipe until the
+                        // first has a reader, and either pipe may be large.
+                        let fallback_reader = text_fallback.map(|read| {
+                            std::thread::spawn(move || read_pipe_bytes_with_timeout(read))
+                        });
+                        match read_pipe_bytes_with_timeout(read) {
+                            Ok(bytes) => {
+                                let contents = match kind {
+                                    ClipboardOfferKind::UriList => {
+                                        let fallback = fallback_reader
+                                            .and_then(|reader| reader.join().ok())
+                                            .and_then(Result::ok);
+                                        crate::os::uri_list::clipboard_contents_from_uri_list(
+                                            &bytes,
+                                            fallback.as_deref(),
+                                        )
+                                    }
+                                    ClipboardOfferKind::Png => ClipboardContents::Image {
+                                        format: crate::ClipboardImageFormat::Png,
+                                        bytes,
+                                    },
+                                    ClipboardOfferKind::Text => ClipboardContents::Text(
+                                        // Same unix line-ending normalization as the
+                                        // textual read.
+                                        String::from_utf8_lossy(&bytes).replace("\r\n", "\n"),
+                                    ),
+                                };
+                                Ok(contents)
+                            }
+                            Err(e) => {
+                                log::error!("while reading clipboard: {}", e);
+                                Err(anyhow!("{}", e))
+                            }
+                        }
+                    })
+                    .await
+                }
+                Err(err) => Err(err),
+            };
+            promise.lock().unwrap().result(result);
+        })
+        .detach();
+        future
+    }
+
     fn set_clipboard(&self, clipboard: Clipboard, text: String) {
         WaylandConnection::with_window_inner(self.0, move |inner| {
             inner
@@ -619,7 +677,11 @@ pub(crate) struct PendingEvent {
     pub(crate) window_state: Option<WindowState>,
 }
 
-pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<String> {
+pub(crate) fn read_pipe_with_timeout(file: ReadPipe) -> anyhow::Result<String> {
+    Ok(String::from_utf8(read_pipe_bytes_with_timeout(file)?)?)
+}
+
+pub(crate) fn read_pipe_bytes_with_timeout(mut file: ReadPipe) -> anyhow::Result<Vec<u8>> {
     let mut result = Vec::new();
 
     // set non-blocking I/O on the pipe
@@ -655,7 +717,7 @@ pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<Strin
         }
     }
 
-    Ok(String::from_utf8(result)?)
+    Ok(result)
 }
 
 pub struct WaylandWindowInner {
@@ -762,9 +824,9 @@ impl WaylandWindowInner {
             return None;
         }
 
-        let edge_pixels =
-            (WAYLAND_RESIZE_EDGE_LOGICAL_PIXELS * self.dimensions.dpi as f64 / crate::DEFAULT_DPI)
-                .round() as usize;
+        let edge_pixels = (WAYLAND_RESIZE_EDGE_LOGICAL_PIXELS * self.dimensions.dpi as f64
+            / crate::DEFAULT_DPI)
+            .round() as usize;
         wayland_surface_resize_edge_at(
             coords.x,
             coords.y,

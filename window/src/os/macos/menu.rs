@@ -1,6 +1,5 @@
 use crate::macos::{nsstring, nsstring_to_str};
-use crate::superclass;
-use crate::{ContextMenuAction, ContextMenuIcon};
+use crate::{superclass, ContextMenuAction, ContextMenuIcon};
 pub use cocoa::appkit::NSEventModifierFlags;
 use cocoa::appkit::{NSApp, NSApplication, NSMenu, NSMenuItem};
 pub use cocoa::base::SEL;

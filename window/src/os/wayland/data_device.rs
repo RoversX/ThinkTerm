@@ -17,6 +17,11 @@ use super::state::WaylandState;
 
 pub(super) const TEXT_MIME_TYPE: &str = "text/plain;charset=utf-8";
 pub(super) const URI_MIME_TYPE: &str = "text/uri-list";
+pub(super) const PNG_MIME_TYPE: &str = "image/png";
+
+fn is_supported_clipboard_mime(mime: &str) -> bool {
+    matches!(mime, TEXT_MIME_TYPE | URI_MIME_TYPE | PNG_MIME_TYPE)
+}
 
 impl DataDeviceHandler for WaylandState {
     fn enter(
@@ -107,13 +112,18 @@ impl DataDeviceHandler for WaylandState {
                 return;
             }
         };
-        if let Some(offer) = offer {
-            if !offer.with_mime_types(|mime_types| mime_types.iter().any(|s| s == TEXT_MIME_TYPE)) {
-                return;
-            }
-
-            if let Some(copy_and_paste) = self.resolve_copy_and_paste() {
+        let supported = offer.as_ref().map_or(false, |offer| {
+            offer.with_mime_types(|mime_types| {
+                mime_types
+                    .iter()
+                    .any(|mime| is_supported_clipboard_mime(mime))
+            })
+        });
+        if let Some(copy_and_paste) = self.resolve_copy_and_paste() {
+            if let (true, Some(offer)) = (supported, offer) {
                 copy_and_paste.lock().unwrap().confirm_selection(offer);
+            } else {
+                copy_and_paste.lock().unwrap().clear_selection();
             }
         }
     }
@@ -141,6 +151,19 @@ impl DataDeviceHandler for WaylandState {
             });
         }
         // if let Some(SurfaceAndOffer { offer, .. }) = pstate.drag_and_drop.offer.take() {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_selection_keeps_every_supported_offer_kind() {
+        assert!(is_supported_clipboard_mime(TEXT_MIME_TYPE));
+        assert!(is_supported_clipboard_mime(URI_MIME_TYPE));
+        assert!(is_supported_clipboard_mime(PNG_MIME_TYPE));
+        assert!(!is_supported_clipboard_mime("application/octet-stream"));
     }
 }
 

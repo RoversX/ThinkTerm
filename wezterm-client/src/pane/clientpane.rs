@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use codec::*;
 use config::configuration;
 use config::keyassignment::ScrollbackEraseMode;
+use futures::lock::Mutex as AsyncMutex;
 use mux::domain::DomainId;
 use mux::pane::{
     alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
@@ -36,6 +37,32 @@ use wezterm_term::{
 struct ResizeDecision {
     converge_local_surface: bool,
     send_rpc: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct ApplicationPaletteTransition {
+    palette: ColorPalette,
+    application_palette: bool,
+    palette_changed: bool,
+    provenance_changed: bool,
+}
+
+fn application_palette_transition(
+    current: &ColorPalette,
+    configured: &ColorPalette,
+    was_application_palette: bool,
+    update: Option<ColorPalette>,
+) -> ApplicationPaletteTransition {
+    let (palette, application_palette) = match update {
+        Some(palette) => (palette, true),
+        None => (configured.clone(), false),
+    };
+    ApplicationPaletteTransition {
+        palette_changed: current != &palette,
+        provenance_changed: was_application_palette != application_palette,
+        palette,
+        application_palette,
+    }
 }
 
 fn render_dimensions_match_size(dimensions: RenderableDimensions, size: TerminalSize) -> bool {
@@ -135,11 +162,15 @@ pub struct ClientPane {
     pub remote_pane_id: PaneId,
     remote_tab_id: AtomicUsize,
     pub renderable: Mutex<RenderableState>,
-    configured_palette: Mutex<ColorPalette>,
+    configured_palette: Arc<Mutex<ColorPalette>>,
     /// Delivery state for the palette advisory: what we want the server to
     /// hold and what it last confirmed. A single worker task drains it; see
     /// [`PaletteDelivery`].
     delivered_palette: Arc<Mutex<PaletteDelivery>>,
+    /// Serializes the two RPCs that can mutate this client's advisory on the
+    /// server: SetPalette and the palette-bearing SetFocusedPane. Without
+    /// this, an older focus task can race a config reload and land last.
+    palette_rpc_lock: Arc<AsyncMutex<()>>,
     palette: Mutex<ColorPalette>,
     application_palette: Mutex<bool>,
     writer: Mutex<PaneWriter>,
@@ -164,6 +195,7 @@ impl ClientPane {
         remote_pane_id: PaneId,
         palette: ColorPalette,
         delivery: Arc<Mutex<PaletteDelivery>>,
+        rpc_lock: Arc<AsyncMutex<()>>,
     ) {
         if !delivery.lock().adopt_target(palette) {
             return;
@@ -176,13 +208,16 @@ impl ClientPane {
                     // Delivered everything we wanted; the slot is released.
                     return;
                 };
-                let result = client
-                    .client
-                    .set_configured_palette_for_pane(SetPalette {
-                        pane_id: remote_pane_id,
-                        palette: target.clone(),
-                    })
-                    .await;
+                let result = {
+                    let _guard = rpc_lock.lock().await;
+                    client
+                        .client
+                        .set_configured_palette_for_pane(SetPalette {
+                            pane_id: remote_pane_id,
+                            palette: target.clone(),
+                        })
+                        .await
+                };
                 match result {
                     Ok(_) => {
                         failures = 0;
@@ -239,6 +274,7 @@ impl ClientPane {
             self.remote_pane_id,
             palette,
             Arc::clone(&self.delivered_palette),
+            Arc::clone(&self.palette_rpc_lock),
         );
     }
 
@@ -293,11 +329,13 @@ impl ClientPane {
         // defaults forever — and an application that queries-then-restores
         // the foreground would then paint the pane in those defaults.
         let delivered_palette = Arc::new(Mutex::new(PaletteDelivery::default()));
+        let palette_rpc_lock = Arc::new(AsyncMutex::new(()));
         Self::advise_server_palette(
             Arc::clone(client),
             remote_pane_id,
             palette.clone(),
             Arc::clone(&delivered_palette),
+            Arc::clone(&palette_rpc_lock),
         );
 
         Self {
@@ -309,8 +347,9 @@ impl ClientPane {
             application_palette: Mutex::new(false),
             renderable: Mutex::new(render),
             writer: Mutex::new(writer),
-            configured_palette: Mutex::new(palette.clone()),
+            configured_palette: Arc::new(Mutex::new(palette.clone())),
             delivered_palette,
+            palette_rpc_lock,
             palette: Mutex::new(palette),
             clipboard: Mutex::new(None),
             mouse_grabbed: Mutex::new(false),
@@ -357,16 +396,28 @@ impl ClientPane {
                     log::error!("ClientPane: Ignoring SetClipboard request {:?}", clipboard);
                 }
             },
-            Pdu::SetPalette(SetPalette { palette, .. }) => {
-                // A redundant advisory must not invalidate the whole
-                // render surface (make_all_stale forces a refetch of every
-                // visible line, which flashes the pane contents).
-                if palette != *self.palette.lock() {
-                    *self.application_palette.lock() = palette != *self.configured_palette.lock();
+            Pdu::SetApplicationPalette(SetApplicationPalette { palette, .. }) => {
+                let current = self.palette.lock().clone();
+                let configured = self.configured_palette.lock().clone();
+                let was_application_palette = *self.application_palette.lock();
+                let transition = application_palette_transition(
+                    &current,
+                    &configured,
+                    was_application_palette,
+                    palette,
+                );
 
-                    *self.palette.lock() = palette;
-                    let mux = Mux::get();
+                *self.application_palette.lock() = transition.application_palette;
+                if transition.palette_changed {
+                    *self.palette.lock() = transition.palette;
                     self.renderable.lock().inner.borrow_mut().make_all_stale();
+                }
+
+                // Provenance changes must propagate through chained muxes even
+                // when the effective colors happen to be identical. Only an
+                // actual color change invalidates the render surface above.
+                if transition.palette_changed || transition.provenance_changed {
+                    let mux = Mux::get();
                     mux.notify(MuxNotification::Alert {
                         pane_id: self.local_pane_id,
                         alert: Alert::PaletteChanged,
@@ -801,6 +852,14 @@ impl Pane for ClientPane {
         self.palette.lock().clone()
     }
 
+    fn palette_override(&self) -> Option<ColorPalette> {
+        if *self.application_palette.lock() {
+            Some(self.palette.lock().clone())
+        } else {
+            None
+        }
+    }
+
     fn domain_id(&self) -> DomainId {
         self.client.local_domain_id
     }
@@ -855,11 +914,20 @@ impl Pane for ClientPane {
                 .replace(std::time::Instant::now());
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
+            let configured_palette = Arc::clone(&self.configured_palette);
+            let palette_rpc_lock = Arc::clone(&self.palette_rpc_lock);
             promise::spawn::spawn(async move {
+                // SetPalette and this palette-bearing focus request both
+                // mutate the same server-side advisory. Serialize them and
+                // sample the palette only after acquiring the lock so an old
+                // focus task cannot overwrite a newer config reload.
+                let _guard = palette_rpc_lock.lock().await;
+                let configured_palette = configured_palette.lock().clone();
                 client
                     .client
                     .set_focused_pane_id(SetFocusedPane {
                         pane_id: remote_pane_id,
+                        configured_palette: Some(configured_palette),
                     })
                     .await
             })
@@ -909,6 +977,7 @@ impl Pane for ClientPane {
                 self.remote_pane_id,
                 palette,
                 Arc::clone(&self.delivered_palette),
+                Arc::clone(&self.palette_rpc_lock),
             );
         }
         self.config.lock().replace(config);
@@ -1021,7 +1090,7 @@ mod test {
 
 #[cfg(test)]
 mod palette_delivery_tests {
-    use super::PaletteDelivery;
+    use super::{application_palette_transition, PaletteDelivery};
     use wezterm_term::color::ColorPalette;
 
     fn palette(fg: f32) -> ColorPalette {
@@ -1127,5 +1196,42 @@ mod palette_delivery_tests {
             "resync restarts the worker"
         );
         assert_eq!(state.next_to_send(), Some(palette(0.5)));
+    }
+
+    #[test]
+    fn explicit_no_override_restores_the_configured_palette() {
+        let configured = palette(1.0);
+        let transition = application_palette_transition(&palette(0.7), &configured, true, None);
+        assert_eq!(transition.palette, configured);
+        assert!(!transition.application_palette);
+        assert!(transition.palette_changed);
+        assert!(transition.provenance_changed);
+    }
+
+    #[test]
+    fn default_gray_is_honored_when_it_is_explicit_application_state() {
+        let configured = palette(1.0);
+        let gray = ColorPalette::default();
+        let transition =
+            application_palette_transition(&configured, &configured, false, Some(gray.clone()));
+        assert_eq!(transition.palette, gray);
+        assert!(transition.application_palette);
+        assert!(transition.palette_changed);
+        assert!(transition.provenance_changed);
+    }
+
+    #[test]
+    fn equal_colors_still_preserve_application_provenance_without_repaint() {
+        let configured = palette(1.0);
+        let transition = application_palette_transition(
+            &configured,
+            &configured,
+            false,
+            Some(configured.clone()),
+        );
+        assert_eq!(transition.palette, configured);
+        assert!(transition.application_palette);
+        assert!(!transition.palette_changed);
+        assert!(transition.provenance_changed);
     }
 }

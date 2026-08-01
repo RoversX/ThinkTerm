@@ -443,7 +443,9 @@ macro_rules! pdu {
 /// are made to the types and protocol.
 /// 47: PaneStackEntry gained pane_stack_id; stack operation PDUs.
 /// 48: MovePaneToStack moves an existing pane into another pane stack.
-pub const CODEC_VERSION: usize = 48;
+/// 49: Palette advisories are client-only, application palette state is
+///     explicit, and SetFocusedPane carries the focusing client's palette.
+pub const CODEC_VERSION: usize = 49;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -507,6 +509,7 @@ pdu! {
     SpawnPaneInStack: 63,
     ActivatePaneInStack: 64,
     MovePaneToStack: 65,
+    SetApplicationPalette: 66,
 }
 
 impl Pdu {
@@ -600,6 +603,7 @@ impl Pdu {
         match self {
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
             | Pdu::SetPalette(SetPalette { pane_id, .. })
+            | Pdu::SetApplicationPalette(SetApplicationPalette { pane_id, .. })
             | Pdu::NotifyAlert(NotifyAlert { pane_id, .. })
             | Pdu::SetClipboard(SetClipboard { pane_id, .. })
             | Pdu::PaneFocused(PaneFocused { pane_id })
@@ -815,13 +819,22 @@ pub struct RenameWorkspace {
     pub new_workspace: String,
 }
 
-/// This is used both as a notification from server->client
-/// and as a configuration request from client->server when
-/// the client's preferred configuration changes
+/// A client-to-server advisory carrying that client's configured palette.
+/// The server uses this as the base for OSC color queries while that client
+/// owns the pane's palette, but must never broadcast it as application state.
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetPalette {
     pub pane_id: PaneId,
     pub palette: ColorPalette,
+}
+
+/// Server-to-client state of the palette override owned by the application
+/// running in the pane. `None` means that the client must render using its own
+/// configured palette; `Some` is authoritative until a later reset.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetApplicationPalette {
+    pub pane_id: PaneId,
+    pub palette: Option<ColorPalette>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -873,6 +886,9 @@ pub struct SetClientId {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetFocusedPane {
     pub pane_id: PaneId,
+    /// GUI mux clients include their configured palette so that focus and OSC
+    /// palette ownership change atomically. Non-rendering CLI clients use None.
+    pub configured_palette: Option<ColorPalette>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1238,6 +1254,50 @@ mod test {
                 pdu: Pdu::MovePaneToStack(MovePaneToStack {
                     source_pane_id: 17,
                     target_pane_id: 29,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn application_palette_state_round_trip() {
+        for palette in [None, Some(ColorPalette::default())] {
+            let mut encoded = Vec::new();
+            Pdu::SetApplicationPalette(SetApplicationPalette {
+                pane_id: 17,
+                palette: palette.clone(),
+            })
+            .encode(&mut encoded, 0x42)
+            .unwrap();
+            assert_eq!(
+                Pdu::decode(encoded.as_slice()).unwrap(),
+                DecodedPdu {
+                    serial: 0x42,
+                    pdu: Pdu::SetApplicationPalette(SetApplicationPalette {
+                        pane_id: 17,
+                        palette,
+                    }),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn focused_pane_palette_round_trip() {
+        let mut encoded = Vec::new();
+        Pdu::SetFocusedPane(SetFocusedPane {
+            pane_id: 29,
+            configured_palette: Some(ColorPalette::default()),
+        })
+        .encode(&mut encoded, 0x43)
+        .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x43,
+                pdu: Pdu::SetFocusedPane(SetFocusedPane {
+                    pane_id: 29,
+                    configured_palette: Some(ColorPalette::default()),
                 }),
             }
         );
