@@ -1440,6 +1440,51 @@ pub fn project_name(project_id: &str) -> Option<String> {
         .map(|project| project.name.clone())
 }
 
+pub fn project_id_for_thread(thread_id: &str) -> Option<ProjectId> {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .find(|project| {
+            project
+                .threads
+                .iter()
+                .any(|session| session.id == thread_id)
+        })
+        .map(|project| project.id.clone())
+}
+
+/// A Space's project ids in render order — the full logical list, not just
+/// what fits in the sidebar's viewport.
+pub fn ordered_project_ids(space_id: &str) -> Vec<ProjectId> {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .filter(|project| project.space_id == space_id)
+        .map(|project| project.id.clone())
+        .collect()
+}
+
+/// The thread ids a project shows under its own row, in render order —
+/// pinned threads live in the sidebar's separate top section.
+pub fn unpinned_thread_ids(project_id: &str) -> Vec<WorkspaceThreadId> {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| {
+            project
+                .threads
+                .iter()
+                .filter(|session| !session.is_pinned)
+                .map(|session| session.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn active_project_id_for_space(space_id: &str) -> Option<ProjectId> {
     let mut store = THREAD_STORE.lock();
     if store.normalize_after_load() {
@@ -1689,6 +1734,24 @@ pub fn disconnect_workspace_thread_record(
         persist_locked(&store);
     }
     disconnected
+}
+
+pub fn move_project_before(space_id: &str, project_id: &str, before: Option<&str>) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.move_project_before(space_id, project_id, before);
+    if changed {
+        persist_locked(&store);
+    }
+    changed
+}
+
+pub fn move_thread_before(project_id: &str, thread_id: &str, before: Option<&str>) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.move_thread_before(project_id, thread_id, before);
+    if changed {
+        persist_locked(&store);
+    }
+    changed
 }
 
 pub fn toggle_project_threads_collapsed(project_id: &str) -> bool {
@@ -3157,6 +3220,111 @@ impl WorkspaceThreadStore {
             return false;
         };
         project.threads_collapsed = !project.threads_collapsed;
+        true
+    }
+
+    /// Move a project so it renders directly before `before` in its Space
+    /// (or last when `before` is None). The projects Vec interleaves every
+    /// Space; only the relative order within this Space changes. Returns
+    /// false — and leaves the store untouched — for unknown ids, a `before`
+    /// from another Space, or a drop on the current position.
+    fn move_project_before(
+        &mut self,
+        space_id: &str,
+        project_id: &str,
+        before: Option<&str>,
+    ) -> bool {
+        let Some(from) = self
+            .projects
+            .iter()
+            .position(|project| project.id == project_id && project.space_id == space_id)
+        else {
+            return false;
+        };
+        let to =
+            match before {
+                Some(before_id) => {
+                    if before_id == project_id {
+                        return false;
+                    }
+                    let Some(index) = self.projects.iter().position(|project| {
+                        project.id == before_id && project.space_id == space_id
+                    }) else {
+                        return false;
+                    };
+                    index
+                }
+                None => {
+                    let Some(last) = self
+                        .projects
+                        .iter()
+                        .rposition(|project| project.space_id == space_id)
+                    else {
+                        return false;
+                    };
+                    last + 1
+                }
+            };
+        if to == from || to == from + 1 {
+            return false;
+        }
+        let project = self.projects.remove(from);
+        let to = if to > from { to - 1 } else { to };
+        self.projects.insert(to, project);
+        true
+    }
+
+    /// Move a thread within its project so it renders directly before
+    /// `before` (or last when `before` is None). Pinned threads live in the
+    /// sidebar's separate cross-project section, so they are neither movable
+    /// here nor valid anchors; inserting before an unpinned sibling's Vec
+    /// position keeps the visible (pinned-filtered) order correct even with
+    /// pinned entries interleaved in the Vec.
+    fn move_thread_before(
+        &mut self,
+        project_id: &str,
+        thread_id: &str,
+        before: Option<&str>,
+    ) -> bool {
+        let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        else {
+            return false;
+        };
+        let Some(from) = project
+            .threads
+            .iter()
+            .position(|thread| thread.id == thread_id)
+        else {
+            return false;
+        };
+        if project.threads[from].is_pinned {
+            return false;
+        }
+        let to = match before {
+            Some(before_id) => {
+                if before_id == thread_id {
+                    return false;
+                }
+                let Some(index) = project
+                    .threads
+                    .iter()
+                    .position(|thread| thread.id == before_id && !thread.is_pinned)
+                else {
+                    return false;
+                };
+                index
+            }
+            None => project.threads.len(),
+        };
+        if to == from || to == from + 1 {
+            return false;
+        }
+        let thread = project.threads.remove(from);
+        let to = if to > from { to - 1 } else { to };
+        project.threads.insert(to, thread);
         true
     }
 }
@@ -6001,5 +6169,119 @@ mod tests {
         assert_eq!(view.pinned_threads[0].id, second_id);
         assert_eq!(view.projects[0].threads.len(), 1);
         assert_eq!(view.projects[0].threads[0].id, first_id);
+    }
+    fn ordered_project_ids(store: &WorkspaceThreadStore, space_id: &str) -> Vec<String> {
+        store
+            .projects
+            .iter()
+            .filter(|project| project.space_id == space_id)
+            .map(|project| project.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_project_drags_before_a_sibling_and_to_the_end() {
+        let mut store = test_store();
+        let space_id = store.spaces[0].id.clone();
+        for id in ["p1", "p2", "p3"] {
+            store.projects.push(test_project_in_space(
+                &space_id,
+                id,
+                id,
+                PathBuf::from(format!("/tmp/{id}")),
+                vec![],
+            ));
+        }
+
+        assert!(store.move_project_before(&space_id, "p3", Some("p1")));
+        assert_eq!(ordered_project_ids(&store, &space_id), ["p3", "p1", "p2"]);
+
+        assert!(store.move_project_before(&space_id, "p3", None));
+        assert_eq!(ordered_project_ids(&store, &space_id), ["p1", "p2", "p3"]);
+
+        // Dropping where the project already sits must not dirty the store.
+        assert!(!store.move_project_before(&space_id, "p3", None));
+        assert!(!store.move_project_before(&space_id, "p2", Some("p3")));
+        assert!(!store.move_project_before(&space_id, "p2", Some("p2")));
+        assert!(!store.move_project_before(&space_id, "missing", Some("p1")));
+        assert!(!store.move_project_before("other-space", "p1", Some("p2")));
+    }
+
+    /// The projects Vec interleaves every Space; moving within one Space
+    /// must not disturb another Space's relative order.
+    #[test]
+    fn a_project_move_stays_inside_its_space() {
+        let mut store = test_store();
+        let space_id = store.spaces[0].id.clone();
+        store.projects.push(test_project_in_space(
+            &space_id,
+            "a1",
+            "a1",
+            PathBuf::from("/tmp/a1"),
+            vec![],
+        ));
+        store.projects.push(test_project_in_space(
+            "space-b",
+            "b1",
+            "b1",
+            PathBuf::from("/tmp/b1"),
+            vec![],
+        ));
+        store.projects.push(test_project_in_space(
+            &space_id,
+            "a2",
+            "a2",
+            PathBuf::from("/tmp/a2"),
+            vec![],
+        ));
+
+        assert!(store.move_project_before(&space_id, "a2", Some("a1")));
+        assert_eq!(ordered_project_ids(&store, &space_id), ["a2", "a1"]);
+        assert_eq!(ordered_project_ids(&store, "space-b"), ["b1"]);
+        // An anchor from another Space is refused outright.
+        assert!(!store.move_project_before(&space_id, "a1", Some("b1")));
+    }
+
+    #[test]
+    fn a_thread_drags_within_its_project_and_pinned_rows_stay_put() {
+        let mut store = test_store();
+        let space_id = store.spaces[0].id.clone();
+        let threads: Vec<WorkspaceThread> = ["t1", "t2", "t3"]
+            .iter()
+            .map(|name| WorkspaceThread::new("project-1".to_string(), name.to_string(), None))
+            .collect();
+        let ids: Vec<String> = threads.iter().map(|thread| thread.id.clone()).collect();
+        store.projects.push(test_project_in_space(
+            &space_id,
+            "project-1",
+            "P",
+            PathBuf::from("/tmp/p"),
+            threads,
+        ));
+
+        let order = |store: &WorkspaceThreadStore| -> Vec<String> {
+            store.projects[0]
+                .threads
+                .iter()
+                .map(|thread| thread.name.clone())
+                .collect()
+        };
+
+        assert!(store.move_thread_before("project-1", &ids[2], Some(&ids[0])));
+        assert_eq!(order(&store), ["t3", "t1", "t2"]);
+        assert!(store.move_thread_before("project-1", &ids[2], None));
+        assert_eq!(order(&store), ["t1", "t2", "t3"]);
+        assert!(!store.move_thread_before("project-1", &ids[2], None));
+        assert!(!store.move_thread_before("project-1", &ids[1], Some(&ids[2])));
+
+        // Pinned threads belong to the sidebar's separate section: neither
+        // draggable nor a valid anchor.
+        assert!(store.toggle_thread_pinned(&ids[0]));
+        assert!(!store.move_thread_before("project-1", &ids[0], None));
+        assert!(!store.move_thread_before("project-1", &ids[1], Some(&ids[0])));
+        // Moving an unpinned thread before an unpinned sibling still works
+        // with the pinned entry interleaved in the Vec.
+        assert!(store.move_thread_before("project-1", &ids[2], Some(&ids[1])));
+        assert_eq!(order(&store), ["t1", "t3", "t2"]);
     }
 }

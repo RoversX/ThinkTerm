@@ -383,6 +383,59 @@ impl crate::TermWindow {
     /// Translucent preview of where a dragged level-2 pane tab would land
     /// (full pane = move into its stack, half pane = split), plus the
     /// floating tab-title pill. Registers no UIItem (hit-transparent).
+    /// Reorder drag of a left-sidebar Project/thread row: a 2px accent
+    /// insert line at the gap releasing would drop into, plus the floating
+    /// ghost pill with the row's title.
+    fn paint_sidebar_row_drag_overlay(&mut self) -> anyhow::Result<()> {
+        let Some(state) = self.sidebar_row_drag.as_ref() else {
+            return Ok(());
+        };
+        if !state.active {
+            return Ok(());
+        }
+        let label = state.title.clone();
+        let anchor = state.current;
+        let line_y = state.target.as_ref().map(|target| target.line_y);
+
+        let sidebar_span = self
+            .ui_items
+            .iter()
+            .find(|item| {
+                item.item_type == crate::termwindow::UIItemType::WorkspaceSidebarBackground
+            })
+            .map(|bg| (bg.x as f32, bg.width as f32));
+
+        if let (Some(line_y), Some((bg_x, bg_width))) = (line_y, sidebar_span) {
+            // Same explicit accent blue as the pane drop preview: readable
+            // in both appearances regardless of the palette's selected_bg.
+            let accent = match crate::native_settings::effective_appearance() {
+                window::Appearance::Light | window::Appearance::LightHighContrast => {
+                    LinearRgba::with_srgba(0, 122, 255, 255)
+                }
+                window::Appearance::Dark | window::Appearance::DarkHighContrast => {
+                    LinearRgba::with_srgba(10, 132, 255, 255)
+                }
+            };
+            let inset = self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_INSET) as f32;
+            let thickness = self.ui_f32(2.0).max(2.0);
+            let rect = euclid::rect(
+                bg_x + inset,
+                line_y as f32 - thickness / 2.0,
+                (bg_width - inset * 2.0).max(0.0),
+                thickness,
+            );
+            let gl_state = self.render_state.as_ref().unwrap();
+            let layer = gl_state
+                .layer_for_zindex(0)
+                .context("sidebar drag overlay layer")?;
+            let mut layers = layer.quad_allocator();
+            self.filled_rectangle(&mut layers, 0, rect, accent)
+                .context("sidebar drag insert line")?;
+        }
+
+        self.paint_drag_ghost_pill(&label, anchor)
+    }
+
     fn paint_pane_tab_drag_overlay(&mut self) -> anyhow::Result<()> {
         let Some(state) = self.pane_tab_drag.as_ref() else {
             return Ok(());
@@ -728,6 +781,8 @@ impl crate::TermWindow {
         self.paint_context_menu().context("paint_context_menu")?;
         self.paint_pane_tab_drag_overlay()
             .context("paint_pane_tab_drag_overlay")?;
+        self.paint_sidebar_row_drag_overlay()
+            .context("paint_sidebar_row_drag_overlay")?;
         self.paint_file_drag_ghost()
             .context("paint_file_drag_ghost")?;
 

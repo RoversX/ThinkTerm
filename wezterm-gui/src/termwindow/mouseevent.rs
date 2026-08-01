@@ -1360,6 +1360,48 @@ impl super::TermWindow {
                         return;
                     }
                     if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        matches!(
+                            item.item_type,
+                            UIItemType::Project(_) | UIItemType::WorkspaceThread(_)
+                        )
+                    }) {
+                        // Release coordinates can differ from the last move
+                        // event; recompute the drop gap from where the button
+                        // actually went up.
+                        if self
+                            .sidebar_row_drag
+                            .as_ref()
+                            .is_some_and(|state| state.active)
+                        {
+                            self.update_sidebar_row_drag_target(event.coords);
+                        }
+                        if let Some(state) = self.sidebar_row_drag.take() {
+                            if state.active {
+                                self.drop_sidebar_row_drag(state, context);
+                            } else {
+                                // Never crossed the drag threshold: this was
+                                // a plain click (moved here from the press
+                                // handler).
+                                match state.kind {
+                                    super::SidebarRowKind::Project(project_id) => {
+                                        crate::workspace_threads::toggle_project_threads_collapsed(
+                                            &project_id,
+                                        );
+                                    }
+                                    super::SidebarRowKind::Thread { thread_id, .. } => {
+                                        if !self.open_remote_workspace_thread_without_connecting(
+                                            &thread_id, context,
+                                        ) {
+                                            self.activate_workspace_thread(thread_id, context);
+                                        }
+                                    }
+                                }
+                            }
+                            context.invalidate();
+                        }
+                        return;
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
                         matches!(item.item_type, UIItemType::PaneNav { .. })
                     }) {
                         // Release coordinates can differ from the last move
@@ -1952,6 +1994,9 @@ impl super::TermWindow {
             UIItemType::PaneNav { .. } => {
                 self.drag_pane_nav_tab(item, start_event, event, context);
             }
+            UIItemType::Project(_) | UIItemType::WorkspaceThread(_) => {
+                self.drag_sidebar_row(item, start_event, event, context);
+            }
             UIItemType::RightSidebarFileRow(ref path) => {
                 if self.is_renaming_sidebar_file(path) {
                     self.drag_right_sidebar_input_selection(item, start_event, event, context);
@@ -2079,6 +2124,234 @@ impl super::TermWindow {
     /// Prime a level-2 pane tab for a potential move/split drag. It only
     /// becomes a real drag once the pointer travels past the threshold, so
     /// plain clicks keep their press-time activation behavior.
+    fn arm_sidebar_row_drag(
+        &mut self,
+        item: UIItem,
+        kind: super::SidebarRowKind,
+        title: String,
+        draggable: bool,
+        event: MouseEvent,
+    ) {
+        self.sidebar_row_drag = Some(super::SidebarRowDragState {
+            kind,
+            title,
+            start: event.coords,
+            current: event.coords,
+            active: false,
+            draggable,
+            autoscroll_scheduled: false,
+            target: None,
+        });
+        self.dragging.replace((item, event));
+    }
+
+    fn drag_sidebar_row(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let mut dragging_active = false;
+        if let Some(state) = self.sidebar_row_drag.as_mut() {
+            if state.draggable && !state.active {
+                let dx = event.coords.x - state.start.x;
+                let dy = event.coords.y - state.start.y;
+                // ~5px of travel turns the pending click into a drag
+                if dx * dx + dy * dy >= 25 {
+                    state.active = true;
+                }
+            }
+            state.current = event.coords;
+            dragging_active = state.active;
+        }
+        if dragging_active {
+            self.autoscroll_sidebar_for_row_drag(event.coords.y);
+            self.update_sidebar_row_drag_target(event.coords);
+            context.set_cursor(Some(MouseCursor::Hand));
+            context.invalidate();
+        }
+        // drag_ui_item takes `dragging` on every move; keep the drag armed
+        self.dragging.replace((item, start_event));
+    }
+
+    /// Dragging near the list's top or bottom edge scrolls it so off-screen
+    /// rows can be reached. One call applies one step; a stationary pointer
+    /// produces no further move events, so each applied step queues a timer
+    /// tick that repeats the check from the last known pointer position
+    /// until the pointer leaves the hot zone, the scroll hits its limit, or
+    /// the drag ends.
+    fn autoscroll_sidebar_for_row_drag(&mut self, pointer_y: isize) {
+        // The list viewport proper: the panel background also covers the
+        // toolbar and footer (and a header strip when there is a top
+        // border), which is exactly the wrong area to hot-zone against.
+        let Some((top, bottom)) = self.workspace_sidebar_list_viewport() else {
+            return;
+        };
+        // Roughly a row's worth of hot zone, with a floor so it stays
+        // usable at scale factors that shrink ui_px results.
+        let hot = (self.ui_px(32) as isize).max(24);
+        let step = (self.ui_px(16) as f32).max(8.0);
+        let delta = if pointer_y < top + hot {
+            -step
+        } else if pointer_y > bottom - hot {
+            step
+        } else {
+            return;
+        };
+        let max = self.workspace_sidebar_scroll_max();
+        let next = (self.workspace_sidebar_scroll_offset + delta).clamp(0.0, max);
+        if (next - self.workspace_sidebar_scroll_offset).abs() < f32::EPSILON {
+            // Already at the end this direction scrolls toward: stop the
+            // timer chain instead of ticking forever.
+            return;
+        }
+        self.workspace_sidebar_scroll_offset = next;
+        self.schedule_sidebar_drag_autoscroll_tick();
+    }
+
+    fn schedule_sidebar_drag_autoscroll_tick(&mut self) {
+        let Some(state) = self.sidebar_row_drag.as_mut() else {
+            return;
+        };
+        if state.autoscroll_scheduled {
+            return;
+        }
+        state.autoscroll_scheduled = true;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(40)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let (pointer, active) = match term_window.sidebar_row_drag.as_mut() {
+                    Some(state) => {
+                        state.autoscroll_scheduled = false;
+                        (state.current, state.active)
+                    }
+                    None => return,
+                };
+                if !active {
+                    return;
+                }
+                term_window.autoscroll_sidebar_for_row_drag(pointer.y);
+                term_window.update_sidebar_row_drag_target(pointer);
+                term_window.invalidate_window();
+            })));
+        })
+        .detach();
+    }
+
+    /// Recompute which gap the drag would drop into. The candidate rows are
+    /// this frame's rendered rects: same-Space Project rows for a project
+    /// drag, the same project's (unpinned) thread rows for a thread drag —
+    /// the pinned section and other projects' threads are not targets.
+    fn update_sidebar_row_drag_target(&mut self, coords: ::window::Point) {
+        let Some(kind) = self
+            .sidebar_row_drag
+            .as_ref()
+            .map(|state| state.kind.clone())
+        else {
+            return;
+        };
+        let sidebar_x_ok = self
+            .ui_items
+            .iter()
+            .find(|candidate| candidate.item_type == UIItemType::WorkspaceSidebarBackground)
+            .is_some_and(|bg| coords.x >= bg.x as isize && coords.x < (bg.x + bg.width) as isize);
+        let rows: Vec<(String, isize, isize)> = match &kind {
+            super::SidebarRowKind::Project(_) => project_block_extents(&self.ui_items),
+            super::SidebarRowKind::Thread { project_id, .. } => {
+                let siblings = crate::workspace_threads::unpinned_thread_ids(project_id);
+                self.ui_items
+                    .iter()
+                    .filter_map(|candidate| match &candidate.item_type {
+                        UIItemType::WorkspaceThread(id) if siblings.contains(id) => Some((
+                            id.clone(),
+                            candidate.y as isize,
+                            (candidate.y + candidate.height) as isize,
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        };
+        // A thread pointer that leaves its own list's vertical extent (plus
+        // one row of slack) is not aiming at any of its gaps: dropping there
+        // cancels instead of snapping to the nearest end, which is what
+        // keeps a thread dragged onto ANOTHER project a no-op. A project
+        // has no foreign list to stray into — the whole sidebar is its drop
+        // zone, so anywhere below the last block simply means "the end".
+        let within_span = match &kind {
+            super::SidebarRowKind::Project(_) => !rows.is_empty(),
+            super::SidebarRowKind::Thread { .. } => {
+                rows.first().zip(rows.last()).is_some_and(|(first, last)| {
+                    let slack = (first.2 - first.1).max(0);
+                    coords.y >= first.1 - slack && coords.y <= last.2 + slack
+                })
+            }
+        };
+        let target = if sidebar_x_ok && within_span {
+            sidebar_insert_position(&rows, coords.y).map(|(before, line_y)| {
+                // The rendered rows are only the VISIBLE ones: "after the
+                // last visible row" is the end of the viewport, not of the
+                // list. Anchor to the next logical sibling instead, so a
+                // scrolled-away tail keeps its place; None remains reserved
+                // for the true end.
+                let logical = match &kind {
+                    super::SidebarRowKind::Project(_) => {
+                        crate::workspace_threads::ordered_project_ids(&self.active_space_id)
+                    }
+                    super::SidebarRowKind::Thread { project_id, .. } => {
+                        crate::workspace_threads::unpinned_thread_ids(project_id)
+                    }
+                };
+                let before = clamp_end_anchor_to_next_logical_sibling(
+                    before,
+                    rows.last().map(|(id, _, _)| id.as_str()),
+                    &logical,
+                );
+                super::SidebarInsertTarget { before, line_y }
+            })
+        } else {
+            None
+        };
+        if let Some(state) = self.sidebar_row_drag.as_mut() {
+            state.target = target;
+        }
+    }
+
+    fn drop_sidebar_row_drag(
+        &mut self,
+        state: super::SidebarRowDragState,
+        context: &dyn WindowOps,
+    ) {
+        let Some(target) = state.target else {
+            return;
+        };
+        let changed = match &state.kind {
+            super::SidebarRowKind::Project(project_id) => {
+                let space_id = self.active_space_id.clone();
+                crate::workspace_threads::move_project_before(
+                    &space_id,
+                    project_id,
+                    target.before.as_deref(),
+                )
+            }
+            super::SidebarRowKind::Thread {
+                thread_id,
+                project_id,
+            } => crate::workspace_threads::move_thread_before(
+                project_id,
+                thread_id,
+                target.before.as_deref(),
+            ),
+        };
+        if changed {
+            context.invalidate();
+        }
+    }
+
     fn arm_pane_tab_drag(&mut self, item: UIItem, pane_id: mux::pane::PaneId, event: MouseEvent) {
         let mux = Mux::get();
         let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
@@ -2505,11 +2778,13 @@ impl super::TermWindow {
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
-            UIItemType::Project(project_id) => {
-                self.mouse_event_project(project_id, event, context);
+            UIItemType::Project(ref project_id) => {
+                let project_id = project_id.clone();
+                self.mouse_event_project(item, project_id, event, context);
             }
-            UIItemType::WorkspaceThread(thread_id) => {
-                self.mouse_event_workspace_thread(thread_id, event, context);
+            UIItemType::WorkspaceThread(ref thread_id) => {
+                let thread_id = thread_id.clone();
+                self.mouse_event_workspace_thread(item, thread_id, event, context);
             }
             UIItemType::WorkspaceThreadPin(thread_id) => {
                 self.mouse_event_workspace_thread_pin(thread_id, event, context);
@@ -2986,11 +3261,13 @@ impl super::TermWindow {
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
-            UIItemType::Project(project_id) => {
-                self.mouse_event_project(project_id, event, context);
+            UIItemType::Project(ref project_id) => {
+                let project_id = project_id.clone();
+                self.mouse_event_project(item, project_id, event, context);
             }
-            UIItemType::WorkspaceThread(thread_id) => {
-                self.mouse_event_workspace_thread(thread_id, event, context);
+            UIItemType::WorkspaceThread(ref thread_id) => {
+                let thread_id = thread_id.clone();
+                self.mouse_event_workspace_thread(item, thread_id, event, context);
             }
             UIItemType::WorkspaceThreadPin(thread_id) => {
                 self.mouse_event_workspace_thread_pin(thread_id, event, context);
@@ -3837,14 +4114,24 @@ impl super::TermWindow {
 
     pub fn mouse_event_project(
         &mut self,
+        item: UIItem,
         project_id: String,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                crate::workspace_threads::toggle_project_threads_collapsed(&project_id);
-                context.invalidate();
+                // Arm a potential reorder drag; the collapse toggle fires on
+                // release when the pointer never crossed the drag threshold.
+                let title = crate::workspace_threads::project_name(&project_id)
+                    .unwrap_or_else(|| project_id.clone());
+                self.arm_sidebar_row_drag(
+                    item,
+                    super::SidebarRowKind::Project(project_id),
+                    title,
+                    true,
+                    event,
+                );
             }
             WMEK::Press(MousePress::Right) => {
                 self.show_term_context_menu(
@@ -3883,15 +4170,34 @@ impl super::TermWindow {
 
     pub fn mouse_event_workspace_thread(
         &mut self,
+        item: UIItem,
         thread_id: String,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
-                    self.activate_workspace_thread(thread_id, context);
-                }
+                // Arm a potential reorder drag; switching to the thread fires
+                // on release when the pointer never crossed the threshold.
+                // Rows in the cross-project pinned section arm too (their
+                // click must keep working) but never activate as drags.
+                let Some(project_id) = crate::workspace_threads::project_id_for_thread(&thread_id)
+                else {
+                    return;
+                };
+                let draggable = !crate::workspace_threads::thread_is_pinned(&thread_id);
+                let title = crate::workspace_threads::thread_name(&thread_id)
+                    .unwrap_or_else(|| thread_id.clone());
+                self.arm_sidebar_row_drag(
+                    item,
+                    super::SidebarRowKind::Thread {
+                        thread_id,
+                        project_id,
+                    },
+                    title,
+                    draggable,
+                    event,
+                );
             }
             WMEK::Press(MousePress::Right) => {
                 self.show_term_context_menu(
@@ -6748,5 +7054,166 @@ fn kill_workspace_windows(workspaces: &[String], skip_workspace: Option<&str>) {
         for window_id in mux.iter_windows_in_workspace(workspace) {
             mux.kill_window(window_id);
         }
+    }
+}
+
+/// A project's draggable extent is its whole BLOCK: the header row plus
+/// every thread row rendered under it (nothing when collapsed). Gaps then
+/// sit between whole workspaces, so "after X" paints below X's last thread
+/// instead of between X's header and its threads. Relies on the sidebar
+/// pushing items in visual order: each Project row followed by its rows,
+/// with the cross-project pinned section preceding the first Project.
+pub(crate) fn project_block_extents(items: &[UIItem]) -> Vec<(String, isize, isize)> {
+    let mut blocks: Vec<(String, isize, isize)> = vec![];
+    for item in items {
+        match &item.item_type {
+            UIItemType::Project(id) => {
+                blocks.push((id.clone(), item.y as isize, (item.y + item.height) as isize))
+            }
+            UIItemType::WorkspaceThread(_) | UIItemType::WorkspaceThreadNew(_) => {
+                if let Some(block) = blocks.last_mut() {
+                    block.2 = block.2.max((item.y + item.height) as isize);
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// "After the last VISIBLE row" only means "the end of the list" when that
+/// row is also the logically last sibling. With the list scrolled, rendered
+/// rows stop at the viewport edge while the store's order continues, so the
+/// end-of-viewport gap must anchor to the first off-screen sibling instead.
+pub(crate) fn clamp_end_anchor_to_next_logical_sibling(
+    before: Option<String>,
+    last_visible: Option<&str>,
+    logical: &[String],
+) -> Option<String> {
+    if before.is_some() {
+        return before;
+    }
+    last_visible.and_then(|last| {
+        logical
+            .iter()
+            .position(|id| id == last)
+            .and_then(|index| logical.get(index + 1).cloned())
+    })
+}
+
+/// Which gap of a row list a pointer at `pointer_y` selects: insert before
+/// the returned id, or at the end when None. The second value is where the
+/// insert indicator line paints. Rows are (id, top, bottom) in render order;
+/// the upper half of a row aims before it, the lower half after it.
+pub(crate) fn sidebar_insert_position(
+    rows: &[(String, isize, isize)],
+    pointer_y: isize,
+) -> Option<(Option<String>, isize)> {
+    for (id, top, bottom) in rows {
+        let mid = (top + bottom) / 2;
+        if pointer_y < mid {
+            return Some((Some(id.clone()), *top));
+        }
+    }
+    rows.last().map(|(_, _, bottom)| (None, *bottom))
+}
+
+#[cfg(test)]
+mod sidebar_drag_tests {
+    use super::{
+        clamp_end_anchor_to_next_logical_sibling, project_block_extents, sidebar_insert_position,
+    };
+    use crate::termwindow::{UIItem, UIItemType};
+
+    /// The scrolled-list regression: dropping after the last VISIBLE row
+    /// while more siblings sit below the viewport must land before those
+    /// siblings, not at the absolute end of the list.
+    #[test]
+    fn an_end_of_viewport_drop_anchors_before_offscreen_siblings() {
+        let logical: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        // c is scrolled out of view: the gap below b anchors to c.
+        assert_eq!(
+            clamp_end_anchor_to_next_logical_sibling(None, Some("b"), &logical),
+            Some("c".to_string())
+        );
+        // b IS the true end: None stays None.
+        assert_eq!(
+            clamp_end_anchor_to_next_logical_sibling(None, Some("c"), &logical),
+            None
+        );
+        // A concrete anchor passes through untouched.
+        assert_eq!(
+            clamp_end_anchor_to_next_logical_sibling(Some("b".to_string()), Some("a"), &logical),
+            Some("b".to_string())
+        );
+    }
+
+    fn rows() -> Vec<(String, isize, isize)> {
+        vec![
+            ("a".to_string(), 0, 20),
+            ("b".to_string(), 24, 44),
+            ("c".to_string(), 48, 68),
+        ]
+    }
+
+    fn item(item_type: UIItemType, y: usize, height: usize) -> UIItem {
+        UIItem {
+            x: 0,
+            y,
+            width: 200,
+            height,
+            item_type,
+        }
+    }
+
+    /// The regression from live testing: with expanded threads, "after a
+    /// project" must mean below its LAST THREAD, not below its header row —
+    /// and the pinned section above the first project is no block at all.
+    #[test]
+    fn a_project_block_runs_through_its_threads() {
+        let items = vec![
+            item(UIItemType::WorkspaceThread("pinned".into()), 40, 20),
+            item(UIItemType::Project("alpha".into()), 100, 20),
+            item(UIItemType::WorkspaceThread("a1".into()), 124, 20),
+            item(UIItemType::WorkspaceThread("a2".into()), 148, 20),
+            item(UIItemType::Project("beta".into()), 176, 20),
+            // collapsed: no thread rows follow
+            item(UIItemType::WorkspaceSidebarBackground, 0, 600),
+        ];
+        assert_eq!(
+            project_block_extents(&items),
+            vec![
+                ("alpha".to_string(), 100, 168),
+                ("beta".to_string(), 176, 196),
+            ]
+        );
+        // Below beta: the end, with the line under the last block.
+        assert_eq!(
+            sidebar_insert_position(&project_block_extents(&items), 500),
+            Some((None, 196))
+        );
+    }
+
+    #[test]
+    fn a_pointer_picks_the_gap_nearest_to_it() {
+        // Above everything and in the first row's upper half: before "a".
+        assert_eq!(
+            sidebar_insert_position(&rows(), -10),
+            Some((Some("a".to_string()), 0))
+        );
+        assert_eq!(
+            sidebar_insert_position(&rows(), 4),
+            Some((Some("a".to_string()), 0))
+        );
+        // Lower half of "a" aims after it = before "b".
+        assert_eq!(
+            sidebar_insert_position(&rows(), 15),
+            Some((Some("b".to_string()), 24))
+        );
+        // Lower half of the last row, and anywhere below: the end.
+        assert_eq!(sidebar_insert_position(&rows(), 60), Some((None, 68)));
+        assert_eq!(sidebar_insert_position(&rows(), 500), Some((None, 68)));
+        // No rows: nowhere to drop.
+        assert_eq!(sidebar_insert_position(&[], 10), None);
     }
 }

@@ -640,6 +640,44 @@ struct FileDragState {
     active: bool,
 }
 
+/// A left-sidebar Project or thread row being dragged to a new position in
+/// its list. Armed on press; the pending click fires on release when the
+/// drag never crossed the movement threshold.
+pub(crate) struct SidebarRowDragState {
+    pub kind: SidebarRowKind,
+    /// The row's display name, for the floating ghost under the cursor.
+    pub title: String,
+    pub start: ::window::Point,
+    pub current: ::window::Point,
+    pub active: bool,
+    /// Pinned thread rows arm (their click still fires on release) but
+    /// never activate: they live in the sidebar's cross-project pinned
+    /// section, whose order is derived, not directly editable.
+    pub draggable: bool,
+    /// A repeating autoscroll tick is already queued; keeps the timer chain
+    /// single while the pointer parks in an edge hot zone.
+    pub autoscroll_scheduled: bool,
+    pub target: Option<SidebarInsertTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SidebarRowKind {
+    Project(String),
+    Thread {
+        thread_id: String,
+        project_id: String,
+    },
+}
+
+/// Where releasing the drag would insert the row: directly before `before`,
+/// or last in the list when None. `line_y` is where the insert indicator
+/// paints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SidebarInsertTarget {
+    pub before: Option<String>,
+    pub line_y: isize,
+}
+
 /// What a Files-panel drag will paste once it lands on the terminal.
 #[derive(Clone, Debug)]
 enum FileDragPayload {
@@ -1282,6 +1320,8 @@ pub struct TermWindow {
     right_sidebar_file_drag: Option<FileDragState>,
     /// In-flight drag of a level-2 pane tab toward a move/split drop.
     pane_tab_drag: Option<PaneTabDragState>,
+    /// In-flight reorder drag of a left-sidebar Project or thread row.
+    sidebar_row_drag: Option<SidebarRowDragState>,
     /// Content views (e.g. SSH hosts) shown as synthetic tabs.
     content_views: Vec<ContentViewTab>,
     active_content_view_id: Option<ContentViewId>,
@@ -1652,6 +1692,7 @@ impl TermWindow {
             self.finish_inline_tab_rename(true);
             self.right_sidebar_file_drag = None;
             self.pane_tab_drag = None;
+            self.sidebar_row_drag = None;
             self.dragging = None;
         }
 
@@ -1985,6 +2026,7 @@ impl TermWindow {
             dragging: None,
             right_sidebar_file_drag: None,
             pane_tab_drag: None,
+            sidebar_row_drag: None,
             content_views: vec![],
             active_content_view_id: None,
             content_view_response_tab_id: None,

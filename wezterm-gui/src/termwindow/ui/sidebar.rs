@@ -563,6 +563,22 @@ impl crate::TermWindow {
         }
     }
 
+    /// The row cell height the sidebar actually PAINTS with: the title font
+    /// at the user's sidebar font size. Every consumer of
+    /// `workspace_sidebar_layout` must use this — a plain `title_font()`
+    /// here made scroll geometry and drag hot zones drift from the pixels
+    /// whenever the sidebar font size was customized.
+    fn workspace_sidebar_cell_height(&self) -> usize {
+        self.fonts
+            .title_font_with_size(crate::native_settings::sidebar_font_size())
+            .map(|font| {
+                RenderMetrics::with_font_metrics(&font.metrics())
+                    .cell_size
+                    .height as usize
+            })
+            .unwrap_or(self.render_metrics.cell_size.height as usize)
+    }
+
     pub fn workspace_sidebar_scroll_max(&self) -> f32 {
         let Some(rect) = self.workspace_sidebar_rect() else {
             return 0.0;
@@ -571,15 +587,7 @@ impl crate::TermWindow {
             return 0.0;
         }
 
-        let ui_cell_height = self
-            .fonts
-            .title_font()
-            .map(|font| {
-                RenderMetrics::with_font_metrics(&font.metrics())
-                    .cell_size
-                    .height as usize
-            })
-            .unwrap_or(self.render_metrics.cell_size.height as usize);
+        let ui_cell_height = self.workspace_sidebar_cell_height();
         let icon_size = (ui_cell_height + self.ui_px(12)).clamp(self.ui_px(30), self.ui_px(36));
         let layout = self.workspace_sidebar_layout(rect, ui_cell_height, icon_size);
         let content_bottom = layout.content_bottom;
@@ -613,21 +621,31 @@ impl crate::TermWindow {
         total_height.saturating_sub(viewport_height) as f32
     }
 
+    /// The vertical extent of the scrollable thread list itself — between
+    /// the toolbar above and the footer below. This is the area row drags
+    /// hit-test and autoscroll against; the panel background also covers
+    /// the header strip and footer, so it must not be used for that.
+    pub(crate) fn workspace_sidebar_list_viewport(&self) -> Option<(isize, isize)> {
+        let rect = self.workspace_sidebar_rect()?;
+        if self.workspace_sidebar_collapsed {
+            return None;
+        }
+        let ui_cell_height = self.workspace_sidebar_cell_height();
+        let icon_size = (ui_cell_height + self.ui_px(12)).clamp(self.ui_px(30), self.ui_px(36));
+        let layout = self.workspace_sidebar_layout(rect, ui_cell_height, icon_size);
+        if layout.content_bottom <= layout.list_top {
+            return None;
+        }
+        Some((layout.list_top as isize, layout.content_bottom as isize))
+    }
+
     pub fn workspace_sidebar_scroll_geometry(&self) -> Option<WorkspaceSidebarScrollGeometry> {
         let rect = self.workspace_sidebar_rect()?;
         if self.workspace_sidebar_collapsed {
             return None;
         }
 
-        let ui_cell_height = self
-            .fonts
-            .title_font()
-            .map(|font| {
-                RenderMetrics::with_font_metrics(&font.metrics())
-                    .cell_size
-                    .height as usize
-            })
-            .unwrap_or(self.render_metrics.cell_size.height as usize);
+        let ui_cell_height = self.workspace_sidebar_cell_height();
         let icon_size = (ui_cell_height + self.ui_px(12)).clamp(self.ui_px(30), self.ui_px(36));
         let layout = self.workspace_sidebar_layout(rect, ui_cell_height, icon_size);
         let content_bottom = layout.content_bottom;
