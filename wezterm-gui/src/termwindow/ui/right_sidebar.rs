@@ -49,6 +49,7 @@ use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use anyhow::Context;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment};
+use fluent_bundle::FluentArgs;
 use mux::pane::{Pane, PaneId};
 use mux::Mux;
 use std::borrow::Cow;
@@ -260,7 +261,11 @@ fn remote_lease_failure_disposition(
 }
 
 const FILE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
-const FILE_PREVIEW_TRUNCATED_LABEL: &str = "Preview truncated to 256 KiB";
+fn right_sidebar_arg(id: &'static str, name: &'static str, value: impl Into<String>) -> String {
+    let mut args = FluentArgs::new();
+    args.set(name, value.into());
+    crate::i18n::tr_args(id, &args)
+}
 const FILE_PREVIEW_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 // The file-size cap above bounds the *encoded* bytes, but a small encoded image
 // can decode to an enormous RGBA bitmap (`width × height × 4`, ×frames for
@@ -1034,11 +1039,11 @@ impl RightSidebarMode {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::Chat => "File",
-            Self::Tasks => "Note",
-            Self::Snippets => "Snippets",
+            Self::Chat => crate::i18n::tr("right-mode-files"),
+            Self::Tasks => crate::i18n::tr("right-mode-notes"),
+            Self::Snippets => crate::i18n::tr("right-mode-snippets"),
         }
     }
 }
@@ -1787,7 +1792,7 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_max_columns = 0;
         self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
-        self.right_sidebar_file_preview_message = Some("Loading file preview...".to_string());
+        self.right_sidebar_file_preview_message = Some(crate::i18n::tr("right-loading-preview"));
         self.right_sidebar_file_preview_truncated = false;
         self.right_sidebar_file_preview_selection = None;
         self.right_sidebar_file_preview_scroll_offset = 0.0;
@@ -1796,7 +1801,8 @@ impl crate::TermWindow {
         self.prefetch_right_sidebar_file_open_with(&path);
 
         let Some(window) = self.window.as_ref().cloned() else {
-            self.right_sidebar_file_preview_message = Some("Window is unavailable".to_string());
+            self.right_sidebar_file_preview_message =
+                Some(crate::i18n::tr("right-window-unavailable"));
             return;
         };
         let use_dark_syntax_theme = matches!(
@@ -1816,7 +1822,11 @@ impl crate::TermWindow {
             .unwrap_or_else(|err| RightSidebarLoadedFilePreview {
                 lines: Vec::new(),
                 image: None,
-                message: Some(format!("Unable to load file preview: {err}")),
+                message: Some(right_sidebar_arg(
+                    "right-preview-error",
+                    "error",
+                    err.to_string(),
+                )),
                 truncated: false,
                 raw_text: None,
             });
@@ -2245,7 +2255,7 @@ impl crate::TermWindow {
         let mut items = Vec::new();
         if !path.is_dir() {
             items.push(ContextMenuItem::item_with_icon(
-                "Open",
+                crate::i18n::tr("right-open"),
                 ContextMenuIcon::ExternalLink,
                 KeyAssignment::OpenFileWithSystemDefault(path_string.clone()),
             ));
@@ -2256,18 +2266,18 @@ impl crate::TermWindow {
             KeyAssignment::RevealFileInFolder(path_string.clone()),
         ));
         items.push(ContextMenuItem::item_with_icon(
-            "Copy Path",
+            crate::i18n::tr("right-copy-path"),
             ContextMenuIcon::Copy,
             KeyAssignment::CopyFilePathToClipboard(path_string.clone()),
         ));
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item_with_icon(
-            "Rename...",
+            crate::i18n::tr("right-rename"),
             ContextMenuIcon::Edit,
             KeyAssignment::RenameSidebarFile(path_string.clone()),
         ));
         items.push(ContextMenuItem::item_with_icon(
-            "Move to Trash",
+            crate::i18n::tr("right-move-trash"),
             ContextMenuIcon::Delete,
             KeyAssignment::TrashSidebarFile(path_string),
         ));
@@ -2390,7 +2400,7 @@ impl crate::TermWindow {
                 .filter(|candidate| current_id.as_deref() != Some(candidate.id.as_str()))
                 .map(|candidate| {
                     ContextMenuItem::item_with_icon(
-                        format!("Open With {}", candidate.label),
+                        right_sidebar_arg("right-open-with", "app", candidate.label.clone()),
                         ContextMenuIcon::Application,
                         KeyAssignment::OpenFileWith {
                             path: path_string.clone(),
@@ -2405,7 +2415,7 @@ impl crate::TermWindow {
             items.push(ContextMenuItem::Separator);
         }
         items.push(ContextMenuItem::item_with_icon(
-            "Open With Other…",
+            crate::i18n::tr("right-open-with-other"),
             ContextMenuIcon::Application,
             KeyAssignment::PickOpenFileWithApp(path_string),
         ));
@@ -3240,13 +3250,13 @@ impl crate::TermWindow {
         let notify_window = window.clone();
         let options = if managed {
             FolderPickerOptions {
-                title: "Create Vault".to_string(),
-                prompt: "Create".to_string(),
+                title: crate::i18n::tr("right-create-vault"),
+                prompt: crate::i18n::tr("right-create"),
             }
         } else {
             FolderPickerOptions {
-                title: "Choose Vault".to_string(),
-                prompt: "Choose".to_string(),
+                title: crate::i18n::tr("right-choose-vault"),
+                prompt: crate::i18n::tr("right-choose"),
             }
         };
         window.pick_folder_async_with_options(
@@ -3443,7 +3453,7 @@ impl crate::TermWindow {
             SaveState::Saved | SaveState::Saving(_)
         );
         let mut source_item = self.context_menu_application_item_with_icon(
-            "Source Mode",
+            crate::i18n::tr("right-source-mode"),
             ContextMenuIcon::Code,
             crate::termwindow::ContextMenuApplicationAction::Note(
                 NoteEditorCommand::ToggleSourceMode,
@@ -3453,24 +3463,24 @@ impl crate::TermWindow {
         source_item = source_item.checked(source_mode);
         let vault_tree_label = if self.right_sidebar_note_wide_layout {
             if self.right_sidebar_note_vault_tree_collapsed {
-                "Show Vault Sidebar"
+                crate::i18n::tr("right-show-vault-sidebar")
             } else {
-                "Hide Vault Sidebar"
+                crate::i18n::tr("right-hide-vault-sidebar")
             }
         } else if self.right_sidebar_note_view == RightSidebarNoteView::Tree {
-            "Hide Vault"
+            crate::i18n::tr("right-hide-vault")
         } else {
-            "Show Vault"
+            crate::i18n::tr("right-show-vault")
         };
         let items = vec![
             self.context_menu_application_item_with_icon(
-                "New Note",
+                crate::i18n::tr("right-new-note"),
                 ContextMenuIcon::Note,
                 crate::termwindow::ContextMenuApplicationAction::Note(NoteEditorCommand::NewNote),
                 true,
             ),
             self.context_menu_application_item_with_icon(
-                "Save",
+                crate::i18n::tr("right-save"),
                 ContextMenuIcon::Save,
                 crate::termwindow::ContextMenuApplicationAction::Note(NoteEditorCommand::Save),
                 save_enabled,
@@ -3486,7 +3496,7 @@ impl crate::TermWindow {
             ),
             ContextMenuItem::Separator,
             self.context_menu_application_item_with_icon(
-                "Choose Another Vault…",
+                crate::i18n::tr("right-choose-another-vault"),
                 ContextMenuIcon::Vault,
                 crate::termwindow::ContextMenuApplicationAction::Note(
                     NoteEditorCommand::ChooseVault { managed: false },
@@ -5221,7 +5231,7 @@ impl crate::TermWindow {
         // several times per frame, so it must stay O(1).
         let max_line_columns = self.right_sidebar_file_preview_max_columns;
         if self.right_sidebar_file_preview_truncated {
-            max_line_columns.max(FILE_PREVIEW_TRUNCATED_LABEL.chars().count())
+            max_line_columns.max(crate::i18n::tr("right-preview-truncated").chars().count())
         } else {
             max_line_columns
         }
@@ -5796,8 +5806,9 @@ impl crate::TermWindow {
             .clamp(self.ui_px(24), self.ui_px(30))
             .min(mode_height.saturating_sub(self.ui_px(22)))
             .max(1);
+        let active_mode_label = self.right_sidebar_mode.label();
         let active_label_target_width = self
-            .sidebar_text_width(&ui_font, self.right_sidebar_mode.label())?
+            .sidebar_text_width(&ui_font, &active_mode_label)?
             .ceil() as usize
             + self.ui_px(MODE_LABEL_CLIP_SLOP);
         let inactive_segment_min_width = (mode_icon_size + self.ui_px(SIDEBAR_INSET) * 4)
@@ -5922,11 +5933,12 @@ impl crate::TermWindow {
                 },
             )?;
             if active && label_width > 0 {
+                let mode_label = mode.label();
                 self.paint_sidebar_text(
                     layers,
                     &ui_font,
                     ui_metrics,
-                    mode.label(),
+                    &mode_label,
                     icon_x + mode_icon_size + self.ui_px(SIDEBAR_ICON_GAP),
                     mode_y + (mode_height.saturating_sub(ui_cell_height)) / 2,
                     label_width,
@@ -6166,7 +6178,7 @@ impl crate::TermWindow {
             layers,
             ui_font,
             ui_metrics,
-            "Vault",
+            &crate::i18n::tr("right-vault"),
             title_x,
             content_top + header_height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
             content_x.saturating_add(content_width).saturating_sub(
@@ -6346,7 +6358,7 @@ impl crate::TermWindow {
                 .right_sidebar_note
                 .load_error
                 .clone()
-                .unwrap_or_else(|| "Unable to open Notes".to_string());
+                .unwrap_or_else(|| crate::i18n::tr("right-notes-open-error"));
             self.paint_sidebar_text(
                 layers,
                 ui_font,
@@ -6373,7 +6385,7 @@ impl crate::TermWindow {
                     content_width,
                     button_height,
                     Some(SvgIcon::FolderOpen),
-                    "Choose Existing Vault…",
+                    &crate::i18n::tr("right-choose-existing-vault"),
                     UIItemType::RightSidebarNoteChooseVault,
                     true,
                 )?;
@@ -6389,7 +6401,7 @@ impl crate::TermWindow {
                     content_width,
                     button_height,
                     Some(SvgIcon::FolderPlus),
-                    "Create New Vault…",
+                    &crate::i18n::tr("right-create-new-vault"),
                     UIItemType::RightSidebarNoteCreateVault,
                     true,
                 )?;
@@ -6836,7 +6848,7 @@ impl crate::TermWindow {
                 layers,
                 ui_font,
                 ui_metrics,
-                "Laying out note…",
+                &crate::i18n::tr("right-laying-out-note"),
                 content_x + self.ui_px(NOTE_BODY_PADDING),
                 body_y + self.ui_px(NOTE_BODY_PADDING),
                 content_width.saturating_sub(self.ui_px(NOTE_BODY_PADDING) * 2),
@@ -8252,7 +8264,7 @@ impl crate::TermWindow {
             }
         }
         if self.right_sidebar_note_opening.as_ref() == Some(&key) {
-            self.right_sidebar_note.load_error = Some("Opening note…".to_string());
+            self.right_sidebar_note.load_error = Some(crate::i18n::tr("right-opening-note"));
             return false;
         }
 
@@ -8268,7 +8280,7 @@ impl crate::TermWindow {
         let generation = self.right_sidebar_note_open_generation;
         self.right_sidebar_note_opening = Some(key.clone());
         self.right_sidebar_note_open_failure = None;
-        self.right_sidebar_note.load_error = Some("Opening note…".to_string());
+        self.right_sidebar_note.load_error = Some(crate::i18n::tr("right-opening-note"));
         let Some(window) = self.window.as_ref().cloned() else {
             self.right_sidebar_note_opening = None;
             return false;
@@ -8324,16 +8336,15 @@ impl crate::TermWindow {
 
     fn ensure_active_right_sidebar_note_document(&mut self) -> bool {
         let Some(vault) = workspace_threads::space_note_vault(&self.active_space_id) else {
-            self.right_sidebar_note.clear_document(Some(
-                "Choose an existing Vault or create a new one to start Notes.".to_string(),
-            ));
+            self.right_sidebar_note
+                .clear_document(Some(crate::i18n::tr("right-notes-first-use")));
             return false;
         };
         let Some(project_id) =
             workspace_threads::active_project_id_for_space(&self.active_space_id)
         else {
             self.right_sidebar_note
-                .clear_document(Some("No active Project in this Space.".to_string()));
+                .clear_document(Some(crate::i18n::tr("right-no-active-project")));
             return false;
         };
 
@@ -8351,7 +8362,8 @@ impl crate::TermWindow {
                 if self.right_sidebar_note_vault_index_root.as_ref() != Some(&vault.root)
                     || self.right_sidebar_note_vault_indexing
                 {
-                    self.right_sidebar_note.load_error = Some("Indexing Vault…".to_string());
+                    self.right_sidebar_note.load_error =
+                        Some(crate::i18n::tr("right-indexing-vault"));
                     return false;
                 }
                 self.right_sidebar_note_vault_paths
@@ -8778,6 +8790,11 @@ impl crate::TermWindow {
         // detail line, since only the tree view paints `error_message`.
         let notice = self.right_sidebar_remote_files.error_message.clone();
         let disconnected_detail = notice.as_deref().or(target_label.as_deref());
+        let not_connected = crate::i18n::tr("right-not-connected");
+        let connect = crate::i18n::tr("right-connect");
+        let connecting = crate::i18n::tr("right-connecting");
+        let connection_failed = crate::i18n::tr("right-connection-failed");
+        let retry = crate::i18n::tr("right-retry");
         match phase {
             RemoteFilesPhase::Disconnected => self.paint_remote_files_empty_state(
                 layers,
@@ -8792,9 +8809,9 @@ impl crate::TermWindow {
                 // "something broke" the first time the panel is opened.
                 SvgIcon::Server,
                 false,
-                "Not connected",
+                &not_connected,
                 disconnected_detail,
-                Some(("Connect", true)),
+                Some((&connect, true)),
             ),
             RemoteFilesPhase::Connecting => self.paint_remote_files_empty_state(
                 layers,
@@ -8809,9 +8826,9 @@ impl crate::TermWindow {
                 // Spinning also drives the repaint schedule, so the panel keeps
                 // animating instead of freezing for the length of the connect.
                 true,
-                "Connecting…",
+                &connecting,
                 target_label.as_deref(),
-                Some(("Connecting…", false)),
+                Some((&connecting, false)),
             ),
             RemoteFilesPhase::Failed(message) => self.paint_remote_files_empty_state(
                 layers,
@@ -8824,9 +8841,9 @@ impl crate::TermWindow {
                 content_bottom,
                 SvgIcon::CircleAlert,
                 false,
-                "Connection failed",
+                &connection_failed,
                 Some(message.as_str()),
-                Some(("Retry", true)),
+                Some((&retry, true)),
             ),
             RemoteFilesPhase::Connected => self.paint_remote_files_tree(
                 layers,
@@ -9051,9 +9068,8 @@ impl crate::TermWindow {
             .right_sidebar_remote_files
             .target
             .as_ref()
-            .map(|target| target.project_name.as_str())
-            .unwrap_or("Remote Files")
-            .to_string();
+            .map(|target| target.project_name.clone())
+            .unwrap_or_else(|| crate::i18n::tr("right-remote-files"));
         self.paint_sidebar_text(
             layers,
             ui_font,
@@ -9110,7 +9126,7 @@ impl crate::TermWindow {
                 content_width,
                 content_bottom,
                 self.ui_px(22),
-                "Loading remote directory...",
+                &crate::i18n::tr("right-loading-remote-directory"),
             );
         }
 
@@ -9241,7 +9257,7 @@ impl crate::TermWindow {
                 layers,
                 ui_font,
                 ui_metrics,
-                "More entries are not shown",
+                &crate::i18n::tr("right-more-entries"),
                 content_x,
                 footer_y,
                 content_width,
@@ -9330,9 +9346,9 @@ impl crate::TermWindow {
         }
         if hidden > 0 {
             let more = if hidden == 1 {
-                "1 more transfer".to_string()
+                crate::i18n::tr("right-more-transfer")
             } else {
-                format!("{hidden} more transfers")
+                right_sidebar_arg("right-more-transfers", "count", hidden.to_string())
             };
             self.paint_sidebar_text(
                 layers,
@@ -11058,7 +11074,7 @@ impl crate::TermWindow {
         match kind {
             RemoteFileKind::File => {
                 items.push(self.context_menu_application_item_with_icon(
-                    "Download",
+                    crate::i18n::tr("right-download"),
                     // No dedicated download glyph in the shared icon set; Save
                     // is the closest fit and already maps on every platform.
                     ContextMenuIcon::Save,
@@ -11071,7 +11087,7 @@ impl crate::TermWindow {
             }
             RemoteFileKind::Directory => {
                 items.push(self.context_menu_application_item_with_icon(
-                    "Download",
+                    crate::i18n::tr("right-download"),
                     ContextMenuIcon::Save,
                     crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFolder {
                         path: path.clone(),
@@ -11081,7 +11097,7 @@ impl crate::TermWindow {
                     enabled,
                 ));
                 items.push(self.context_menu_application_item_with_icon(
-                    "New Folder",
+                    crate::i18n::tr("right-new-folder"),
                     ContextMenuIcon::FolderAdd,
                     crate::termwindow::ContextMenuApplicationAction::NewRemoteFolder {
                         parent: path.clone(),
@@ -11095,13 +11111,13 @@ impl crate::TermWindow {
             RemoteFileKind::Symlink | RemoteFileKind::Other => {}
         }
         items.push(ContextMenuItem::item_with_icon(
-            "Copy Path",
+            crate::i18n::tr("right-copy-path"),
             ContextMenuIcon::Copy,
             KeyAssignment::CopyFilePathToClipboard(path_string),
         ));
         if !is_root {
             items.push(self.context_menu_application_item_with_icon(
-                "Rename\u{2026}",
+                crate::i18n::tr("right-rename"),
                 ContextMenuIcon::Edit,
                 crate::termwindow::ContextMenuApplicationAction::RenameRemoteEntry {
                     path: path.clone(),
@@ -11111,7 +11127,7 @@ impl crate::TermWindow {
             ));
             items.push(ContextMenuItem::Separator);
             items.push(self.context_menu_application_item_with_icon(
-                "Delete\u{2026}",
+                crate::i18n::tr("right-delete"),
                 ContextMenuIcon::Delete,
                 crate::termwindow::ContextMenuApplicationAction::DeleteRemoteEntry {
                     path,
@@ -11261,13 +11277,11 @@ impl crate::TermWindow {
         // The count goes into each label rather than a heading row: every
         // option then says exactly what it will do, and there is no inert row
         // for the user to try clicking.
-        let noun = if count == 1 { "file" } else { "files" };
-
         // One pass: beginning the block clears the action table, so minting an
         // item after a second call would leave the earlier ones dead.
         self.begin_context_menu_application_actions();
         let overwrite = self.context_menu_application_item_with_icon(
-            format!("Replace {count} existing {noun}"),
+            right_sidebar_arg("right-replace-conflicts", "count", count.to_string()),
             ContextMenuIcon::Save,
             crate::termwindow::ContextMenuApplicationAction::ResolveLocalCopyConflict(
                 ConflictChoice::Overwrite,
@@ -11275,7 +11289,7 @@ impl crate::TermWindow {
             true,
         );
         let skip = self.context_menu_application_item_with_icon(
-            format!("Skip {count} existing {noun}"),
+            right_sidebar_arg("right-skip-conflicts", "count", count.to_string()),
             ContextMenuIcon::Check,
             crate::termwindow::ContextMenuApplicationAction::ResolveLocalCopyConflict(
                 ConflictChoice::Skip,
@@ -11283,7 +11297,7 @@ impl crate::TermWindow {
             true,
         );
         let cancel = self.context_menu_application_item_with_icon(
-            "Cancel the copy",
+            crate::i18n::tr("right-cancel-copy"),
             ContextMenuIcon::Close,
             crate::termwindow::ContextMenuApplicationAction::ResolveLocalCopyConflict(
                 ConflictChoice::Cancel,
@@ -11434,19 +11448,19 @@ impl crate::TermWindow {
         // turn the earlier items into dead entries.
         self.begin_context_menu_application_actions();
         let copy_selection = self.context_menu_application_item_with_icon(
-            "Copy",
+            crate::i18n::tr("menu-copy"),
             ContextMenuIcon::Copy,
             crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewSelection,
             has_selection,
         );
         let copy_all = self.context_menu_application_item_with_icon(
-            "Copy All",
+            crate::i18n::tr("right-copy-all"),
             ContextMenuIcon::Copy,
             crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewAll,
             has_text,
         );
         let download = self.context_menu_application_item_with_icon(
-            "Download",
+            crate::i18n::tr("right-download"),
             ContextMenuIcon::Save,
             crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile { path, origin },
             can_download,
@@ -11834,20 +11848,36 @@ impl crate::TermWindow {
         };
         let (proceed_label, proceed_icon) = match &pending {
             PendingRemoteConfirm::FolderDownload { plan, .. } => (
-                format!("Download {} items", plan.entries.len()),
+                right_sidebar_arg(
+                    "right-confirm-download",
+                    "count",
+                    plan.entries.len().to_string(),
+                ),
                 ContextMenuIcon::Save,
             ),
             PendingRemoteConfirm::FolderDelete { plan, .. } => (
                 // +1: the folder itself goes too.
-                format!("Delete {} items permanently", plan.entries.len() + 1),
+                right_sidebar_arg(
+                    "right-confirm-delete-items",
+                    "count",
+                    (plan.entries.len() + 1).to_string(),
+                ),
                 ContextMenuIcon::Delete,
             ),
             PendingRemoteConfirm::FileDelete { remote, .. } => (
-                format!("Delete \u{201c}{}\u{201d} permanently", remote.file_name()),
+                right_sidebar_arg(
+                    "right-confirm-delete-name",
+                    "name",
+                    remote.file_name().to_string(),
+                ),
                 ContextMenuIcon::Delete,
             ),
             PendingRemoteConfirm::FolderUpload { plan, .. } => (
-                format!("Upload {} items", plan.entries.len()),
+                right_sidebar_arg(
+                    "right-confirm-upload",
+                    "count",
+                    plan.entries.len().to_string(),
+                ),
                 ContextMenuIcon::Save,
             ),
         };
@@ -11859,7 +11889,7 @@ impl crate::TermWindow {
             true,
         );
         let cancel = self.context_menu_application_item_with_icon(
-            "Cancel",
+            crate::i18n::tr("right-cancel"),
             ContextMenuIcon::Close,
             crate::termwindow::ContextMenuApplicationAction::ResolveRemoteConfirm(false),
             true,
@@ -12440,13 +12470,13 @@ impl crate::TermWindow {
             };
             self.begin_context_menu_application_actions();
             let retry = self.context_menu_application_item_with_icon(
-                "Retry",
+                crate::i18n::tr("right-retry"),
                 ContextMenuIcon::Refresh,
                 crate::termwindow::ContextMenuApplicationAction::RetryRemoteTransfer { id, anchor },
                 true,
             );
             let dismiss = self.context_menu_application_item_with_icon(
-                "Dismiss",
+                crate::i18n::tr("right-dismiss"),
                 ContextMenuIcon::Close,
                 crate::termwindow::ContextMenuApplicationAction::DismissRemoteTransfer(id),
                 true,
@@ -12923,6 +12953,7 @@ impl crate::TermWindow {
         let refresh_x = content_x + content_width - refresh_size;
         let refresh_y =
             content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
+        let filter_label = crate::i18n::tr("right-filter-files");
 
         let filter_input = self.right_sidebar_file_filter.clone();
         self.paint_snippet_text_box(
@@ -12937,7 +12968,7 @@ impl crate::TermWindow {
             filter_width,
             self.ui_px(FILE_FILTER_HEIGHT),
             Some(SvgIcon::Search),
-            "Filter files",
+            &filter_label,
             &filter_input,
             self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter),
             UIItemType::RightSidebarFileFilter,
@@ -12998,7 +13029,7 @@ impl crate::TermWindow {
                         content_width,
                         content_bottom,
                         icon_size,
-                        "Indexing files...",
+                        &crate::i18n::tr("right-indexing-files"),
                     );
                 }
             },
@@ -13029,7 +13060,7 @@ impl crate::TermWindow {
                     content_width,
                     content_bottom,
                     icon_size,
-                    "Indexing files...",
+                    &crate::i18n::tr("right-indexing-files"),
                 );
             }
         };
@@ -13055,7 +13086,7 @@ impl crate::TermWindow {
                 content_width,
                 content_bottom,
                 icon_size,
-                "Searching files...",
+                &crate::i18n::tr("right-searching-files"),
             );
         }
 
@@ -13071,7 +13102,7 @@ impl crate::TermWindow {
                 content_width,
                 content_bottom,
                 icon_size,
-                "No matching files",
+                &crate::i18n::tr("right-no-matching-files"),
             );
         }
 
@@ -13172,7 +13203,7 @@ impl crate::TermWindow {
                 filter_width,
                 self.ui_px(FILE_FILTER_HEIGHT),
                 Some(SvgIcon::Search),
-                "Filter files",
+                &filter_label,
                 &filter_input,
                 self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter),
                 UIItemType::RightSidebarFileFilter,
@@ -13530,8 +13561,8 @@ impl crate::TermWindow {
         // actually used.
         let app_label = self.right_sidebar_current_open_with_app_label(path);
         let open_label = match &app_label {
-            Some(app) => format!("Open With {app}"),
-            None => "Open".to_string(),
+            Some(app) => right_sidebar_arg("right-open-with", "app", app.clone()),
+            None => crate::i18n::tr("right-open"),
         };
         let label_px = self
             .sidebar_text_width(ui_font, &open_label)
@@ -13996,13 +14027,11 @@ impl crate::TermWindow {
             }
 
             if self.right_sidebar_file_preview_truncated {
+                let truncated_label = crate::i18n::tr("right-preview-truncated");
                 let line_top = body_y as f32 + (line_count * line_height) as f32 - scroll_offset;
                 if line_top < body_bottom as f32 {
-                    let visible_text = preview_text_slice(
-                        FILE_PREVIEW_TRUNCATED_LABEL,
-                        horizontal_offset,
-                        paint_columns,
-                    );
+                    let visible_text =
+                        preview_text_slice(&truncated_label, horizontal_offset, paint_columns);
                     self.paint_sidebar_text(
                         layers,
                         ui_font,
@@ -14587,10 +14616,11 @@ impl crate::TermWindow {
         icon_size: usize,
     ) -> anyhow::Result<()> {
         let toolbar_y = content_top;
+        let new_snippet_label = crate::i18n::tr("right-new-snippet");
         let new_button_icon_size = (ui_metrics.cell_size.height as usize + self.ui_px(2))
             .clamp(self.ui_px(18), self.ui_px(22));
         let new_button_label_width =
-            self.sidebar_text_width(ui_font, "New Snippet")?.ceil() as usize;
+            self.sidebar_text_width(ui_font, &new_snippet_label)?.ceil() as usize;
         let toolbar_gap = self.ui_px(SNIPPET_ROW_GAP);
         let search_is_active = self.right_sidebar_snippet_focus
             == Some(RightSidebarSnippetField::Search)
@@ -14610,7 +14640,7 @@ impl crate::TermWindow {
         let new_button_label = if collapse_new_button {
             ""
         } else {
-            "New Snippet"
+            &new_snippet_label
         };
         self.paint_snippet_button(
             layers,
@@ -14648,7 +14678,7 @@ impl crate::TermWindow {
                 search_width,
                 self.ui_px(SNIPPET_SEARCH_HEIGHT),
                 Some(SvgIcon::Search),
-                "Search",
+                &crate::i18n::tr("right-search"),
                 &search_input,
                 self.right_sidebar_snippet_focus == Some(RightSidebarSnippetField::Search),
                 UIItemType::RightSidebarSnippetSearch,
@@ -14719,15 +14749,16 @@ impl crate::TermWindow {
                 empty_icon_size,
                 muted_fg,
             )?;
+            let empty_label = if needle.is_empty() {
+                crate::i18n::tr("right-no-snippets")
+            } else {
+                crate::i18n::tr("right-no-matching-snippets")
+            };
             self.paint_sidebar_text(
                 layers,
                 ui_font,
                 ui_metrics,
-                if needle.is_empty() {
-                    "No snippets"
-                } else {
-                    "No matching snippets"
-                },
+                &empty_label,
                 empty_icon_x + empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + 2,
                 list_top + (empty_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
                 content_width.saturating_sub(
@@ -14866,22 +14897,23 @@ impl crate::TermWindow {
         )?;
 
         let title_x = content_x + back_size + self.ui_px(SIDEBAR_INSET);
-        let save_label_width = self.sidebar_text_width(ui_font, "Save")?.ceil() as usize;
+        let save_label = crate::i18n::tr("right-save");
+        let save_label_width = self.sidebar_text_width(ui_font, &save_label)?.ceil() as usize;
         let save_width = (save_label_width + self.ui_px(SIDEBAR_INSET) * 6)
             .clamp(self.ui_px(110), self.ui_px(136))
             .min(content_width.saturating_sub(back_size + self.ui_px(SIDEBAR_INSET) * 2));
         let save_x = content_x + content_width.saturating_sub(save_width);
         let title_width = save_x.saturating_sub(title_x + self.ui_px(SIDEBAR_INSET) * 2);
         let title_label = match self.right_sidebar_snippet_view {
-            RightSidebarSnippetView::EditNew => "New Snippet",
-            RightSidebarSnippetView::EditExisting(_) => "Edit Snippet",
-            RightSidebarSnippetView::List => "Snippet",
+            RightSidebarSnippetView::EditNew => crate::i18n::tr("right-new-snippet"),
+            RightSidebarSnippetView::EditExisting(_) => crate::i18n::tr("right-edit-snippet"),
+            RightSidebarSnippetView::List => crate::i18n::tr("right-snippet"),
         };
         self.paint_sidebar_text(
             layers,
             ui_font,
             ui_metrics,
-            title_label,
+            &title_label,
             title_x,
             header_top,
             title_width,
@@ -14891,7 +14923,7 @@ impl crate::TermWindow {
             layers,
             ui_font,
             ui_metrics,
-            "Personal vault",
+            &crate::i18n::tr("right-personal-vault"),
             title_x,
             header_top + ui_metrics.cell_size.height as usize + 8,
             title_width,
@@ -14911,7 +14943,7 @@ impl crate::TermWindow {
             self.ui_px(SNIPPET_SAVE_BUTTON_HEIGHT)
                 .min(self.ui_px(SNIPPET_EDITOR_HEADER_HEIGHT) - 12),
             None,
-            "Save",
+            &save_label,
             UIItemType::RightSidebarSnippetSave,
             true,
         )?;
@@ -14922,7 +14954,7 @@ impl crate::TermWindow {
             layers,
             ui_font,
             ui_metrics,
-            "Action description",
+            &crate::i18n::tr("right-action-description"),
             content_x,
             title_label_y,
             content_width,
@@ -14942,7 +14974,7 @@ impl crate::TermWindow {
             content_width,
             self.ui_px(SNIPPET_FIELD_HEIGHT),
             None,
-            "Describe this action",
+            &crate::i18n::tr("right-action-description-placeholder"),
             &title_input,
             self.right_sidebar_snippet_focus == Some(RightSidebarSnippetField::Title),
             UIItemType::RightSidebarSnippetTitle,
@@ -14955,7 +14987,7 @@ impl crate::TermWindow {
             layers,
             ui_font,
             ui_metrics,
-            "Script *",
+            &crate::i18n::tr("right-script-required"),
             content_x,
             body_label_y,
             content_width,
@@ -14978,7 +15010,7 @@ impl crate::TermWindow {
             content_width,
             body_height,
             None,
-            "Type command or script",
+            &crate::i18n::tr("right-script-placeholder"),
             &body_input,
             self.right_sidebar_snippet_focus == Some(RightSidebarSnippetField::Body),
             UIItemType::RightSidebarSnippetBody,
@@ -15048,10 +15080,12 @@ impl crate::TermWindow {
 
         let card_pad = self.ui_px(SIDEBAR_INSET) * 2;
         let text_x = x + card_pad;
-        let run_button_width = (self.sidebar_text_width(ui_font, "Run")?.ceil() as usize
+        let run_label = crate::i18n::tr("right-run");
+        let paste_label = crate::i18n::tr("menu-paste");
+        let run_button_width = (self.sidebar_text_width(ui_font, &run_label)?.ceil() as usize
             + self.ui_px(SIDEBAR_INSET) * 4)
             .max(self.ui_px(SNIPPET_ACTION_BUTTON_MIN_WIDTH));
-        let paste_button_width = (self.sidebar_text_width(ui_font, "Paste")?.ceil() as usize
+        let paste_button_width = (self.sidebar_text_width(ui_font, &paste_label)?.ceil() as usize
             + self.ui_px(SIDEBAR_INSET) * 4)
             .max(self.ui_px(SNIPPET_ACTION_BUTTON_MIN_WIDTH));
         let delete_button_size = self.ui_px(SNIPPET_ACTION_BUTTON_HEIGHT);
@@ -15110,7 +15144,7 @@ impl crate::TermWindow {
                 run_button_width,
                 self.ui_px(SNIPPET_ACTION_BUTTON_HEIGHT),
                 None,
-                "Run",
+                &run_label,
                 UIItemType::RightSidebarSnippetRun(snippet.id.clone()),
                 true,
             )?;
@@ -15126,7 +15160,7 @@ impl crate::TermWindow {
                 paste_button_width,
                 self.ui_px(SNIPPET_ACTION_BUTTON_HEIGHT),
                 None,
-                "Paste",
+                &paste_label,
                 UIItemType::RightSidebarSnippetPaste(snippet.id.clone()),
                 true,
             )?;

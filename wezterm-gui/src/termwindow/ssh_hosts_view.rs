@@ -16,6 +16,7 @@ use crate::ui::{
     TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads;
+use fluent_bundle::FluentArgs;
 use std::rc::Rc;
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
@@ -34,14 +35,14 @@ const FIELD_WORKSPACE: usize = 6;
 const FIELD_MOSH_SERVER: usize = 7;
 const BASE_FIELD_COUNT: usize = 7;
 const FIELD_COUNT: usize = 8;
-const FIELD_LABELS: [&str; BASE_FIELD_COUNT] = [
-    "Name",
-    "Host",
-    "Port",
-    "User",
-    "Password",
-    "Identity file",
-    "Workspace",
+const FIELD_LABEL_KEYS: [&str; BASE_FIELD_COUNT] = [
+    "ssh-field-name",
+    "ssh-field-host",
+    "ssh-field-port",
+    "ssh-field-user",
+    "ssh-field-password",
+    "ssh-field-identity",
+    "ssh-field-workspace",
 ];
 
 /// Heading emitted before the field at the given index, so the form reads as
@@ -91,11 +92,17 @@ fn text_input_with(text: String) -> TextInputState {
     input
 }
 
-const FIELD_GROUP_HEADINGS: [(usize, &str); 3] = [
-    (FIELD_NAME, "Connection"),
-    (FIELD_PASSWORD, "Authentication"),
-    (FIELD_WORKSPACE, "Session"),
+const FIELD_GROUP_HEADING_KEYS: [(usize, &str); 3] = [
+    (FIELD_NAME, "ssh-group-connection"),
+    (FIELD_PASSWORD, "ssh-group-authentication"),
+    (FIELD_WORKSPACE, "ssh-group-session"),
 ];
+
+fn ssh_error(id: &'static str, error: impl Into<String>) -> String {
+    let mut args = FluentArgs::new();
+    args.set("error", error.into());
+    crate::i18n::tr_args(id, &args)
+}
 
 const PAD: f32 = 20.0;
 const LEFT_DEFAULT_W: f32 = 500.0;
@@ -358,7 +365,7 @@ impl SshHostsView {
         let form = self.form.as_mut()?;
         let host = form.fields[FIELD_HOST].text().trim().to_string();
         if host.is_empty() {
-            form.error = Some("Host is required".to_string());
+            form.error = Some(crate::i18n::tr("ssh-error-host-required"));
             return None;
         }
         let port = match form.fields[FIELD_PORT].text().trim() {
@@ -366,7 +373,7 @@ impl SshHostsView {
             value => match value.parse::<u16>() {
                 Ok(p) => Some(p),
                 Err(_) => {
-                    form.error = Some("Port must be a number".to_string());
+                    form.error = Some(crate::i18n::tr("ssh-error-port-number"));
                     return None;
                 }
             },
@@ -403,7 +410,7 @@ impl SshHostsView {
                 Ok(encrypted) => Some(encrypted),
                 Err(err) => {
                     log::error!("failed to encrypt SSH password: {err:#}");
-                    form.error = Some(format!("Failed to encrypt password: {err:#}"));
+                    form.error = Some(ssh_error("ssh-error-encrypt", format!("{err:#}")));
                     return None;
                 }
             },
@@ -419,7 +426,7 @@ impl SshHostsView {
         spec.multiplexing = form.multiplexing;
         let mosh_server_command = form.fields[FIELD_MOSH_SERVER].text().trim();
         if spec.use_mosh && mosh_server_command.is_empty() {
-            form.error = Some("Mosh server command is required".to_string());
+            form.error = Some(crate::i18n::tr("ssh-error-mosh-command"));
             return None;
         }
         spec.mosh_server_command = if mosh_server_command.is_empty() {
@@ -432,18 +439,18 @@ impl SshHostsView {
             Some(id) => match ssh_hosts::try_update_host(id, spec) {
                 Ok(true) => id.clone(),
                 Ok(false) => {
-                    form.error = Some("Host no longer exists".to_string());
+                    form.error = Some(crate::i18n::tr("ssh-error-host-missing"));
                     return None;
                 }
                 Err(err) => {
-                    form.error = Some(format!("Failed to save host: {err:#}"));
+                    form.error = Some(ssh_error("ssh-error-save", format!("{err:#}")));
                     return None;
                 }
             },
             None => match ssh_hosts::try_create_host(spec) {
                 Ok(id) => id,
                 Err(err) => {
-                    form.error = Some(format!("Failed to save host: {err:#}"));
+                    form.error = Some(ssh_error("ssh-error-save", format!("{err:#}")));
                     return None;
                 }
             },
@@ -1035,7 +1042,7 @@ impl SshHostsView {
                 font,
                 left_x,
                 list_top + ctx.px(8.0),
-                "No hosts yet. Click + to add.",
+                &crate::i18n::tr("ssh-no-hosts"),
                 palette.muted_text,
                 inner_left_w,
             )?;
@@ -1228,7 +1235,7 @@ impl SshHostsView {
                 font,
                 right_x,
                 oy + h / 2.0 - 10.0,
-                "Select a host, or click + to add a new one.",
+                &crate::i18n::tr("ssh-select-host"),
                 palette.muted_text,
                 right_w.max(0.0),
             )?;
@@ -1257,7 +1264,7 @@ impl SshHostsView {
             font,
             left_x,
             title_y,
-            "SSH Hosts",
+            &crate::i18n::tr("ssh-hosts-title"),
             palette.text,
             inner_left_w,
         )?;
@@ -1303,8 +1310,9 @@ impl SshHostsView {
         // frame, since it may move the caret.
         let search_text_owned = self.search.text().to_string();
         self.resolve_pending_caret_click(ctx, font, Focus::Search, &search_text_owned, text_left);
+        let search_placeholder = crate::i18n::tr("ssh-search");
         let (search_text, search_color) = if search_text_owned.is_empty() && !search_focused {
-            ("Search hosts...", palette.muted_text)
+            (search_placeholder.as_str(), palette.muted_text)
         } else {
             (search_text_owned.as_str(), palette.text)
         };
@@ -1514,7 +1522,9 @@ impl SshHostsView {
             SvgIcon::ChevronDown
         };
         ctx.draw_svg_icon(layers, icon, x + 12.0, y + 12.0, 20.0, palette.muted_text)?;
-        let label = format!("System SSH ({})", self.system_host_count);
+        let mut args = FluentArgs::new();
+        args.set("count", self.system_host_count);
+        let label = crate::i18n::tr_args("ssh-system-hosts", &args);
         ctx.draw_text(
             layers,
             font,
@@ -1719,23 +1729,43 @@ impl SshHostsView {
             font,
             x,
             cur_y,
-            if editing { "Edit Host" } else { "New Host" },
+            &crate::i18n::tr(if editing {
+                "ssh-edit-host"
+            } else {
+                "ssh-new-host"
+            }),
             palette.text,
             field_w,
         )?;
         cur_y += ctx.metrics.cell_size.height as f32 + ctx.px(18.0);
 
         let line_h = ctx.metrics.cell_size.height as f32;
-        for (i, label) in FIELD_LABELS.iter().enumerate() {
-            if let Some(heading) = FIELD_GROUP_HEADINGS
+        for (i, label_key) in FIELD_LABEL_KEYS.iter().enumerate() {
+            if let Some(heading_key) = FIELD_GROUP_HEADING_KEYS
                 .iter()
                 .find_map(|(at, heading)| (*at == i).then_some(*heading))
             {
                 cur_y += ctx.px(if i == 0 { 0.0 } else { 10.0 });
-                ctx.draw_text(layers, font, x, cur_y, heading, palette.text, field_w)?;
+                ctx.draw_text(
+                    layers,
+                    font,
+                    x,
+                    cur_y,
+                    &crate::i18n::tr(heading_key),
+                    palette.text,
+                    field_w,
+                )?;
                 cur_y += line_h + ctx.px(10.0);
             }
-            ctx.draw_text(layers, font, x, cur_y, label, palette.muted_text, field_w)?;
+            ctx.draw_text(
+                layers,
+                font,
+                x,
+                cur_y,
+                &crate::i18n::tr(label_key),
+                palette.muted_text,
+                field_w,
+            )?;
             let input_y = cur_y + line_h + ctx.px(6.0);
             // Mask the password field.
             let masked = if i == FIELD_PASSWORD {
@@ -1782,7 +1812,7 @@ impl SshHostsView {
             font,
             x,
             cur_y + (toggle_h - line_h) / 2.0,
-            "Detect OS on connect",
+            &crate::i18n::tr("ssh-detect-os"),
             palette.text,
             field_w - toggle_w - ctx.px(12.0),
         )?;
@@ -1804,7 +1834,7 @@ impl SshHostsView {
             font,
             x,
             cur_y + (toggle_h - line_h) / 2.0,
-            "Connect with Mosh",
+            &crate::i18n::tr("ssh-use-mosh"),
             palette.text,
             field_w - toggle_w - ctx.px(12.0),
         )?;
@@ -1859,7 +1889,7 @@ impl SshHostsView {
             font,
             x,
             cur_y + (toggle_h - line_h) / 2.0,
-            "ThinkTerm Connect (persistent mux)",
+            &crate::i18n::tr("ssh-use-mux"),
             palette.text,
             field_w - toggle_w - ctx.px(12.0),
         )?;
@@ -1889,7 +1919,7 @@ impl SshHostsView {
             font,
             x,
             cur_y + (advanced_h - line_h) / 2.0,
-            &format!("{disclosure}  Advanced (ssh_config options)"),
+            &format!("{disclosure}  {}", crate::i18n::tr("ssh-advanced")),
             palette.text,
             field_w,
         )?;
@@ -1975,8 +2005,8 @@ impl SshHostsView {
                 cur_y += ctx.px(INPUT_H) + gap;
             }
 
-            let add_label = "+ Add option";
-            let add_w = ctx.measure_text_width(font, add_label) + ctx.px(36.0);
+            let add_label = crate::i18n::tr("ssh-add-option");
+            let add_w = ctx.measure_text_width(font, &add_label) + ctx.px(36.0);
             // Resolved before `self.widgets` is borrowed mutably below.
             let add_state = self.button_state(SshViewAction::AddOption, false);
             draw_button(
@@ -1986,7 +2016,7 @@ impl SshHostsView {
                 &mut self.widgets,
                 palette,
                 ButtonSpec {
-                    label: add_label,
+                    label: &add_label,
                     action: SshViewAction::AddOption,
                     rect: rect(x, cur_y, add_w, ctx.px(BTN_H)),
                     state: add_state,
@@ -2014,13 +2044,17 @@ impl SshHostsView {
         let btn_w = |label: &str| ctx.measure_text_width(font, label) + ctx.px(36.0);
         let mut bx = x;
         for (label, action, primary) in [
-            ("Save & Open", SshViewAction::SaveAndConnect, true),
-            ("Save", SshViewAction::Save, false),
-            ("Cancel", SshViewAction::Cancel, false),
+            (
+                crate::i18n::tr("ssh-save-open"),
+                SshViewAction::SaveAndConnect,
+                true,
+            ),
+            (crate::i18n::tr("ssh-save"), SshViewAction::Save, false),
+            (crate::i18n::tr("ssh-cancel"), SshViewAction::Cancel, false),
         ] {
-            let w = btn_w(label);
+            let w = btn_w(&label);
             let spec = ButtonSpec {
-                label,
+                label: &label,
                 action,
                 rect: rect(bx, cur_y, w, ctx.px(BTN_H)),
                 state: self.button_state(action, primary),
@@ -2085,7 +2119,7 @@ fn open_thread_response(project_id: String) -> ContentViewResponse {
 
 impl ContentView for SshHostsView {
     fn title(&self) -> String {
-        "SSH Hosts".to_string()
+        crate::i18n::tr("ssh-hosts-title")
     }
 
     fn tab_key(&self) -> Option<String> {

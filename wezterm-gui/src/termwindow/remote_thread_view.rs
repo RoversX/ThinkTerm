@@ -8,6 +8,7 @@ use crate::ui::{
     ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads::{self, ThreadConnectionState};
+use fluent_bundle::FluentArgs;
 use mux::Mux;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -24,6 +25,14 @@ const BUTTON_RADIUS: f32 = 14.0;
 const BUTTON_MIN_H: f32 = 52.0;
 const HERO_ICON_SIZE: f32 = 64.0;
 pub(crate) const REMOTE_THREAD_CONTENT_VIEW_KEY_PREFIX: &str = "remote-thread:";
+
+fn remote_thread_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
+    let mut args = FluentArgs::new();
+    for (name, value) in values {
+        args.set(*name, value.clone());
+    }
+    crate::i18n::tr_args(id, &args)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteThreadAction {
@@ -191,12 +200,15 @@ impl RemoteThreadView {
         )?;
 
         let status = match &self.phase {
-            ViewPhase::Connecting { .. } => format!("Connecting to {}…", self.endpoint),
+            ViewPhase::Connecting { .. } => remote_thread_tr(
+                "remote-thread-connecting-to",
+                &[("endpoint", self.endpoint.clone())],
+            ),
             ViewPhase::Failed { message } => message.clone(),
             ViewPhase::Idle => self
                 .stale_message
                 .clone()
-                .unwrap_or_else(|| "This SSH thread is not connected.".to_string()),
+                .unwrap_or_else(|| crate::i18n::tr("remote-thread-not-connected")),
         };
         ctx.draw_text(
             layers,
@@ -276,16 +288,25 @@ impl RemoteThreadView {
             font,
             x + pad,
             y + ctx.px(22.0),
-            "Connection",
+            &crate::i18n::tr("remote-thread-connection"),
             palette.text,
             width - pad * 2.0,
         )?;
         let row_y = y + ctx.px(70.0);
         let label_w = (width * 0.32).clamp(ctx.px(118.0), ctx.px(168.0));
         let details = [
-            ("Project", self.state.project_name.as_str()),
-            ("Endpoint", self.endpoint.as_str()),
-            ("Thread", self.state.thread_name.as_str()),
+            (
+                crate::i18n::tr("remote-thread-project"),
+                self.state.project_name.as_str(),
+            ),
+            (
+                crate::i18n::tr("remote-thread-endpoint"),
+                self.endpoint.as_str(),
+            ),
+            (
+                crate::i18n::tr("remote-thread-thread"),
+                self.state.thread_name.as_str(),
+            ),
         ];
         for (idx, (label, value)) in details.iter().enumerate() {
             let y = row_y + idx as f32 * (line_h + ctx.px(6.0));
@@ -335,30 +356,35 @@ impl RemoteThreadView {
                 let frame =
                     SPINNER_FRAMES[(elapsed.as_millis() / 120) as usize % SPINNER_FRAMES.len()];
                 (
-                    format!("{frame}  Connecting…"),
-                    format!(
-                        "Transport: {} · elapsed {}s",
-                        self.transport_label(),
-                        elapsed.as_secs()
+                    remote_thread_tr("remote-thread-connecting", &[("frame", frame.to_string())]),
+                    remote_thread_tr(
+                        "remote-thread-transport-elapsed",
+                        &[
+                            ("transport", self.transport_label().to_string()),
+                            ("seconds", elapsed.as_secs().to_string()),
+                        ],
                     ),
                 )
             }
             ViewPhase::Failed { .. } => (
-                "The connection failed.".to_string(),
-                format!(
-                    "Transport: {} · retry, or cancel to dismiss.",
-                    self.transport_label()
+                crate::i18n::tr("remote-thread-failed"),
+                remote_thread_tr(
+                    "remote-thread-failed-detail",
+                    &[("transport", self.transport_label().to_string())],
                 ),
             ),
             ViewPhase::Idle => {
                 let detail = if self.uses_mosh {
-                    "Starts mosh-server over SSH, then opens mosh-client."
+                    crate::i18n::tr("remote-thread-mosh-detail")
                 } else {
-                    "Opens a ThinkTerm SSH session."
+                    crate::i18n::tr("remote-thread-ssh-detail")
                 };
                 (
-                    format!("Transport: {}", self.transport_label()),
-                    detail.to_string(),
+                    remote_thread_tr(
+                        "remote-thread-transport",
+                        &[("transport", self.transport_label().to_string())],
+                    ),
+                    detail,
                 )
             }
         };
@@ -394,17 +420,17 @@ impl RemoteThreadView {
         button_h: f32,
     ) -> anyhow::Result<()> {
         // (label, icon, action, primary, enabled)
-        let buttons: Vec<(&str, SvgIcon, RemoteThreadAction, bool, bool)> = match &self.phase {
+        let buttons: Vec<(String, SvgIcon, RemoteThreadAction, bool, bool)> = match &self.phase {
             ViewPhase::Idle => vec![
                 (
-                    "Connect",
+                    crate::i18n::tr("remote-thread-connect"),
                     SvgIcon::Link2,
                     RemoteThreadAction::Connect,
                     true,
                     self.can_connect(),
                 ),
                 (
-                    "Delete Thread",
+                    crate::i18n::tr("remote-thread-delete"),
                     SvgIcon::Trash2,
                     RemoteThreadAction::EndThread,
                     false,
@@ -413,7 +439,7 @@ impl RemoteThreadView {
             ],
             ViewPhase::Connecting { .. } => {
                 vec![(
-                    "Cancel",
+                    crate::i18n::tr("remote-thread-cancel"),
                     SvgIcon::X,
                     RemoteThreadAction::Cancel,
                     false,
@@ -422,14 +448,14 @@ impl RemoteThreadView {
             }
             ViewPhase::Failed { .. } => vec![
                 (
-                    "Retry",
+                    crate::i18n::tr("remote-thread-retry"),
                     SvgIcon::RotateCcw,
                     RemoteThreadAction::Retry,
                     true,
                     self.can_connect(),
                 ),
                 (
-                    "Cancel",
+                    crate::i18n::tr("remote-thread-cancel"),
                     SvgIcon::X,
                     RemoteThreadAction::Cancel,
                     false,
@@ -439,14 +465,14 @@ impl RemoteThreadView {
         };
         let mut bx = x;
         for (label, icon, action, primary, enabled) in buttons {
-            let w = (ctx.measure_text_width(font, label) + ctx.px(92.0)).max(ctx.px(168.0));
+            let w = (ctx.measure_text_width(font, &label) + ctx.px(92.0)).max(ctx.px(168.0));
             self.paint_action_button(
                 ctx,
                 layers,
                 font,
                 palette,
                 rect(bx, y, w, button_h),
-                label,
+                &label,
                 icon,
                 action,
                 primary,
@@ -634,7 +660,7 @@ impl ContentView for RemoteThreadView {
         let Some(state) =
             workspace_threads::thread_connection_state(&self.state.thread_id, &live_workspaces)
         else {
-            self.stale_message = Some("This saved SSH thread no longer exists.".to_string());
+            self.stale_message = Some(crate::i18n::tr("remote-thread-stale"));
             return ContentViewResponse::Redraw;
         };
 
@@ -710,7 +736,7 @@ fn remote_thread_snapshot(state: ThreadConnectionState) -> RemoteThreadSnapshot 
         .map(format_endpoint)
         .unwrap_or_else(|| state.project_name.clone());
     let stale_message = if state.is_remote && spec.is_none() {
-        Some("The saved SSH host for this thread no longer exists.".to_string())
+        Some(crate::i18n::tr("remote-thread-host-stale"))
     } else {
         None
     };

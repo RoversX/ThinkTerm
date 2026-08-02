@@ -755,15 +755,12 @@ impl crate::TermWindow {
         let row_text_x = row_icon_x + row_icon_size + self.ui_px(SIDEBAR_ICON_GAP);
         let row_text_max =
             (row_x + row_width).saturating_sub(row_text_x + self.ui_px(SIDEBAR_INSET));
-        let row_label = self.ellipsize_ui_text(
-            ui_font,
-            if reconnect_in_flight {
-                "Connecting…"
-            } else {
-                "Reconnect"
-            },
-            row_text_max,
-        )?;
+        let reconnect_label = if reconnect_in_flight {
+            crate::i18n::tr("sidebar-connecting")
+        } else {
+            crate::i18n::tr("sidebar-reconnect")
+        };
+        let row_label = self.ellipsize_ui_text(ui_font, &reconnect_label, row_text_max)?;
         let row_label = row_label.into_owned();
         self.paint_sidebar_text(
             layers,
@@ -1082,7 +1079,7 @@ impl crate::TermWindow {
             .saturating_sub(self.ui_px(SIDEBAR_INSET) + space_action_icon_size + top_action_gap);
         let space_text_x = space_icon_x + space_icon_size + top_action_gap;
         let space_name = crate::workspace_threads::active_space_name(&self.active_space_id)
-            .unwrap_or_else(|| "Default".to_string());
+            .unwrap_or_else(|| crate::i18n::tr("sidebar-default-space"));
         let space_title = self.sidebar_space_title(&self.active_space_id, &space_name);
         let space_label = self.ellipsize_ui_text(
             &ui_font,
@@ -1235,8 +1232,9 @@ impl crate::TermWindow {
         let top_action_icon_size = header_icon_size.min(top_action_height.saturating_sub(14));
         let top_action_text_max_width = top_action_width
             .saturating_sub(top_action_icon_size + top_action_gap + self.ui_px(SIDEBAR_INSET) * 2);
+        let top_action_label_text = crate::i18n::tr("sidebar-new-thread");
         let top_action_label =
-            self.ellipsize_ui_text(&ui_font, "New Thread", top_action_text_max_width)?;
+            self.ellipsize_ui_text(&ui_font, &top_action_label_text, top_action_text_max_width)?;
         let top_action_text_width = self
             .sidebar_text_width(&ui_font, top_action_label.as_ref())?
             .ceil()
@@ -1354,7 +1352,7 @@ impl crate::TermWindow {
                     layers,
                     &ui_font,
                     ui_metrics,
-                    "Pinned",
+                    &crate::i18n::tr("sidebar-pinned"),
                     label_text_x,
                     label_y + ((session_row_height.saturating_sub(ui_cell_height)) / 2),
                     item_x
@@ -1540,7 +1538,7 @@ impl crate::TermWindow {
                     layers,
                     &ui_font,
                     ui_metrics,
-                    "Workspaces",
+                    &crate::i18n::tr("sidebar-workspaces"),
                     item_x + self.ui_px(SIDEBAR_INSET),
                     label_y + ((session_row_height.saturating_sub(ui_cell_height)) / 2),
                     button_x.saturating_sub(item_x + self.ui_px(SIDEBAR_INSET) * 2),
@@ -2326,7 +2324,7 @@ impl crate::TermWindow {
                 layers,
                 &ui_font,
                 ui_metrics,
-                "Settings",
+                &crate::i18n::tr("sidebar-settings"),
                 settings_text_x,
                 settings_text_y,
                 settings_action_x.saturating_sub(settings_text_x + self.ui_px(SIDEBAR_INSET)),

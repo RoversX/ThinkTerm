@@ -173,13 +173,6 @@ impl Default for NativeBottomQuoteMode {
 }
 
 impl NativeBottomQuoteMode {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Timed => "Timed",
-            Self::PseudoRandom => "Pseudo-random",
-        }
-    }
-
     pub(crate) fn next(self) -> Self {
         match self {
             Self::Timed => Self::PseudoRandom,
@@ -311,6 +304,15 @@ impl Default for NativeWorkspaceSettings {
     }
 }
 
+/// Application-wide UI localization. `None` identifies a pre-localization
+/// settings file so the effective preference can be migrated from the legacy
+/// Onboarding-only value without mutating Onboarding itself.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeLocalizationSettings {
+    pub(crate) language: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct ThinkTermNativeSettings {
@@ -320,6 +322,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) chrome: NativeChromeSettings,
     pub(crate) developer: NativeDeveloperSettings,
     pub(crate) onboarding: NativeOnboardingSettings,
+    pub(crate) localization: NativeLocalizationSettings,
     pub(crate) compatibility: NativeCompatibilitySettings,
     pub(crate) window: NativeWindowSettings,
     pub(crate) workspaces: NativeWorkspaceSettings,
@@ -334,6 +337,7 @@ impl Default for ThinkTermNativeSettings {
             chrome: NativeChromeSettings::default(),
             developer: NativeDeveloperSettings::default(),
             onboarding: NativeOnboardingSettings::default(),
+            localization: NativeLocalizationSettings::default(),
             compatibility: NativeCompatibilitySettings::default(),
             window: NativeWindowSettings::default(),
             workspaces: NativeWorkspaceSettings::default(),
@@ -491,6 +495,7 @@ pub(crate) fn effective_appearance() -> Appearance {
 }
 
 pub(crate) fn apply_to_app(settings: &ThinkTermNativeSettings) {
+    crate::i18n::activate_from_settings(settings);
     if let Some(conn) = Connection::get() {
         conn.set_preferred_appearance(settings.appearance.theme_mode.preferred_app_appearance());
     }
@@ -778,6 +783,28 @@ mod tests {
         assert_eq!(
             settings.workspaces.remote_sftp_idle_minutes,
             DEFAULT_REMOTE_SFTP_IDLE_MINUTES
+        );
+    }
+
+    #[test]
+    fn older_settings_leave_application_language_unset_for_legacy_migration() {
+        let settings: ThinkTermNativeSettings = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert_eq!(settings.localization.language, None);
+    }
+
+    #[test]
+    fn application_language_round_trips_independently_of_onboarding() {
+        let mut settings = ThinkTermNativeSettings::default();
+        settings.onboarding.language = NativeLanguagePreference::Japanese;
+        settings.localization.language = Some("fr-FR".to_string());
+
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let decoded: ThinkTermNativeSettings = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.localization.language.as_deref(), Some("fr-FR"));
+        assert_eq!(
+            decoded.onboarding.language,
+            NativeLanguagePreference::Japanese
         );
     }
 }

@@ -34,10 +34,11 @@ use window::{
 };
 
 use crate::native_settings::{
-    NativeAppIcon, NativeRendererBackend, NativeThemeMode, ThinkTermNativeSettings,
-    DEFAULT_HOME_FONT_SIZE, DEFAULT_PANE_HEADER_FONT_SIZE, DEFAULT_SETTINGS_FONT_SIZE,
-    DEFAULT_SIDEBAR_FONT_SIZE, DEFAULT_TAB_FONT_SIZE,
+    NativeAppIcon, NativeBottomQuoteMode, NativeRendererBackend, NativeThemeMode,
+    ThinkTermNativeSettings, DEFAULT_HOME_FONT_SIZE, DEFAULT_PANE_HEADER_FONT_SIZE,
+    DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE, DEFAULT_TAB_FONT_SIZE,
 };
+use fluent_bundle::FluentArgs;
 
 // All chrome geometry below is authored in 2x macOS backing pixels.
 // settings_ui_scale_for_dpi maps it onto other platforms by treating the
@@ -163,18 +164,18 @@ const BASE_SECTIONS: &[SettingsSection] = &[
 const DEVELOPER_SECTIONS: &[SettingsSection] = &[SettingsSection::UiKit, SettingsSection::Memory];
 
 impl SettingsSection {
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::General => "General",
-            Self::Appearance => "Appearance",
-            Self::Terminal => "Terminal",
-            Self::Workspaces => "Workspaces",
-            Self::Keymap => "Keymap",
-            Self::Compatibility => "Compatibility",
-            Self::Developer => "Developer",
-            Self::UiKit => "UI Kit",
-            Self::Memory => "Memory",
-            Self::About => "About",
+            Self::General => crate::i18n::tr("settings-section-general"),
+            Self::Appearance => crate::i18n::tr("settings-section-appearance"),
+            Self::Terminal => crate::i18n::tr("settings-section-terminal"),
+            Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
+            Self::Keymap => crate::i18n::tr("settings-section-keymap"),
+            Self::Compatibility => crate::i18n::tr("settings-section-compatibility"),
+            Self::Developer => crate::i18n::tr("settings-section-developer"),
+            Self::UiKit => "UI Kit".to_string(),
+            Self::Memory => "Memory".to_string(),
+            Self::About => crate::i18n::tr("settings-section-about"),
         }
     }
 
@@ -196,6 +197,7 @@ impl SettingsSection {
     fn search_terms(self) -> &'static [&'static str] {
         match self {
             Self::General => &[
+                "Language",
                 "Config Source",
                 "ThinkTerm Native Settings",
                 "Theme Mode",
@@ -304,6 +306,60 @@ impl SettingsSection {
             Self::About => &["About", "Version", "ThinkTerm"],
         }
     }
+
+    fn matches_search(self, query: &str) -> bool {
+        self.label().to_lowercase().contains(query)
+            || self
+                .search_terms()
+                .iter()
+                .any(|term| term.to_lowercase().contains(query))
+            || (self == Self::General
+                && crate::i18n::tr("settings-language")
+                    .to_lowercase()
+                    .contains(query))
+    }
+}
+
+#[cfg(test)]
+mod settings_search_tests {
+    use super::*;
+
+    #[test]
+    fn general_is_searchable_by_the_language_row_label() {
+        assert!(SettingsSection::General.matches_search("language"));
+        let localized_label = crate::i18n::tr("settings-language").to_lowercase();
+        assert!(SettingsSection::General.matches_search(&localized_label));
+    }
+}
+
+fn localized_theme_mode_label(mode: NativeThemeMode) -> String {
+    crate::i18n::tr(match mode {
+        NativeThemeMode::System => "settings-theme-system",
+        NativeThemeMode::Light => "settings-theme-light",
+        NativeThemeMode::Dark => "settings-theme-dark",
+    })
+}
+
+fn localized_app_icon_label(icon: NativeAppIcon) -> String {
+    crate::i18n::tr(match icon {
+        NativeAppIcon::Simple => "settings-app-icon-simple",
+        NativeAppIcon::Classic => "settings-app-icon-classic",
+    })
+}
+
+fn localized_quote_mode_label(mode: NativeBottomQuoteMode) -> String {
+    crate::i18n::tr(match mode {
+        NativeBottomQuoteMode::Timed => "settings-quote-mode-timed",
+        NativeBottomQuoteMode::PseudoRandom => "settings-quote-mode-random",
+    })
+}
+
+fn settings_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
+    let mut args = FluentArgs::new();
+    for (name, value) in values {
+        args.set(*name, value.clone());
+    }
+    crate::i18n::tr_args(id, &args)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +387,8 @@ enum SettingsAction {
     CopyInputDiagnostics,
     ToggleThemeModeMenu,
     SetThemeMode(NativeThemeMode),
+    ToggleLanguageMenu,
+    SetLanguage(&'static str),
     ToggleAppIconMenu,
     SetAppIcon(NativeAppIcon),
     ToggleMainRendererMenu,
@@ -377,6 +435,7 @@ enum SettingsDrag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsDropdown {
+    Language,
     ThemeMode,
     AppIcon,
     MainRenderer,
@@ -723,28 +782,26 @@ const TYPOGRAPHY_FONT_AREAS: [ChromeFontArea; 6] = [
 ];
 
 impl ChromeFontArea {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Settings => "Settings UI Font Size",
-            Self::Home => "Home Font Size",
-            Self::RightSidebar => "Right Sidebar Font Size",
-            Self::Sidebar => "Workspace Sidebar Font Size",
-            Self::TabBar => "Tab Bar Font Size",
-            Self::PaneHeader => "Pane Header Font Size",
-        }
+    fn localized_label(self) -> String {
+        crate::i18n::tr(match self {
+            Self::Settings => "settings-font-size-settings",
+            Self::Home => "settings-font-size-home",
+            Self::RightSidebar => "settings-font-size-right-sidebar",
+            Self::Sidebar => "settings-font-size-workspace-sidebar",
+            Self::TabBar => "settings-font-size-tab-bar",
+            Self::PaneHeader => "settings-font-size-pane-header",
+        })
     }
 
-    fn description(self) -> &'static str {
-        match self {
-            Self::Settings => "Controls the Settings window chrome and content text.",
-            Self::Home => "Controls the main home/content view text.",
-            Self::RightSidebar => {
-                "Follows Home Font Size until set — files, notes and snippets panel."
-            }
-            Self::Sidebar => "Saved separately for the main workspace sidebar.",
-            Self::TabBar => "Saved separately for the top terminal tab bar.",
-            Self::PaneHeader => "Saved separately for split-pane header labels.",
-        }
+    fn localized_description(self) -> String {
+        crate::i18n::tr(match self {
+            Self::Settings => "settings-font-size-settings-description",
+            Self::Home => "settings-font-size-home-description",
+            Self::RightSidebar => "settings-font-size-right-sidebar-description",
+            Self::Sidebar => "settings-font-size-workspace-sidebar-description",
+            Self::TabBar => "settings-font-size-tab-bar-description",
+            Self::PaneHeader => "settings-font-size-pane-header-description",
+        })
     }
 
     fn default_size(self) -> f64 {
@@ -1391,9 +1448,10 @@ impl SettingsWindow {
             origin: GeometryOrigin::default(),
         };
 
+        let title = crate::i18n::tr("settings-window-title");
         let window = Window::new_window(
             "thinkterm-settings",
-            "ThinkTerm Settings",
+            &title,
             geometry,
             Some(&config),
             Rc::clone(&fonts),
@@ -1405,7 +1463,7 @@ impl SettingsWindow {
         )
         .await?;
 
-        window.set_title("ThinkTerm Settings");
+        window.set_title(&title);
         let webgpu = match WebGpuState::new(&window, dimensions, &config).await {
             Ok(webgpu) => Rc::new(webgpu),
             Err(err) => {
@@ -1636,6 +1694,8 @@ impl SettingsWindow {
                     Some(
                         SettingsAction::ToggleThemeModeMenu
                         | SettingsAction::SetThemeMode(_)
+                        | SettingsAction::ToggleLanguageMenu
+                        | SettingsAction::SetLanguage(_)
                         | SettingsAction::ToggleAppIconMenu
                         | SettingsAction::SetAppIcon(_)
                         | SettingsAction::ToggleMainRendererMenu
@@ -2229,19 +2289,28 @@ impl SettingsWindow {
         let current = self.current_bottom_quote_interval_minutes() as i32;
         let value = (current + delta).clamp(1, 24 * 60) as u32;
         self.native_settings.terminal.bottom_quote_interval_minutes = Some(value);
-        self.save_and_apply_bottom_quote_settings(format!(
-            "Bottom quote interval is now {}.",
-            Self::format_bottom_quote_interval(value)
+        self.save_and_apply_bottom_quote_settings(settings_tr(
+            "settings-status-value-now",
+            &[
+                ("setting", crate::i18n::tr("settings-quote-interval")),
+                ("value", Self::format_bottom_quote_interval(value)),
+            ],
         ));
     }
 
     fn reset_bottom_quote_interval(&mut self) {
         self.native_settings.terminal.bottom_quote_interval_minutes = None;
-        self.save_and_apply_bottom_quote_settings(format!(
-            "Bottom quote interval reset to {}.",
-            Self::format_bottom_quote_interval(
-                crate::native_settings::DEFAULT_BOTTOM_QUOTE_INTERVAL_MINUTES
-            )
+        self.save_and_apply_bottom_quote_settings(settings_tr(
+            "settings-status-value-reset",
+            &[
+                ("setting", crate::i18n::tr("settings-quote-interval")),
+                (
+                    "value",
+                    Self::format_bottom_quote_interval(
+                        crate::native_settings::DEFAULT_BOTTOM_QUOTE_INTERVAL_MINUTES,
+                    ),
+                ),
+            ],
         ));
     }
 
@@ -2268,10 +2337,14 @@ impl SettingsWindow {
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
                 crate::termwindow::remote_files::update_remote_connection_idle_timeout(value);
-                self.status = format!("Remote Files idle timeout is now {value} minutes.");
+                self.status =
+                    settings_tr("settings-status-sftp-idle", &[("count", value.to_string())]);
             }
             Err(err) => {
-                self.status = format!("Unable to save Remote Files idle timeout: {err:#}");
+                self.status = settings_tr(
+                    "settings-status-sftp-error",
+                    &[("error", format!("{err:#}"))],
+                );
             }
         }
     }
@@ -2289,8 +2362,11 @@ impl SettingsWindow {
             return configured.to_string();
         }
         match crate::native_settings::effective_remote_download_directory() {
-            Some(path) => format!("{} (system default)", path.display()),
-            None => "No Downloads folder found".to_string(),
+            Some(path) => settings_tr(
+                "settings-system-default-path",
+                &[("path", path.display().to_string())],
+            ),
+            None => crate::i18n::tr("settings-no-downloads-folder"),
         }
     }
 
@@ -2303,8 +2379,8 @@ impl SettingsWindow {
         let notify = window.clone();
         window.pick_folder_async_with_options(
             FolderPickerOptions {
-                title: "Choose a download folder".to_string(),
-                prompt: "Choose".to_string(),
+                title: crate::i18n::tr("settings-download-picker-title"),
+                prompt: crate::i18n::tr("common-choose"),
             },
             Box::new(move |path| {
                 // Cancelling the picker must leave the setting alone, so only
@@ -2330,13 +2406,16 @@ impl SettingsWindow {
         match crate::native_settings::set_remote_download_directory(path) {
             Ok(()) => {
                 self.native_settings = crate::native_settings::load();
-                self.status = format!(
-                    "Downloads are saved to {}",
-                    self.remote_download_directory_label()
+                self.status = settings_tr(
+                    "settings-status-download-path",
+                    &[("path", self.remote_download_directory_label())],
                 );
             }
             Err(err) => {
-                self.status = format!("Unable to save the download folder: {err:#}");
+                self.status = settings_tr(
+                    "settings-status-download-error",
+                    &[("error", format!("{err:#}"))],
+                );
             }
         }
     }
@@ -2367,19 +2446,28 @@ impl SettingsWindow {
     fn step_bottom_quote_font_size(&mut self, delta: f64) {
         let value = (self.current_bottom_quote_font_size() + delta).clamp(6.0, 20.0);
         self.native_settings.terminal.bottom_quote_font_size = Some(value);
-        self.save_and_apply_bottom_quote_settings(format!(
-            "Bottom quote font size is now {}.",
-            Self::format_bottom_quote_font_size(value)
+        self.save_and_apply_bottom_quote_settings(settings_tr(
+            "settings-status-value-now",
+            &[
+                ("setting", crate::i18n::tr("settings-quote-font-size")),
+                ("value", Self::format_bottom_quote_font_size(value)),
+            ],
         ));
     }
 
     fn reset_bottom_quote_font_size(&mut self) {
         self.native_settings.terminal.bottom_quote_font_size = None;
-        self.save_and_apply_bottom_quote_settings(format!(
-            "Bottom quote font size reset to {}.",
-            Self::format_bottom_quote_font_size(
-                crate::native_settings::DEFAULT_BOTTOM_QUOTE_FONT_SIZE
-            )
+        self.save_and_apply_bottom_quote_settings(settings_tr(
+            "settings-status-value-reset",
+            &[
+                ("setting", crate::i18n::tr("settings-quote-font-size")),
+                (
+                    "value",
+                    Self::format_bottom_quote_font_size(
+                        crate::native_settings::DEFAULT_BOTTOM_QUOTE_FONT_SIZE,
+                    ),
+                ),
+            ],
         ));
     }
 
@@ -2467,17 +2555,32 @@ impl SettingsWindow {
             Ok(()) => {
                 if area == ChromeFontArea::Settings {
                     if let Err(err) = self.reload_settings_fonts() {
-                        self.status = format!("Unable to load Settings font: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-save-error",
+                            &[
+                                ("setting", area.localized_label()),
+                                ("error", format!("{err:#}")),
+                            ],
+                        );
                         return;
                     }
                 }
                 if let Some(front_end) = crate::frontend::try_front_end() {
                     front_end.invalidate_all_windows();
                 }
-                self.status = format!("{} saved.", area.label());
+                self.status = settings_tr(
+                    "settings-status-saved",
+                    &[("setting", area.localized_label())],
+                );
             }
             Err(err) => {
-                self.status = format!("Unable to save {}: {err:#}", area.label());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[
+                        ("setting", area.localized_label()),
+                        ("error", format!("{err:#}")),
+                    ],
+                );
             }
         }
     }
@@ -2504,11 +2607,13 @@ impl SettingsWindow {
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
                 self.apply_terminal_font_size_to_open_windows();
-                self.status =
-                    "Terminal settings saved; font size applied to open windows.".to_string();
+                self.status = crate::i18n::tr("settings-status-terminal-saved");
             }
             Err(err) => {
-                self.status = format!("Unable to save terminal settings: {err:#}");
+                self.status = settings_tr(
+                    "settings-status-terminal-error",
+                    &[("error", format!("{err:#}"))],
+                );
             }
         }
     }
@@ -2522,7 +2627,10 @@ impl SettingsWindow {
                 self.status = status;
             }
             Err(err) => {
-                self.status = format!("Unable to save bottom quote setting: {err:#}");
+                self.status = settings_tr(
+                    "settings-status-quote-error",
+                    &[("error", format!("{err:#}"))],
+                );
             }
         }
     }
@@ -2802,13 +2910,16 @@ impl SettingsWindow {
                 match crate::native_settings::save(&self.native_settings) {
                     Ok(()) => {
                         self.status = if self.native_settings.window.restore_main_window_frame {
-                            "Main window frame restore enabled for new macOS windows.".to_string()
+                            crate::i18n::tr("settings-status-window-restore-on")
                         } else {
-                            "Main window frame restore disabled for new macOS windows.".to_string()
+                            crate::i18n::tr("settings-status-window-restore-off")
                         };
                     }
                     Err(err) => {
-                        self.status = format!("Unable to save window restore setting: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-window-restore-error",
+                            &[("error", format!("{err:#}"))],
+                        );
                     }
                 }
             }
@@ -2825,13 +2936,16 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 match crate::native_settings::save(&self.native_settings) {
                     Ok(()) => {
-                        self.status = format!(
-                            "Main window renderer set to {}; restart ThinkTerm to apply it.",
-                            renderer.label()
+                        self.status = settings_tr(
+                            "settings-status-renderer",
+                            &[("renderer", renderer.label().to_string())],
                         );
                     }
                     Err(err) => {
-                        self.status = format!("Unable to save renderer setting: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-renderer-error",
+                            &[("error", format!("{err:#}"))],
+                        );
                     }
                 }
             }
@@ -2839,16 +2953,19 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 match Self::restart_application() {
                     Ok(()) => {
-                        self.status = "Restarting ThinkTerm...".to_string();
+                        self.status = crate::i18n::tr("settings-status-restarting");
                     }
                     Err(err) => {
-                        self.status = format!("Unable to restart ThinkTerm: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-restart-error",
+                            &[("error", format!("{err:#}"))],
+                        );
                     }
                 }
             }
             SettingsAction::QuitApplication => {
                 self.ui.open_dropdown = None;
-                self.status = "Quitting ThinkTerm...".to_string();
+                self.status = crate::i18n::tr("settings-status-quitting");
                 if let Some(conn) = Connection::get() {
                     conn.terminate_message_loop();
                 }
@@ -2858,9 +2975,9 @@ impl SettingsWindow {
                 self.native_settings.terminal.bottom_quote_enabled =
                     !self.native_settings.terminal.bottom_quote_enabled;
                 let status = if self.native_settings.terminal.bottom_quote_enabled {
-                    "Bottom quote enabled.".to_string()
+                    crate::i18n::tr("settings-status-quote-enabled")
                 } else {
-                    "Bottom quote disabled.".to_string()
+                    crate::i18n::tr("settings-status-quote-disabled")
                 };
                 self.save_and_apply_bottom_quote_settings(status);
             }
@@ -2868,9 +2985,17 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 self.native_settings.terminal.bottom_quote_mode =
                     self.native_settings.terminal.bottom_quote_mode.next();
-                self.save_and_apply_bottom_quote_settings(format!(
-                    "Bottom quote rotation is now {}.",
-                    self.native_settings.terminal.bottom_quote_mode.label()
+                self.save_and_apply_bottom_quote_settings(settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", crate::i18n::tr("settings-quote-rotation")),
+                        (
+                            "value",
+                            localized_quote_mode_label(
+                                self.native_settings.terminal.bottom_quote_mode,
+                            ),
+                        ),
+                    ],
                 ));
             }
             SettingsAction::DecreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(-1.0),
@@ -2892,11 +3017,17 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 match crate::bottom_quotes::ensure_quotes_file() {
                     Ok(path) => {
-                        self.status = format!("Opening bottom quotes JSON {}", path.display());
+                        self.status = settings_tr(
+                            "settings-status-opening-quotes",
+                            &[("path", path.display().to_string())],
+                        );
                         Self::open_path(path);
                     }
                     Err(err) => {
-                        self.status = format!("Unable to prepare bottom quotes JSON: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-open-quotes-error",
+                            &[("error", format!("{err:#}"))],
+                        );
                     }
                 }
             }
@@ -2907,10 +3038,16 @@ impl SettingsWindow {
                         if let Some(front_end) = crate::frontend::try_front_end() {
                             front_end.invalidate_all_windows();
                         }
-                        self.status = format!("Reset bottom quotes JSON {}", path.display());
+                        self.status = settings_tr(
+                            "settings-status-reset-quotes",
+                            &[("path", path.display().to_string())],
+                        );
                     }
                     Err(err) => {
-                        self.status = format!("Unable to reset bottom quotes JSON: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-reset-quotes-error",
+                            &[("error", format!("{err:#}"))],
+                        );
                     }
                 }
             }
@@ -3073,6 +3210,50 @@ impl SettingsWindow {
                         Some(SettingsDropdown::ThemeMode)
                     };
             }
+            SettingsAction::ToggleLanguageMenu => {
+                self.ui.open_dropdown = if self.ui.open_dropdown == Some(SettingsDropdown::Language)
+                {
+                    None
+                } else {
+                    Some(SettingsDropdown::Language)
+                };
+            }
+            SettingsAction::SetLanguage(preference) => {
+                self.ui.open_dropdown = None;
+                let previous_language = self.native_settings.localization.language.clone();
+                self.native_settings.localization.language = Some(preference.to_string());
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        let locale = crate::i18n::activate_preference(preference);
+                        self.status.clear();
+                        self.ui.sidebar_scroll.reset();
+                        self.sync_selected_section_with_search();
+                        window.set_title(&crate::i18n::tr("settings-window-title"));
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            for gui_window in front_end.gui_windows() {
+                                gui_window.window.notify(
+                                    crate::termwindow::TermWindowNotif::Apply(Box::new(
+                                        |term_window| {
+                                            term_window.dismiss_fallback_context_menu();
+                                        },
+                                    )),
+                                );
+                            }
+                            front_end.invalidate_all_windows();
+                        }
+                        let mut args = FluentArgs::new();
+                        args.set("language", locale);
+                        self.status = crate::i18n::tr_args("settings-language-changed", &args);
+                        window.invalidate();
+                    }
+                    Err(err) => {
+                        self.native_settings.localization.language = previous_language;
+                        let mut args = FluentArgs::new();
+                        args.set("error", format!("{err:#}"));
+                        self.status = crate::i18n::tr_args("settings-language-save-error", &args);
+                    }
+                }
+            }
             SettingsAction::SetThemeMode(mode) => {
                 self.native_settings.appearance.theme_mode = mode;
                 self.ui.open_dropdown = None;
@@ -3082,10 +3263,14 @@ impl SettingsWindow {
                         if let Some(front_end) = crate::frontend::try_front_end() {
                             front_end.invalidate_all_windows();
                         }
-                        self.status = format!("Theme mode is now {}.", mode.label());
+                        let mut args = FluentArgs::new();
+                        args.set("mode", localized_theme_mode_label(mode));
+                        self.status = crate::i18n::tr_args("settings-theme-changed", &args);
                     }
                     Err(err) => {
-                        self.status = format!("Unable to save theme mode: {err:#}");
+                        let mut args = FluentArgs::new();
+                        args.set("error", format!("{err:#}"));
+                        self.status = crate::i18n::tr_args("settings-theme-save-error", &args);
                     }
                 }
             }
@@ -3103,10 +3288,16 @@ impl SettingsWindow {
                 match crate::native_settings::save(&self.native_settings) {
                     Ok(()) => {
                         crate::native_settings::apply_to_app(&self.native_settings);
-                        self.status = format!("App icon is now {}.", icon.label());
+                        self.status = settings_tr(
+                            "settings-status-app-icon",
+                            &[("icon", localized_app_icon_label(icon))],
+                        );
                     }
                     Err(err) => {
-                        self.status = format!("Unable to save app icon: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-app-icon-error",
+                            &[("error", format!("{err:#}"))],
+                        );
                     }
                 }
             }
@@ -3535,7 +3726,7 @@ impl SettingsWindow {
         self.paint_text_input(
             layers,
             TextInputSpec {
-                placeholder: "Search settings...",
+                placeholder: &crate::i18n::tr("settings-search-placeholder"),
                 text: &search_text,
                 rect: search_rect,
                 focused: self.ui.interaction.focused == Some(SettingsAction::SearchInput),
@@ -3636,7 +3827,7 @@ impl SettingsWindow {
                 &ui_font,
                 tokens.sidebar_padding + 12.0,
                 list_top + self.ui_px(18.0),
-                "No settings found",
+                &crate::i18n::tr("settings-search-no-results"),
                 palette.muted_text,
                 sidebar_width - tokens.sidebar_padding * 2.0 - 24.0,
             )?;
@@ -3694,12 +3885,13 @@ impl SettingsWindow {
                 sidebar_icon_size as f32,
                 text_color,
             )?;
+            let section_label = section.label();
             self.draw_text(
                 layers,
                 &nav_font,
                 row_x + self.ui_px(56.0),
                 self.control_text_y(row_y, self.ui_px(NAV_ROW_HEIGHT)),
-                section.label(),
+                &section_label,
                 text_color,
                 row_width - self.ui_px(76.0),
             )?;
@@ -3740,12 +3932,13 @@ impl SettingsWindow {
         );
 
         let scroll = self.ui.content_scroll.offset;
+        let selected_label = self.selected.label();
         self.draw_text(
             layers,
             &title_font,
             x,
             self.ui_px(CONTENT_TITLE_Y) - scroll,
-            self.selected.label(),
+            &selected_label,
             palette.title,
             max_width,
         )?;
@@ -3760,7 +3953,7 @@ impl SettingsWindow {
                 layers,
                 &ui_font,
                 x,
-                "Keyboard shortcuts and command palette actions.",
+                &crate::i18n::tr("settings-keymap-description"),
                 max_width,
             )?,
             SettingsSection::Developer => self.paint_developer(layers, x, max_width)?,
@@ -3770,7 +3963,7 @@ impl SettingsWindow {
                 layers,
                 &ui_font,
                 x,
-                "ThinkTerm version, project information, and app metadata.",
+                &crate::i18n::tr("settings-about-description"),
                 max_width,
             )?,
         }
@@ -3797,8 +3990,8 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Each settings card owns its row count because rows are painted manually.
-        // General currently paints seven rows below; the count drives card height and scroll extent.
-        let row_count = 7;
+        // General currently paints eight rows below; the count drives card height and scroll extent.
+        let row_count = 8;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         self.ui.content_scroll.set_extents(
@@ -3810,7 +4003,14 @@ impl SettingsWindow {
         let native_status = if native_path.exists() {
             native_path.display().to_string()
         } else {
-            format!("Defaults; optional file at {}", native_path.display())
+            let mut args = FluentArgs::new();
+            args.set("path", native_path.display().to_string());
+            crate::i18n::tr_args("settings-native-settings-default", &args)
+        };
+        let config_source_kind = if config::configuration_file().is_some() {
+            crate::i18n::tr("common-file")
+        } else {
+            crate::i18n::tr("common-defaults")
         };
 
         self.draw_text(
@@ -3818,7 +4018,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             section_y,
-            "Configuration",
+            &crate::i18n::tr("settings-general-heading"),
             palette.muted_text,
             max_width,
         )?;
@@ -3828,26 +4028,23 @@ impl SettingsWindow {
         let row_x = card_x + card_padding;
         let row_width = max_width - card_padding * 2.0;
         self.paint_group_card(layers, card_x, card_y, max_width, card_height)?;
-        self.paint_setting_row(
-            layers,
-            row_x,
-            first_row_y,
-            row_width,
-            "Config Source",
-            &source,
-            if config::configuration_file().is_some() {
-                "File"
-            } else {
-                "Defaults"
-            },
-            false,
-        )?;
+        self.paint_language_row(layers, row_x, first_row_y, row_width, false)?;
         self.paint_setting_row(
             layers,
             row_x,
             first_row_y + row_step,
             row_width,
-            "ThinkTerm Native Settings",
+            &crate::i18n::tr("settings-config-source"),
+            &source,
+            &config_source_kind,
+            false,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 2.0,
+            row_width,
+            &crate::i18n::tr("settings-native-settings"),
             &native_status,
             &format!("v{}", self.native_settings.version),
             true,
@@ -3855,32 +4052,32 @@ impl SettingsWindow {
         self.paint_theme_mode_row(
             layers,
             row_x,
-            first_row_y + row_step * 2.0,
+            first_row_y + row_step * 3.0,
             row_width,
-            "Small ThinkTerm-native state; terminal config stays in ThinkTerm's own thinkterm.lua.",
+            &crate::i18n::tr("settings-native-settings-description"),
             true,
         )?;
-        self.paint_main_renderer_row(layers, row_x, first_row_y + row_step * 3.0, row_width, true)?;
+        self.paint_main_renderer_row(layers, row_x, first_row_y + row_step * 4.0, row_width, true)?;
         self.paint_toggle_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 4.0,
+            first_row_y + row_step * 5.0,
             row_width,
-            "Restore Main Window Frame",
-            "macOS restores the last main terminal window size and position.",
+            &crate::i18n::tr("settings-restore-window-frame"),
+            &crate::i18n::tr("settings-restore-window-frame-description"),
             self.native_settings.window.restore_main_window_frame,
             SettingsAction::ToggleMainWindowFrameRestore,
             true,
         )?;
-        self.paint_restart_row(layers, row_x, first_row_y + row_step * 5.0, row_width, true)?;
+        self.paint_restart_row(layers, row_x, first_row_y + row_step * 6.0, row_width, true)?;
         self.paint_action_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 6.0,
+            first_row_y + row_step * 7.0,
             row_width,
-            "Quit",
-            "Close all ThinkTerm windows and exit the app.",
-            "Quit ThinkTerm",
+            &crate::i18n::tr("settings-quit"),
+            &crate::i18n::tr("settings-quit-description"),
+            &crate::i18n::tr("settings-quit-app"),
             SettingsAction::QuitApplication,
             true,
         )?;
@@ -3910,6 +4107,11 @@ impl SettingsWindow {
         let typography_card_y = typography_title_y + self.settings_section_card_gap().min(54.0);
         let typography_first_row_y = typography_card_y + self.settings_card_top_padding();
         let typography_card_height = self.settings_card_height(typography_row_count);
+        let config_source_kind = if config::configuration_file().is_some() {
+            crate::i18n::tr("common-file")
+        } else {
+            crate::i18n::tr("common-defaults")
+        };
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
             self.settings_content_extent(typography_card_y + scroll + typography_card_height),
@@ -3920,7 +4122,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             section_y,
-            "Theme",
+            &crate::i18n::tr("settings-appearance-theme-heading"),
             palette.muted_text,
             max_width,
         )?;
@@ -3934,7 +4136,7 @@ impl SettingsWindow {
             row_x,
             y,
             row_width,
-            "ThinkTerm-native window appearance preference.",
+            &crate::i18n::tr("settings-theme-description"),
             false,
         )?;
         y += row_step;
@@ -3943,8 +4145,8 @@ impl SettingsWindow {
             row_x,
             y,
             row_width,
-            "Switch the running Dock and app switcher icon.",
-            "Currently only works on macOS.",
+            &crate::i18n::tr("settings-app-icon-description"),
+            &crate::i18n::tr("settings-app-icon-note"),
             true,
         )?;
         y += row_step + app_icon_note_space;
@@ -3953,8 +4155,8 @@ impl SettingsWindow {
             row_x,
             y,
             row_width,
-            "Effective Color Scheme",
-            "Resolved through the WezTerm-compatible config path.",
+            &crate::i18n::tr("settings-effective-color-scheme"),
+            &crate::i18n::tr("settings-effective-color-scheme-description"),
             Self::effective_color_scheme_label(&config),
             true,
         )?;
@@ -3964,13 +4166,9 @@ impl SettingsWindow {
             row_x,
             y,
             row_width,
-            "Config Source",
+            &crate::i18n::tr("settings-config-source"),
             &Self::config_source_summary(),
-            if config::configuration_file().is_some() {
-                "File"
-            } else {
-                "Defaults"
-            },
+            &config_source_kind,
             true,
         )?;
 
@@ -3979,7 +4177,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             typography_title_y,
-            "Typography",
+            &crate::i18n::tr("settings-typography-heading"),
             palette.muted_text,
             max_width,
         )?;
@@ -3993,13 +4191,15 @@ impl SettingsWindow {
         )?;
         y = typography_first_row_y;
         for area in TYPOGRAPHY_FONT_AREAS {
+            let label = area.localized_label();
+            let description = area.localized_description();
             self.paint_font_size_stepper_row(
                 layers,
                 row_x,
                 y,
                 row_width,
-                area.label(),
-                area.description(),
+                &label,
+                &description,
                 self.current_chrome_font_size_value(area),
                 None,
                 SettingsAction::ResetChromeFontSize(area),
@@ -4014,8 +4214,8 @@ impl SettingsWindow {
             row_x,
             y,
             row_width,
-            "Settings UI Font Weight",
-            "Controls the Settings window chrome and content text weight.",
+            &crate::i18n::tr("settings-font-weight"),
+            &crate::i18n::tr("settings-font-weight-description"),
             self.current_settings_font_weight_value(),
             None,
             SettingsAction::ResetSettingsFontWeight,
@@ -4051,7 +4251,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             section_y,
-            "Remote Files",
+            &crate::i18n::tr("settings-workspaces-heading"),
             palette.muted_text,
             max_width,
         )?;
@@ -4060,14 +4260,16 @@ impl SettingsWindow {
         let row_width = max_width - padding * 2.0;
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
         let minutes = self.current_remote_sftp_idle_minutes();
-        let value_label = format!("{minutes} min");
+        let mut minutes_args = FluentArgs::new();
+        minutes_args.set("count", minutes);
+        let value_label = crate::i18n::tr_args("common-minutes", &minutes_args);
         self.paint_font_size_stepper_row(
             layers,
             row_x,
             first_row_y,
             row_width,
-            "Remote Files Connection Idle Timeout",
-            "Disconnects an unused SFTP session; directory and preview data are released immediately.",
+            &crate::i18n::tr("settings-sftp-idle"),
+            &crate::i18n::tr("settings-sftp-idle-description"),
             minutes as f64,
             Some(&value_label),
             SettingsAction::ResetRemoteSftpIdle,
@@ -4083,9 +4285,9 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step,
             row_width,
-            "Download Folder",
+            &crate::i18n::tr("settings-download-folder"),
             &download_label,
-            "Choose...",
+            &crate::i18n::tr("common-choose"),
             SettingsAction::ChooseRemoteDownloadDirectory,
             true,
         )?;
@@ -4094,9 +4296,9 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 2.0,
             row_width,
-            "Use the System Downloads Folder",
-            "Clears the chosen folder so downloads follow this computer's own setting.",
-            "Reset",
+            &crate::i18n::tr("settings-system-download-folder"),
+            &crate::i18n::tr("settings-system-download-folder-description"),
+            &crate::i18n::tr("common-reset"),
             SettingsAction::ResetRemoteDownloadDirectory,
             true,
         )?;
@@ -4106,8 +4308,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 3.0,
             row_width,
-            "Remote Drop Destination",
-            "Where files dropped onto a remote terminal are uploaded. Use cwd for the shell's current directory.",
+            &crate::i18n::tr("settings-remote-drop-destination"),
+            &crate::i18n::tr("settings-remote-drop-destination-description"),
             &remote_drop_value,
             crate::native_settings::DEFAULT_REMOTE_DROP_DESTINATION,
             SettingsAction::RemoteDropDestinationInput,
@@ -4133,8 +4335,10 @@ impl SettingsWindow {
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         let button_y = card_y + card_height + self.settings_section_card_gap();
-        let open_quotes_width = self.button_width_for_label("Open Quotes JSON", 260.0);
-        let reset_quotes_width = self.button_width_for_label("Reset Quotes JSON", 260.0);
+        let open_quotes_label = crate::i18n::tr("settings-open-quotes-json");
+        let reset_quotes_label = crate::i18n::tr("settings-reset-quotes-json");
+        let open_quotes_width = self.button_width_for_label(&open_quotes_label, 260.0);
+        let reset_quotes_width = self.button_width_for_label(&reset_quotes_label, 260.0);
         let button_gap = 16.0;
         let reset_button_x = x + open_quotes_width + button_gap;
         let reset_button_y = if open_quotes_width + button_gap + reset_quotes_width <= max_width {
@@ -4146,7 +4350,9 @@ impl SettingsWindow {
             self.content_viewport_extent(),
             self.settings_content_extent(reset_button_y + scroll + self.ui_px(CONTROL_HEIGHT)),
         );
-        let font_size = format!("{:.1} pt", config.font_size);
+        let mut font_size_args = FluentArgs::new();
+        font_size_args.set("value", format!("{:.1}", config.font_size));
+        let font_size = crate::i18n::tr_args("common-points", &font_size_args);
         let font_family = Self::effective_font_family(&config);
         let quote_font_size_label = self.bottom_quote_font_size_label();
         let quote_interval_label = self.bottom_quote_interval_label();
@@ -4156,7 +4362,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             section_y,
-            "Effective terminal config",
+            &crate::i18n::tr("settings-terminal-heading"),
             palette.muted_text,
             max_width,
         )?;
@@ -4171,8 +4377,8 @@ impl SettingsWindow {
             row_x,
             first_row_y,
             row_width,
-            "Font Size",
-            "Current effective value from the WezTerm-compatible config.",
+            &crate::i18n::tr("settings-terminal-font-size"),
+            &crate::i18n::tr("settings-terminal-font-size-description"),
             &font_size,
             false,
         )?;
@@ -4181,8 +4387,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step,
             row_width,
-            "Font Family",
-            "Current primary terminal font family.",
+            &crate::i18n::tr("settings-terminal-font-family"),
+            &crate::i18n::tr("settings-terminal-font-family-description"),
             &font_family,
             true,
         )?;
@@ -4191,8 +4397,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 2.0,
             row_width,
-            "ThinkTerm Font Size",
-            "Saved locally and applied immediately to open terminal windows.",
+            &crate::i18n::tr("settings-terminal-native-font-size"),
+            &crate::i18n::tr("settings-terminal-native-font-size-description"),
             self.current_terminal_font_size_value(),
             None,
             SettingsAction::ResetFontSize,
@@ -4206,8 +4412,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 3.0,
             row_width,
-            "Native Font Family",
-            "Local quick-setting draft. Persistence and terminal application are pending.",
+            &crate::i18n::tr("settings-terminal-native-font-family"),
+            &crate::i18n::tr("settings-terminal-native-font-family-description"),
             &native_font_family,
             "JetBrains Mono",
             SettingsAction::FontFamilyInput,
@@ -4218,8 +4424,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 4.0,
             row_width,
-            "Bottom Quote",
-            "Shows a small quote in the existing bottom gutter.",
+            &crate::i18n::tr("settings-bottom-quote"),
+            &crate::i18n::tr("settings-bottom-quote-description"),
             self.native_settings.terminal.bottom_quote_enabled,
             SettingsAction::ToggleBottomQuote,
             true,
@@ -4229,8 +4435,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 5.0,
             row_width,
-            "Quote Font Size",
-            "Changes only the painted quote text; gutter height stays unchanged.",
+            &crate::i18n::tr("settings-quote-font-size"),
+            &crate::i18n::tr("settings-quote-font-size-description"),
             self.current_bottom_quote_font_size(),
             Some(&quote_font_size_label),
             SettingsAction::ResetBottomQuoteFontSize,
@@ -4243,9 +4449,9 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 6.0,
             row_width,
-            "Quote Rotation",
-            "Timed rotates in order; pseudo-random picks a stable quote per interval.",
-            self.native_settings.terminal.bottom_quote_mode.label(),
+            &crate::i18n::tr("settings-quote-rotation"),
+            &crate::i18n::tr("settings-quote-rotation-description"),
+            &localized_quote_mode_label(self.native_settings.terminal.bottom_quote_mode),
             SettingsAction::CycleBottomQuoteMode,
             true,
         )?;
@@ -4254,8 +4460,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 7.0,
             row_width,
-            "Quote Interval",
-            "Controls how often the bottom quote rotates.",
+            &crate::i18n::tr("settings-quote-interval"),
+            &crate::i18n::tr("settings-quote-interval-description"),
             self.current_bottom_quote_interval_minutes() as f64,
             Some(&quote_interval_label),
             SettingsAction::ResetBottomQuoteInterval,
@@ -4268,7 +4474,7 @@ impl SettingsWindow {
             x,
             button_y,
             open_quotes_width,
-            "Open Quotes JSON",
+            &open_quotes_label,
             SettingsAction::OpenBottomQuotesJson,
         )?;
         self.draw_button(
@@ -4280,7 +4486,7 @@ impl SettingsWindow {
             },
             reset_button_y,
             reset_quotes_width,
-            "Reset Quotes JSON",
+            &reset_quotes_label,
             SettingsAction::ResetBottomQuotesJson,
         )?;
         Ok(())
@@ -4310,7 +4516,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             section_y,
-            "Keep normal Settings clean. Enable developer mode to reveal internal pages. Memory sampling still has to be started manually.",
+            &crate::i18n::tr("settings-developer-description"),
             palette.secondary_text,
             max_width,
         )?;
@@ -4318,19 +4524,25 @@ impl SettingsWindow {
         let card_padding = 36.0;
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
+        let developer_mode_value = if self.developer_mode_enabled() {
+            crate::i18n::tr("common-on")
+        } else {
+            crate::i18n::tr("common-off")
+        };
+        let developer_tabs_value = if self.developer_mode_enabled() {
+            crate::i18n::tr("settings-developer-tabs-value")
+        } else {
+            crate::i18n::tr("common-hidden")
+        };
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
         self.paint_setting_row(
             layers,
             row_x,
             first_row_y,
             row_width,
-            "Developer Mode",
-            "Shows internal Settings pages for UI tuning and memory diagnostics.",
-            if self.developer_mode_enabled() {
-                "On"
-            } else {
-                "Off"
-            },
+            &crate::i18n::tr("settings-developer-mode"),
+            &crate::i18n::tr("settings-developer-mode-description"),
+            &developer_mode_value,
             false,
         )?;
         self.paint_toggle_setting_row(
@@ -4338,11 +4550,9 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step,
             row_width,
-            "Use Fallback Context Menu",
-            "On macOS, route right-click menus through the app-rendered fallback for local testing.",
-            self.native_settings
-                .developer
-                .force_fallback_context_menu,
+            &crate::i18n::tr("settings-fallback-menu"),
+            &crate::i18n::tr("settings-fallback-menu-description"),
+            self.native_settings.developer.force_fallback_context_menu,
             SettingsAction::ToggleFallbackContextMenu,
             true,
         )?;
@@ -4351,13 +4561,9 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 2.0,
             row_width,
-            "Visible Developer Tabs",
-            "UI Kit and Memory/Input tabs are shown here; diagnostics do not run automatically.",
-            if self.developer_mode_enabled() {
-                "UI Kit, Memory/Input"
-            } else {
-                "Hidden"
-            },
+            &crate::i18n::tr("settings-developer-tabs"),
+            &crate::i18n::tr("settings-developer-tabs-description"),
+            &developer_tabs_value,
             false,
         )?;
         self.paint_setting_row(
@@ -4365,31 +4571,32 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 3.0,
             row_width,
-            "Onboarding",
-            "Open the setup wizard without changing the saved seen version.",
-            "Manual test entry",
+            &crate::i18n::tr("settings-onboarding-launcher"),
+            &crate::i18n::tr("settings-onboarding-launcher-description"),
+            &crate::i18n::tr("settings-onboarding-launcher-value"),
             true,
         )?;
         let developer_label = if self.developer_mode_enabled() {
-            "Disable Developer Mode"
+            crate::i18n::tr("settings-disable-developer")
         } else {
-            "Enable Developer Mode"
+            crate::i18n::tr("settings-enable-developer")
         };
-        let developer_width = self.button_width_for_label(developer_label, 300.0);
+        let developer_width = self.button_width_for_label(&developer_label, 300.0);
+        let show_onboarding_label = crate::i18n::tr("settings-show-onboarding");
         self.draw_button(
             layers,
             x,
             button_y,
             developer_width,
-            developer_label,
+            &developer_label,
             SettingsAction::ToggleDeveloperMode,
         )?;
         self.draw_button(
             layers,
             x + developer_width + self.ui_px(14.0),
             button_y,
-            self.button_width_for_label("Show Onboarding Now", 300.0),
-            "Show Onboarding Now",
+            self.button_width_for_label(&show_onboarding_label, 300.0),
+            &show_onboarding_label,
             SettingsAction::ShowOnboardingNow,
         )?;
 
@@ -4520,7 +4727,7 @@ impl SettingsWindow {
             x,
             800.0 - scroll,
             preview_width,
-            "Theme Mode",
+            &crate::i18n::tr("settings-theme-mode"),
             "Follow macOS appearance.",
             "System",
             false,
@@ -5282,30 +5489,43 @@ impl SettingsWindow {
         let thinkterm_source = if thinkterm_path.exists() {
             thinkterm_path.display().to_string()
         } else {
-            format!("Not created yet; target is {}", thinkterm_path.display())
+            let mut args = FluentArgs::new();
+            args.set("path", thinkterm_path.display().to_string());
+            crate::i18n::tr_args("settings-thinkterm-config-missing", &args)
         };
         let wezterm_source = Self::first_wezterm_config_path()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "No existing WezTerm config found".to_string());
+            .unwrap_or_else(|| crate::i18n::tr("settings-wezterm-source-missing"));
         let loaded_source = self
             .compatibility_import
             .loaded_source
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "Not loaded yet".to_string());
+            .unwrap_or_else(|| crate::i18n::tr("settings-not-loaded"));
         let loaded_source_description = if self.compatibility_import.warnings.is_empty() {
             loaded_source
         } else {
-            format!(
-                "{} ({} warning{})",
-                loaded_source,
-                self.compatibility_import.warnings.len(),
-                if self.compatibility_import.warnings.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )
+            let mut args = FluentArgs::new();
+            args.set("source", loaded_source);
+            args.set("count", self.compatibility_import.warnings.len());
+            crate::i18n::tr_args("settings-loaded-source-warnings", &args)
+        };
+        let thinkterm_status = if thinkterm_path.exists() {
+            crate::i18n::tr("common-independent")
+        } else {
+            crate::i18n::tr("common-defaults")
+        };
+        let wezterm_status = if Self::first_wezterm_config_path().is_some() {
+            crate::i18n::tr("common-found")
+        } else {
+            crate::i18n::tr("common-missing")
+        };
+        let loaded_status = if self.compatibility_import.error.is_some() {
+            crate::i18n::tr("common-error")
+        } else if field_count > 0 {
+            crate::i18n::tr("common-parsed")
+        } else {
+            crate::i18n::tr("common-idle")
         };
 
         self.draw_text(
@@ -5313,7 +5533,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             section_y,
-            "ThinkTerm uses its own WezTerm-compatible config. Existing WezTerm files are optional import sources, not shared live state.",
+            &crate::i18n::tr("settings-compatibility-description"),
             palette.secondary_text,
             max_width,
         )?;
@@ -5326,13 +5546,9 @@ impl SettingsWindow {
             row_x,
             first_row_y,
             row_width,
-            "ThinkTerm Config",
+            &crate::i18n::tr("settings-thinkterm-config"),
             &thinkterm_source,
-            if thinkterm_path.exists() {
-                "Independent"
-            } else {
-                "Defaults"
-            },
+            &thinkterm_status,
             false,
         )?;
         self.paint_setting_row(
@@ -5340,13 +5556,9 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step,
             row_width,
-            "WezTerm Source",
+            &crate::i18n::tr("settings-wezterm-source"),
             &wezterm_source,
-            if Self::first_wezterm_config_path().is_some() {
-                "Found"
-            } else {
-                "Missing"
-            },
+            &wezterm_status,
             true,
         )?;
         self.paint_setting_row(
@@ -5354,15 +5566,9 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 2.0,
             row_width,
-            "Loaded Source",
+            &crate::i18n::tr("settings-loaded-source"),
             &loaded_source_description,
-            if self.compatibility_import.error.is_some() {
-                "Error"
-            } else if field_count > 0 {
-                "Parsed"
-            } else {
-                "Idle"
-            },
+            &loaded_status,
             true,
         )?;
 
@@ -5374,38 +5580,44 @@ impl SettingsWindow {
             .filter(|field| field.lua_value.is_some() && self.import_field_selected(field.id))
             .count();
         let detected_label = if field_count == 0 {
-            "No fields loaded".to_string()
+            crate::i18n::tr("settings-no-fields-loaded")
         } else {
-            format!("{selected_count} of {field_count} selected")
+            let mut args = FluentArgs::new();
+            args.set("selected", selected_count);
+            args.set("total", field_count);
+            crate::i18n::tr_args("settings-fields-selected", &args)
         };
         self.paint_setting_row(
             layers,
             row_x,
             row_y,
             row_width,
-            "Importable Fields",
-            "Choose exactly which source config values ThinkTerm should copy.",
+            &crate::i18n::tr("settings-importable-fields"),
+            &crate::i18n::tr("settings-importable-fields-description"),
             &detected_label,
             true,
         )?;
         row_y += row_step;
 
         if self.compatibility_import.fields.is_empty() {
+            let empty_description = self
+                .compatibility_import
+                .error
+                .clone()
+                .unwrap_or_else(|| crate::i18n::tr("settings-load-source-description"));
+            let empty_status = if self.compatibility_import.error.is_some() {
+                crate::i18n::tr("common-error")
+            } else {
+                crate::i18n::tr("common-empty")
+            };
             self.paint_setting_row(
                 layers,
                 row_x,
                 row_y,
                 row_width,
-                "Detected Fields",
-                self.compatibility_import
-                    .error
-                    .as_deref()
-                    .unwrap_or("Load a WezTerm source config to inspect importable fields."),
-                if self.compatibility_import.error.is_some() {
-                    "Error"
-                } else {
-                    "Empty"
-                },
+                &crate::i18n::tr("settings-detected-fields"),
+                &empty_description,
+                &empty_status,
                 true,
             )?;
         } else {
@@ -5415,41 +5627,47 @@ impl SettingsWindow {
                 row_y += row_step;
             }
         }
+        let load_label = crate::i18n::tr("settings-load-wezterm-source");
+        let select_all_label = crate::i18n::tr("common-select-all");
+        let clear_label = crate::i18n::tr("common-clear");
+        let import_label = crate::i18n::tr("settings-import-selected");
+        let open_wezterm_label = crate::i18n::tr("settings-open-wezterm-source");
+        let open_thinkterm_label = crate::i18n::tr("settings-open-thinkterm-config");
         self.draw_button(
             layers,
             x,
             buttons_y,
-            self.button_width_for_label("Load WezTerm Source", 290.0),
-            "Load WezTerm Source",
+            self.button_width_for_label(&load_label, 290.0),
+            &load_label,
             SettingsAction::LoadWezTermSource,
         )?;
-        let second_x =
-            x + self.button_width_for_label("Load WezTerm Source", 290.0) + self.ui_px(16.0);
+        let second_x = x + self.button_width_for_label(&load_label, 290.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             second_x,
             buttons_y,
-            self.button_width_for_label("Select All", 180.0),
-            "Select All",
+            self.button_width_for_label(&select_all_label, 180.0),
+            &select_all_label,
             SettingsAction::SelectAllImportFields,
         )?;
         let third_x =
-            second_x + self.button_width_for_label("Select All", 180.0) + self.ui_px(16.0);
+            second_x + self.button_width_for_label(&select_all_label, 180.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             third_x,
             buttons_y,
-            self.button_width_for_label("Clear", 150.0),
-            "Clear",
+            self.button_width_for_label(&clear_label, 150.0),
+            &clear_label,
             SettingsAction::ClearImportFields,
         )?;
-        let fourth_x = third_x + self.button_width_for_label("Clear", 150.0) + self.ui_px(16.0);
+        let fourth_x =
+            third_x + self.button_width_for_label(&clear_label, 150.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             fourth_x,
             buttons_y,
-            self.button_width_for_label("Import Selected", 260.0),
-            "Import Selected",
+            self.button_width_for_label(&import_label, 260.0),
+            &import_label,
             SettingsAction::ImportSelectedFields,
         )?;
         let open_buttons_y = buttons_y + self.ui_px(CONTROL_HEIGHT) + 14.0;
@@ -5457,18 +5675,18 @@ impl SettingsWindow {
             layers,
             x,
             open_buttons_y,
-            self.button_width_for_label("Open WezTerm Source", 300.0),
-            "Open WezTerm Source",
+            self.button_width_for_label(&open_wezterm_label, 300.0),
+            &open_wezterm_label,
             SettingsAction::OpenWezTermConfigFile,
         )?;
         let fifth_x =
-            x + self.button_width_for_label("Open WezTerm Source", 300.0) + self.ui_px(16.0);
+            x + self.button_width_for_label(&open_wezterm_label, 300.0) + self.ui_px(16.0);
         self.draw_button(
             layers,
             fifth_x,
             open_buttons_y,
-            self.button_width_for_label("Open ThinkTerm Config", 300.0),
-            "Open ThinkTerm Config",
+            self.button_width_for_label(&open_thinkterm_label, 300.0),
+            &open_thinkterm_label,
             SettingsAction::OpenThinkTermConfigFile,
         )?;
 
@@ -6265,7 +6483,7 @@ impl SettingsWindow {
             &ui_font,
             control_x + self.ui_px(16.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            self.native_settings.appearance.theme_mode.label(),
+            &localized_theme_mode_label(self.native_settings.appearance.theme_mode),
             palette.text,
             control_width - self.ui_px(60.0),
         )?;
@@ -6278,6 +6496,96 @@ impl SettingsWindow {
             palette.secondary_text,
         )?;
 
+        Ok(())
+    }
+
+    fn paint_language_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+
+        let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
+        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let action = SettingsAction::ToggleLanguageMenu;
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
+        let open = self.ui.open_dropdown == Some(SettingsDropdown::Language);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            &crate::i18n::tr("settings-language"),
+            palette.text,
+            text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y),
+            &crate::i18n::tr("settings-language-description"),
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            control_rect.origin.x,
+            control_rect.origin.y,
+            control_rect.size.width,
+            control_rect.size.height,
+            bg,
+            border,
+            self.ui_px(CONTROL_RADIUS),
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            control_x + self.ui_px(16.0),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
+            &crate::i18n::configured_language_label(&self.native_settings),
+            palette.text,
+            control_width - self.ui_px(60.0),
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronDown,
+            control_x + control_width - self.ui_px(38.0),
+            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
+            self.ui_px(22.0),
+            palette.secondary_text,
+        )?;
         Ok(())
     }
 
@@ -6324,7 +6632,15 @@ impl SettingsWindow {
 
         self.ui_context
             .push(control_rect, WidgetKind::Button, action);
-        self.draw_text(layers, &ui_font, x, y, "App Icon", palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            &crate::i18n::tr("settings-app-icon"),
+            palette.text,
+            text_width,
+        )?;
         self.draw_text(
             layers,
             &ui_font,
@@ -6361,7 +6677,7 @@ impl SettingsWindow {
             &ui_font,
             control_x + self.ui_px(16.0),
             self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            self.native_settings.appearance.app_icon.label(),
+            &localized_app_icon_label(self.native_settings.appearance.app_icon),
             palette.text,
             control_width - self.ui_px(60.0),
         )?;
@@ -6423,7 +6739,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             y,
-            "Main Window Renderer",
+            &crate::i18n::tr("settings-main-renderer"),
             palette.text,
             text_width,
         )?;
@@ -6432,7 +6748,7 @@ impl SettingsWindow {
             &ui_font,
             x,
             self.settings_row_description_y(y),
-            "Applies to the main terminal window after restart.",
+            &crate::i18n::tr("settings-main-renderer-description"),
             palette.secondary_text,
             text_width,
         )?;
@@ -6483,27 +6799,37 @@ impl SettingsWindow {
         }
 
         let button_label = if self.main_renderer_restart_required() {
-            "Restart ThinkTerm"
+            crate::i18n::tr("settings-restart-app")
         } else {
-            "Restart"
+            crate::i18n::tr("settings-restart")
         };
         let button_width = self
-            .button_width_for_label(button_label, 0.0)
+            .button_width_for_label(&button_label, 0.0)
             .max(self.ui_px(220.0));
         let button_x = x + width - button_width;
         let text_width = (button_x - x - 24.0).max(width * 0.45);
         let value = if self.main_renderer_restart_required() {
-            "Required"
+            crate::i18n::tr("common-required")
         } else {
-            "Not required"
+            crate::i18n::tr("common-not-required")
         };
-        self.draw_text(layers, &ui_font, x, y, "Restart", palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            &crate::i18n::tr("settings-restart"),
+            palette.text,
+            text_width,
+        )?;
+        let mut status_args = FluentArgs::new();
+        status_args.set("status", value);
         self.draw_text(
             layers,
             &ui_font,
             x,
             self.settings_row_description_y(y),
-            &format!("Renderer change status: {value}."),
+            &crate::i18n::tr_args("settings-restart-status", &status_args),
             palette.secondary_text,
             text_width,
         )?;
@@ -6512,7 +6838,7 @@ impl SettingsWindow {
             button_x,
             y + self.ui_px(4.0),
             button_width,
-            button_label,
+            &button_label,
             SettingsAction::RestartApplication,
         )?;
 
@@ -6550,7 +6876,7 @@ impl SettingsWindow {
         let card_padding = 36.0;
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let row_count = match self.selected {
-            SettingsSection::General => 7,
+            SettingsSection::General => 8,
             SettingsSection::Appearance => 4,
             _ => 4,
         };
@@ -6558,6 +6884,7 @@ impl SettingsWindow {
         let (row_x, row_y, row_width) = match self.selected {
             SettingsSection::Appearance => {
                 let row_y = match dropdown {
+                    SettingsDropdown::Language => return Ok(()),
                     SettingsDropdown::ThemeMode => first_row_y,
                     SettingsDropdown::AppIcon => first_row_y + self.settings_row_step(),
                     SettingsDropdown::MainRenderer => return Ok(()),
@@ -6566,8 +6893,9 @@ impl SettingsWindow {
             }
             SettingsSection::General => {
                 let row_y = match dropdown {
-                    SettingsDropdown::ThemeMode => first_row_y + self.settings_row_step() * 2.0,
-                    SettingsDropdown::MainRenderer => first_row_y + self.settings_row_step() * 3.0,
+                    SettingsDropdown::Language => first_row_y,
+                    SettingsDropdown::ThemeMode => first_row_y + self.settings_row_step() * 3.0,
+                    SettingsDropdown::MainRenderer => first_row_y + self.settings_row_step() * 4.0,
                     SettingsDropdown::AppIcon => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
@@ -6577,6 +6905,12 @@ impl SettingsWindow {
         let (control_x, control_y, control_width) =
             self.dropdown_control_geometry(row_x, row_y, row_width);
         match dropdown {
+            SettingsDropdown::Language => self.paint_language_menu(
+                layers,
+                control_x,
+                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_width,
+            ),
             SettingsDropdown::ThemeMode => self.paint_theme_mode_menu(
                 layers,
                 control_x,
@@ -6598,6 +6932,27 @@ impl SettingsWindow {
         }
     }
 
+    fn paint_language_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<()> {
+        let configured = crate::i18n::configured_preference(&self.native_settings);
+        let options: Vec<(String, SettingsAction, bool)> = crate::i18n::LANGUAGE_OPTIONS
+            .iter()
+            .map(|option| {
+                (
+                    crate::i18n::language_option_label(*option),
+                    SettingsAction::SetLanguage(option.preference),
+                    configured.eq_ignore_ascii_case(option.preference),
+                )
+            })
+            .collect();
+        self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
     fn paint_theme_mode_menu(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -6607,17 +6962,17 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let options = [
             (
-                NativeThemeMode::System.label(),
+                localized_theme_mode_label(NativeThemeMode::System),
                 SettingsAction::SetThemeMode(NativeThemeMode::System),
                 self.native_settings.appearance.theme_mode == NativeThemeMode::System,
             ),
             (
-                NativeThemeMode::Light.label(),
+                localized_theme_mode_label(NativeThemeMode::Light),
                 SettingsAction::SetThemeMode(NativeThemeMode::Light),
                 self.native_settings.appearance.theme_mode == NativeThemeMode::Light,
             ),
             (
-                NativeThemeMode::Dark.label(),
+                localized_theme_mode_label(NativeThemeMode::Dark),
                 SettingsAction::SetThemeMode(NativeThemeMode::Dark),
                 self.native_settings.appearance.theme_mode == NativeThemeMode::Dark,
             ),
@@ -6634,12 +6989,12 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let options = [
             (
-                NativeAppIcon::Simple.label(),
+                localized_app_icon_label(NativeAppIcon::Simple),
                 SettingsAction::SetAppIcon(NativeAppIcon::Simple),
                 self.native_settings.appearance.app_icon == NativeAppIcon::Simple,
             ),
             (
-                NativeAppIcon::Classic.label(),
+                localized_app_icon_label(NativeAppIcon::Classic),
                 SettingsAction::SetAppIcon(NativeAppIcon::Classic),
                 self.native_settings.appearance.app_icon == NativeAppIcon::Classic,
             ),
@@ -6657,12 +7012,12 @@ impl SettingsWindow {
         let current = self.current_main_renderer();
         let options = [
             (
-                NativeRendererBackend::OpenGL.label(),
+                NativeRendererBackend::OpenGL.label().to_string(),
                 SettingsAction::SetMainRenderer(NativeRendererBackend::OpenGL),
                 current == NativeRendererBackend::OpenGL,
             ),
             (
-                NativeRendererBackend::WebGpu.label(),
+                NativeRendererBackend::WebGpu.label().to_string(),
                 SettingsAction::SetMainRenderer(NativeRendererBackend::WebGpu),
                 current == NativeRendererBackend::WebGpu,
             ),
@@ -6676,7 +7031,7 @@ impl SettingsWindow {
         x: f32,
         y: f32,
         width: f32,
-        options: &[(&'static str, SettingsAction, bool)],
+        options: &[(String, SettingsAction, bool)],
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
@@ -6704,7 +7059,9 @@ impl SettingsWindow {
         )?;
 
         let mut row_y = y + menu_padding;
-        for (label, action, selected) in options.iter().copied() {
+        for (label, action, selected) in options {
+            let action = *action;
+            let selected = *selected;
             let row_rect = rect(
                 x + self.ui_px(8.0),
                 row_y,
@@ -6799,13 +7156,7 @@ impl SettingsWindow {
         }
         sections
             .into_iter()
-            .filter(|section| {
-                section.label().to_lowercase().contains(&query)
-                    || section
-                        .search_terms()
-                        .iter()
-                        .any(|term| term.to_lowercase().contains(&query))
-            })
+            .filter(|section| section.matches_search(&query))
             .collect()
     }
 
@@ -7407,11 +7758,13 @@ impl SettingsWindow {
 
     fn config_source_summary() -> String {
         if let Some(path) = config::configuration_file() {
-            format!("Loaded from {}", path.display())
+            let mut args = FluentArgs::new();
+            args.set("path", path.display().to_string());
+            crate::i18n::tr_args("settings-config-source-file", &args)
         } else if config::is_config_overridden() {
-            "No config file loaded; command-line overrides or --skip-config are active".to_string()
+            crate::i18n::tr("settings-config-source-overridden")
         } else {
-            "No config file loaded; using built-in defaults".to_string()
+            crate::i18n::tr("settings-config-source-default")
         }
     }
 

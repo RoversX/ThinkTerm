@@ -35,13 +35,13 @@ const MENU_ROW_RADIUS: f32 = 18.0;
 const MENU_ROW_HOVER_INSET_X: usize = 10;
 const MENU_ROW_HOVER_INSET_Y: usize = 4;
 
-pub(crate) fn reveal_in_folder_label() -> &'static str {
+pub(crate) fn reveal_in_folder_label() -> String {
     if cfg!(target_os = "macos") {
-        "Reveal in Finder"
+        crate::i18n::tr("menu-reveal-finder")
     } else if cfg!(target_os = "windows") {
-        "Show in File Explorer"
+        crate::i18n::tr("menu-reveal-explorer")
     } else {
-        "Show in Folder"
+        crate::i18n::tr("menu-reveal-folder")
     }
 }
 

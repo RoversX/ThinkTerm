@@ -41,6 +41,7 @@ mod customglyph;
 mod download;
 mod frontend;
 mod glyphcache;
+mod i18n;
 mod input_diagnostics;
 mod inputmap;
 mod markdown_editor;

@@ -21,6 +21,7 @@ use config::keyassignment::{
     PaneDirection, SpawnCommand, SpawnTabDomain, SplitPane, SplitSize,
 };
 use config::{MouseEventAltScreen, TermConfig};
+use fluent_bundle::FluentArgs;
 use mux::domain::SplitSource;
 use mux::pane::{Pane, WithPaneLines};
 use mux::ssh::{RemoteSshDomain, SshConnectionStatus};
@@ -42,6 +43,12 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
+
+fn tr_with_name(id: &'static str, name: &str) -> String {
+    let mut args = FluentArgs::new();
+    args.set("name", name.to_string());
+    crate::i18n::tr_args(id, &args)
+}
 
 fn note_drag_scroll_delta(
     pointer_y: f32,
@@ -4384,24 +4391,24 @@ impl super::TermWindow {
 
         vec![
             ContextMenuItem::item_with_icon(
-                "Rename Workspace...",
+                crate::i18n::tr("menu-rename-project"),
                 ContextMenuIcon::Edit,
                 KeyAssignment::PromptRenameProject(project_id.clone()),
             ),
             reveal_item,
             ContextMenuItem::item_with_icon(
-                "New Thread",
+                crate::i18n::tr("menu-new-thread"),
                 ContextMenuIcon::New,
                 KeyAssignment::CreateWorkspaceThread(project_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "Collapse / Expand Threads",
+                crate::i18n::tr("menu-toggle-threads"),
                 ContextMenuIcon::Collapse,
                 KeyAssignment::ToggleWorkspaceThreadsCollapsed(project_id.clone()),
             ),
             ContextMenuItem::Separator,
             ContextMenuItem::item_with_icon(
-                "Remove Workspace",
+                crate::i18n::tr("menu-remove-project"),
                 ContextMenuIcon::FolderRemove,
                 KeyAssignment::RemoveProject(project_id),
             ),
@@ -4413,9 +4420,9 @@ impl super::TermWindow {
         let mut items = vec![];
         for space in &spaces {
             let label = if space.is_occupied_by_other_window {
-                format!("{} (occupied)", space.name)
+                tr_with_name("menu-space-occupied", &space.name)
             } else if space.is_remote {
-                format!("{} (Remote)", space.name)
+                tr_with_name("menu-space-remote", &space.name)
             } else {
                 space.name.clone()
             };
@@ -4439,7 +4446,7 @@ impl super::TermWindow {
 
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item_with_icon(
-            "New Space",
+            crate::i18n::tr("menu-new-space"),
             ContextMenuIcon::New,
             KeyAssignment::CreateSpace,
         ));
@@ -4447,8 +4454,8 @@ impl super::TermWindow {
             spaces
                 .iter()
                 .find(|space| space.is_active)
-                .map(|space| format!("Rename \"{}\"...", space.name))
-                .unwrap_or_else(|| "Rename Space...".to_string()),
+                .map(|space| tr_with_name("menu-rename-named-space", &space.name))
+                .unwrap_or_else(|| crate::i18n::tr("menu-rename-space")),
             ContextMenuIcon::Edit,
             KeyAssignment::PromptRenameSpace(self.active_space_id.clone()),
         ));
@@ -4462,9 +4469,9 @@ impl super::TermWindow {
             // are untouched. Label it accordingly.
             ContextMenuItem::item_with_icon(
                 if space.is_remote {
-                    format!("Disconnect \"{}\" (Server Keeps Running)", space.name)
+                    tr_with_name("menu-disconnect-space", &space.name)
                 } else {
-                    format!("Delete \"{}\"", space.name)
+                    tr_with_name("menu-delete-space", &space.name)
                 },
                 ContextMenuIcon::Delete,
                 KeyAssignment::DeleteSpace(space.id),
@@ -4492,7 +4499,7 @@ impl super::TermWindow {
             items.push(delete_item(space));
             if offer_remote_kill {
                 items.push(ContextMenuItem::item_with_icon(
-                    format!("Delete \"{name}\" & End Remote Sessions"),
+                    tr_with_name("menu-delete-space-and-sessions", &name),
                     ContextMenuIcon::Delete,
                     KeyAssignment::DeleteSpaceAndRemoteSessions(id),
                 ));
@@ -4506,7 +4513,7 @@ impl super::TermWindow {
             .collect::<Vec<_>>();
         if !other_delete_candidates.is_empty() {
             items.push(ContextMenuItem::submenu_with_icon(
-                "Delete Other Space",
+                crate::i18n::tr("menu-delete-other-space"),
                 ContextMenuIcon::Delete,
                 other_delete_candidates,
             ));
@@ -4523,22 +4530,22 @@ impl super::TermWindow {
         let mut status_items = Vec::new();
         for (label, icon, status) in [
             (
-                "Running",
+                crate::i18n::tr("menu-status-running"),
                 ContextMenuIcon::Refresh,
                 WorkspaceThreadWorkStatus::Running,
             ),
             (
-                "Needs Attention",
+                crate::i18n::tr("menu-status-attention"),
                 ContextMenuIcon::Warning,
                 WorkspaceThreadWorkStatus::NeedsAttention,
             ),
             (
-                "Done",
+                crate::i18n::tr("menu-status-done"),
                 ContextMenuIcon::Check,
                 WorkspaceThreadWorkStatus::FinishedUnseen,
             ),
             (
-                "Idle",
+                crate::i18n::tr("menu-status-idle"),
                 ContextMenuIcon::Info,
                 WorkspaceThreadWorkStatus::Idle,
             ),
@@ -4558,19 +4565,31 @@ impl super::TermWindow {
         }
 
         vec![
-            ContextMenuItem::item_with_icon("Group by", ContextMenuIcon::Stack, KeyAssignment::Nop)
-                .disabled(),
             ContextMenuItem::item_with_icon(
-                "Workspace",
+                crate::i18n::tr("menu-group-by"),
+                ContextMenuIcon::Stack,
+                KeyAssignment::Nop,
+            )
+            .disabled(),
+            ContextMenuItem::item_with_icon(
+                crate::i18n::tr("menu-workspace"),
                 ContextMenuIcon::Folder,
                 KeyAssignment::Nop,
             )
             .checked(true)
             .disabled(),
             ContextMenuItem::Separator,
-            ContextMenuItem::item_with_icon("Show", ContextMenuIcon::Info, KeyAssignment::Nop)
-                .disabled(),
-            ContextMenuItem::submenu_with_icon("Status", ContextMenuIcon::Check, status_items),
+            ContextMenuItem::item_with_icon(
+                crate::i18n::tr("menu-show"),
+                ContextMenuIcon::Info,
+                KeyAssignment::Nop,
+            )
+            .disabled(),
+            ContextMenuItem::submenu_with_icon(
+                crate::i18n::tr("menu-status"),
+                ContextMenuIcon::Check,
+                status_items,
+            ),
         ]
     }
 
@@ -4624,7 +4643,7 @@ impl super::TermWindow {
         self.begin_context_menu_application_actions();
         let items = if notifications.is_empty() {
             vec![ContextMenuItem::item_with_icon(
-                "No notifications",
+                crate::i18n::tr("menu-no-notifications"),
                 ContextMenuIcon::Notification,
                 KeyAssignment::Nop,
             )
@@ -4738,14 +4757,14 @@ impl super::TermWindow {
                 .is_some();
             if connection.is_remote && connection.is_live {
                 items.push(ContextMenuItem::item_with_icon(
-                    "Disconnect Thread",
+                    crate::i18n::tr("menu-disconnect-thread"),
                     ContextMenuIcon::Close,
                     KeyAssignment::DisconnectWorkspaceThread(thread_id.clone()),
                 ));
                 items.push(ContextMenuItem::Separator);
             } else if connection.is_remote && remote_host_exists {
                 items.push(ContextMenuItem::item_with_icon(
-                    "Connect Thread",
+                    crate::i18n::tr("menu-connect-thread"),
                     ContextMenuIcon::ExternalLink,
                     KeyAssignment::ConnectWorkspaceThread(thread_id.clone()),
                 ));
@@ -4756,9 +4775,9 @@ impl super::TermWindow {
         items.extend([
             ContextMenuItem::item_with_icon(
                 if is_pinned {
-                    "Unpin Thread"
+                    crate::i18n::tr("menu-unpin-thread")
                 } else {
-                    "Pin Thread"
+                    crate::i18n::tr("menu-pin-thread")
                 },
                 if is_pinned {
                     ContextMenuIcon::Unpin
@@ -4768,17 +4787,17 @@ impl super::TermWindow {
                 KeyAssignment::ToggleWorkspaceThreadPinned(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "Rename Thread...",
+                crate::i18n::tr("menu-rename-thread"),
                 ContextMenuIcon::Edit,
                 KeyAssignment::PromptRenameWorkspaceThread(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "Delete Thread",
+                crate::i18n::tr("menu-delete-thread"),
                 ContextMenuIcon::Delete,
                 KeyAssignment::DeleteWorkspaceThread(thread_id.clone()),
             ),
             ContextMenuItem::item_with_icon(
-                "Mark as Unread",
+                crate::i18n::tr("menu-mark-unread"),
                 ContextMenuIcon::Notification,
                 KeyAssignment::MarkWorkspaceThreadUnread(thread_id),
             ),
@@ -6131,7 +6150,7 @@ impl super::TermWindow {
         }
 
         let mut items = vec![ContextMenuItem::item_with_icon(
-            "Rename Tab...",
+            crate::i18n::tr("menu-rename-tab"),
             ContextMenuIcon::Edit,
             Self::tab_context_action(tab_idx, KeyAssignment::PromptRenameTab),
         )];
@@ -6139,21 +6158,21 @@ impl super::TermWindow {
         let mut close_items = vec![];
         if let Some(action) = Self::close_tabs_to_left_action(tab_idx) {
             close_items.push(ContextMenuItem::item_with_icon(
-                "Close Tabs to Left",
+                crate::i18n::tr("menu-close-tabs-left"),
                 ContextMenuIcon::Close,
                 action,
             ));
         }
         if let Some(action) = Self::close_tabs_to_right_action(tab_idx, tab_count) {
             close_items.push(ContextMenuItem::item_with_icon(
-                "Close Tabs to Right",
+                crate::i18n::tr("menu-close-tabs-right"),
                 ContextMenuIcon::Close,
                 action,
             ));
         }
         if let Some(action) = Self::close_other_tabs_action(tab_idx, tab_count) {
             close_items.push(ContextMenuItem::item_with_icon(
-                "Close Other Tabs",
+                crate::i18n::tr("menu-close-other-tabs"),
                 ContextMenuIcon::Close,
                 action,
             ));
@@ -6166,14 +6185,14 @@ impl super::TermWindow {
         let mut move_items = vec![];
         if tab_idx > 0 {
             move_items.push(ContextMenuItem::item_with_icon(
-                "Move Tab Left",
+                crate::i18n::tr("menu-move-tab-left"),
                 ContextMenuIcon::MoveLeft,
                 Self::tab_context_action(tab_idx, KeyAssignment::MoveTab(tab_idx - 1)),
             ));
         }
         if tab_idx + 1 < tab_count {
             move_items.push(ContextMenuItem::item_with_icon(
-                "Move Tab Right",
+                crate::i18n::tr("menu-move-tab-right"),
                 ContextMenuIcon::MoveRight,
                 Self::tab_context_action(tab_idx, KeyAssignment::MoveTab(tab_idx + 1)),
             ));
@@ -6185,7 +6204,7 @@ impl super::TermWindow {
 
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item_with_icon(
-            "New Terminal Tab to Right",
+            crate::i18n::tr("menu-new-terminal-tab-right"),
             ContextMenuIcon::Terminal,
             Self::tab_context_action(
                 tab_idx,
@@ -6194,7 +6213,7 @@ impl super::TermWindow {
         ));
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item_with_icon(
-            "Zoom Pane",
+            crate::i18n::tr("menu-zoom-pane"),
             ContextMenuIcon::Expand,
             Self::tab_context_action(tab_idx, KeyAssignment::TogglePaneZoomState),
         ));
@@ -6395,7 +6414,7 @@ impl super::TermWindow {
 
     fn terminal_context_menu_items(&self) -> Vec<ContextMenuItem> {
         fn split_item(
-            label: &str,
+            label: String,
             icon: ContextMenuIcon,
             direction: PaneDirection,
         ) -> ContextMenuItem {
@@ -6413,39 +6432,39 @@ impl super::TermWindow {
 
         vec![
             ContextMenuItem::item_with_icon(
-                "Copy",
+                crate::i18n::tr("menu-copy"),
                 ContextMenuIcon::Copy,
                 KeyAssignment::CopyTo(ClipboardCopyDestination::Clipboard),
             ),
             ContextMenuItem::item_with_icon(
-                "Paste",
+                crate::i18n::tr("menu-paste"),
                 ContextMenuIcon::Paste,
                 KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard),
             ),
             ContextMenuItem::Separator,
             split_item(
-                "Split Right",
+                crate::i18n::tr("menu-split-right"),
                 ContextMenuIcon::SplitHorizontal,
                 PaneDirection::Right,
             ),
             split_item(
-                "Split Left",
+                crate::i18n::tr("menu-split-left"),
                 ContextMenuIcon::SplitHorizontal,
                 PaneDirection::Left,
             ),
             split_item(
-                "Split Down",
+                crate::i18n::tr("menu-split-down"),
                 ContextMenuIcon::SplitVertical,
                 PaneDirection::Down,
             ),
             split_item(
-                "Split Up",
+                crate::i18n::tr("menu-split-up"),
                 ContextMenuIcon::SplitVertical,
                 PaneDirection::Up,
             ),
             ContextMenuItem::Separator,
             ContextMenuItem::item_with_icon(
-                "Reset Terminal",
+                crate::i18n::tr("menu-reset-terminal"),
                 ContextMenuIcon::Refresh,
                 KeyAssignment::ResetTerminal,
             ),
@@ -6503,7 +6522,7 @@ impl super::TermWindow {
                 items.push(ContextMenuItem::Separator);
             }
             items.push(self.context_menu_application_item_with_icon(
-                "Ignore Spelling",
+                crate::i18n::tr("menu-ignore-spelling"),
                 ContextMenuIcon::Spellcheck,
                 ContextMenuApplicationAction::Note(NoteEditorCommand::IgnoreSpelling {
                     word: issue.word.clone(),
@@ -6511,7 +6530,7 @@ impl super::TermWindow {
                 true,
             ));
             items.push(self.context_menu_application_item_with_icon(
-                "Learn Spelling",
+                crate::i18n::tr("menu-learn-spelling"),
                 ContextMenuIcon::Spellcheck,
                 ContextMenuApplicationAction::Note(NoteEditorCommand::LearnSpelling {
                     word: issue.word,
@@ -6522,7 +6541,7 @@ impl super::TermWindow {
         }
         if let Some(text) = lookup_text {
             items.push(self.context_menu_application_item_with_icon(
-                "Look Up",
+                crate::i18n::tr("menu-look-up"),
                 ContextMenuIcon::Search,
                 ContextMenuApplicationAction::Note(NoteEditorCommand::LookUp {
                     text,
@@ -6533,45 +6552,45 @@ impl super::TermWindow {
             items.push(ContextMenuItem::Separator);
         }
         items.push(self.context_menu_application_item_with_icon(
-            "Undo",
+            crate::i18n::tr("menu-undo"),
             ContextMenuIcon::Undo,
             ContextMenuApplicationAction::Note(NoteEditorCommand::Undo),
             can_undo,
         ));
         items.push(self.context_menu_application_item_with_icon(
-            "Redo",
+            crate::i18n::tr("menu-redo"),
             ContextMenuIcon::Redo,
             ContextMenuApplicationAction::Note(NoteEditorCommand::Redo),
             can_redo,
         ));
         items.push(ContextMenuItem::Separator);
         items.push(self.context_menu_application_item_with_icon(
-            "Cut",
+            crate::i18n::tr("menu-cut"),
             ContextMenuIcon::Cut,
             ContextMenuApplicationAction::Note(NoteEditorCommand::Cut),
             editable && has_selection,
         ));
         items.push(self.context_menu_application_item_with_icon(
-            "Copy",
+            crate::i18n::tr("menu-copy"),
             ContextMenuIcon::Copy,
             ContextMenuApplicationAction::Note(NoteEditorCommand::Copy),
             has_selection,
         ));
         items.push(self.context_menu_application_item_with_icon(
-            "Paste",
+            crate::i18n::tr("menu-paste"),
             ContextMenuIcon::Paste,
             ContextMenuApplicationAction::Note(NoteEditorCommand::Paste),
             editable,
         ));
         items.push(self.context_menu_application_item_with_icon(
-            "Delete",
+            crate::i18n::tr("menu-delete"),
             ContextMenuIcon::Delete,
             ContextMenuApplicationAction::Note(NoteEditorCommand::Delete),
             editable && has_selection,
         ));
         items.push(ContextMenuItem::Separator);
         items.push(self.context_menu_application_item_with_icon(
-            "Select All",
+            crate::i18n::tr("menu-select-all"),
             ContextMenuIcon::Check,
             ContextMenuApplicationAction::Note(NoteEditorCommand::SelectAll),
             has_text,
