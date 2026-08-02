@@ -294,6 +294,31 @@ fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<Stri
     }
 }
 
+/// Backoff for a retrying in-window connection, waking frequently enough that
+/// closing the empty ConnectionUI window is a real cancellation rather than a
+/// hidden retry loop that keeps the process alive.
+async fn wait_connect_backoff_while_window_exists(
+    window_id: mux::window::WindowId,
+    duration: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        if Mux::get().get_window(window_id).is_none() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        smol::Timer::after(
+            deadline
+                .saturating_duration_since(now)
+                .min(std::time::Duration::from_millis(100)),
+        )
+        .await;
+    }
+}
+
 /// Returns the domain id to tag domain-owned mux windows with, when the
 /// domain is a ClientDomain (remote mux). Tagged windows are exempt from
 /// the frontend's saved-thread restore/adoption and local layout snapshots.
@@ -499,29 +524,69 @@ pub(crate) async fn connect_domain_into_space(
             ..Default::default()
         });
         loop {
+            if mux.get_window(window_id).is_none() {
+                ui.close();
+                return Ok(());
+            }
             let attempt = match domain.downcast_ref::<ClientDomain>() {
                 Some(client) => client.attach_with_ui(Some(window_id), ui.clone()).await,
                 None => domain.attach(Some(window_id)).await,
             };
             match attempt {
-                Ok(()) => break,
+                Ok(()) => {
+                    // The transport can finish connecting just after the user
+                    // closes its GUI. Do not turn that late success into a
+                    // headless attached domain.
+                    if mux.get_window(window_id).is_none() {
+                        ui.close();
+                        if domain.state() == DomainState::Attached {
+                            domain.detach()?;
+                        }
+                        return Ok(());
+                    }
+                    break;
+                }
                 Err(err) => {
                     log::error!("attaching {domain_name} failed: {err:#}; retrying in {backoff:?}");
                     ui.output_str(&format!("Will retry in {backoff:?}...\n"));
-                    smol::Timer::after(backoff).await;
+                    if !wait_connect_backoff_while_window_exists(window_id, backoff).await {
+                        ui.close();
+                        return Ok(());
+                    }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
         }
     }
 
+    // The server owns the sidebar tree and only hands it over as part of the
+    // attach, so the Space and thread picked above were a guess: a device
+    // meeting this server for the first time has to invent a Space before it
+    // can authenticate, and learns the real ones only now. Ask again against
+    // the tree that has since landed, then push up whatever the server is
+    // still missing (its tree can legitimately be empty — the last Space was
+    // deleted from another device — in which case the Space we invented is
+    // the right answer and wants seeding).
+    let settled = workspace_threads::ensure_mux_domain_space(&domain_name);
+    let settled_workspace = workspace_threads::ensure_mux_thread_workspace(&settled);
+    workspace_threads::reconcile_remote_subtree(&domain_name);
+
     // Spawn the thread's first shell when its workspace has no panes on the
     // server. Keying this off "does the domain have any panes at all" left
     // the connect window empty whenever the server had unrelated windows
     // (its own startup window, other threads) — the old blind window
     // adoption papered over that by grabbing one of them as a tab.
-    let thread_workspace_filter = Some(thread_workspace);
-    if !have_panes_in_domain_and_ws(&domain, &thread_workspace_filter) {
+    let thread_workspace_filter = Some(thread_workspace.clone());
+    if settled_workspace != thread_workspace {
+        // The invented Space is gone from the store, so the window created
+        // above is being re-homed onto one the server really has, and that
+        // path materializes the destination thread itself. Spawning here
+        // would strand a shell in a workspace no row on the server names.
+        log::info!(
+            "{domain_name} has its own Spaces; leaving {settled_workspace} \
+             to the re-home instead of spawning into {thread_workspace}"
+        );
+    } else if !have_panes_in_domain_and_ws(&domain, &thread_workspace_filter) {
         let _config_subscription = config::subscribe_to_config_reload(move || {
             promise::spawn::spawn_into_main_thread(async move {
                 if let Err(err) = update_mux_domains(&config::configuration()) {
@@ -960,6 +1025,16 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     if let Some(pos) = opts.position.as_ref() {
         set_window_position(pos.clone());
     }
+
+    // A mux server owns the sidebar tree for its Spaces; wezterm-client hands
+    // every copy it receives to this sink, which merges it with the parts of
+    // the view that belong to this device alone.
+    wezterm_client::domain::set_thinkterm_tree_sink(|domain_name, tree| {
+        crate::workspace_threads::ingest_remote_tree(domain_name, tree);
+    });
+    wezterm_client::domain::set_thinkterm_connect_sink(|domain_name| {
+        crate::workspace_threads::note_remote_connected(domain_name);
+    });
 
     let config = config::configuration();
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();

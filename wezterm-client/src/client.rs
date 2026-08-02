@@ -329,6 +329,24 @@ fn process_unilateral(
             .detach();
             return Ok(());
         }
+        Pdu::ThinkTermTreeState(_) => {
+            // Another device (or this one) changed the server's sidebar tree.
+            // Hand the whole thing to the GUI, which merges it with this
+            // device's own view state.
+            let Pdu::ThinkTermTreeState(state) = decoded.pdu else {
+                unreachable!("matched ThinkTermTreeState above");
+            };
+            promise::spawn::spawn_into_main_thread(async move {
+                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                crate::domain::deliver_thinkterm_tree(domain.domain_name(), state.tree);
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
+            return Ok(());
+        }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
             promise::spawn::spawn_into_main_thread(async move {
@@ -1620,6 +1638,16 @@ impl Client {
         move_pane_to_new_tab,
         MovePaneToNewTab,
         MovePaneToNewTabResponse
+    );
+    rpc!(
+        get_thinkterm_tree,
+        GetThinkTermTree = (),
+        ThinkTermTreeState
+    );
+    rpc!(
+        mutate_thinkterm_tree,
+        MutateThinkTermTree,
+        ThinkTermTreeState
     );
     rpc!(write_to_pane, WriteToPane, UnitResponse);
     rpc!(send_paste, SendPaste, UnitResponse);

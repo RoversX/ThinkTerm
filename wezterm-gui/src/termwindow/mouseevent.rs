@@ -2,6 +2,7 @@ use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::content_view::ContentViewId;
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
+use crate::termwindow::ui::sidebar::SpaceConnectionState;
 use crate::termwindow::ui::tokens::{
     PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_ROW_START_PADDING,
     TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
@@ -4415,14 +4416,19 @@ impl super::TermWindow {
         ]
     }
 
+    /// One row per Space, grouped by the server hosting it.
+    ///
+    /// A remote server is a *connection*, not a Space: it can host several, and
+    /// they all go up and down together. So it appears as a disabled group
+    /// header carrying the connection's state, with its Spaces listed beneath
+    /// and a "New Space Here" entry of its own. Local Spaces stay at the top,
+    /// ungrouped.
     fn space_menu_items(&self) -> Vec<ContextMenuItem> {
         let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
-        let mut items = vec![];
-        for space in &spaces {
+
+        let space_item = |space: &crate::workspace_threads::SpaceView| {
             let label = if space.is_occupied_by_other_window {
                 tr_with_name("menu-space-occupied", &space.name)
-            } else if space.is_remote {
-                tr_with_name("menu-space-remote", &space.name)
             } else {
                 space.name.clone()
             };
@@ -4430,8 +4436,6 @@ impl super::TermWindow {
                 label,
                 if space.is_default {
                     ContextMenuIcon::Home
-                } else if space.is_remote {
-                    ContextMenuIcon::Server
                 } else {
                     ContextMenuIcon::Stack
                 },
@@ -4441,7 +4445,65 @@ impl super::TermWindow {
             if space.is_occupied_by_other_window {
                 item = item.disabled();
             }
-            items.push(item);
+            item
+        };
+
+        let mut items = vec![];
+        for space in spaces.iter().filter(|space| space.domain.is_none()) {
+            items.push(space_item(space));
+        }
+
+        // Keep the servers in the order their Spaces appear rather than
+        // sorting: that order is the user's.
+        let mut domains: Vec<&str> = vec![];
+        for domain in spaces.iter().filter_map(|space| space.domain.as_deref()) {
+            if !domains.contains(&domain) {
+                domains.push(domain);
+            }
+        }
+
+        for domain in domains {
+            items.push(ContextMenuItem::Separator);
+            let state = spaces
+                .iter()
+                .find(|space| space.domain.as_deref() == Some(domain))
+                .map(|space| self.space_connection_state(&space.id))
+                .unwrap_or(SpaceConnectionState::Connected);
+            let header = match state {
+                SpaceConnectionState::Connected => tr_with_name("menu-space-server-group", domain),
+                SpaceConnectionState::Connecting => {
+                    tr_with_name("menu-space-server-group-connecting", domain)
+                }
+                // Distinct from disconnected: the transport is being retried,
+                // and calling that "disconnected" reads as though the Spaces
+                // below are unreachable for good.
+                SpaceConnectionState::Reconnecting => {
+                    tr_with_name("menu-space-server-group-reconnecting", domain)
+                }
+                SpaceConnectionState::Disconnected => {
+                    tr_with_name("menu-space-server-group-offline", domain)
+                }
+            };
+            // Disabled: a server is a heading, not something to switch to.
+            items.push(
+                ContextMenuItem::item_with_icon(
+                    header,
+                    ContextMenuIcon::Server,
+                    KeyAssignment::Nop,
+                )
+                .disabled(),
+            );
+            for space in spaces
+                .iter()
+                .filter(|space| space.domain.as_deref() == Some(domain))
+            {
+                items.push(space_item(space));
+            }
+            items.push(ContextMenuItem::item_with_icon(
+                crate::i18n::tr("menu-new-space-here"),
+                ContextMenuIcon::New,
+                KeyAssignment::CreateSpaceOnDomain(domain.to_string()),
+            ));
         }
 
         items.push(ContextMenuItem::Separator);
@@ -4463,10 +4525,11 @@ impl super::TermWindow {
             .iter()
             .find(|space| space.is_active)
             .map(|space| space.id.clone());
+        // A remote Space lives on its server, so removing it here only drops
+        // this device's copy: the Space is untouched for everyone else and
+        // returns on the next connect. Deleting it for real is a separate,
+        // more-consequential entry offered alongside.
         let delete_item = |space: crate::workspace_threads::SpaceView| {
-            // Deleting a remote Space only detaches and removes the local
-            // records; the remote mux server and everything running in it
-            // are untouched. Label it accordingly.
             ContextMenuItem::item_with_icon(
                 if space.is_remote {
                     tr_with_name("menu-disconnect-space", &space.name)
@@ -4487,9 +4550,10 @@ impl super::TermWindow {
             .find(|space| active_space_id.as_deref() == Some(space.id.as_str()))
             .cloned();
         if let Some(space) = active_delete {
-            // For a currently-connected remote Space, also offer really
-            // ending the sessions on the server before removing it.
-            let offer_remote_kill = space.is_remote
+            let is_remote = space.is_remote;
+            // Ending the sessions too only makes sense while we are actually
+            // connected to the server.
+            let offer_remote_kill = is_remote
                 && crate::workspace_threads::client_domain_for_space(&space.id)
                     .and_then(|name| Mux::get().get_domain_by_name(&name))
                     .map_or(false, |domain| {
@@ -4497,6 +4561,13 @@ impl super::TermWindow {
                     });
             let (name, id) = (space.name.clone(), space.id.clone());
             items.push(delete_item(space));
+            if is_remote {
+                items.push(ContextMenuItem::item_with_icon(
+                    tr_with_name("menu-delete-space-everywhere", &name),
+                    ContextMenuIcon::Delete,
+                    KeyAssignment::DeleteSpaceEverywhere(id.clone()),
+                ));
+            }
             if offer_remote_kill {
                 items.push(ContextMenuItem::item_with_icon(
                     tr_with_name("menu-delete-space-and-sessions", &name),
@@ -4824,7 +4895,14 @@ impl super::TermWindow {
     }
 
     pub(crate) fn create_workspace_thread(&mut self, project_id: &str, context: &dyn WindowOps) {
-        let thread_id = crate::workspace_threads::create_thread(project_id, None);
+        let thread_id = match crate::workspace_threads::create_thread(project_id, None) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                log::warn!("failed to create ThinkTerm thread: {err:#}");
+                context.invalidate();
+                return;
+            }
+        };
         if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
             self.activate_workspace_thread(thread_id, context);
         }

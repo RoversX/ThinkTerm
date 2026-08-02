@@ -541,14 +541,26 @@ impl ClientPane {
     }
 
     /// Arrange to suppress the next Pane::kill call.
-    /// This is a bit of a hack that we use when closing a window;
-    /// our Domain::local_window_is_closing impl calls this for each
-    /// ClientPane in the window so that closing a window effectively
-    /// "detaches" the window so that reconnecting later will resume
-    /// from where they left off.
-    /// It isn't perfect.
+    ///
+    /// ThinkTerm uses this when it intentionally discards a local mirror
+    /// (for example, Disconnect or Delete Space) while leaving the pane alive
+    /// on the mux server.  Native GUI closure can keep the whole mux window in
+    /// the background instead, so it does not need this one-shot suppression.
     pub fn ignore_next_kill(&self) {
         *self.ignore_next_kill.lock() = true;
+    }
+
+    /// End the remote pane and wait for the mux server to acknowledge it.
+    /// Destructive compound workflows use this instead of `Pane::kill`, whose
+    /// fire-and-forget task can lose a race with detaching the last window.
+    pub async fn kill_remote_and_wait(&self) -> anyhow::Result<()> {
+        self.client
+            .client
+            .kill_pane(KillPane {
+                pane_id: self.remote_pane_id,
+            })
+            .await?;
+        Ok(())
     }
 }
 

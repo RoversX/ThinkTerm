@@ -6,6 +6,14 @@ use mux::termwiztermtab::TermWizTerminal;
 use mux::window::WindowId;
 use mux::Mux;
 
+fn close_window_confirmation_prompt(preserve_mux_window: bool) -> &'static str {
+    if preserve_mux_window {
+        "Really close this window? Remote sessions will continue running."
+    } else {
+        "🛑 Really kill this window and all contained tabs and panes?"
+    }
+}
+
 pub fn confirm_close_pane(
     pane_id: PaneId,
     mut term: TermWizTerminal,
@@ -54,20 +62,41 @@ pub fn confirm_close_window(
     mux_window_id: WindowId,
     window: ::window::Window,
     tab_id: TabId,
+    preserve_mux_window: bool,
 ) -> anyhow::Result<()> {
-    if confirm::run_confirmation(
-        "🛑 Really kill this window and all contained tabs and panes?",
-        &mut term,
-    )? {
+    let prompt = close_window_confirmation_prompt(preserve_mux_window);
+    if confirm::run_confirmation(prompt, &mut term)? {
+        let gui_window = window.clone();
         promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            mux.kill_window(mux_window_id);
+            if preserve_mux_window {
+                TermWindow::close_gui_window_preserving_mux(&gui_window);
+            } else {
+                let mux = Mux::get();
+                mux.kill_window(mux_window_id);
+            }
         })
         .detach();
     }
     TermWindow::schedule_cancel_overlay(window, tab_id, None);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_close_prompt_matches_close_semantics() {
+        assert_eq!(
+            close_window_confirmation_prompt(true),
+            "Really close this window? Remote sessions will continue running."
+        );
+        assert_eq!(
+            close_window_confirmation_prompt(false),
+            "🛑 Really kill this window and all contained tabs and panes?"
+        );
+    }
 }
 
 pub fn confirm_quit_program(

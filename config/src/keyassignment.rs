@@ -591,10 +591,19 @@ pub enum KeyAssignment {
     PromptRenameWorkspaceThread(String),
     PromptRenameSpace(String),
     CreateSpace,
+    /// Create a Space that lives on the named mux server rather than locally.
+    /// One server can host several.
+    CreateSpaceOnDomain(String),
     SwitchSpace(String),
+    /// Remove the Space from this device. A remote Space lives on its mux
+    /// server, so this only drops the local copy: the Space is still there for
+    /// other devices and comes back on the next connect.
     DeleteSpace(String),
-    /// Like DeleteSpace, but for a remote (mux-domain) Space also kill its
-    /// sessions on the remote mux server before detaching.
+    /// Delete a remote Space on the server that hosts it, so it disappears
+    /// from every device.
+    DeleteSpaceEverywhere(String),
+    /// Like DeleteSpaceEverywhere, but also kill the Space's sessions on the
+    /// remote mux server first.
     DeleteSpaceAndRemoteSessions(String),
     CreateWorkspaceThread(String),
     ToggleWorkspaceThreadsCollapsed(String),

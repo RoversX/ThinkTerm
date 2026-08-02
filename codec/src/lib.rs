@@ -36,6 +36,12 @@ use thiserror::Error;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 
+pub mod thinkterm_tree;
+pub use thinkterm_tree::{
+    apply_op, ensure_unique_thread_names, ThinkTermTree, TreeOp, TtProject, TtProjectId, TtSpace,
+    TtSpaceId, TtThread, TtThreadId,
+};
+
 #[derive(Error, Debug)]
 #[error("Corrupt Response: {0}")]
 pub struct CorruptResponse(String);
@@ -445,7 +451,8 @@ macro_rules! pdu {
 /// 48: MovePaneToStack moves an existing pane into another pane stack.
 /// 49: Palette advisories are client-only, application palette state is
 ///     explicit, and SetFocusedPane carries the focusing client's palette.
-pub const CODEC_VERSION: usize = 49;
+/// 50: The server owns the ThinkTerm sidebar tree (Space/Project/Thread).
+pub const CODEC_VERSION: usize = 51;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -510,6 +517,9 @@ pdu! {
     ActivatePaneInStack: 64,
     MovePaneToStack: 65,
     SetApplicationPalette: 66,
+    GetThinkTermTree: 67,
+    MutateThinkTermTree: 68,
+    ThinkTermTreeState: 69,
 }
 
 impl Pdu {
@@ -841,6 +851,32 @@ pub struct SetApplicationPalette {
 pub struct NotifyAlert {
     pub pane_id: PaneId,
     pub alert: Alert,
+}
+
+/// Fetch the server's ThinkTerm sidebar tree. Responds with
+/// `ThinkTermTreeState`.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetThinkTermTree {}
+
+/// Apply mutations to the server's ThinkTerm sidebar tree, in order. Responds
+/// with `ThinkTermTreeState` carrying the tree as it stands afterwards; when
+/// anything changed the same state is also pushed unilaterally to every other
+/// connected client.
+///
+/// A batch is what lets a client seed a fresh server — "here is everything I
+/// have for you" — in one round trip and one broadcast instead of a storm of
+/// single-op RPCs.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct MutateThinkTermTree {
+    pub ops: Vec<TreeOp>,
+}
+
+/// The whole tree. It is small enough (tens of KB) that shipping it in full on
+/// every change is cheaper than maintaining a delta protocol, and it removes
+/// an entire class of resync bugs. Doubles as the server's unilateral push.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct ThinkTermTreeState {
+    pub tree: ThinkTermTree,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1255,6 +1291,72 @@ mod test {
                     source_pane_id: 17,
                     target_pane_id: 29,
                 }),
+            }
+        );
+    }
+
+    #[test]
+    fn thinkterm_tree_round_trip() {
+        let mut tree = ThinkTermTree::default();
+        for op in [
+            TreeOp::CreateSpace {
+                space_id: "s1".into(),
+                name: "Work".into(),
+            },
+            TreeOp::CreateProject {
+                project_id: "p1".into(),
+                space_id: "s1".into(),
+                name: "thinkterm".into(),
+                path: "/home/x/github/ThinkTerm".into(),
+            },
+            TreeOp::CreateThread {
+                thread_id: "t1".into(),
+                project_id: "p1".into(),
+                name: "main".into(),
+                workspace: Some("thinkterm:p1:t1".into()),
+                created_at: 1_700_000_000,
+            },
+            TreeOp::SetThreadPinned {
+                thread_id: "t1".into(),
+                pinned: true,
+                last_active_at: 1_700_000_001,
+            },
+        ] {
+            assert!(apply_op(&mut tree, &op));
+        }
+
+        let mut encoded = Vec::new();
+        Pdu::ThinkTermTreeState(ThinkTermTreeState { tree: tree.clone() })
+            .encode(&mut encoded, 0x11)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x11,
+                pdu: Pdu::ThinkTermTreeState(ThinkTermTreeState { tree }),
+            }
+        );
+
+        // The ops travel in the other direction, in batches.
+        let ops = vec![
+            TreeOp::MoveThreadBefore {
+                project_id: "p1".into(),
+                thread_id: "t2".into(),
+                before: None,
+            },
+            TreeOp::DeleteSpace {
+                space_id: "s1".into(),
+            },
+        ];
+        let mut encoded = Vec::new();
+        Pdu::MutateThinkTermTree(MutateThinkTermTree { ops: ops.clone() })
+            .encode(&mut encoded, 0x12)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x12,
+                pdu: Pdu::MutateThinkTermTree(MutateThinkTermTree { ops }),
             }
         );
     }

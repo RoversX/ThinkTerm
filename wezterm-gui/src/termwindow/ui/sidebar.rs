@@ -20,7 +20,9 @@ use crate::workspace_threads;
 use anyhow::Context;
 use mux::Mux;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{MouseEventKind as WMEK, RectF};
@@ -48,13 +50,17 @@ const SESSION_STATUS_ACTIVE_ICON_SIZE: usize = 26;
 const SESSION_STATUS_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
 const SESSION_STATUS_OPEN_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
 const SPACE_DISCONNECTED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
+const NOTIFICATION_BADGE_COLOR: LinearRgba = LinearRgba::with_components(0.96, 0.16, 0.22, 1.0);
+const NOTIFICATION_BADGE_PULSE_DURATION: Duration = Duration::from_millis(1800);
+const NOTIFICATION_BADGE_PULSE_COUNT: f32 = 3.0;
+const NOTIFICATION_BADGE_FRAME_MS: u64 = 33;
 const SIDEBAR_SECTION_ACTION_SIZE: usize = 48;
 const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 6;
 
 /// Connection health of the active Space's mux client domain, as shown by
 /// the sidebar indicator. Local Spaces are always Connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpaceConnectionState {
+pub(crate) enum SpaceConnectionState {
     Connected,
     /// An attach is in flight (initial connect or manual re-attach); not an
     /// error state, so no alert icon and no Reconnect button.
@@ -311,11 +317,99 @@ impl crate::TermWindow {
         }
     }
 
+    /// Update this window's notification snapshot and return the expanding
+    /// halo phase for a newly arrived notification. An initial snapshot does
+    /// not pulse: notifications restored at startup are unread, but not new.
+    fn workspace_notification_badge_pulse(
+        &mut self,
+        notifications: &[workspace_threads::ThreadWorkNotification],
+    ) -> Option<f32> {
+        let current = notifications
+            .iter()
+            .map(|notification| (notification.thread_id.clone(), notification.status))
+            .collect::<HashMap<_, _>>();
+
+        let has_new_notification = notification_snapshot_has_new_entry(
+            self.workspace_notification_snapshot.as_ref(),
+            &current,
+        );
+        let has_current_notifications = !current.is_empty();
+        self.workspace_notification_snapshot = Some(current);
+
+        if !has_current_notifications {
+            self.workspace_notification_pulse_started_at = None;
+            return None;
+        }
+
+        let now = Instant::now();
+        if has_new_notification {
+            self.workspace_notification_pulse_started_at = Some(now);
+        }
+
+        let started_at = self.workspace_notification_pulse_started_at?;
+        let Some(phase) = notification_badge_pulse_phase(now.saturating_duration_since(started_at))
+        else {
+            self.workspace_notification_pulse_started_at = None;
+            return None;
+        };
+
+        self.update_next_frame_time(Some(
+            now + Duration::from_millis(NOTIFICATION_BADGE_FRAME_MS),
+        ));
+        Some(phase)
+    }
+
+    fn paint_workspace_notification_badge(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer: usize,
+        action_x: usize,
+        action_y: usize,
+        action_size: usize,
+        pulse_phase: Option<f32>,
+    ) -> anyhow::Result<()> {
+        let badge_size = self.ui_px(9).max(4);
+        let badge_x = (action_x + action_size).saturating_sub(badge_size + self.ui_px(6));
+        let badge_y = action_y + self.ui_px(6);
+
+        if let Some(phase) = pulse_phase {
+            // Keep the core visible and radiate a short, fading halo three
+            // times. This attracts attention without a continuously blinking
+            // control once the animation ends.
+            let expansion = self.ui_f32(10.0) * phase;
+            let halo_size = badge_size as f32 + expansion;
+            let halo_x = badge_x as f32 + badge_size as f32 / 2.0 - halo_size / 2.0;
+            let halo_y = badge_y as f32 + badge_size as f32 / 2.0 - halo_size / 2.0;
+            self.fill_rounded_rectangle(
+                layers,
+                layer,
+                euclid::rect(halo_x, halo_y, halo_size, halo_size),
+                NOTIFICATION_BADGE_COLOR.mul_alpha(0.48 * (1.0 - phase)),
+                halo_size / 2.0,
+            )
+            .context("sidebar notification badge pulse")?;
+        }
+
+        self.fill_rounded_rectangle(
+            layers,
+            layer,
+            euclid::rect(
+                badge_x as f32,
+                badge_y as f32,
+                badge_size as f32,
+                badge_size as f32,
+            ),
+            NOTIFICATION_BADGE_COLOR,
+            badge_size as f32 / 2.0,
+        )
+        .context("sidebar notification badge")
+    }
+
     /// Connection health of a client-domain Space. While the Space is
     /// remote we keep a slow self-driven repaint tick going: a dead
     /// connection produces no output, so nothing else would repaint the
     /// indicator when the state flips.
-    fn space_connection_state(&self, space_id: &str) -> SpaceConnectionState {
+    pub(crate) fn space_connection_state(&self, space_id: &str) -> SpaceConnectionState {
         const SUSTAINED_LAG_MS: u64 = 5000;
         let Some(domain_name) = workspace_threads::client_domain_for_space(space_id) else {
             return SpaceConnectionState::Connected;
@@ -1274,6 +1368,12 @@ impl crate::TermWindow {
         )?;
         let notification_icon_size =
             top_action_icon_size.min(notification_action_size.saturating_sub(14));
+        let notification_count = workspace_threads::pending_work_notification_count();
+        let notifications = workspace_threads::pending_work_notifications();
+        // Treat either snapshot as authoritative for this frame if work state
+        // changes between the two short store reads.
+        let has_notifications = notification_count > 0 || !notifications.is_empty();
+        let notification_badge_pulse = self.workspace_notification_badge_pulse(&notifications);
         self.paint_sidebar_icon(
             layers,
             SvgIcon::Bell,
@@ -1288,23 +1388,16 @@ impl crate::TermWindow {
                 muted_fg
             },
         )?;
-        if workspace_threads::pending_work_notification_count() > 0 {
-            // Unread badge; reuses the attention hue the Space indicators use.
-            let badge_size = self.ui_px(8).max(4);
-            self.fill_rounded_rectangle(
+        if has_notifications {
+            self.paint_workspace_notification_badge(
                 layers,
                 2,
-                euclid::rect(
-                    (notification_action_x + notification_action_size)
-                        .saturating_sub(badge_size + self.ui_px(6)) as f32,
-                    (notification_action_y + self.ui_px(6)) as f32,
-                    badge_size as f32,
-                    badge_size as f32,
-                ),
-                SPACE_DISCONNECTED_COLOR,
-                badge_size as f32 / 2.0,
+                notification_action_x,
+                notification_action_y,
+                notification_action_size,
+                notification_badge_pulse,
             )
-            .context("sidebar notification badge")?;
+            .context("sidebar notification badge initial paint")?;
         }
         let list_top = layout.list_top;
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
@@ -2104,6 +2197,20 @@ impl crate::TermWindow {
                     muted_fg
                 },
             )?;
+            if has_notifications {
+                // The layer-2 header mask above covers the initial header
+                // paint. Repaint the badge here too, after the button and bell,
+                // so the unread indicator is actually visible.
+                self.paint_workspace_notification_badge(
+                    layers,
+                    2,
+                    notification_action_x,
+                    notification_action_y,
+                    notification_action_size,
+                    notification_badge_pulse,
+                )
+                .context("sidebar notification badge repaint")?;
+            }
         }
 
         if max_scroll > 0.0 && scroll_offset > 0.0 {
@@ -2837,9 +2944,35 @@ fn snapped_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
         .floor()
 }
 
+fn notification_snapshot_has_new_entry(
+    previous: Option<&HashMap<String, workspace_threads::WorkspaceThreadWorkStatus>>,
+    current: &HashMap<String, workspace_threads::WorkspaceThreadWorkStatus>,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    current
+        .iter()
+        .any(|(thread_id, status)| previous.get(thread_id) != Some(status))
+}
+
+fn notification_badge_pulse_phase(elapsed: Duration) -> Option<f32> {
+    if elapsed >= NOTIFICATION_BADGE_PULSE_DURATION {
+        return None;
+    }
+    let total_progress = elapsed.as_secs_f32() / NOTIFICATION_BADGE_PULSE_DURATION.as_secs_f32();
+    Some((total_progress * NOTIFICATION_BADGE_PULSE_COUNT).fract())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ellipsize_cut_byte, snapped_rounded_corner_radius};
+    use super::{
+        ellipsize_cut_byte, notification_badge_pulse_phase, notification_snapshot_has_new_entry,
+        snapped_rounded_corner_radius, NOTIFICATION_BADGE_PULSE_DURATION,
+    };
+    use crate::workspace_threads::WorkspaceThreadWorkStatus;
+    use std::collections::HashMap;
+    use std::time::Duration;
 
     // Build (advance, cluster) pairs for an ASCII or per-char string where every
     // char is one glyph of `advance` px and the cluster is its byte offset.
@@ -2893,5 +3026,59 @@ mod tests {
         assert_eq!(snapped_rounded_corner_radius(odd_height, 999.0), 16.0);
         assert_eq!(snapped_rounded_corner_radius(even_height, 999.0), 17.0);
         assert_eq!(snapped_rounded_corner_radius(even_height, 10.75), 10.0);
+    }
+
+    #[test]
+    fn notification_snapshot_ignores_initial_state_and_detects_replacements() {
+        let current = HashMap::from([(
+            "thread-a".to_string(),
+            WorkspaceThreadWorkStatus::FinishedUnseen,
+        )]);
+        assert!(!notification_snapshot_has_new_entry(None, &current));
+        assert!(!notification_snapshot_has_new_entry(
+            Some(&current),
+            &current
+        ));
+
+        // Total count is still one, but a different thread completed.
+        let replacement = HashMap::from([(
+            "thread-b".to_string(),
+            WorkspaceThreadWorkStatus::FinishedUnseen,
+        )]);
+        assert!(notification_snapshot_has_new_entry(
+            Some(&current),
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn notification_snapshot_detects_status_transition() {
+        let attention = HashMap::from([(
+            "thread-a".to_string(),
+            WorkspaceThreadWorkStatus::NeedsAttention,
+        )]);
+        let finished = HashMap::from([(
+            "thread-a".to_string(),
+            WorkspaceThreadWorkStatus::FinishedUnseen,
+        )]);
+        assert!(notification_snapshot_has_new_entry(
+            Some(&attention),
+            &finished
+        ));
+    }
+
+    #[test]
+    fn notification_badge_pulses_three_times_then_stops() {
+        assert_eq!(notification_badge_pulse_phase(Duration::ZERO), Some(0.0));
+        assert_eq!(
+            notification_badge_pulse_phase(NOTIFICATION_BADGE_PULSE_DURATION),
+            None
+        );
+
+        // Halfway through each 600ms cycle, the expanding halo is halfway out.
+        for elapsed_ms in [300, 900, 1500] {
+            let phase = notification_badge_pulse_phase(Duration::from_millis(elapsed_ms)).unwrap();
+            assert!((phase - 0.5).abs() < 0.001);
+        }
     }
 }

@@ -527,6 +527,51 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
     true
 }
 
+/// Receives a mux server's ThinkTerm sidebar tree whenever it arrives, either
+/// as the answer to a fetch or as a server push.
+///
+/// `wezterm-client` has no way to reach into the GUI's store, and the GUI is
+/// the only thing that knows how to merge a shared tree with this device's own
+/// state, so it registers a sink here at startup. Headless clients (the CLI,
+/// the mux server's own client domains) simply never register one and the
+/// trees are dropped.
+pub type ThinkTermTreeSink = fn(domain_name: &str, tree: codec::ThinkTermTree);
+
+/// Announces a fresh connection to a server, before anything is asked of it.
+///
+/// Trees do not carry which connection they belong to, and the client has to
+/// know: everything it believes about a server's tree describes the previous
+/// connection, and a server that comes back having lost or rolled back its own
+/// copy must be able to say so rather than be dismissed as out of date.
+pub type ThinkTermConnectSink = fn(domain_name: &str);
+
+lazy_static::lazy_static! {
+    static ref THINKTERM_TREE_SINK: Mutex<Option<ThinkTermTreeSink>> = Mutex::new(None);
+    static ref THINKTERM_CONNECT_SINK: Mutex<Option<ThinkTermConnectSink>> = Mutex::new(None);
+}
+
+pub fn set_thinkterm_tree_sink(sink: ThinkTermTreeSink) {
+    THINKTERM_TREE_SINK.lock().unwrap().replace(sink);
+}
+
+pub fn set_thinkterm_connect_sink(sink: ThinkTermConnectSink) {
+    THINKTERM_CONNECT_SINK.lock().unwrap().replace(sink);
+}
+
+pub(crate) fn deliver_thinkterm_tree(domain_name: &str, tree: codec::ThinkTermTree) {
+    let sink = *THINKTERM_TREE_SINK.lock().unwrap();
+    if let Some(sink) = sink {
+        sink(domain_name, tree);
+    }
+}
+
+pub(crate) fn deliver_thinkterm_connected(domain_name: &str) {
+    let sink = *THINKTERM_CONNECT_SINK.lock().unwrap();
+    if let Some(sink) = sink {
+        sink(domain_name);
+    }
+}
+
 impl ClientDomain {
     pub fn new(config: ClientDomainConfig) -> Self {
         let local_domain_id = alloc_domain_id();
@@ -637,11 +682,44 @@ impl ClientDomain {
     /// more tabs at the time that a disconnect was detected, and
     /// it's also possible that another client connected and adjusted
     /// the set of tabs since we were connected, so we need to re-sync.
+    /// Take up a connection that was re-established after an outage.
+    ///
+    /// This is the funnel every automatic reconnect passes through, so it has
+    /// to do everything a first attach does and not only re-pull the panes.
     pub async fn reattach(domain_id: DomainId, ui: ConnectionUI) -> anyhow::Result<()> {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
+        let domain = Mux::get().get_domain(domain_id);
+
+        // A reconnect begins a new connection generation. The revision
+        // baseline, any old connection-scoped presentation overlay, and the
+        // Spaces a local disconnect hid all belong to the connection that just
+        // died — and this is the "next connect" the Disconnect menu item
+        // promises. Announced first so the tree below, and any push that
+        // overtakes it, is measured against this connection; a push that beats
+        // the announcement is at worst dropped as stale and put right by that
+        // same fetch.
+        if let Some(domain) = &domain {
+            deliver_thinkterm_connected(domain.domain_name());
+        }
 
         let panes = inner.client.list_panes().await?;
         Self::process_pane_list(inner, panes, None, true)?;
+
+        // Pull the tree exactly as a first attach does. Pushes only carry what
+        // changes from now on, so without this the sidebar would keep showing
+        // whatever it held when the link dropped. Remote edits are rejected
+        // while reconnecting; there is deliberately no client queue to flush.
+        if let Some(client) = domain
+            .as_ref()
+            .and_then(|domain| domain.downcast_ref::<ClientDomain>())
+        {
+            if let Err(err) = client.fetch_thinkterm_tree().await {
+                log::warn!(
+                    "failed to fetch the ThinkTerm tree after reconnecting to {}: {err:#}",
+                    client.config.name()
+                );
+            }
+        }
 
         ui.close();
         Ok(())
@@ -666,6 +744,38 @@ impl ClientDomain {
             }
             Self::process_pane_list(inner, panes, None, false)?;
         }
+        Ok(())
+    }
+
+    /// Send mutations of the server's ThinkTerm sidebar tree, hand the
+    /// authoritative result to the sink and return it to the initiating
+    /// workflow.  Returning the tree lets destructive callers wait for an
+    /// explicit server acknowledgement before tearing down the transport that
+    /// carries the request.
+    pub async fn mutate_thinkterm_tree(
+        &self,
+        ops: Vec<codec::TreeOp>,
+    ) -> anyhow::Result<codec::ThinkTermTree> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let response = inner
+            .client
+            .mutate_thinkterm_tree(codec::MutateThinkTermTree { ops })
+            .await?;
+        let tree = response.tree;
+        deliver_thinkterm_tree(self.config.name(), tree.clone());
+        Ok(tree)
+    }
+
+    /// Pull the server's tree and hand it to the sink. Used on attach and
+    /// whenever a client wants to force a resync of the sidebar structure.
+    pub async fn fetch_thinkterm_tree(&self) -> anyhow::Result<()> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let response = inner.client.get_thinkterm_tree().await?;
+        deliver_thinkterm_tree(self.config.name(), response.tree);
         Ok(())
     }
 
@@ -1132,18 +1242,12 @@ impl Domain for ClientDomain {
         let target_pane = mux
             .get_pane(target_local_pane_id)
             .ok_or_else(|| anyhow!("target pane_id {target_local_pane_id} is invalid"))?;
-        let source_client_pane =
-            source_pane
-                .downcast_ref::<ClientPane>()
-                .ok_or_else(|| {
-                    anyhow!("source pane_id {source_local_pane_id} is not a ClientPane")
-                })?;
-        let target_client_pane =
-            target_pane
-                .downcast_ref::<ClientPane>()
-                .ok_or_else(|| {
-                    anyhow!("target pane_id {target_local_pane_id} is not a ClientPane")
-                })?;
+        let source_client_pane = source_pane
+            .downcast_ref::<ClientPane>()
+            .ok_or_else(|| anyhow!("source pane_id {source_local_pane_id} is not a ClientPane"))?;
+        let target_client_pane = target_pane
+            .downcast_ref::<ClientPane>()
+            .ok_or_else(|| anyhow!("target pane_id {target_local_pane_id} is not a ClientPane"))?;
         if !source_client_pane.belongs_to_client(&inner)
             || !target_client_pane.belongs_to_client(&inner)
         {
@@ -1385,12 +1489,7 @@ impl Domain for ClientDomain {
         // post-response update below.
         let optimistic_move_applied = if let Some((moved_pane, _)) = moved_local_pane.as_ref() {
             if source_tab_id == Some(tab_id) {
-                mux.move_pane_to_split(
-                    moved_pane.pane_id(),
-                    tab_id,
-                    pane_id,
-                    split_request,
-                )?;
+                mux.move_pane_to_split(moved_pane.pane_id(), tab_id, pane_id, split_request)?;
                 true
             } else {
                 false
@@ -1609,6 +1708,21 @@ impl ClientDomain {
             ui.output_str(&format!("Error during attach: {:#}\n", e));
             e
         })?;
+
+        // Announce the new connection before asking it anything, so that the
+        // answer — and any push that overtakes it — is measured against this
+        // connection rather than the last one.
+        deliver_thinkterm_connected(self.config.name());
+
+        // The sidebar structure lives on the server. Fetching it is not worth
+        // failing an otherwise-good attach over: without it the Space simply
+        // shows no rows until the next push or reconnect.
+        if let Err(err) = self.fetch_thinkterm_tree().await {
+            log::warn!(
+                "failed to fetch the ThinkTerm tree from {}: {err:#}",
+                self.config.name()
+            );
+        }
 
         ui.output_str("Attached!\n");
         drop(activity);

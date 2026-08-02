@@ -944,6 +944,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_add"),
         },
+        CreateSpaceOnDomain(_) => CommandDef {
+            brief: "New Space Here".into(),
+            doc: "Creates a new ThinkTerm space on this mux server".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_add"),
+        },
         SwitchSpace(_) => CommandDef {
             brief: "Switch Space".into(),
             doc: "Switches the active ThinkTerm space for this window".into(),
@@ -960,10 +968,20 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_delete"),
         },
+        DeleteSpaceEverywhere(_) => CommandDef {
+            brief: "Delete Space Everywhere".into(),
+            doc: "Deletes the Space on the mux server that hosts it, so it \
+                  disappears from every device"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_delete"),
+        },
         DeleteSpaceAndRemoteSessions(_) => CommandDef {
             brief: "Delete Space & End Remote Sessions".into(),
             doc: "Kills the Space's sessions on the remote mux server, then \
-                  deletes the local records"
+                  deletes the Space everywhere"
                 .into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],

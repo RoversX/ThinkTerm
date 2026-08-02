@@ -98,6 +98,10 @@ pub enum MuxNotification {
         old_workspace: String,
         new_workspace: String,
     },
+    /// The mux server's ThinkTerm sidebar tree (Space/Project/Thread) changed;
+    /// every connection re-sends it. Raised only on the server side — a GUI
+    /// mux never owns a tree of its own.
+    ThinkTermTreeChanged,
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);

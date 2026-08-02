@@ -913,6 +913,22 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::GetThinkTermTree(_) => {
+                send_response(Ok(Pdu::ThinkTermTreeState(ThinkTermTreeState {
+                    tree: crate::thinkterm_tree::snapshot(),
+                })));
+            }
+
+            Pdu::MutateThinkTermTree(MutateThinkTermTree { ops }) => {
+                // mutate() broadcasts to every connection when the batch
+                // changed something; the direct response here is what lets the
+                // caller reconcile even when it did not.
+                send_response(
+                    crate::thinkterm_tree::mutate(&ops)
+                        .map(|tree| Pdu::ThinkTermTreeState(ThinkTermTreeState { tree })),
+                );
+            }
+
             Pdu::MovePaneToNewTab(request) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
@@ -1188,6 +1204,7 @@ impl SessionHandler {
             | Pdu::MovePaneToNewTabResponse { .. }
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
+            | Pdu::ThinkTermTreeState { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }

@@ -202,6 +202,17 @@ where
                 .await?;
                 stream.flush().await.context("flushing PDU to client")?;
             }
+            Ok(Item::Notif(MuxNotification::ThinkTermTreeChanged)) => {
+                // The tree is small enough to resend whole; this is also the
+                // path that tells the client which mutated it that the server
+                // accepted the op.
+                Pdu::ThinkTermTreeState(codec::ThinkTermTreeState {
+                    tree: crate::thinkterm_tree::snapshot(),
+                })
+                .encode_async(&mut stream, 0)
+                .await?;
+                stream.flush().await.context("flushing PDU to client")?;
+            }
             Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
             Ok(Item::Notif(MuxNotification::Empty)) => {}
             Err(err) => {

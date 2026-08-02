@@ -43,6 +43,7 @@ use config::{
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
+use mux::domain::DomainId;
 use mux::pane::{
     CachePolicy, CloseReason, Pane, PaneId, Pattern as MuxPattern, PerformAssignmentResult,
 };
@@ -73,6 +74,65 @@ use wezterm_font::FontConfiguration;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
+
+/// A domain-owned remote window should stay in the local mux when its native
+/// GUI window closes.  The origin tag is authoritative; the Space/domain
+/// fallback covers a window created before that tag was available, but only
+/// when every pane in the actual mux window belongs to that same domain.
+/// Requiring all panes avoids treating a local Space containing one manually
+/// opened remote tab as a remote-owned window.
+fn preserve_mux_window_on_gui_close(
+    origin_client_domain: Option<DomainId>,
+    active_space_domain: Option<DomainId>,
+    pane_domains: &[DomainId],
+    client_pane_domains: &[DomainId],
+) -> bool {
+    if let Some(domain_id) = origin_client_domain {
+        // A tag identifies ownership, but an empty/tag-only connection window
+        // has no remote session to preserve.  Requiring a real ClientPane is
+        // also what lets close cancel an initial failed attach.
+        return client_pane_domains
+            .iter()
+            .any(|pane_domain| *pane_domain == domain_id);
+    }
+
+    active_space_domain.is_some_and(|domain_id| {
+        !pane_domains.is_empty()
+            && pane_domains.len() == client_pane_domains.len()
+            && client_pane_domains
+                .iter()
+                .all(|pane_domain| *pane_domain == domain_id)
+    })
+}
+
+#[cfg(test)]
+mod window_close_tests {
+    use super::preserve_mux_window_on_gui_close;
+
+    #[test]
+    fn close_disposition_uses_origin_then_matching_space_domain() {
+        assert!(preserve_mux_window_on_gui_close(Some(7), None, &[7], &[7]));
+        assert!(preserve_mux_window_on_gui_close(
+            None,
+            Some(7),
+            &[7, 7],
+            &[7, 7]
+        ));
+
+        // A tag alone is not a remote session. This is the initial failed
+        // connection case: close must remove the mux window and cancel retry.
+        assert!(!preserve_mux_window_on_gui_close(Some(7), None, &[], &[]));
+        assert!(!preserve_mux_window_on_gui_close(None, None, &[7], &[7]));
+        assert!(!preserve_mux_window_on_gui_close(None, Some(7), &[], &[]));
+        assert!(!preserve_mux_window_on_gui_close(
+            None,
+            Some(7),
+            &[7, 8],
+            &[7]
+        ));
+        assert!(!preserve_mux_window_on_gui_close(None, Some(7), &[8], &[8]));
+    }
+}
 
 fn gpu_debug_enabled() -> bool {
     std::env::var_os("THINKTERM_GPU_DEBUG").is_some()
@@ -1350,6 +1410,12 @@ pub struct TermWindow {
     workspace_sidebar_collapsed: bool,
     workspace_sidebar_scroll_offset: f32,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
+    /// Last notification state painted by this GUI window. Comparing identities
+    /// and statuses (rather than just the count) lets the bell pulse when one
+    /// notification replaces another without changing the total.
+    workspace_notification_snapshot:
+        Option<HashMap<String, crate::workspace_threads::WorkspaceThreadWorkStatus>>,
+    workspace_notification_pulse_started_at: Option<Instant>,
     right_sidebar_width: usize,
     right_sidebar_collapsed: bool,
     right_sidebar_mode: RightSidebarMode,
@@ -1604,25 +1670,79 @@ impl TermWindow {
         self.remember_workspace_layout_structure_fingerprint();
     }
 
+    fn should_preserve_mux_window_on_gui_close(&self) -> bool {
+        let mux = Mux::get();
+        let Some((origin_domain, pane_domains, client_pane_domains)) =
+            mux.get_window(self.mux_window_id).map(|window| {
+                let panes = window
+                    .iter()
+                    .flat_map(|tab| tab.iter_all_panes())
+                    .collect::<Vec<_>>();
+                let pane_domains = panes
+                    .iter()
+                    .map(|pane| pane.domain_id())
+                    .collect::<Vec<_>>();
+                let client_pane_domains = panes
+                    .iter()
+                    .filter(|pane| {
+                        pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                            .is_some()
+                    })
+                    .map(|pane| pane.domain_id())
+                    .collect::<Vec<_>>();
+                (window.origin_domain(), pane_domains, client_pane_domains)
+            })
+        else {
+            return false;
+        };
+
+        let origin_client_domain = origin_domain
+            .and_then(|domain_id| mux.get_domain(domain_id))
+            .filter(|domain| domain.downcast_ref::<ClientDomain>().is_some())
+            .map(|domain| domain.domain_id());
+
+        let active_space_domain =
+            crate::workspace_threads::client_domain_for_space(&self.active_space_id)
+                .and_then(|domain_name| mux.get_domain_by_name(&domain_name))
+                .filter(|domain| domain.downcast_ref::<ClientDomain>().is_some())
+                .map(|domain| domain.domain_id());
+
+        preserve_mux_window_on_gui_close(
+            origin_client_domain,
+            active_space_domain,
+            &pane_domains,
+            &client_pane_domains,
+        )
+    }
+
+    pub(crate) fn close_gui_window_preserving_mux(window: &Window) {
+        window.close();
+        front_end().forget_known_window(window);
+    }
+
+    fn close_gui_window_now(&self, window: &Window, preserve_mux_window: bool) {
+        if !preserve_mux_window {
+            // Local windows retain the established destructive close behavior.
+            Mux::get().kill_window(self.mux_window_id);
+        }
+        Self::close_gui_window_preserving_mux(window);
+    }
+
     fn close_requested(&mut self, window: &Window) {
         self.flush_right_sidebar_note_blocking();
         self.persist_workspace_layout_after_mutation("window close requested");
 
         let mux = Mux::get();
+        let preserve_mux_window = self.should_preserve_mux_window_on_gui_close();
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
-                // Immediately kill the tabs and allow the window to close
-                mux.kill_window(self.mux_window_id);
-                window.close();
-                front_end().forget_known_window(window);
+                self.close_gui_window_now(window, preserve_mux_window);
             }
             WindowCloseConfirmation::AlwaysPrompt => {
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => {
-                        mux.kill_window(self.mux_window_id);
-                        window.close();
-                        front_end().forget_known_window(window);
+                        self.close_gui_window_now(window, preserve_mux_window);
                         return;
                     }
                 };
@@ -1633,14 +1753,12 @@ impl TermWindow {
                     .get_window(mux_window_id)
                     .map_or(false, |w| w.can_close_without_prompting());
                 if can_close {
-                    mux.kill_window(self.mux_window_id);
-                    window.close();
-                    front_end().forget_known_window(window);
+                    self.close_gui_window_now(window, preserve_mux_window);
                     return;
                 }
                 let window = self.window.clone().unwrap();
                 let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                    confirm_close_window(term, mux_window_id, window, tab_id)
+                    confirm_close_window(term, mux_window_id, window, tab_id, preserve_mux_window)
                 });
                 self.assign_overlay(tab.tab_id(), overlay);
                 promise::spawn::spawn(future).detach();
@@ -2046,6 +2164,8 @@ impl TermWindow {
             workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
             workspace_sidebar_scrollbar_visible_until: None,
+            workspace_notification_snapshot: None,
+            workspace_notification_pulse_started_at: None,
             right_sidebar_width: ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize),
             right_sidebar_collapsed: true,
             right_sidebar_mode: RightSidebarMode::Snippets,
@@ -2854,6 +2974,10 @@ impl TermWindow {
                 MuxNotification::SaveToDownloads { .. } => {
                     // Handled by frontend
                 }
+                MuxNotification::ThinkTermTreeChanged => {
+                    // Server-side only; the remote tree reaches this process
+                    // as a pushed ThinkTermTreeState PDU instead.
+                }
                 MuxNotification::PaneFocused(pane_id) => {
                     // Also handled by clientpane
                     self.refresh_thread_work_for_pane(pane_id);
@@ -3297,6 +3421,7 @@ impl TermWindow {
             | MuxNotification::ActiveWorkspaceChanged(_)
             | MuxNotification::WorkspaceRenamed { .. }
             | MuxNotification::Empty
+            | MuxNotification::ThinkTermTreeChanged
             | MuxNotification::WindowWorkspaceChanged(_) => return true,
             MuxNotification::Alert {
                 alert: Alert::PaletteChanged { .. },
@@ -3370,6 +3495,32 @@ impl TermWindow {
         self.invalidate_window_if(crate::workspace_threads::refresh_all_thread_work());
     }
 
+    /// Move this window off a Space that no longer exists.
+    ///
+    /// A device connecting to a mux server for the first time has to choose a
+    /// Space before it can authenticate, so it invents one; the server's real
+    /// list only arrives afterwards and replaces it. `rehome` pairs each
+    /// affected window with somewhere that does exist.
+    pub(crate) fn rehome_if_space_vanished(&mut self, rehome: &[(u64, String)]) {
+        let Some(target) = rehome
+            .iter()
+            .find(|(owner_id, _)| *owner_id == self.space_owner_id)
+            .map(|(_, space_id)| space_id.clone())
+        else {
+            return;
+        };
+        if self.active_space_id == target {
+            return;
+        }
+        log::info!(
+            "Space {} is gone from its server; moving this window to {target}",
+            self.active_space_id
+        );
+        if let Some(window) = self.window.clone() {
+            self.switch_space(target, &window);
+        }
+    }
+
     pub(crate) fn switch_space(&mut self, space_id: String, window: &Window) {
         self.switch_space_to_thread(space_id, None, window);
     }
@@ -3431,47 +3582,63 @@ impl TermWindow {
         true
     }
 
-    /// Delete a remote Space AND end its sessions on the server: send a
-    /// remote kill for every pane of the Space's client domain, then delete
-    /// the Space (which detaches). The deletion is deferred a moment so the
-    /// KillPane PDUs can flush before the detach tears the transport down.
+    /// Delete a remote Space AND end its sessions on the server.  The shared
+    /// tree deletion is acknowledged before any local mirror is removed, so
+    /// the last window cannot detach the domain while its DeleteSpace RPC is
+    /// still waiting to be polled.
     fn delete_space_and_remote_sessions(&mut self, space_id: &str) {
-        let attached_domain = crate::workspace_threads::client_domain_for_space(space_id)
-            .and_then(|name| Mux::get().get_domain_by_name(&name))
-            .filter(|domain| domain.state() == mux::domain::DomainState::Attached);
+        self.start_delete_space(
+            space_id,
+            crate::workspace_threads::SpaceRemoval::Everywhere,
+            true,
+        );
+    }
 
-        let Some(domain) = attached_domain else {
-            let window = self.window.clone();
-            self.delete_space(space_id, window.as_ref());
-            return;
-        };
+    fn delete_space(
+        &mut self,
+        space_id: &str,
+        _window: Option<&Window>,
+        removal: crate::workspace_threads::SpaceRemoval,
+    ) {
+        self.start_delete_space(space_id, removal, false);
+    }
 
-        let domain_id = domain.domain_id();
-        for pane in Mux::get().iter_panes() {
-            if pane.domain_id() == domain_id {
-                pane.kill();
-            }
-        }
-
+    fn start_delete_space(
+        &mut self,
+        space_id: &str,
+        removal: crate::workspace_threads::SpaceRemoval,
+        end_remote_sessions: bool,
+    ) {
+        let owner_id = self.space_owner_id;
         let space_id = space_id.to_string();
         let gui_window = self.window.clone();
-        promise::spawn::spawn(async move {
-            smol::Timer::after(Duration::from_millis(400)).await;
+        promise::spawn::spawn_into_main_thread(async move {
+            let result = crate::workspace_threads::delete_space_for_window(
+                owner_id,
+                &space_id,
+                removal,
+                end_remote_sessions,
+            )
+            .await;
             if let Some(gui_window) = gui_window {
                 gui_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let window = term_window.window.clone();
-                    term_window.delete_space(&space_id, window.as_ref());
-                    if let Some(window) = window {
-                        window.invalidate();
-                    }
+                    term_window.finish_delete_space(&space_id, result);
                 })));
             }
         })
         .detach();
     }
 
-    fn delete_space(&mut self, space_id: &str, window: Option<&Window>) {
-        match crate::workspace_threads::delete_space_for_window(self.space_owner_id, space_id) {
+    fn finish_delete_space(
+        &mut self,
+        space_id: &str,
+        result: Result<
+            crate::workspace_threads::DeletedSpace,
+            crate::workspace_threads::DeleteSpaceError,
+        >,
+    ) {
+        let window = self.window.clone();
+        match result {
             Ok(deleted) => {
                 let deleted_active_space = self.active_space_id == space_id;
                 if deleted_active_space {
@@ -3484,7 +3651,7 @@ impl TermWindow {
                     // adopted so the resize does not hit the deleted Space's
                     // panes.
                     self.pending_sidebar_reflow_width = Some(previous_sidebar_width);
-                    if let Some(window) = window {
+                    if let Some(window) = window.as_ref() {
                         if let Some(thread_id) =
                             crate::workspace_threads::ensure_active_thread_for_space(
                                 &self.active_space_id,
@@ -3500,15 +3667,46 @@ impl TermWindow {
                     }
                 }
 
+                // Mirror teardown happens only after the server tree has
+                // acknowledged the deletion.  Normal server/local disconnect
+                // preserves sessions; the explicit end-sessions action sends
+                // remote kills, still scoped to this Space's workspaces.
                 let mux = Mux::get();
                 for workspace in deleted.materialized_workspace_names {
                     for window_id in mux.iter_windows_in_workspace(&workspace) {
+                        let panes = mux
+                            .get_window(window_id)
+                            .map(|window| {
+                                window
+                                    .iter()
+                                    .flat_map(|tab| tab.iter_all_panes())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        for pane in panes {
+                            if let Some(client) =
+                                pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                            {
+                                // Explicit end-session deletions already used
+                                // the awaited KillPane path before the server
+                                // tree was removed. Any mirrors still present
+                                // here must not send a duplicate request while
+                                // the window is torn down.
+                                client.ignore_next_kill();
+                            }
+                        }
                         mux.kill_window(window_id);
                     }
+                }
+                if let Some(window) = window {
+                    window.invalidate();
                 }
             }
             Err(err) => {
                 log::warn!("failed to delete ThinkTerm space {space_id}: {err:?}");
+                if let Some(window) = window {
+                    window.invalidate();
+                }
             }
         }
     }
@@ -5800,13 +5998,43 @@ impl TermWindow {
                     window.invalidate();
                 }
             }
+            CreateSpaceOnDomain(domain_name) => {
+                match crate::workspace_threads::create_space_on_domain(domain_name, None) {
+                    Ok(space_id) => {
+                        if let Some(window) = window.as_ref() {
+                            self.switch_space(space_id.clone(), window);
+                            self.prompt_rename_space(space_id);
+                            window.invalidate();
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("failed to create Space on {domain_name}: {err:#}");
+                    }
+                }
+            }
             SwitchSpace(space_id) => {
                 if let Some(window) = window.as_ref() {
                     self.switch_space(space_id.clone(), window);
                 }
             }
             DeleteSpace(space_id) => {
-                self.delete_space(space_id, window.as_ref());
+                // A remote Space belongs to its server; removing it here is a
+                // disconnect, and it returns on the next connect.
+                self.delete_space(
+                    space_id,
+                    window.as_ref(),
+                    crate::workspace_threads::SpaceRemoval::Local,
+                );
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            DeleteSpaceEverywhere(space_id) => {
+                self.delete_space(
+                    space_id,
+                    window.as_ref(),
+                    crate::workspace_threads::SpaceRemoval::Everywhere,
+                );
                 if let Some(window) = window.as_ref() {
                     window.invalidate();
                 }
