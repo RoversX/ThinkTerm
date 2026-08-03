@@ -196,6 +196,12 @@ pub enum ContextMenuItem {
         enabled: bool,
         submenu: Vec<ContextMenuItem>,
     },
+    /// A caption naming the group of items that follows. Never selectable and
+    /// never highlighted, so it cannot be mistaken for a command; macOS renders
+    /// it with the system's own section-header style.
+    SectionHeader {
+        label: String,
+    },
     Separator,
 }
 
@@ -243,6 +249,7 @@ pub enum ContextMenuIcon {
     Terminal,
     Undo,
     Unpin,
+    Unplug,
     Vault,
     Warning,
     Window,
@@ -305,6 +312,9 @@ impl ContextMenuIcon {
             Self::Terminal => "terminal",
             Self::Undo => "arrow.uturn.backward",
             Self::Unpin => "pin.slash",
+            // Only in recent SF Symbols releases; older systems fall through to
+            // the bundled Lucide unplug glyph, which is the same picture.
+            Self::Unplug => "powerplug.portrait.slash",
             Self::Warning => "exclamationmark.circle",
             Self::Window => "macwindow",
         }
@@ -360,6 +370,7 @@ impl ContextMenuIcon {
             Self::Terminal => include_bytes!("../../third_party/lucide/icons/terminal.svg"),
             Self::Undo => include_bytes!("../../third_party/lucide/icons/undo.svg"),
             Self::Unpin => include_bytes!("../../third_party/lucide/icons/pin-off.svg"),
+            Self::Unplug => include_bytes!("../../third_party/lucide/icons/unplug.svg"),
             Self::Vault => include_bytes!("../../third_party/lucide/icons/folder-tree.svg"),
             Self::Warning => include_bytes!("../../third_party/lucide/icons/circle-alert.svg"),
             Self::Window => include_bytes!("../../third_party/lucide/icons/panels-top-left.svg"),
@@ -402,6 +413,12 @@ impl ContextMenuItem {
             checked: false,
             enabled: true,
             submenu: vec![],
+        }
+    }
+
+    pub fn section_header(label: impl Into<String>) -> Self {
+        Self::SectionHeader {
+            label: label.into(),
         }
     }
 

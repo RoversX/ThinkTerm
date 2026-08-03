@@ -1,11 +1,11 @@
 ## Installing on macOS
 
-The CI system builds the package on macOS Big Sur and should run on systems as
-"old" as Mojave.  It may run on earlier versions of macOS, but that has not
-been tested.
+macOS 14 (Sonoma) or later is required.  The app bundle declares that minimum,
+so earlier systems refuse to launch it rather than failing later in a way that
+is harder to diagnose.
 
-Starting with version 20210203-095643-70a364eb, WezTerm is a Universal binary
-with support for both Apple Silicon and Intel hardware.
+The package is a Universal binary with support for both Apple Silicon and Intel
+hardware.
 
 [:simple-apple: Download for macOS :material-tray-arrow-down:]({{ macos_zip_stable }}){ .md-button }
 [:simple-apple: Nightly for macOS :material-tray-arrow-down:]({{ macos_zip_nightly }}){ .md-button }

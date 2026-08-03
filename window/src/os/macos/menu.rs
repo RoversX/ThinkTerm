@@ -96,6 +96,18 @@ impl Menu {
         }
     }
 
+    /// With automatic enabling left on (the AppKit default) an item is enabled
+    /// whenever its target responds to its action, which silently overrides
+    /// every `setEnabled: NO` we make. Context menus set their own enabled
+    /// state, so they must turn it off; the main menu bar relies on the
+    /// automatic validation and must not.
+    pub fn set_autoenables_items(&self, enabled: bool) {
+        unsafe {
+            let enabled: BOOL = if enabled { YES } else { NO };
+            let () = msg_send![*self.menu, setAutoenablesItems: enabled];
+        }
+    }
+
     /// Tracks the menu and returns whether the user selected an item.
     pub fn pop_up_at(&self, view: id, x: f64, y: f64) -> bool {
         unsafe {
@@ -229,6 +241,31 @@ impl MenuItem {
     pub fn new_separator() -> Self {
         let item = unsafe { StrongPtr::retain(NSMenuItem::separatorItem(nil)) };
         Self { item }
+    }
+
+    /// The system's own section-header item: a caption that is never selectable
+    /// and never highlights.
+    ///
+    /// `None` when the running AppKit has no such constructor. A selector name
+    /// cannot be checked at compile time, and sending an unrecognized one is
+    /// fatal, so the caller keeps a plain disabled item as the fallback — the
+    /// same shape `set_system_symbol_image` uses for SF Symbols.
+    pub fn new_section_header(title: &str) -> Option<Self> {
+        unsafe {
+            let cls = class!(NSMenuItem);
+            let responds: BOOL = msg_send![cls, respondsToSelector: sel!(sectionHeaderWithTitle:)];
+            if responds == NO {
+                return None;
+            }
+            let item: id = msg_send![cls, sectionHeaderWithTitle: *nsstring(title)];
+            if item.is_null() {
+                return None;
+            }
+            // Autoreleased, so take our own reference.
+            Some(Self {
+                item: StrongPtr::retain(item),
+            })
+        }
     }
 
     pub fn new_with(title: &str, action: Option<SEL>, key: &str) -> Self {

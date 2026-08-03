@@ -67,7 +67,7 @@ dhat-heap.json
 __pycache__/
 *.py[cod]
 /nix/result
-/research
+/research/
 /docs/
 ThinkTerm-macos-v0.1.0.zip
 *.md

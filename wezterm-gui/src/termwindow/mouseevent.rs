@@ -51,6 +51,56 @@ fn tr_with_name(id: &'static str, name: &str) -> String {
     crate::i18n::tr_args(id, &args)
 }
 
+/// The entries that get rid of the active Space.
+///
+/// A remote Space has up to three of them and each one wants the Space named to
+/// be unambiguous, which made the menu four lines of the same name. They fold
+/// into one submenu instead: the name is said once, on the parent, and the
+/// children say only what they do. A local Space has a single action, so it
+/// stays flat — a submenu holding one item is just an extra click.
+fn space_destructive_menu_items(
+    space: &crate::workspace_threads::SpaceView,
+    offer_remote_kill: bool,
+) -> Vec<ContextMenuItem> {
+    if !space.is_remote {
+        return vec![ContextMenuItem::item_with_icon(
+            tr_with_name("menu-delete-space", &space.name),
+            ContextMenuIcon::Delete,
+            KeyAssignment::DeleteSpace(space.id.clone()),
+        )];
+    }
+
+    // A remote Space lives on its server, so removing it here only drops this
+    // device's copy: the Space is untouched for everyone else and returns on
+    // the next connect. Deleting it for real is a separate, more-consequential
+    // entry offered alongside.
+    let mut children = vec![
+        ContextMenuItem::item_with_icon(
+            crate::i18n::tr("menu-space-disconnect-short"),
+            ContextMenuIcon::Unplug,
+            KeyAssignment::DeleteSpace(space.id.clone()),
+        ),
+        ContextMenuItem::item_with_icon(
+            crate::i18n::tr("menu-space-delete-everywhere-short"),
+            ContextMenuIcon::Delete,
+            KeyAssignment::DeleteSpaceEverywhere(space.id.clone()),
+        ),
+    ];
+    if offer_remote_kill {
+        children.push(ContextMenuItem::item_with_icon(
+            crate::i18n::tr("menu-space-delete-and-sessions-short"),
+            ContextMenuIcon::Delete,
+            KeyAssignment::DeleteSpaceAndRemoteSessions(space.id.clone()),
+        ));
+    }
+
+    vec![ContextMenuItem::submenu_with_icon(
+        tr_with_name("menu-remove-named-space", &space.name),
+        ContextMenuIcon::Delete,
+        children,
+    )]
+}
+
 fn note_drag_scroll_delta(
     pointer_y: f32,
     top: f32,
@@ -4484,15 +4534,11 @@ impl super::TermWindow {
                     tr_with_name("menu-space-server-group-offline", domain)
                 }
             };
-            // Disabled: a server is a heading, not something to switch to.
-            items.push(
-                ContextMenuItem::item_with_icon(
-                    header,
-                    ContextMenuIcon::Server,
-                    KeyAssignment::Nop,
-                )
-                .disabled(),
-            );
+            // A server is a heading, not something to switch to. Saying that
+            // with a section header rather than a disabled row is what makes it
+            // *look* like a heading: the platform styles it as a caption and
+            // never highlights it under the pointer.
+            items.push(ContextMenuItem::section_header(header));
             for space in spaces
                 .iter()
                 .filter(|space| space.domain.as_deref() == Some(domain))
@@ -4525,10 +4571,9 @@ impl super::TermWindow {
             .iter()
             .find(|space| space.is_active)
             .map(|space| space.id.clone());
-        // A remote Space lives on its server, so removing it here only drops
-        // this device's copy: the Space is untouched for everyone else and
-        // returns on the next connect. Deleting it for real is a separate,
-        // more-consequential entry offered alongside.
+        // For a Space other than the active one there is only ever the one
+        // action, so it is named in full here; the active Space's several
+        // actions are grouped by `space_destructive_menu_items` instead.
         let delete_item = |space: crate::workspace_threads::SpaceView| {
             ContextMenuItem::item_with_icon(
                 if space.is_remote {
@@ -4536,7 +4581,11 @@ impl super::TermWindow {
                 } else {
                     tr_with_name("menu-delete-space", &space.name)
                 },
-                ContextMenuIcon::Delete,
+                if space.is_remote {
+                    ContextMenuIcon::Unplug
+                } else {
+                    ContextMenuIcon::Delete
+                },
                 KeyAssignment::DeleteSpace(space.id),
             )
         };
@@ -4550,31 +4599,15 @@ impl super::TermWindow {
             .find(|space| active_space_id.as_deref() == Some(space.id.as_str()))
             .cloned();
         if let Some(space) = active_delete {
-            let is_remote = space.is_remote;
             // Ending the sessions too only makes sense while we are actually
             // connected to the server.
-            let offer_remote_kill = is_remote
+            let offer_remote_kill = space.is_remote
                 && crate::workspace_threads::client_domain_for_space(&space.id)
                     .and_then(|name| Mux::get().get_domain_by_name(&name))
                     .map_or(false, |domain| {
                         domain.state() == mux::domain::DomainState::Attached
                     });
-            let (name, id) = (space.name.clone(), space.id.clone());
-            items.push(delete_item(space));
-            if is_remote {
-                items.push(ContextMenuItem::item_with_icon(
-                    tr_with_name("menu-delete-space-everywhere", &name),
-                    ContextMenuIcon::Delete,
-                    KeyAssignment::DeleteSpaceEverywhere(id.clone()),
-                ));
-            }
-            if offer_remote_kill {
-                items.push(ContextMenuItem::item_with_icon(
-                    tr_with_name("menu-delete-space-and-sessions", &name),
-                    ContextMenuIcon::Delete,
-                    KeyAssignment::DeleteSpaceAndRemoteSessions(id),
-                ));
-            }
+            items.extend(space_destructive_menu_items(&space, offer_remote_kill));
         }
 
         let other_delete_candidates = delete_candidates
@@ -4584,7 +4617,7 @@ impl super::TermWindow {
             .collect::<Vec<_>>();
         if !other_delete_candidates.is_empty() {
             items.push(ContextMenuItem::submenu_with_icon(
-                crate::i18n::tr("menu-delete-other-space"),
+                crate::i18n::tr("menu-remove-other-space"),
                 ContextMenuIcon::Delete,
                 other_delete_candidates,
             ));
@@ -4636,12 +4669,9 @@ impl super::TermWindow {
         }
 
         vec![
-            ContextMenuItem::item_with_icon(
-                crate::i18n::tr("menu-group-by"),
-                ContextMenuIcon::Stack,
-                KeyAssignment::Nop,
-            )
-            .disabled(),
+            ContextMenuItem::section_header(crate::i18n::tr("menu-group-by")),
+            // Not a heading: it is the one grouping mode there is, shown ticked
+            // and unclickable because there is nothing to switch it to.
             ContextMenuItem::item_with_icon(
                 crate::i18n::tr("menu-workspace"),
                 ContextMenuIcon::Folder,
@@ -4650,12 +4680,7 @@ impl super::TermWindow {
             .checked(true)
             .disabled(),
             ContextMenuItem::Separator,
-            ContextMenuItem::item_with_icon(
-                crate::i18n::tr("menu-show"),
-                ContextMenuIcon::Info,
-                KeyAssignment::Nop,
-            )
-            .disabled(),
+            ContextMenuItem::section_header(crate::i18n::tr("menu-show")),
             ContextMenuItem::submenu_with_icon(
                 crate::i18n::tr("menu-status"),
                 ContextMenuIcon::Check,
@@ -7312,5 +7337,92 @@ mod sidebar_drag_tests {
         assert_eq!(sidebar_insert_position(&rows(), 500), Some((None, 68)));
         // No rows: nowhere to drop.
         assert_eq!(sidebar_insert_position(&[], 10), None);
+    }
+}
+
+#[cfg(test)]
+mod space_menu_tests {
+    use super::space_destructive_menu_items;
+    use crate::workspace_threads::SpaceView;
+    use config::keyassignment::KeyAssignment;
+    use window::ContextMenuAction;
+    use window::ContextMenuItem;
+
+    fn space(is_remote: bool) -> SpaceView {
+        SpaceView {
+            id: "s1".to_string(),
+            name: "Remote 2".to_string(),
+            is_active: true,
+            is_default: false,
+            is_occupied_by_other_window: false,
+            is_remote,
+            domain: is_remote.then(|| "DO SYD X user".to_string()),
+        }
+    }
+
+    /// The submenu's shape is the contract; the labels come from whichever
+    /// locale happens to be active, so asserting on them would be asserting on
+    /// the test machine's settings.
+    fn actions(items: &[ContextMenuItem]) -> Vec<KeyAssignment> {
+        items
+            .iter()
+            .map(|item| match item {
+                ContextMenuItem::Item {
+                    action: ContextMenuAction::KeyAssignment(action),
+                    ..
+                } => action.clone(),
+                other => panic!("expected a key assignment item, got {:?}", other),
+            })
+            .collect()
+    }
+
+    fn submenu_of(item: &ContextMenuItem) -> &[ContextMenuItem] {
+        match item {
+            ContextMenuItem::Item { submenu, .. } => submenu,
+            other => panic!("expected an item, got {:?}", other),
+        }
+    }
+
+    /// One action does not deserve a submenu: a local Space keeps the single
+    /// named row it has always had.
+    #[test]
+    fn a_local_space_stays_flat() {
+        let items = space_destructive_menu_items(&space(false), false);
+        assert_eq!(items.len(), 1);
+        assert!(submenu_of(&items[0]).is_empty());
+        assert_eq!(
+            actions(&items),
+            vec![KeyAssignment::DeleteSpace("s1".to_string())]
+        );
+    }
+
+    /// The four lines that prompted this: one parent row carrying the name,
+    /// with the actions underneath.
+    #[test]
+    fn a_remote_space_folds_its_actions_into_one_submenu() {
+        let items = space_destructive_menu_items(&space(true), true);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            actions(submenu_of(&items[0])),
+            vec![
+                KeyAssignment::DeleteSpace("s1".to_string()),
+                KeyAssignment::DeleteSpaceEverywhere("s1".to_string()),
+                KeyAssignment::DeleteSpaceAndRemoteSessions("s1".to_string()),
+            ]
+        );
+    }
+
+    /// Ending the remote sessions needs a live connection to end them over, so
+    /// a detached domain offers only the two that work offline.
+    #[test]
+    fn a_detached_remote_space_omits_the_session_kill() {
+        let items = space_destructive_menu_items(&space(true), false);
+        assert_eq!(
+            actions(submenu_of(&items[0])),
+            vec![
+                KeyAssignment::DeleteSpace("s1".to_string()),
+                KeyAssignment::DeleteSpaceEverywhere("s1".to_string()),
+            ]
+        );
     }
 }

@@ -73,6 +73,9 @@ enum MenuRow<'a> {
         index: usize,
         item: &'a ContextMenuItem,
     },
+    SectionHeader {
+        label: &'a str,
+    },
     Separator,
 }
 
@@ -575,6 +578,10 @@ fn render_rows(items: &[ContextMenuItem]) -> Vec<MenuRow<'_>> {
                 rows.push(MenuRow::Item { index, item });
                 last_was_separator = false;
             }
+            ContextMenuItem::SectionHeader { label } => {
+                rows.push(MenuRow::SectionHeader { label });
+                last_was_separator = false;
+            }
             ContextMenuItem::Separator => {
                 if !last_was_separator {
                     rows.push(MenuRow::Separator);
@@ -584,7 +591,12 @@ fn render_rows(items: &[ContextMenuItem]) -> Vec<MenuRow<'_>> {
         }
     }
 
-    while matches!(rows.last(), Some(MenuRow::Separator)) {
+    // A trailing separator or a header captioning nothing is noise; both can
+    // appear once a caller filters the entries that were supposed to follow.
+    while matches!(
+        rows.last(),
+        Some(MenuRow::Separator) | Some(MenuRow::SectionHeader { .. })
+    ) {
         rows.pop();
     }
 
@@ -610,13 +622,23 @@ fn compute_menu_metrics(
                 }
                 height = height.saturating_add(row_height);
             }
+            // Headers share the item label column, so they measure the same way.
+            MenuRow::SectionHeader { label } => {
+                label_width =
+                    label_width.max(term.sidebar_text_width(font, label)?.ceil() as usize);
+                height = height.saturating_add(row_height);
+            }
             MenuRow::Separator => {
                 height = height.saturating_add(term.ui_px(MENU_SEPARATOR_HEIGHT));
             }
         }
     }
 
+    // Rows are laid out inside the border, not across it, so the width owed to
+    // the widest label has to include the border it sits between; without this
+    // that one label is the only one that ends up ellipsized.
     let ideal_width = term.ui_px(MENU_PADDING_X) * 2
+        + (term.ui_f32(MENU_BORDER_WIDTH) as usize) * 2
         + term.ui_px(MENU_CHECK_SLOT)
         + term.ui_px(MENU_ICON_SLOT)
         + term.ui_px(MENU_LABEL_GAP)
@@ -741,6 +763,36 @@ fn paint_menu_rows(
                 )?;
                 cursor_y += term.ui_px(MENU_SEPARATOR_HEIGHT);
             }
+            // A caption, not a command: muted, never highlighted, and left out
+            // of `ui_items`/`layout` so the mouse cannot land on it at all.
+            MenuRow::SectionHeader { label } => {
+                let label_x = x
+                    + term.ui_f32(MENU_BORDER_WIDTH) as usize
+                    + term.ui_px(MENU_PADDING_X)
+                    + term.ui_px(MENU_CHECK_SLOT)
+                    + term.ui_px(MENU_ICON_SLOT)
+                    + term.ui_px(MENU_LABEL_GAP);
+                let text_y = cursor_y
+                    + (metrics
+                        .row_height
+                        .saturating_sub(font_metrics.cell_size.height as usize))
+                        / 2;
+                let label_width = metrics
+                    .width
+                    .saturating_sub(label_x.saturating_sub(x))
+                    .saturating_sub(term.ui_px(MENU_PADDING_X));
+                term.paint_sidebar_text(
+                    layers,
+                    font,
+                    font_metrics,
+                    label,
+                    label_x,
+                    text_y,
+                    label_width,
+                    palette.muted_text,
+                )?;
+                cursor_y += metrics.row_height;
+            }
             MenuRow::Item { index, item } => {
                 let mut path = menu_path.to_vec();
                 path.push(*index);
@@ -756,7 +808,7 @@ fn paint_menu_rows(
                     ContextMenuItem::Item { submenu, .. } => {
                         ContextMenuState::has_renderable_items(submenu)
                     }
-                    ContextMenuItem::Separator => false,
+                    ContextMenuItem::SectionHeader { .. } | ContextMenuItem::Separator => false,
                 };
                 let hovered = active_path.is_some_and(|active| {
                     active == path.as_slice() || (has_submenu && active.starts_with(&path))
@@ -958,7 +1010,70 @@ fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
         ContextMenuIcon::Terminal => Some(SvgIcon::Terminal),
         ContextMenuIcon::Undo => Some(SvgIcon::RotateCcw),
         ContextMenuIcon::Unpin => Some(SvgIcon::PinOff),
+        ContextMenuIcon::Unplug => Some(SvgIcon::Unplug),
         ContextMenuIcon::Vault => Some(SvgIcon::FolderTree),
         ContextMenuIcon::Warning => Some(SvgIcon::CircleAlert),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_rows, ContextMenuState, MenuRow};
+    use config::keyassignment::KeyAssignment;
+    use window::ContextMenuItem;
+
+    fn item(label: &str) -> ContextMenuItem {
+        ContextMenuItem::item(label, KeyAssignment::Nop)
+    }
+
+    fn shape(rows: &[MenuRow<'_>]) -> Vec<&'static str> {
+        rows.iter()
+            .map(|row| match row {
+                MenuRow::Item { .. } => "item",
+                MenuRow::SectionHeader { .. } => "header",
+                MenuRow::Separator => "separator",
+            })
+            .collect()
+    }
+
+    /// A header captions the rows beneath it, so one with nothing beneath is
+    /// left over from a caller that filtered them all away — drop it, the same
+    /// way a trailing separator is dropped.
+    #[test]
+    fn a_header_with_nothing_under_it_is_dropped() {
+        let items = vec![
+            item("Space 6"),
+            ContextMenuItem::Separator,
+            ContextMenuItem::section_header("DO SYD X user"),
+        ];
+        assert_eq!(shape(&render_rows(&items)), vec!["item"]);
+    }
+
+    /// The real shape of the Space menu: a header is content, so the separator
+    /// before it survives and the rows under it render normally.
+    #[test]
+    fn a_header_keeps_the_separator_that_introduces_it() {
+        let items = vec![
+            item("Space 6"),
+            ContextMenuItem::Separator,
+            ContextMenuItem::section_header("DO SYD X user"),
+            item("Remote 2"),
+        ];
+        assert_eq!(
+            shape(&render_rows(&items)),
+            vec!["item", "separator", "header", "item"]
+        );
+    }
+
+    /// Headers are not commands: a submenu holding only headers has nothing to
+    /// activate, so it must not present itself as openable.
+    #[test]
+    fn headers_alone_do_not_make_a_menu_renderable() {
+        let headers = vec![ContextMenuItem::section_header("Group by")];
+        assert!(!ContextMenuState::has_renderable_items(&headers));
+        assert!(ContextMenuState::has_renderable_items(&[
+            ContextMenuItem::section_header("Group by"),
+            item("Workspace"),
+        ]));
     }
 }

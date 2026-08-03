@@ -1672,6 +1672,7 @@ impl WindowInner {
                         menu_item.set_enabled(enabled);
                         if has_submenu {
                             let child_menu = Menu::new_with_title(&label);
+                            child_menu.set_autoenables_items(false);
                             if add_context_menu_items(&child_menu, view, submenu) {
                                 menu_item.set_sub_menu(&child_menu);
                                 menu.add_item(&menu_item);
@@ -1685,6 +1686,17 @@ impl WindowInner {
                             has_items = true;
                         }
                     }
+                    ContextMenuItem::SectionHeader { label } => {
+                        // Falls back to a disabled item where the system has no
+                        // section-header constructor; with automatic enabling
+                        // off that still renders as grey, unhighlightable text.
+                        let menu_item = MenuItem::new_section_header(&label).unwrap_or_else(|| {
+                            let item = MenuItem::new_with(&label, None, "");
+                            item.set_enabled(false);
+                            item
+                        });
+                        menu.add_item(&menu_item);
+                    }
                     ContextMenuItem::Separator => {
                         if has_items {
                             menu.add_item(&MenuItem::new_separator());
@@ -1696,6 +1708,7 @@ impl WindowInner {
         }
 
         let menu = Menu::new_with_title("");
+        menu.set_autoenables_items(false);
         let has_items = add_context_menu_items(&menu, *self.view, items);
 
         if !has_items {
