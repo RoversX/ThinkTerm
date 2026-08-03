@@ -6,6 +6,7 @@ set -e
 mkdir AppDir
 
 install -Dsm755 -t AppDir/usr/bin target/release/wezterm-mux-server
+install -Dsm755 -t AppDir/usr/bin target/release/thinkterm
 install -Dsm755 -t AppDir/usr/bin target/release/wezterm
 install -Dsm755 -t AppDir/usr/bin target/release/wezterm-gui
 install -Dsm755 -t AppDir/usr/bin target/release/strip-ansi-escapes

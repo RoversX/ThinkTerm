@@ -394,7 +394,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     Ok(())
 }
 
-/// `wezterm connect <domain>` routed through the ThinkTerm Space system:
+/// `thinkterm connect <domain>` routed through the ThinkTerm Space system:
 /// find-or-create the domain's dedicated Space; if already connected in this
 /// process, focus an existing window instead of duplicating; otherwise create
 /// the connect window with an explicit Space claim so the frontend's
@@ -772,7 +772,7 @@ async fn async_run_terminal_gui(
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
-    // `wezterm connect` to a mux client domain goes through the Space system:
+    // `thinkterm connect` to a mux client domain goes through the Space system:
     // dedicated find-or-create Space, explicit window claim, no restore.
     if is_connecting {
         if let Some(domain) = &domain {

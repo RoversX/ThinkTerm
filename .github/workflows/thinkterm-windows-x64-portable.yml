@@ -44,10 +44,15 @@ jobs:
           New-Item -ItemType Directory -Path $package | Out-Null
           New-Item -ItemType Directory -Path "$package\mesa" | Out-Null
 
+          Copy-Item target\release\thinkterm.exe $package\
           Copy-Item target\release\wezterm.exe $package\
           Copy-Item target\release\wezterm-gui.exe $package\
           Copy-Item target\release\wezterm-mux-server.exe $package\
           Copy-Item target\release\strip-ansi-escapes.exe $package\
+
+          if (Test-Path target\release\thinkterm.pdb) {
+            Copy-Item target\release\thinkterm.pdb $package\
+          }
 
           if (Test-Path target\release\wezterm.pdb) {
             Copy-Item target\release\wezterm.pdb $package\

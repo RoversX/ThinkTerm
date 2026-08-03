@@ -4,6 +4,15 @@ version = "0.1.0"
 authors = ["Wez Furlong <wez@wezfurlong.org>"]
 edition = "2018"
 publish = false
+autobins = false
+
+[[bin]]
+name = "thinkterm"
+path = "src/main.rs"
+
+[[bin]]
+name = "wezterm"
+path = "src/bin/wezterm.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

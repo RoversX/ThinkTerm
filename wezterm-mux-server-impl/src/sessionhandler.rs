@@ -386,7 +386,7 @@ impl SessionHandler {
                 } else {
                     // If this session is a proxy, override the incoming id with
                     // the proxy information so that it is clear what is going
-                    // on from the `wezterm cli list-clients` information
+                    // on from the `thinkterm cli list-clients` information
                     if let Some(proxy_id) = &self.proxy_client_id {
                         client_id.ssh_auth_sock = proxy_id.ssh_auth_sock.clone();
                         // Note that this `via proxy pid` string is coupled

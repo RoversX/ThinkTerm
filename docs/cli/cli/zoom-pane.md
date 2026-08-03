@@ -1,8 +1,8 @@
-# `wezterm cli zoom-pane`
+# `thinkterm cli zoom-pane`
 
 {{since('20240127-113634-bbcac864')}}
 
-*Run `wezterm cli zoom-pane --help` to see more help*
+*Run `thinkterm cli zoom-pane --help` to see more help*
 
 ## Synopsis
 

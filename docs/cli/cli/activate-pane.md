@@ -1,4 +1,4 @@
-# `wezterm cli activate-pane`
+# `thinkterm cli activate-pane`
 
 {{since('20230326-111934-3666303c')}}
 

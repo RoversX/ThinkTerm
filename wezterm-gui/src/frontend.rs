@@ -628,7 +628,7 @@ impl GuiFrontEnd {
     }
 
     /// Pre-claim a mux window that the caller is about to create a GUI window
-    /// for explicitly (e.g. the `wezterm connect` flow), so that neither the
+    /// for explicitly (e.g. the `thinkterm connect` flow), so that neither the
     /// WindowCreated handler nor the additive reconcile spawns a duplicate.
     pub fn claim_spawned_mux_window(&self, mux_window_id: MuxWindowId) {
         self.spawned_mux_window.borrow_mut().insert(mux_window_id);

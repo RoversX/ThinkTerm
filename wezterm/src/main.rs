@@ -5,7 +5,7 @@ use clap_complete::{generate as generate_completion, shells, Generator as Comple
 use config::{wezterm_version, ConfigHandle};
 use mux::Mux;
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write};
 use termwiz::caps::Capabilities;
 use termwiz::escape::esc::{Esc, EscCode};
 use termwiz::escape::OneBased;
@@ -23,11 +23,12 @@ mod cli;
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "thinkterm",
     about = "ThinkTerm - a workspace-first terminal\nhttps://github.com/RoversX/thinkterm",
     version = wezterm_version()
 )]
 pub struct Opt {
-    /// Skip loading wezterm.lua
+    /// Skip loading the ThinkTerm configuration
     #[arg(long, short = 'n')]
     skip_config: bool,
 
@@ -87,6 +88,120 @@ impl CompletionGenerator for Shell {
     }
 }
 
+fn render_shell_completion(shell: Shell) -> anyhow::Result<String> {
+    use clap::CommandFactory;
+
+    let mut cmd = Opt::command();
+    let name = cmd.get_name().to_string();
+    let mut rendered = vec![];
+    generate_completion(shell.clone(), &mut cmd, name, &mut rendered);
+    let mut rendered = String::from_utf8(rendered)
+        .context("shell completion generator produced non-UTF-8 output")?;
+
+    // ThinkTerm is the canonical command, but the legacy `wezterm`
+    // launcher remains supported. Register that name without maintaining a
+    // second, independently generated command tree.
+    match shell {
+        Shell::Bash => {
+            rendered = rendered
+                .lines()
+                .map(|line| {
+                    if line.trim_start().starts_with("complete -F _thinkterm")
+                        && line.ends_with(" thinkterm")
+                    {
+                        format!("{line} wezterm")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            rendered.push('\n');
+        }
+        Shell::Fish => {
+            rendered.push_str("\ncomplete -c wezterm -w thinkterm\n");
+        }
+        Shell::Zsh => {
+            rendered = rendered.replacen("#compdef thinkterm", "#compdef thinkterm wezterm", 1);
+            rendered = rendered.replacen(
+                "compdef _thinkterm thinkterm\n",
+                "compdef _thinkterm thinkterm wezterm\n",
+                1,
+            );
+        }
+        Shell::Elvish => {
+            rendered.push_str(
+                "\nset edit:completion:arg-completer[wezterm] = $edit:completion:arg-completer[thinkterm]\n",
+            );
+        }
+        Shell::PowerShell => {
+            rendered = rendered.replacen(
+                "-CommandName 'thinkterm' -ScriptBlock",
+                "-CommandName 'thinkterm', 'wezterm' -ScriptBlock",
+                1,
+            );
+        }
+        Shell::Fig => {
+            rendered = rendered.replacen(
+                "  name: \"thinkterm\",",
+                "  name: [\"thinkterm\", \"wezterm\"],",
+                1,
+            );
+        }
+    }
+
+    Ok(rendered)
+}
+
+#[cfg(test)]
+mod shell_completion_tests {
+    use super::*;
+
+    #[test]
+    fn bash_registers_canonical_and_legacy_commands() {
+        let completion = render_shell_completion(Shell::Bash).unwrap();
+        assert!(completion.contains("complete -F _thinkterm"));
+        assert!(completion.contains("thinkterm wezterm"));
+    }
+
+    #[test]
+    fn zsh_registers_canonical_and_legacy_commands() {
+        let completion = render_shell_completion(Shell::Zsh).unwrap();
+        assert!(completion.starts_with("#compdef thinkterm wezterm\n"));
+        assert!(completion.contains("compdef _thinkterm thinkterm wezterm\n"));
+    }
+
+    #[test]
+    fn fish_wraps_the_canonical_command_for_legacy_users() {
+        let completion = render_shell_completion(Shell::Fish).unwrap();
+        assert!(completion.contains("complete -c thinkterm"));
+        assert!(completion.ends_with("complete -c wezterm -w thinkterm\n"));
+    }
+
+    #[test]
+    fn elvish_registers_canonical_and_legacy_commands() {
+        let completion = render_shell_completion(Shell::Elvish).unwrap();
+        assert!(completion.contains("edit:completion:arg-completer[thinkterm]"));
+        assert!(completion.ends_with(
+            "set edit:completion:arg-completer[wezterm] = $edit:completion:arg-completer[thinkterm]\n"
+        ));
+    }
+
+    #[test]
+    fn powershell_registers_canonical_and_legacy_commands() {
+        let completion = render_shell_completion(Shell::PowerShell).unwrap();
+        assert!(completion.contains(
+            "Register-ArgumentCompleter -Native -CommandName 'thinkterm', 'wezterm' -ScriptBlock"
+        ));
+    }
+
+    #[test]
+    fn fig_registers_canonical_and_legacy_commands() {
+        let completion = render_shell_completion(Shell::Fig).unwrap();
+        assert!(completion.contains("name: [\"thinkterm\", \"wezterm\"]"));
+    }
+}
+
 #[derive(Debug, Parser, Clone)]
 enum SubCommand {
     #[command(
@@ -107,7 +222,7 @@ enum SubCommand {
     #[command(name = "serial", about = "Open a serial port")]
     Serial(SerialCommand),
 
-    #[command(name = "connect", about = "Connect to wezterm multiplexer")]
+    #[command(name = "connect", about = "Connect to ThinkTerm multiplexer")]
     Connect(ConnectCommand),
 
     #[command(name = "ls-fonts", about = "Display information about fonts")]
@@ -192,7 +307,7 @@ struct ImgCatCommand {
     /// Set the maximum number of pixels per image frame.
     /// Images will be scaled down so that they do not exceed this size,
     /// unless `--no-resample` is also used.
-    /// The default value matches the limit set by wezterm.
+    /// The default value matches the limit set by ThinkTerm.
     /// Note that resampling the image here will reduce any animated
     /// images to a single frame.
     #[arg(long, default_value = "25000000")]
@@ -201,7 +316,7 @@ struct ImgCatCommand {
     /// Do not resample images whose frames are larger than the
     /// max-pixels value.
     /// Note that this will typically result in the image refusing
-    /// to display in wezterm.
+    /// to display in ThinkTerm.
     #[arg(long)]
     no_resample: bool,
 
@@ -756,10 +871,8 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Record(cmd) => cmd.run(init_config(&opts)?),
         SubCommand::Replay(cmd) => cmd.run(),
         SubCommand::ShellCompletion { shell } => {
-            use clap::CommandFactory;
-            let mut cmd = Opt::command();
-            let name = cmd.get_name().to_string();
-            generate_completion(shell, &mut cmd, name, &mut std::io::stdout());
+            let rendered = render_shell_completion(shell)?;
+            std::io::stdout().write_all(rendered.as_bytes())?;
             Ok(())
         }
     }

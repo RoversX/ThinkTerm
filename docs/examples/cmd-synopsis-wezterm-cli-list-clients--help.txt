@@ -1,8 +1,7 @@
 list clients
 
-Usage: wezterm cli list-clients [OPTIONS]
+Usage: thinkterm cli list-clients [OPTIONS]
 
 Options:
-      --format <FORMAT>  Controls the output format. "table" and "json" are
-                         possible formats [default: table]
+      --format <FORMAT>  Controls the output format. "table" and "json" are possible formats [default: table]
   -h, --help             Print help

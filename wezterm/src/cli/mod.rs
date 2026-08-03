@@ -58,7 +58,7 @@ pub struct CliCommand {
 
     /// Prefer connecting to a background mux server.
     /// The default is to prefer connecting to a running
-    /// wezterm gui instance
+    /// ThinkTerm GUI instance
     #[arg(long = "prefer-mux")]
     prefer_mux: bool,
 

@@ -269,7 +269,7 @@ fn setup_pretty() -> (LevelFilter, Logger) {
 
     if base_name.contains("gui") {
         // Only tidy up logs when the gui process is starting.
-        // rationale: `wezterm cli` commands should have as low startup
+        // rationale: `thinkterm cli` commands should have as low startup
         // overhead as possible
         prune_old_logs();
     }

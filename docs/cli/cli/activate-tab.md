@@ -1,4 +1,4 @@
-# `wezterm cli activate-tab`
+# `thinkterm cli activate-tab`
 
 {{since('20230326-111934-3666303c')}}
 

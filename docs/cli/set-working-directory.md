@@ -1,4 +1,4 @@
-# `wezterm set-working-directory`
+# `thinkterm set-working-directory`
 
 ```console
 {% include "../examples/cmd-synopsis-wezterm-set-working-directory--help.txt" %}

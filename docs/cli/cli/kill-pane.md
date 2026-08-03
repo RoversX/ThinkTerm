@@ -1,4 +1,4 @@
-# `wezterm cli kill-pane`
+# `thinkterm cli kill-pane`
 
 {{since('20230326-111934-3666303c')}}
 

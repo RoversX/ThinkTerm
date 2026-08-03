@@ -1,15 +1,15 @@
-# `wezterm cli get-text`
+# `thinkterm cli get-text`
 
 {{since('20230320-124340-559cb7b0')}}
 
-*Run `wezterm cli get-text --help` to see more help*
+*Run `thinkterm cli get-text --help` to see more help*
 
 Retrieves the textual content of a pane and output it to stdout.
 
 For example:
 
 ```
-$ wezterm cli get-text > /tmp/myscreen.txt
+$ thinkterm cli get-text > /tmp/myscreen.txt
 ```
 
 will capture the main (non-scrollback) portion of the current pane to `/tmp/myscreen.txt`.
@@ -18,7 +18,7 @@ By default, just the raw text is captured without any color or styling escape se
 You may pass `--escapes` to include those:
 
 ```
-$ wezterm cli get-text --escapes > /tmp/myscreen-with-colors.txt
+$ thinkterm cli get-text --escapes > /tmp/myscreen-with-colors.txt
 ```
 
 The default capture region is the main terminal screen, not including the scrollback.

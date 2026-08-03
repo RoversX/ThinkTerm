@@ -1,6 +1,6 @@
 Change the title of a tab
 
-Usage: wezterm cli set-tab-title [OPTIONS] <TITLE>
+Usage: thinkterm cli set-tab-title [OPTIONS] <TITLE>
 
 Arguments:
   <TITLE>
@@ -11,9 +11,8 @@ Options:
           Specify the target tab by its id
 
       --pane-id <PANE_ID>
-          Specify the current pane. The default is to use the current pane based
-          on the environment variable WEZTERM_PANE.
-          
+          Specify the current pane. The default is to use the current pane based on the environment variable WEZTERM_PANE.
+
           The pane is used to figure out which tab should be renamed.
 
   -h, --help

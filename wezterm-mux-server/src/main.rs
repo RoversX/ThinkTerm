@@ -16,12 +16,12 @@ mod daemonize;
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
+    about = "ThinkTerm Multiplexer Server\nhttps://github.com/RoversX/thinkterm",
     version = config::wezterm_version(),
     trailing_var_arg = true,
 )]
 struct Opt {
-    /// Skip loading wezterm.lua
+    /// Skip loading the ThinkTerm configuration
     #[arg(long, short = 'n')]
     skip_config: bool,
 
@@ -57,7 +57,7 @@ struct Opt {
     pid_file_fd: Option<i32>,
 
     /// Instead of executing your shell, run PROG.
-    /// For example: `wezterm start -- bash -l` will spawn bash
+    /// For example: `thinkterm start -- bash -l` will spawn bash
     /// as if it were a login shell.
     #[arg(value_parser, value_hint=ValueHint::CommandWithArguments, num_args=1..)]
     prog: Vec<OsString>,

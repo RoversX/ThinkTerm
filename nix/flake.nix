@@ -125,6 +125,7 @@
 
             # hash does not work well with NixOS
             substituteInPlace assets/shell-integration/wezterm.sh \
+              --replace-fail 'hash thinkterm 2>/dev/null' 'command type -P thinkterm &>/dev/null' \
               --replace-fail 'hash wezterm 2>/dev/null' 'command type -P wezterm &>/dev/null' \
               --replace-fail 'hash base64 2>/dev/null' 'command type -P base64 &>/dev/null' \
               --replace-fail 'hash hostname 2>/dev/null' 'command type -P hostname &>/dev/null' \
@@ -150,8 +151,8 @@
               # macOS will only recognize our application bundle
               # if the binaries are inside of it. Move them there
               # and create symbolic links for them in bin/.
-              mv $out/bin/{wezterm,wezterm-mux-server,wezterm-gui,strip-ansi-escapes} "$OUT_APP"
-              ln -s "$OUT_APP"/{wezterm,wezterm-mux-server,wezterm-gui,strip-ansi-escapes} "$out/bin"
+              mv $out/bin/{thinkterm,wezterm,wezterm-mux-server,wezterm-gui,strip-ansi-escapes} "$OUT_APP"
+              ln -s "$OUT_APP"/{thinkterm,wezterm,wezterm-mux-server,wezterm-gui,strip-ansi-escapes} "$out/bin"
             '';
 
           postInstall = ''
@@ -163,7 +164,7 @@
             install -Dm644 assets/wezterm.appdata.xml $out/share/metainfo/com.roversx.thinkterm.appdata.xml
 
             install -Dm644 assets/shell-integration/wezterm.sh -t $out/etc/profile.d
-            installShellCompletion --cmd wezterm \
+            installShellCompletion --cmd thinkterm \
               --bash assets/shell-completion/bash \
               --fish assets/shell-completion/fish \
               --zsh assets/shell-completion/zsh
@@ -213,7 +214,7 @@
                 '';
           };
 
-          meta.mainProgram = "wezterm";
+          meta.mainProgram = "thinkterm";
         };
 
         devShell = pkgs.mkShell {

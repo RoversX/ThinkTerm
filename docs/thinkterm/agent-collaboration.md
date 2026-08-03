@@ -13,9 +13,9 @@ own work.
 
 This has been demonstrated using two existing CLI primitives:
 
-- [`wezterm cli send-text`](../cli/cli/send-text.md) sends bytes to a target
+- [`thinkterm cli send-text`](../cli/cli/send-text.md) sends bytes to a target
   pane as if they had been typed or pasted by the user.
-- [`wezterm cli get-text`](../cli/cli/get-text.md) reads the visible or
+- [`thinkterm cli get-text`](../cli/cli/get-text.md) reads the visible or
   scrollback contents of a target pane.
 
 Together, these commands form a minimal communication loop:

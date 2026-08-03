@@ -462,7 +462,7 @@ impl ClientPane {
             Pdu::PaneFocused(PaneFocused { pane_id }) => {
                 // We get here whenever the pane focus is changed on the
                 // server. That might be an echo of a focus change we
-                // advised ourselves, or a "remote" `wezterm cli
+                // advised ourselves, or a "remote" `thinkterm cli
                 // activate-pane-direction` style call from some other
                 // actor. Applying it yanks both the window's active tab
                 // and the pane stack's active pane, so a STALE echo (of an

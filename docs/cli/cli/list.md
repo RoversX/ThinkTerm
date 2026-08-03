@@ -1,15 +1,15 @@
-# `wezterm cli list`
+# `thinkterm cli list`
 
-*Run `wezterm cli list --help` to see more help*
+*Run `thinkterm cli list --help` to see more help*
 
 Lists the set of windows, tabs and panes that are being managed.
 
 The default output is tabular:
 
 ```
-$ wezterm cli list
+$ thinkterm cli list
 WINID TABID PANEID WORKSPACE SIZE  TITLE                          CWD
-    0     0      0 default   80x24 wezterm cli list  -- wez@foo:~ file://foo/home/wez/
+    0     0      0 default   80x24 thinkterm cli list  -- wez@foo:~ file://foo/home/wez/
 ```
 
 Each row describes a pane.  The meaning of the fields are:
@@ -27,7 +27,7 @@ Each row describes a pane.  The meaning of the fields are:
 You may request JSON output:
 
 ```
-$ wezterm cli list --format json
+$ thinkterm cli list --format json
 [
   {
     "window_id": 0,
@@ -38,7 +38,7 @@ $ wezterm cli list --format json
       "rows": 24,
       "cols": 80
     },
-    "title": "wezterm cli list --format json -- wez@foo:~",
+    "title": "thinkterm cli list --format json -- wez@foo:~",
     "cwd": "file://foo/home/wez/"
   }
 ]

@@ -35,14 +35,14 @@ class OpenInWezTermAction(GObject.GObject, Nautilus.MenuProvider):
                     "org.freedesktop.systemd1.Manager", None)
 
     def _open_terminal(self, path):
-        cmd = ['wezterm', 'start', '--cwd', path]
+        cmd = ['thinkterm', 'start', '--cwd', path]
         child = Gio.Subprocess.new(cmd, Gio.SubprocessFlags.NONE)
         if self._systemd:
             # Move new terminal into a dedicated systemd scope to make systemd
             # track the terminal separately; in particular this makes systemd
             # keep a separate CPU and memory account for Wezterm which in turn
             # ensures that oomd doesn't take nautilus down if a process in
-            # wezterm consumes a lot of memory.
+            # ThinkTerm consumes a lot of memory.
             pid = int(child.get_identifier())
             props = [("PIDs", GLib.Variant('au', [pid])),
                 ('CollectMode', GLib.Variant('s', 'inactive-or-failed'))]

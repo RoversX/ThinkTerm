@@ -1,6 +1,6 @@
 Show key assignments
 
-Usage: wezterm show-keys [OPTIONS]
+Usage: thinkterm show-keys [OPTIONS]
 
 Options:
       --lua                    Show the keys as lua config statements

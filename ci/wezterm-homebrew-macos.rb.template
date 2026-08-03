@@ -22,6 +22,7 @@ cask "thinkterm" do
 
   app "ThinkTerm.app"
   [
+    "thinkterm",
     "wezterm",
     "wezterm-gui",
     "wezterm-mux-server",
@@ -44,8 +45,8 @@ cask "thinkterm" do
   ]
 
   def caveats; <<~EOS
-    Cask #{token} related executables like 'wezterm', 'wezterm-gui',
-    'wezterm-mux-server', are linked into
+    Cask #{token} related executables like 'thinkterm', 'wezterm',
+    'wezterm-gui', and 'wezterm-mux-server' are linked into
       /usr/local/bin/    for x86 Mac,
       /opt/homebrew/bin/ for M1 Mac.
 

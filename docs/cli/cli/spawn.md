@@ -1,6 +1,6 @@
-# `wezterm cli spawn`
+# `thinkterm cli spawn`
 
-*Run `wezterm cli spawn --help` to see more help*
+*Run `thinkterm cli spawn --help` to see more help*
 
 Spawn a command into a new tab or window.  Outputs the pane-id for the newly
 created pane on success.
@@ -11,25 +11,25 @@ program; this example spawns a new pane with id 1 running that default program
 
 
 ```
-$ wezterm cli spawn
+$ thinkterm cli spawn
 1
 ```
 
 You may spawn an alternative program by passing the argument list; it is
 recommended that you use `--` to denote the end of the arguments being passed
-to `wezterm cli spawn` so that any parameters you may wish to pass to the
-program are not confused with parameters to `wezterm cli spawn`.  This example
+to `thinkterm cli spawn` so that any parameters you may wish to pass to the
+program are not confused with parameters to `thinkterm cli spawn`.  This example
 launches `top` in a new tab:
 
 ```
-$ wezterm cli spawn -- top
+$ thinkterm cli spawn -- top
 2
 ```
 
 This example explicitly runs bash as a login shell:
 
 ```
-$ wezterm cli spawn -- bash -l
+$ thinkterm cli spawn -- bash -l
 3
 ```
 

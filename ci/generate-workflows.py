@@ -21,6 +21,7 @@ TRIGGER_PATHS_APPIMAGE = [
 ]
 
 TRIGGER_PATHS_UNIX = [
+    "assets/open-thinkterm-here",
     "assets/open-wezterm-here",
     "assets/shell-completion/**/*",
     "assets/shell-integration/**/*",

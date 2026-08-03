@@ -11,8 +11,8 @@ pkgdesc='A GPU-accelerated cross-platform terminal emulator and multiplexer impl
 arch=('i686' 'x86_64')
 url='https://github.com/RoversX/thinkterm'
 license=('MIT')
-provides=('wezterm')
-conflicts=('wezterm')
+provides=('thinkterm' 'wezterm')
+conflicts=('thinkterm' 'wezterm')
 # Don't strip: it will break the binary and it only saves ~10% anyway
 options=('!strip')
 makedepends=('fuse')
@@ -51,6 +51,7 @@ build() {
 }
 
 package() {
+  install -Dm755 squashfs-root/usr/bin/thinkterm -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/wezterm -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/wezterm-gui -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/wezterm-mux-server -t "${pkgdir}/usr/bin/"

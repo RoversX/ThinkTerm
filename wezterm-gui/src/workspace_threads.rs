@@ -61,7 +61,7 @@ pub struct Space {
     #[serde(default)]
     pub is_default: bool,
     /// When set, this Space is dedicated to a wezterm mux client domain
-    /// (`wezterm connect <name>`). Such Spaces are found-or-created by domain
+    /// (`thinkterm connect <name>`). Such Spaces are found-or-created by domain
     /// name, are never claimed by startup/Dock windows, and never persist
     /// layout locally (the remote mux server owns the layout truth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2945,7 +2945,7 @@ impl WorkspaceThreadStore {
         &mut self,
         occupied: &std::collections::HashSet<SpaceId>,
     ) -> SpaceId {
-        // Mux-domain Spaces belong to `wezterm connect`; startup and Dock
+        // Mux-domain Spaces belong to `thinkterm connect`; startup and Dock
         // "New Window" must never claim them (they would materialize a local
         // shell into a remote-owned workspace).
         self.last_active_space_id
@@ -5394,7 +5394,7 @@ fn is_remote_project(project: &Project, spaces: &[Space]) -> bool {
 
 fn thread_has_restorable_workspace(thread: &WorkspaceThread) -> bool {
     // Mux-domain threads have no local layout to restore: their content lives
-    // on the remote mux server and only materializes through `wezterm connect`.
+    // on the remote mux server and only materializes through `thinkterm connect`.
     if is_mux_domain_project_id(&thread.project_id) {
         return false;
     }
@@ -5751,7 +5751,7 @@ pub fn create_remote_project_from_path(space_id: &str, path: &str) -> Result<Wor
     Ok(thread_id)
 }
 
-/// Everything `wezterm connect` needs to route a client-domain attach into
+/// Everything `thinkterm connect` needs to route a client-domain attach into
 /// its dedicated Space.
 #[derive(Debug, Clone)]
 pub struct MuxDomainSpacePlan {

@@ -112,10 +112,12 @@ case $OSTYPE in
     fi
     rm -rf $zipdir $zipname
     mkdir $zipdir
-    cp $TARGET_DIR/release/wezterm.exe \
+    cp $TARGET_DIR/release/thinkterm.exe \
+      $TARGET_DIR/release/wezterm.exe \
       $TARGET_DIR/release/wezterm-mux-server.exe \
       $TARGET_DIR/release/wezterm-gui.exe \
       $TARGET_DIR/release/strip-ansi-escapes.exe \
+      $TARGET_DIR/release/thinkterm.pdb \
       $TARGET_DIR/release/wezterm.pdb \
       assets/windows/conhost/conpty.dll \
       assets/windows/conhost/OpenConsole.exe \
@@ -240,14 +242,18 @@ ${BUILD_SECTION}
 set -x
 cd ${HERE}
 mkdir -p %{buildroot}/usr/bin %{buildroot}/etc/profile.d %{buildroot}/usr/share/icons/hicolor/128x128/apps %{buildroot}/usr/share/applications %{buildroot}/usr/share/metainfo %{buildroot}/usr/share/nautilus-python/extensions
-install -Dm755 assets/open-wezterm-here -t %{buildroot}/usr/bin
+install -Dm755 assets/open-thinkterm-here assets/open-wezterm-here -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/release/thinkterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/release/wezterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/release/wezterm-gui -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/release/wezterm-mux-server -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/release/strip-ansi-escapes -t %{buildroot}/usr/bin
 install -Dm644 assets/shell-integration/* -t %{buildroot}/etc/profile.d
-install -Dm644 assets/shell-completion/zsh %{buildroot}/usr/share/zsh/site-functions/_wezterm
-install -Dm644 assets/shell-completion/bash %{buildroot}/etc/bash_completion.d/wezterm
+install -Dm644 assets/shell-completion/zsh %{buildroot}/usr/share/zsh/site-functions/_thinkterm
+install -Dm644 assets/shell-completion/bash %{buildroot}/etc/bash_completion.d/thinkterm
+install -Dm644 assets/shell-completion/fish %{buildroot}/usr/share/fish/vendor_completions.d/thinkterm.fish
+ln -s thinkterm %{buildroot}/etc/bash_completion.d/wezterm
+ln -s thinkterm.fish %{buildroot}/usr/share/fish/vendor_completions.d/wezterm.fish
 install -Dm644 assets/icon/terminal.png %{buildroot}/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
 install -Dm644 assets/wezterm.desktop %{buildroot}/usr/share/applications/com.roversx.thinkterm.desktop
 install -Dm644 assets/wezterm.appdata.xml %{buildroot}/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
@@ -257,13 +263,18 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 # Main package (metapackage) has no files
 
 %files -n wezterm-common
+/usr/bin/thinkterm
 /usr/bin/wezterm
 /usr/bin/strip-ansi-escapes
-/usr/share/zsh/site-functions/_wezterm
+/usr/share/zsh/site-functions/_thinkterm
+/usr/share/fish/vendor_completions.d/thinkterm.fish
+/usr/share/fish/vendor_completions.d/wezterm.fish
+/etc/bash_completion.d/thinkterm
 /etc/bash_completion.d/wezterm
 /etc/profile.d/*
 
 %files -n wezterm-gui
+/usr/bin/open-thinkterm-here
 /usr/bin/open-wezterm-here
 /usr/bin/wezterm-gui
 /usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
@@ -320,7 +331,8 @@ EOF
 #!/bin/sh
 set -e
 if [ "\$1" = "configure" ] ; then
-        update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator /usr/bin/open-wezterm-here 20
+        update-alternatives --remove x-terminal-emulator /usr/bin/open-wezterm-here
+        update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator /usr/bin/open-thinkterm-here 20
 fi
 EOF
 
@@ -328,14 +340,16 @@ EOF
 #!/bin/sh
 set -e
 if [ "\$1" = "remove" ]; then
+	update-alternatives --remove x-terminal-emulator /usr/bin/open-thinkterm-here
 	update-alternatives --remove x-terminal-emulator /usr/bin/open-wezterm-here
 fi
 EOF
 
         install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/wezterm-mux-server
         install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/wezterm-gui
+        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/thinkterm
         install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/wezterm
-        install -Dm755 -t pkg/debian/usr/bin assets/open-wezterm-here
+        install -Dm755 -t pkg/debian/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
         install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/strip-ansi-escapes
 
         deps=$(cd pkg && dpkg-shlibdeps -O -e debian/usr/bin/*)
@@ -352,8 +366,11 @@ EOF
         install -Dm644 assets/wezterm.desktop pkg/debian/usr/share/applications/com.roversx.thinkterm.desktop
         install -Dm644 assets/wezterm.appdata.xml pkg/debian/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
         install -Dm644 assets/wezterm-nautilus.py pkg/debian/usr/share/nautilus-python/extensions/wezterm-nautilus.py
-        install -Dm644 assets/shell-completion/bash pkg/debian/usr/share/bash-completion/completions/wezterm
-        install -Dm644 assets/shell-completion/zsh pkg/debian/usr/share/zsh/functions/Completion/Unix/_wezterm
+        install -Dm644 assets/shell-completion/bash pkg/debian/usr/share/bash-completion/completions/thinkterm
+        install -Dm644 assets/shell-completion/zsh pkg/debian/usr/share/zsh/functions/Completion/Unix/_thinkterm
+        install -Dm644 assets/shell-completion/fish pkg/debian/usr/share/fish/vendor_completions.d/thinkterm.fish
+        ln -s thinkterm pkg/debian/usr/share/bash-completion/completions/wezterm
+        ln -s thinkterm.fish pkg/debian/usr/share/fish/vendor_completions.d/wezterm.fish
         install -Dm644 assets/shell-integration/* -t pkg/debian/etc/profile.d
 
         if [[ "$BUILD_REASON" == "Schedule" ]] ; then
@@ -401,9 +418,11 @@ options="!check"
 url="https://github.com/RoversX/thinkterm"
 makedepends="cmd:tic"
 source="
+  $TARGET_DIR/release/thinkterm
   $TARGET_DIR/release/wezterm
   $TARGET_DIR/release/wezterm-gui
   $TARGET_DIR/release/wezterm-mux-server
+  assets/open-thinkterm-here
   assets/open-wezterm-here
   assets/wezterm.desktop
   assets/wezterm.appdata.xml
@@ -418,7 +437,9 @@ build() {
 }
 
 package() {
+  install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/open-thinkterm-here
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/open-wezterm-here
+  install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm-gui
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm-mux-server

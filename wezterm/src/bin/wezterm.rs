@@ -1,12 +1,13 @@
-//! `thinkterm` is the branded name for the ThinkTerm CLI. The full CLI
-//! lives in the `wezterm` binary built from this same crate; exec it so
-//! the two names stay perfectly in sync without compiling the crate twice.
+//! `wezterm` is the legacy compatibility name for the ThinkTerm CLI. The
+//! full CLI lives in the `thinkterm` binary built from this same crate; exec
+//! it so existing scripts keep working while all visible branding stays on
+//! ThinkTerm.
 
 fn main() {
     let exe_name = if cfg!(windows) {
-        "wezterm.exe"
+        "thinkterm.exe"
     } else {
-        "wezterm"
+        "thinkterm"
     };
     let exe = match std::env::current_exe()
         .ok()
@@ -14,7 +15,7 @@ fn main() {
     {
         Some(exe) => exe,
         None => {
-            eprintln!("thinkterm: unable to locate the {exe_name} binary next to this one");
+            eprintln!("wezterm: unable to locate the {exe_name} binary next to this one");
             std::process::exit(1);
         }
     };
@@ -26,7 +27,7 @@ fn main() {
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
-        eprintln!("thinkterm: failed to exec {cmd:?}: {err}");
+        eprintln!("wezterm: failed to exec {cmd:?}: {err}");
         std::process::exit(1);
     }
     #[cfg(windows)]
@@ -34,7 +35,7 @@ fn main() {
         match cmd.status() {
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
             Err(err) => {
-                eprintln!("thinkterm: failed to run {cmd:?}: {err}");
+                eprintln!("wezterm: failed to run {cmd:?}: {err}");
                 std::process::exit(1);
             }
         }

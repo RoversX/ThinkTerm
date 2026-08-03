@@ -11,7 +11,8 @@ class Wezterm < Formula
 
   def install
     Dir.glob("*.AppImage").each do |img|
-      bin.install img => "wezterm"
+      bin.install img => "thinkterm"
+      bin.install_symlink "thinkterm" => "wezterm"
     end
   end
 end

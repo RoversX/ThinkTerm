@@ -1,6 +1,6 @@
 Change the title of a window
 
-Usage: wezterm cli set-window-title [OPTIONS] <TITLE>
+Usage: thinkterm cli set-window-title [OPTIONS] <TITLE>
 
 Arguments:
   <TITLE>
@@ -11,9 +11,8 @@ Options:
           Specify the target window by its id
 
       --pane-id <PANE_ID>
-          Specify the current pane. The default is to use the current pane based
-          on the environment variable WEZTERM_PANE.
-          
+          Specify the current pane. The default is to use the current pane based on the environment variable WEZTERM_PANE.
+
           The pane is used to figure out which window should be renamed.
 
   -h, --help

@@ -48,7 +48,7 @@ pub struct SshHostSpec {
     pub ssh_options: HashMap<String, String>,
     /// Use WezTerm's multiplexed SSH (persistent, reconnecting) when true.
     /// That requires `wezterm` installed on the remote; default to direct
-    /// `ssh` (like `wezterm ssh`) so password auth + the shell work anywhere.
+    /// `ssh` (like `thinkterm ssh`) so password auth + the shell work anywhere.
     #[serde(default)]
     pub multiplexing: bool,
     /// Override the default `ssh:<host>` workspace name.
