@@ -1286,11 +1286,6 @@ pub struct TermWindow {
     /// Terminal dimensions
     terminal_size: TerminalSize,
     pub mux_window_id: MuxWindowId,
-    /// A viewport claim is in flight; a second click must not queue another.
-    frontend_viewport_claim_pending: bool,
-    /// The tab this window last described to the server, so a switch to a tab
-    /// it has never described says so before anyone has to click.
-    last_described_tab: Option<TabId>,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     pub render_metrics: RenderMetrics,
     render_state: Option<RenderState>,
@@ -2025,8 +2020,6 @@ impl TermWindow {
             crate::workspace_threads::space_note_vault(&active_space_id).is_some();
 
         let myself = Self {
-            frontend_viewport_claim_pending: false,
-            last_described_tab: None,
             created: Instant::now(),
             connection_name,
             last_fps_check_time: Instant::now(),

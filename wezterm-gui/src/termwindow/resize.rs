@@ -1,5 +1,4 @@
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
-use crate::termwindow::TermWindowNotif;
 use crate::ui::rescale_ui_usize;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
@@ -44,121 +43,6 @@ impl super::TermWindow {
             .map_or(true, |tab| self.tab_owns_frontend_viewport(&tab))
     }
 
-    /// Take the viewport because someone is using this window right now.
-    ///
-    /// The server hands the lease over on *input*, and a click or a scroll in a
-    /// pane that is not asking for mouse reporting never reaches the server at
-    /// all — it is handled here. So a window you sat down at and clicked in
-    /// kept drawing at whatever size the phone that last typed had left it,
-    /// until something incidental (toggling the sidebar) happened to re-report
-    /// the geometry. Interacting with a window is the plainest possible
-    /// statement that it is the one being looked at.
-    ///
-    /// Nothing happens when this window already owns the viewport, which is the
-    /// overwhelmingly common case, so the cost on an ordinary click is one
-    /// comparison.
-    pub(crate) fn claim_frontend_viewport_for_interaction(&mut self) {
-        if self.frontend_viewport_claim_pending || self.owns_frontend_viewport() {
-            return;
-        }
-        let mux = Mux::get();
-        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
-            return;
-        };
-        let Some(active_pane) = tab.get_active_pane() else {
-            return;
-        };
-        let Some(client_pane) = active_pane.downcast_ref::<ClientPane>() else {
-            return;
-        };
-        let Some(domain) = mux.get_domain(client_pane.domain_id()) else {
-            return;
-        };
-        if !domain.is::<ClientDomain>() {
-            return;
-        }
-        let tab_id = tab.tab_id();
-        let Some(window) = self.window.as_ref().cloned() else {
-            return;
-        };
-        // Advertise before claiming, in that order, in one go. The server can
-        // only hand the viewport to a client whose geometry it already holds,
-        // and this window advertises for the *active* tab only — so a tab
-        // switched to while another device held the lease was never described
-        // at all, and clicking in it claimed nothing. That is the tab that then
-        // sat at the other device's size with no way back short of resizing the
-        // window.
-        let viewport = self.active_frontend_viewport();
-        self.frontend_viewport_claim_pending = true;
-        promise::spawn::spawn(async move {
-            let claimed = match domain.downcast_ref::<ClientDomain>() {
-                Some(domain) => {
-                    if let Some(viewport) = viewport {
-                        if let Err(err) = domain.set_client_viewport(tab_id, viewport).await {
-                            log::warn!("advertising the viewport before claiming it: {err:#}");
-                        }
-                    }
-                    domain.claim_client_viewport(tab_id).await.is_ok()
-                }
-                None => false,
-            };
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.frontend_viewport_claim_pending = false;
-                if claimed {
-                    // The lease is ours now, so the resize this window has been
-                    // wanting all along is finally allowed through.
-                    term_window.resize_mux_tabs_to_current_terminal_size();
-                    term_window.invalidate_window();
-                }
-            })));
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
-    }
-
-    /// How this window would describe itself to the server right now.
-    ///
-    /// `None` when the active tab is not backed by a remote mux, which is the
-    /// case where there is no lease to hold in the first place.
-    fn active_frontend_viewport(&self) -> Option<codec::ClientViewport> {
-        let mux = Mux::get();
-        let tab = mux.get_active_tab_for_window(self.mux_window_id)?;
-        let active_pane = tab.get_active_pane()?;
-        let client_pane = active_pane.downcast_ref::<ClientPane>()?;
-        let domain_id = client_pane.domain_id();
-        // A window that does not hold the lease describes only its overall
-        // grid: its per-pane split of that grid is not the one in force, and
-        // offering it would ask the server to act on a layout nobody is
-        // looking at.
-        let panes = if self.tab_owns_frontend_viewport(&tab) {
-            self.get_panes_to_render()
-                .into_iter()
-                .filter_map(|positioned| {
-                    let pane = positioned.pane.downcast_ref::<ClientPane>()?;
-                    if pane.domain_id() != domain_id {
-                        return None;
-                    }
-                    let font_scale = self.pane_font_scale(positioned.pane.pane_id());
-                    let metrics = if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
-                        self.render_metrics
-                    } else {
-                        self.pane_font_resources(font_scale).ok()?.1
-                    };
-                    Some(codec::ClientPaneViewport {
-                        pane_id: positioned.pane.pane_id(),
-                        size: self.terminal_size_for_positioned_pane(&positioned, metrics),
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Some(codec::ClientViewport::Native {
-            size: self.terminal_size,
-            panes,
-        })
-    }
-
     fn report_active_frontend_viewport(&self) {
         let mux = Mux::get();
         let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
@@ -168,16 +52,49 @@ impl super::TermWindow {
             return;
         };
         let tab_id = tab.tab_id();
+        let owns = self.tab_owns_frontend_viewport(&tab);
 
         if let Some(client_pane) = active_pane.downcast_ref::<ClientPane>() {
-            let Some(domain) = mux.get_domain(client_pane.domain_id()) else {
+            let domain_id = client_pane.domain_id();
+            let Some(domain) = mux.get_domain(domain_id) else {
                 return;
             };
             if !domain.is::<ClientDomain>() {
                 return;
             }
-            let Some(viewport) = self.active_frontend_viewport() else {
-                return;
+            let panes = if owns {
+                self.get_panes_to_render()
+                    .into_iter()
+                    .filter_map(|positioned| {
+                        let pane = positioned.pane.downcast_ref::<ClientPane>()?;
+                        if pane.domain_id() != domain_id {
+                            return None;
+                        }
+                        let font_scale = self.pane_font_scale(positioned.pane.pane_id());
+                        let metrics =
+                            if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
+                                self.render_metrics
+                            } else {
+                                match self.pane_font_resources(font_scale) {
+                                    Ok((_, metrics)) => metrics,
+                                    Err(err) => {
+                                        log::warn!("cannot calculate native viewport: {err:#}");
+                                        return None;
+                                    }
+                                }
+                            };
+                        Some(codec::ClientPaneViewport {
+                            pane_id: positioned.pane.pane_id(),
+                            size: self.terminal_size_for_positioned_pane(&positioned, metrics),
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let viewport = codec::ClientViewport::Native {
+                size: self.terminal_size,
+                panes,
             };
             promise::spawn::spawn(async move {
                 let Some(domain) = domain.downcast_ref::<ClientDomain>() else {
@@ -197,7 +114,7 @@ impl super::TermWindow {
         let Some(client_id) = mux.active_identity() else {
             return;
         };
-        let panes = if self.tab_owns_frontend_viewport(&tab) {
+        let panes = if owns {
             self.get_panes_to_render()
                 .into_iter()
                 .filter(|positioned| !positioned.pane.is_remote_mirror())
@@ -603,19 +520,6 @@ impl super::TermWindow {
     pub(crate) fn reconcile_active_mux_tab_size_before_paint(&mut self) {
         if self.content_view_foreground() {
             return;
-        }
-        // Before the ownership gate, because a tab this window has never
-        // described is precisely a tab it cannot own. This window advertises
-        // for the active tab only, so switching tabs — or closing one, which
-        // activates its neighbour — used to leave the newly shown tab
-        // undescribed, and therefore unclaimable, at whatever size the device
-        // that last held it had chosen. Saying so once per change is enough.
-        let active_tab = Mux::get()
-            .get_active_tab_for_window(self.mux_window_id)
-            .map(|tab| tab.tab_id());
-        if self.last_described_tab != active_tab {
-            self.last_described_tab = active_tab;
-            self.report_active_frontend_viewport();
         }
         if !self.owns_frontend_viewport() {
             return;
