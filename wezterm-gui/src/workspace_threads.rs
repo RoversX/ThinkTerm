@@ -337,12 +337,21 @@ pub struct SpaceView {
 lazy_static::lazy_static! {
     static ref THREAD_STORE: Mutex<WorkspaceThreadStore> =
         Mutex::new(load_workspace_thread_store().unwrap_or_else(|err| {
-            log::warn!("failed to load ThinkTerm workspace thread store: {err:#}");
+            log::error!("cannot read the ThinkTerm workspace store: {err:#}");
+            preserve_unreadable_workspace_thread_store();
+            STORE_IS_UNREADABLE.store(true, Ordering::Release);
             WorkspaceThreadStore::default()
         }));
     static ref WINDOW_SPACES: Mutex<HashMap<u64, SpaceId>> = Mutex::new(HashMap::new());
     static ref MATERIALIZING_LAYOUT_WORKSPACES: Mutex<HashMap<String, usize>> =
         Mutex::new(HashMap::new());
+    /// Workspaces whose saved layout this build could not decode. They opened
+    /// as a single terminal, so snapshotting them would write that one pane
+    /// over the arrangement we failed to read — turning a version skew into
+    /// permanent data loss. Held in memory only: a build that can read the
+    /// file again starts with an empty set and resumes saving normally.
+    static ref UNREADABLE_LAYOUT_WORKSPACES: Mutex<std::collections::HashSet<String>> =
+        Mutex::new(std::collections::HashSet::new());
     static ref WORK_RUNNING_LAST_SEEN: Mutex<HashMap<String, std::time::Instant>> =
         Mutex::new(HashMap::new());
     static ref WORK_STATUS_RECHECK_PENDING: Mutex<std::collections::HashSet<String>> =
@@ -375,6 +384,15 @@ lazy_static::lazy_static! {
 
 static THREAD_STORE_PERSIST_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static THREAD_STORE_PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Set when the store on disk exists but could not be read.
+///
+/// Nothing may be written while it is set. The in-memory store is empty in
+/// that case, so saving would replace a file this build could not parse with
+/// one describing nothing at all — every Space, Project and Thread the user
+/// has, and the evidence needed to work out why, gone in a single atomic
+/// rename. The same shape as a layout snapshot the renderer cannot decode,
+/// and the same answer: read failures must not be allowed to write.
+static STORE_IS_UNREADABLE: AtomicBool = AtomicBool::new(false);
 static NEXT_SPACE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 fn publish_thinkterm_session_changed() {
     wezterm_mux_server_impl::thinkterm_session::publish_changed();
@@ -528,6 +546,35 @@ fn migrate_legacy_remote_hosts(value: &serde_json::Value) {
                 "failed to migrate legacy SSH host from workspace project {project_id}: {err:#}"
             );
         }
+    }
+}
+
+/// Copy a store that could not be read to a name that will not be reopened.
+///
+/// Refusing to write already keeps the original safe; this makes it safe from
+/// the user too, who has no reason to suspect the untouched-looking file is
+/// the only copy of their workspace and may well delete it while trying to get
+/// a working app back.
+fn preserve_unreadable_workspace_thread_store() {
+    let path = workspace_thread_store_path();
+    let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return;
+    };
+    let preserved = path.with_file_name(format!("{name}.unreadable-{}.json", now_ts()));
+    if preserved.exists() {
+        return;
+    }
+    match fs::copy(&path, &preserved) {
+        Ok(_) => log::error!(
+            "kept a copy of the unreadable workspace store at {}. \
+             ThinkTerm will not save over the original, so nothing further \
+             is lost; this session's changes are not being saved either.",
+            preserved.display()
+        ),
+        Err(err) => log::error!(
+            "cannot copy the unreadable workspace store to {}: {err:#}",
+            preserved.display()
+        ),
     }
 }
 
@@ -854,6 +901,34 @@ pub enum SpaceRemoval {
     /// Delete the Space on the server that hosts it, so it disappears
     /// everywhere. Falls back to a local removal for a local Space.
     Everywhere,
+}
+
+/// Every mux domain this device currently mirrors Spaces from.
+pub fn remote_space_domains() -> Vec<String> {
+    THREAD_STORE.lock().remote_space_domains()
+}
+
+/// The Spaces this device mirrored from a mux server it reaches under any of
+/// `domain_names`.
+///
+/// A host is connected under more than one name — the label for a ThinkTerm
+/// Connect domain, `ssh:user@host` for a direct one — and the Space records
+/// whichever one it arrived through, so a caller asking "what did this host
+/// bring in" has to ask about all of them.
+pub fn space_ids_for_domains(domain_names: &[String]) -> Vec<SpaceId> {
+    THREAD_STORE.lock().space_ids_for_domains(domain_names)
+}
+
+/// Owner id no live window can have: they are handed out from 1.
+const NO_WINDOW_OWNER: u64 = 0;
+
+/// Drop this device's copy of `space_id` with no window in the picture.
+///
+/// The windowed path ([`TermWindow::start_delete_space`]) exists because a
+/// window showing the Space has to be moved off it first. At startup there are
+/// no windows yet, so there is nothing to move.
+pub fn forget_space_locally(space_id: &str) -> Result<DeletedSpace, DeleteSpaceError> {
+    delete_space_for_window_local(NO_WINDOW_OWNER, space_id, SpaceRemoval::Local)
 }
 
 fn delete_space_for_window_local(
@@ -1578,6 +1653,16 @@ pub fn acknowledge_thread_work_for_workspace_deferred(workspace: &str) -> bool {
     change.changed
 }
 
+fn mark_layout_unreadable(workspace: &str) {
+    UNREADABLE_LAYOUT_WORKSPACES
+        .lock()
+        .insert(workspace.to_string());
+}
+
+fn layout_is_unreadable(workspace: &str) -> bool {
+    UNREADABLE_LAYOUT_WORKSPACES.lock().contains(workspace)
+}
+
 pub fn is_materializing_thread_layout(workspace: &str) -> bool {
     MATERIALIZING_LAYOUT_WORKSPACES
         .lock()
@@ -1622,6 +1707,13 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
     F: Fn(PaneId) -> Option<f64>,
 {
     if is_materializing_thread_layout(workspace) {
+        return;
+    }
+
+    // The window standing in for a layout we could not read describes one
+    // empty pane, and saving that would destroy the arrangement it stands in
+    // for. Keep the file as it is; a build that can read it restores it.
+    if layout_is_unreadable(workspace) {
         return;
     }
 
@@ -1705,16 +1797,29 @@ pub async fn materialize_thread(
         return Ok(());
     }
 
+    // Decoding before the branch, rather than inside `materialize_layout`, is
+    // what makes a layout this build cannot read a lost *arrangement* instead
+    // of a Thread that will not open: an undecodable snapshot falls through to
+    // the plain spawn below, which still lands in the project directory.
     let layout = layout.and_then(|layout| {
         if layout.tabs.is_empty() {
-            None
-        } else {
-            Some(layout)
+            return None;
         }
+        let tabs = decode_layout_tabs(&workspace_name, &layout)?;
+        Some((layout, tabs))
     });
-    if let Some(layout) = layout {
+    if let Some((layout, tabs)) = layout {
         let _guard = MaterializeThreadLayoutGuard::new(workspace_name.clone());
-        materialize_layout(mux, workspace_name, layout, initial_cwd, size, term_config).await
+        materialize_layout(
+            mux,
+            workspace_name,
+            layout,
+            tabs,
+            initial_cwd,
+            size,
+            term_config,
+        )
+        .await
     } else {
         // A thread whose Space lives on a mux server needs its window tagged
         // with that domain. `spawn_tab_or_window` makes untagged windows, and
@@ -3175,6 +3280,34 @@ impl WorkspaceThreadStore {
             .filter(|space| space.client_domain.as_deref() == Some(domain_name))
             .map(|space| space.id.clone())
             .collect()
+    }
+
+    /// The same question across several names, in sidebar order because the
+    /// caller removes them one at a time and a nondeterministic order would
+    /// make which Space a window lands on depend on hashing.
+    fn space_ids_for_domains(&self, domain_names: &[String]) -> Vec<SpaceId> {
+        self.spaces
+            .iter()
+            .filter(|space| {
+                space
+                    .client_domain
+                    .as_ref()
+                    .is_some_and(|domain| domain_names.iter().any(|name| name == domain))
+            })
+            .map(|space| space.id.clone())
+            .collect()
+    }
+
+    fn remote_space_domains(&self) -> Vec<String> {
+        let mut domains: Vec<String> = Vec::new();
+        for space in &self.spaces {
+            if let Some(domain) = space.client_domain.as_ref() {
+                if !domains.iter().any(|known| known == domain) {
+                    domains.push(domain.clone());
+                }
+            }
+        }
+        domains
     }
 
     #[cfg(test)]
@@ -4957,6 +5090,11 @@ fn valid_font_scale(font_scale: Option<f64>) -> Option<f64> {
 }
 
 fn persist_locked(store: &WorkspaceThreadStore) {
+    // See `STORE_IS_UNREADABLE`: this write is the one that would destroy the
+    // file, so it is the one that has to be refused.
+    if STORE_IS_UNREADABLE.load(Ordering::Acquire) {
+        return;
+    }
     if let Err(err) = save_workspace_thread_store(store) {
         log::warn!("failed to save ThinkTerm thread store: {err:#}");
     }
@@ -5163,10 +5301,41 @@ fn collect_pane_entries<'a>(node: &'a PaneNode, entries: &mut Vec<&'a PaneEntry>
     }
 }
 
+/// Decode a saved layout's tabs, or `None` if this build cannot read it.
+///
+/// `PaneNode` is the mux's wire type as well as this file's on-disk format.
+/// Adding a field to it is free on the wire — the codec version rises and both
+/// ends move together — but every layout already on disk was written by an
+/// older shape and stays that way forever. So a decode failure here is a
+/// routine forward-compatibility event, not a bug in the file, and it must not
+/// take the whole Thread down with it.
+fn decode_layout_tabs(
+    workspace_name: &str,
+    layout: &WorkspaceThreadLayoutSnapshot,
+) -> Option<Vec<PaneNode>> {
+    let mut tabs = Vec::with_capacity(layout.tabs.len());
+    for tab_value in &layout.tabs {
+        match serde_json::from_value::<PaneNode>(tab_value.clone()) {
+            Ok(node) => tabs.push(node),
+            Err(err) => {
+                log::error!(
+                    "cannot read the saved layout for {workspace_name}: {err:#}. \
+                     Opening a single terminal instead; the saved layout is left \
+                     on disk untouched."
+                );
+                mark_layout_unreadable(workspace_name);
+                return None;
+            }
+        }
+    }
+    Some(tabs)
+}
+
 async fn materialize_layout(
     mux: Arc<Mux>,
     workspace_name: String,
     layout: WorkspaceThreadLayoutSnapshot,
+    tabs: Vec<PaneNode>,
     initial_cwd: Option<String>,
     size: TerminalSize,
     term_config: Arc<dyn TerminalConfiguration>,
@@ -5178,10 +5347,8 @@ async fn materialize_layout(
         .collect::<HashMap<_, _>>();
     let mut window_id = None;
     let mut spawned_tabs = 0usize;
-    for tab_value in &layout.tabs {
-        let node: PaneNode =
-            serde_json::from_value(tab_value.clone()).context("decode thread tab layout")?;
-        let first_entry = first_pane_entry(&node);
+    for node in &tabs {
+        let first_entry = first_pane_entry(node);
         let cwd = first_entry
             .and_then(|entry| working_dir_for_entry(entry, &terminal_specs))
             .or_else(|| initial_cwd.clone());
@@ -5206,7 +5373,7 @@ async fn materialize_layout(
         restore_node(
             Arc::clone(&mux),
             pane.pane_id(),
-            &node,
+            node,
             &terminal_specs,
             Arc::clone(&term_config),
         )
@@ -6075,6 +6242,111 @@ mod tests {
         let mut store = WorkspaceThreadStore::default();
         store.normalize_after_load();
         store
+    }
+
+    /// A store that fails to parse must not come back as an empty one that
+    /// then overwrites the file it could not read. The parse is strict, so the
+    /// next field added to `Space`, `Project` or `WorkspaceThread` without a
+    /// default lands here — and unlike a layout snapshot, what it would take
+    /// with it is every Space, Project and Thread the user has.
+    #[test]
+    fn a_store_that_cannot_be_parsed_is_an_error_rather_than_an_empty_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace_threads.json");
+
+        // A thread as an older build wrote it, missing a field a later one
+        // made required.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "spaces": [{"id": "space-1", "name": "Default", "active_project_id": null}],
+                "projects": [{
+                    "id": "project-1",
+                    "space_id": "space-1",
+                    "name": "thinkterm",
+                    "path": "/tmp/thinkterm",
+                    "active_thread_id": null,
+                    "threads": [{
+                        "id": "thread-1",
+                        "name": "main",
+                        "project_id": "project-1",
+                        "layout": null,
+                        "materialized_workspace_name": null
+                        // last_active_at, which the struct requires, is absent
+                    }]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = load_workspace_thread_store_from_path(&path)
+            .expect_err("a store missing a required field must not parse as empty");
+        assert!(
+            format!("{err:#}").contains("last_active_at"),
+            "the error should name the field: {err:#}"
+        );
+
+        // And the file is still there to be recovered from.
+        assert!(path.exists());
+    }
+
+    /// `WorkspaceThreadLayoutSnapshot::tabs` holds serialized `PaneNode`s, so
+    /// that type is this file's on-disk format as much as it is the mux's wire
+    /// format. A field added to it without a default invalidates every layout
+    /// a user has ever saved: `materialize_layout` fails to decode, the Thread
+    /// comes up as a single empty pane, and the next snapshot writes that over
+    /// the layout it could not read. This is the shape of a tab saved before
+    /// `PaneEntry::alt_screen` existed.
+    #[test]
+    fn layout_snapshot_saved_before_alt_screen_still_decodes() {
+        let stored = serde_json::json!({
+            "Leaf": {
+                "window_id": 1,
+                "tab_id": 1,
+                "pane_id": 6,
+                "title": "zsh",
+                "size": {"rows": 24, "cols": 80, "pixel_width": 0, "pixel_height": 0, "dpi": 0},
+                "working_dir": "file:///Users/someone/project",
+                "is_active_pane": true,
+                "is_zoomed_pane": false,
+                "workspace": "default",
+                "cursor_pos": {"x": 0, "y": 0, "shape": "Default", "visibility": "Visible"},
+                "physical_top": 0,
+                "top_row": 0,
+                "left_col": 0,
+                "tty_name": null
+            }
+        });
+
+        let node: PaneNode =
+            serde_json::from_value(stored).expect("decode a layout saved before alt_screen");
+        let PaneNode::Leaf(entry) = node else {
+            panic!("expected a leaf");
+        };
+        assert_eq!(entry.pane_id, 6);
+        assert!(!entry.alt_screen);
+    }
+
+    /// The next field added to `PaneEntry` without a default will land here
+    /// again. When it does, the Thread must still open — and the arrangement
+    /// we could not read must still be on disk afterwards, so that a build
+    /// which can read it gets it back.
+    #[test]
+    fn an_undecodable_layout_is_refused_rather_than_overwritten() {
+        let workspace = "test-workspace-undecodable-layout";
+        let layout = WorkspaceThreadLayoutSnapshot {
+            active_tab: 0,
+            tabs: vec![serde_json::json!({"Leaf": {"a field from the future": true}})],
+            terminal_specs: vec![],
+        };
+
+        assert!(!layout_is_unreadable(workspace));
+        // No tabs to spawn from, so `materialize_thread` falls through to the
+        // plain project-directory spawn instead of failing the Thread.
+        assert!(decode_layout_tabs(workspace, &layout).is_none());
+        // And the single pane that spawn produces must not be saved over it.
+        assert!(layout_is_unreadable(workspace));
     }
 
     fn test_project(id: &str, name: &str, path: PathBuf, threads: Vec<WorkspaceThread>) -> Project {
@@ -8498,6 +8770,48 @@ mod tests {
         );
 
         WINDOW_SPACES.lock().remove(&owner_id);
+    }
+
+    /// Deleting a host has to find every Space that host brought in, and a
+    /// host is connectable under more than one name: the label for a ThinkTerm
+    /// Connect domain, `ssh:user@host` for a direct one. Matching only one of
+    /// them leaves the other's Spaces stranded — visible, unconnectable, and
+    /// refusing every rename or delete because those go through a server this
+    /// device can no longer name.
+    #[test]
+    fn a_hosts_spaces_are_found_under_every_name_it_connects_under() {
+        let mut store = remote_test_store("DO SYD");
+        store.spaces.push(Space {
+            id: "space-direct".to_string(),
+            name: "direct".to_string(),
+            active_project_id: None,
+            note_vault: None,
+            is_default: false,
+            client_domain: Some("ssh:x@203.0.113.9".to_string()),
+        });
+        store.spaces.push(Space {
+            id: "space-elsewhere".to_string(),
+            name: "another server".to_string(),
+            active_project_id: None,
+            note_vault: None,
+            is_default: false,
+            client_domain: Some("DO AMS".to_string()),
+        });
+
+        let names = vec!["ssh:x@203.0.113.9".to_string(), "DO SYD".to_string()];
+        assert_eq!(
+            store.space_ids_for_domains(&names),
+            vec!["space-remote".to_string(), "space-direct".to_string()]
+        );
+
+        // Another server's Spaces, and the purely local one, stay put.
+        assert!(!store
+            .space_ids_for_domains(&names)
+            .contains(&"space-elsewhere".to_string()));
+
+        let mut domains = store.remote_space_domains();
+        domains.sort();
+        assert_eq!(domains, vec!["DO AMS", "DO SYD", "ssh:x@203.0.113.9"]);
     }
 
     /// Ending the sessions of one Space must not reach into its siblings on

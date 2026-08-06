@@ -1,4 +1,5 @@
 use crate::customglyph::{BlockKey, Poly};
+use crate::glyphcache::CachedGlyph;
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::renderstate::{RenderContext, RenderState};
 use crate::termwindow::render::corners::{
@@ -16,6 +17,7 @@ use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
 use config::{configuration, Dimension, GeometryOrigin};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1318,6 +1320,31 @@ pub fn show() {
     }
 }
 
+/// One string, shaped and glyph-resolved once for one font.
+///
+/// `width` is the same sum the painter walks, so a measurement and the paint
+/// that follows it can never disagree about how wide a label is.
+struct ShapedText {
+    glyphs: Vec<Rc<CachedGlyph>>,
+    width: f32,
+}
+
+/// Identifies a shaped run. The font id covers family, size, weight and DPI,
+/// so a settings change that rebuilds the fonts cannot be served stale entries
+/// even before the cache is cleared.
+#[derive(PartialEq, Eq, Hash)]
+struct ShapedTextKey {
+    font_id: usize,
+    text: String,
+}
+
+/// Distinct strings held before the cache is dropped and rebuilt.
+///
+/// The window's own labels are a fixed set in the low hundreds; the headroom
+/// above that is for text the user types into a field, which produces a new
+/// string per keystroke and is the only unbounded source here.
+const SHAPED_TEXT_CACHE_LIMIT: usize = 2048;
+
 struct SettingsWindow {
     instance_id: u64,
     cleaned_up: bool,
@@ -1339,6 +1366,21 @@ struct SettingsWindow {
     ui_context: UiContext<SettingsAction>,
     compatibility_import: CompatibilityImportState,
     status: String,
+    /// Shaped runs for this window's proportional text.
+    ///
+    /// This window paints entirely from immediate-mode code: every label is
+    /// measured and then drawn from scratch on each frame, and measuring an
+    /// over-long one used to shape it once more per step of a binary search.
+    /// Shaping is by far the most expensive part of that and the one part that
+    /// does not change between frames.
+    ///
+    /// Latin text hid the cost. Text the UI font does not cover does not:
+    /// `blocking_shape` hands those characters to the fallback resolver and
+    /// blocks the UI thread until it answers, so scrolling in Chinese or
+    /// Japanese dropped frames. Blocking is also why the result is safe to
+    /// keep — it returns only once the fallback is in place, so a cached run
+    /// is final rather than a first guess to be revised.
+    shape_cache: RefCell<HashMap<ShapedTextKey, Rc<ShapedText>>>,
 }
 
 impl SettingsWindow {
@@ -1437,6 +1479,7 @@ impl SettingsWindow {
             ui_context: UiContext::default(),
             compatibility_import: CompatibilityImportState::default(),
             status: Self::initial_status(),
+            shape_cache: RefCell::new(HashMap::new()),
         }));
 
         let event_settings = Rc::clone(&settings);
@@ -1587,6 +1630,7 @@ impl SettingsWindow {
                     if let Some(render_state) = self.render_state.as_mut() {
                         render_state.recreate_texture_atlas(&self.fonts, &self.metrics, None)?;
                     }
+                    self.invalidate_shaped_text();
                 }
                 if let Some(webgpu) = self.webgpu.as_ref() {
                     webgpu.resize(dimensions);
@@ -2601,6 +2645,7 @@ impl SettingsWindow {
             SIDEBAR_BRAND_FONT_WEIGHT,
         )?;
         self.metrics = RenderMetrics::with_font_metrics(&self.ui_font.metrics());
+        self.invalidate_shaped_text();
         Ok(())
     }
 
@@ -3425,12 +3470,15 @@ impl SettingsWindow {
                     {
                         let size = size.max(current_size);
                         crate::perf::log_counter("settings_atlas_reallocate", size);
-                        if let Err(err) = self
+                        let recreated = self
                             .render_state
                             .as_mut()
                             .unwrap()
-                            .recreate_texture_atlas(&self.fonts, &self.metrics, Some(size))
-                        {
+                            .recreate_texture_atlas(&self.fonts, &self.metrics, Some(size));
+                        // Every cached glyph now points into the old atlas,
+                        // whether or not the new one was allocated.
+                        self.invalidate_shaped_text();
+                        if let Err(err) = recreated {
                             log::error!("settings window texture atlas resize failed: {err:#}");
                             break;
                         }
@@ -7692,18 +7740,16 @@ impl SettingsWindow {
             return Ok(());
         }
 
-        let infos = font.blocking_shape(&display_text, None, Direction::LeftToRight, None, None)?;
-        let render_state = self.render_state.as_ref().unwrap();
-        let mut glyph_cache = render_state.glyph_cache.borrow_mut();
-        let style = font.style();
+        let Some(shaped) = self.shaped_text(font, &display_text) else {
+            return Ok(());
+        };
         let mut pos_x = x;
         let baseline = self.metrics.cell_size.height as f32 + self.metrics.descender.get() as f32;
         let left_offset = self.dimensions.pixel_width as f32 / 2.0;
         let top_offset = self.dimensions.pixel_height as f32 / 2.0;
         let right_edge = x + max_width;
 
-        for info in infos {
-            let glyph = glyph_cache.cached_glyph(&info, style, false, font, &self.metrics, 1)?;
+        for glyph in &shaped.glyphs {
             if let Some(texture) = glyph.texture.as_ref() {
                 let glyph_x = (pos_x + (glyph.x_offset + glyph.bearing_x).get() as f32).round();
                 let glyph_y =
@@ -7736,25 +7782,67 @@ impl SettingsWindow {
         Ok(())
     }
 
-    fn measure_text_width(&self, font: &Rc<LoadedFont>, text: &str) -> f32 {
+    /// Shape and glyph-resolve `text`, reusing the previous frame's work.
+    fn shaped_text(&self, font: &Rc<LoadedFont>, text: &str) -> Option<Rc<ShapedText>> {
         if text.is_empty() {
-            return 0.0;
+            return None;
         }
-        let Ok(infos) = font.blocking_shape(text, None, Direction::LeftToRight, None, None) else {
-            return 0.0;
+        let key = ShapedTextKey {
+            font_id: font.id(),
+            text: text.to_string(),
         };
-        let render_state = self.render_state.as_ref().unwrap();
+        if let Some(shaped) = self.shape_cache.borrow().get(&key) {
+            return Some(Rc::clone(shaped));
+        }
+
+        let infos = font
+            .blocking_shape(text, None, Direction::LeftToRight, None, None)
+            .ok()?;
+        let render_state = self.render_state.as_ref()?;
         let mut glyph_cache = render_state.glyph_cache.borrow_mut();
         let style = font.style();
-        infos
+        let glyphs: Vec<Rc<CachedGlyph>> = infos
             .into_iter()
             .filter_map(|info| {
                 glyph_cache
                     .cached_glyph(&info, style, false, font, &self.metrics, 1)
                     .ok()
-                    .map(|glyph| glyph.x_advance.get() as f32)
             })
-            .sum()
+            .collect();
+        drop(glyph_cache);
+
+        let shaped = Rc::new(ShapedText {
+            width: glyphs
+                .iter()
+                .map(|glyph| glyph.x_advance.get() as f32)
+                .sum(),
+            glyphs,
+        });
+
+        let mut cache = self.shape_cache.borrow_mut();
+        // Dropping the whole map rather than one entry: there is no recency
+        // order to evict by, and the labels it is full of are about to be
+        // re-shaped on the very next frame anyway.
+        if cache.len() >= SHAPED_TEXT_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, Rc::clone(&shaped));
+        Some(shaped)
+    }
+
+    /// Drop shaped runs that a new font, DPI or glyph atlas has invalidated.
+    ///
+    /// The atlas cases matter as much as the font ones: a cached run holds
+    /// glyphs by texture coordinate, and those describe the atlas that was
+    /// current when they were rasterized.
+    fn invalidate_shaped_text(&self) {
+        self.shape_cache.borrow_mut().clear();
+    }
+
+    fn measure_text_width(&self, font: &Rc<LoadedFont>, text: &str) -> f32 {
+        self.shaped_text(font, text)
+            .map(|shaped| shaped.width)
+            .unwrap_or(0.0)
     }
 
     fn text_with_ellipsis(&self, font: &Rc<LoadedFont>, text: &str, max_width: f32) -> String {
@@ -7772,31 +7860,31 @@ impl SettingsWindow {
             return String::new();
         }
 
-        let mut boundaries = text
-            .char_indices()
-            .map(|(idx, _)| idx)
-            .chain(std::iter::once(text.len()))
-            .collect::<Vec<_>>();
-        boundaries.dedup();
-
-        let mut low = 0;
-        let mut high = boundaries.len().saturating_sub(1);
-        let mut best = 0;
-        while low <= high {
-            let mid = (low + high) / 2;
-            let candidate = &text[..boundaries[mid]];
-            let width = self.measure_text_width(font, candidate) + ellipsis_width;
-            if width <= max_width {
-                best = mid;
-                low = mid + 1;
-            } else if mid == 0 {
+        // Walk the run already shaped above rather than binary-searching by
+        // re-measuring prefixes. The old search shaped log2(len) extra strings
+        // per label per frame and left every one of those prefixes behind,
+        // which would now be junk filling the cache as well as time spent.
+        let Some(shaped) = self.shaped_text(font, text) else {
+            return String::new();
+        };
+        let budget = max_width - ellipsis_width;
+        let mut width = 0.0;
+        let mut chars = text.char_indices();
+        let mut end = 0;
+        // One glyph per character is the common case and the assumption the
+        // painter already makes; zip stops at whichever runs out first, so a
+        // string that shapes to fewer glyphs truncates early rather than
+        // indexing past the end.
+        for (glyph, (idx, _)) in shaped.glyphs.iter().zip(&mut chars) {
+            let advance = glyph.x_advance.get() as f32;
+            if width + advance > budget {
                 break;
-            } else {
-                high = mid - 1;
             }
+            width += advance;
+            end = idx + text[idx..].chars().next().map_or(0, char::len_utf8);
         }
 
-        format!("{}{}", text[..boundaries[best]].trim_end(), ellipsis)
+        format!("{}{}", text[..end].trim_end(), ellipsis)
     }
 
     fn native_settings_path() -> PathBuf {

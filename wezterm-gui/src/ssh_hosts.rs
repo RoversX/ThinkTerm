@@ -486,6 +486,67 @@ pub fn register_saved_hosts() {
     }
 }
 
+/// Every name this host can be connected under.
+///
+/// A ThinkTerm Connect host attaches its persistent mux domain under the
+/// user's label; a direct host registers as `ssh:user@host`. A Space mirrored
+/// from that machine is tagged with whichever one it arrived through.
+pub fn domain_names_for_host(spec: &SshHostSpec) -> Vec<String> {
+    let mut names = vec![ssh_domain_name(spec)];
+    let label = spec.label.trim();
+    if !label.is_empty() && !names.iter().any(|name| name == label) {
+        names.push(label.to_string());
+    }
+    names
+}
+
+/// Whether a mux domain of this name can still be reached.
+///
+/// Deliberately the same question `connect_domain_from_ssh_host` answers, so
+/// "reachable" here means exactly "something would happen if you clicked it":
+/// a lua-configured or already-attached domain, or a saved host that would be
+/// connected under this name.
+fn domain_name_is_reachable(domain_name: &str) -> bool {
+    if Mux::get().get_domain_by_name(domain_name).is_some() {
+        return true;
+    }
+    list_all_hosts()
+        .into_iter()
+        .any(|entry| entry.spec.label == domain_name || entry.id == domain_name)
+}
+
+/// Drop this device's copy of every Space whose mux server it can no longer
+/// name.
+///
+/// Deleting a host used to leave its Spaces in the sidebar forever: they
+/// cannot be connected to (nothing resolves the domain), and they cannot be
+/// renamed or removed through the server either, because every mutation is
+/// refused while the domain is unattached. Removal is local — the server keeps
+/// its Spaces and other devices never notice — so re-adding the host brings
+/// them straight back.
+///
+/// Call once at startup, after both lua domains and saved hosts are
+/// registered and before any window exists.
+pub fn forget_spaces_of_deleted_hosts() {
+    let unreachable = crate::workspace_threads::remote_space_domains()
+        .into_iter()
+        .filter(|domain| !domain_name_is_reachable(domain))
+        .collect::<Vec<_>>();
+    if unreachable.is_empty() {
+        return;
+    }
+    for space_id in crate::workspace_threads::space_ids_for_domains(&unreachable) {
+        match crate::workspace_threads::forget_space_locally(&space_id) {
+            Ok(_) => log::info!(
+                "removed Space {space_id} from this device: the host its mux \
+                 server was reached through is no longer saved. The server \
+                 keeps it; re-adding the host brings it back."
+            ),
+            Err(err) => log::warn!("cannot remove unreachable Space {space_id}: {err:?}"),
+        }
+    }
+}
+
 pub fn list_system_hosts() -> Vec<SshHostEntry> {
     let path = config::HOME_DIR.join(".ssh").join("config");
     match parse_system_ssh_config(&path) {
@@ -671,6 +732,36 @@ Host prod *.internal
             .as_deref()
             .unwrap()
             .ends_with("/.ssh/prod"));
+    }
+
+    /// The two names one host can attach a mux domain under. A Space is tagged
+    /// with whichever one it arrived through, so deleting the host has to look
+    /// for both or it leaves half of them stranded.
+    #[test]
+    fn a_host_is_reachable_under_both_its_label_and_its_endpoint() {
+        let mut spec = spec_with_options(HashMap::new());
+        spec.label = "DO SYD".to_string();
+        spec.username = Some("x".to_string());
+
+        assert_eq!(
+            domain_names_for_host(&spec),
+            vec!["ssh:x@example.com".to_string(), "DO SYD".to_string()]
+        );
+
+        // A host left unlabelled must not contribute an empty name, which
+        // would match nothing and read as a bug at the call site.
+        spec.label = "  ".to_string();
+        assert_eq!(
+            domain_names_for_host(&spec),
+            vec!["ssh:x@example.com".to_string()]
+        );
+
+        // And a label that is already the endpoint is not worth saying twice.
+        spec.label = "ssh:x@example.com".to_string();
+        assert_eq!(
+            domain_names_for_host(&spec),
+            vec!["ssh:x@example.com".to_string()]
+        );
     }
 
     fn spec_with_options(ssh_options: HashMap<String, String>) -> SshHostSpec {

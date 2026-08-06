@@ -991,6 +991,10 @@ fn setup_mux(
     // Register ThinkTerm's saved SSH hosts as runtime mux domains so that
     // reconnecting / restoring remote sessions can resolve them by name.
     crate::ssh_hosts::register_saved_hosts();
+    // Both sources of domain names are registered by now, so a Space naming
+    // one that still does not exist belongs to a host that has been deleted.
+    // Local removal only; the server keeps its copy.
+    crate::ssh_hosts::forget_spaces_of_deleted_hosts();
 
     let default_name =
         default_domain_name.unwrap_or(config.default_domain.as_deref().unwrap_or("local"));

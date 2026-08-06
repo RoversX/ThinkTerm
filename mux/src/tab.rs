@@ -3472,6 +3472,13 @@ pub struct PaneEntry {
     /// Whether the pane is showing the alternate screen. Carried here as well
     /// as in render changes so that a renderer knows it the moment it learns
     /// the pane exists, rather than only once something in it next changes.
+    ///
+    /// Defaulted for the same reason as `PaneStackEntry::pane_stack_id`: this
+    /// type is the on-disk format of a Thread's saved layout, and every
+    /// snapshot written before the field existed omits it. Without a default,
+    /// adding it made all of them fail to decode, which meant every Thread
+    /// opened as a single empty pane and then overwrote its own saved layout.
+    #[serde(default)]
     pub alt_screen: bool,
     pub workspace: String,
     pub cursor_pos: StableCursorPosition,

@@ -600,18 +600,51 @@ impl SshHostsView {
                 ContentViewResponse::Redraw
             }
             SshViewAction::Delete(i) => {
-                if let Some(entry) = self.filtered.get(i) {
-                    let id = entry.id.clone();
-                    if entry.source == SshHostSource::ThinkTerm {
-                        if let Err(err) = ssh_hosts::try_remove_host(&id) {
-                            log::error!("failed to delete SSH host {id}: {err:#}");
-                        } else {
-                            let _ = workspace_threads::remove_project(&id);
-                        }
-                        self.refresh();
-                    }
+                let Some(entry) = self
+                    .filtered
+                    .get(i)
+                    .filter(|entry| entry.source == SshHostSource::ThinkTerm)
+                else {
+                    return ContentViewResponse::Redraw;
+                };
+                let id = entry.id.clone();
+                // Read what this host brought in while the record naming it is
+                // still here. A ThinkTerm Connect host mirrors whole Spaces
+                // from its mux server, and those are keyed by domain name, not
+                // by host id — so `remove_project` below, which matches the
+                // host id, never sees them. Left behind they are unreachable:
+                // nothing resolves the domain to connect, and every rename or
+                // delete is refused because it has to go through a server this
+                // device can no longer name.
+                let orphaned_spaces =
+                    workspace_threads::space_ids_for_domains(&ssh_hosts::domain_names_for_host(
+                        &entry.spec,
+                    ));
+
+                if let Err(err) = ssh_hosts::try_remove_host(&id) {
+                    log::error!("failed to delete SSH host {id}: {err:#}");
+                    self.refresh();
+                    return ContentViewResponse::Redraw;
                 }
-                ContentViewResponse::Redraw
+                let _ = workspace_threads::remove_project(&id);
+                self.refresh();
+
+                if orphaned_spaces.is_empty() {
+                    return ContentViewResponse::Redraw;
+                }
+                // Through the window, because one of them may be the Space
+                // this very window is showing; that path moves it off first.
+                // Local removal: the server keeps its Spaces, so re-adding the
+                // host brings them back.
+                ContentViewResponse::Run(Box::new(move |term_window| {
+                    for space_id in orphaned_spaces {
+                        term_window.start_delete_space(
+                            &space_id,
+                            workspace_threads::SpaceRemoval::Local,
+                            false,
+                        );
+                    }
+                }))
             }
             SshViewAction::FocusField(n) => {
                 let count = self

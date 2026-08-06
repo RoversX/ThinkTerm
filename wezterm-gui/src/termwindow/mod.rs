@@ -3624,7 +3624,7 @@ impl TermWindow {
         self.start_delete_space(space_id, removal, false);
     }
 
-    fn start_delete_space(
+    pub(crate) fn start_delete_space(
         &mut self,
         space_id: &str,
         removal: crate::workspace_threads::SpaceRemoval,
