@@ -25,7 +25,7 @@ use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
@@ -102,10 +102,45 @@ pub enum MuxNotification {
     /// every connection re-sends it. Raised only on the server side — a GUI
     /// mux never owns a tree of its own.
     ThinkTermTreeChanged,
+    /// The authoritative server tree or live mux topology changed; thin
+    /// frontends should refresh their read-only session snapshot.
+    ThinkTermSessionChanged,
+    /// The renderer allowed to drive one tab's shared PTY geometry changed,
+    /// or that owner published a new canonical viewport.
+    FrontendLeaseChanged(FrontendViewportState),
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
 static PALETTE_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
+static CLIENT_REGISTRATION_ID: AtomicUsize = AtomicUsize::new(1);
+static SERVER_ID_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
+fn new_runtime_server_id() -> String {
+    let epoch_nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let host = hostname::get()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "localhost".to_string());
+    format!(
+        "{host}:{}:{epoch_nanos}:{}",
+        std::process::id(),
+        SERVER_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Identifies one live transport registration for a `ClientId`. A reconnect
+/// intentionally reuses `ClientId`, so disconnect cleanup and queued viewport
+/// work also carry this generation and cannot tear down the replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClientRegistrationId(usize);
+
+impl ClientRegistrationId {
+    fn new() -> Self {
+        Self(CLIENT_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// A single mux-server transport connection. `ClientId` identifies the GUI
 /// process and can be reused when that process reconnects, so it is not
@@ -117,6 +152,80 @@ pub struct PaletteSessionId(usize);
 pub struct PaletteSelectionChange {
     pub pane_id: PaneId,
     pub palette: Option<ColorPalette>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontendPaneViewport {
+    pub pane_id: PaneId,
+    pub size: wezterm_term::TerminalSize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrontendViewport {
+    CellGrid {
+        size: wezterm_term::TerminalSize,
+    },
+    Native {
+        size: wezterm_term::TerminalSize,
+        panes: Vec<FrontendPaneViewport>,
+    },
+}
+
+impl FrontendViewport {
+    pub fn size(&self) -> wezterm_term::TerminalSize {
+        match self {
+            Self::CellGrid { size } | Self::Native { size, .. } => *size,
+        }
+    }
+}
+
+/// What the renderer holding a tab's viewport is currently looking at.
+///
+/// Size alone makes two attached devices the same shape; it does not make them
+/// the same view. Without this a phone and a desktop on one tab sit at
+/// different points in the same scrollback, which reads as two sessions that
+/// happen to share a name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrontendView {
+    /// Lines above the bottom of each pane's scrollback. A pane that is absent
+    /// is following its output.
+    pub scroll: Vec<(PaneId, u32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendViewportState {
+    pub tab_id: TabId,
+    pub owner: Option<ClientId>,
+    pub canonical_size: wezterm_term::TerminalSize,
+    /// What the owner is looking at, when the owner is a renderer that says.
+    /// `None` means nobody has offered one — followers keep their own view
+    /// rather than being pulled somewhere arbitrary.
+    pub view: Option<FrontendView>,
+    pub generation: u64,
+}
+
+#[derive(Default)]
+struct TabFrontendLease {
+    owner: Option<ClientId>,
+    viewports: HashMap<ClientId, FrontendViewport>,
+    /// Written by the owner alone, and dropped the moment the lease moves, so
+    /// it can never describe a renderer that is no longer driving.
+    view: Option<FrontendView>,
+    generation: u64,
+}
+
+struct FrontendLeaseState {
+    tabs: HashMap<TabId, TabFrontendLease>,
+    next_generation: u64,
+}
+
+impl Default for FrontendLeaseState {
+    fn default() -> Self {
+        Self {
+            tabs: HashMap::new(),
+            next_generation: 1,
+        }
+    }
 }
 
 /// Server-side palette advice is scoped to the client that supplied it.
@@ -219,6 +328,7 @@ impl PaletteAdvisoryState {
 }
 
 pub struct Mux {
+    runtime_server_id: String,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
     windows: RwLock<HashMap<WindowId, Window>>,
@@ -228,6 +338,8 @@ pub struct Mux {
     subscribers: RwLock<HashMap<usize, Box<dyn Fn(MuxNotification) -> bool + Send + Sync>>>,
     banner: RwLock<Option<String>>,
     clients: RwLock<HashMap<ClientId, ClientInfo>>,
+    client_registrations: RwLock<HashMap<ClientId, ClientRegistrationId>>,
+    frontend_lease: Mutex<FrontendLeaseState>,
     palette_advisories: Mutex<PaletteAdvisoryState>,
     identity: RwLock<Option<Arc<ClientId>>>,
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
@@ -560,6 +672,7 @@ impl Mux {
         };
 
         Self {
+            runtime_server_id: new_runtime_server_id(),
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
@@ -569,12 +682,21 @@ impl Mux {
             subscribers: RwLock::new(HashMap::new()),
             banner: RwLock::new(None),
             clients: RwLock::new(HashMap::new()),
+            client_registrations: RwLock::new(HashMap::new()),
+            frontend_lease: Mutex::new(FrontendLeaseState::default()),
             palette_advisories: Mutex::new(PaletteAdvisoryState::default()),
             identity: RwLock::new(None),
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
             agent,
         }
+    }
+
+    /// Identity of this running mux process. This is intentionally ephemeral:
+    /// today a mux restart cannot preserve any pane whose environment refers
+    /// to the old value.
+    pub fn runtime_server_id(&self) -> &str {
+        &self.runtime_server_id
     }
 
     fn get_default_workspace(&self) -> String {
@@ -616,9 +738,334 @@ impl Mux {
         }
     }
 
+    /// Transport-scoped input accounting. Returns false for work from a
+    /// connection that has already been superseded by a reconnect.
+    pub fn registered_client_had_input(
+        &self,
+        client_id: &ClientId,
+        registration: ClientRegistrationId,
+    ) -> bool {
+        let registrations = self.client_registrations.read();
+        if registrations.get(client_id) != Some(&registration) {
+            return false;
+        }
+        self.client_had_input(client_id);
+        true
+    }
+
+    fn validate_frontend_viewport(
+        &self,
+        tab_id: TabId,
+        viewport: &FrontendViewport,
+    ) -> anyhow::Result<()> {
+        let tab = self
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+        if viewport.size().rows == 0 || viewport.size().cols == 0 {
+            anyhow::bail!("viewport for tab {tab_id} has zero rows or columns");
+        }
+        if let FrontendViewport::Native { panes, .. } = viewport {
+            for pane in panes {
+                if !tab.contains_pane(pane.pane_id) {
+                    anyhow::bail!(
+                        "pane {} is not contained by viewport tab {tab_id}",
+                        pane.pane_id
+                    );
+                }
+                if pane.size.rows == 0 || pane.size.cols == 0 {
+                    anyhow::bail!("viewport for pane {} is empty", pane.pane_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn viewport_state(&self, tab_id: TabId) -> Option<FrontendViewportState> {
+        let tab = self.get_tab(tab_id)?;
+        let lease = self.frontend_lease.lock();
+        let state = lease.tabs.get(&tab_id)?;
+        Some(FrontendViewportState {
+            tab_id,
+            owner: state.owner.clone(),
+            canonical_size: tab.get_size(),
+            view: state.view.clone(),
+            generation: state.generation,
+        })
+    }
+
+    /// Record what the owner of a tab's viewport is looking at.
+    ///
+    /// Only the owner may write it, for the same reason only the owner sets the
+    /// size: a renderer that is not being used does not get to move everyone
+    /// else. Returns whether anything changed, so a caller can avoid publishing
+    /// a scroll that already matches.
+    pub fn set_client_view(&self, client_id: &ClientId, tab_id: TabId, view: FrontendView) -> bool {
+        let changed = {
+            let mut lease = self.frontend_lease.lock();
+            let Some(state) = lease.tabs.get_mut(&tab_id) else {
+                return false;
+            };
+            if state.owner.as_ref() != Some(client_id) {
+                return false;
+            }
+            if state.view.as_ref() == Some(&view) {
+                false
+            } else {
+                state.view = Some(view);
+                true
+            }
+        };
+        if changed {
+            self.publish_frontend_viewport_state(tab_id);
+        }
+        changed
+    }
+
+    /// Record one renderer's desired viewport for one tab. A passive resize
+    /// never steals ownership. The first renderer establishes an owner; an
+    /// existing owner applies its changed viewport immediately.
+    pub fn set_client_viewport(
+        &self,
+        client_id: &ClientId,
+        tab_id: TabId,
+        viewport: FrontendViewport,
+    ) -> anyhow::Result<FrontendViewportState> {
+        self.validate_frontend_viewport(tab_id, &viewport)?;
+        let (should_apply, should_publish) = {
+            let mut lease = self.frontend_lease.lock();
+            let state = lease.tabs.entry(tab_id).or_default();
+            let viewport_changed = state.viewports.get(client_id) != Some(&viewport);
+            if viewport_changed {
+                state.viewports.insert(client_id.clone(), viewport.clone());
+            }
+            let owner_changed = state.owner.is_none();
+            if owner_changed {
+                state.owner = Some(client_id.clone());
+            }
+            let should_apply =
+                state.owner.as_ref() == Some(client_id) && (owner_changed || viewport_changed);
+            (should_apply, should_apply)
+        };
+        if should_apply {
+            self.apply_frontend_viewport(tab_id, &viewport)?;
+        }
+        if should_publish {
+            self.publish_frontend_viewport_state(tab_id);
+        }
+        self.viewport_state(tab_id)
+            .ok_or_else(|| anyhow!("viewport state for tab {tab_id} disappeared"))
+    }
+
+    /// Transport-scoped viewport update. Old handlers can still have work in
+    /// the mux queue after a reconnect; reject it instead of applying stale
+    /// geometry to the replacement connection.
+    pub fn set_registered_client_viewport(
+        &self,
+        client_id: &ClientId,
+        registration: ClientRegistrationId,
+        tab_id: TabId,
+        viewport: FrontendViewport,
+    ) -> anyhow::Result<Option<FrontendViewportState>> {
+        let registrations = self.client_registrations.read();
+        if registrations.get(client_id) != Some(&registration) {
+            return Ok(None);
+        }
+        drop(registrations);
+        self.set_client_viewport(client_id, tab_id, viewport)
+            .map(Some)
+    }
+
+    pub fn client_owns_frontend_lease(&self, client_id: &ClientId, tab_id: TabId) -> bool {
+        self.frontend_lease
+            .lock()
+            .tabs
+            .get(&tab_id)
+            .and_then(|state| state.owner.as_ref())
+            == Some(client_id)
+    }
+
+    pub fn current_identity_owns_frontend_lease(&self, tab_id: TabId) -> bool {
+        match self.active_identity() {
+            Some(identity) => self.client_owns_frontend_lease(&identity, tab_id),
+            None => self
+                .frontend_lease
+                .lock()
+                .tabs
+                .get(&tab_id)
+                .and_then(|state| state.owner.as_ref())
+                .is_none(),
+        }
+    }
+
+    /// Claim the viewport for a real user interaction. Clients without a
+    /// viewport (for example `thinkterm cli send-text`) update idle accounting
+    /// but cannot become geometry owners.
+    pub fn registered_client_had_tab_input(
+        &self,
+        client_id: &ClientId,
+        registration: ClientRegistrationId,
+        tab_id: TabId,
+    ) -> bool {
+        let registrations = self.client_registrations.read();
+        if registrations.get(client_id) != Some(&registration) {
+            return false;
+        }
+        drop(registrations);
+        self.client_had_input(client_id);
+
+        if let Err(err) = self.claim_frontend_viewport(client_id, tab_id) {
+            log::error!("failed to apply claimed viewport for tab {tab_id}: {err:#}");
+        }
+        true
+    }
+
+    /// Explicit renderer claim used by UI-only interactions such as pane
+    /// resize.  The transport must still be current and must already have
+    /// advertised a viewport; geometry is taken only from that server-held
+    /// advertisement.
+    pub fn claim_registered_client_viewport(
+        &self,
+        client_id: &ClientId,
+        registration: ClientRegistrationId,
+        tab_id: TabId,
+    ) -> anyhow::Result<Option<FrontendViewportState>> {
+        let registrations = self.client_registrations.read();
+        if registrations.get(client_id) != Some(&registration) {
+            return Ok(None);
+        }
+        drop(registrations);
+        self.client_had_input(client_id);
+        self.claim_frontend_viewport(client_id, tab_id)?
+            .ok_or_else(|| anyhow!("client has not advertised a viewport for tab {tab_id}"))
+            .map(Some)
+    }
+
+    fn claim_frontend_viewport(
+        &self,
+        client_id: &ClientId,
+        tab_id: TabId,
+    ) -> anyhow::Result<Option<FrontendViewportState>> {
+        let (viewport, already_owned) = {
+            let lease = self.frontend_lease.lock();
+            let Some(state) = lease.tabs.get(&tab_id) else {
+                return Ok(None);
+            };
+            let Some(viewport) = state.viewports.get(client_id).cloned() else {
+                return Ok(None);
+            };
+            (viewport, state.owner.as_ref() == Some(client_id))
+        };
+        if already_owned {
+            return Ok(self.viewport_state(tab_id));
+        }
+
+        self.apply_frontend_viewport(tab_id, &viewport)?;
+        {
+            let mut lease = self.frontend_lease.lock();
+            let Some(state) = lease.tabs.get_mut(&tab_id) else {
+                return Ok(None);
+            };
+            if !state.viewports.contains_key(client_id) {
+                return Ok(None);
+            }
+            state.owner = Some(client_id.clone());
+            // The view belonged to whoever was driving. Carrying it across a
+            // handover would leave the new owner's followers pinned to a
+            // scrollback position nobody chose; the new owner publishes its own
+            // on its next frame.
+            state.view = None;
+        }
+        self.publish_frontend_viewport_state(tab_id);
+        Ok(self.viewport_state(tab_id))
+    }
+
+    /// `None` means the transport generation is stale. `Some(false)` means a
+    /// live non-owner submitted a legacy pane resize and it must be a no-op.
+    pub fn registered_client_may_resize_tab(
+        &self,
+        client_id: &ClientId,
+        registration: ClientRegistrationId,
+        tab_id: TabId,
+    ) -> Option<bool> {
+        if self.client_registrations.read().get(client_id) != Some(&registration) {
+            return None;
+        }
+        let lease = self.frontend_lease.lock();
+        Some(match lease.tabs.get(&tab_id) {
+            None => true,
+            Some(state) => state.owner.as_ref() == Some(client_id),
+        })
+    }
+
+    fn publish_frontend_viewport_state(&self, tab_id: TabId) {
+        let (generation, owner, view) = {
+            let mut lease = self.frontend_lease.lock();
+            let generation = lease.next_generation;
+            lease.next_generation = lease.next_generation.saturating_add(1);
+            let Some(state) = lease.tabs.get_mut(&tab_id) else {
+                return;
+            };
+            state.generation = generation;
+            (generation, state.owner.clone(), state.view.clone())
+        };
+        let Some(tab) = self.get_tab(tab_id) else {
+            return;
+        };
+        self.notify(MuxNotification::FrontendLeaseChanged(
+            FrontendViewportState {
+                tab_id,
+                owner,
+                canonical_size: tab.get_size(),
+                view,
+                generation,
+            },
+        ));
+    }
+
+    fn apply_frontend_viewport(
+        &self,
+        tab_id: TabId,
+        viewport: &FrontendViewport,
+    ) -> anyhow::Result<()> {
+        let tab = self
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+        let size = viewport.size();
+        tab.resize(size);
+
+        if let FrontendViewport::Native { panes, .. } = viewport {
+            for pane_viewport in panes {
+                let pane = self
+                    .get_pane(pane_viewport.pane_id)
+                    .ok_or_else(|| anyhow!("no such pane {}", pane_viewport.pane_id))?;
+                if !tab.contains_pane(pane_viewport.pane_id) {
+                    anyhow::bail!("pane {} is not in tab {tab_id}", pane_viewport.pane_id);
+                }
+                pane.resize(pane_viewport.size)?;
+            }
+            if !panes.is_empty() {
+                tab.rebuild_splits_sizes_from_contained_panes();
+            }
+            return Ok(());
+        }
+
+        for positioned in tab.iter_panes() {
+            let target = pane_size_for_cell_grid(size, positioned.width, positioned.height);
+            positioned.pane.resize(target)?;
+        }
+        Ok(())
+    }
+
     pub fn record_input_for_current_identity(&self) {
-        if let Some(ident) = self.identity.read().as_ref() {
-            self.client_had_input(ident);
+        let Some(ident) = self.active_identity() else {
+            return;
+        };
+        self.client_had_input(&ident);
+        let Some((_domain, _window, tab_id, _pane)) = self.resolve_focused_pane(&ident) else {
+            return;
+        };
+        if let Err(err) = self.claim_frontend_viewport(&ident, tab_id) {
+            log::error!("failed to claim local frontend viewport for tab {tab_id}: {err:#}");
         }
     }
 
@@ -690,10 +1137,20 @@ impl Mux {
         Ok(())
     }
 
-    pub fn register_client(&self, client_id: Arc<ClientId>) {
-        self.clients
-            .write()
-            .insert((*client_id).clone(), ClientInfo::new(client_id));
+    pub fn register_client(&self, client_id: Arc<ClientId>) -> ClientRegistrationId {
+        let registration = ClientRegistrationId::new();
+        let key = (*client_id).clone();
+        {
+            // Registration generation and client metadata are one logical
+            // replacement. Keep the generation lock until both are visible so
+            // a stale Drop cannot remove the newly reconnected client between
+            // the two writes.
+            let mut registrations = self.client_registrations.write();
+            let mut clients = self.clients.write();
+            clients.insert(key.clone(), ClientInfo::new(client_id));
+            registrations.insert(key.clone(), registration);
+        }
+        registration
     }
 
     pub fn iter_clients(&self) -> Vec<ClientInfo> {
@@ -813,8 +1270,48 @@ impl Mux {
 
     /// Remove a client from the ordinary mux client list.
     /// Palette ownership is connection-scoped and is cleaned independently.
-    pub fn unregister_client(&self, client_id: &ClientId) {
-        self.clients.write().remove(client_id);
+    pub fn unregister_client(&self, client_id: &ClientId, registration: ClientRegistrationId) {
+        {
+            let mut registrations = self.client_registrations.write();
+            if registrations.get(client_id) != Some(&registration) {
+                return;
+            }
+            self.clients.write().remove(client_id);
+            registrations.remove(client_id);
+        }
+        let clients = self.clients.read();
+        let affected = {
+            let mut lease = self.frontend_lease.lock();
+            let mut affected = Vec::new();
+            for (tab_id, state) in &mut lease.tabs {
+                state.viewports.remove(client_id);
+                if state.owner.as_ref() != Some(client_id) {
+                    continue;
+                }
+                let replacement = clients
+                    .values()
+                    .filter(|info| state.viewports.contains_key(info.client_id.as_ref()))
+                    .max_by_key(|info| info.last_input)
+                    .map(|info| (*info.client_id).clone());
+                state.owner = replacement.clone();
+                state.view = None;
+                let viewport = replacement
+                    .as_ref()
+                    .and_then(|replacement| state.viewports.get(replacement).cloned());
+                affected.push((*tab_id, viewport));
+            }
+            affected
+        };
+        drop(clients);
+
+        for (tab_id, viewport) in affected {
+            if let Some(viewport) = viewport {
+                if let Err(err) = self.apply_frontend_viewport(tab_id, &viewport) {
+                    log::error!("failed to apply fallback viewport for tab {tab_id}: {err:#}");
+                }
+            }
+            self.publish_frontend_viewport_state(tab_id);
+        }
     }
 
     /// Register one transport connection for palette advice. The returned
@@ -1006,6 +1503,7 @@ impl Mux {
         log::debug!("remove_tab_internal tab {}", tab_id);
 
         let tab = self.tabs.write().remove(&tab_id)?;
+        self.frontend_lease.lock().tabs.remove(&tab_id);
 
         if let Some(mut windows) = self.windows.try_write() {
             for w in windows.values_mut() {
@@ -1850,6 +2348,24 @@ impl Mux {
     }
 }
 
+fn pane_size_for_cell_grid(size: TerminalSize, cols: usize, rows: usize) -> TerminalSize {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let cell_width = (size.pixel_width != 0)
+        .then(|| size.pixel_width / size.cols.max(1))
+        .map(|width| width.max(1));
+    let cell_height = (size.pixel_height != 0)
+        .then(|| size.pixel_height / size.rows.max(1))
+        .map(|height| height.max(1));
+    TerminalSize {
+        rows,
+        cols,
+        pixel_width: cell_width.map_or(0, |width| cols.saturating_mul(width)),
+        pixel_height: cell_height.map_or(0, |height| rows.saturating_mul(height)),
+        dpi: size.dpi,
+    }
+}
+
 pub struct IdentityHolder {
     prior: Option<Arc<ClientId>>,
 }
@@ -2007,6 +2523,252 @@ mod tests {
         let updated = palette(1.0);
         assert_eq!(state.advise(session, 4, updated.clone()), Some(updated));
         assert_eq!(state.activate(session, 4), None);
+    }
+
+    #[test]
+    fn stale_client_disconnect_cannot_remove_reconnected_frontend_lease() {
+        let mux = Mux::new(None);
+        let client = Arc::new(client_id(21));
+        let old_registration = mux.register_client(Arc::clone(&client));
+        let new_registration = mux.register_client(Arc::clone(&client));
+
+        assert!(!mux.registered_client_had_input(&client, old_registration));
+        assert!(mux.registered_client_had_input(&client, new_registration));
+        mux.unregister_client(&client, old_registration);
+
+        assert_eq!(mux.iter_clients().len(), 1);
+        mux.unregister_client(&client, new_registration);
+        assert!(mux.iter_clients().is_empty());
+    }
+
+    #[test]
+    fn frontend_ownership_is_scoped_per_tab() {
+        let mux = Mux::new(None);
+        let first = Arc::new(client_id(31));
+        let second = Arc::new(client_id(32));
+        let mut lease = mux.frontend_lease.lock();
+        lease.tabs.entry(10).or_default().owner = Some((*first).clone());
+        lease.tabs.entry(11).or_default().owner = Some((*second).clone());
+        drop(lease);
+
+        assert!(mux.client_owns_frontend_lease(&first, 10));
+        assert!(!mux.client_owns_frontend_lease(&first, 11));
+        assert!(mux.client_owns_frontend_lease(&second, 11));
+    }
+
+    #[test]
+    fn non_rendering_cli_input_does_not_steal_a_tab_viewport() {
+        let mux = Mux::new(None);
+        let tui = Arc::new(client_id(62));
+        let cli = Arc::new(client_id(63));
+        mux.register_client(Arc::clone(&tui));
+        let cli_registration = mux.register_client(Arc::clone(&cli));
+        mux.frontend_lease.lock().tabs.entry(30).or_default().owner = Some((*tui).clone());
+
+        assert!(mux.registered_client_had_tab_input(&cli, cli_registration, 30));
+        assert!(mux.client_owns_frontend_lease(&tui, 30));
+    }
+
+    /// A view outliving its author would pin every follower to a scrollback
+    /// position that the renderer now driving never chose.
+    #[test]
+    fn only_the_owner_publishes_a_view_and_a_handover_drops_it() {
+        fn grid() -> FrontendViewport {
+            FrontendViewport::CellGrid {
+                size: TerminalSize::default(),
+            }
+        }
+        let mux = Mux::new(None);
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab);
+        let tab_40 = tab.tab_id();
+        let first = Arc::new(client_id(80));
+        let second = Arc::new(client_id(81));
+        {
+            let mut lease = mux.frontend_lease.lock();
+            let state = lease.tabs.entry(tab_40).or_default();
+            state.owner = Some((*first).clone());
+            state.viewports.insert((*first).clone(), grid());
+            state.viewports.insert((*second).clone(), grid());
+        }
+
+        assert!(mux.set_client_view(
+            &first,
+            tab_40,
+            FrontendView {
+                scroll: vec![(7, 120)]
+            }
+        ));
+        assert!(
+            !mux.set_client_view(
+                &first,
+                tab_40,
+                FrontendView {
+                    scroll: vec![(7, 120)]
+                }
+            ),
+            "saying the same thing twice is not a change worth publishing"
+        );
+        assert!(
+            !mux.set_client_view(
+                &second,
+                tab_40,
+                FrontendView {
+                    scroll: vec![(7, 999)]
+                }
+            ),
+            "a renderer nobody is using does not get to move everyone else"
+        );
+        assert_eq!(
+            mux.frontend_lease.lock().tabs[&tab_40].view,
+            Some(FrontendView {
+                scroll: vec![(7, 120)]
+            })
+        );
+
+        let _ = mux.claim_frontend_viewport(&second, tab_40);
+        assert_eq!(
+            mux.frontend_lease.lock().tabs[&tab_40].view,
+            None,
+            "the new owner publishes its own on its next frame"
+        );
+    }
+
+    #[test]
+    fn different_sized_renderers_converge_on_one_owner_without_oscillation() {
+        fn size(cols: usize, rows: usize) -> TerminalSize {
+            TerminalSize {
+                cols,
+                rows,
+                pixel_width: cols * 8,
+                pixel_height: rows * 16,
+                dpi: 96,
+            }
+        }
+
+        let mux = Mux::new(None);
+        let initial = size(132, 40);
+        let tab = Arc::new(Tab::new(&initial));
+        mux.add_tab_no_panes(&tab);
+        let tab_id = tab.tab_id();
+
+        let large = Arc::new(client_id(70));
+        let small = Arc::new(client_id(71));
+        let large_registration = mux.register_client(Arc::clone(&large));
+        let small_registration = mux.register_client(Arc::clone(&small));
+
+        mux.set_registered_client_viewport(
+            &large,
+            large_registration,
+            tab_id,
+            FrontendViewport::CellGrid { size: initial },
+        )
+        .unwrap()
+        .unwrap();
+        mux.set_registered_client_viewport(
+            &small,
+            small_registration,
+            tab_id,
+            FrontendViewport::CellGrid { size: size(80, 24) },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(tab.get_size(), initial);
+        assert_eq!(
+            mux.registered_client_may_resize_tab(&large, large_registration, tab_id),
+            Some(true)
+        );
+        assert_eq!(
+            mux.registered_client_may_resize_tab(&small, small_registration, tab_id),
+            Some(false)
+        );
+
+        assert!(mux.registered_client_had_tab_input(&small, small_registration, tab_id));
+        assert_eq!(tab.get_size(), size(80, 24));
+        assert!(mux.client_owns_frontend_lease(&small, tab_id));
+        assert_eq!(
+            mux.registered_client_may_resize_tab(&large, large_registration, tab_id),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn explicit_viewport_claim_uses_the_server_stored_advertisement() {
+        let mux = Mux::new(None);
+        let initial = TerminalSize {
+            cols: 120,
+            rows: 36,
+            pixel_width: 960,
+            pixel_height: 576,
+            dpi: 96,
+        };
+        let tab = Arc::new(Tab::new(&initial));
+        mux.add_tab_no_panes(&tab);
+        let tab_id = tab.tab_id();
+        let first = Arc::new(client_id(80));
+        let second = Arc::new(client_id(81));
+        let first_registration = mux.register_client(Arc::clone(&first));
+        let second_registration = mux.register_client(Arc::clone(&second));
+
+        mux.set_registered_client_viewport(
+            &first,
+            first_registration,
+            tab_id,
+            FrontendViewport::CellGrid { size: initial },
+        )
+        .unwrap();
+        let smaller = TerminalSize {
+            cols: 72,
+            rows: 20,
+            pixel_width: 576,
+            pixel_height: 320,
+            dpi: 96,
+        };
+        mux.set_registered_client_viewport(
+            &second,
+            second_registration,
+            tab_id,
+            FrontendViewport::CellGrid { size: smaller },
+        )
+        .unwrap();
+
+        let state = mux
+            .claim_registered_client_viewport(&second, second_registration, tab_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.owner.as_ref(), Some(second.as_ref()));
+        assert_eq!(state.canonical_size, smaller);
+        assert_eq!(tab.get_size(), smaller);
+    }
+
+    #[test]
+    fn unknown_cell_grid_pixels_stay_unknown_for_each_pane() {
+        let target = pane_size_for_cell_grid(
+            TerminalSize {
+                cols: 120,
+                rows: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            60,
+            20,
+        );
+        assert_eq!((target.pixel_width, target.pixel_height), (0, 0));
+
+        let known = pane_size_for_cell_grid(
+            TerminalSize {
+                cols: 120,
+                rows: 40,
+                pixel_width: 960,
+                pixel_height: 640,
+                dpi: 96,
+            },
+            60,
+            20,
+        );
+        assert_eq!((known.pixel_width, known.pixel_height), (480, 320));
     }
 
     #[test]

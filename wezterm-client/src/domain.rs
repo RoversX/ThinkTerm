@@ -25,6 +25,8 @@ pub struct ClientInner {
     remote_to_local_window: Mutex<HashMap<WindowId, WindowId>>,
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
+    /// Authoritative per-remote-tab viewport ownership pushed by the server.
+    remote_viewports: Mutex<HashMap<TabId, codec::ClientViewportState>>,
     /// Remote pane-stack id -> stable local pane-stack id. Remote and local
     /// stack ids live in different id spaces; translating (rather than
     /// adopting) avoids collisions with locally-created stacks while keeping
@@ -274,6 +276,38 @@ impl ClientInner {
         map.get(&remote_tab_id).copied()
     }
 
+    fn update_remote_viewport(&self, state: codec::ClientViewportState) -> bool {
+        let mut states = self.remote_viewports.lock().unwrap();
+        if states
+            .get(&state.tab_id)
+            .is_some_and(|prior| prior.generation > state.generation)
+        {
+            return false;
+        }
+        states.insert(state.tab_id, state);
+        true
+    }
+
+    pub fn remote_viewport_state(
+        &self,
+        remote_tab_id: TabId,
+    ) -> Option<codec::ClientViewportState> {
+        self.remote_viewports
+            .lock()
+            .unwrap()
+            .get(&remote_tab_id)
+            .cloned()
+    }
+
+    pub fn owns_remote_viewport(&self, remote_tab_id: TabId) -> Option<bool> {
+        let state = self.remote_viewport_state(remote_tab_id)?;
+        Some(state.owner.as_ref() == Some(&self.client.client_id))
+    }
+
+    fn clear_remote_viewports(&self) {
+        self.remote_viewports.lock().unwrap().clear();
+    }
+
     pub fn is_local(&self) -> bool {
         self.client.is_local
     }
@@ -349,6 +383,7 @@ impl ClientInner {
             remote_to_local_window: Mutex::new(HashMap::new()),
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
+            remote_viewports: Mutex::new(HashMap::new()),
             remote_to_local_stack: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
             focus_advised_at: Mutex::new(None),
@@ -537,17 +572,30 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
 /// trees are dropped.
 pub type ThinkTermTreeSink = fn(domain_name: &str, tree: codec::ThinkTermTree);
 
+/// Receives the authoritative tree-plus-live-topology view exported by one
+/// mux server. Thin frontends keep it separate per client-domain name.
+pub type ThinkTermSessionSink =
+    fn(domain_name: &str, connection_generation: u64, state: codec::ThinkTermSessionState);
+
 /// Announces a fresh connection to a server, before anything is asked of it.
 ///
 /// Trees do not carry which connection they belong to, and the client has to
 /// know: everything it believes about a server's tree describes the previous
 /// connection, and a server that comes back having lost or rolled back its own
 /// copy must be able to say so rather than be dismissed as out of date.
-pub type ThinkTermConnectSink = fn(domain_name: &str);
+pub type ThinkTermConnectSink = fn(domain_name: &str, connection_generation: u64);
+
+/// Wakes a blocking thin frontend as soon as the transport reader receives
+/// anything.  The actual PDU is still processed on the main-thread executor;
+/// this hook only breaks the frontend out of `poll_input(None)` so that the
+/// executor can run without a fixed polling timer.
+pub type ThinkTermFrontendWakeSink = fn();
 
 lazy_static::lazy_static! {
     static ref THINKTERM_TREE_SINK: Mutex<Option<ThinkTermTreeSink>> = Mutex::new(None);
     static ref THINKTERM_CONNECT_SINK: Mutex<Option<ThinkTermConnectSink>> = Mutex::new(None);
+    static ref THINKTERM_SESSION_SINK: Mutex<Option<ThinkTermSessionSink>> = Mutex::new(None);
+    static ref THINKTERM_FRONTEND_WAKE_SINK: Mutex<Option<ThinkTermFrontendWakeSink>> = Mutex::new(None);
 }
 
 pub fn set_thinkterm_tree_sink(sink: ThinkTermTreeSink) {
@@ -558,6 +606,21 @@ pub fn set_thinkterm_connect_sink(sink: ThinkTermConnectSink) {
     THINKTERM_CONNECT_SINK.lock().unwrap().replace(sink);
 }
 
+pub fn set_thinkterm_session_sink(sink: ThinkTermSessionSink) {
+    THINKTERM_SESSION_SINK.lock().unwrap().replace(sink);
+}
+
+pub fn set_thinkterm_frontend_wake_sink(sink: ThinkTermFrontendWakeSink) {
+    THINKTERM_FRONTEND_WAKE_SINK.lock().unwrap().replace(sink);
+}
+
+pub(crate) fn wake_thinkterm_frontend() {
+    let sink = *THINKTERM_FRONTEND_WAKE_SINK.lock().unwrap();
+    if let Some(sink) = sink {
+        sink();
+    }
+}
+
 pub(crate) fn deliver_thinkterm_tree(domain_name: &str, tree: codec::ThinkTermTree) {
     let sink = *THINKTERM_TREE_SINK.lock().unwrap();
     if let Some(sink) = sink {
@@ -565,10 +628,21 @@ pub(crate) fn deliver_thinkterm_tree(domain_name: &str, tree: codec::ThinkTermTr
     }
 }
 
-pub(crate) fn deliver_thinkterm_connected(domain_name: &str) {
+pub(crate) fn deliver_thinkterm_connected(domain_name: &str, connection_generation: u64) {
     let sink = *THINKTERM_CONNECT_SINK.lock().unwrap();
     if let Some(sink) = sink {
-        sink(domain_name);
+        sink(domain_name, connection_generation);
+    }
+}
+
+pub(crate) fn deliver_thinkterm_session(
+    domain_name: &str,
+    connection_generation: u64,
+    state: codec::ThinkTermSessionState,
+) {
+    let sink = *THINKTERM_SESSION_SINK.lock().unwrap();
+    if let Some(sink) = sink {
+        sink(domain_name, connection_generation, state);
     }
 }
 
@@ -662,6 +736,57 @@ impl ClientDomain {
         inner.local_to_remote_tab(local_tab_id)
     }
 
+    pub fn remote_to_local_tab_id(&self, remote_tab_id: TabId) -> Option<TabId> {
+        let inner = self.inner()?;
+        inner.remote_to_local_tab_id(remote_tab_id)
+    }
+
+    pub fn remote_server_id(&self) -> Option<String> {
+        self.inner()?.client.remote_server_id()
+    }
+
+    pub fn connection_generation(&self) -> Option<u64> {
+        Some(self.inner()?.client.connection_generation())
+    }
+
+    pub fn remote_viewport_state(&self, local_tab_id: TabId) -> Option<codec::ClientViewportState> {
+        let inner = self.inner()?;
+        let remote_tab_id = inner.local_to_remote_tab(local_tab_id)?;
+        inner.remote_viewport_state(remote_tab_id)
+    }
+
+    pub fn owns_remote_viewport(&self, local_tab_id: TabId) -> Option<bool> {
+        let inner = self.inner()?;
+        let remote_tab_id = inner.local_to_remote_tab(local_tab_id)?;
+        inner.owns_remote_viewport(remote_tab_id)
+    }
+
+    pub fn process_remote_viewport_state(&self, state: codec::ClientViewportState) {
+        let Some(inner) = self.inner() else {
+            return;
+        };
+        if !inner.update_remote_viewport(state.clone()) {
+            return;
+        }
+        if let Some(local_tab_id) = inner.remote_to_local_tab_id(state.tab_id) {
+            Mux::get().notify(MuxNotification::FrontendLeaseChanged(
+                mux::FrontendViewportState {
+                    tab_id: local_tab_id,
+                    owner: state.owner,
+                    canonical_size: state.canonical_size,
+                    view: state.view.map(|view| mux::FrontendView {
+                        scroll: view
+                            .scroll
+                            .into_iter()
+                            .map(|entry| (entry.pane_id, entry.lines_from_bottom))
+                            .collect(),
+                    }),
+                    generation: state.generation,
+                },
+            ));
+        }
+    }
+
     pub fn get_client_inner_for_domain(domain_id: DomainId) -> anyhow::Result<Arc<ClientInner>> {
         let mux = Mux::get();
         let domain = mux
@@ -688,6 +813,7 @@ impl ClientDomain {
     /// to do everything a first attach does and not only re-pull the panes.
     pub async fn reattach(domain_id: DomainId, ui: ConnectionUI) -> anyhow::Result<()> {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
+        inner.clear_remote_viewports();
         let domain = Mux::get().get_domain(domain_id);
 
         // A reconnect begins a new connection generation. The revision
@@ -699,7 +825,7 @@ impl ClientDomain {
         // the announcement is at worst dropped as stale and put right by that
         // same fetch.
         if let Some(domain) = &domain {
-            deliver_thinkterm_connected(domain.domain_name());
+            deliver_thinkterm_connected(domain.domain_name(), inner.client.connection_generation());
         }
 
         let panes = inner.client.list_panes().await?;
@@ -777,6 +903,144 @@ impl ClientDomain {
         let response = inner.client.get_thinkterm_tree().await?;
         deliver_thinkterm_tree(self.config.name(), response.tree);
         Ok(())
+    }
+
+    /// Pull the mux server's authoritative tree-plus-live-topology view.
+    pub async fn fetch_thinkterm_session_state(
+        &self,
+    ) -> anyhow::Result<codec::ThinkTermSessionState> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let state = inner.client.get_thinkterm_session_state().await?;
+        deliver_thinkterm_session(
+            self.config.name(),
+            inner.client.connection_generation(),
+            state.clone(),
+        );
+        Ok(state)
+    }
+
+    /// Ask the authoritative mux server to choose (or create) a landing
+    /// Thread and ensure that its workspace contains a live terminal.  The
+    /// following resync installs the remote-to-local tab and pane mappings so
+    /// callers can immediately render the returned Thread.
+    pub async fn ensure_thinkterm_thread(
+        &self,
+        preferred_thread_id: Option<codec::TtThreadId>,
+        size: wezterm_term::TerminalSize,
+    ) -> anyhow::Result<codec::EnsureThinkTermThreadResponse> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let response = inner
+            .client
+            .ensure_thinkterm_thread(codec::EnsureThinkTermThread {
+                preferred_thread_id,
+                size,
+            })
+            .await?;
+        self.resync().await?;
+        Ok(response)
+    }
+
+    /// Report the viewport for a locally mirrored tab to the frontend mux.
+    pub async fn set_client_viewport(
+        &self,
+        local_tab_id: TabId,
+        viewport: codec::ClientViewport,
+    ) -> anyhow::Result<codec::ClientViewportState> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let remote_tab_id = inner
+            .local_to_remote_tab(local_tab_id)
+            .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
+        let viewport = match viewport {
+            codec::ClientViewport::CellGrid { size } => codec::ClientViewport::CellGrid { size },
+            codec::ClientViewport::Native { size, panes } => {
+                let mut remote_panes = Vec::with_capacity(panes.len());
+                for pane in panes {
+                    let local = Mux::get()
+                        .get_pane(pane.pane_id)
+                        .ok_or_else(|| anyhow!("no such local pane {}", pane.pane_id))?;
+                    let remote = local
+                        .downcast_ref::<ClientPane>()
+                        .filter(|client| client.domain_id() == self.local_domain_id)
+                        .ok_or_else(|| {
+                            anyhow!("pane {} is not owned by this domain", pane.pane_id)
+                        })?
+                        .remote_pane_id();
+                    remote_panes.push(codec::ClientPaneViewport {
+                        pane_id: remote,
+                        size: pane.size,
+                    });
+                }
+                codec::ClientViewport::Native {
+                    size,
+                    panes: remote_panes,
+                }
+            }
+        };
+        let state = inner
+            .client
+            .set_client_viewport(codec::SetClientViewport {
+                tab_id: remote_tab_id,
+                viewport,
+            })
+            .await?;
+        self.process_remote_viewport_state(state.clone());
+        Ok(state)
+    }
+
+    /// Offer what this renderer is looking at, for other renderers on the same
+    /// tab to follow. The server ignores it unless this client owns the tab's
+    /// viewport, so it is safe to send whenever the view changes.
+    /// `view` must already carry pane ids in the server's namespace — see
+    /// `ClientPane::remote_pane_id`, which the caller has in hand while it is
+    /// reading each pane's scroll position anyway.
+    pub async fn set_client_view(
+        &self,
+        local_tab_id: TabId,
+        view: codec::ClientView,
+    ) -> anyhow::Result<()> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let remote_tab_id = inner
+            .local_to_remote_tab(local_tab_id)
+            .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
+        inner
+            .client
+            .set_client_view(codec::SetClientView {
+                tab_id: remote_tab_id,
+                view,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Claim a previously advertised viewport after a real frontend-only
+    /// interaction (for example, dragging a split).  The server chooses the
+    /// owner and geometry and returns the authoritative result.
+    pub async fn claim_client_viewport(
+        &self,
+        local_tab_id: TabId,
+    ) -> anyhow::Result<codec::ClientViewportState> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let remote_tab_id = inner
+            .local_to_remote_tab(local_tab_id)
+            .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
+        let state = inner
+            .client
+            .claim_client_viewport(codec::ClaimClientViewport {
+                tab_id: remote_tab_id,
+            })
+            .await?;
+        self.process_remote_viewport_state(state.clone());
+        Ok(state)
     }
 
     pub fn process_remote_window_title_change(&self, remote_window_id: WindowId, title: String) {
@@ -933,6 +1197,7 @@ impl ClientDomain {
                                     entry.pane_id,
                                     entry.size,
                                     &entry.title,
+                                    entry.alt_screen,
                                 ));
                                 mux.add_pane(&pane).expect("failed to add pane to mux");
                                 pane
@@ -945,6 +1210,7 @@ impl ClientDomain {
                             entry.pane_id,
                             entry.size,
                             &entry.title,
+                            entry.alt_screen,
                         ));
                         log::debug!(
                             "domain: {} attaching to remote pane {:?} -> local pane_id {}",
@@ -1206,6 +1472,7 @@ impl Domain for ClientDomain {
             result.pane_id,
             result.size,
             "thinkterm",
+            false,
         ));
         mux.add_pane(&pane)?;
 
@@ -1394,6 +1661,7 @@ impl Domain for ClientDomain {
             result.pane_id,
             size,
             "thinkterm",
+            false,
         ));
         let tab = Arc::new(Tab::new(&size));
         tab.assign_pane(&pane);
@@ -1571,6 +1839,7 @@ impl Domain for ClientDomain {
             result.pane_id,
             result.size,
             "thinkterm",
+            false,
         ));
 
         let pane_index = match tab
@@ -1712,7 +1981,10 @@ impl ClientDomain {
         // Announce the new connection before asking it anything, so that the
         // answer — and any push that overtakes it — is measured against this
         // connection rather than the last one.
-        deliver_thinkterm_connected(self.config.name());
+        let connection_generation = self
+            .connection_generation()
+            .ok_or_else(|| anyhow!("domain detached immediately after attach"))?;
+        deliver_thinkterm_connected(self.config.name(), connection_generation);
 
         // The sidebar structure lives on the server. Fetching it is not worth
         // failing an otherwise-good attach over: without it the Space simply

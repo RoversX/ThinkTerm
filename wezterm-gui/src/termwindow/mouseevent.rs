@@ -77,7 +77,7 @@ fn space_destructive_menu_items(
     let mut children = vec![
         ContextMenuItem::item_with_icon(
             crate::i18n::tr("menu-space-disconnect-short"),
-            ContextMenuIcon::Unplug,
+            ContextMenuIcon::Disconnect,
             KeyAssignment::DeleteSpace(space.id.clone()),
         ),
         ContextMenuItem::item_with_icon(
@@ -1220,6 +1220,18 @@ impl super::TermWindow {
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
         let pane = self.get_active_pane_or_overlay();
+
+        // Whoever is touching a window is the one looking at it, and the server
+        // hands the frontend viewport over on input it can see. A click or a
+        // scroll in a pane that has not asked for mouse reporting never leaves
+        // this process, so without this a window sat down at and used kept
+        // drawing at the size some other device left behind.
+        if matches!(
+            event.kind,
+            WMEK::Press(_) | WMEK::VertWheel(_) | WMEK::HorzWheel(_)
+        ) {
+            self.claim_frontend_viewport_for_interaction();
+        }
 
         self.current_mouse_event.replace(event.clone());
 
@@ -4582,7 +4594,7 @@ impl super::TermWindow {
                     tr_with_name("menu-delete-space", &space.name)
                 },
                 if space.is_remote {
-                    ContextMenuIcon::Unplug
+                    ContextMenuIcon::Disconnect
                 } else {
                     ContextMenuIcon::Delete
                 },

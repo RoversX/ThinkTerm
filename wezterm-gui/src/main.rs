@@ -1032,7 +1032,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     wezterm_client::domain::set_thinkterm_tree_sink(|domain_name, tree| {
         crate::workspace_threads::ingest_remote_tree(domain_name, tree);
     });
-    wezterm_client::domain::set_thinkterm_connect_sink(|domain_name| {
+    wezterm_client::domain::set_thinkterm_connect_sink(|domain_name, _connection_generation| {
         crate::workspace_threads::note_remote_connected(domain_name);
     });
 
@@ -1063,7 +1063,6 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         default_domain_name.as_deref(),
         opts.workspace.as_deref(),
     )?;
-
     // First, let's see if we can ask an already running wezterm to do this.
     // We must do this before we start the gui frontend as the scheduler
     // requirements are different.

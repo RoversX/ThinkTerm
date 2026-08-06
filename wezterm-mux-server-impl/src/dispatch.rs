@@ -213,6 +213,19 @@ where
                 .await?;
                 stream.flush().await.context("flushing PDU to client")?;
             }
+            Ok(Item::Notif(MuxNotification::ThinkTermSessionChanged)) => {
+                let state = crate::thinkterm_session::snapshot()?;
+                Pdu::ThinkTermSessionState(state)
+                    .encode_async(&mut stream, 0)
+                    .await?;
+                stream.flush().await.context("flushing PDU to client")?;
+            }
+            Ok(Item::Notif(MuxNotification::FrontendLeaseChanged(state))) => {
+                Pdu::ClientViewportState(crate::sessionhandler::codec_viewport_state(state))
+                    .encode_async(&mut stream, 0)
+                    .await?;
+                stream.flush().await.context("flushing PDU to client")?;
+            }
             Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
             Ok(Item::Notif(MuxNotification::Empty)) => {}
             Err(err) => {

@@ -30,13 +30,15 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::channel;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 use wezterm_uds::UnixStream;
+
+static NEXT_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Error, Debug)]
 #[error("Timeout")]
@@ -76,6 +78,11 @@ pub struct Client {
     /// button.
     reconnect_suspended: Arc<AtomicBool>,
     resume_reconnect_tx: std::sync::mpsc::Sender<()>,
+    remote_server_id: Arc<RwLock<Option<String>>>,
+    /// Process-unique identity of the currently attached transport.  A
+    /// reconnect gets a fresh value so queued unilateral messages from the
+    /// superseded reader cannot be mistaken for current server state.
+    connection_generation: Arc<AtomicU64>,
 }
 
 impl Client {
@@ -90,6 +97,14 @@ impl Client {
     /// Wake a parked reconnect loop for another round of retries.
     pub fn resume_reconnect(&self) {
         let _ = self.resume_reconnect_tx.send(());
+    }
+
+    pub fn remote_server_id(&self) -> Option<String> {
+        self.remote_server_id.read().unwrap().clone()
+    }
+
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation.load(Ordering::Acquire)
     }
 }
 
@@ -225,6 +240,7 @@ async fn process_unilateral_inner_async(
 
 fn process_unilateral(
     local_domain_id: Option<DomainId>,
+    connection_generation: u64,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
     let local_domain_id = match local_domain_id {
@@ -347,6 +363,46 @@ fn process_unilateral(
             .detach();
             return Ok(());
         }
+        Pdu::ThinkTermSessionState(_) => {
+            let Pdu::ThinkTermSessionState(state) = decoded.pdu else {
+                unreachable!("matched ThinkTermSessionState above");
+            };
+            promise::spawn::spawn_into_main_thread(async move {
+                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                crate::domain::deliver_thinkterm_session(
+                    domain.domain_name(),
+                    connection_generation,
+                    state,
+                );
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
+            return Ok(());
+        }
+        Pdu::ClientViewportState(_) => {
+            let Pdu::ClientViewportState(state) = decoded.pdu else {
+                unreachable!("matched ClientViewportState above");
+            };
+            promise::spawn::spawn_into_main_thread(async move {
+                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let domain = domain
+                    .downcast_ref::<ClientDomain>()
+                    .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", local_domain_id))?;
+                if domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
+                domain.process_remote_viewport_state(state);
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
+            return Ok(());
+        }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
             promise::spawn::spawn_into_main_thread(async move {
@@ -390,14 +446,21 @@ enum NotReconnectableError {
 fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
+    connection_generation: u64,
     rx: &mut Receiver<ReaderMessage>,
 ) -> anyhow::Result<()> {
-    block_on(client_thread_async(reconnectable, local_domain_id, rx))
+    block_on(client_thread_async(
+        reconnectable,
+        local_domain_id,
+        connection_generation,
+        rx,
+    ))
 }
 
 async fn client_thread_async(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
+    connection_generation: u64,
     rx: &mut Receiver<ReaderMessage>,
 ) -> anyhow::Result<()> {
     let mut next_serial = 1u64;
@@ -476,6 +539,7 @@ async fn client_thread_async(
             Ok(ReaderMessage::Readable) => {
                 match Pdu::decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
+                        crate::domain::wake_thinkterm_frontend();
                         log::debug!(
                             "decoded serial {} {}",
                             decoded.serial,
@@ -484,7 +548,7 @@ async fn client_thread_async(
                         if pending_ping.map_or(false, |(serial, _)| serial == decoded.serial) {
                             pending_ping = None;
                         } else if decoded.serial == 0 {
-                            process_unilateral(local_domain_id, decoded)
+                            process_unilateral(local_domain_id, connection_generation, decoded)
                                 .context("processing unilateral PDU from server")
                                 .map_err(|e| {
                                     log::error!("process_unilateral: {:?}", e);
@@ -1150,6 +1214,9 @@ impl Client {
         let reconnect_suspended = Arc::new(AtomicBool::new(false));
         let suspended_flag = Arc::clone(&reconnect_suspended);
         let (resume_reconnect_tx, resume_reconnect_rx) = channel::<()>();
+        let remote_server_id = Arc::new(RwLock::new(None));
+        let connection_generation = Arc::new(AtomicU64::new(0));
+        let reader_connection_generation = Arc::clone(&connection_generation);
 
         thread::spawn(move || {
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
@@ -1177,7 +1244,14 @@ impl Client {
 
             'client: loop {
                 let session_started = std::time::Instant::now();
-                if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
+                let generation = NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
+                reader_connection_generation.store(generation, Ordering::Release);
+                if let Err(e) = client_thread(
+                    &mut reconnectable,
+                    local_domain_id,
+                    generation,
+                    &mut receiver,
+                ) {
                     if !reconnectable.reconnectable() || local_domain_id.is_none() {
                         log::debug!("client thread ended: {}", e);
                         break;
@@ -1339,6 +1413,7 @@ impl Client {
                                         .ok();
                                 })
                                 .detach();
+                                crate::domain::wake_thinkterm_frontend();
                                 break;
                             }
                             Err(err) => {
@@ -1426,6 +1501,8 @@ impl Client {
             is_reconnecting,
             reconnect_suspended,
             resume_reconnect_tx,
+            remote_server_id,
+            connection_generation,
         }
     }
 
@@ -1456,6 +1533,7 @@ impl Client {
                     is_proxy: false,
                 })
                 .await?;
+                *self.remote_server_id.write().unwrap() = Some(info.server_id.clone());
                 Ok(info)
             }
             Ok(info) => {
@@ -1507,7 +1585,7 @@ impl Client {
         self.local_domain_id
     }
 
-    fn compute_unix_domain(
+    pub fn resolve_default_unix_domain(
         prefer_mux: bool,
         class_name: &str,
     ) -> anyhow::Result<config::UnixDomain> {
@@ -1549,7 +1627,7 @@ impl Client {
         prefer_mux: bool,
         class_name: &str,
     ) -> anyhow::Result<Self> {
-        let unix_dom = Self::compute_unix_domain(prefer_mux, class_name)?;
+        let unix_dom = Self::resolve_default_unix_domain(prefer_mux, class_name)?;
         Self::new_unix_domain(None, &unix_dom, initial, ui, no_auto_start)
     }
 
@@ -1649,6 +1727,23 @@ impl Client {
         MutateThinkTermTree,
         ThinkTermTreeState
     );
+    rpc!(
+        get_thinkterm_session_state,
+        GetThinkTermSessionState = (),
+        ThinkTermSessionState
+    );
+    rpc!(
+        ensure_thinkterm_thread,
+        EnsureThinkTermThread,
+        EnsureThinkTermThreadResponse
+    );
+    rpc!(set_client_viewport, SetClientViewport, ClientViewportState);
+    rpc!(set_client_view, SetClientView, UnitResponse);
+    rpc!(
+        claim_client_viewport,
+        ClaimClientViewport,
+        ClientViewportState
+    );
     rpc!(write_to_pane, WriteToPane, UnitResponse);
     rpc!(send_paste, SendPaste, UnitResponse);
     rpc!(key_down, SendKeyDown, UnitResponse);
@@ -1711,7 +1806,7 @@ mod tests {
     #[test]
     fn remote_mux_command_defaults_to_thinkterm_with_wezterm_fallback() {
         let cmd = Reconnectable::remote_mux_command(&None, "cli --prefer-mux proxy");
-        assert!(cmd.contains("thinkterm cli --prefer-mux proxy"), "{cmd}");
-        assert!(cmd.contains("wezterm cli --prefer-mux proxy"), "{cmd}");
+        assert!(cmd.contains("thinkterm cli --prefer-mux proxy"), "{}", cmd);
+        assert!(cmd.contains("wezterm cli --prefer-mux proxy"), "{}", cmd);
     }
 }

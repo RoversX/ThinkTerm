@@ -1010,7 +1010,7 @@ fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
         ContextMenuIcon::Terminal => Some(SvgIcon::Terminal),
         ContextMenuIcon::Undo => Some(SvgIcon::RotateCcw),
         ContextMenuIcon::Unpin => Some(SvgIcon::PinOff),
-        ContextMenuIcon::Unplug => Some(SvgIcon::Unplug),
+        ContextMenuIcon::Disconnect => Some(SvgIcon::Unlink2),
         ContextMenuIcon::Vault => Some(SvgIcon::FolderTree),
         ContextMenuIcon::Warning => Some(SvgIcon::CircleAlert),
     }

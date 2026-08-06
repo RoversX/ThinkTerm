@@ -292,6 +292,9 @@ pub(crate) struct NativeWorkspaceSettings {
     /// path. Empty means [`DEFAULT_REMOTE_DROP_DESTINATION`]; the literal
     /// `cwd` means the shell's current directory at drop time.
     pub(crate) remote_drop_destination: String,
+    /// Play a short sound when a thread you are not watching finishes, or when
+    /// one starts waiting on you.
+    pub(crate) notification_sounds_enabled: bool,
 }
 
 impl Default for NativeWorkspaceSettings {
@@ -300,6 +303,7 @@ impl Default for NativeWorkspaceSettings {
             remote_sftp_idle_minutes: DEFAULT_REMOTE_SFTP_IDLE_MINUTES,
             remote_download_directory: String::new(),
             remote_drop_destination: String::new(),
+            notification_sounds_enabled: true,
         }
     }
 }
@@ -697,6 +701,10 @@ pub(crate) fn pane_header_font_size() -> f64 {
         .pane_header_font_size
         .unwrap_or(DEFAULT_PANE_HEADER_FONT_SIZE)
         .clamp(10.0, 28.0)
+}
+
+pub(crate) fn notification_sounds_enabled() -> bool {
+    load().workspaces.notification_sounds_enabled
 }
 
 pub(crate) fn bottom_quote_interval_minutes(settings: &ThinkTermNativeSettings) -> u32 {

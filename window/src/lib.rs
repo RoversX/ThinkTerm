@@ -219,6 +219,7 @@ pub enum ContextMenuIcon {
     Copy,
     Cut,
     Delete,
+    Disconnect,
     Edit,
     Expand,
     ExternalLink,
@@ -249,7 +250,6 @@ pub enum ContextMenuIcon {
     Terminal,
     Undo,
     Unpin,
-    Unplug,
     Vault,
     Warning,
     Window,
@@ -282,6 +282,11 @@ impl ContextMenuIcon {
             Self::Copy => "doc.on.doc",
             Self::Cut => "scissors",
             Self::Delete => "trash",
+            // The Finder gesture for "stop using this server, it stays up".
+            // A plug symbol would read better but every spelling of one is too
+            // new to rely on, and the fallback bitmap looks nothing like its
+            // neighbours.
+            Self::Disconnect => "eject",
             Self::Edit => "pencil",
             Self::Expand => "rectangle.expand.vertical",
             Self::ExternalLink => "arrow.up.right.square",
@@ -312,9 +317,6 @@ impl ContextMenuIcon {
             Self::Terminal => "terminal",
             Self::Undo => "arrow.uturn.backward",
             Self::Unpin => "pin.slash",
-            // Only in recent SF Symbols releases; older systems fall through to
-            // the bundled Lucide unplug glyph, which is the same picture.
-            Self::Unplug => "powerplug.portrait.slash",
             Self::Warning => "exclamationmark.circle",
             Self::Window => "macwindow",
         }
@@ -333,6 +335,7 @@ impl ContextMenuIcon {
             Self::Copy => include_bytes!("../../third_party/lucide/icons/copy.svg"),
             Self::Cut => include_bytes!("../../third_party/lucide/icons/scissors.svg"),
             Self::Delete => include_bytes!("../../third_party/lucide/icons/trash-2.svg"),
+            Self::Disconnect => include_bytes!("../../third_party/lucide/icons/unlink-2.svg"),
             Self::Edit => include_bytes!("../../third_party/lucide/icons/pencil.svg"),
             Self::Expand => include_bytes!("../../third_party/lucide/icons/expand.svg"),
             Self::ExternalLink => {
@@ -370,7 +373,6 @@ impl ContextMenuIcon {
             Self::Terminal => include_bytes!("../../third_party/lucide/icons/terminal.svg"),
             Self::Undo => include_bytes!("../../third_party/lucide/icons/undo.svg"),
             Self::Unpin => include_bytes!("../../third_party/lucide/icons/pin-off.svg"),
-            Self::Unplug => include_bytes!("../../third_party/lucide/icons/unplug.svg"),
             Self::Vault => include_bytes!("../../third_party/lucide/icons/folder-tree.svg"),
             Self::Warning => include_bytes!("../../third_party/lucide/icons/circle-alert.svg"),
             Self::Window => include_bytes!("../../third_party/lucide/icons/panels-top-left.svg"),

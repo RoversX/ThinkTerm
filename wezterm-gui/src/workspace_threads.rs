@@ -210,6 +210,17 @@ impl WorkspaceThreadWorkStatus {
     }
 }
 
+impl From<WorkspaceThreadWorkStatus> for codec::ThinkTermSessionWorkStatus {
+    fn from(status: WorkspaceThreadWorkStatus) -> Self {
+        match status {
+            WorkspaceThreadWorkStatus::Idle => Self::Idle,
+            WorkspaceThreadWorkStatus::Running => Self::Running,
+            WorkspaceThreadWorkStatus::NeedsAttention => Self::NeedsAttention,
+            WorkspaceThreadWorkStatus::FinishedUnseen => Self::FinishedUnseen,
+        }
+    }
+}
+
 /// A thread whose work finished without being seen or needs attention,
 /// across every Space; feeds the sidebar notification bell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +237,20 @@ pub struct ThreadWorkNotification {
 struct WorkspaceThreadWorkChange {
     changed: bool,
     should_persist: bool,
+    /// What this transition is worth saying out loud, if anything. Set only on
+    /// the observation that first crosses into the state, so re-scanning a
+    /// thread that has not moved stays quiet without any extra bookkeeping.
+    announce: Option<WorkAnnouncement>,
+}
+
+/// A transition is at most one of these, so a single field makes it impossible
+/// to announce two things about the same moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkAnnouncement {
+    /// Work that was running has stopped.
+    Finished,
+    /// Something is waiting on the user.
+    NeedsInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +376,9 @@ lazy_static::lazy_static! {
 static THREAD_STORE_PERSIST_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static THREAD_STORE_PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
 static NEXT_SPACE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+fn publish_thinkterm_session_changed() {
+    wezterm_mux_server_impl::thinkterm_session::publish_changed();
+}
 
 pub fn workspace_thread_store_path() -> PathBuf {
     crate::native_paths::data_file("workspace_threads.json")
@@ -1397,15 +1425,67 @@ fn schedule_work_status_recheck(workspace: String, delay: Duration) {
     });
 }
 
+/// The bundled prompts. Regenerate them with `assets/sounds/synth.py`; they are
+/// synthesised rather than sourced so nothing here is licensed from anyone.
+static DONE_WAV: &[u8] = include_bytes!("../../assets/sounds/done.wav");
+static NEEDS_INPUT_WAV: &[u8] = include_bytes!("../../assets/sounds/needs-input.wav");
+
+/// Silences every prompt regardless of the setting. Test runners have no
+/// business making noise, and neither does a machine someone is presenting on.
+const DISABLE_SOUND_ENV: &str = "THINKTERM_DISABLE_SOUND";
+
+/// Whether a transition is worth a sound, given what the user is already
+/// looking at.
+///
+/// Watching the thread that just finished means the news arrived by eye
+/// already, and a sound on top of that is just noise. Everything else happened
+/// out of sight, which is the entire point of the feature.
+fn should_announce(changed_workspace: &str, active_workspace: &str) -> bool {
+    changed_workspace != active_workspace
+}
+
+fn announce_work(workspace: &str, announcement: WorkAnnouncement) {
+    if std::env::var_os(DISABLE_SOUND_ENV).is_some() {
+        return;
+    }
+    if !crate::native_settings::notification_sounds_enabled() {
+        return;
+    }
+    if !should_announce(workspace, &Mux::get().active_workspace()) {
+        return;
+    }
+    let wav = match announcement {
+        WorkAnnouncement::Finished => DONE_WAV,
+        WorkAnnouncement::NeedsInput => NEEDS_INPUT_WAV,
+    };
+    // The connection is main-thread only. Every caller of
+    // `refresh_thread_work_for_workspace` is on it today, and staying silent is
+    // the right answer if that ever stops being true.
+    use ::window::ConnectionOps;
+    match ::window::Connection::get() {
+        Some(connection) => connection.play_sound(wav),
+        None => log::debug!("no window connection on this thread; notification stays silent"),
+    }
+}
+
 pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
     let observed = scan_workspace_work_status(workspace);
     let observed = debounce_work_status(workspace, observed);
-    let mut store = THREAD_STORE.lock();
-    let Some(change) = store.observe_thread_work_for_workspace(workspace, observed) else {
-        return false;
+    let change = {
+        let mut store = THREAD_STORE.lock();
+        let Some(change) = store.observe_thread_work_for_workspace(workspace, observed) else {
+            return false;
+        };
+        change
     };
+    if let Some(announcement) = change.announce {
+        announce_work(workspace, announcement);
+    }
     if change.should_persist {
         schedule_workspace_thread_store_persist();
+    }
+    if change.changed {
+        publish_thinkterm_session_changed();
     }
     change.changed
 }
@@ -1428,6 +1508,9 @@ pub fn acknowledge_thread_work_for_workspace(workspace: &str) -> bool {
     if change.should_persist {
         persist_locked(&store);
     }
+    if change.changed && !change.should_persist {
+        publish_thinkterm_session_changed();
+    }
     change.changed
 }
 
@@ -1438,6 +1521,9 @@ pub fn acknowledge_thread_work_for_thread(thread_id: &str) -> bool {
     let change = store.acknowledge_thread_work_for_thread(thread_id);
     if change.should_persist {
         persist_locked(&store);
+    }
+    if change.changed && !change.should_persist {
+        publish_thinkterm_session_changed();
     }
     change.changed
 }
@@ -1485,6 +1571,9 @@ pub fn acknowledge_thread_work_for_workspace_deferred(workspace: &str) -> bool {
     let change = store.acknowledge_thread_work_for_workspace(workspace);
     if change.should_persist {
         schedule_workspace_thread_store_persist();
+    }
+    if change.changed {
+        publish_thinkterm_session_changed();
     }
     change.changed
 }
@@ -4306,6 +4395,7 @@ impl WorkspaceThreadStore {
                     return WorkspaceThreadWorkChange {
                         changed,
                         should_persist,
+                        announce: None,
                     };
                 }
             }
@@ -4313,6 +4403,7 @@ impl WorkspaceThreadStore {
         WorkspaceThreadWorkChange {
             changed: false,
             should_persist: false,
+            announce: None,
         }
     }
 
@@ -4327,6 +4418,7 @@ impl WorkspaceThreadStore {
                     return WorkspaceThreadWorkChange {
                         changed,
                         should_persist,
+                        announce: None,
                     };
                 }
             }
@@ -4334,6 +4426,7 @@ impl WorkspaceThreadStore {
         WorkspaceThreadWorkChange {
             changed: false,
             should_persist: false,
+            announce: None,
         }
     }
 
@@ -4820,6 +4913,7 @@ impl WorkspaceThread {
                 WorkspaceThreadWorkChange {
                     changed,
                     should_persist,
+                    announce: None,
                 }
             }
             WorkspaceThreadWorkStatus::NeedsAttention => {
@@ -4828,14 +4922,22 @@ impl WorkspaceThread {
                 WorkspaceThreadWorkChange {
                     changed,
                     should_persist: false,
+                    // `changed` is already "this is the first time we have seen
+                    // it waiting", which is exactly when it is worth saying.
+                    announce: changed.then_some(WorkAnnouncement::NeedsInput),
                 }
             }
             WorkspaceThreadWorkStatus::Idle | WorkspaceThreadWorkStatus::FinishedUnseen => {
                 let was_running = self.work_is_running;
                 let had_attention = self.work_needs_attention;
                 let mut should_persist = false;
+                let mut finished_now = false;
                 if was_running {
-                    should_persist = !self.work_finished_unseen;
+                    // The same condition that decides whether this is worth
+                    // writing to disk decides whether it is worth announcing:
+                    // both mean "it had not already finished".
+                    finished_now = !self.work_finished_unseen;
+                    should_persist = finished_now;
                     self.work_finished_unseen = true;
                 }
                 self.work_is_running = false;
@@ -4843,6 +4945,7 @@ impl WorkspaceThread {
                 WorkspaceThreadWorkChange {
                     changed: was_running || had_attention,
                     should_persist,
+                    announce: finished_now.then_some(WorkAnnouncement::Finished),
                 }
             }
         }
@@ -4857,6 +4960,7 @@ fn persist_locked(store: &WorkspaceThreadStore) {
     if let Err(err) = save_workspace_thread_store(store) {
         log::warn!("failed to save ThinkTerm thread store: {err:#}");
     }
+    publish_thinkterm_session_changed();
 }
 
 fn schedule_workspace_thread_store_persist() {
@@ -6662,6 +6766,118 @@ mod tests {
             store.projects[0].threads[0].work_status(),
             WorkspaceThreadWorkStatus::FinishedUnseen
         );
+    }
+
+    fn work_store_with_one_thread() -> WorkspaceThreadStore {
+        let mut store = test_store();
+        let session = WorkspaceThread::new(
+            "project-1".to_string(),
+            "main".to_string(),
+            Some("workspace-1".to_string()),
+        );
+        store.projects.push(test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![session],
+        ));
+        store
+    }
+
+    fn observe(
+        store: &mut WorkspaceThreadStore,
+        status: WorkspaceThreadWorkStatus,
+    ) -> Option<WorkAnnouncement> {
+        store
+            .observe_thread_work_for_workspace("workspace-1", status)
+            .unwrap()
+            .announce
+    }
+
+    /// The status is re-scanned on a timer, so the same finished thread is
+    /// observed over and over. Announcing every observation would turn one
+    /// completed job into a stream of dings.
+    #[test]
+    fn finishing_announces_once_per_run_not_once_per_scan() {
+        let mut store = work_store_with_one_thread();
+
+        assert_eq!(
+            observe(&mut store, WorkspaceThreadWorkStatus::Running),
+            None
+        );
+        assert_eq!(
+            observe(&mut store, WorkspaceThreadWorkStatus::Idle),
+            Some(WorkAnnouncement::Finished)
+        );
+        // Still finished, still idle — and now silent.
+        assert_eq!(observe(&mut store, WorkspaceThreadWorkStatus::Idle), None);
+        assert_eq!(observe(&mut store, WorkspaceThreadWorkStatus::Idle), None);
+
+        // A second run of work earns a second announcement.
+        assert_eq!(
+            observe(&mut store, WorkspaceThreadWorkStatus::Running),
+            None
+        );
+        assert_eq!(
+            observe(&mut store, WorkspaceThreadWorkStatus::Idle),
+            Some(WorkAnnouncement::Finished)
+        );
+    }
+
+    /// Going idle without ever having run is a thread that did nothing, not a
+    /// thread that finished something.
+    #[test]
+    fn going_idle_without_running_announces_nothing() {
+        let mut store = work_store_with_one_thread();
+        assert_eq!(observe(&mut store, WorkspaceThreadWorkStatus::Idle), None);
+    }
+
+    #[test]
+    fn needing_input_announces_once_until_it_clears() {
+        let mut store = work_store_with_one_thread();
+
+        assert_eq!(
+            observe(&mut store, WorkspaceThreadWorkStatus::NeedsAttention),
+            Some(WorkAnnouncement::NeedsInput)
+        );
+        assert_eq!(
+            observe(&mut store, WorkspaceThreadWorkStatus::NeedsAttention),
+            None
+        );
+
+        // Work resumes, so the next time it gets stuck it is news again.
+        assert_eq!(
+            observe(&mut store, WorkspaceThreadWorkStatus::Running),
+            None
+        );
+        assert_eq!(
+            observe(&mut store, WorkspaceThreadWorkStatus::NeedsAttention),
+            Some(WorkAnnouncement::NeedsInput)
+        );
+    }
+
+    /// Acknowledging is the user saying they already know; it must not double
+    /// as news.
+    #[test]
+    fn acknowledging_announces_nothing() {
+        let mut store = work_store_with_one_thread();
+        observe(&mut store, WorkspaceThreadWorkStatus::Running);
+        observe(&mut store, WorkspaceThreadWorkStatus::Idle);
+
+        assert_eq!(
+            store
+                .acknowledge_thread_work_for_workspace("workspace-1")
+                .announce,
+            None
+        );
+    }
+
+    /// A sound for the thread already on screen is noise: the news arrived by
+    /// eye before it could arrive by ear.
+    #[test]
+    fn the_workspace_being_watched_stays_silent() {
+        assert!(!should_announce("workspace-1", "workspace-1"));
+        assert!(should_announce("workspace-1", "workspace-2"));
     }
 
     #[test]

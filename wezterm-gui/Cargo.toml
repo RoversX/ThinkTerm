@@ -99,6 +99,7 @@ textwrap.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
 thinkterm-syntax = { path = "../thinkterm-syntax" }
+thinkterm-core.workspace = true
 trash.workspace = true
 umask.workspace = true
 unicode-normalization.workspace = true

@@ -11,7 +11,8 @@ use crate::Appearance;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyRegular, NSScreen};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSArray, NSInteger};
-use objc::runtime::{Object, BOOL, YES};
+use objc::rc::StrongPtr;
+use objc::runtime::{Object, BOOL, NO, YES};
 use objc::*;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -202,6 +203,35 @@ impl ConnectionOps for Connection {
     fn beep(&self) {
         unsafe {
             NSBeep();
+        }
+    }
+
+    fn play_sound(&self, wav: &'static [u8]) {
+        unsafe {
+            // NSData borrows the bytes; NSSound copies what it needs during
+            // initWithData:, so the borrow does not have to outlive this call.
+            let data: id = msg_send![
+                class!(NSData),
+                dataWithBytes: wav.as_ptr()
+                length: wav.len()
+            ];
+            if data.is_null() {
+                log::warn!("could not wrap {} bytes of audio for NSSound", wav.len());
+                return;
+            }
+            let sound: id = msg_send![class!(NSSound), alloc];
+            let sound: id = msg_send![sound, initWithData: data];
+            if sound.is_null() {
+                log::warn!("NSSound rejected the audio data");
+                return;
+            }
+            let sound = StrongPtr::new(sound);
+            // -play returns immediately and NSSound keeps itself alive for the
+            // duration, so dropping our reference here does not cut it short.
+            let started: BOOL = msg_send![*sound, play];
+            if started == NO {
+                log::warn!("NSSound refused to play");
+            }
         }
     }
 

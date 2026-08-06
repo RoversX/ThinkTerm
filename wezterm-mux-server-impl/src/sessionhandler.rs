@@ -1,13 +1,17 @@
 use crate::PKI;
 use anyhow::{anyhow, Context};
 use codec::*;
+use config::keyassignment::SpawnTabDomain;
 use config::TermConfig;
 use mux::client::ClientId;
 use mux::domain::SplitSource;
 use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
-use mux::{Mux, PaletteSessionId};
+use mux::{
+    ClientRegistrationId, FrontendPaneViewport, FrontendViewport, FrontendViewportState, Mux,
+    PaletteSessionId,
+};
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,6 +21,14 @@ use url::Url;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::terminal::Alert;
 use wezterm_term::StableRowIndex;
+
+lazy_static::lazy_static! {
+    /// Serializes the authoritative tree decision with the live-workspace
+    /// check and spawn. Without this, two clients opening the same empty
+    /// Thread concurrently can each create its first tab.
+    static ref THINKTERM_MATERIALIZE: futures::lock::Mutex<()> =
+        futures::lock::Mutex::new(());
+}
 
 #[derive(Clone)]
 pub struct PduSender {
@@ -43,6 +55,7 @@ pub(crate) struct PerPane {
     working_dir: Option<Url>,
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
+    alt_screen: bool,
     /// Outer None means that this connection has never received application
     /// palette state for the pane. Inner None is an explicit reset to the
     /// client's own configured palette.
@@ -68,6 +81,11 @@ impl PerPane {
         let mut changed = false;
         let mouse_grabbed = pane.is_mouse_grabbed();
         if mouse_grabbed != self.mouse_grabbed {
+            changed = true;
+        }
+
+        let alt_screen = pane.is_alt_screen_active();
+        if alt_screen != self.alt_screen {
             changed = true;
         }
 
@@ -137,11 +155,13 @@ impl PerPane {
         self.working_dir = working_dir.clone();
         self.dimensions = dims;
         self.mouse_grabbed = mouse_grabbed;
+        self.alt_screen = alt_screen;
 
         let bonus_lines = bonus_lines.into();
         Some(GetPaneRenderChangesResponse {
             pane_id: pane.pane_id(),
             mouse_grabbed,
+            alt_screen,
             dirty_lines: all_dirty_lines.iter().cloned().collect(),
             dimensions: dims,
             cursor_position,
@@ -229,6 +249,68 @@ fn apply_client_palette(pane: &Arc<dyn Pane>, palette: Option<ColorPalette>) -> 
     Ok(())
 }
 
+pub(crate) fn codec_viewport_state(state: FrontendViewportState) -> ClientViewportState {
+    ClientViewportState {
+        tab_id: state.tab_id,
+        owner: state.owner,
+        canonical_size: state.canonical_size,
+        view: state.view.map(|view| codec::ClientView {
+            scroll: view
+                .scroll
+                .into_iter()
+                .map(|(pane_id, lines_from_bottom)| codec::ClientPaneScroll {
+                    pane_id,
+                    lines_from_bottom,
+                })
+                .collect(),
+        }),
+        generation: state.generation,
+    }
+}
+
+fn mux_view(view: codec::ClientView) -> mux::FrontendView {
+    mux::FrontendView {
+        scroll: view
+            .scroll
+            .into_iter()
+            .map(|entry| (entry.pane_id, entry.lines_from_bottom))
+            .collect(),
+    }
+}
+
+fn mux_viewport(viewport: ClientViewport) -> FrontendViewport {
+    match viewport {
+        ClientViewport::CellGrid { size } => FrontendViewport::CellGrid { size },
+        ClientViewport::Native { size, panes } => FrontendViewport::Native {
+            size,
+            panes: panes
+                .into_iter()
+                .map(|pane| FrontendPaneViewport {
+                    pane_id: pane.pane_id,
+                    size: pane.size,
+                })
+                .collect(),
+        },
+    }
+}
+
+fn claim_viewport_for_pane(
+    mux: &Mux,
+    client_id: Option<&Arc<ClientId>>,
+    registration: Option<ClientRegistrationId>,
+    pane_id: PaneId,
+) -> anyhow::Result<TabId> {
+    let (_domain_id, _window_id, tab_id) = mux
+        .resolve_pane_id(pane_id)
+        .ok_or_else(|| anyhow!("no such pane {pane_id}"))?;
+    if let (Some(client_id), Some(registration)) = (client_id, registration) {
+        if !mux.registered_client_had_tab_input(client_id, registration, tab_id) {
+            anyhow::bail!("client connection was superseded");
+        }
+    }
+    Ok(tab_id)
+}
+
 fn activate_client_palette(
     mux: &Mux,
     pane: &Arc<dyn Pane>,
@@ -271,6 +353,7 @@ pub struct SessionHandler {
     to_write_tx: PduSender,
     per_pane: HashMap<TabId, Arc<Mutex<PerPane>>>,
     client_id: Option<Arc<ClientId>>,
+    client_registration: Option<ClientRegistrationId>,
     palette_session_id: Option<PaletteSessionId>,
     proxy_client_id: Option<ClientId>,
 }
@@ -280,8 +363,10 @@ impl Drop for SessionHandler {
         if let Some(session_id) = self.palette_session_id.take() {
             schedule_palette_session_cleanup(session_id, "client disconnect");
         }
-        if let Some(client_id) = self.client_id.take() {
-            Mux::get().unregister_client(&client_id);
+        if let (Some(client_id), Some(registration)) =
+            (self.client_id.take(), self.client_registration.take())
+        {
+            Mux::get().unregister_client(&client_id, registration);
         }
     }
 }
@@ -292,6 +377,7 @@ impl SessionHandler {
             to_write_tx,
             per_pane: HashMap::new(),
             client_id: None,
+            client_registration: None,
             palette_session_id: None,
             proxy_client_id: None,
         }
@@ -326,9 +412,35 @@ impl SessionHandler {
         let palette_session_id = self.palette_session_id;
         log::trace!("recv {} {}", serial, decoded.pdu.pdu_name());
 
-        if let Some(client_id) = &self.client_id {
+        if let (Some(client_id), Some(registration)) = (&self.client_id, self.client_registration) {
             if decoded.pdu.is_user_input() {
-                Mux::get().client_had_input(client_id);
+                let mux = Mux::get();
+                mux.registered_client_had_input(client_id, registration);
+                // Whoever last acted *on a terminal* decides how big it is —
+                // typing, pasting, a mouse event a program asked for. Not a
+                // resize: a renderer reports its pane sizes on its first frame,
+                // so counting that made opening a second client take the grid
+                // away from the one someone was using. Without
+                // this the first renderer to attach kept the tab at its own
+                // size for as long as it stayed connected, so picking up a
+                // phone while a desktop was still open left the phone reading a
+                // grid shaped for the desktop and unable to do anything about
+                // it. Claiming needs a viewport this client has already
+                // advertised, so a client that has yet to draw changes nothing.
+                if let Some(tab_id) = decoded
+                    .pdu
+                    .is_terminal_interaction()
+                    .then(|| decoded.pdu.pane_id())
+                    .flatten()
+                    .and_then(|pane_id| mux.resolve_pane_id(pane_id))
+                    .map(|(_, _, tab_id)| tab_id)
+                {
+                    if let Err(err) =
+                        mux.claim_registered_client_viewport(client_id, registration, tab_id)
+                    {
+                        log::trace!("input did not move the viewport for tab {tab_id}: {err:#}");
+                    }
+                }
             }
         }
 
@@ -401,12 +513,14 @@ impl SessionHandler {
                     }
                     self.palette_session_id =
                         Some(Mux::get().register_palette_session(client_id.as_ref()));
-                    self.client_id.replace(client_id.clone());
-                    spawn_into_main_thread(async move {
-                        let mux = Mux::get();
-                        mux.register_client(client_id);
-                    })
-                    .detach();
+                    if let (Some(old_client), Some(old_registration)) =
+                        (self.client_id.take(), self.client_registration.take())
+                    {
+                        Mux::get().unregister_client(&old_client, old_registration);
+                    }
+                    let registration = Mux::get().register_client(client_id.clone());
+                    self.client_id.replace(client_id);
+                    self.client_registration.replace(registration);
                 }
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})))
             }
@@ -415,6 +529,7 @@ impl SessionHandler {
                 configured_palette,
             }) => {
                 let client_id = self.client_id.clone();
+                let registration = self.client_registration;
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
@@ -424,6 +539,12 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
+                            claim_viewport_for_pane(
+                                &mux,
+                                client_id.as_ref(),
+                                registration,
+                                pane_id,
+                            )?;
 
                             if let Some(palette) = configured_palette {
                                 if let Some(palette) = mux.advise_client_palette(
@@ -536,13 +657,22 @@ impl SessionHandler {
             Pdu::WriteToPane(WriteToPane { pane_id, data }) => {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
+                            let _identity = mux.with_identity(client_id.clone());
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            claim_viewport_for_pane(
+                                &mux,
+                                client_id.as_ref(),
+                                registration,
+                                pane_id,
+                            )?;
                             activate_client_palette(&mux, &pane, palette_session_id)?;
                             pane.writer().write_all(&data)?;
                             maybe_push_pane_changes(&pane, sender, per_pane)?;
@@ -595,13 +725,22 @@ impl SessionHandler {
             Pdu::SendPaste(SendPaste { pane_id, data }) => {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
+                            let _identity = mux.with_identity(client_id.clone());
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            claim_viewport_for_pane(
+                                &mux,
+                                client_id.as_ref(),
+                                registration,
+                                pane_id,
+                            )?;
                             activate_client_palette(&mux, &pane, palette_session_id)?;
                             pane.send_paste(&data)?;
                             maybe_push_pane_changes(&pane, sender, per_pane)?;
@@ -716,10 +855,18 @@ impl SessionHandler {
             }
 
             Pdu::ActivatePaneDirection(ActivatePaneDirection { pane_id, direction }) => {
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
+                            claim_viewport_for_pane(
+                                &mux,
+                                client_id.as_ref(),
+                                registration,
+                                pane_id,
+                            )?;
                             let (_domain_id, _window_id, tab_id) = mux
                                 .resolve_pane_id(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
@@ -753,17 +900,37 @@ impl SessionHandler {
                 pane_id,
                 size,
             }) => {
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
+                            if let (Some(client_id), Some(registration)) =
+                                (client_id.as_ref(), registration)
+                            {
+                                match mux.registered_client_may_resize_tab(
+                                    client_id,
+                                    registration,
+                                    containing_tab_id,
+                                ) {
+                                    None => anyhow::bail!("client connection was superseded"),
+                                    Some(false) => {
+                                        return Ok(Pdu::UnitResponse(UnitResponse {}));
+                                    }
+                                    Some(true) => {}
+                                }
+                            }
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.resize(size)?;
                             let tab = mux
                                 .get_tab(containing_tab_id)
                                 .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
+                            if !tab.contains_pane(pane_id) {
+                                anyhow::bail!("pane {pane_id} is not in tab {containing_tab_id}");
+                            }
+                            pane.resize(size)?;
                             tab.rebuild_splits_sizes_from_contained_panes();
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
@@ -780,13 +947,22 @@ impl SessionHandler {
             }) => {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
+                            let _identity = mux.with_identity(client_id.clone());
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            claim_viewport_for_pane(
+                                &mux,
+                                client_id.as_ref(),
+                                registration,
+                                pane_id,
+                            )?;
                             activate_client_palette(&mux, &pane, palette_session_id)?;
                             pane.key_down(event.key, event.modifiers)?;
 
@@ -811,13 +987,22 @@ impl SessionHandler {
             Pdu::SendMouseEvent(SendMouseEvent { pane_id, event }) => {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
+                            let _identity = mux.with_identity(client_id.clone());
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            claim_viewport_for_pane(
+                                &mux,
+                                client_id.as_ref(),
+                                registration,
+                                pane_id,
+                            )?;
                             activate_client_palette(&mux, &pane, palette_session_id)?;
                             // The client coalesces rapid wheel motion into a single
                             // event with an accumulated amount, but the terminal
@@ -877,6 +1062,7 @@ impl SessionHandler {
 
             Pdu::ActivatePaneInStack(request) => {
                 let client_id = self.client_id.clone();
+                let registration = self.client_registration;
                 spawn_into_main_thread(async move {
                     let mux = Mux::get();
                     let _identity = mux.with_identity(client_id.clone());
@@ -884,6 +1070,12 @@ impl SessionHandler {
                         let pane = mux
                             .get_pane(request.pane_id)
                             .ok_or_else(|| anyhow!("no such pane {}", request.pane_id))?;
+                        claim_viewport_for_pane(
+                            &mux,
+                            client_id.as_ref(),
+                            registration,
+                            request.pane_id,
+                        )?;
                         let (_domain_id, _window_id, tab_id) = mux
                             .resolve_pane_id(request.pane_id)
                             .ok_or_else(|| anyhow!("no such pane {}", request.pane_id))?;
@@ -917,6 +1109,88 @@ impl SessionHandler {
                 send_response(Ok(Pdu::ThinkTermTreeState(ThinkTermTreeState {
                     tree: crate::thinkterm_tree::snapshot(),
                 })));
+            }
+
+            Pdu::GetThinkTermSessionState(_) => {
+                send_response(crate::thinkterm_session::snapshot().map(Pdu::ThinkTermSessionState));
+            }
+
+            Pdu::EnsureThinkTermThread(request) => {
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    schedule_ensure_thinkterm_thread(request, send_response, client_id);
+                })
+                .detach();
+            }
+
+            Pdu::SetClientViewport(SetClientViewport { tab_id, viewport }) => {
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let client_id = client_id.ok_or_else(|| {
+                                anyhow!("SetClientViewport requires an identified client")
+                            })?;
+                            let registration = registration.ok_or_else(|| {
+                                anyhow!("SetClientViewport requires a live client registration")
+                            })?;
+                            let mux = Mux::get();
+                            let state = mux
+                                .set_registered_client_viewport(
+                                    &client_id,
+                                    registration,
+                                    tab_id,
+                                    mux_viewport(viewport),
+                                )?
+                                .ok_or_else(|| anyhow!("client connection was superseded"))?;
+                            Ok(Pdu::ClientViewportState(codec_viewport_state(state)))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
+            // Offering a view is not a claim: a renderer that is not driving is
+            // ignored, so this can be sent freely without stealing the lease.
+            Pdu::SetClientView(codec::SetClientView { tab_id, view }) => {
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let client_id = client_id.ok_or_else(|| {
+                                anyhow!("SetClientView requires an identified client")
+                            })?;
+                            Mux::get().set_client_view(&client_id, tab_id, mux_view(view));
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+            Pdu::ClaimClientViewport(ClaimClientViewport { tab_id }) => {
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let client_id = client_id.ok_or_else(|| {
+                                anyhow!("ClaimClientViewport requires an identified client")
+                            })?;
+                            let registration = registration.ok_or_else(|| {
+                                anyhow!("ClaimClientViewport requires a live client registration")
+                            })?;
+                            let state = Mux::get()
+                                .claim_registered_client_viewport(&client_id, registration, tab_id)?
+                                .ok_or_else(|| anyhow!("client connection was superseded"))?;
+                            Ok(Pdu::ClientViewportState(codec_viewport_state(state)))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
             }
 
             Pdu::MutateThinkTermTree(MutateThinkTermTree { ops }) => {
@@ -1062,6 +1336,7 @@ impl SessionHandler {
                         send_response(Ok(Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
                             codec_vers: CODEC_VERSION,
                             version_string: config::wezterm_version().to_owned(),
+                            server_id: Mux::get().runtime_server_id().to_string(),
                             executable_path,
                             config_file_path: std::env::var_os("WEZTERM_CONFIG_FILE")
                                 .map(Into::into),
@@ -1205,6 +1480,9 @@ impl SessionHandler {
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
             | Pdu::ThinkTermTreeState { .. }
+            | Pdu::ThinkTermSessionState { .. }
+            | Pdu::EnsureThinkTermThreadResponse { .. }
+            | Pdu::ClientViewportState { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }
@@ -1225,6 +1503,66 @@ fn schedule_domain_spawn_v2<SND>(
 {
     promise::spawn::spawn(async move { send_response(domain_spawn_v2(spawn, client_id).await) })
         .detach();
+}
+
+fn schedule_ensure_thinkterm_thread<SND>(
+    request: EnsureThinkTermThread,
+    send_response: SND,
+    client_id: Option<Arc<ClientId>>,
+) where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+{
+    promise::spawn::spawn(async move {
+        send_response(ensure_thinkterm_thread(request, client_id).await)
+    })
+    .detach();
+}
+
+async fn ensure_thinkterm_thread(
+    request: EnsureThinkTermThread,
+    client_id: Option<Arc<ClientId>>,
+) -> anyhow::Result<Pdu> {
+    let _materialize = THINKTERM_MATERIALIZE.lock().await;
+    let mux = Mux::get();
+    let _identity = mux.with_identity(client_id);
+    let landing = crate::thinkterm_tree::ensure_landing(request.preferred_thread_id.as_deref())?;
+
+    let has_live_pane = mux
+        .iter_windows_in_workspace(&landing.workspace)
+        .into_iter()
+        .filter_map(|window_id| mux.get_window(window_id))
+        .any(|window| window.iter().any(|tab| !tab.iter_all_panes().is_empty()));
+
+    let spawned = if has_live_pane {
+        false
+    } else {
+        let command_dir = match landing.project_path.trim() {
+            "" => None,
+            path if path.starts_with("wezterm-mux://") => None,
+            path => Some(path.to_string()),
+        };
+        mux.spawn_tab_or_window(
+            None,
+            SpawnTabDomain::DefaultDomain,
+            None,
+            command_dir,
+            request.size,
+            None,
+            landing.workspace.clone(),
+            None,
+        )
+        .await?;
+        crate::thinkterm_session::publish_changed();
+        true
+    };
+
+    Ok(Pdu::EnsureThinkTermThreadResponse(
+        EnsureThinkTermThreadResponse {
+            thread_id: landing.thread_id,
+            workspace: landing.workspace,
+            spawned,
+        },
+    ))
 }
 
 fn schedule_split_pane<SND>(split: SplitPane, send_response: SND, client_id: Option<Arc<ClientId>>)

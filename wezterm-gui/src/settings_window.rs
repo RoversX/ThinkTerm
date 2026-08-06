@@ -376,6 +376,7 @@ enum SettingsAction {
     ClearImportFields,
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
+    ToggleNotificationSounds,
     ToggleDeveloperMode,
     ToggleFallbackContextMenu,
     ShowOnboardingNow,
@@ -2923,6 +2924,27 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleNotificationSounds => {
+                self.ui.open_dropdown = None;
+                self.native_settings.workspaces.notification_sounds_enabled =
+                    !self.native_settings.workspaces.notification_sounds_enabled;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = if self.native_settings.workspaces.notification_sounds_enabled
+                        {
+                            crate::i18n::tr("settings-status-notification-sounds-on")
+                        } else {
+                            crate::i18n::tr("settings-status-notification-sounds-off")
+                        };
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-notification-sounds-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::ToggleMainRendererMenu => {
                 self.ui.open_dropdown =
                     if self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer) {
@@ -4241,9 +4263,16 @@ impl SettingsWindow {
         let row_count = 4;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
+        // Notification sounds are not a remote-files concern, so they get their
+        // own card rather than being filed under that heading.
+        let sounds_row_count = 1;
+        let sounds_title_y = card_y + card_height + self.settings_section_card_gap();
+        let sounds_card_y = sounds_title_y + self.settings_section_card_gap().min(54.0);
+        let sounds_first_row_y = sounds_card_y + self.settings_card_top_padding();
+        let sounds_card_height = self.settings_card_height(sounds_row_count);
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
-            self.settings_content_extent(card_y + scroll + card_height),
+            self.settings_content_extent(sounds_card_y + scroll + sounds_card_height),
         );
 
         self.draw_text(
@@ -4313,6 +4342,28 @@ impl SettingsWindow {
             &remote_drop_value,
             crate::native_settings::DEFAULT_REMOTE_DROP_DESTINATION,
             SettingsAction::RemoteDropDestinationInput,
+            true,
+        )?;
+
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            sounds_title_y,
+            &crate::i18n::tr("settings-notifications-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        self.paint_group_card(layers, x, sounds_card_y, max_width, sounds_card_height)?;
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            sounds_first_row_y,
+            row_width,
+            &crate::i18n::tr("settings-notification-sounds"),
+            &crate::i18n::tr("settings-notification-sounds-description"),
+            self.native_settings.workspaces.notification_sounds_enabled,
+            SettingsAction::ToggleNotificationSounds,
             true,
         )
     }

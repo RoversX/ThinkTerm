@@ -430,6 +430,7 @@ fn pane_tree(
             title: pane.get_title(),
             is_active_pane: is_pane(pane, &active),
             is_zoomed_pane: is_pane(pane, &zoomed),
+            alt_screen: pane.is_alt_screen_active(),
             size: TerminalSize {
                 cols: dims.cols,
                 rows: dims.viewport_rows,
@@ -3468,6 +3469,10 @@ pub struct PaneEntry {
     pub working_dir: Option<SerdeUrl>,
     pub is_active_pane: bool,
     pub is_zoomed_pane: bool,
+    /// Whether the pane is showing the alternate screen. Carried here as well
+    /// as in render changes so that a renderer knows it the moment it learns
+    /// the pane exists, rather than only once something in it next changes.
+    pub alt_screen: bool,
     pub workspace: String,
     pub cursor_pos: StableCursorPosition,
     pub physical_top: StableRowIndex,
@@ -4299,6 +4304,7 @@ mod test {
             working_dir: None,
             is_active_pane,
             is_zoomed_pane: false,
+            alt_screen: false,
             workspace: "default".to_string(),
             cursor_pos: StableCursorPosition::default(),
             physical_top: 0,

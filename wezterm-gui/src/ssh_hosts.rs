@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
-use config::{SshDomain, SshMultiplexing};
+use config::SshDomain;
 use filedescriptor::FileDescriptor;
 use mux::domain::Domain;
 use mux::ssh::RemoteSshDomain;
@@ -21,79 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wezterm_ssh::{Session, SessionEvent};
 
-pub type SshHostId = String;
-
-pub const DEFAULT_MOSH_SERVER_COMMAND: &str = "mosh-server new -s -l LANG=en_US.UTF-8";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SshHostSpec {
-    /// Display name shown on the host card / sidebar row.
-    pub label: String,
-    /// Hostname or IP address of the remote server.
-    pub host: String,
-    #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub username: Option<String>,
-    /// Path to an SSH identity (private key) file, if any.
-    #[serde(default)]
-    pub identity_file: Option<String>,
-    /// Optional stored password used to auto-answer the password prompt on
-    /// connect. New values are stored encrypted (`enc:v1:...`); legacy
-    /// plaintext values are still accepted by the connection layer.
-    #[serde(default)]
-    pub password: Option<String>,
-    /// Extra `ssh_config` option overrides (key -> value).
-    #[serde(default)]
-    pub ssh_options: HashMap<String, String>,
-    /// Use WezTerm's multiplexed SSH (persistent, reconnecting) when true.
-    /// That requires `wezterm` installed on the remote; default to direct
-    /// `ssh` (like `thinkterm ssh`) so password auth + the shell work anywhere.
-    #[serde(default)]
-    pub multiplexing: bool,
-    /// Override the default `ssh:<host>` workspace name.
-    #[serde(default)]
-    pub default_workspace: Option<String>,
-    /// When true, run a one-shot `cat /etc/os-release` after connecting to
-    /// detect the distro and pick its icon. User-controlled (opt-in).
-    #[serde(default = "default_true")]
-    pub detect_os: bool,
-    /// `/etc/os-release` `ID` detected after connecting; drives the OS icon.
-    #[serde(default)]
-    pub detected_distro: Option<String>,
-    /// When true, connect with Mosh instead of WezTerm's SSH domain. ThinkTerm
-    /// first tries an integrated SSH bootstrap (`mosh-server new ...`) so the
-    /// stored password can be used; if that fails, it falls back to the
-    /// external `mosh` wrapper for manual interaction.
-    #[serde(default)]
-    pub use_mosh: bool,
-    /// Remote command used by an integrated mosh bootstrap path to start
-    /// `mosh-server`. Kept configurable because different servers may need
-    /// environment overrides or a non-default binary path.
-    #[serde(default = "default_mosh_server_command")]
-    pub mosh_server_command: String,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_mosh_server_command() -> String {
-    DEFAULT_MOSH_SERVER_COMMAND.to_string()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SshHostSource {
-    ThinkTerm,
-    System,
-}
-
-#[derive(Debug, Clone)]
-pub struct SshHostEntry {
-    pub id: SshHostId,
-    pub source: SshHostSource,
-    pub spec: SshHostSpec,
-}
+pub use thinkterm_core::ssh_hosts::{
+    default_mosh_server_command, SshHostEntry, SshHostId, SshHostSource, SshHostSpec,
+    DEFAULT_MOSH_SERVER_COMMAND,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SshHostRecord {
@@ -506,50 +437,12 @@ pub async fn build_integrated_mosh_spawn(spec: &SshHostSpec) -> Result<SpawnComm
 /// snapshotted SSH layout (which records the pane's domain name) can be
 /// re-materialized after [`register_saved_hosts`] re-registers the domain.
 pub fn ssh_domain_name(spec: &SshHostSpec) -> String {
-    format!("ssh:{}", endpoint(spec))
+    thinkterm_core::ssh_hosts::ssh_domain_name(spec)
 }
 
 /// Translate a stored host spec into a `config::SshDomain`.
 pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
-    let mut ssh_option = HashMap::new();
-    for (key, value) in &spec.ssh_options {
-        ssh_option.insert(key.to_lowercase(), value.clone());
-    }
-    if let Some(identity) = &spec.identity_file {
-        if !identity.trim().is_empty() {
-            ssh_option.insert("identityfile".to_string(), identity.clone());
-        }
-    }
-    // Default connect timeout so an unreachable host fails fast instead of
-    // hanging on the OS default TCP timeout. Users can override via ssh_options.
-    ssh_option
-        .entry("connecttimeout".to_string())
-        .or_insert_with(|| "10".to_string());
-
-    let remote_address = match spec.port {
-        Some(port) => format!("{}:{port}", spec.host),
-        None => spec.host.clone(),
-    };
-
-    SshDomain {
-        name: ssh_domain_name(spec),
-        remote_address,
-        username: spec.username.clone(),
-        multiplexing: if spec.multiplexing {
-            SshMultiplexing::WezTerm
-        } else {
-            SshMultiplexing::None
-        },
-        ssh_option,
-        // The derived Default is all-zero here: the documented Some(100ms)
-        // predictive-echo threshold (and the read timeout) only apply when
-        // the domain is deserialized from lua config. Without them, mux
-        // sessions built from the host store never show local-echo
-        // predictions, no matter how laggy the link.
-        local_echo_threshold_ms: config::default_local_echo_threshold_ms(),
-        timeout: config::default_read_timeout(),
-        ..Default::default()
-    }
+    thinkterm_core::ssh_hosts::build_ssh_domain(spec)
 }
 
 fn register_ssh_domain(spec: &SshHostSpec) -> Result<()> {

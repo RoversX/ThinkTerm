@@ -43,6 +43,7 @@ tempfile.workspace = true
 termwiz-funcs.workspace = true
 termwiz.workspace = true
 textwrap.workspace  =true
+thinkterm-tui = { path = "../thinkterm-tui" }
 umask.workspace = true
 url.workspace = true
 wezterm-client.workspace = true

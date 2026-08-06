@@ -36,6 +36,57 @@ pub enum Window {
     Wayland(WaylandWindow),
 }
 
+/// Players that accept a WAV on stdin, and the argument each needs to be told
+/// to read it from there. Nothing is written to disk and no decoder is
+/// involved, which is the whole reason the bundled sounds are WAV rather than
+/// the MP3 that comparable tools ship: MP3 would drag in a chain of optional
+/// decoders and a temporary file on this platform alone.
+const WAV_PLAYERS: &[(&str, &[&str])] = &[("paplay", &[]), ("pw-play", &["-"])];
+
+fn play_wav(wav: &'static [u8]) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let spawned = std::thread::Builder::new()
+        .name("thinkterm-sound".to_string())
+        .spawn(move || {
+            for (player, args) in WAV_PLAYERS {
+                let child = Command::new(player)
+                    .args(*args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                let mut child = match child {
+                    Ok(child) => child,
+                    Err(err) => {
+                        log::debug!("{player} is unavailable: {err}");
+                        continue;
+                    }
+                };
+                if let Some(mut stdin) = child.stdin.take() {
+                    // Dropping stdin at the end of this block is what signals
+                    // end-of-stream. A player that gives up early (no sink, or
+                    // a format it dislikes) closes the pipe first, and that
+                    // broken pipe is not worth reporting.
+                    let _ = stdin.write_all(wav);
+                }
+                // Waiting here rather than detaching is what keeps a zombie
+                // from accumulating for every notification.
+                match child.wait() {
+                    Ok(status) if status.success() => return,
+                    Ok(status) => log::debug!("{player} exited with {status}"),
+                    Err(err) => log::debug!("could not wait for {player}: {err}"),
+                }
+            }
+            log::debug!("no WAV player available; the notification stays silent");
+        });
+
+    if let Err(err) = spawned {
+        log::warn!("could not start the sound thread: {err}");
+    }
+}
+
 impl Connection {
     pub(crate) fn create_new() -> anyhow::Result<Connection> {
         #[cfg(feature = "wayland")]
@@ -166,6 +217,12 @@ impl ConnectionOps for Connection {
             #[cfg(feature = "wayland")]
             Self::Wayland(w) => w.beep(),
         }
+    }
+
+    fn play_sound(&self, wav: &'static [u8]) {
+        // Audio does not go through the display server, so both arms share one
+        // implementation instead of each growing its own copy.
+        play_wav(wav);
     }
 
     fn screens(&self) -> anyhow::Result<Screens> {

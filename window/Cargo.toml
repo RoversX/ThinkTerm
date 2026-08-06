@@ -59,6 +59,7 @@ winapi = { workspace=true, features = [
     "imm",
     "libloaderapi",
     "objbase",
+    "playsoundapi",
     "shellscalingapi",
     "shobjidl",
     "shobjidl_core",

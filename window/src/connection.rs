@@ -79,6 +79,21 @@ pub trait ConnectionOps {
     /// Perform the system beep/notification sound
     fn beep(&self) {}
 
+    /// Play a WAV held in memory, without blocking.
+    ///
+    /// This is fire-and-forget on purpose: a prompt that fails to sound must
+    /// never disturb the work it was reporting on, so every implementation
+    /// swallows its errors into the log. A platform with no way to play one
+    /// stays silent, which is the same outcome the user gets by turning the
+    /// sounds off.
+    ///
+    /// The bytes are `'static` because playback outlives this call on every
+    /// platform: Windows keeps reading the caller's buffer for the duration of
+    /// an async `PlaySound`, and the unix implementation hands it to a thread.
+    /// `include_bytes!` already yields exactly this, so the bound costs the
+    /// callers nothing and removes the lifetime hazard entirely.
+    fn play_sound(&self, _wav: &'static [u8]) {}
+
     /// Returns information about the screens
     fn screens(&self) -> anyhow::Result<Screens> {
         anyhow::bail!("Unable to query screen information");

@@ -85,6 +85,25 @@ fn decide_resize(
     }
 }
 
+fn decide_resize_for_viewport(
+    owns_viewport: Option<bool>,
+    last_requested: Option<TerminalSize>,
+    dimensions: RenderableDimensions,
+    target: TerminalSize,
+) -> ResizeDecision {
+    if owns_viewport != Some(true) {
+        // A passive renderer shows the canonical server grid.  Do not first
+        // reflow locally and then get snapped back by the next server push.
+        // `None` is not permission: it is the attach-time interval before the
+        // server has answered the first viewport advertisement.
+        return ResizeDecision {
+            converge_local_surface: false,
+            send_rpc: false,
+        };
+    }
+    decide_resize(last_requested, dimensions, target)
+}
+
 /// Delivery state of the palette advisory RPC.
 ///
 /// A single worker task owns all sending for a pane, and it always sends the
@@ -177,6 +196,7 @@ pub struct ClientPane {
     mouse: Arc<Mutex<MouseState>>,
     clipboard: Mutex<Option<Arc<dyn Clipboard>>>,
     mouse_grabbed: Mutex<bool>,
+    alt_screen: Mutex<bool>,
     requested_size: Mutex<Option<TerminalSize>>,
     ignore_next_kill: Mutex<bool>,
     user_vars: Mutex<HashMap<String, String>>,
@@ -284,6 +304,7 @@ impl ClientPane {
         remote_pane_id: PaneId,
         size: TerminalSize,
         title: &str,
+        alt_screen: bool,
     ) -> Self {
         let local_pane_id = alloc_pane_id();
         let writer = PaneWriter {
@@ -353,6 +374,7 @@ impl ClientPane {
             palette: Mutex::new(palette),
             clipboard: Mutex::new(None),
             mouse_grabbed: Mutex::new(false),
+            alt_screen: Mutex::new(alt_screen),
             requested_size: Mutex::new(Some(size)),
             ignore_next_kill: Mutex::new(false),
             unseen_output: Mutex::new(false),
@@ -366,6 +388,7 @@ impl ClientPane {
         match pdu {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
                 *self.mouse_grabbed.lock() = delta.mouse_grabbed;
+                *self.alt_screen.lock() = delta.alt_screen;
 
                 let bonus_lines = std::mem::take(&mut delta.bonus_lines);
                 let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
@@ -511,6 +534,14 @@ impl ClientPane {
         self.remote_tab_id.load(Ordering::Relaxed)
     }
 
+    pub fn remote_viewport_state(&self) -> Option<codec::ClientViewportState> {
+        self.client.remote_viewport_state(self.remote_tab_id())
+    }
+
+    pub fn owns_remote_viewport(&self) -> Option<bool> {
+        self.client.owns_remote_viewport(self.remote_tab_id())
+    }
+
     pub(crate) fn set_remote_tab_id(&self, remote_tab_id: TabId) {
         self.remote_tab_id.store(remote_tab_id, Ordering::Relaxed);
     }
@@ -642,6 +673,7 @@ impl Pane for ClientPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
+        Mux::get().record_input_for_current_identity();
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         self.renderable
@@ -712,7 +744,16 @@ impl Pane for ClientPane {
             let render = self.renderable.lock();
             let mut inner = render.inner.borrow_mut();
             let advertised = inner.dimensions;
-            let decision = decide_resize(prior_requested, advertised, size);
+            let decision = decide_resize_for_viewport(
+                self.client.owns_remote_viewport(self.remote_tab_id()),
+                prior_requested,
+                advertised,
+                size,
+            );
+            // A passive renderer displays the server's canonical grid. It
+            // must neither reshape its local RenderableDimensions nor send a
+            // resize that the server will reject; doing the former alone
+            // creates a local/server invalidate loop and visible flicker.
             requested.replace(size);
 
             if decision.converge_local_surface {
@@ -775,6 +816,7 @@ impl Pane for ClientPane {
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        Mux::get().record_input_for_current_identity();
         let input_serial;
         {
             let renderable = self.renderable.lock();
@@ -849,6 +891,7 @@ impl Pane for ClientPane {
     }
 
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
+        Mux::get().record_input_for_current_identity();
         self.mouse.lock().append(event);
         if MouseState::next(Arc::clone(&self.mouse)) {
             self.renderable.lock().inner.borrow_mut().update_last_send();
@@ -881,8 +924,7 @@ impl Pane for ClientPane {
     }
 
     fn is_alt_screen_active(&self) -> bool {
-        // FIXME: retrieve this from the remote
-        false
+        *self.alt_screen.lock()
     }
 
     fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
@@ -1094,6 +1136,40 @@ mod test {
             decide_resize(Some(target), advertised, target),
             ResizeDecision {
                 converge_local_surface: true,
+                send_rpc: false,
+            }
+        );
+    }
+
+    #[test]
+    fn passive_different_sized_client_keeps_the_canonical_surface_stable() {
+        let canonical = size(132, 40, 96);
+        let passive_window = size(80, 24, 96);
+
+        assert_eq!(
+            decide_resize_for_viewport(
+                Some(false),
+                Some(passive_window),
+                dimensions(canonical),
+                passive_window,
+            ),
+            ResizeDecision {
+                converge_local_surface: false,
+                send_rpc: false,
+            },
+            "a non-owner must neither publish nor locally reflow to its different window size"
+        );
+    }
+
+    #[test]
+    fn unknown_viewport_ownership_waits_for_the_server() {
+        let canonical = size(132, 40, 96);
+        let attaching_window = size(80, 24, 96);
+
+        assert_eq!(
+            decide_resize_for_viewport(None, None, dimensions(canonical), attaching_window,),
+            ResizeDecision {
+                converge_local_surface: false,
                 send_rpc: false,
             }
         );

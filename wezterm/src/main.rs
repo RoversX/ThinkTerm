@@ -225,6 +225,9 @@ enum SubCommand {
     #[command(name = "connect", about = "Connect to ThinkTerm multiplexer")]
     Connect(ConnectCommand),
 
+    #[command(name = "tui", about = "Open the ThinkTerm terminal interface")]
+    Tui(TuiCommand),
+
     #[command(name = "ls-fonts", about = "Display information about fonts")]
     LsFonts(LsFontsCommand),
 
@@ -257,6 +260,22 @@ enum SubCommand {
         #[arg(long, value_parser)]
         shell: Shell,
     },
+}
+
+#[derive(Debug, Parser, Clone, Default)]
+struct TuiCommand {
+    /// Mux client domains to show. Defaults to Local when omitted; remote
+    /// domains can also be attached later from the Connections panel.
+    #[arg(value_name = "DOMAIN")]
+    domains: Vec<String>,
+
+    /// Window class used to discover a running ThinkTerm GUI socket.
+    #[arg(long, default_value = wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS)]
+    class: String,
+
+    /// Override the independent ThinkTerm TUI settings file.
+    #[arg(long, value_name = "PATH")]
+    tui_config: Option<std::path::PathBuf>,
 }
 
 use termwiz::escape::osc::{
@@ -870,6 +889,14 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Cli(cli) => cli::run_cli(&opts, cli),
         SubCommand::Record(cmd) => cmd.run(init_config(&opts)?),
         SubCommand::Replay(cmd) => cmd.run(),
+        SubCommand::Tui(cmd) => thinkterm_tui::run(
+            init_config(&opts)?,
+            thinkterm_tui::TuiOptions {
+                domains: cmd.domains,
+                class_name: cmd.class,
+                tui_config_path: cmd.tui_config,
+            },
+        ),
         SubCommand::ShellCompletion { shell } => {
             let rendered = render_shell_completion(shell)?;
             std::io::stdout().write_all(rendered.as_bytes())?;

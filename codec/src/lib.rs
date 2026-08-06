@@ -452,7 +452,14 @@ macro_rules! pdu {
 /// 49: Palette advisories are client-only, application palette state is
 ///     explicit, and SetFocusedPane carries the focusing client's palette.
 /// 50: The server owns the ThinkTerm sidebar tree (Space/Project/Thread).
-pub const CODEC_VERSION: usize = 51;
+/// 51: Server-side tree revisions and authoritative compound mutations.
+/// 52: ThinkTerm session snapshots, runtime server identity and per-tab
+///     frontend viewport ownership.
+/// 53: Explicit, server-authoritative frontend viewport claims.
+/// 54: Server-authoritative ThinkTerm Thread landing and materialization.
+/// 55: Panes report alternate screen state so renderers can route the wheel.
+/// 56: Pane entries carry that state too, so a renderer knows it on arrival.
+pub const CODEC_VERSION: usize = 57;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -520,12 +527,38 @@ pdu! {
     GetThinkTermTree: 67,
     MutateThinkTermTree: 68,
     ThinkTermTreeState: 69,
+    GetThinkTermSessionState: 70,
+    ThinkTermSessionState: 71,
+    SetClientViewport: 72,
+    ClientViewportState: 73,
+    ClaimClientViewport: 74,
+    EnsureThinkTermThread: 75,
+    EnsureThinkTermThreadResponse: 76,
+    SetClientView: 77,
 }
 
 impl Pdu {
     /// Returns true if this type of Pdu represents action taken
     /// directly by a user, rather than background traffic on
     /// a live connection
+    /// A person doing something *to a terminal*, as opposed to a renderer
+    /// managing its own geometry.
+    ///
+    /// This is what decides who owns a tab's viewport, so the line matters: a
+    /// renderer tells the server its pane sizes on the first frame after it
+    /// attaches, and counting that as interaction meant merely opening a second
+    /// client took the grid away from the one being used. Resizing, zooming,
+    /// spawning and stack bookkeeping are all things a frontend does to itself.
+    pub fn is_terminal_interaction(&self) -> bool {
+        matches!(
+            self,
+            Self::WriteToPane(_)
+                | Self::SendKeyDown(_)
+                | Self::SendMouseEvent(_)
+                | Self::SendPaste(_)
+        )
+    }
+
     pub fn is_user_input(&self) -> bool {
         match self {
             Self::WriteToPane(_)
@@ -535,6 +568,9 @@ impl Pdu {
             | Self::Resize(_)
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
+            | Self::ClaimClientViewport(_)
+            | Self::SetClientView(_)
+            | Self::EnsureThinkTermThread(_)
             | Self::SpawnV2(_)
             | Self::SpawnPaneInStack(_)
             | Self::ActivatePaneInStack(_)
@@ -638,6 +674,9 @@ pub struct GetCodecVersion {}
 pub struct GetCodecVersionResponse {
     pub codec_vers: usize,
     pub version_string: String,
+    /// Unique to this running mux process. It deliberately does not survive a
+    /// restart: the current server cannot preserve live PTYs across one.
+    pub server_id: String,
     pub executable_path: PathBuf,
     pub config_file_path: Option<PathBuf>,
 }
@@ -879,6 +918,186 @@ pub struct ThinkTermTreeState {
     pub tree: ThinkTermTree,
 }
 
+/// Read-only view built by one authoritative mux server from its tree and its
+/// live mux topology. It intentionally excludes credentials and
+/// device-private presentation data.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct ThinkTermSessionState {
+    /// Identity of the running server that produced this snapshot.
+    pub server_id: String,
+    /// Revision of the authoritative Space/Project/Thread tree.
+    pub tree_revision: u64,
+    /// Monotonic within one server process. Consumers establish a new
+    /// comparison baseline when `server_id` changes.
+    pub generation: u64,
+    pub spaces: Vec<ThinkTermSessionSpace>,
+    pub projects: Vec<ThinkTermSessionProject>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct ThinkTermSessionSpace {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    /// The mux client domain that owns this Space. `None` means local to the
+    /// running ThinkTerm frontend.
+    pub domain: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct ThinkTermSessionProject {
+    pub id: String,
+    pub space_id: String,
+    pub name: String,
+    /// A path on the machine that owns this project.
+    pub path: String,
+    pub threads: Vec<ThinkTermSessionThread>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct ThinkTermSessionThread {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub planned_workspace_name: Option<String>,
+    pub materialized_workspace_name: Option<String>,
+    pub is_pinned: bool,
+    pub is_unread: bool,
+    pub work_status: ThinkTermSessionWorkStatus,
+    /// Exact live mux objects owned by this thread. IDs are in the producing
+    /// server's namespace; a client domain translates them into local mirror
+    /// IDs before rendering.
+    pub tabs: Vec<ThinkTermSessionTab>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct ThinkTermSessionTab {
+    pub window_id: WindowId,
+    pub tab_id: TabId,
+    pub pane_ids: Vec<PaneId>,
+    pub title: String,
+    pub is_active: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Default)]
+pub enum ThinkTermSessionWorkStatus {
+    #[default]
+    Idle,
+    Running,
+    NeedsAttention,
+    FinishedUnseen,
+}
+
+/// Ask a mux server for its authoritative ThinkTerm session view.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct GetThinkTermSessionState {}
+
+/// Select an existing authoritative Thread, or create the canonical
+/// Default/Home/main landing when the server has no usable Thread, and make
+/// sure that the selected Thread has a live terminal. The server validates the
+/// preferred ID against its current tree and owns both fallback selection and
+/// materialization.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct EnsureThinkTermThread {
+    pub preferred_thread_id: Option<TtThreadId>,
+    pub size: TerminalSize,
+}
+
+/// The Thread and workspace chosen by the server. A client resyncs mux
+/// topology after this response before attempting to render the live tab.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct EnsureThinkTermThreadResponse {
+    pub thread_id: TtThreadId,
+    pub workspace: String,
+    pub spawned: bool,
+}
+
+/// A complete renderer viewport. Native GUI clients include their per-pane
+/// targets so that font scaling and pane chrome are restored when ownership
+/// changes; cell-grid clients have a single canonical grid.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub enum ClientViewport {
+    CellGrid {
+        size: TerminalSize,
+    },
+    Native {
+        size: TerminalSize,
+        panes: Vec<ClientPaneViewport>,
+    },
+}
+
+impl ClientViewport {
+    pub fn size(&self) -> TerminalSize {
+        match self {
+            Self::CellGrid { size } | Self::Native { size, .. } => *size,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ClientPaneViewport {
+    pub pane_id: PaneId,
+    pub size: TerminalSize,
+}
+
+/// Advertise one renderer's desired viewport for a remote tab. Advertising
+/// does not steal ownership; the first renderer seeds an owner, and later
+/// ownership changes only on real user interaction.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct SetClientViewport {
+    pub tab_id: TabId,
+    pub viewport: ClientViewport,
+}
+
+/// Claim a tab's viewport after a real renderer interaction.  The server uses
+/// the viewport previously advertised by this registered client; this request
+/// carries no geometry or owner identity for the server to trust.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ClaimClientViewport {
+    pub tab_id: TabId,
+}
+
+/// Authoritative viewport state returned by `SetClientViewport` and pushed
+/// whenever the owner or canonical server grid changes.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ClientViewportState {
+    pub tab_id: TabId,
+    pub owner: Option<ClientId>,
+    pub canonical_size: TerminalSize,
+    /// What the owner is looking at, when the owner is a renderer that says.
+    /// `None` means nobody offered one, and a follower keeps its own view.
+    pub view: Option<ClientView>,
+    pub generation: u64,
+}
+
+/// What the renderer holding a tab's viewport is currently looking at.
+///
+/// Sharing the size makes two attached devices the same shape; it does not make
+/// them the same view. Without this a phone and a desktop on one tab sit at
+/// different points in the same scrollback, which reads as two sessions that
+/// merely share a name.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct ClientView {
+    /// Lines above the bottom of each pane's scrollback. A pane that is absent
+    /// is following its output.
+    pub scroll: Vec<ClientPaneScroll>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ClientPaneScroll {
+    pub pane_id: PaneId,
+    pub lines_from_bottom: u32,
+}
+
+/// Offer what this renderer is looking at, for the other renderers on the same
+/// tab to follow. Ignored unless this client owns the tab's viewport — a
+/// renderer nobody is using does not get to move everyone else.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct SetClientView {
+    pub tab_id: TabId,
+    pub view: ClientView,
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct TabAddedToWindow {
     pub tab_id: TabId,
@@ -1000,6 +1219,10 @@ pub struct LivenessResponse {
 pub struct GetPaneRenderChangesResponse {
     pub pane_id: PaneId,
     pub mouse_grabbed: bool,
+    /// Whether the pane is showing the alternate screen. A renderer needs this
+    /// to know that a wheel notch has no scrollback to travel through and
+    /// belongs to the full-screen program instead.
+    pub alt_screen: bool,
     pub cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
     pub dirty_lines: Vec<Range<StableRowIndex>>,
@@ -1307,7 +1530,7 @@ mod test {
                 project_id: "p1".into(),
                 space_id: "s1".into(),
                 name: "thinkterm".into(),
-                path: "/home/x/github/ThinkTerm".into(),
+                path: "/srv/projects/example".into(),
             },
             TreeOp::CreateThread {
                 thread_id: "t1".into(),
@@ -1357,6 +1580,120 @@ mod test {
             DecodedPdu {
                 serial: 0x12,
                 pdu: Pdu::MutateThinkTermTree(MutateThinkTermTree { ops }),
+            }
+        );
+    }
+
+    #[test]
+    fn thinkterm_session_viewport_and_landing_protocol_round_trip_at_version_56() {
+        assert_eq!(CODEC_VERSION, 57);
+        let size = TerminalSize {
+            rows: 40,
+            cols: 132,
+            pixel_width: 1056,
+            pixel_height: 640,
+            dpi: 96,
+        };
+        let viewport = SetClientViewport {
+            tab_id: 17,
+            viewport: ClientViewport::CellGrid { size },
+        };
+        let mut encoded = Vec::new();
+        Pdu::SetClientViewport(viewport.clone())
+            .encode(&mut encoded, 0x52)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x52,
+                pdu: Pdu::SetClientViewport(viewport),
+            }
+        );
+
+        let claim = ClaimClientViewport { tab_id: 17 };
+        let mut encoded = Vec::new();
+        Pdu::ClaimClientViewport(claim.clone())
+            .encode(&mut encoded, 0x53)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x53,
+                pdu: Pdu::ClaimClientViewport(claim),
+            }
+        );
+
+        let session = ThinkTermSessionState {
+            server_id: "server-runtime-id".into(),
+            tree_revision: 9,
+            generation: 11,
+            spaces: vec![ThinkTermSessionSpace {
+                id: "space".into(),
+                name: "Space".into(),
+                ..Default::default()
+            }],
+            projects: vec![ThinkTermSessionProject {
+                id: "project".into(),
+                space_id: "space".into(),
+                name: "Project".into(),
+                threads: vec![ThinkTermSessionThread {
+                    id: "thread".into(),
+                    project_id: "project".into(),
+                    name: "main".into(),
+                    tabs: vec![ThinkTermSessionTab {
+                        window_id: 3,
+                        tab_id: 17,
+                        pane_ids: vec![21, 22],
+                        title: "shell".into(),
+                        is_active: true,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        encoded.clear();
+        Pdu::ThinkTermSessionState(session.clone())
+            .encode(&mut encoded, 0x53)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x53,
+                pdu: Pdu::ThinkTermSessionState(session),
+            }
+        );
+
+        let request = EnsureThinkTermThread {
+            preferred_thread_id: Some("thread".into()),
+            size,
+        };
+        encoded.clear();
+        Pdu::EnsureThinkTermThread(request.clone())
+            .encode(&mut encoded, 0x54)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x54,
+                pdu: Pdu::EnsureThinkTermThread(request),
+            }
+        );
+
+        let response = EnsureThinkTermThreadResponse {
+            thread_id: "thread".into(),
+            workspace: "thinkterm:project:thread".into(),
+            spawned: true,
+        };
+        encoded.clear();
+        Pdu::EnsureThinkTermThreadResponse(response.clone())
+            .encode(&mut encoded, 0x55)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x55,
+                pdu: Pdu::EnsureThinkTermThreadResponse(response),
             }
         );
     }

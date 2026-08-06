@@ -52,7 +52,6 @@ pub enum SvgIcon {
     Pin,
     PinOff,
     Plus,
-    Unplug,
     RotateCcw,
     RotateCw,
     Save,
@@ -75,6 +74,7 @@ pub enum SvgIcon {
     SpellCheck,
     Terminal,
     Trash2,
+    Unlink2,
     X,
 }
 
@@ -176,7 +176,7 @@ impl SvgIcon {
             Self::Pencil => include_bytes!("../../../../third_party/lucide/icons/pencil.svg"),
             Self::Pin => include_bytes!("../../../../third_party/lucide/icons/pin.svg"),
             Self::PinOff => include_bytes!("../../../../third_party/lucide/icons/pin-off.svg"),
-            Self::Unplug => include_bytes!("../../../../third_party/lucide/icons/unplug.svg"),
+            Self::Unlink2 => include_bytes!("../../../../third_party/lucide/icons/unlink-2.svg"),
             Self::Plus => include_bytes!("../../../../third_party/lucide/icons/plus.svg"),
             Self::RotateCcw => {
                 include_bytes!("../../../../third_party/lucide/icons/rotate-ccw.svg")
@@ -540,7 +540,7 @@ mod tests {
             SvgIcon::Pin,
             SvgIcon::PinOff,
             SvgIcon::Plus,
-            SvgIcon::Unplug,
+            SvgIcon::Unlink2,
             SvgIcon::RotateCcw,
             SvgIcon::RotateCw,
             SvgIcon::Search,

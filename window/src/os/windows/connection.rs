@@ -15,6 +15,7 @@ use std::rc::Rc;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
 use winapi::shared::winerror::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+use winapi::um::playsoundapi::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 use winapi::um::shellscalingapi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use winapi::um::winbase::INFINITE;
 use winapi::um::wingdi::{
@@ -109,6 +110,23 @@ impl ConnectionOps for Connection {
     fn beep(&self) {
         unsafe {
             MessageBeep(MB_OK);
+        }
+    }
+
+    fn play_sound(&self, wav: &'static [u8]) {
+        unsafe {
+            // SND_MEMORY reads the WAV image out of our buffer rather than a
+            // file, and SND_ASYNC means it keeps reading after we return —
+            // which is exactly why the bytes have to be 'static. SND_NODEFAULT
+            // keeps a rejected buffer from turning into the system ding.
+            if PlaySoundW(
+                wav.as_ptr() as *const u16,
+                null_mut(),
+                SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+            ) == 0
+            {
+                log::warn!("PlaySound refused {} bytes of audio", wav.len());
+            }
         }
     }
 

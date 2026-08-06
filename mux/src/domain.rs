@@ -498,6 +498,10 @@ impl LocalDomain {
             cmd.env("WEZTERM_UNIX_SOCKET", sock);
         }
         cmd.env("WEZTERM_PANE", pane_id.to_string());
+        cmd.env(
+            "THINKTERM_MUX_SERVER_ID",
+            Mux::get().runtime_server_id().to_string(),
+        );
         if let Some(agent) = Mux::get().agent.as_ref() {
             cmd.env("SSH_AUTH_SOCK", agent.path());
         }

@@ -1286,6 +1286,11 @@ pub struct TermWindow {
     /// Terminal dimensions
     terminal_size: TerminalSize,
     pub mux_window_id: MuxWindowId,
+    /// A viewport claim is in flight; a second click must not queue another.
+    frontend_viewport_claim_pending: bool,
+    /// The tab this window last described to the server, so a switch to a tab
+    /// it has never described says so before anyone has to click.
+    last_described_tab: Option<TabId>,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     pub render_metrics: RenderMetrics,
     render_state: Option<RenderState>,
@@ -2020,6 +2025,8 @@ impl TermWindow {
             crate::workspace_threads::space_note_vault(&active_space_id).is_some();
 
         let myself = Self {
+            frontend_viewport_claim_pending: false,
+            last_described_tab: None,
             created: Instant::now(),
             connection_name,
             last_fps_check_time: Instant::now(),
@@ -2978,6 +2985,18 @@ impl TermWindow {
                     // Server-side only; the remote tree reaches this process
                     // as a pushed ThinkTermTreeState PDU instead.
                 }
+                MuxNotification::ThinkTermSessionChanged => {
+                    // Consumed by mux-server connections attached to this GUI.
+                }
+                MuxNotification::FrontendLeaseChanged(state) => {
+                    let mux = Mux::get();
+                    if mux.window_containing_tab(state.tab_id) == Some(self.mux_window_id) {
+                        if self.owns_frontend_viewport() {
+                            self.resize_mux_tabs_to_current_terminal_size();
+                        }
+                        window.invalidate();
+                    }
+                }
                 MuxNotification::PaneFocused(pane_id) => {
                     // Also handled by clientpane
                     self.refresh_thread_work_for_pane(pane_id);
@@ -3411,6 +3430,14 @@ impl TermWindow {
                     return true;
                 }
             }
+            MuxNotification::FrontendLeaseChanged(ref state) => {
+                let mux = Mux::get();
+                if mux.window_containing_tab(state.tab_id) == Some(mux_window_id) {
+                    // fall through
+                } else {
+                    return true;
+                }
+            }
             MuxNotification::Alert {
                 alert: Alert::ToastNotification { .. },
                 ..
@@ -3422,6 +3449,7 @@ impl TermWindow {
             | MuxNotification::WorkspaceRenamed { .. }
             | MuxNotification::Empty
             | MuxNotification::ThinkTermTreeChanged
+            | MuxNotification::ThinkTermSessionChanged
             | MuxNotification::WindowWorkspaceChanged(_) => return true,
             MuxNotification::Alert {
                 alert: Alert::PaletteChanged { .. },
@@ -4680,7 +4708,7 @@ impl TermWindow {
             }
         };
 
-        let title = match title {
+        let mut title = match title {
             Some(title) => title,
             None => {
                 if let (Some(pos), Some(tab)) = (active_pane, active_tab) {
@@ -4700,6 +4728,23 @@ impl TermWindow {
                 }
             }
         };
+
+        if let Some(state) = Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .and_then(|tab| tab.get_active_pane())
+            .and_then(|pane| {
+                pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                    .and_then(|pane| {
+                        pane.remote_viewport_state()
+                            .filter(|_| pane.owns_remote_viewport() == Some(false))
+                    })
+            })
+        {
+            title.push_str(&format!(
+                " · VIEW {}×{} · input to take control",
+                state.canonical_size.cols, state.canonical_size.rows
+            ));
+        }
 
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);

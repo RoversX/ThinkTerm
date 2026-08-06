@@ -5,6 +5,8 @@ members = [
   "strip-ansi-escapes",
   "sync-color-schemes",
   "thinkterm-syntax",
+  "thinkterm-core",
+  "thinkterm-tui",
   "deps/cairo",
   "wezterm",
   "wezterm-blob-leases",
@@ -70,6 +72,7 @@ codec = { path = "codec" }
 color-funcs = { path = "lua-api-crates/color-funcs" }
 colorgrad = "0.6"
 config = { path = "config" }
+thinkterm-core = { path = "thinkterm-core" }
 core-foundation = "=0.10.0"
 core-graphics = "=0.24.0"
 core-text = "=21.0.0"
@@ -180,6 +183,7 @@ proc-macro2 = "1.0"
 procinfo = { path = "procinfo" }
 procinfo-funcs = { path = "lua-api-crates/procinfo-funcs" }
 promise = { path = "promise" }
+ratatui = { version = "=0.30.0", default-features = false, features = ["std", "underline-color"] }
 quote = "1.0.2"
 rangeset = { path = "rangeset" }
 ratelim= { path = "ratelim" }

@@ -29,6 +29,7 @@ smol.workspace = true
 tempfile.workspace = true
 termwiz = { workspace=true, features=["use_serde"] }
 url.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 wezterm-client.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds.workspace = true

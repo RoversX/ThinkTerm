@@ -11,11 +11,21 @@
 //! buy at this size (tens of KB) that an atomic file replace does not.
 
 use anyhow::{Context, Result};
-use codec::{apply_op, ensure_unique_thread_names, ThinkTermTree, TreeOp};
+use codec::{
+    apply_op, ensure_unique_thread_names, ThinkTermTree, TreeOp, TtProject, TtSpace, TtThread,
+};
 use mux::{Mux, MuxNotification};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandingRecord {
+    pub thread_id: String,
+    pub workspace: String,
+    pub project_path: String,
+}
 
 lazy_static::lazy_static! {
     static ref TREE: Mutex<ThinkTermTree> = Mutex::new(load_or_default());
@@ -101,6 +111,143 @@ pub fn snapshot() -> ThinkTermTree {
     TREE.lock().unwrap().clone()
 }
 
+fn new_id(kind: &str) -> String {
+    format!("{kind}-{}", Uuid::new_v4())
+}
+
+fn workspace_name(project_id: &str, thread_id: &str) -> String {
+    format!("thinkterm:{project_id}:{thread_id}")
+}
+
+/// Resolve a landing Thread against the authoritative tree.  Missing
+/// Default/Home/main rows are created here, never reconstructed from a client
+/// cache.  The operation is idempotent: once a usable Thread exists, repeated
+/// calls only return it.
+fn ensure_landing_in_tree(
+    tree: &mut ThinkTermTree,
+    preferred_thread_id: Option<&str>,
+) -> (LandingRecord, bool) {
+    let mut changed = false;
+    let selected = preferred_thread_id
+        .and_then(|preferred| {
+            tree.projects
+                .iter()
+                .enumerate()
+                .find_map(|(project_index, project)| {
+                    project
+                        .threads
+                        .iter()
+                        .position(|thread| thread.id == preferred)
+                        .map(|thread_index| (project_index, thread_index))
+                })
+        })
+        .or_else(|| {
+            tree.projects
+                .iter()
+                .enumerate()
+                .find_map(|(project_index, project)| {
+                    (!project.threads.is_empty()).then_some((project_index, 0))
+                })
+        });
+
+    let (project_index, thread_index) = match selected {
+        Some(selected) => selected,
+        None => {
+            if tree.spaces.is_empty() {
+                tree.spaces.push(TtSpace {
+                    id: new_id("space"),
+                    name: "Default".to_string(),
+                });
+            }
+
+            let project_index = tree
+                .projects
+                .iter()
+                .position(|project| tree.spaces.iter().any(|space| space.id == project.space_id));
+            let project_index = match project_index {
+                Some(index) => index,
+                None => {
+                    let space_id = tree.spaces[0].id.clone();
+                    tree.projects.push(TtProject {
+                        id: new_id("project"),
+                        space_id,
+                        name: "Home".to_string(),
+                        path: "~".to_string(),
+                        threads: vec![],
+                    });
+                    tree.projects.len() - 1
+                }
+            };
+
+            let project_id = tree.projects[project_index].id.clone();
+            tree.projects[project_index].threads.push(TtThread {
+                id: new_id("thread"),
+                project_id,
+                name: "main".to_string(),
+                planned_workspace_name: None,
+                materialized_workspace_name: None,
+                last_active_at: 0,
+                is_pinned: false,
+                is_unread: false,
+            });
+            changed = true;
+            (
+                project_index,
+                tree.projects[project_index].threads.len() - 1,
+            )
+        }
+    };
+
+    let project = &mut tree.projects[project_index];
+    let project_id = project.id.clone();
+    let thread = &mut project.threads[thread_index];
+    let workspace = thread
+        .materialized_workspace_name
+        .clone()
+        .or_else(|| thread.planned_workspace_name.clone())
+        .unwrap_or_else(|| workspace_name(&project_id, &thread.id));
+    if thread.materialized_workspace_name.as_deref() != Some(&workspace)
+        || thread.planned_workspace_name.is_some()
+    {
+        thread.planned_workspace_name = None;
+        thread.materialized_workspace_name = Some(workspace.clone());
+        changed = true;
+    }
+
+    (
+        LandingRecord {
+            thread_id: thread.id.clone(),
+            workspace,
+            project_path: project.path.clone(),
+        },
+        changed,
+    )
+}
+
+/// Ensure a server-owned landing Thread and persist it before any terminal is
+/// spawned into its workspace.  A server restart may leave a valid tree with
+/// no live topology; retaining the row IDs while recreating the shell is the
+/// intended recovery behavior.
+pub fn ensure_landing(preferred_thread_id: Option<&str>) -> Result<LandingRecord> {
+    let (landing, changed) = {
+        let mut guard = TREE.lock().unwrap();
+        let mut candidate = guard.clone();
+        let (landing, changed) = ensure_landing_in_tree(&mut candidate, preferred_thread_id);
+        if changed {
+            ensure_unique_thread_names(&mut candidate);
+            candidate.revision = candidate.revision.saturating_add(1);
+            save_to_path(&tree_path(), &candidate)
+                .context("persist authoritative ThinkTerm landing")?;
+            *guard = candidate;
+        }
+        (landing, changed)
+    };
+    if changed {
+        Mux::notify_from_any_thread(MuxNotification::ThinkTermTreeChanged);
+    }
+    Ok(landing)
+}
+
 fn apply_and_persist(
     current: &ThinkTermTree,
     ops: &[TreeOp],
@@ -170,7 +317,7 @@ mod test {
                 project_id: "p1".into(),
                 space_id: "s1".into(),
                 name: "thinkterm".into(),
-                path: "/home/x/github/ThinkTerm".into(),
+                path: "/srv/projects/example".into(),
             }
         ));
         assert!(apply_op(
@@ -283,5 +430,51 @@ mod test {
         assert!(apply_and_persist(&current, &[op], &path).is_err());
         assert_eq!(current.space("s1").unwrap().name, "Work");
         assert_eq!(current.revision, 0);
+    }
+
+    #[test]
+    fn landing_bootstraps_default_home_main_once() {
+        let mut tree = ThinkTermTree::default();
+        let (first, changed) = ensure_landing_in_tree(&mut tree, None);
+        assert!(changed);
+        assert_eq!(tree.spaces.len(), 1);
+        assert_eq!(tree.spaces[0].name, "Default");
+        assert_eq!(tree.projects.len(), 1);
+        assert_eq!(tree.projects[0].name, "Home");
+        assert_eq!(tree.projects[0].path, "~");
+        assert_eq!(tree.projects[0].threads.len(), 1);
+        assert_eq!(tree.projects[0].threads[0].name, "main");
+        assert_eq!(first.thread_id, tree.projects[0].threads[0].id);
+
+        let (second, changed) = ensure_landing_in_tree(&mut tree, None);
+        assert!(!changed);
+        assert_eq!(second, first);
+        assert_eq!(tree.spaces.len(), 1);
+        assert_eq!(tree.projects.len(), 1);
+        assert_eq!(tree.projects[0].threads.len(), 1);
+    }
+
+    #[test]
+    fn landing_honors_an_existing_preferred_thread() {
+        let mut tree = sample();
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("t1"));
+        assert!(!changed);
+        assert_eq!(landing.thread_id, "t1");
+        assert_eq!(landing.workspace, "thinkterm:p1:t1");
+        assert_eq!(landing.project_path, "/srv/projects/example");
+    }
+
+    #[test]
+    fn landing_after_an_authoritative_empty_tree_uses_fresh_ids() {
+        let mut tree = ThinkTermTree {
+            revision: 9,
+            ..ThinkTermTree::default()
+        };
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("stale-thread"));
+        assert!(changed);
+        assert_ne!(landing.thread_id, "stale-thread");
+        assert!(landing.thread_id.starts_with("thread-"));
+        assert!(tree.spaces[0].id.starts_with("space-"));
+        assert!(tree.projects[0].id.starts_with("project-"));
     }
 }
