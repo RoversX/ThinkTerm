@@ -1509,24 +1509,11 @@ static NEEDS_INPUT_WAV: &[u8] = include_bytes!("../../assets/sounds/needs-input.
 /// business making noise, and neither does a machine someone is presenting on.
 const DISABLE_SOUND_ENV: &str = "THINKTERM_DISABLE_SOUND";
 
-/// Whether a transition is worth a sound, given what the user is already
-/// looking at.
-///
-/// Watching the thread that just finished means the news arrived by eye
-/// already, and a sound on top of that is just noise. Everything else happened
-/// out of sight, which is the entire point of the feature.
-fn should_announce(changed_workspace: &str, active_workspace: &str) -> bool {
-    changed_workspace != active_workspace
-}
-
-fn announce_work(workspace: &str, announcement: WorkAnnouncement) {
+fn announce_work(announcement: WorkAnnouncement) {
     if std::env::var_os(DISABLE_SOUND_ENV).is_some() {
         return;
     }
     if !crate::native_settings::notification_sounds_enabled() {
-        return;
-    }
-    if !should_announce(workspace, &Mux::get().active_workspace()) {
         return;
     }
     let wav = match announcement {
@@ -1554,7 +1541,7 @@ pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
         change
     };
     if let Some(announcement) = change.announce {
-        announce_work(workspace, announcement);
+        announce_work(announcement);
     }
     if change.should_persist {
         schedule_workspace_thread_store_persist();
@@ -7179,14 +7166,6 @@ mod tests {
                 .announce,
             None
         );
-    }
-
-    /// A sound for the thread already on screen is noise: the news arrived by
-    /// eye before it could arrive by ear.
-    #[test]
-    fn the_workspace_being_watched_stays_silent() {
-        assert!(!should_announce("workspace-1", "workspace-1"));
-        assert!(should_announce("workspace-1", "workspace-2"));
     }
 
     #[test]
