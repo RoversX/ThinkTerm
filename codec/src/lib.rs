@@ -459,7 +459,9 @@ macro_rules! pdu {
 /// 54: Server-authoritative ThinkTerm Thread landing and materialization.
 /// 55: Panes report alternate screen state so renderers can route the wheel.
 /// 56: Pane entries carry that state too, so a renderer knows it on arrival.
-pub const CODEC_VERSION: usize = 57;
+/// 57: Frontends publish and follow a shared per-tab scroll position.
+/// 58: Connection-wide A/B access modes and atomic geometry-bearing claims.
+pub const CODEC_VERSION: usize = 58;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -535,6 +537,8 @@ pdu! {
     EnsureThinkTermThread: 75,
     EnsureThinkTermThreadResponse: 76,
     SetClientView: 77,
+    SetFrontendAccessMode: 78,
+    FrontendAccessState: 79,
 }
 
 impl Pdu {
@@ -1049,12 +1053,46 @@ pub struct SetClientViewport {
     pub viewport: ClientViewport,
 }
 
-/// Claim a tab's viewport after a real renderer interaction.  The server uses
-/// the viewport previously advertised by this registered client; this request
-/// carries no geometry or owner identity for the server to trust.
+/// Claim access after a real terminal-area interaction and install the exact
+/// geometry used for that interaction as one atomic server operation.
+///
+/// In shared mode this moves only `tab_id`'s layout lease. In handoff mode it
+/// moves the connection-wide visibility/input lease. The registered transport
+/// supplies the identity; no owner identity is accepted from the wire.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
 pub struct ClaimClientViewport {
     pub tab_id: TabId,
+    pub viewport: ClientViewport,
+}
+
+/// A is the tmux-like mode: every renderer may see and interact, while the
+/// last terminal-area interaction on each tab chooses its canonical grid.
+/// B is an exclusive handoff: only one renderer may see or interact with any
+/// tab on this mux connection.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Default)]
+pub enum FrontendAccessMode {
+    TmuxLatest,
+    #[default]
+    Handoff,
+}
+
+/// Runtime connection-wide visibility/input ownership. The selected mode is
+/// persisted by the server; owner and generation deliberately are not.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct FrontendAccessState {
+    pub mode: FrontendAccessMode,
+    pub owner: Option<ClientId>,
+    pub generation: u64,
+}
+
+/// Change the server-wide mode. Supplying the active tab and its current
+/// geometry lets the authorization check and resulting ownership/layout change
+/// happen without an observable intermediate state.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct SetFrontendAccessMode {
+    pub mode: FrontendAccessMode,
+    pub tab_id: TabId,
+    pub viewport: ClientViewport,
 }
 
 /// Authoritative viewport state returned by `SetClientViewport` and pushed
@@ -1062,12 +1100,16 @@ pub struct ClaimClientViewport {
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
 pub struct ClientViewportState {
     pub tab_id: TabId,
+    /// Per-tab layout owner used by `TmuxLatest` mode.
     pub owner: Option<ClientId>,
     pub canonical_size: TerminalSize,
     /// What the owner is looking at, when the owner is a renderer that says.
     /// `None` means nobody offered one, and a follower keeps its own view.
     pub view: Option<ClientView>,
     pub generation: u64,
+    /// A same-response snapshot of the connection-wide access state. This is
+    /// what makes a handoff claim atomic from a renderer's point of view.
+    pub access: FrontendAccessState,
 }
 
 /// What the renderer holding a tab's viewport is currently looking at.
@@ -1585,8 +1627,8 @@ mod test {
     }
 
     #[test]
-    fn thinkterm_session_viewport_and_landing_protocol_round_trip_at_version_56() {
-        assert_eq!(CODEC_VERSION, 57);
+    fn thinkterm_session_viewport_and_landing_protocol_round_trip_at_version_58() {
+        assert_eq!(CODEC_VERSION, 58);
         let size = TerminalSize {
             rows: 40,
             cols: 132,
@@ -1610,7 +1652,10 @@ mod test {
             }
         );
 
-        let claim = ClaimClientViewport { tab_id: 17 };
+        let claim = ClaimClientViewport {
+            tab_id: 17,
+            viewport: ClientViewport::CellGrid { size },
+        };
         let mut encoded = Vec::new();
         Pdu::ClaimClientViewport(claim.clone())
             .encode(&mut encoded, 0x53)
@@ -1620,6 +1665,40 @@ mod test {
             DecodedPdu {
                 serial: 0x53,
                 pdu: Pdu::ClaimClientViewport(claim),
+            }
+        );
+
+        let mode = SetFrontendAccessMode {
+            mode: FrontendAccessMode::TmuxLatest,
+            tab_id: 17,
+            viewport: ClientViewport::CellGrid { size },
+        };
+        encoded.clear();
+        Pdu::SetFrontendAccessMode(mode.clone())
+            .encode(&mut encoded, 0x54)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x54,
+                pdu: Pdu::SetFrontendAccessMode(mode),
+            }
+        );
+
+        let access = FrontendAccessState {
+            mode: FrontendAccessMode::Handoff,
+            owner: None,
+            generation: 27,
+        };
+        encoded.clear();
+        Pdu::FrontendAccessState(access.clone())
+            .encode(&mut encoded, 0x55)
+            .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x55,
+                pdu: Pdu::FrontendAccessState(access),
             }
         );
 

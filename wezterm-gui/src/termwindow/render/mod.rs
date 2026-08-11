@@ -67,6 +67,11 @@ pub struct LineQuadCacheKey {
     pub font_identity: u64,
     pub top_pixel_y: NotNan<f32>,
     pub left_pixel_x: NotNan<f32>,
+    /// The same terminal line can be painted at a different width while a
+    /// split divider is being dragged.  Keep that geometry in the key so the
+    /// old, wider GPU quads can never be replayed across the new divider.
+    pub render_cols: usize,
+    pub render_pixel_width: usize,
     pub phys_line_idx: usize,
     pub pane_id: PaneId,
     pub pane_is_active: bool,
@@ -1020,5 +1025,39 @@ fn same_hyperlink(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> boo
     match (a, b) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod line_quad_cache_tests {
+    use super::*;
+
+    fn key(render_cols: usize, render_pixel_width: usize) -> LineQuadCacheKey {
+        LineQuadCacheKey {
+            config_generation: 0,
+            shape_generation: 0,
+            quad_generation: 0,
+            composing: None,
+            selection: 0..0,
+            shape_hash: [0; 16],
+            font_identity: 0,
+            top_pixel_y: NotNan::new(0.0).unwrap(),
+            left_pixel_x: NotNan::new(0.0).unwrap(),
+            render_cols,
+            render_pixel_width,
+            phys_line_idx: 0,
+            pane_id: 1,
+            pane_is_active: true,
+            cursor: None,
+            reverse_video: false,
+            password_input: false,
+        }
+    }
+
+    #[test]
+    fn divider_resize_cannot_reuse_line_quads_from_the_old_pane_width() {
+        let wide = key(120, 1_200);
+        assert_ne!(wide, key(80, 800));
+        assert_ne!(wide, key(120, 1_000));
     }
 }

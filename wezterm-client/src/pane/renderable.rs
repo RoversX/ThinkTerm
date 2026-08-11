@@ -87,6 +87,17 @@ fn render_geometry_changed(current: RenderableDimensions, next: RenderableDimens
         || current.dpi != next.dpi
 }
 
+fn render_dimensions_match_terminal_size(
+    dimensions: RenderableDimensions,
+    size: wezterm_term::TerminalSize,
+) -> bool {
+    dimensions.cols == size.cols
+        && dimensions.viewport_rows == size.rows
+        && dimensions.pixel_width == size.pixel_width
+        && dimensions.pixel_height == size.pixel_height
+        && dimensions.dpi == size.dpi
+}
+
 fn fetch_token_is_current(token: FetchToken, epoch: u64) -> bool {
     token.epoch == epoch
 }
@@ -102,6 +113,11 @@ pub struct RenderableInner {
 
     cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
+    /// The dimensions most recently confirmed by the remote pane.  A GUI
+    /// takeover may resize its local surface optimistically; keeping the
+    /// server value separate lets it remain masked until a post-resize render
+    /// snapshot has actually arrived.
+    server_dimensions: RenderableDimensions,
 
     lines: LruCache<StableRowIndex, LineEntry>,
     line_cache_epoch: u64,
@@ -144,6 +160,7 @@ impl RenderableInner {
             poll_interval: BASE_POLL_INTERVAL,
             cursor_position: StableCursorPosition::default(),
             dimensions,
+            server_dimensions: dimensions,
             lines: LruCache::new(
                 NonZeroUsize::new(configuration().scrollback_lines.max(128)).unwrap(),
             ),
@@ -389,6 +406,7 @@ impl RenderableInner {
         {
             self.cursor_position = delta.cursor_position;
         }
+        self.server_dimensions = delta.dimensions;
         if render_geometry_changed(self.dimensions, delta.dimensions) {
             let preserve_lines = self.dimensions.cols == delta.dimensions.cols;
             self.dimensions = delta.dimensions;
@@ -949,6 +967,34 @@ impl RenderableState {
     pub fn get_dimensions(&self) -> RenderableDimensions {
         self.inner.borrow().dimensions
     }
+
+    /// Drive a render poll and populate every currently visible line while a
+    /// takeover overlay is still opaque.  Returns true only after the server
+    /// has confirmed `size` and none of those rows is stale or in flight.
+    pub(crate) fn prime_frontend_geometry(&self, size: wezterm_term::TerminalSize) -> bool {
+        let mut visible = {
+            let mut inner = self.inner.borrow_mut();
+            let now = Instant::now();
+            inner.poll_interval = BASE_POLL_INTERVAL;
+            inner.last_poll = now.checked_sub(BASE_POLL_INTERVAL).unwrap_or(now);
+            if let Err(err) = inner.poll() {
+                log::trace!("polling takeover geometry: {err:#}");
+            }
+            let top = inner.dimensions.physical_top;
+            top..top.saturating_add(size.rows as StableRowIndex)
+        };
+
+        // This both returns any retained rows and schedules missing/stale
+        // rows. Fetch completion emits PaneOutput and drives another overlay
+        // frame, where the readiness check below can finally pass.
+        let _ = self.get_lines(visible.clone());
+
+        let mut inner = self.inner.borrow_mut();
+        if !render_dimensions_match_terminal_size(inner.server_dimensions, size) {
+            return false;
+        }
+        visible.all(|row| matches!(inner.lines.get(&row), Some(LineEntry::Line(_))))
+    }
 }
 
 #[cfg(test)]
@@ -1018,6 +1064,30 @@ mod test {
         let mut new_dpi = current;
         new_dpi.dpi += 1;
         assert!(render_geometry_changed(current, new_dpi));
+    }
+
+    #[test]
+    fn server_geometry_confirmation_requires_the_complete_terminal_size() {
+        let expected = wezterm_term::TerminalSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 800,
+            dpi: 144,
+        };
+        let confirmed = dimensions(120, 40, 144);
+        assert!(render_dimensions_match_terminal_size(confirmed, expected));
+
+        let mut stale_rows = confirmed;
+        stale_rows.viewport_rows = 24;
+        assert!(!render_dimensions_match_terminal_size(stale_rows, expected));
+
+        let mut stale_pixels = confirmed;
+        stale_pixels.pixel_height = 768;
+        assert!(!render_dimensions_match_terminal_size(
+            stale_pixels,
+            expected
+        ));
     }
 
     #[test]

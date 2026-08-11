@@ -1,18 +1,60 @@
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
+use crate::termwindow::TermWindowNotif;
 use crate::ui::rescale_ui_usize;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
+use mux::domain::Domain;
 use mux::pane::{Pane, PaneId};
 use mux::tab::PositionedPane;
 use mux::Mux;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use wezterm_client::domain::ClientDomain;
+use std::time::Duration;
+use wezterm_client::domain::{ClientDomain, RemoteFrontendGate};
 use wezterm_client::pane::ClientPane;
 use wezterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontendGeometryAction {
+    Passive,
+    Set { takeover: bool },
+    Claim,
+}
+
+fn frontend_geometry_action(
+    ownership: Option<bool>,
+    collaborative: bool,
+    previewing: bool,
+) -> FrontendGeometryAction {
+    match ownership {
+        Some(false) if previewing && collaborative => FrontendGeometryAction::Claim,
+        Some(false) => FrontendGeometryAction::Passive,
+        Some(true) => FrontendGeometryAction::Set { takeover: false },
+        None => FrontendGeometryAction::Set { takeover: true },
+    }
+}
+
+// Full-screen TUIs handle SIGWINCH asynchronously after the server-side PTY
+// resize has returned.  Keep two 125ms overlay frames of quiet time so a
+// slightly delayed clear/redraw cannot become the first visible GUI frame.
+const FRONTEND_GEOMETRY_SETTLE: Duration = Duration::from_millis(200);
+
+fn geometry_confirmation_settled(
+    ready: bool,
+    now: std::time::Instant,
+    ready_since: &mut Option<std::time::Instant>,
+) -> bool {
+    if !ready {
+        *ready_since = None;
+        return false;
+    }
+
+    let started = ready_since.get_or_insert(now);
+    now.duration_since(*started) >= FRONTEND_GEOMETRY_SETTLE
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RowsAndCols {
@@ -27,14 +69,100 @@ pub enum ScaleChange {
 }
 
 impl super::TermWindow {
-    fn tab_owns_frontend_viewport(&self, tab: &Arc<mux::tab::Tab>) -> bool {
+    pub(crate) fn active_frontend_access_state(&self) -> Option<mux::FrontendAccessState> {
+        let pane = Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)?
+            .get_active_pane()?;
+        if let Some(client) = pane.downcast_ref::<ClientPane>() {
+            return client
+                .remote_access_state()
+                .map(|state| mux::FrontendAccessState {
+                    mode: match state.mode {
+                        codec::FrontendAccessMode::TmuxLatest => {
+                            mux::FrontendAccessMode::TmuxLatest
+                        }
+                        codec::FrontendAccessMode::Handoff => mux::FrontendAccessMode::Handoff,
+                    },
+                    owner: state.owner,
+                    generation: state.generation,
+                });
+        }
+        Some(Mux::get().frontend_access_state())
+    }
+
+    pub(crate) fn frontend_terminal_gate(&self) -> RemoteFrontendGate {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return RemoteFrontendGate::Visible;
+        };
+        let Some(pane) = tab.get_active_pane() else {
+            return RemoteFrontendGate::Visible;
+        };
+        let gate = if let Some(client) = pane.downcast_ref::<ClientPane>() {
+            client.remote_frontend_gate()
+        } else {
+            let state = Mux::get().frontend_access_state();
+            if state.mode == mux::FrontendAccessMode::TmuxLatest
+                || Mux::get()
+                    .active_identity()
+                    .as_deref()
+                    .is_some_and(|identity| state.owner.as_ref() == Some(identity))
+            {
+                RemoteFrontendGate::Visible
+            } else {
+                RemoteFrontendGate::Claimable { owner: state.owner }
+            }
+        };
+        let obscured_by_geometry = self
+            .frontend_geometry_phases
+            .get(&tab.tab_id())
+            .copied()
+            .is_some_and(super::FrontendGeometryPhase::obscures_terminal);
+        if obscured_by_geometry
+            && matches!(
+                gate,
+                RemoteFrontendGate::Visible
+                    | RemoteFrontendGate::Claimable { .. }
+                    | RemoteFrontendGate::Syncing
+            )
+        {
+            RemoteFrontendGate::Syncing
+        } else {
+            // Connection health remains more informative than a geometry
+            // wait if the transport drops during takeover.
+            gate
+        }
+    }
+
+    pub(crate) fn frontend_surface_blocked(&self) -> bool {
+        self.frontend_terminal_gate().obscures_terminal()
+    }
+
+    pub(crate) fn frontend_takeover_claimable(&self) -> bool {
+        self.frontend_terminal_gate().is_claimable()
+    }
+
+    pub(crate) fn active_remote_frontend_viewport_state(
+        &self,
+    ) -> Option<codec::ClientViewportState> {
+        Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)?
+            .get_active_pane()?
+            .downcast_ref::<ClientPane>()?
+            .remote_viewport_state()
+    }
+
+    fn tab_frontend_viewport_ownership(&self, tab: &Arc<mux::tab::Tab>) -> Option<bool> {
         if let Some(owns) = tab.get_active_pane().and_then(|pane| {
             pane.downcast_ref::<ClientPane>()
                 .map(ClientPane::owns_remote_viewport)
         }) {
-            return owns == Some(true);
+            return owns;
         }
-        Mux::get().current_identity_owns_frontend_lease(tab.tab_id())
+        Some(Mux::get().current_identity_owns_frontend_lease(tab.tab_id()))
+    }
+
+    fn tab_owns_frontend_viewport(&self, tab: &Arc<mux::tab::Tab>) -> bool {
+        self.tab_frontend_viewport_ownership(tab) == Some(true)
     }
 
     pub(crate) fn owns_frontend_viewport(&self) -> bool {
@@ -43,69 +171,714 @@ impl super::TermWindow {
             .map_or(true, |tab| self.tab_owns_frontend_viewport(&tab))
     }
 
-    fn report_active_frontend_viewport(&self) {
+    fn begin_frontend_geometry_epoch(
+        &mut self,
+        tab_id: mux::tab::TabId,
+        takeover: bool,
+    ) -> Option<u64> {
+        if self
+            .frontend_geometry_phases
+            .get(&tab_id)
+            .copied()
+            .is_some_and(super::FrontendGeometryPhase::is_in_flight)
+        {
+            return None;
+        }
+        let epoch = self.next_frontend_geometry_epoch;
+        self.next_frontend_geometry_epoch =
+            self.next_frontend_geometry_epoch.wrapping_add(1).max(1);
+        let phase = if takeover {
+            super::FrontendGeometryPhase::TakeoverSyncing { epoch }
+        } else {
+            super::FrontendGeometryPhase::Committing { epoch }
+        };
+        self.frontend_geometry_phases.insert(tab_id, phase);
+        self.invalidate_window();
+        Some(epoch)
+    }
+
+    fn finish_frontend_geometry_epoch(
+        &mut self,
+        tab_id: mux::tab::TabId,
+        epoch: u64,
+        succeeded: bool,
+        adopted: &[(PaneId, TerminalSize)],
+    ) {
+        let Some(phase) = self.frontend_geometry_phases.get(&tab_id).copied() else {
+            return;
+        };
+        if phase.epoch() != epoch {
+            return;
+        }
+
+        let mux = Mux::get();
+        for (pane_id, size) in adopted {
+            let Some(pane) = mux.get_pane(*pane_id) else {
+                continue;
+            };
+            let Some(client) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            if succeeded {
+                // A resync notification can race the RPC completion and
+                // temporarily put the advertised dimensions back. Validate
+                // the surface against the exact acknowledged viewport before
+                // allowing the first unmasked paint.
+                client.adopt_frontend_geometry(*size);
+            } else {
+                client.forget_frontend_geometry(*size);
+            }
+        }
+
+        if succeeded && phase.obscures_terminal() {
+            // The RPC acknowledgement means that the server has issued the
+            // PTY resize, not that the resized screen has reached this
+            // renderer. Keep the opaque takeover state and actively fetch a
+            // complete post-resize snapshot before revealing it.
+            self.frontend_geometry_confirmations.insert(
+                tab_id,
+                super::FrontendGeometryConfirmation {
+                    epoch,
+                    panes: adopted.to_vec(),
+                    ready_since: None,
+                },
+            );
+            self.advance_frontend_geometry_confirmation();
+            self.update_title_post_status();
+            self.invalidate_window();
+            return;
+        }
+
+        self.complete_frontend_geometry_epoch(tab_id, epoch);
+    }
+
+    fn complete_frontend_geometry_epoch(&mut self, tab_id: mux::tab::TabId, epoch: u64) {
+        let Some(phase) = self.frontend_geometry_phases.get(&tab_id).copied() else {
+            return;
+        };
+        if phase.epoch() != epoch {
+            return;
+        }
+        let keep_follow_up_obscured = phase.obscures_terminal();
+        self.frontend_geometry_confirmations.remove(&tab_id);
+        self.frontend_geometry_phases.remove(&tab_id);
+        let needs_follow_up = self.frontend_geometry_resync_after_epoch.remove(&tab_id);
+        if needs_follow_up && self.active_tab_is(tab_id) {
+            // Starting the follow-up synchronously keeps the tab opaque: the
+            // old epoch is replaced before this callback can paint.
+            self.sync_active_tab_geometry_now();
+            if keep_follow_up_obscured {
+                if let Some(super::FrontendGeometryPhase::Committing { epoch }) =
+                    self.frontend_geometry_phases.get(&tab_id).copied()
+                {
+                    self.frontend_geometry_phases.insert(
+                        tab_id,
+                        super::FrontendGeometryPhase::TakeoverSyncing { epoch },
+                    );
+                }
+            }
+        }
+        self.update_title_post_status();
+        self.invalidate_window();
+    }
+
+    /// Progress the active takeover without painting its old terminal grid.
+    /// Each call forces a remote render poll and primes missing visible rows;
+    /// PaneOutput and the overlay animation schedule subsequent checks.
+    pub(crate) fn advance_frontend_geometry_confirmation(&mut self) {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let tab_id = tab.tab_id();
+        let Some(confirmation) = self.frontend_geometry_confirmations.get(&tab_id).cloned() else {
+            return;
+        };
+        if self
+            .frontend_geometry_phases
+            .get(&tab_id)
+            .copied()
+            .map(super::FrontendGeometryPhase::epoch)
+            != Some(confirmation.epoch)
+        {
+            self.frontend_geometry_confirmations.remove(&tab_id);
+            return;
+        }
+
+        let mux = Mux::get();
+        let mut ready = !confirmation.panes.is_empty();
+        for (pane_id, size) in &confirmation.panes {
+            let pane_ready = mux
+                .get_pane(*pane_id)
+                .and_then(|pane| {
+                    pane.downcast_ref::<ClientPane>()
+                        .map(|client| client.prime_frontend_geometry(*size))
+                })
+                .unwrap_or(false);
+            ready &= pane_ready;
+        }
+
+        let now = std::time::Instant::now();
+        let settled = if let Some(pending) = self.frontend_geometry_confirmations.get_mut(&tab_id) {
+            geometry_confirmation_settled(ready, now, &mut pending.ready_since)
+        } else {
+            false
+        };
+        if settled {
+            self.complete_frontend_geometry_epoch(tab_id, confirmation.epoch);
+        }
+    }
+
+    pub(crate) fn active_tab_is(&self, tab_id: mux::tab::TabId) -> bool {
+        Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .is_some_and(|tab| tab.tab_id() == tab_id)
+    }
+
+    /// Reflow one active top-level tab and derive both the root viewport and
+    /// every visible pane surface from that same final layout pass.
+    fn prepare_client_frontend_geometry(
+        &mut self,
+        tab: &Arc<mux::tab::Tab>,
+    ) -> Option<(
+        Arc<dyn Domain>,
+        codec::ClientViewport,
+        Vec<(PaneId, TerminalSize)>,
+    )> {
+        if !self.active_tab_is(tab.tab_id()) {
+            return None;
+        }
+        let active_pane = tab.get_active_pane()?;
+        let client_pane = active_pane.downcast_ref::<ClientPane>()?;
+        let domain_id = client_pane.domain_id();
+        let domain = Mux::get().get_domain(domain_id)?;
+        if !domain.is::<ClientDomain>() {
+            return None;
+        }
+
+        tab.resize(self.terminal_size);
+        self.reapply_collapsed_panes_for_tab(tab.tab_id());
+
+        let mut panes = Vec::new();
+        let mut adopted = Vec::new();
+        for positioned in self.get_panes_to_render() {
+            let pane = positioned.pane.downcast_ref::<ClientPane>()?;
+            if pane.domain_id() != domain_id {
+                return None;
+            }
+            let font_scale = self.pane_font_scale(positioned.pane.pane_id());
+            let metrics = if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
+                self.render_metrics
+            } else {
+                match self.pane_font_resources(font_scale) {
+                    Ok((_, metrics)) => metrics,
+                    Err(err) => {
+                        log::warn!("cannot calculate native viewport: {err:#}");
+                        return None;
+                    }
+                }
+            };
+            let size = self.terminal_size_for_positioned_pane(&positioned, metrics);
+            panes.push(codec::ClientPaneViewport {
+                pane_id: positioned.pane.pane_id(),
+                size,
+            });
+            adopted.push((positioned.pane.pane_id(), size));
+        }
+        for (pane_id, size) in &adopted {
+            let pane = Mux::get().get_pane(*pane_id)?;
+            pane.downcast_ref::<ClientPane>()?
+                .adopt_frontend_geometry(*size);
+        }
+
+        Some((
+            domain,
+            codec::ClientViewport::Native {
+                size: self.terminal_size,
+                panes,
+            },
+            adopted,
+        ))
+    }
+
+    /// Keep a remote split visually attached to its divider while it is being
+    /// dragged. Tab's split tree intentionally skips remote mirror PTY
+    /// resizes; adopt the exact GUI pane surfaces locally and defer the one
+    /// complete viewport RPC until release.
+    pub(crate) fn preview_active_tab_geometry_now(&mut self) {
+        if self.content_view_foreground() {
+            return;
+        }
         let mux = Mux::get();
         let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
             return;
         };
+        let tab_id = tab.tab_id();
+        if tab
+            .get_active_pane()
+            .is_none_or(|pane| pane.downcast_ref::<ClientPane>().is_none())
+        {
+            self.force_sync_active_mux_tab_pane_sizes();
+            return;
+        }
+
+        let mode = self.active_frontend_access_state().map(|state| state.mode);
+        let ownership = self.tab_frontend_viewport_ownership(&tab);
+        if mode == Some(mux::FrontendAccessMode::Handoff) && ownership != Some(true) {
+            return;
+        }
+        if self.prepare_client_frontend_geometry(&tab).is_none() {
+            return;
+        }
+
+        let epoch = self.next_frontend_geometry_epoch;
+        self.next_frontend_geometry_epoch =
+            self.next_frontend_geometry_epoch.wrapping_add(1).max(1);
+        self.frontend_geometry_phases
+            .insert(tab_id, super::FrontendGeometryPhase::Previewing { epoch });
+        self.invalidate_window();
+    }
+
+    /// Take the viewport because someone is using this window right now.
+    ///
+    /// The server hands the lease over on *input*, and a click in a pane that
+    /// is not asking for mouse reporting never reaches the server at all — it
+    /// is handled here. So a window sat down at and clicked in kept drawing at
+    /// whatever size the phone that last typed had left it, until something
+    /// incidental happened to re-report the geometry.
+    ///
+    /// Terminal-area clicks and scrolling claim.  Tab/sidebar/window chrome
+    /// calls never reach this method, so merely navigating the surrounding UI
+    /// cannot steal the terminal from another renderer.
+    ///
+    /// Nothing happens when this window already owns the viewport, which is
+    /// the overwhelmingly common case, so an ordinary click costs one
+    /// comparison.
+    pub(crate) fn claim_frontend_viewport_for_interaction(&mut self) {
+        if !matches!(
+            self.frontend_terminal_gate(),
+            RemoteFrontendGate::Visible | RemoteFrontendGate::Claimable { .. }
+        ) {
+            return;
+        }
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let tab_id = tab.tab_id();
+        if self
+            .frontend_geometry_phases
+            .get(&tab_id)
+            .copied()
+            .is_some_and(super::FrontendGeometryPhase::is_in_flight)
+            || self.owns_frontend_viewport()
+        {
+            return;
+        }
+
+        if tab
+            .get_active_pane()
+            .is_some_and(|pane| pane.downcast_ref::<ClientPane>().is_none())
+        {
+            let Some(client_id) = mux.active_identity() else {
+                return;
+            };
+            let viewport = self.local_frontend_viewport_for_tab(&tab, true);
+            if let Err(err) = mux.claim_local_frontend_viewport(&client_id, tab_id, viewport) {
+                log::warn!("claiming local GUI frontend viewport: {err:#}");
+                return;
+            }
+            self.resize_mux_tabs_to_current_terminal_size();
+            self.invalidate_window();
+            return;
+        }
+
+        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, true) else {
+            return;
+        };
+        let Some((domain, viewport, adopted)) = self.prepare_client_frontend_geometry(&tab) else {
+            self.frontend_geometry_phases.remove(&tab_id);
+            self.invalidate_window();
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.frontend_geometry_phases.remove(&tab_id);
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let result = match domain.downcast_ref::<ClientDomain>() {
+                Some(client_domain) => {
+                    let result = client_domain.claim_client_viewport(tab_id, viewport).await;
+                    if let Err(err) = &result {
+                        log::warn!("claiming remote GUI frontend viewport: {err:#}");
+                        if let Err(resync_err) = client_domain.resync().await {
+                            log::warn!(
+                                "resyncing after failed frontend viewport claim: {resync_err:#}"
+                            );
+                        }
+                    }
+                    result.map(|_| client_domain.owns_remote_viewport(tab_id) == Some(true))
+                }
+                None => Err(anyhow::anyhow!("frontend domain is not a client domain")),
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let succeeded = result.as_ref().is_ok_and(|owns| *owns);
+                let is_still_active = term_window.active_tab_is(tab_id);
+                term_window.finish_frontend_geometry_epoch(tab_id, epoch, succeeded, &adopted);
+                if succeeded && is_still_active {
+                    for pos in term_window.get_panes_to_render() {
+                        term_window.scroll_to_bottom(&pos.pane);
+                    }
+                }
+            })));
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    pub(crate) fn request_frontend_access_mode(&mut self, mode: codec::FrontendAccessMode) {
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let tab_id = tab.tab_id();
+        let is_remote = tab
+            .get_active_pane()
+            .is_some_and(|pane| pane.downcast_ref::<ClientPane>().is_some());
+        if is_remote {
+            let Some((domain, viewport)) = self.client_viewport_for_tab(&tab, true) else {
+                return;
+            };
+            let Some(window) = self.window.as_ref().cloned() else {
+                return;
+            };
+            promise::spawn::spawn(async move {
+                let result = match domain.downcast_ref::<ClientDomain>() {
+                    Some(domain) => domain
+                        .set_frontend_access_mode(tab_id, mode, viewport)
+                        .await
+                        .map(|_| ()),
+                    None => Ok(()),
+                };
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    if let Err(err) = result {
+                        log::warn!("changing frontend access mode: {err:#}");
+                    } else {
+                        for pos in term_window.get_panes_to_render() {
+                            term_window.scroll_to_bottom(&pos.pane);
+                        }
+                        term_window.resize_mux_tabs_to_current_terminal_size();
+                    }
+                    term_window.update_title_post_status();
+                    term_window.invalidate_window();
+                })));
+                Ok::<(), anyhow::Error>(())
+            })
+            .detach();
+            return;
+        }
+
+        let Some(client_id) = mux.active_identity() else {
+            return;
+        };
+        let target = match mode {
+            codec::FrontendAccessMode::TmuxLatest => mux::FrontendAccessMode::TmuxLatest,
+            codec::FrontendAccessMode::Handoff => mux::FrontendAccessMode::Handoff,
+        };
+        let viewport = self.local_frontend_viewport_for_tab(&tab, true);
+        if let Err(err) =
+            mux.validate_frontend_access_mode_change(&client_id, target, tab_id, &viewport)
+        {
+            log::warn!("changing local frontend access mode: {err:#}");
+            return;
+        }
+        let prior = mux.frontend_access_state().mode;
+        if let Err(err) = wezterm_mux_server_impl::thinkterm_access::persist_mode(target) {
+            log::warn!("persisting local frontend access mode: {err:#}");
+            return;
+        }
+        if let Err(err) = mux.set_frontend_access_mode(&client_id, target, tab_id, viewport) {
+            if prior != target {
+                if let Err(rollback) =
+                    wezterm_mux_server_impl::thinkterm_access::persist_mode(prior)
+                {
+                    log::error!("rolling back local frontend mode: {rollback:#}");
+                }
+            }
+            log::warn!("changing local frontend access mode: {err:#}");
+            return;
+        }
+        for pos in self.get_panes_to_render() {
+            self.scroll_to_bottom(&pos.pane);
+        }
+        self.resize_mux_tabs_to_current_terminal_size();
+        self.update_title_post_status();
+        self.invalidate_window();
+    }
+
+    /// How this window would describe itself for `tab`, when that tab is
+    /// backed by a remote mux. `None` for a tab that is not.
+    ///
+    /// `include_panes` says whether the per-pane split is worth offering.
+    /// It is false for any tab this window is not currently drawing — its
+    /// split is not the one in force, and offering it would ask the server to
+    /// act on a layout nobody is looking at. The overall grid is still said,
+    /// because the server can only hand the viewport to a client whose
+    /// geometry it already holds: a tab this window has never described is a
+    /// tab it can never take back.
+    fn client_viewport_for_tab(
+        &self,
+        tab: &Arc<mux::tab::Tab>,
+        include_panes: bool,
+    ) -> Option<(Arc<dyn Domain>, codec::ClientViewport)> {
+        let mux = Mux::get();
+        let active_pane = tab.get_active_pane()?;
+        let client_pane = active_pane.downcast_ref::<ClientPane>()?;
+        let domain_id = client_pane.domain_id();
+        let domain = mux.get_domain(domain_id)?;
+        if !domain.is::<ClientDomain>() {
+            return None;
+        }
+        let panes = if include_panes {
+            self.get_panes_to_render()
+                .into_iter()
+                .filter_map(|positioned| {
+                    let pane = positioned.pane.downcast_ref::<ClientPane>()?;
+                    if pane.domain_id() != domain_id {
+                        return None;
+                    }
+                    let font_scale = self.pane_font_scale(positioned.pane.pane_id());
+                    let metrics = if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
+                        self.render_metrics
+                    } else {
+                        match self.pane_font_resources(font_scale) {
+                            Ok((_, metrics)) => metrics,
+                            Err(err) => {
+                                log::warn!("cannot calculate native viewport: {err:#}");
+                                return None;
+                            }
+                        }
+                    };
+                    Some(codec::ClientPaneViewport {
+                        pane_id: positioned.pane.pane_id(),
+                        size: self.terminal_size_for_positioned_pane(&positioned, metrics),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some((
+            domain,
+            codec::ClientViewport::Native {
+                size: self.terminal_size,
+                panes,
+            },
+        ))
+    }
+
+    /// Debounce resize-driven advertisements. Only the active tab has exact
+    /// pane rectangles; background tabs are never overwritten with an empty
+    /// native layout.
+    pub(crate) fn report_frontend_viewport(&self) {
+        if self
+            .frontend_viewport_report_pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.frontend_viewport_report_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        let pending = Arc::clone(&self.frontend_viewport_report_pending);
+        promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(120)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                pending.store(false, std::sync::atomic::Ordering::Release);
+                term_window.report_frontend_viewport_now();
+            })));
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn report_frontend_viewport_now(&mut self) {
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        if let Some(phase) = self.frontend_geometry_phases.get(&tab.tab_id()).copied() {
+            if phase.is_in_flight() {
+                self.frontend_geometry_resync_after_epoch
+                    .insert(tab.tab_id());
+            }
+            // Preview geometry is committed explicitly on divider release;
+            // in-flight geometry schedules one newest follow-up above.
+            return;
+        }
+        self.report_frontend_viewport_for_tab(&tab);
+    }
+
+    /// Immediately converge the active top-level tab. Discrete lifecycle
+    /// events (activation, tab creation, split completion and divider release)
+    /// use this instead of the window-resize debounce so the first paint is
+    /// already based on the current GUI geometry.
+    pub(crate) fn sync_active_tab_geometry_now(&mut self) {
+        if self.content_view_foreground() {
+            return;
+        }
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let tab_id = tab.tab_id();
+        let Some(active_pane) = tab.get_active_pane() else {
+            return;
+        };
+
+        if active_pane.downcast_ref::<ClientPane>().is_none() {
+            tab.resize(self.terminal_size);
+            self.reapply_collapsed_panes_for_tab(tab_id);
+            self.force_sync_active_mux_tab_pane_sizes();
+            self.report_frontend_viewport_for_tab(&tab);
+            self.invalidate_window();
+            return;
+        }
+
+        let ownership = self.tab_frontend_viewport_ownership(&tab);
+        let previewing = matches!(
+            self.frontend_geometry_phases.get(&tab_id),
+            Some(super::FrontendGeometryPhase::Previewing { .. })
+        );
+        let collaborative = self
+            .active_frontend_access_state()
+            .is_some_and(|state| state.mode == mux::FrontendAccessMode::TmuxLatest);
+
+        // A known passive renderer advertises availability without reshaping
+        // its mirror. The sole exception is an explicit A-mode layout preview:
+        // releasing its divider claims and commits that final geometry.
+        let action = frontend_geometry_action(ownership, collaborative, previewing);
+        if action == FrontendGeometryAction::Passive {
+            self.frontend_geometry_phases.remove(&tab_id);
+            self.report_frontend_viewport_for_tab(&tab);
+            self.invalidate_window();
+            return;
+        }
+        if self
+            .frontend_geometry_phases
+            .get(&tab_id)
+            .copied()
+            .is_some_and(super::FrontendGeometryPhase::is_in_flight)
+        {
+            self.frontend_geometry_resync_after_epoch.insert(tab_id);
+            return;
+        }
+        let takeover = action == FrontendGeometryAction::Set { takeover: true };
+        let claim = action == FrontendGeometryAction::Claim;
+        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, takeover) else {
+            return;
+        };
+        let Some((domain, viewport, adopted)) = self.prepare_client_frontend_geometry(&tab) else {
+            self.frontend_geometry_phases.remove(&tab_id);
+            self.invalidate_window();
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.frontend_geometry_phases.remove(&tab_id);
+            return;
+        };
+
+        promise::spawn::spawn(async move {
+            let result = match domain.downcast_ref::<ClientDomain>() {
+                Some(client_domain) => {
+                    let result = if claim {
+                        client_domain.claim_client_viewport(tab_id, viewport).await
+                    } else {
+                        client_domain.set_client_viewport(tab_id, viewport).await
+                    };
+                    if let Err(err) = &result {
+                        log::warn!("synchronizing active GUI tab geometry: {err:#}");
+                        if let Err(resync_err) = client_domain.resync().await {
+                            log::warn!(
+                                "resyncing after failed active tab geometry: {resync_err:#}"
+                            );
+                        }
+                    }
+                    // SetClientViewport is intentionally non-claiming.  It
+                    // succeeds even when another frontend owns B mode, in
+                    // which case the submitted geometry was only recorded
+                    // and will never be reflected by the server pane.  Do
+                    // not wait forever for that impossible confirmation.
+                    result.map(|_| client_domain.owns_remote_viewport(tab_id) == Some(true))
+                }
+                None => Err(anyhow::anyhow!("frontend domain is not a client domain")),
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let geometry_applied = result.as_ref().is_ok_and(|owns| *owns);
+                term_window.finish_frontend_geometry_epoch(
+                    tab_id,
+                    epoch,
+                    geometry_applied,
+                    &adopted,
+                );
+            })));
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn report_frontend_viewport_for_tab(&self, tab: &Arc<mux::tab::Tab>) {
+        let mux = Mux::get();
         let Some(active_pane) = tab.get_active_pane() else {
             return;
         };
         let tab_id = tab.tab_id();
-        let owns = self.tab_owns_frontend_viewport(&tab);
+        // Only the tab being drawn can offer a pane split, and only when it
+        // holds the lease; anything else describes a layout nobody sees.
+        let include_panes = self.active_tab_is(tab_id) && self.tab_owns_frontend_viewport(tab);
 
-        if let Some(client_pane) = active_pane.downcast_ref::<ClientPane>() {
-            let domain_id = client_pane.domain_id();
-            let Some(domain) = mux.get_domain(domain_id) else {
+        if active_pane.downcast_ref::<ClientPane>().is_some() {
+            let Some((domain, viewport)) = self.client_viewport_for_tab(tab, include_panes) else {
                 return;
             };
-            if !domain.is::<ClientDomain>() {
-                return;
-            }
-            let panes = if owns {
-                self.get_panes_to_render()
-                    .into_iter()
-                    .filter_map(|positioned| {
-                        let pane = positioned.pane.downcast_ref::<ClientPane>()?;
-                        if pane.domain_id() != domain_id {
-                            return None;
-                        }
-                        let font_scale = self.pane_font_scale(positioned.pane.pane_id());
-                        let metrics =
-                            if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
-                                self.render_metrics
-                            } else {
-                                match self.pane_font_resources(font_scale) {
-                                    Ok((_, metrics)) => metrics,
-                                    Err(err) => {
-                                        log::warn!("cannot calculate native viewport: {err:#}");
-                                        return None;
-                                    }
-                                }
-                            };
-                        Some(codec::ClientPaneViewport {
-                            pane_id: positioned.pane.pane_id(),
-                            size: self.terminal_size_for_positioned_pane(&positioned, metrics),
-                        })
-                    })
-                    .collect()
-            } else {
-                Vec::new()
+            let adopted = match &viewport {
+                codec::ClientViewport::Native { panes, .. } => panes
+                    .iter()
+                    .map(|pane| (pane.pane_id, pane.size))
+                    .collect::<Vec<_>>(),
+                codec::ClientViewport::CellGrid { .. } => Vec::new(),
             };
-            let viewport = codec::ClientViewport::Native {
-                size: self.terminal_size,
-                panes,
-            };
+            let window = self.window.as_ref().cloned();
             promise::spawn::spawn(async move {
-                let Some(domain) = domain.downcast_ref::<ClientDomain>() else {
+                let Some(client_domain) = domain.downcast_ref::<ClientDomain>() else {
                     return Ok::<(), anyhow::Error>(());
                 };
-                domain.set_client_viewport(tab_id, viewport).await?;
+                if let Err(err) = client_domain.set_client_viewport(tab_id, viewport).await {
+                    log::warn!("publishing GUI frontend viewport: {err:#}");
+                    if let Err(resync_err) = client_domain.resync().await {
+                        log::warn!("resyncing after failed GUI viewport: {resync_err:#}");
+                    }
+                    if let Some(window) = window {
+                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            let mux = Mux::get();
+                            for (pane_id, size) in &adopted {
+                                if let Some(pane) = mux.get_pane(*pane_id) {
+                                    if let Some(client) = pane.downcast_ref::<ClientPane>() {
+                                        client.forget_frontend_geometry(*size);
+                                    }
+                                }
+                            }
+                            term_window.invalidate_window();
+                        })));
+                    }
+                }
                 Ok(())
             })
             .detach();
             return;
         }
+        let owns = include_panes;
 
         // This GUI is itself hosting the authoritative mux. Register its
         // LocalPane viewport under the GUI's normal ClientId just like a
@@ -114,7 +887,21 @@ impl super::TermWindow {
         let Some(client_id) = mux.active_identity() else {
             return;
         };
-        let panes = if owns {
+        if let Err(err) = mux.set_client_viewport(
+            &client_id,
+            tab_id,
+            self.local_frontend_viewport_for_tab(tab, owns),
+        ) {
+            log::warn!("cannot publish local GUI viewport: {err:#}");
+        }
+    }
+
+    fn local_frontend_viewport_for_tab(
+        &self,
+        _tab: &Arc<mux::tab::Tab>,
+        include_panes: bool,
+    ) -> mux::FrontendViewport {
+        let panes = if include_panes {
             self.get_panes_to_render()
                 .into_iter()
                 .filter(|positioned| !positioned.pane.is_remote_mirror())
@@ -140,15 +927,9 @@ impl super::TermWindow {
         } else {
             Vec::new()
         };
-        if let Err(err) = mux.set_client_viewport(
-            &client_id,
-            tab_id,
-            mux::FrontendViewport::Native {
-                size: self.terminal_size,
-                panes,
-            },
-        ) {
-            log::warn!("cannot publish local GUI viewport: {err:#}");
+        mux::FrontendViewport::Native {
+            size: self.terminal_size,
+            panes,
         }
     }
 
@@ -456,7 +1237,11 @@ impl super::TermWindow {
             || dims.pixel_height != target_size.pixel_height
             || dims.dpi != target_size.dpi
         {
-            pos.pane.resize(target_size)?;
+            if let Some(client) = pos.pane.downcast_ref::<ClientPane>() {
+                client.adopt_frontend_geometry(target_size);
+            } else {
+                pos.pane.resize(target_size)?;
+            }
         }
 
         Ok(())
@@ -492,21 +1277,31 @@ impl super::TermWindow {
     }
 
     pub(crate) fn resize_mux_tabs_to_current_terminal_size(&mut self) {
-        if !self.owns_frontend_viewport() {
-            self.report_active_frontend_viewport();
-            return;
-        }
         let mux = Mux::get();
-        if let Some(window) = mux.get_window(self.mux_window_id) {
-            for tab in window.iter() {
-                if self.tab_owns_frontend_viewport(tab) {
-                    tab.resize(self.terminal_size);
-                }
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        match self.tab_frontend_viewport_ownership(&tab) {
+            None => {
+                // This is the common first-open race: the remote topology is
+                // already present but its access snapshot has not arrived.
+                // A passive report can make this client the first owner while
+                // leaving the old renderer geometry visible. Route it through
+                // the opaque takeover epoch so root and pane surfaces are
+                // converged before the first terminal frame.
+                self.sync_active_tab_geometry_now();
+                return;
             }
+            Some(false) => {
+                self.report_frontend_viewport();
+                return;
+            }
+            Some(true) => {}
         }
-        self.reapply_collapsed_panes_for_window();
+        tab.resize(self.terminal_size);
+        self.reapply_collapsed_panes_for_tab(tab.tab_id());
         self.force_sync_active_mux_tab_pane_sizes();
-        self.report_active_frontend_viewport();
+        self.report_frontend_viewport();
     }
 
     /// Repair a missed/deferred sidebar reflow before terminal geometry is
@@ -542,7 +1337,7 @@ impl super::TermWindow {
         if !tab.resize(self.terminal_size) {
             return;
         }
-        self.reapply_collapsed_panes_for_window();
+        self.reapply_collapsed_panes_for_tab(tab.tab_id());
         self.force_sync_active_mux_tab_pane_sizes();
     }
 
@@ -718,7 +1513,7 @@ impl super::TermWindow {
                 self.resize_mux_tabs_to_current_terminal_size();
             }
         } else {
-            self.report_active_frontend_viewport();
+            self.report_frontend_viewport();
             log::trace!("terminal size unchanged; syncing active pane geometry");
             if !self.content_view_foreground() {
                 self.sync_pane_font_sizes();
@@ -1070,5 +1865,76 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
         context.pixel_cell as usize
     } else {
         config.window_padding.right.evaluate_as_pixels(context) as usize
+    }
+}
+
+#[cfg(test)]
+mod frontend_geometry_tests {
+    use super::{
+        frontend_geometry_action, geometry_confirmation_settled, FrontendGeometryAction,
+        FRONTEND_GEOMETRY_SETTLE,
+    };
+    use crate::termwindow::FrontendGeometryPhase;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_takeover_geometry_obscures_the_terminal() {
+        assert!(!FrontendGeometryPhase::Previewing { epoch: 1 }.obscures_terminal());
+        assert!(!FrontendGeometryPhase::Committing { epoch: 2 }.obscures_terminal());
+        assert!(FrontendGeometryPhase::TakeoverSyncing { epoch: 3 }.obscures_terminal());
+    }
+
+    #[test]
+    fn geometry_action_separates_owner_updates_takeover_and_passive_tabs() {
+        assert_eq!(
+            frontend_geometry_action(Some(true), false, false),
+            FrontendGeometryAction::Set { takeover: false }
+        );
+        assert_eq!(
+            frontend_geometry_action(None, false, false),
+            FrontendGeometryAction::Set { takeover: true }
+        );
+        assert_eq!(
+            frontend_geometry_action(Some(false), false, false),
+            FrontendGeometryAction::Passive
+        );
+        assert_eq!(
+            frontend_geometry_action(Some(false), true, true),
+            FrontendGeometryAction::Claim
+        );
+    }
+
+    #[test]
+    fn takeover_geometry_must_remain_ready_for_a_stable_interval() {
+        let start = Instant::now();
+        let mut ready_since = None;
+
+        assert!(!geometry_confirmation_settled(
+            true,
+            start,
+            &mut ready_since
+        ));
+        assert!(!geometry_confirmation_settled(
+            true,
+            start + FRONTEND_GEOMETRY_SETTLE - Duration::from_millis(1),
+            &mut ready_since
+        ));
+        assert!(geometry_confirmation_settled(
+            true,
+            start + FRONTEND_GEOMETRY_SETTLE,
+            &mut ready_since
+        ));
+
+        assert!(!geometry_confirmation_settled(
+            false,
+            start + FRONTEND_GEOMETRY_SETTLE,
+            &mut ready_since
+        ));
+        assert_eq!(ready_since, None);
+        assert!(!geometry_confirmation_settled(
+            true,
+            start + FRONTEND_GEOMETRY_SETTLE,
+            &mut ready_since
+        ));
     }
 }

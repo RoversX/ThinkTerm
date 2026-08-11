@@ -58,13 +58,13 @@ fn clamp_pane_horizontal_span(
 fn visible_render_columns(
     requested_cols: usize,
     content_left: f32,
-    viewport_right: f32,
+    clip_right: f32,
     cell_width: f32,
 ) -> usize {
     if requested_cols == 0 || cell_width <= 0.0 {
         return 0;
     }
-    let visible_width = (viewport_right - content_left).max(0.0);
+    let visible_width = (clip_right - content_left).max(0.0);
     requested_cols.min((visible_width / cell_width).floor().max(0.0) as usize)
 }
 
@@ -95,7 +95,7 @@ mod pane_geometry_tests {
     }
 
     #[test]
-    fn terminal_columns_are_clipped_while_old_geometry_is_being_repaired() {
+    fn terminal_columns_are_clipped_to_the_current_pane_while_geometry_is_repaired() {
         assert_eq!(visible_render_columns(100, 354.0, 802.0, 10.0), 44);
         assert_eq!(visible_render_columns(30, 354.0, 802.0, 10.0), 30);
         assert_eq!(visible_render_columns(100, 900.0, 802.0, 10.0), 0);
@@ -1134,16 +1134,24 @@ impl crate::TermWindow {
         let content_left = padding_left
             + border.left.get() as f32
             + pos.left as f32 * global_render_metrics.cell_size.width as f32;
+        let pane_target_size = self.terminal_size_for_positioned_pane(pos, pane_render_metrics);
+        let pane_content_right =
+            (content_left + pos.pixel_width as f32).min(self.terminal_viewport_right());
         let visible_cols = visible_render_columns(
             dims.cols,
             content_left,
-            self.terminal_viewport_right(),
+            pane_content_right,
             pane_render_metrics.cell_size.width.max(1) as f32,
         );
         let mut render_dims = dims;
-        render_dims.cols = visible_cols;
-        render_dims.pixel_width =
-            visible_cols.saturating_mul(pane_render_metrics.cell_size.width.max(1) as usize);
+        render_dims.cols = visible_cols.min(pane_target_size.cols);
+        render_dims.viewport_rows = render_dims.viewport_rows.min(pane_target_size.rows);
+        render_dims.pixel_width = render_dims
+            .cols
+            .saturating_mul(pane_render_metrics.cell_size.width.max(1) as usize);
+        render_dims.pixel_height = render_dims
+            .viewport_rows
+            .saturating_mul(pane_render_metrics.cell_size.height.max(1) as usize);
 
         let gl_state = self.render_state.as_ref().unwrap();
 
@@ -1524,6 +1532,8 @@ impl crate::TermWindow {
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
                             + line_idx as f32 * self.render_metrics.cell_size.height as f32,
                         left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
+                        render_cols: self.dims.cols,
+                        render_pixel_width: self.dims.pixel_width,
                         phys_line_idx: line_idx,
                         reverse_video: self.dims.reverse_video,
                     };

@@ -1099,7 +1099,7 @@ impl Config {
                         file_name: Some(path_item.path.clone()),
                         lua: None,
                         warnings: vec![],
-                    }
+                    };
                 }
                 Ok(None) => continue,
                 Ok(Some(loaded)) => return loaded,
@@ -2001,6 +2001,11 @@ fn default_unicode_version() -> u8 {
 
 fn default_mux_env_remove() -> Vec<String> {
     vec![
+        // The remote proxy is intentionally launched without a tty.  Shell
+        // startup files sometimes translate that into NO_COLOR=1, which then
+        // leaks through the long-lived mux daemon into real PTY panes.  Color
+        // policy belongs to the pane/session, not to the transport process.
+        "NO_COLOR".to_string(),
         "SSH_AUTH_SOCK".to_string(),
         "SSH_CLIENT".to_string(),
         "SSH_CONNECTION".to_string(),
@@ -2410,8 +2415,8 @@ fn default_colr_rasterizer() -> FontRasterizerSelection {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_thinkterm_config_candidates, copy_legacy_data_item, migrate_legacy_data_dir, Config,
-        HOME_DIR, LEGACY_PRODUCT_DIR_NAME, PRODUCT_DIR_NAME,
+        active_thinkterm_config_candidates, copy_legacy_data_item, default_mux_env_remove,
+        migrate_legacy_data_dir, Config, HOME_DIR, LEGACY_PRODUCT_DIR_NAME, PRODUCT_DIR_NAME,
     };
     use std::sync::Mutex;
 
@@ -2590,6 +2595,13 @@ return config
             cmd.get_env("THINKTERM_VERSION"),
             cmd.get_env("TERM_PROGRAM_VERSION")
         );
+    }
+
+    #[test]
+    fn mux_does_not_inherit_proxy_color_policy() {
+        assert!(default_mux_env_remove()
+            .iter()
+            .any(|name| name == "NO_COLOR"));
     }
 
     #[test]

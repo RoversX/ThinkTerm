@@ -179,7 +179,7 @@ pub struct ClientPane {
     client: Arc<ClientInner>,
     local_pane_id: PaneId,
     pub remote_pane_id: PaneId,
-    remote_tab_id: AtomicUsize,
+    remote_tab_id: Arc<AtomicUsize>,
     pub renderable: Mutex<RenderableState>,
     configured_palette: Arc<Mutex<ColorPalette>>,
     /// Delivery state for the palette advisory: what we want the server to
@@ -307,14 +307,17 @@ impl ClientPane {
         alt_screen: bool,
     ) -> Self {
         let local_pane_id = alloc_pane_id();
+        let remote_tab_id = Arc::new(AtomicUsize::new(remote_tab_id));
         let writer = PaneWriter {
             client: Arc::clone(client),
             remote_pane_id,
+            remote_tab_id: Arc::clone(&remote_tab_id),
         };
 
         let mouse = Arc::new(Mutex::new(MouseState::new(
             remote_pane_id,
-            client.client.clone(),
+            Arc::clone(client),
+            Arc::clone(&remote_tab_id),
         )));
 
         let fetch_limiter =
@@ -364,7 +367,7 @@ impl ClientPane {
             mouse,
             remote_pane_id,
             local_pane_id,
-            remote_tab_id: AtomicUsize::new(remote_tab_id),
+            remote_tab_id,
             application_palette: Mutex::new(false),
             renderable: Mutex::new(render),
             writer: Mutex::new(writer),
@@ -542,6 +545,18 @@ impl ClientPane {
         self.client.owns_remote_viewport(self.remote_tab_id())
     }
 
+    pub fn remote_access_state(&self) -> Option<codec::FrontendAccessState> {
+        self.client.remote_access_state()
+    }
+
+    pub fn has_remote_access(&self) -> Option<bool> {
+        self.client.has_remote_access()
+    }
+
+    pub fn remote_frontend_gate(&self) -> crate::domain::RemoteFrontendGate {
+        self.client.remote_frontend_gate()
+    }
+
     pub(crate) fn set_remote_tab_id(&self, remote_tab_id: TabId) {
         self.remote_tab_id.store(remote_tab_id, Ordering::Relaxed);
     }
@@ -555,17 +570,27 @@ impl ClientPane {
     /// this, the next resync would flip the local stack back to the server's
     /// stale active pane.
     pub fn activate_in_stack_on_server(&self) {
+        if self.client.remote_tab_input_is_blocked() {
+            return;
+        }
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id();
         promise::spawn::spawn(async move {
-            if let Err(err) = client
-                .client
-                .activate_pane_in_stack(codec::ActivatePaneInStack {
-                    pane_id: remote_pane_id,
-                })
-                .await
-            {
-                log::error!("remote stack activation failed: {err:#}");
+            match client.prepare_remote_tab_input(remote_tab_id).await {
+                Ok(true) => {
+                    if let Err(err) = client
+                        .client
+                        .activate_pane_in_stack(codec::ActivatePaneInStack {
+                            pane_id: remote_pane_id,
+                        })
+                        .await
+                    {
+                        log::error!("remote stack activation failed: {err:#}");
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => log::error!("remote stack activation claim failed: {err:#}"),
             }
         })
         .detach();
@@ -581,10 +606,53 @@ impl ClientPane {
         *self.ignore_next_kill.lock() = true;
     }
 
+    /// Adopt geometry that is carried by a complete frontend viewport RPC.
+    ///
+    /// The GUI has already computed the tab root and every split pane from a
+    /// single layout pass.  Updating the local render surface here makes that
+    /// geometry visible atomically with the viewport request, while recording
+    /// the requested size prevents the normal `Pane::resize` path from
+    /// following up with a duplicate per-pane Resize RPC.
+    pub fn adopt_frontend_geometry(&self, size: TerminalSize) -> bool {
+        *self.requested_size.lock() = Some(size);
+        let render = self.renderable.lock();
+        let mut inner = render.inner.borrow_mut();
+        let changed = inner.apply_local_resize(size);
+        if changed {
+            inner.update_last_send();
+        }
+        changed
+    }
+
+    /// Forget a geometry adoption when the complete viewport RPC failed.
+    /// A later authoritative resync can then establish the server's actual
+    /// dimensions instead of having the failed request remain a dedupe key.
+    pub fn forget_frontend_geometry(&self, size: TerminalSize) {
+        let mut requested = self.requested_size.lock();
+        if requested.as_ref() == Some(&size) {
+            requested.take();
+        }
+    }
+
+    /// Prime and verify the remote render snapshot for an optimistically
+    /// adopted frontend size.  GUI takeover uses this while its opaque mask is
+    /// still present, so a full-screen application cannot expose its old grid
+    /// or incremental redraw after the ownership RPC completes.
+    pub fn prime_frontend_geometry(&self, size: TerminalSize) -> bool {
+        self.renderable.lock().prime_frontend_geometry(size)
+    }
+
     /// End the remote pane and wait for the mux server to acknowledge it.
     /// Destructive compound workflows use this instead of `Pane::kill`, whose
     /// fire-and-forget task can lose a race with detaching the last window.
     pub async fn kill_remote_and_wait(&self) -> anyhow::Result<()> {
+        if !self
+            .client
+            .prepare_remote_tab_input(self.remote_tab_id())
+            .await?
+        {
+            anyhow::bail!("terminal is being operated on another device");
+        }
         self.client
             .client
             .kill_pane(KillPane {
@@ -673,9 +741,13 @@ impl Pane for ClientPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
+        if self.client.remote_tab_input_is_blocked() {
+            return Ok(());
+        }
         Mux::get().record_input_for_current_identity();
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id();
         self.renderable
             .lock()
             .inner
@@ -684,13 +756,16 @@ impl Pane for ClientPane {
 
         let data = text.to_owned();
         promise::spawn::spawn(async move {
-            client
-                .client
-                .send_paste(SendPaste {
-                    pane_id: remote_pane_id,
-                    data,
-                })
-                .await
+            if client.prepare_remote_tab_input(remote_tab_id).await? {
+                client
+                    .client
+                    .send_paste(SendPaste {
+                        pane_id: remote_pane_id,
+                        data,
+                    })
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
         })
         .detach();
         self.renderable.lock().inner.borrow_mut().update_last_send();
@@ -709,6 +784,9 @@ impl Pane for ClientPane {
     }
 
     fn set_zoomed(&self, zoomed: bool) {
+        if self.client.remote_tab_input_is_blocked() {
+            return;
+        }
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
         let client = Arc::clone(&self.client);
@@ -717,14 +795,17 @@ impl Pane for ClientPane {
         // Invalidate any cached rows on a resize
         inner.make_all_stale();
         promise::spawn::spawn(async move {
-            client
-                .client
-                .set_zoomed(SetPaneZoomed {
-                    containing_tab_id: remote_tab_id,
-                    pane_id: remote_pane_id,
-                    zoomed,
-                })
-                .await
+            if client.prepare_remote_tab_input(remote_tab_id).await? {
+                client
+                    .client
+                    .set_zoomed(SetPaneZoomed {
+                        containing_tab_id: remote_tab_id,
+                        pane_id: remote_pane_id,
+                        zoomed,
+                    })
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
         })
         .detach();
         inner.update_last_send();
@@ -816,6 +897,9 @@ impl Pane for ClientPane {
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        if self.client.remote_tab_input_is_blocked() {
+            return Ok(());
+        }
         Mux::get().record_input_for_current_identity();
         let input_serial;
         {
@@ -827,18 +911,22 @@ impl Pane for ClientPane {
         }
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id();
         promise::spawn::spawn(async move {
-            client
-                .client
-                .key_down(SendKeyDown {
-                    pane_id: remote_pane_id,
-                    event: KeyEvent {
-                        key,
-                        modifiers: mods,
-                    },
-                    input_serial,
-                })
-                .await
+            if client.prepare_remote_tab_input(remote_tab_id).await? {
+                client
+                    .client
+                    .key_down(SendKeyDown {
+                        pane_id: remote_pane_id,
+                        event: KeyEvent {
+                            key,
+                            modifiers: mods,
+                        },
+                        input_serial,
+                    })
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
         })
         .detach();
         self.renderable.lock().inner.borrow_mut().update_last_send();
@@ -856,8 +944,12 @@ impl Pane for ClientPane {
             *ignore = false;
             return;
         }
+        if self.client.remote_tab_input_is_blocked() {
+            return;
+        }
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id();
         let local_domain_id = self.client.local_domain_id;
 
         // We only want to ask the server to kill the pane if the user
@@ -879,18 +971,24 @@ impl Pane for ClientPane {
 
         if send_kill {
             promise::spawn::spawn(async move {
-                client
-                    .client
-                    .kill_pane(KillPane {
-                        pane_id: remote_pane_id,
-                    })
-                    .await
+                if client.prepare_remote_tab_input(remote_tab_id).await? {
+                    client
+                        .client
+                        .kill_pane(KillPane {
+                            pane_id: remote_pane_id,
+                        })
+                        .await?;
+                }
+                Ok::<(), anyhow::Error>(())
             })
             .detach();
         }
     }
 
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
+        if self.client.remote_tab_input_is_blocked() {
+            return Ok(());
+        }
         Mux::get().record_input_for_current_identity();
         self.mouse.lock().append(event);
         if MouseState::next(Arc::clone(&self.mouse)) {
@@ -943,21 +1041,31 @@ impl Pane for ClientPane {
     }
 
     fn erase_scrollback(&self, erase_mode: ScrollbackEraseMode) {
+        if self.client.remote_tab_input_is_blocked() {
+            return;
+        }
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id();
         promise::spawn::spawn(async move {
-            client
-                .client
-                .erase_scrollback(EraseScrollbackRequest {
-                    pane_id: remote_pane_id,
-                    erase_mode,
-                })
-                .await
+            if client.prepare_remote_tab_input(remote_tab_id).await? {
+                client
+                    .client
+                    .erase_scrollback(EraseScrollbackRequest {
+                        pane_id: remote_pane_id,
+                        erase_mode,
+                    })
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
         })
         .detach();
     }
 
     fn advise_focus(&self) {
+        if self.client.remote_tab_input_is_blocked() {
+            return;
+        }
         let mut focused_pane = self.client.focused_remote_pane_id.lock().unwrap();
         if *focused_pane != Some(self.remote_pane_id) {
             focused_pane.replace(self.remote_pane_id);
@@ -1045,14 +1153,28 @@ impl Pane for ClientPane {
 struct PaneWriter {
     client: Arc<ClientInner>,
     remote_pane_id: TabId,
+    remote_tab_id: Arc<AtomicUsize>,
 }
 
 impl std::io::Write for PaneWriter {
     fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
-        promise::spawn::block_on(self.client.client.write_to_pane(WriteToPane {
-            pane_id: self.remote_pane_id,
-            data: data.to_vec(),
-        }))
+        if self.client.remote_tab_input_is_blocked() {
+            return Ok(data.len());
+        }
+        let remote_tab_id = self.remote_tab_id.load(Ordering::Relaxed);
+        let payload = data.to_vec();
+        promise::spawn::block_on(async {
+            if self.client.prepare_remote_tab_input(remote_tab_id).await? {
+                self.client
+                    .client
+                    .write_to_pane(WriteToPane {
+                        pane_id: self.remote_pane_id,
+                        data: payload,
+                    })
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
         Ok(data.len())
     }

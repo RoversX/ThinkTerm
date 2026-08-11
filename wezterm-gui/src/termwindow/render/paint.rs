@@ -17,6 +17,163 @@ pub enum AllowImage {
 }
 
 impl crate::TermWindow {
+    fn paint_frontend_handoff_overlay(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+    ) -> anyhow::Result<bool> {
+        let gate = self.frontend_terminal_gate();
+        let Some((title, hint)) = gate.overlay_message() else {
+            return Ok(false);
+        };
+        let now = Instant::now();
+        let animation_ms = self.created.elapsed().as_millis() as u64;
+        let eyes_closed = animation_ms % 5_000 >= 4_750;
+        // Reuse the renderer's existing animation wakeup. Once the overlay is
+        // gone no next frame is requested, so an ordinary terminal remains
+        // fully draw-on-demand.
+        self.update_next_frame_time(Some(now + Duration::from_millis(125)));
+        let area = self.content_view_area();
+        let palette = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        self.filled_rectangle(layers, 0, area, palette.window_bg)
+            .context("frontend handoff opaque background")?;
+
+        let font_size = crate::native_settings::home_font_size(&crate::native_settings::load());
+        let title_font = self.fonts.title_font_with_size(font_size + 2.0)?;
+        let hint_font = self.fonts.title_font_with_size(font_size)?;
+        let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&title_font.metrics());
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &metrics);
+        let title_width = ctx.measure_text_width(&title_font, &title);
+        let hint_width = ctx.measure_text_width(&hint_font, &hint);
+        let line_height = metrics.cell_size.height as f32;
+        let eyes = if eyes_closed { "─  ─" } else { "•  •" };
+        let eyes_width = ctx.measure_text_width(&title_font, eyes);
+        let eyes_height = line_height;
+        let show_eyes = area.size.width >= 160.0 && area.size.height >= 100.0;
+        let text_height = line_height * 2.4;
+        let group_height = if show_eyes {
+            eyes_height + line_height * 1.1 + text_height
+        } else {
+            text_height
+        };
+        let x_title = area.origin.x + ((area.size.width - title_width).max(0.0) / 2.0);
+        let x_hint = area.origin.x + ((area.size.width - hint_width).max(0.0) / 2.0);
+        let group_y = area.origin.y + ((area.size.height - group_height).max(0.0) / 2.0);
+
+        // One measured text run keeps the two eyes centered as a unit across
+        // fonts and display scales, without introducing a mascot asset.
+        if show_eyes {
+            let x_eyes = area.origin.x + ((area.size.width - eyes_width).max(0.0) / 2.0);
+            ctx.draw_text_on_layer(
+                layers,
+                2,
+                &title_font,
+                x_eyes,
+                group_y,
+                eyes,
+                palette.text,
+                area.size.width,
+            )?;
+        }
+
+        let y_title = if show_eyes {
+            group_y + eyes_height + line_height * 1.1
+        } else {
+            group_y
+        };
+        ctx.draw_text_on_layer(
+            layers,
+            2,
+            &title_font,
+            x_title,
+            y_title,
+            &title,
+            palette.text,
+            area.size.width,
+        )?;
+        ctx.draw_text_on_layer(
+            layers,
+            2,
+            &hint_font,
+            x_hint,
+            y_title + line_height * 1.4,
+            &hint,
+            palette.secondary_text,
+            area.size.width,
+        )?;
+        Ok(true)
+    }
+
+    /// In A mode a follower keeps the canonical PTY grid. If its window is
+    /// larger, mark the renderer-only remainder with a faint cell grid rather
+    /// than stretching or reflowing terminal data that belongs to the owner.
+    fn paint_frontend_shared_unused_grid(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+    ) -> anyhow::Result<()> {
+        let Some(state) = self.active_remote_frontend_viewport_state() else {
+            return Ok(());
+        };
+        if state.access.mode != codec::FrontendAccessMode::TmuxLatest
+            || self.owns_frontend_viewport()
+        {
+            return Ok(());
+        }
+        let area = self.content_view_area();
+        let cell_w = self.render_metrics.cell_size.width.max(1) as f32;
+        let cell_h = self.render_metrics.cell_size.height.max(1) as f32;
+        let used_w = (state.canonical_size.cols as f32 * cell_w).min(area.size.width);
+        let used_h = (state.canonical_size.rows as f32 * cell_h).min(area.size.height);
+        if used_w >= area.size.width && used_h >= area.size.height {
+            return Ok(());
+        }
+        let palette = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let line = palette.muted_text.mul_alpha(0.10);
+        let right_x = area.origin.x + used_w;
+        let bottom_y = area.origin.y + used_h;
+
+        let mut x = right_x;
+        while x <= area.max_x() {
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(x, area.origin.y, 1.0, area.size.height),
+                line,
+            )?;
+            x += cell_w;
+        }
+        let mut y = area.origin.y;
+        while y <= area.max_y() {
+            if right_x < area.max_x() {
+                self.filled_rectangle(
+                    layers,
+                    0,
+                    euclid::rect(right_x, y, area.max_x() - right_x, 1.0),
+                    line,
+                )?;
+            }
+            y += cell_h;
+        }
+        y = bottom_y;
+        while y <= area.max_y() {
+            self.filled_rectangle(layers, 0, euclid::rect(area.origin.x, y, used_w, 1.0), line)?;
+            y += cell_h;
+        }
+        x = area.origin.x;
+        while x <= right_x {
+            if bottom_y < area.max_y() {
+                self.filled_rectangle(
+                    layers,
+                    0,
+                    euclid::rect(x, bottom_y, 1.0, area.max_y() - bottom_y),
+                    line,
+                )?;
+            }
+            x += cell_w;
+        }
+        Ok(())
+    }
+
     fn damp_scroll_value(current: f32, target: f32) -> (f32, bool) {
         let delta = target - current;
         if delta.abs() <= 0.75 {
@@ -735,6 +892,15 @@ impl crate::TermWindow {
         let content_view_active = self.content_view_foreground();
 
         if !content_view_active {
+            // Takeover remains opaque while this actively polls and hydrates
+            // the post-resize remote screen.  Once every pane is coherent the
+            // matching epoch is cleared before `frontend_blocked` is sampled.
+            self.advance_frontend_geometry_confirmation();
+        }
+
+        let frontend_blocked = !content_view_active && self.frontend_surface_blocked();
+
+        if !content_view_active && !frontend_blocked {
             for pos in panes {
                 if pos.is_active {
                     self.update_text_cursor(&pos);
@@ -753,11 +919,18 @@ impl crate::TermWindow {
                         .context("paint_split")?;
                 }
             }
+            self.paint_frontend_shared_unused_grid(&mut layers)
+                .context("paint shared unused grid")?;
         }
 
-        if !content_view_active {
+        if !content_view_active && !frontend_blocked {
             self.paint_bottom_quote(&mut layers)
                 .context("paint_bottom_quote")?;
+        }
+
+        if frontend_blocked {
+            self.paint_frontend_handoff_overlay(&mut layers)
+                .context("paint frontend handoff overlay")?;
         }
 
         if content_view_active {

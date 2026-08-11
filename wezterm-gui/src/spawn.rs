@@ -43,6 +43,7 @@ pub fn spawn_command_impl(
                                 action(tw);
                             }
                             if let Some(reason) = layout_mutation_reason {
+                                tw.sync_active_tab_geometry_now();
                                 tw.persist_workspace_layout_after_mutation(reason);
                             }
                         },

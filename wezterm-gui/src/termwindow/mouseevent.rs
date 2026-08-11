@@ -1221,6 +1221,53 @@ impl super::TermWindow {
         log::trace!("{:?}", event);
         let pane = self.get_active_pane_or_overlay();
 
+        if self.frontend_handoff_consumed_press && matches!(event.kind, WMEK::Release(_)) {
+            self.frontend_handoff_consumed_press = false;
+            return;
+        }
+
+        // Hit-test first. Tab bar, sidebars, menus and OS chrome stay usable
+        // without silently taking a terminal away from another device.
+        let area = self.content_view_area();
+        let point_is_in_terminal_area = !self.content_view_foreground()
+            && (event.coords.x as f32) >= area.min_x()
+            && (event.coords.x as f32) < area.max_x()
+            && (event.coords.y as f32) >= area.min_y()
+            && (event.coords.y as f32) < area.max_y();
+        let terminal_ui_item = self.resolve_ui_item(&event).is_some_and(|item| {
+            matches!(
+                item.item_type,
+                UIItemType::PaneNav { .. }
+                    | UIItemType::AboveScrollThumb
+                    | UIItemType::ScrollThumb
+                    | UIItemType::BelowScrollThumb
+                    | UIItemType::Split(_)
+            )
+        });
+        let terminal_surface = point_is_in_terminal_area
+            && (self.resolve_ui_item(&event).is_none() || terminal_ui_item);
+        let takeover_gesture = matches!(
+            event.kind,
+            WMEK::Press(_) | WMEK::VertWheel(_) | WMEK::HorzWheel(_)
+        );
+
+        if terminal_surface && self.frontend_surface_blocked() {
+            if takeover_gesture && self.frontend_takeover_claimable() {
+                self.frontend_handoff_consumed_press = matches!(event.kind, WMEK::Press(_));
+                self.claim_frontend_viewport_for_interaction();
+                context.invalidate();
+            }
+            // The opaque handoff surface consumes the triggering gesture and
+            // all pointer traffic while blocked; nothing leaks to the pane.
+            return;
+        }
+        if terminal_surface && takeover_gesture {
+            // In shared mode this updates the per-tab layout owner. The event
+            // itself may continue; ClientPane serializes forwarded input behind
+            // the same geometry-bearing claim.
+            self.claim_frontend_viewport_for_interaction();
+        }
+
         self.current_mouse_event.replace(event.clone());
 
         if self.consume_context_menu_suppressed_release(&event) {
@@ -1358,6 +1405,7 @@ impl super::TermWindow {
                         .as_ref()
                         .is_some_and(|(item, _)| matches!(item.item_type, UIItemType::Split(_)))
                     {
+                        self.sync_active_tab_geometry_now();
                         self.persist_workspace_layout_after_mutation("split drag released");
                     }
                     if completed_drag.as_ref().is_some_and(|(item, _)| {
@@ -1677,6 +1725,7 @@ impl super::TermWindow {
 
         if delta != 0 {
             tab.resize_split_by(split.index, delta);
+            self.preview_active_tab_geometry_now();
             if let Some(split) = tab.iter_splits().into_iter().nth(split.index) {
                 item.item_type = UIItemType::Split(split);
                 context.invalidate();
@@ -2608,6 +2657,9 @@ impl super::TermWindow {
                                     if let Some(tab) = Mux::get().get_tab(dest_tab_id) {
                                         tab.set_active_pane(&moved);
                                     }
+                                    if term_window.active_tab_is(dest_tab_id) {
+                                        term_window.sync_active_tab_geometry_now();
+                                    }
                                     if term_window.current_mux_workspace() == workspace {
                                         term_window.persist_workspace_layout_after_mutation(
                                             "pane tab drop move",
@@ -2686,6 +2738,9 @@ impl super::TermWindow {
                                         // directions end focused on the moved
                                         // pane.
                                         tab.set_active_pane(&moved);
+                                    }
+                                    if term_window.active_tab_is(dest_tab_id) {
+                                        term_window.sync_active_tab_geometry_now();
                                     }
                                     if term_window.current_mux_workspace() == workspace {
                                         term_window.persist_workspace_layout_after_mutation(
@@ -5973,10 +6028,12 @@ impl super::TermWindow {
                 self.spawn_pane_nav_tab(pane_id, pane_index);
             }
             PaneNavAction::ToggleZoom => {
+                self.claim_frontend_viewport_for_interaction();
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
                     tab.set_active_idx(pane_index);
                     tab.toggle_zoom();
                 }
+                self.sync_active_tab_geometry_now();
             }
             PaneNavAction::ToggleCollapse => {
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
@@ -6026,6 +6083,7 @@ impl super::TermWindow {
                         }
                     }
                 }
+                self.sync_active_tab_geometry_now();
             }
             PaneNavAction::SplitRight | PaneNavAction::SplitDown => {
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
@@ -6102,6 +6160,7 @@ impl super::TermWindow {
             window
                 .window
                 .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.sync_active_tab_geometry_now();
                     term_window.update_title();
                     if let Some(window) = term_window.window.as_ref() {
                         window.invalidate();
@@ -6515,7 +6574,7 @@ impl super::TermWindow {
         }
     }
 
-    fn terminal_context_menu_items(&self) -> Vec<ContextMenuItem> {
+    fn terminal_context_menu_items(&mut self) -> Vec<ContextMenuItem> {
         fn split_item(
             label: String,
             icon: ContextMenuIcon,
@@ -6533,7 +6592,8 @@ impl super::TermWindow {
             )
         }
 
-        vec![
+        self.begin_context_menu_application_actions();
+        let mut items = vec![
             ContextMenuItem::item_with_icon(
                 crate::i18n::tr("menu-copy"),
                 ContextMenuIcon::Copy,
@@ -6571,7 +6631,48 @@ impl super::TermWindow {
                 ContextMenuIcon::Refresh,
                 KeyAssignment::ResetTerminal,
             ),
-        ]
+        ];
+        let current_mode = self
+            .active_frontend_access_state()
+            .map(|state| state.mode)
+            .unwrap_or(mux::FrontendAccessMode::Handoff);
+        let modes = [
+            (
+                "A · Shared (tmux-like)",
+                codec::FrontendAccessMode::TmuxLatest,
+                mux::FrontendAccessMode::TmuxLatest,
+            ),
+            (
+                "B · Handoff (exclusive)",
+                codec::FrontendAccessMode::Handoff,
+                mux::FrontendAccessMode::Handoff,
+            ),
+        ];
+        let children = modes
+            .iter()
+            .copied()
+            .map(|(label, codec_mode, mux_mode)| {
+                self.context_menu_application_item_with_icon(
+                    label,
+                    if current_mode == mux_mode {
+                        ContextMenuIcon::Check
+                    } else {
+                        ContextMenuIcon::Terminal
+                    },
+                    crate::termwindow::ContextMenuApplicationAction::SetFrontendAccessMode(
+                        codec_mode,
+                    ),
+                    true,
+                )
+            })
+            .collect();
+        items.push(ContextMenuItem::Separator);
+        items.push(ContextMenuItem::submenu_with_icon(
+            "Frontend access",
+            ContextMenuIcon::Terminal,
+            children,
+        ));
+        items
     }
 
     fn right_sidebar_note_context_menu_items(
@@ -7043,7 +7144,8 @@ impl super::TermWindow {
             && matches!(event.kind, WMEK::Release(MousePress::Right))
             && !pane.is_mouse_grabbed()
         {
-            self.show_term_context_menu(context, event.coords, self.terminal_context_menu_items());
+            let items = self.terminal_context_menu_items();
+            self.show_term_context_menu(context, event.coords, items);
             return;
         }
 

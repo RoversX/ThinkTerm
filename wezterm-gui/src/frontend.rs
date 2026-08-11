@@ -132,6 +132,7 @@ impl GuiFrontEnd {
                 MuxNotification::ThinkTermTreeChanged => {}
                 MuxNotification::ThinkTermSessionChanged => {}
                 MuxNotification::FrontendLeaseChanged(_) => {}
+                MuxNotification::FrontendAccessChanged(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}
                 MuxNotification::PaneRemoved(_) => {}
                 MuxNotification::WindowInvalidated(_) => {}

@@ -9,7 +9,7 @@ use filedescriptor::FileDescriptor;
 use futures::FutureExt;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
-use mux::domain::DomainId;
+use mux::domain::{Domain, DomainId};
 use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui_and_password;
 use mux::Mux;
@@ -19,7 +19,7 @@ use portable_pty::Child;
 use smol::channel::{bounded, unbounded, Receiver, Sender};
 use smol::prelude::*;
 use smol::{block_on, Async};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
@@ -30,7 +30,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -52,11 +52,122 @@ enum ReaderMessage {
     SendPdu {
         pdu: Pdu,
         promise: Sender<anyhow::Result<Pdu>>,
+        registration_required: bool,
+    },
+    /// `SetClientId` was acknowledged for this connection generation.  Only
+    /// now may ordinary RPCs queued during reconnect reach the new session.
+    RegistrationComplete {
+        connection_generation: u64,
+    },
+    /// Tear down a generation whose transport connected but whose topology
+    /// could not be restored. The normal reconnect loop will make a fresh
+    /// transport and repeat the complete bootstrap.
+    AbortGeneration {
+        connection_generation: u64,
+        reason: String,
     },
     Readable,
     /// The connection has been idle for a while: send a keepalive ping,
     /// or declare the transport dead if the previous ping went unanswered.
     KeepaliveTick,
+}
+
+struct RegistrationBarrier<T> {
+    complete: bool,
+    deferred: VecDeque<T>,
+}
+
+impl<T> RegistrationBarrier<T> {
+    fn new() -> Self {
+        Self {
+            complete: false,
+            deferred: VecDeque::new(),
+        }
+    }
+
+    fn submit(&mut self, item: T, registration_required: bool) -> Option<T> {
+        if registration_required && !self.complete {
+            self.deferred.push_back(item);
+            None
+        } else {
+            Some(item)
+        }
+    }
+
+    fn complete(&mut self) -> VecDeque<T> {
+        self.complete = true;
+        std::mem::take(&mut self.deferred)
+    }
+
+    fn drain(&mut self) -> VecDeque<T> {
+        std::mem::take(&mut self.deferred)
+    }
+}
+
+struct PduRegistrationBarrier {
+    inner: RegistrationBarrier<(Pdu, Sender<anyhow::Result<Pdu>>)>,
+}
+
+impl PduRegistrationBarrier {
+    fn new() -> Self {
+        Self {
+            inner: RegistrationBarrier::new(),
+        }
+    }
+
+    fn submit(
+        &mut self,
+        item: (Pdu, Sender<anyhow::Result<Pdu>>),
+        registration_required: bool,
+    ) -> Option<(Pdu, Sender<anyhow::Result<Pdu>>)> {
+        self.inner.submit(item, registration_required)
+    }
+
+    fn complete(&mut self) -> VecDeque<(Pdu, Sender<anyhow::Result<Pdu>>)> {
+        self.inner.complete()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.inner.complete
+    }
+
+    fn fail_deferred(&mut self, reason: &str) {
+        for (_, promise) in self.inner.drain() {
+            let _ = promise.try_send(Err(anyhow!(reason.to_string())));
+        }
+    }
+}
+
+impl Drop for PduRegistrationBarrier {
+    fn drop(&mut self) {
+        self.fail_deferred("reconnect generation ended before mux client registration completed");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClientConnectionPhase {
+    Connecting = 0,
+    Registering = 1,
+    Syncing = 2,
+    Ready = 3,
+    Reconnecting = 4,
+    Suspended = 5,
+    Detached = 6,
+}
+
+impl ClientConnectionPhase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Connecting,
+            1 => Self::Registering,
+            2 => Self::Syncing,
+            3 => Self::Ready,
+            4 => Self::Reconnecting,
+            5 => Self::Suspended,
+            _ => Self::Detached,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -67,16 +178,10 @@ pub struct Client {
     client_domain_config: ClientDomainConfig,
     pub is_reconnectable: bool,
     pub is_local: bool,
-    /// True from the moment the transport dies until a reconnect succeeds
-    /// (or retries are suspended). Pane-level tardiness only trips after
-    /// something is SENT on the pane, so it misses idle disconnects; this
-    /// is the authoritative connection-health signal for GUI indicators.
-    is_reconnecting: Arc<AtomicBool>,
-    /// True once automatic reconnection has failed continuously for the
-    /// give-up window: the retry loop is parked (nothing is torn down)
-    /// until resume_reconnect() is called, e.g. from a GUI Reconnect
-    /// button.
-    reconnect_suspended: Arc<AtomicBool>,
+    /// Authoritative lifecycle of the current transport generation. A socket
+    /// becoming writable is not Ready: the mux identity and topology must be
+    /// restored first.
+    connection_phase: Arc<AtomicU8>,
     resume_reconnect_tx: std::sync::mpsc::Sender<()>,
     remote_server_id: Arc<RwLock<Option<String>>>,
     /// Process-unique identity of the currently attached transport.  A
@@ -86,12 +191,26 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn connection_phase(&self) -> ClientConnectionPhase {
+        ClientConnectionPhase::from_u8(self.connection_phase.load(Ordering::Acquire))
+    }
+
+    fn set_connection_phase(&self, phase: ClientConnectionPhase) {
+        self.connection_phase.store(phase as u8, Ordering::Release);
+        crate::domain::wake_thinkterm_frontend();
+    }
+
     pub fn is_reconnecting(&self) -> bool {
-        self.is_reconnecting.load(Ordering::Relaxed)
+        matches!(
+            self.connection_phase(),
+            ClientConnectionPhase::Registering
+                | ClientConnectionPhase::Syncing
+                | ClientConnectionPhase::Reconnecting
+        )
     }
 
     pub fn reconnect_is_suspended(&self) -> bool {
-        self.reconnect_suspended.load(Ordering::Relaxed)
+        self.connection_phase() == ClientConnectionPhase::Suspended
     }
 
     /// Wake a parked reconnect loop for another round of retries.
@@ -105,6 +224,29 @@ impl Client {
 
     pub fn connection_generation(&self) -> u64 {
         self.connection_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_ready(&self) {
+        self.set_connection_phase(ClientConnectionPhase::Ready);
+    }
+
+    fn mark_registration_complete(&self) -> anyhow::Result<()> {
+        let connection_generation = self.connection_generation();
+        self.sender
+            .try_send(ReaderMessage::RegistrationComplete {
+                connection_generation,
+            })
+            .map_err(|_| ChannelSendError)
+            .context("marking mux client registration complete")?;
+        self.set_connection_phase(ClientConnectionPhase::Syncing);
+        Ok(())
+    }
+
+    pub(crate) fn abort_connection_generation(&self, connection_generation: u64, reason: String) {
+        let _ = self.sender.try_send(ReaderMessage::AbortGeneration {
+            connection_generation,
+            reason,
+        });
     }
 }
 
@@ -160,9 +302,15 @@ macro_rules! rpc {
     };
 }
 
-fn process_unilateral_inner(pane_id: PaneId, local_domain_id: DomainId, decoded: DecodedPdu) {
+fn process_unilateral_inner(
+    pane_id: PaneId,
+    local_domain_id: DomainId,
+    connection_generation: u64,
+    decoded: DecodedPdu,
+) {
     promise::spawn::spawn(async move {
-        process_unilateral_inner_async(pane_id, local_domain_id, decoded).await?;
+        process_unilateral_inner_async(pane_id, local_domain_id, connection_generation, decoded)
+            .await?;
         Ok::<(), anyhow::Error>(())
     })
     .detach();
@@ -171,6 +319,7 @@ fn process_unilateral_inner(pane_id: PaneId, local_domain_id: DomainId, decoded:
 async fn process_unilateral_inner_async(
     pane_id: PaneId,
     local_domain_id: DomainId,
+    connection_generation: u64,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
     let mux = match Mux::try_get() {
@@ -187,6 +336,9 @@ async fn process_unilateral_inner_async(
     let client_domain = client_domain
         .downcast_ref::<ClientDomain>()
         .ok_or_else(|| anyhow!("domain {} is not a ClientDomain instance", local_domain_id))?;
+    if client_domain.connection_generation() != Some(connection_generation) {
+        return Ok(());
+    }
 
     // If we get a push for a pane that we don't yet know about,
     // it means that some other client has manipulated the mux
@@ -196,6 +348,9 @@ async fn process_unilateral_inner_async(
         None => {
             log::debug!("got {decoded:?}, pane not found locally, resync");
             client_domain.resync().await?;
+            if client_domain.connection_generation() != Some(connection_generation) {
+                return Ok(());
+            }
             client_domain
                 .remote_to_local_pane_id(pane_id)
                 .ok_or_else(|| {
@@ -209,6 +364,9 @@ async fn process_unilateral_inner_async(
         None => {
             log::debug!("got {decoded:?}, but local pane {local_pane_id} no longer exists; resync");
             client_domain.resync().await?;
+            if client_domain.connection_generation() != Some(connection_generation) {
+                return Ok(());
+            }
 
             let local_pane_id =
                 client_domain
@@ -274,6 +432,9 @@ fn process_unilateral(
                         .ok_or_else(|| {
                             anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
                         })?;
+                if client_domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
 
                 let local_window_id = client_domain
                     .remote_to_local_window_id(window_id)
@@ -302,6 +463,9 @@ fn process_unilateral(
                         .ok_or_else(|| {
                             anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
                         })?;
+                if client_domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
 
                 client_domain.process_remote_window_title_change(window_id, title);
                 anyhow::Result::<()>::Ok(())
@@ -317,6 +481,15 @@ fn process_unilateral(
             let new_workspace = new_workspace.to_string();
             promise::spawn::spawn_into_main_thread(async move {
                 let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let domain = domain.downcast_ref::<ClientDomain>().ok_or_else(|| {
+                    anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
+                })?;
+                if domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
                 log::debug!("got a rename {old_workspace} -> {new_workspace}");
                 mux.rename_workspace(&old_workspace, &new_workspace);
                 anyhow::Result::<()>::Ok(())
@@ -338,6 +511,9 @@ fn process_unilateral(
                         .ok_or_else(|| {
                             anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
                         })?;
+                if client_domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
 
                 client_domain.process_remote_tab_title_change(tab_id, title);
                 anyhow::Result::<()>::Ok(())
@@ -357,6 +533,12 @@ fn process_unilateral(
                 let domain = mux
                     .get_domain(local_domain_id)
                     .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let domain = domain
+                    .downcast_ref::<ClientDomain>()
+                    .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", local_domain_id))?;
+                if domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
                 crate::domain::deliver_thinkterm_tree(domain.domain_name(), state.tree);
                 anyhow::Result::<()>::Ok(())
             })
@@ -372,6 +554,12 @@ fn process_unilateral(
                 let domain = mux
                     .get_domain(local_domain_id)
                     .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let domain = domain
+                    .downcast_ref::<ClientDomain>()
+                    .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", local_domain_id))?;
+                if domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
                 crate::domain::deliver_thinkterm_session(
                     domain.domain_name(),
                     connection_generation,
@@ -403,6 +591,27 @@ fn process_unilateral(
             .detach();
             return Ok(());
         }
+        Pdu::FrontendAccessState(_) => {
+            let Pdu::FrontendAccessState(state) = decoded.pdu else {
+                unreachable!("matched FrontendAccessState above");
+            };
+            promise::spawn::spawn_into_main_thread(async move {
+                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let domain = domain
+                    .downcast_ref::<ClientDomain>()
+                    .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", local_domain_id))?;
+                if domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
+                domain.process_remote_access_state(state);
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
+            return Ok(());
+        }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
             promise::spawn::spawn_into_main_thread(async move {
@@ -416,6 +625,9 @@ fn process_unilateral(
                         .ok_or_else(|| {
                             anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
                         })?;
+                if client_domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
 
                 client_domain.resync().await
             })
@@ -428,7 +640,7 @@ fn process_unilateral(
 
     if let Some(pane_id) = decoded.pdu.pane_id() {
         promise::spawn::spawn_into_main_thread(async move {
-            process_unilateral_inner(pane_id, local_domain_id, decoded)
+            process_unilateral_inner(pane_id, local_domain_id, connection_generation, decoded)
         })
         .detach();
     } else {
@@ -464,6 +676,8 @@ async fn client_thread_async(
     rx: &mut Receiver<ReaderMessage>,
 ) -> anyhow::Result<()> {
     let mut next_serial = 1u64;
+    let mut registration = PduRegistrationBarrier::new();
+    let mut deferred_unilateral = VecDeque::<DecodedPdu>::new();
 
     struct Promises {
         map: HashMap<u64, Sender<anyhow::Result<Pdu>>>,
@@ -507,7 +721,16 @@ async fn client_thread_async(
         };
 
         match smol::future::or(smol::future::or(rx_msg, wait_for_read), keepalive).await {
-            Ok(ReaderMessage::SendPdu { pdu, promise }) => {
+            Ok(ReaderMessage::SendPdu {
+                pdu,
+                promise,
+                registration_required,
+            }) => {
+                let Some((pdu, promise)) =
+                    registration.submit((pdu, promise), registration_required)
+                else {
+                    continue;
+                };
                 let serial = next_serial;
                 next_serial += 1;
                 promises.map.insert(serial, promise);
@@ -516,6 +739,48 @@ async fn client_thread_async(
                     .await
                     .context("encoding a PDU to send to the server")?;
                 stream.flush().await.context("flushing PDU to server")?;
+            }
+            Ok(ReaderMessage::RegistrationComplete {
+                connection_generation: completed_generation,
+            }) => {
+                if completed_generation != connection_generation {
+                    log::debug!(
+                        "ignoring registration completion for generation {completed_generation}; \
+                         current generation is {connection_generation}"
+                    );
+                    continue;
+                }
+                while let Some(decoded) = deferred_unilateral.pop_front() {
+                    process_unilateral(local_domain_id, connection_generation, decoded)
+                        .context("processing unilateral PDU buffered during registration")?;
+                }
+                for (pdu, promise) in registration.complete() {
+                    let serial = next_serial;
+                    next_serial += 1;
+                    promises.map.insert(serial, promise);
+                    pdu.encode_async(&mut stream, serial)
+                        .await
+                        .context("encoding a deferred PDU after client registration")?;
+                }
+                stream
+                    .flush()
+                    .await
+                    .context("flushing deferred PDUs after client registration")?;
+            }
+            Ok(ReaderMessage::AbortGeneration {
+                connection_generation: aborted_generation,
+                reason,
+            }) => {
+                if aborted_generation != connection_generation {
+                    log::debug!(
+                        "ignoring abort for generation {aborted_generation}; \
+                         current generation is {connection_generation}: {reason}"
+                    );
+                    continue;
+                }
+                promises.fail_all(&reason);
+                registration.fail_deferred(&reason);
+                anyhow::bail!("reattach failed for generation {connection_generation}: {reason}");
             }
             Ok(ReaderMessage::KeepaliveTick) => {
                 if let Some((serial, sent)) = pending_ping.take() {
@@ -548,12 +813,16 @@ async fn client_thread_async(
                         if pending_ping.map_or(false, |(serial, _)| serial == decoded.serial) {
                             pending_ping = None;
                         } else if decoded.serial == 0 {
-                            process_unilateral(local_domain_id, connection_generation, decoded)
-                                .context("processing unilateral PDU from server")
-                                .map_err(|e| {
-                                    log::error!("process_unilateral: {:?}", e);
-                                    e
-                                })?;
+                            if registration.is_complete() {
+                                process_unilateral(local_domain_id, connection_generation, decoded)
+                                    .context("processing unilateral PDU from server")
+                                    .map_err(|e| {
+                                        log::error!("process_unilateral: {:?}", e);
+                                        e
+                                    })?;
+                            } else {
+                                deferred_unilateral.push_back(decoded);
+                            }
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
                                 return Err(NotReconnectableError::ClientWasDestroyed.into());
@@ -1209,10 +1478,8 @@ impl Client {
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
         let client_id = ClientId::new();
-        let is_reconnecting = Arc::new(AtomicBool::new(false));
-        let reconnecting_flag = Arc::clone(&is_reconnecting);
-        let reconnect_suspended = Arc::new(AtomicBool::new(false));
-        let suspended_flag = Arc::clone(&reconnect_suspended);
+        let connection_phase = Arc::new(AtomicU8::new(ClientConnectionPhase::Registering as u8));
+        let reader_connection_phase = Arc::clone(&connection_phase);
         let (resume_reconnect_tx, resume_reconnect_rx) = channel::<()>();
         let remote_server_id = Arc::new(RwLock::new(None));
         let connection_generation = Arc::new(AtomicU64::new(0));
@@ -1242,10 +1509,44 @@ impl Client {
             // that moves it off screen rebuilds it where the user is now.
             let mut windowed_ui: Option<(ConnectionUI, String)> = None;
 
+            let mut pending_reattach_ui: Option<ConnectionUI> = None;
             'client: loop {
                 let session_started = std::time::Instant::now();
                 let generation = NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
                 reader_connection_generation.store(generation, Ordering::Release);
+                if let (Some(reattach_ui), Some(local_domain_id)) =
+                    (pending_reattach_ui.take(), local_domain_id)
+                {
+                    let phase = Arc::clone(&reader_connection_phase);
+                    promise::spawn::spawn_into_main_thread(async move {
+                        match ClientDomain::reattach(
+                            local_domain_id,
+                            generation,
+                            reattach_ui.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                phase.store(ClientConnectionPhase::Ready as u8, Ordering::Release);
+                                log::info!("Reconnected and restored generation {generation}");
+                                reattach_ui.close();
+                                crate::domain::wake_thinkterm_frontend();
+                            }
+                            Err(err) => {
+                                log::error!("reattach failed for generation {generation}: {err:#}");
+                                if let Ok(inner) =
+                                    ClientDomain::get_client_inner_for_domain(local_domain_id)
+                                {
+                                    inner.client.abort_connection_generation(
+                                        generation,
+                                        format!("{err:#}"),
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .detach();
+                }
                 if let Err(e) = client_thread(
                     &mut reconnectable,
                     local_domain_id,
@@ -1274,7 +1575,9 @@ impl Client {
                         break;
                     }
 
-                    reconnecting_flag.store(true, Ordering::Relaxed);
+                    reader_connection_phase
+                        .store(ClientConnectionPhase::Reconnecting as u8, Ordering::Release);
+                    crate::domain::wake_thinkterm_frontend();
 
                     if session_started.elapsed() >= SHORT_SESSION {
                         // The previous connection genuinely worked; restart
@@ -1404,15 +1707,12 @@ impl Client {
                         let no_auto_start = short_sessions < 2;
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {
                             Ok(_) => {
-                                log::error!("Reconnected!");
-                                reconnecting_flag.store(false, Ordering::Relaxed);
-                                let reattach_ui = ui.clone();
-                                promise::spawn::spawn_into_main_thread(async move {
-                                    ClientDomain::reattach(local_domain_id, reattach_ui)
-                                        .await
-                                        .ok();
-                                })
-                                .detach();
+                                log::info!("Transport reconnected; restoring mux session");
+                                reader_connection_phase.store(
+                                    ClientConnectionPhase::Registering as u8,
+                                    Ordering::Release,
+                                );
+                                pending_reattach_ui = Some(ui.clone());
                                 crate::domain::wake_thinkterm_frontend();
                                 break;
                             }
@@ -1430,12 +1730,17 @@ impl Client {
                                     if let Some((ui, _)) = windowed_ui.take() {
                                         ui.close();
                                     }
-                                    reconnecting_flag.store(false, Ordering::Relaxed);
-                                    suspended_flag.store(true, Ordering::Relaxed);
+                                    reader_connection_phase.store(
+                                        ClientConnectionPhase::Suspended as u8,
+                                        Ordering::Release,
+                                    );
+                                    crate::domain::wake_thinkterm_frontend();
                                     match resume_reconnect_rx.recv() {
                                         Ok(()) => {
-                                            suspended_flag.store(false, Ordering::Relaxed);
-                                            reconnecting_flag.store(true, Ordering::Relaxed);
+                                            reader_connection_phase.store(
+                                                ClientConnectionPhase::Reconnecting as u8,
+                                                Ordering::Release,
+                                            );
                                             outage_started = std::time::Instant::now();
                                             backoff = BASE_INTERVAL;
                                             short_sessions = 0;
@@ -1462,8 +1767,7 @@ impl Client {
             // Whatever ended the loop (cancelled by user, not
             // reconnectable), don't leave the reconnect tab behind. The
             // domain detaches below, so we are no longer "reconnecting".
-            reconnecting_flag.store(false, Ordering::Relaxed);
-            suspended_flag.store(false, Ordering::Relaxed);
+            reader_connection_phase.store(ClientConnectionPhase::Detached as u8, Ordering::Release);
             if let Some((ui, _)) = windowed_ui.take() {
                 ui.close();
             }
@@ -1498,8 +1802,7 @@ impl Client {
             is_local,
             client_id,
             client_domain_config,
-            is_reconnecting,
-            reconnect_suspended,
+            connection_phase,
             resume_reconnect_tx,
             remote_server_id,
             connection_generation,
@@ -1515,28 +1818,37 @@ impl Client {
         ui: &ConnectionUI,
     ) -> anyhow::Result<GetCodecVersionResponse> {
         match self
-            .get_codec_version(GetCodecVersion {})
+            .send_bootstrap_pdu(Pdu::GetCodecVersion(GetCodecVersion {}))
             .or(async {
                 smol::Timer::after(Duration::from_secs(60)).await;
                 Err(Timeout).context("Timeout")
             })
             .await
         {
-            Ok(info) if info.codec_vers == CODEC_VERSION => {
+            Ok(Pdu::GetCodecVersionResponse(info)) if info.codec_vers == CODEC_VERSION => {
                 log::trace!(
                     "Server version is {} (codec version {})",
                     info.version_string,
                     info.codec_vers
                 );
-                self.set_client_id(SetClientId {
-                    client_id: self.client_id.clone(),
-                    is_proxy: false,
-                })
-                .await?;
+                match self
+                    .send_bootstrap_pdu(Pdu::SetClientId(SetClientId {
+                        client_id: self.client_id.clone(),
+                        is_proxy: false,
+                    }))
+                    .await?
+                {
+                    Pdu::UnitResponse(_) => {}
+                    Pdu::ErrorResponse(err) => anyhow::bail!(err.reason),
+                    response => anyhow::bail!(
+                        "unexpected SetClientId response during bootstrap: {response:?}"
+                    ),
+                }
                 *self.remote_server_id.write().unwrap() = Some(info.server_id.clone());
+                self.mark_registration_complete()?;
                 Ok(info)
             }
-            Ok(info) => {
+            Ok(Pdu::GetCodecVersionResponse(info)) => {
                 let err = IncompatibleVersionError {
                     version: info.version_string,
                     codec_vers: info.codec_vers,
@@ -1544,6 +1856,10 @@ impl Client {
                 ui.output_str(&err.to_string());
                 log::error!("{:?}", err);
                 return Err(err.into());
+            }
+            Ok(Pdu::ErrorResponse(err)) => anyhow::bail!(err.reason),
+            Ok(response) => {
+                anyhow::bail!("unexpected GetCodecVersion response during bootstrap: {response:?}")
             }
             Err(err) => {
                 log::trace!("{:?}", err);
@@ -1668,10 +1984,27 @@ impl Client {
     }
 
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
+        self.send_pdu_with_registration_requirement(pdu, true).await
+    }
+
+    async fn send_bootstrap_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
+        self.send_pdu_with_registration_requirement(pdu, false)
+            .await
+    }
+
+    async fn send_pdu_with_registration_requirement(
+        &self,
+        pdu: Pdu,
+        registration_required: bool,
+    ) -> anyhow::Result<Pdu> {
         log::trace!("send_pdu {}", pdu.pdu_name());
         let (promise, rx) = bounded(1);
         self.sender
-            .send(ReaderMessage::SendPdu { pdu, promise })
+            .send(ReaderMessage::SendPdu {
+                pdu,
+                promise,
+                registration_required,
+            })
             .await
             .map_err(|_| ChannelSendError)
             .context("send_pdu send")?;
@@ -1744,6 +2077,11 @@ impl Client {
         ClaimClientViewport,
         ClientViewportState
     );
+    rpc!(
+        set_frontend_access_mode,
+        SetFrontendAccessMode,
+        FrontendAccessState
+    );
     rpc!(write_to_pane, WriteToPane, UnitResponse);
     rpc!(send_paste, SendPaste, UnitResponse);
     rpc!(key_down, SendKeyDown, UnitResponse);
@@ -1790,7 +2128,24 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::Reconnectable;
+    use super::{Reconnectable, RegistrationBarrier};
+
+    #[test]
+    fn registration_barrier_sends_bootstrap_before_deferred_rpcs() {
+        let mut barrier = RegistrationBarrier::new();
+        assert_eq!(barrier.submit("palette", true), None);
+        assert_eq!(barrier.submit("viewport", true), None);
+        assert_eq!(
+            barrier.submit("GetCodecVersion", false),
+            Some("GetCodecVersion")
+        );
+        assert_eq!(barrier.submit("SetClientId", false), Some("SetClientId"));
+        assert_eq!(
+            barrier.complete().into_iter().collect::<Vec<_>>(),
+            vec!["palette", "viewport"]
+        );
+        assert_eq!(barrier.submit("focus", true), Some("focus"));
+    }
 
     #[test]
     fn remote_mux_command_uses_configured_path() {

@@ -199,6 +199,9 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::Note(command) => {
                 self.perform_right_sidebar_note_command(command);
             }
+            crate::termwindow::ContextMenuApplicationAction::SetFrontendAccessMode(mode) => {
+                self.request_frontend_access_mode(mode);
+            }
             crate::termwindow::ContextMenuApplicationAction::ActivateWorkspaceThread {
                 space_id,
                 thread_id,

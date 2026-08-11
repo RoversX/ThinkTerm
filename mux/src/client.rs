@@ -37,6 +37,36 @@ impl ClientId {
             ssh_auth_sock: crate::AgentProxy::default_ssh_auth_sock(),
         }
     }
+
+    /// Whether two ids describe the same logical client, allowing for the
+    /// transport-only decoration applied by an SSH mux proxy.
+    ///
+    /// The server appends ` (via proxy pid N)` to the hostname and replaces
+    /// `ssh_auth_sock` so that `list-clients` can explain the route.  Neither
+    /// change should make the originating renderer stop recognizing itself.
+    pub fn same_logical_client(&self, other: &Self) -> bool {
+        proxy_hostname_base(&self.hostname) == proxy_hostname_base(&other.hostname)
+            && self.username == other.username
+            && self.pid == other.pid
+            && self.epoch == other.epoch
+            && self.id == other.id
+    }
+}
+
+fn proxy_hostname_base(hostname: &str) -> &str {
+    const PREFIX: &str = " (via proxy pid ";
+
+    let Some((base, suffix)) = hostname.rsplit_once(PREFIX) else {
+        return hostname;
+    };
+    let Some(pid) = suffix.strip_suffix(')') else {
+        return hostname;
+    };
+    if !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        base
+    } else {
+        hostname
+    }
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -81,4 +111,49 @@ fn utc_now() -> DateTime<Utc> {
         .unwrap_or_default();
     DateTime::<Utc>::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
         .expect("system time should fit chrono timestamp range")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_id(hostname: &str, id: usize, ssh_auth_sock: Option<&str>) -> ClientId {
+        ClientId {
+            hostname: hostname.to_string(),
+            username: "test-user".to_string(),
+            pid: 42,
+            epoch: 123,
+            id,
+            ssh_auth_sock: ssh_auth_sock.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn proxied_identity_matches_its_originating_client() {
+        let local = client_id("myhost.local", 7, Some("/local/agent"));
+        let proxied = client_id(
+            "myhost.local (via proxy pid 190892)",
+            7,
+            Some("/remote/agent"),
+        );
+
+        assert!(local.same_logical_client(&proxied));
+        assert!(proxied.same_logical_client(&local));
+    }
+
+    #[test]
+    fn proxy_decoration_does_not_merge_distinct_clients() {
+        let local = client_id("myhost.local", 7, None);
+        let other = client_id("myhost.local (via proxy pid 190892)", 8, None);
+
+        assert!(!local.same_logical_client(&other));
+    }
+
+    #[test]
+    fn malformed_proxy_decoration_is_part_of_the_hostname() {
+        let local = client_id("myhost.local", 7, None);
+        let malformed = client_id("myhost.local (via proxy pid unknown)", 7, None);
+
+        assert!(!local.same_logical_client(&malformed));
+    }
 }

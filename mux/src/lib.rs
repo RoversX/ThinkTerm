@@ -108,6 +108,8 @@ pub enum MuxNotification {
     /// The renderer allowed to drive one tab's shared PTY geometry changed,
     /// or that owner published a new canonical viewport.
     FrontendLeaseChanged(FrontendViewportState),
+    /// The connection-wide A/B mode or the exclusive handoff owner changed.
+    FrontendAccessChanged(FrontendAccessState),
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
@@ -195,6 +197,7 @@ pub struct FrontendView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontendViewportState {
     pub tab_id: TabId,
+    /// Per-tab layout owner used by `TmuxLatest` mode.
     pub owner: Option<ClientId>,
     pub canonical_size: wezterm_term::TerminalSize,
     /// What the owner is looking at, when the owner is a renderer that says.
@@ -202,11 +205,29 @@ pub struct FrontendViewportState {
     /// rather than being pulled somewhere arbitrary.
     pub view: Option<FrontendView>,
     pub generation: u64,
+    pub access: FrontendAccessState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrontendAccessMode {
+    TmuxLatest,
+    #[default]
+    Handoff,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendAccessState {
+    pub mode: FrontendAccessMode,
+    pub owner: Option<ClientId>,
+    pub generation: u64,
 }
 
 #[derive(Default)]
 struct TabFrontendLease {
     owner: Option<ClientId>,
+    /// Last geometry advertised by each renderer. Network claims always carry
+    /// their geometry and never trust this cache; it remains useful for the
+    /// in-process GUI, whose Pane input reaches the mux without a wire PDU.
     viewports: HashMap<ClientId, FrontendViewport>,
     /// Written by the owner alone, and dropped the moment the lease moves, so
     /// it can never describe a renderer that is no longer driving.
@@ -216,6 +237,13 @@ struct TabFrontendLease {
 
 struct FrontendLeaseState {
     tabs: HashMap<TabId, TabFrontendLease>,
+    access_mode: FrontendAccessMode,
+    handoff_owner: Option<ClientId>,
+    /// Distinguishes initial server startup (first renderer auto-owns) from an
+    /// owner disconnect (everyone stays blocked until an explicit takeover).
+    handoff_ever_owned: bool,
+    access_initialized: bool,
+    access_generation: u64,
     next_generation: u64,
 }
 
@@ -223,6 +251,11 @@ impl Default for FrontendLeaseState {
     fn default() -> Self {
         Self {
             tabs: HashMap::new(),
+            access_mode: FrontendAccessMode::Handoff,
+            handoff_owner: None,
+            handoff_ever_owned: false,
+            access_initialized: false,
+            access_generation: 0,
             next_generation: 1,
         }
     }
@@ -340,11 +373,81 @@ pub struct Mux {
     clients: RwLock<HashMap<ClientId, ClientInfo>>,
     client_registrations: RwLock<HashMap<ClientId, ClientRegistrationId>>,
     frontend_lease: Mutex<FrontendLeaseState>,
+    tab_resize_notifications: Mutex<TabResizeNotificationState>,
+    #[cfg(test)]
+    frontend_geometry_failures: Mutex<std::collections::VecDeque<bool>>,
     palette_advisories: Mutex<PaletteAdvisoryState>,
     identity: RwLock<Option<Arc<ClientId>>>,
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
     main_thread_id: std::thread::ThreadId,
     agent: Option<AgentProxy>,
+}
+
+#[derive(Default)]
+struct TabResizeNotificationState {
+    depth: HashMap<TabId, usize>,
+    pending: HashSet<TabId>,
+    aborted: HashSet<TabId>,
+}
+
+impl TabResizeNotificationState {
+    fn begin(&mut self, tab_id: TabId) {
+        if self.depth.get(&tab_id).copied().unwrap_or_default() == 0 {
+            self.aborted.remove(&tab_id);
+        }
+        *self.depth.entry(tab_id).or_default() += 1;
+    }
+
+    fn defer(&mut self, tab_id: TabId) -> bool {
+        if self.depth.get(&tab_id).copied().unwrap_or_default() == 0 {
+            return false;
+        }
+        self.pending.insert(tab_id);
+        true
+    }
+
+    fn finish(&mut self, tab_id: TabId, commit: bool) -> bool {
+        if !commit {
+            self.aborted.insert(tab_id);
+        }
+        let Some(depth) = self.depth.get_mut(&tab_id) else {
+            return false;
+        };
+        *depth -= 1;
+        if *depth != 0 {
+            return false;
+        }
+        self.depth.remove(&tab_id);
+        let pending = self.pending.remove(&tab_id);
+        let aborted = self.aborted.remove(&tab_id);
+        commit && !aborted && pending
+    }
+}
+
+struct TabGeometryTransaction<'a> {
+    mux: &'a Mux,
+    tab_id: TabId,
+    commit: bool,
+}
+
+impl TabGeometryTransaction<'_> {
+    fn commit(&mut self) {
+        self.commit = true;
+    }
+}
+
+impl Drop for TabGeometryTransaction<'_> {
+    fn drop(&mut self) {
+        let publish = self
+            .mux
+            .tab_resize_notifications
+            .lock()
+            .finish(self.tab_id, self.commit);
+        if publish {
+            self.mux
+                .notify_immediate(MuxNotification::TabResized(self.tab_id));
+        }
+    }
 }
 
 const BUFSIZE: usize = 1024 * 1024;
@@ -684,6 +787,9 @@ impl Mux {
             clients: RwLock::new(HashMap::new()),
             client_registrations: RwLock::new(HashMap::new()),
             frontend_lease: Mutex::new(FrontendLeaseState::default()),
+            tab_resize_notifications: Mutex::new(TabResizeNotificationState::default()),
+            #[cfg(test)]
+            frontend_geometry_failures: Mutex::new(std::collections::VecDeque::new()),
             palette_advisories: Mutex::new(PaletteAdvisoryState::default()),
             identity: RwLock::new(None),
             num_panes_by_workspace: RwLock::new(HashMap::new()),
@@ -780,6 +886,60 @@ impl Mux {
         Ok(())
     }
 
+    fn access_state_locked(lease: &FrontendLeaseState) -> FrontendAccessState {
+        FrontendAccessState {
+            mode: lease.access_mode,
+            owner: match lease.access_mode {
+                FrontendAccessMode::TmuxLatest => None,
+                FrontendAccessMode::Handoff => lease.handoff_owner.clone(),
+            },
+            generation: lease.access_generation,
+        }
+    }
+
+    pub fn frontend_access_state(&self) -> FrontendAccessState {
+        Self::access_state_locked(&self.frontend_lease.lock())
+    }
+
+    /// Install the mode loaded by the mux-server persistence layer. This is
+    /// intentionally one-shot so a configuration reload cannot overwrite a
+    /// mode selected while this server process is running.
+    pub fn initialize_frontend_access_mode(&self, mode: FrontendAccessMode) {
+        let mut lease = self.frontend_lease.lock();
+        if lease.access_initialized {
+            return;
+        }
+        lease.access_mode = mode;
+        lease.access_initialized = true;
+    }
+
+    pub fn frontend_access_mode_is_initialized(&self) -> bool {
+        self.frontend_lease.lock().access_initialized
+    }
+
+    pub fn client_has_frontend_access(&self, client_id: &ClientId) -> bool {
+        let lease = self.frontend_lease.lock();
+        match lease.access_mode {
+            FrontendAccessMode::TmuxLatest => true,
+            FrontendAccessMode::Handoff => lease.handoff_owner.as_ref() == Some(client_id),
+        }
+    }
+
+    /// Check the server-wide interaction gate for one live transport.  This
+    /// does not claim anything: chrome actions such as closing a pane must be
+    /// rejected for B's opaque followers, but must not silently take A's
+    /// layout lease just because they originated outside the terminal area.
+    pub fn registered_client_has_frontend_access(
+        &self,
+        client_id: &ClientId,
+        registration: ClientRegistrationId,
+    ) -> Option<bool> {
+        if self.client_registrations.read().get(client_id) != Some(&registration) {
+            return None;
+        }
+        Some(self.client_has_frontend_access(client_id))
+    }
+
     fn viewport_state(&self, tab_id: TabId) -> Option<FrontendViewportState> {
         let tab = self.get_tab(tab_id)?;
         let lease = self.frontend_lease.lock();
@@ -790,6 +950,7 @@ impl Mux {
             canonical_size: tab.get_size(),
             view: state.view.clone(),
             generation: state.generation,
+            access: Self::access_state_locked(&lease),
         })
     }
 
@@ -802,12 +963,22 @@ impl Mux {
     pub fn set_client_view(&self, client_id: &ClientId, tab_id: TabId, view: FrontendView) -> bool {
         let changed = {
             let mut lease = self.frontend_lease.lock();
+            let may_publish = match lease.access_mode {
+                FrontendAccessMode::TmuxLatest => {
+                    lease
+                        .tabs
+                        .get(&tab_id)
+                        .and_then(|state| state.owner.as_ref())
+                        == Some(client_id)
+                }
+                FrontendAccessMode::Handoff => lease.handoff_owner.as_ref() == Some(client_id),
+            };
+            if !may_publish {
+                return false;
+            }
             let Some(state) = lease.tabs.get_mut(&tab_id) else {
                 return false;
             };
-            if state.owner.as_ref() != Some(client_id) {
-                return false;
-            }
             if state.view.as_ref() == Some(&view) {
                 false
             } else {
@@ -822,8 +993,9 @@ impl Mux {
     }
 
     /// Record one renderer's desired viewport for one tab. A passive resize
-    /// never steals ownership. The first renderer establishes an owner; an
-    /// existing owner applies its changed viewport immediately.
+    /// never steals an established owner. The first renderer after server
+    /// startup seeds B's global handoff owner; after that owner disconnects,
+    /// passive reports remain blocked until an explicit claim.
     pub fn set_client_viewport(
         &self,
         client_id: &ClientId,
@@ -831,23 +1003,48 @@ impl Mux {
         viewport: FrontendViewport,
     ) -> anyhow::Result<FrontendViewportState> {
         self.validate_frontend_viewport(tab_id, &viewport)?;
-        let (should_apply, should_publish) = {
+        let (should_apply, should_publish, access_changed) = {
             let mut lease = self.frontend_lease.lock();
+            let mut access_changed = false;
+            if lease.access_mode == FrontendAccessMode::Handoff
+                && lease.handoff_owner.is_none()
+                && !lease.handoff_ever_owned
+            {
+                lease.handoff_owner = Some(client_id.clone());
+                lease.handoff_ever_owned = true;
+                access_changed = true;
+            }
+            let mode = lease.access_mode;
+            let handoff_owner = lease.handoff_owner.clone();
             let state = lease.tabs.entry(tab_id).or_default();
             let viewport_changed = state.viewports.get(client_id) != Some(&viewport);
             if viewport_changed {
                 state.viewports.insert(client_id.clone(), viewport.clone());
             }
-            let owner_changed = state.owner.is_none();
+            let can_drive = match mode {
+                FrontendAccessMode::TmuxLatest => {
+                    if state.owner.is_none() {
+                        state.owner = Some(client_id.clone());
+                    }
+                    state.owner.as_ref() == Some(client_id)
+                }
+                FrontendAccessMode::Handoff => handoff_owner.as_ref() == Some(client_id),
+            };
+            let owner_changed = can_drive && state.owner.as_ref() != Some(client_id);
             if owner_changed {
                 state.owner = Some(client_id.clone());
+                state.view = None;
             }
-            let should_apply =
-                state.owner.as_ref() == Some(client_id) && (owner_changed || viewport_changed);
-            (should_apply, should_apply)
+            let should_apply = can_drive && (owner_changed || viewport_changed || access_changed);
+            (should_apply, should_apply, access_changed)
         };
         if should_apply {
-            self.apply_frontend_viewport(tab_id, &viewport)?;
+            if let Err(err) = self.apply_frontend_viewport(tab_id, &viewport) {
+                return Err(self.fail_closed_frontend_geometry(tab_id, None, err));
+            }
+        }
+        if access_changed {
+            self.publish_frontend_access_state();
         }
         if should_publish {
             self.publish_frontend_viewport_state(tab_id);
@@ -876,30 +1073,40 @@ impl Mux {
     }
 
     pub fn client_owns_frontend_lease(&self, client_id: &ClientId, tab_id: TabId) -> bool {
-        self.frontend_lease
-            .lock()
-            .tabs
-            .get(&tab_id)
-            .and_then(|state| state.owner.as_ref())
-            == Some(client_id)
+        let lease = self.frontend_lease.lock();
+        match lease.access_mode {
+            FrontendAccessMode::TmuxLatest => {
+                lease
+                    .tabs
+                    .get(&tab_id)
+                    .and_then(|state| state.owner.as_ref())
+                    == Some(client_id)
+            }
+            FrontendAccessMode::Handoff => lease.handoff_owner.as_ref() == Some(client_id),
+        }
     }
 
     pub fn current_identity_owns_frontend_lease(&self, tab_id: TabId) -> bool {
         match self.active_identity() {
             Some(identity) => self.client_owns_frontend_lease(&identity, tab_id),
-            None => self
-                .frontend_lease
-                .lock()
-                .tabs
-                .get(&tab_id)
-                .and_then(|state| state.owner.as_ref())
-                .is_none(),
+            None => {
+                let lease = self.frontend_lease.lock();
+                match lease.access_mode {
+                    FrontendAccessMode::Handoff => lease.handoff_owner.is_none(),
+                    FrontendAccessMode::TmuxLatest => lease
+                        .tabs
+                        .get(&tab_id)
+                        .and_then(|state| state.owner.as_ref())
+                        .is_none(),
+                }
+            }
         }
     }
 
-    /// Claim the viewport for a real user interaction. Clients without a
-    /// viewport (for example `thinkterm cli send-text`) update idle accounting
-    /// but cannot become geometry owners.
+    /// Account for an input PDU and enforce B's global input gate. In A, input
+    /// is allowed for every renderer and the most recently advertised local
+    /// geometry is used as a compatibility fallback; interactive frontends use
+    /// the explicit geometry-bearing claim before forwarding the input.
     pub fn registered_client_had_tab_input(
         &self,
         client_id: &ClientId,
@@ -912,22 +1119,39 @@ impl Mux {
         }
         drop(registrations);
         self.client_had_input(client_id);
-
-        if let Err(err) = self.claim_frontend_viewport(client_id, tab_id) {
-            log::error!("failed to apply claimed viewport for tab {tab_id}: {err:#}");
+        let (mode, handoff_owner, viewport) = {
+            let lease = self.frontend_lease.lock();
+            (
+                lease.access_mode,
+                lease.handoff_owner.clone(),
+                lease
+                    .tabs
+                    .get(&tab_id)
+                    .and_then(|state| state.viewports.get(client_id).cloned()),
+            )
+        };
+        match mode {
+            FrontendAccessMode::Handoff => handoff_owner.as_ref() == Some(client_id),
+            FrontendAccessMode::TmuxLatest => {
+                if let Some(viewport) = viewport {
+                    if let Err(err) = self.claim_frontend_viewport(client_id, tab_id, viewport) {
+                        log::error!("failed to apply claimed viewport for tab {tab_id}: {err:#}");
+                    }
+                }
+                true
+            }
         }
-        true
     }
 
-    /// Explicit renderer claim used by UI-only interactions such as pane
-    /// resize.  The transport must still be current and must already have
-    /// advertised a viewport; geometry is taken only from that server-held
-    /// advertisement.
+    /// Explicit renderer claim used by terminal-area interaction and pane
+    /// layout changes. Geometry is supplied in this request and applied in the
+    /// same main-thread operation as the owner change.
     pub fn claim_registered_client_viewport(
         &self,
         client_id: &ClientId,
         registration: ClientRegistrationId,
         tab_id: TabId,
+        viewport: FrontendViewport,
     ) -> anyhow::Result<Option<FrontendViewportState>> {
         let registrations = self.client_registrations.read();
         if registrations.get(client_id) != Some(&registration) {
@@ -935,8 +1159,7 @@ impl Mux {
         }
         drop(registrations);
         self.client_had_input(client_id);
-        self.claim_frontend_viewport(client_id, tab_id)?
-            .ok_or_else(|| anyhow!("client has not advertised a viewport for tab {tab_id}"))
+        self.claim_frontend_viewport(client_id, tab_id, viewport)
             .map(Some)
     }
 
@@ -944,39 +1167,196 @@ impl Mux {
         &self,
         client_id: &ClientId,
         tab_id: TabId,
-    ) -> anyhow::Result<Option<FrontendViewportState>> {
-        let (viewport, already_owned) = {
+        viewport: FrontendViewport,
+    ) -> anyhow::Result<FrontendViewportState> {
+        self.validate_frontend_viewport(tab_id, &viewport)?;
+        let unchanged = {
             let lease = self.frontend_lease.lock();
-            let Some(state) = lease.tabs.get(&tab_id) else {
-                return Ok(None);
+            let effective_owner = match lease.access_mode {
+                FrontendAccessMode::TmuxLatest => {
+                    lease
+                        .tabs
+                        .get(&tab_id)
+                        .and_then(|state| state.owner.as_ref())
+                        == Some(client_id)
+                }
+                FrontendAccessMode::Handoff => lease.handoff_owner.as_ref() == Some(client_id),
             };
-            let Some(viewport) = state.viewports.get(client_id).cloned() else {
-                return Ok(None);
-            };
-            (viewport, state.owner.as_ref() == Some(client_id))
+            effective_owner
+                && lease.tabs.get(&tab_id).is_some_and(|state| {
+                    state.owner.as_ref() == Some(client_id)
+                        && state.viewports.get(client_id) == Some(&viewport)
+                })
         };
-        if already_owned {
-            return Ok(self.viewport_state(tab_id));
+        if unchanged {
+            return self
+                .viewport_state(tab_id)
+                .ok_or_else(|| anyhow!("viewport state for tab {tab_id} disappeared"));
+        }
+        let (access_changed, mut affected_tabs) = {
+            let mut lease = self.frontend_lease.lock();
+            let mode = lease.access_mode;
+            let mut access_changed = false;
+            let mut affected_tabs = vec![tab_id];
+            if mode == FrontendAccessMode::Handoff {
+                access_changed = lease.handoff_owner.as_ref() != Some(client_id);
+                lease.handoff_owner = Some(client_id.clone());
+                lease.handoff_ever_owned = true;
+                if access_changed {
+                    for (affected_tab_id, state) in &mut lease.tabs {
+                        if state.view.take().is_some() && *affected_tab_id != tab_id {
+                            affected_tabs.push(*affected_tab_id);
+                        }
+                    }
+                }
+            }
+            let state = lease.tabs.entry(tab_id).or_default();
+            state.viewports.insert(client_id.clone(), viewport.clone());
+            state.owner = Some(client_id.clone());
+            state.view = None;
+            (access_changed, affected_tabs)
+        };
+        if access_changed {
+            self.publish_frontend_access_state();
+        }
+        // Commit and publish B's new owner before Tab::resize can emit a
+        // synchronous TabResized notification. Any observer reacting to the
+        // new geometry must already mask the prior owner.
+        if let Err(err) = self.apply_frontend_viewport(tab_id, &viewport) {
+            return Err(self.fail_closed_frontend_geometry(tab_id, None, err));
+        }
+        affected_tabs.sort_unstable();
+        affected_tabs.dedup();
+        for affected_tab_id in affected_tabs {
+            self.publish_frontend_viewport_state(affected_tab_id);
+        }
+        self.viewport_state(tab_id)
+            .ok_or_else(|| anyhow!("viewport state for tab {tab_id} disappeared"))
+    }
+
+    /// In-process GUI equivalent of the wire claim. The GUI identity is
+    /// already registered with this mux, but there is no transport generation
+    /// involved because the call never crosses a connection.
+    pub fn claim_local_frontend_viewport(
+        &self,
+        client_id: &ClientId,
+        tab_id: TabId,
+        viewport: FrontendViewport,
+    ) -> anyhow::Result<FrontendViewportState> {
+        self.client_had_input(client_id);
+        self.claim_frontend_viewport(client_id, tab_id, viewport)
+    }
+
+    /// Validate a mode transition without mutating state. The server uses this
+    /// before atomically persisting the selected mode.
+    pub fn validate_registered_frontend_access_mode_change(
+        &self,
+        client_id: &ClientId,
+        registration: ClientRegistrationId,
+        mode: FrontendAccessMode,
+        tab_id: TabId,
+        viewport: &FrontendViewport,
+    ) -> anyhow::Result<()> {
+        if self.client_registrations.read().get(client_id) != Some(&registration) {
+            anyhow::bail!("client connection was superseded");
+        }
+        self.validate_frontend_access_mode_change(client_id, mode, tab_id, viewport)
+    }
+
+    pub fn validate_frontend_access_mode_change(
+        &self,
+        client_id: &ClientId,
+        mode: FrontendAccessMode,
+        tab_id: TabId,
+        viewport: &FrontendViewport,
+    ) -> anyhow::Result<()> {
+        self.validate_frontend_viewport(tab_id, viewport)?;
+        let lease = self.frontend_lease.lock();
+        if lease.access_mode == mode {
+            return Ok(());
+        }
+        let authorized = match lease.access_mode {
+            FrontendAccessMode::Handoff => lease.handoff_owner.as_ref() == Some(client_id),
+            FrontendAccessMode::TmuxLatest => {
+                lease
+                    .tabs
+                    .get(&tab_id)
+                    .and_then(|state| state.owner.as_ref())
+                    == Some(client_id)
+            }
+        };
+        if !authorized {
+            anyhow::bail!("only the current frontend owner may change access mode");
+        }
+        Ok(())
+    }
+
+    /// Commit a previously validated mode transition. The caller runs this on
+    /// the mux main thread after persistence succeeds.
+    pub fn set_registered_frontend_access_mode(
+        &self,
+        client_id: &ClientId,
+        registration: ClientRegistrationId,
+        mode: FrontendAccessMode,
+        tab_id: TabId,
+        viewport: FrontendViewport,
+    ) -> anyhow::Result<FrontendAccessState> {
+        if self.client_registrations.read().get(client_id) != Some(&registration) {
+            anyhow::bail!("client connection was superseded");
+        }
+        self.set_frontend_access_mode(client_id, mode, tab_id, viewport)
+    }
+
+    pub fn set_frontend_access_mode(
+        &self,
+        client_id: &ClientId,
+        mode: FrontendAccessMode,
+        tab_id: TabId,
+        viewport: FrontendViewport,
+    ) -> anyhow::Result<FrontendAccessState> {
+        self.validate_frontend_access_mode_change(client_id, mode, tab_id, &viewport)?;
+        let prior_access = self.frontend_access_state();
+        if prior_access.mode == mode {
+            return Ok(self.frontend_access_state());
         }
 
-        self.apply_frontend_viewport(tab_id, &viewport)?;
-        {
+        let affected_tabs = {
             let mut lease = self.frontend_lease.lock();
-            let Some(state) = lease.tabs.get_mut(&tab_id) else {
-                return Ok(None);
-            };
-            if !state.viewports.contains_key(client_id) {
-                return Ok(None);
+            lease.access_mode = mode;
+            lease.access_initialized = true;
+            match mode {
+                FrontendAccessMode::TmuxLatest => {
+                    lease.handoff_owner = None;
+                }
+                FrontendAccessMode::Handoff => {
+                    lease.handoff_owner = Some(client_id.clone());
+                    lease.handoff_ever_owned = true;
+                }
             }
+            let mut affected = Vec::new();
+            for (affected_tab_id, state) in &mut lease.tabs {
+                if state.view.take().is_some() || *affected_tab_id == tab_id {
+                    affected.push(*affected_tab_id);
+                }
+            }
+            let state = lease.tabs.entry(tab_id).or_default();
+            state.viewports.insert(client_id.clone(), viewport.clone());
             state.owner = Some(client_id.clone());
-            // The view belonged to whoever was driving. Carrying it across a
-            // handover would leave the new owner's followers pinned to a
-            // scrollback position nobody chose; the new owner publishes its own
-            // on its next frame.
-            state.view = None;
+            if !affected.contains(&tab_id) {
+                affected.push(tab_id);
+            }
+            affected
+        };
+        self.publish_frontend_access_state();
+        // As with a direct claim, mode/owner is authoritative before resize
+        // notifications expose geometry from the newly selected frontend.
+        if let Err(err) = self.apply_frontend_viewport(tab_id, &viewport) {
+            return Err(self.fail_closed_frontend_geometry(tab_id, Some(prior_access.mode), err));
         }
-        self.publish_frontend_viewport_state(tab_id);
-        Ok(self.viewport_state(tab_id))
+        for affected_tab_id in affected_tabs {
+            self.publish_frontend_viewport_state(affected_tab_id);
+        }
+        Ok(self.frontend_access_state())
     }
 
     /// `None` means the transport generation is stale. `Some(false)` means a
@@ -991,14 +1371,28 @@ impl Mux {
             return None;
         }
         let lease = self.frontend_lease.lock();
-        Some(match lease.tabs.get(&tab_id) {
-            None => true,
-            Some(state) => state.owner.as_ref() == Some(client_id),
+        Some(match lease.access_mode {
+            FrontendAccessMode::Handoff => lease.handoff_owner.as_ref() == Some(client_id),
+            FrontendAccessMode::TmuxLatest => match lease.tabs.get(&tab_id) {
+                None => true,
+                Some(state) => state.owner.as_ref() == Some(client_id),
+            },
         })
     }
 
+    fn publish_frontend_access_state(&self) {
+        let state = {
+            let mut lease = self.frontend_lease.lock();
+            let generation = lease.next_generation;
+            lease.next_generation = lease.next_generation.saturating_add(1);
+            lease.access_generation = generation;
+            Self::access_state_locked(&lease)
+        };
+        self.notify(MuxNotification::FrontendAccessChanged(state));
+    }
+
     fn publish_frontend_viewport_state(&self, tab_id: TabId) {
-        let (generation, owner, view) = {
+        let (generation, owner, view, access) = {
             let mut lease = self.frontend_lease.lock();
             let generation = lease.next_generation;
             lease.next_generation = lease.next_generation.saturating_add(1);
@@ -1006,7 +1400,10 @@ impl Mux {
                 return;
             };
             state.generation = generation;
-            (generation, state.owner.clone(), state.view.clone())
+            let owner = state.owner.clone();
+            let view = state.view.clone();
+            let access = Self::access_state_locked(&lease);
+            (generation, owner, view, access)
         };
         let Some(tab) = self.get_tab(tab_id) else {
             return;
@@ -1018,6 +1415,7 @@ impl Mux {
                 canonical_size: tab.get_size(),
                 view,
                 generation,
+                access,
             },
         ));
     }
@@ -1030,30 +1428,109 @@ impl Mux {
         let tab = self
             .get_tab(tab_id)
             .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
-        let size = viewport.size();
-        tab.resize(size);
+        let mut transaction = self.begin_tab_geometry_transaction(tab_id);
+        let result = (|| {
+            let size = viewport.size();
+            self.frontend_geometry_step("resizing the tab root")?;
+            tab.resize(size);
 
-        if let FrontendViewport::Native { panes, .. } = viewport {
-            for pane_viewport in panes {
-                let pane = self
-                    .get_pane(pane_viewport.pane_id)
-                    .ok_or_else(|| anyhow!("no such pane {}", pane_viewport.pane_id))?;
-                if !tab.contains_pane(pane_viewport.pane_id) {
-                    anyhow::bail!("pane {} is not in tab {tab_id}", pane_viewport.pane_id);
+            if let FrontendViewport::Native { panes, .. } = viewport {
+                for pane_viewport in panes {
+                    let pane = self
+                        .get_pane(pane_viewport.pane_id)
+                        .ok_or_else(|| anyhow!("no such pane {}", pane_viewport.pane_id))?;
+                    if !tab.contains_pane(pane_viewport.pane_id) {
+                        anyhow::bail!("pane {} is not in tab {tab_id}", pane_viewport.pane_id);
+                    }
+                    self.frontend_geometry_step("resizing a native pane")?;
+                    pane.resize(pane_viewport.size)?;
                 }
-                pane.resize(pane_viewport.size)?;
+                if !panes.is_empty() {
+                    tab.rebuild_splits_sizes_from_contained_panes();
+                }
+                return Ok(());
             }
-            if !panes.is_empty() {
-                tab.rebuild_splits_sizes_from_contained_panes();
-            }
-            return Ok(());
-        }
 
-        for positioned in tab.iter_panes() {
-            let target = pane_size_for_cell_grid(size, positioned.width, positioned.height);
-            positioned.pane.resize(target)?;
+            for positioned in tab.iter_panes() {
+                let target = pane_size_for_cell_grid(size, positioned.width, positioned.height);
+                self.frontend_geometry_step("resizing a cell-grid pane")?;
+                positioned.pane.resize(target)?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            transaction.commit();
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn frontend_geometry_step(&self, what: &str) -> anyhow::Result<()> {
+        if self
+            .frontend_geometry_failures
+            .lock()
+            .pop_front()
+            .unwrap_or(false)
+        {
+            anyhow::bail!("injected frontend geometry failure while {what}");
         }
         Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn frontend_geometry_step(&self, _what: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn fail_closed_frontend_geometry(
+        &self,
+        tab_id: TabId,
+        restore_mode: Option<FrontendAccessMode>,
+        apply_error: anyhow::Error,
+    ) -> anyhow::Error {
+        let (mode, mut affected_tabs) = {
+            let mut lease = self.frontend_lease.lock();
+            if let Some(mode) = restore_mode {
+                lease.access_mode = mode;
+                lease.access_initialized = true;
+            }
+            let mode = lease.access_mode;
+            let mut affected = Vec::new();
+            match mode {
+                FrontendAccessMode::Handoff => {
+                    lease.handoff_owner = None;
+                    lease.handoff_ever_owned = true;
+                    for (affected_tab_id, state) in &mut lease.tabs {
+                        state.owner = None;
+                        state.view = None;
+                        affected.push(*affected_tab_id);
+                    }
+                }
+                FrontendAccessMode::TmuxLatest => {
+                    lease.handoff_owner = None;
+                    let state = lease.tabs.entry(tab_id).or_default();
+                    state.owner = None;
+                    state.view = None;
+                    affected.push(tab_id);
+                }
+            }
+            if !lease.tabs.contains_key(&tab_id) {
+                lease.tabs.entry(tab_id).or_default();
+                affected.push(tab_id);
+            }
+            (mode, affected)
+        };
+
+        affected_tabs.sort_unstable();
+        affected_tabs.dedup();
+        self.publish_frontend_access_state();
+        for affected_tab_id in affected_tabs {
+            self.publish_frontend_viewport_state(affected_tab_id);
+        }
+        self.notify(MuxNotification::TabResized(tab_id));
+        anyhow!(
+            "applying frontend geometry for tab {tab_id} failed; the {mode:?} lease was revoked: {apply_error:#}"
+        )
     }
 
     pub fn record_input_for_current_identity(&self) {
@@ -1064,8 +1541,20 @@ impl Mux {
         let Some((_domain, _window, tab_id, _pane)) = self.resolve_focused_pane(&ident) else {
             return;
         };
-        if let Err(err) = self.claim_frontend_viewport(&ident, tab_id) {
-            log::error!("failed to claim local frontend viewport for tab {tab_id}: {err:#}");
+        let viewport = {
+            let lease = self.frontend_lease.lock();
+            if lease.access_mode != FrontendAccessMode::TmuxLatest {
+                return;
+            }
+            lease
+                .tabs
+                .get(&tab_id)
+                .and_then(|state| state.viewports.get(ident.as_ref()).cloned())
+        };
+        if let Some(viewport) = viewport {
+            if let Err(err) = self.claim_frontend_viewport(&ident, tab_id, viewport) {
+                log::error!("failed to claim local frontend viewport for tab {tab_id}: {err:#}");
+            }
         }
     }
 
@@ -1279,8 +1768,7 @@ impl Mux {
             self.clients.write().remove(client_id);
             registrations.remove(client_id);
         }
-        let clients = self.clients.read();
-        let affected = {
+        let (affected, access_changed) = {
             let mut lease = self.frontend_lease.lock();
             let mut affected = Vec::new();
             for (tab_id, state) in &mut lease.tabs {
@@ -1288,28 +1776,26 @@ impl Mux {
                 if state.owner.as_ref() != Some(client_id) {
                     continue;
                 }
-                let replacement = clients
-                    .values()
-                    .filter(|info| state.viewports.contains_key(info.client_id.as_ref()))
-                    .max_by_key(|info| info.last_input)
-                    .map(|info| (*info.client_id).clone());
-                state.owner = replacement.clone();
+                state.owner = None;
                 state.view = None;
-                let viewport = replacement
-                    .as_ref()
-                    .and_then(|replacement| state.viewports.get(replacement).cloned());
-                affected.push((*tab_id, viewport));
+                affected.push(*tab_id);
             }
-            affected
+            let access_changed = lease.access_mode == FrontendAccessMode::Handoff
+                && lease.handoff_owner.as_ref() == Some(client_id);
+            if access_changed {
+                // Do not select a surviving renderer automatically. Every
+                // remaining device stays opaque until one explicitly clicks,
+                // wheels or swipes the takeover surface.
+                lease.handoff_owner = None;
+                lease.handoff_ever_owned = true;
+            }
+            (affected, access_changed)
         };
-        drop(clients);
 
-        for (tab_id, viewport) in affected {
-            if let Some(viewport) = viewport {
-                if let Err(err) = self.apply_frontend_viewport(tab_id, &viewport) {
-                    log::error!("failed to apply fallback viewport for tab {tab_id}: {err:#}");
-                }
-            }
+        if access_changed {
+            self.publish_frontend_access_state();
+        }
+        for tab_id in affected {
             self.publish_frontend_viewport_state(tab_id);
         }
     }
@@ -1374,8 +1860,29 @@ impl Mux {
     }
 
     pub fn notify(&self, notification: MuxNotification) {
+        match notification {
+            MuxNotification::TabResized(tab_id) => {
+                if self.tab_resize_notifications.lock().defer(tab_id) {
+                    return;
+                }
+                self.notify_immediate(MuxNotification::TabResized(tab_id));
+            }
+            other => self.notify_immediate(other),
+        }
+    }
+
+    fn notify_immediate(&self, notification: MuxNotification) {
         let mut subscribers = self.subscribers.write();
         subscribers.retain(|_, notify| notify(notification.clone()));
+    }
+
+    fn begin_tab_geometry_transaction(&self, tab_id: TabId) -> TabGeometryTransaction<'_> {
+        self.tab_resize_notifications.lock().begin(tab_id);
+        TabGeometryTransaction {
+            mux: self,
+            tab_id,
+            commit: false,
+        }
     }
 
     pub fn notify_from_any_thread(notification: MuxNotification) {
@@ -2436,6 +2943,57 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tab_geometry_transaction_coalesces_and_is_tab_scoped() {
+        let mut state = TabResizeNotificationState::default();
+        state.begin(10);
+        state.begin(10);
+        state.begin(11);
+
+        assert!(state.defer(10));
+        assert!(state.defer(10));
+        assert!(state.defer(11));
+        assert!(!state.finish(10, true), "nested scope is still open");
+        assert!(state.finish(10, true), "tab 10 publishes exactly once");
+        assert!(state.finish(11, true), "tab 11 is independent");
+        assert!(!state.defer(10), "completed tabs are no longer deferred");
+    }
+
+    #[test]
+    fn failed_tab_geometry_transaction_discards_partial_notification() {
+        let mut state = TabResizeNotificationState::default();
+        state.begin(12);
+        state.begin(12);
+        assert!(state.defer(12));
+        assert!(!state.finish(12, false));
+        assert!(!state.finish(12, true), "an inner abort poisons the batch");
+        assert!(!state.pending.contains(&12));
+        assert!(!state.depth.contains_key(&12));
+        assert!(!state.aborted.contains(&12));
+    }
+
+    #[test]
+    fn tab_geometry_transaction_publishes_one_final_notification() {
+        let mux = Mux::new(None);
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::TabResized(21)) {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        });
+
+        {
+            let mut transaction = mux.begin_tab_geometry_transaction(21);
+            mux.notify(MuxNotification::TabResized(21));
+            mux.notify(MuxNotification::TabResized(21));
+            assert_eq!(notifications.load(Ordering::Relaxed), 0);
+            transaction.commit();
+        }
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+    }
+
     fn client_id(id: usize) -> ClientId {
         ClientId {
             hostname: "test-host".to_string(),
@@ -2445,6 +3003,95 @@ mod tests {
             id,
             ssh_auth_sock: None,
         }
+    }
+
+    fn frontend_test_size(cols: usize, rows: usize) -> TerminalSize {
+        TerminalSize {
+            cols,
+            rows,
+            pixel_width: cols * 8,
+            pixel_height: rows * 16,
+            dpi: 96,
+        }
+    }
+
+    fn frontend_test_viewport(cols: usize, rows: usize) -> FrontendViewport {
+        FrontendViewport::CellGrid {
+            size: frontend_test_size(cols, rows),
+        }
+    }
+
+    fn frontend_test_tab(mux: &Mux) -> TabId {
+        let tab = Arc::new(Tab::new(&frontend_test_size(80, 24)));
+        mux.add_tab_no_panes(&tab);
+        tab.tab_id()
+    }
+
+    #[test]
+    fn failed_first_handoff_geometry_revokes_the_automatic_owner() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
+        let tab_id = frontend_test_tab(&mux);
+        let client = client_id(201);
+        mux.frontend_geometry_failures.lock().push_back(true);
+
+        assert!(mux
+            .set_client_viewport(&client, tab_id, frontend_test_viewport(120, 40))
+            .is_err());
+        let lease = mux.frontend_lease.lock();
+        assert_eq!(lease.handoff_owner, None);
+        assert!(lease.handoff_ever_owned);
+        assert_eq!(lease.tabs[&tab_id].owner, None);
+    }
+
+    #[test]
+    fn failed_handoff_claim_revokes_the_global_owner() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
+        let tab_id = frontend_test_tab(&mux);
+        let first = client_id(211);
+        let second = client_id(212);
+        {
+            let mut lease = mux.frontend_lease.lock();
+            lease.handoff_owner = Some(first.clone());
+            lease.handoff_ever_owned = true;
+            lease.tabs.entry(tab_id).or_default().owner = Some(first);
+        }
+        mux.frontend_geometry_failures.lock().push_back(true);
+
+        assert!(mux
+            .claim_frontend_viewport(&second, tab_id, frontend_test_viewport(120, 40))
+            .is_err());
+        let lease = mux.frontend_lease.lock();
+        assert_eq!(lease.handoff_owner, None);
+        assert_eq!(lease.tabs[&tab_id].owner, None);
+    }
+
+    #[test]
+    fn failed_mode_geometry_restores_the_prior_mode_but_clears_ownership() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
+        let tab_id = frontend_test_tab(&mux);
+        let owner = client_id(221);
+        {
+            let mut lease = mux.frontend_lease.lock();
+            lease.handoff_owner = Some(owner.clone());
+            lease.handoff_ever_owned = true;
+            lease.tabs.entry(tab_id).or_default().owner = Some(owner.clone());
+        }
+        mux.frontend_geometry_failures.lock().push_back(true);
+
+        assert!(mux
+            .set_frontend_access_mode(
+                &owner,
+                FrontendAccessMode::TmuxLatest,
+                tab_id,
+                frontend_test_viewport(120, 40),
+            )
+            .is_err());
+        let access = mux.frontend_access_state();
+        assert_eq!(access.mode, FrontendAccessMode::Handoff);
+        assert_eq!(access.owner, None);
     }
 
     fn palette(foreground: f32) -> ColorPalette {
@@ -2544,6 +3191,7 @@ mod tests {
     #[test]
     fn frontend_ownership_is_scoped_per_tab() {
         let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::TmuxLatest);
         let first = Arc::new(client_id(31));
         let second = Arc::new(client_id(32));
         let mut lease = mux.frontend_lease.lock();
@@ -2559,6 +3207,7 @@ mod tests {
     #[test]
     fn non_rendering_cli_input_does_not_steal_a_tab_viewport() {
         let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::TmuxLatest);
         let tui = Arc::new(client_id(62));
         let cli = Arc::new(client_id(63));
         mux.register_client(Arc::clone(&tui));
@@ -2579,6 +3228,7 @@ mod tests {
             }
         }
         let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::TmuxLatest);
         let tab = Arc::new(Tab::new(&TerminalSize::default()));
         mux.add_tab_no_panes(&tab);
         let tab_40 = tab.tab_id();
@@ -2626,7 +3276,7 @@ mod tests {
             })
         );
 
-        let _ = mux.claim_frontend_viewport(&second, tab_40);
+        let _ = mux.claim_frontend_viewport(&second, tab_40, grid());
         assert_eq!(
             mux.frontend_lease.lock().tabs[&tab_40].view,
             None,
@@ -2647,6 +3297,7 @@ mod tests {
         }
 
         let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::TmuxLatest);
         let initial = size(132, 40);
         let tab = Arc::new(Tab::new(&initial));
         mux.add_tab_no_panes(&tab);
@@ -2694,7 +3345,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_viewport_claim_uses_the_server_stored_advertisement() {
+    fn explicit_viewport_claim_uses_request_geometry_atomically() {
         let mux = Mux::new(None);
         let initial = TerminalSize {
             cols: 120,
@@ -2718,7 +3369,7 @@ mod tests {
             FrontendViewport::CellGrid { size: initial },
         )
         .unwrap();
-        let smaller = TerminalSize {
+        let advertised = TerminalSize {
             cols: 72,
             rows: 20,
             pixel_width: 576,
@@ -2729,17 +3380,160 @@ mod tests {
             &second,
             second_registration,
             tab_id,
-            FrontendViewport::CellGrid { size: smaller },
+            FrontendViewport::CellGrid { size: advertised },
         )
         .unwrap();
 
+        let claimed = TerminalSize {
+            cols: 84,
+            rows: 26,
+            pixel_width: 672,
+            pixel_height: 416,
+            dpi: 96,
+        };
+
         let state = mux
-            .claim_registered_client_viewport(&second, second_registration, tab_id)
+            .claim_registered_client_viewport(
+                &second,
+                second_registration,
+                tab_id,
+                FrontendViewport::CellGrid { size: claimed },
+            )
             .unwrap()
             .unwrap();
         assert_eq!(state.owner.as_ref(), Some(second.as_ref()));
-        assert_eq!(state.canonical_size, smaller);
-        assert_eq!(tab.get_size(), smaller);
+        assert_eq!(state.access.owner.as_ref(), Some(second.as_ref()));
+        assert_eq!(state.canonical_size, claimed);
+        assert_eq!(tab.get_size(), claimed);
+        let repeated = mux
+            .claim_registered_client_viewport(
+                &second,
+                second_registration,
+                tab_id,
+                FrontendViewport::CellGrid { size: claimed },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.generation, state.generation);
+    }
+
+    #[test]
+    fn handoff_disconnect_has_no_automatic_fallback() {
+        let mux = Mux::new(None);
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab);
+        let tab_id = tab.tab_id();
+        let first = Arc::new(client_id(90));
+        let second = Arc::new(client_id(91));
+        let first_registration = mux.register_client(Arc::clone(&first));
+        let second_registration = mux.register_client(Arc::clone(&second));
+        let grid = FrontendViewport::CellGrid {
+            size: TerminalSize::default(),
+        };
+
+        mux.set_registered_client_viewport(&first, first_registration, tab_id, grid.clone())
+            .unwrap();
+        mux.set_registered_client_viewport(&second, second_registration, tab_id, grid.clone())
+            .unwrap();
+        assert_eq!(
+            mux.frontend_access_state().owner.as_ref(),
+            Some(first.as_ref())
+        );
+        assert_eq!(
+            mux.registered_client_has_frontend_access(&first, first_registration),
+            Some(true)
+        );
+        assert_eq!(
+            mux.registered_client_has_frontend_access(&second, second_registration),
+            Some(false)
+        );
+        assert!(mux.registered_client_had_tab_input(&first, first_registration, tab_id));
+        assert!(
+            !mux.registered_client_had_tab_input(&second, second_registration, tab_id),
+            "B must reject keyboard/mouse input from the opaque renderer"
+        );
+
+        mux.unregister_client(&first, first_registration);
+        assert_eq!(
+            mux.registered_client_has_frontend_access(&first, first_registration),
+            None
+        );
+        assert_eq!(mux.frontend_access_state().owner, None);
+        assert!(!mux.client_has_frontend_access(&second));
+
+        // A passive redraw after the disconnect still must not acquire B.
+        mux.set_registered_client_viewport(&second, second_registration, tab_id, grid.clone())
+            .unwrap();
+        assert_eq!(mux.frontend_access_state().owner, None);
+
+        mux.claim_registered_client_viewport(&second, second_registration, tab_id, grid)
+            .unwrap();
+        assert_eq!(
+            mux.frontend_access_state().owner.as_ref(),
+            Some(second.as_ref())
+        );
+    }
+
+    #[test]
+    fn mode_changes_require_the_correct_current_owner() {
+        let mux = Mux::new(None);
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab);
+        let tab_id = tab.tab_id();
+        let first = Arc::new(client_id(92));
+        let second = Arc::new(client_id(93));
+        let first_registration = mux.register_client(Arc::clone(&first));
+        let second_registration = mux.register_client(Arc::clone(&second));
+        let grid = FrontendViewport::CellGrid {
+            size: TerminalSize::default(),
+        };
+        mux.set_registered_client_viewport(&first, first_registration, tab_id, grid.clone())
+            .unwrap();
+        mux.set_registered_client_viewport(&second, second_registration, tab_id, grid.clone())
+            .unwrap();
+
+        assert!(mux
+            .set_registered_frontend_access_mode(
+                &second,
+                second_registration,
+                FrontendAccessMode::TmuxLatest,
+                tab_id,
+                grid.clone(),
+            )
+            .is_err());
+        mux.set_registered_frontend_access_mode(
+            &first,
+            first_registration,
+            FrontendAccessMode::TmuxLatest,
+            tab_id,
+            grid.clone(),
+        )
+        .unwrap();
+
+        // In A the active tab's layout owner, not an unrelated renderer, is
+        // the one allowed to make itself B's global owner.
+        mux.claim_registered_client_viewport(&second, second_registration, tab_id, grid.clone())
+            .unwrap();
+        assert!(mux
+            .set_registered_frontend_access_mode(
+                &first,
+                first_registration,
+                FrontendAccessMode::Handoff,
+                tab_id,
+                grid.clone(),
+            )
+            .is_err());
+        let access = mux
+            .set_registered_frontend_access_mode(
+                &second,
+                second_registration,
+                FrontendAccessMode::Handoff,
+                tab_id,
+                grid,
+            )
+            .unwrap();
+        assert_eq!(access.mode, FrontendAccessMode::Handoff);
+        assert_eq!(access.owner.as_ref(), Some(second.as_ref()));
     }
 
     #[test]

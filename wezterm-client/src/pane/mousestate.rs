@@ -1,24 +1,30 @@
-use crate::client::Client;
+use crate::domain::ClientInner;
 use codec::*;
 use mux::tab::TabId;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use wezterm_term::{MouseButton, MouseEvent, MouseEventKind};
 
 pub struct MouseState {
     pending: AtomicBool,
     queue: VecDeque<MouseEvent>,
-    client: Client,
+    client: Arc<ClientInner>,
     remote_pane_id: TabId,
+    remote_tab_id: Arc<AtomicUsize>,
 }
 
 impl MouseState {
-    pub fn new(remote_pane_id: TabId, client: Client) -> Self {
+    pub fn new(
+        remote_pane_id: TabId,
+        client: Arc<ClientInner>,
+        remote_tab_id: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             remote_pane_id,
             client,
+            remote_tab_id,
             pending: AtomicBool::new(false),
             queue: VecDeque::new(),
         }
@@ -92,15 +98,23 @@ impl MouseState {
             let state = Arc::clone(&state);
             mouse.pending.store(true, Ordering::SeqCst);
             let remote_pane_id = mouse.remote_pane_id;
+            let remote_tab_id = mouse.remote_tab_id.load(Ordering::Relaxed);
 
             promise::spawn::spawn(async move {
-                client
-                    .mouse_event(SendMouseEvent {
-                        pane_id: remote_pane_id,
-                        event,
-                    })
+                if client
+                    .prepare_remote_tab_input(remote_tab_id)
                     .await
-                    .ok();
+                    .unwrap_or(false)
+                {
+                    client
+                        .client
+                        .mouse_event(SendMouseEvent {
+                            pane_id: remote_pane_id,
+                            event,
+                        })
+                        .await
+                        .ok();
+                }
 
                 let mouse = state.lock();
                 mouse.pending.store(false, Ordering::SeqCst);

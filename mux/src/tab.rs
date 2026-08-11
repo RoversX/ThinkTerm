@@ -1404,8 +1404,16 @@ impl TabInner {
             self.size_before_zoom = size;
             if let Some(pane) = self.get_active_pane() {
                 pane.set_zoomed(true);
-                if let Err(err) = pane.resize(size) {
-                    log::error!("failed to resize zoomed pane: {err:#}");
+                // A remote mirror's frontend must subtract its own pane
+                // chrome before sizing the PTY. Resizing it to the raw tab
+                // size here races the frontend's complete viewport update
+                // and briefly gives the zoomed pane too many rows/columns.
+                // The geometry convergence following the zoom supplies the
+                // authoritative frontend size.
+                if !pane.is_remote_mirror() {
+                    if let Err(err) = pane.resize(size) {
+                        log::error!("failed to resize zoomed pane: {err:#}");
+                    }
                 }
                 self.zoomed.replace(pane);
             }
@@ -3535,6 +3543,7 @@ mod test {
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
+        remote_mirror: bool,
     }
 
     impl FakePane {
@@ -3542,6 +3551,15 @@ mod test {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                remote_mirror: false,
+            })
+        }
+
+        fn remote_mirror(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                remote_mirror: true,
             })
         }
     }
@@ -3641,6 +3659,9 @@ mod test {
         fn domain_id(&self) -> DomainId {
             1
         }
+        fn is_remote_mirror(&self) -> bool {
+            self.remote_mirror
+        }
         fn is_mouse_grabbed(&self) -> bool {
             false
         }
@@ -3668,15 +3689,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
@@ -3921,6 +3943,30 @@ mod test {
     }
 
     #[test]
+    fn zoom_does_not_raw_resize_a_remote_mirror() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let pane_size = TerminalSize {
+            rows: 11,
+            cols: 39,
+            pixel_width: 390,
+            pixel_height: 275,
+            dpi: 96,
+        };
+        let tab = Tab::new(&tab_size);
+        let pane = FakePane::remote_mirror(1, pane_size);
+        tab.assign_pane(&pane);
+
+        tab.toggle_zoom();
+
+        let dimensions = pane.get_dimensions();
+        assert_eq!(dimensions.cols, pane_size.cols);
+        assert_eq!(dimensions.viewport_rows, pane_size.rows);
+        assert_eq!(tab.iter_panes()[0].width, tab_size.cols);
+        assert_eq!(tab.iter_panes()[0].height, tab_size.rows);
+    }
+
+    #[test]
     fn pane_stack_add_switch_and_remove() {
         let _mux = install_mux();
         let size = test_size();
@@ -4094,9 +4140,10 @@ mod test {
             size: SplitSize::Cells(1000),
         };
         let target_index = tab.pane_index_for_pane(1).unwrap();
-        assert!(tab
-            .split_and_insert(target_index, request, Arc::clone(&removed))
-            .is_err());
+        assert!(
+            tab.split_and_insert(target_index, request, Arc::clone(&removed))
+                .is_err()
+        );
 
         tab.rehome_orphan_pane(&removed);
         assert_eq!(tab.count_panes(), Some(2));
@@ -4239,14 +4286,15 @@ mod test {
         mux.add_tab_no_panes(&target_tab);
         mux.add_pane(&target).unwrap();
 
-        assert!(mux
-            .move_pane_to_split(
+        assert!(
+            mux.move_pane_to_split(
                 src.pane_id(),
                 target_tab.tab_id(),
                 target.pane_id(),
                 SplitRequest::default(),
             )
-            .is_err());
+            .is_err()
+        );
 
         assert!(mux.get_tab(src_tab.tab_id()).is_some());
         assert!(src_tab.pane_index_for_pane(src.pane_id()).is_some());

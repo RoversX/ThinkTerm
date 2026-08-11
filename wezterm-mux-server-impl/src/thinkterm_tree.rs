@@ -243,6 +243,9 @@ pub fn ensure_landing(preferred_thread_id: Option<&str>) -> Result<LandingRecord
         (landing, changed)
     };
     if changed {
+        if let Err(err) = crate::thinkterm_layout::reconcile_with_tree(&snapshot()) {
+            log::error!("reconciling ThinkTerm layouts after tree mutation: {err:#}");
+        }
         Mux::notify_from_any_thread(MuxNotification::ThinkTermTreeChanged);
     }
     Ok(landing)
@@ -291,6 +294,9 @@ pub fn mutate(ops: &[TreeOp]) -> Result<ThinkTermTree> {
     };
 
     if changed {
+        if let Err(err) = crate::thinkterm_layout::reconcile_with_tree(&tree) {
+            log::error!("reconciling ThinkTerm layouts after tree mutation: {err:#}");
+        }
         Mux::notify_from_any_thread(MuxNotification::ThinkTermTreeChanged);
     }
 

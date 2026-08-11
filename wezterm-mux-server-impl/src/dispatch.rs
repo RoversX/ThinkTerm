@@ -226,6 +226,12 @@ where
                     .await?;
                 stream.flush().await.context("flushing PDU to client")?;
             }
+            Ok(Item::Notif(MuxNotification::FrontendAccessChanged(state))) => {
+                Pdu::FrontendAccessState(crate::sessionhandler::codec_access_state(state))
+                    .encode_async(&mut stream, 0)
+                    .await?;
+                stream.flush().await.context("flushing PDU to client")?;
+            }
             Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
             Ok(Item::Notif(MuxNotification::Empty)) => {}
             Err(err) => {

@@ -1,4 +1,4 @@
-use crate::client::Client;
+use crate::client::{Client, ClientConnectionPhase};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -17,6 +17,125 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use wezterm_term::TerminalSize;
 
+fn accepts_generation(prior: Option<u64>, incoming: u64) -> bool {
+    prior.is_none_or(|prior| incoming > prior)
+}
+
+fn remote_owner_matches_client(
+    owner: Option<&mux::client::ClientId>,
+    client_id: &mux::client::ClientId,
+) -> bool {
+    owner.is_some_and(|owner| owner.same_logical_client(client_id))
+}
+
+fn owns_remote_viewport_from_states(
+    client_id: &mux::client::ClientId,
+    access: Option<&codec::FrontendAccessState>,
+    viewport: Option<&codec::ClientViewportState>,
+) -> Option<bool> {
+    let access = access?;
+    match access.mode {
+        // Handoff is connection-wide.  A claim made while another tab is
+        // active does not publish a fresh viewport snapshot for every tab, so
+        // consulting `viewport.access` here can leave those tabs believing an
+        // old owner indefinitely.
+        codec::FrontendAccessMode::Handoff => Some(remote_owner_matches_client(
+            access.owner.as_ref(),
+            client_id,
+        )),
+        // Collaborative mode deliberately keeps one layout owner per tab.
+        codec::FrontendAccessMode::TmuxLatest => {
+            viewport.map(|state| remote_owner_matches_client(state.owner.as_ref(), client_id))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteFrontendGate {
+    Visible,
+    Claimable {
+        owner: Option<mux::client::ClientId>,
+    },
+    Connecting,
+    Reconnecting,
+    Offline,
+    Syncing,
+}
+
+impl RemoteFrontendGate {
+    pub fn obscures_terminal(&self) -> bool {
+        !matches!(self, Self::Visible)
+    }
+
+    pub fn is_claimable(&self) -> bool {
+        matches!(self, Self::Claimable { .. })
+    }
+
+    pub fn overlay_message(&self) -> Option<(String, String)> {
+        match self {
+            Self::Visible => None,
+            Self::Claimable { owner: Some(owner) } => {
+                let hostname = owner.hostname.trim();
+                let title = if hostname.is_empty() {
+                    "Terminal is being used on another device".to_string()
+                } else {
+                    format!("Terminal is being used on {hostname}")
+                };
+                Some((title, "Click or scroll to continue".to_string()))
+            }
+            Self::Claimable { owner: None } => Some((
+                "Terminal is available".to_string(),
+                "Click or scroll to take control".to_string(),
+            )),
+            Self::Connecting => Some((
+                "Connecting to terminal…".to_string(),
+                "Please wait".to_string(),
+            )),
+            Self::Reconnecting => Some((
+                "Connection lost — Reconnecting…".to_string(),
+                "Terminal will resume automatically".to_string(),
+            )),
+            Self::Offline => Some((
+                "Connection offline".to_string(),
+                "Reconnect from the sidebar".to_string(),
+            )),
+            Self::Syncing => Some((
+                "Restoring terminal state…".to_string(),
+                "Please wait".to_string(),
+            )),
+        }
+    }
+}
+
+fn remote_frontend_gate_from_state(
+    phase: ClientConnectionPhase,
+    access: Option<&codec::FrontendAccessState>,
+    client_id: &mux::client::ClientId,
+) -> RemoteFrontendGate {
+    match phase {
+        ClientConnectionPhase::Connecting => RemoteFrontendGate::Connecting,
+        ClientConnectionPhase::Registering | ClientConnectionPhase::Reconnecting => {
+            RemoteFrontendGate::Reconnecting
+        }
+        ClientConnectionPhase::Syncing => RemoteFrontendGate::Syncing,
+        ClientConnectionPhase::Suspended | ClientConnectionPhase::Detached => {
+            RemoteFrontendGate::Offline
+        }
+        ClientConnectionPhase::Ready => match access {
+            None => RemoteFrontendGate::Syncing,
+            Some(access) if access.mode == codec::FrontendAccessMode::TmuxLatest => {
+                RemoteFrontendGate::Visible
+            }
+            Some(access) if remote_owner_matches_client(access.owner.as_ref(), client_id) => {
+                RemoteFrontendGate::Visible
+            }
+            Some(access) => RemoteFrontendGate::Claimable {
+                owner: access.owner.clone(),
+            },
+        },
+    }
+}
+
 pub struct ClientInner {
     pub client: Client,
     pub local_domain_id: DomainId,
@@ -27,6 +146,14 @@ pub struct ClientInner {
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     /// Authoritative per-remote-tab viewport ownership pushed by the server.
     remote_viewports: Mutex<HashMap<TabId, codec::ClientViewportState>>,
+    /// Connection-wide A/B mode and exclusive handoff owner.
+    remote_access: Mutex<Option<codec::FrontendAccessState>>,
+    /// Latest geometry this renderer actually reported for each remote tab.
+    /// Explicit claims copy this geometry into the same PDU as the owner move.
+    reported_viewports: Mutex<HashMap<TabId, codec::ClientViewport>>,
+    /// Claims on a tab are coalesced behind one request-scoped async lock. A
+    /// second input rechecks ownership after the first request completes.
+    frontend_claim_locks: Mutex<HashMap<TabId, Arc<futures::lock::Mutex<()>>>>,
     /// Remote pane-stack id -> stable local pane-stack id. Remote and local
     /// stack ids live in different id spaces; translating (rather than
     /// adopting) avoids collisions with locally-created stacks while keeping
@@ -111,6 +238,19 @@ fn remote_move_pane_id(
 }
 
 impl ClientInner {
+    fn remote_owner_is_self(&self, owner: Option<&mux::client::ClientId>) -> bool {
+        remote_owner_matches_client(owner, &self.client.client_id)
+    }
+
+    pub fn remote_frontend_gate(&self) -> RemoteFrontendGate {
+        let access = self.remote_access_state();
+        remote_frontend_gate_from_state(
+            self.client.connection_phase(),
+            access.as_ref(),
+            &self.client.client_id,
+        )
+    }
+
     fn remote_to_local_window(&self, remote_window_id: WindowId) -> Option<WindowId> {
         let map = self.remote_to_local_window.lock().unwrap();
         map.get(&remote_window_id).cloned()
@@ -278,10 +418,10 @@ impl ClientInner {
 
     fn update_remote_viewport(&self, state: codec::ClientViewportState) -> bool {
         let mut states = self.remote_viewports.lock().unwrap();
-        if states
-            .get(&state.tab_id)
-            .is_some_and(|prior| prior.generation > state.generation)
-        {
+        if !accepts_generation(
+            states.get(&state.tab_id).map(|prior| prior.generation),
+            state.generation,
+        ) {
             return false;
         }
         states.insert(state.tab_id, state);
@@ -300,12 +440,132 @@ impl ClientInner {
     }
 
     pub fn owns_remote_viewport(&self, remote_tab_id: TabId) -> Option<bool> {
-        let state = self.remote_viewport_state(remote_tab_id)?;
-        Some(state.owner.as_ref() == Some(&self.client.client_id))
+        let access = self.remote_access_state();
+        let viewport = self.remote_viewport_state(remote_tab_id);
+        owns_remote_viewport_from_states(&self.client.client_id, access.as_ref(), viewport.as_ref())
     }
 
-    fn clear_remote_viewports(&self) {
+    /// Drop connection-scoped state before registering a new transport
+    /// generation.  Keep the latest locally-rendered geometry: replaying it
+    /// after SetClientId is how the new live session obtains authoritative
+    /// access/owner state without claiming ownership or waiting for an
+    /// incidental GUI resize.
+    fn begin_remote_generation(&self) {
         self.remote_viewports.lock().unwrap().clear();
+        *self.remote_access.lock().unwrap() = None;
+        self.frontend_claim_locks.lock().unwrap().clear();
+    }
+
+    fn reported_viewports_for_live_tabs(&self) -> Vec<(TabId, codec::ClientViewport)> {
+        let live_tabs: HashSet<TabId> = self
+            .remote_to_local_tab
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        let mut reported = self.reported_viewports.lock().unwrap();
+        reported.retain(|tab_id, _| live_tabs.contains(tab_id));
+        reported
+            .iter()
+            .map(|(tab_id, viewport)| (*tab_id, viewport.clone()))
+            .collect()
+    }
+
+    fn update_remote_access(&self, state: codec::FrontendAccessState) -> bool {
+        let mut prior = self.remote_access.lock().unwrap();
+        if !accepts_generation(
+            prior.as_ref().map(|prior| prior.generation),
+            state.generation,
+        ) {
+            return false;
+        }
+        *prior = Some(state);
+        true
+    }
+
+    pub fn remote_access_state(&self) -> Option<codec::FrontendAccessState> {
+        self.remote_access.lock().unwrap().clone()
+    }
+
+    pub fn has_remote_access(&self) -> Option<bool> {
+        let state = self.remote_access_state()?;
+        Some(match state.mode {
+            codec::FrontendAccessMode::TmuxLatest => true,
+            codec::FrontendAccessMode::Handoff => self.remote_owner_is_self(state.owner.as_ref()),
+        })
+    }
+
+    fn remember_reported_viewport(&self, tab_id: TabId, viewport: codec::ClientViewport) {
+        self.reported_viewports
+            .lock()
+            .unwrap()
+            .insert(tab_id, viewport);
+    }
+
+    fn claim_lock(&self, tab_id: TabId) -> Arc<futures::lock::Mutex<()>> {
+        self.frontend_claim_locks
+            .lock()
+            .unwrap()
+            .entry(tab_id)
+            .or_insert_with(|| Arc::new(futures::lock::Mutex::new(())))
+            .clone()
+    }
+
+    /// Return false only for B's opaque non-owner state. In A, serialize an
+    /// atomic claim before forwarding the terminal input.
+    pub(crate) async fn prepare_remote_tab_input(
+        &self,
+        remote_tab_id: TabId,
+    ) -> anyhow::Result<bool> {
+        if self.remote_frontend_gate().obscures_terminal() {
+            return Ok(false);
+        }
+        let Some(access) = self.remote_access_state() else {
+            return Ok(false);
+        };
+        match access.mode {
+            codec::FrontendAccessMode::Handoff => {
+                return Ok(self.remote_owner_is_self(access.owner.as_ref()));
+            }
+            codec::FrontendAccessMode::TmuxLatest => {}
+        }
+        if self
+            .remote_viewport_state(remote_tab_id)
+            .is_some_and(|state| self.remote_owner_is_self(state.owner.as_ref()))
+        {
+            return Ok(true);
+        }
+        let lock = self.claim_lock(remote_tab_id);
+        let _guard = lock.lock().await;
+        if self
+            .remote_viewport_state(remote_tab_id)
+            .is_some_and(|state| self.remote_owner_is_self(state.owner.as_ref()))
+        {
+            return Ok(true);
+        }
+        let viewport = self
+            .reported_viewports
+            .lock()
+            .unwrap()
+            .get(&remote_tab_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("viewport for remote tab {remote_tab_id} is not ready"))?;
+        let state = self
+            .client
+            .claim_client_viewport(codec::ClaimClientViewport {
+                tab_id: remote_tab_id,
+                viewport,
+            })
+            .await?;
+        let owns = self.remote_owner_is_self(state.owner.as_ref());
+        self.update_remote_access(state.access.clone());
+        self.update_remote_viewport(state);
+        Ok(owns)
+    }
+
+    pub(crate) fn remote_tab_input_is_blocked(&self) -> bool {
+        self.remote_frontend_gate().obscures_terminal()
     }
 
     pub fn is_local(&self) -> bool {
@@ -384,6 +644,9 @@ impl ClientInner {
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             remote_viewports: Mutex::new(HashMap::new()),
+            remote_access: Mutex::new(None),
+            reported_viewports: Mutex::new(HashMap::new()),
+            frontend_claim_locks: Mutex::new(HashMap::new()),
             remote_to_local_stack: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
             focus_advised_at: Mutex::new(None),
@@ -761,10 +1024,47 @@ impl ClientDomain {
         inner.owns_remote_viewport(remote_tab_id)
     }
 
+    pub fn remote_access_state(&self) -> Option<codec::FrontendAccessState> {
+        self.inner()?.remote_access_state()
+    }
+
+    pub fn has_remote_access(&self) -> Option<bool> {
+        self.inner()?.has_remote_access()
+    }
+
+    pub fn remote_frontend_gate(&self) -> RemoteFrontendGate {
+        if self.is_attaching() {
+            return RemoteFrontendGate::Connecting;
+        }
+        self.inner()
+            .map(|inner| inner.remote_frontend_gate())
+            .unwrap_or(RemoteFrontendGate::Offline)
+    }
+
+    pub fn process_remote_access_state(&self, state: codec::FrontendAccessState) {
+        let Some(inner) = self.inner() else {
+            return;
+        };
+        if !inner.update_remote_access(state.clone()) {
+            return;
+        }
+        Mux::get().notify(MuxNotification::FrontendAccessChanged(
+            mux::FrontendAccessState {
+                mode: match state.mode {
+                    codec::FrontendAccessMode::TmuxLatest => mux::FrontendAccessMode::TmuxLatest,
+                    codec::FrontendAccessMode::Handoff => mux::FrontendAccessMode::Handoff,
+                },
+                owner: state.owner,
+                generation: state.generation,
+            },
+        ));
+    }
+
     pub fn process_remote_viewport_state(&self, state: codec::ClientViewportState) {
         let Some(inner) = self.inner() else {
             return;
         };
+        self.process_remote_access_state(state.access.clone());
         if !inner.update_remote_viewport(state.clone()) {
             return;
         }
@@ -782,6 +1082,16 @@ impl ClientDomain {
                             .collect(),
                     }),
                     generation: state.generation,
+                    access: mux::FrontendAccessState {
+                        mode: match state.access.mode {
+                            codec::FrontendAccessMode::TmuxLatest => {
+                                mux::FrontendAccessMode::TmuxLatest
+                            }
+                            codec::FrontendAccessMode::Handoff => mux::FrontendAccessMode::Handoff,
+                        },
+                        owner: state.access.owner,
+                        generation: state.access.generation,
+                    },
                 },
             ));
         }
@@ -811,10 +1121,25 @@ impl ClientDomain {
     ///
     /// This is the funnel every automatic reconnect passes through, so it has
     /// to do everything a first attach does and not only re-pull the panes.
-    pub async fn reattach(domain_id: DomainId, ui: ConnectionUI) -> anyhow::Result<()> {
+    pub async fn reattach(
+        domain_id: DomainId,
+        connection_generation: u64,
+        ui: ConnectionUI,
+    ) -> anyhow::Result<()> {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
-        inner.clear_remote_viewports();
-        let domain = Mux::get().get_domain(domain_id);
+        if inner.client.connection_generation() != connection_generation {
+            bail!("generation {connection_generation} was superseded before reattach began");
+        }
+        inner.begin_remote_generation();
+        let domain = Mux::get()
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow!("domain {domain_id} disappeared during reattach"))?;
+
+        ui.output_str("Checking server version and restoring client identity\n");
+        inner.client.verify_version_compat(&ui).await?;
+        if inner.client.connection_generation() != connection_generation {
+            bail!("generation {connection_generation} was superseded during registration");
+        }
 
         // A reconnect begins a new connection generation. The revision
         // baseline, any old connection-scoped presentation overlay, and the
@@ -824,30 +1149,55 @@ impl ClientDomain {
         // overtakes it, is measured against this connection; a push that beats
         // the announcement is at worst dropped as stale and put right by that
         // same fetch.
-        if let Some(domain) = &domain {
-            deliver_thinkterm_connected(domain.domain_name(), inner.client.connection_generation());
-        }
+        deliver_thinkterm_connected(domain.domain_name(), connection_generation);
 
         let panes = inner.client.list_panes().await?;
-        Self::process_pane_list(inner, panes, None, true)?;
+        Self::process_pane_list(Arc::clone(&inner), panes, None, true)?;
 
         // Pull the tree exactly as a first attach does. Pushes only carry what
         // changes from now on, so without this the sidebar would keep showing
-        // whatever it held when the link dropped. Remote edits are rejected
-        // while reconnecting; there is deliberately no client queue to flush.
-        if let Some(client) = domain
-            .as_ref()
-            .and_then(|domain| domain.downcast_ref::<ClientDomain>())
+        // whatever it held when the link dropped. Ordinary RPCs remain behind
+        // the registration barrier until SetClientId has been acknowledged.
+        let client = domain
+            .downcast_ref::<ClientDomain>()
+            .ok_or_else(|| anyhow!("domain {domain_id} changed type during reattach"))?;
+
+        // SetClientId deliberately does not restore ownership.  Re-advertise
+        // the exact geometry this frontend rendered before the outage so the
+        // server can return current access state for the new live session.
+        // SetClientViewport is non-claiming: if another device took over while
+        // we were offline, it remains the owner.
+        for (remote_tab_id, viewport) in inner.reported_viewports_for_live_tabs() {
+            let state = inner
+                .client
+                .set_client_viewport(codec::SetClientViewport {
+                    tab_id: remote_tab_id,
+                    viewport,
+                })
+                .await
+                .with_context(|| {
+                    format!("restoring viewport and access state for remote tab {remote_tab_id}")
+                })?;
+            client.process_remote_viewport_state(state);
+        }
+        if !inner.remote_to_local_tab.lock().unwrap().is_empty()
+            && inner.remote_access_state().is_none()
         {
-            if let Err(err) = client.fetch_thinkterm_tree().await {
-                log::warn!(
-                    "failed to fetch the ThinkTerm tree after reconnecting to {}: {err:#}",
-                    client.config.name()
-                );
-            }
+            bail!(
+                "the reconnected mux session did not return frontend access state; \
+                 refusing to mark generation {connection_generation} ready"
+            );
         }
 
-        ui.close();
+        client.fetch_thinkterm_tree().await.with_context(|| {
+            format!(
+                "fetching the ThinkTerm tree after reconnecting to {}",
+                client.config.name()
+            )
+        })?;
+        if inner.client.connection_generation() != connection_generation {
+            bail!("generation {connection_generation} was superseded during topology sync");
+        }
         Ok(())
     }
 
@@ -944,19 +1294,11 @@ impl ClientDomain {
         Ok(response)
     }
 
-    /// Report the viewport for a locally mirrored tab to the frontend mux.
-    pub async fn set_client_viewport(
+    fn translate_client_viewport(
         &self,
-        local_tab_id: TabId,
         viewport: codec::ClientViewport,
-    ) -> anyhow::Result<codec::ClientViewportState> {
-        let inner = self
-            .inner()
-            .ok_or_else(|| anyhow!("domain is not attached"))?;
-        let remote_tab_id = inner
-            .local_to_remote_tab(local_tab_id)
-            .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
-        let viewport = match viewport {
+    ) -> anyhow::Result<codec::ClientViewport> {
+        Ok(match viewport {
             codec::ClientViewport::CellGrid { size } => codec::ClientViewport::CellGrid { size },
             codec::ClientViewport::Native { size, panes } => {
                 let mut remote_panes = Vec::with_capacity(panes.len());
@@ -981,7 +1323,23 @@ impl ClientDomain {
                     panes: remote_panes,
                 }
             }
-        };
+        })
+    }
+
+    /// Report the viewport for a locally mirrored tab to the frontend mux.
+    pub async fn set_client_viewport(
+        &self,
+        local_tab_id: TabId,
+        viewport: codec::ClientViewport,
+    ) -> anyhow::Result<codec::ClientViewportState> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let remote_tab_id = inner
+            .local_to_remote_tab(local_tab_id)
+            .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
+        let viewport = self.translate_client_viewport(viewport)?;
+        let reported = viewport.clone();
         let state = inner
             .client
             .set_client_viewport(codec::SetClientViewport {
@@ -989,6 +1347,7 @@ impl ClientDomain {
                 viewport,
             })
             .await?;
+        inner.remember_reported_viewport(remote_tab_id, reported);
         self.process_remote_viewport_state(state.clone());
         Ok(state)
     }
@@ -1020,12 +1379,12 @@ impl ClientDomain {
         Ok(())
     }
 
-    /// Claim a previously advertised viewport after a real frontend-only
-    /// interaction (for example, dragging a split).  The server chooses the
-    /// owner and geometry and returns the authoritative result.
+    /// Atomically claim the current access/layout lease and install the exact
+    /// geometry used for the interaction.
     pub async fn claim_client_viewport(
         &self,
         local_tab_id: TabId,
+        viewport: codec::ClientViewport,
     ) -> anyhow::Result<codec::ClientViewportState> {
         let inner = self
             .inner()
@@ -1033,13 +1392,44 @@ impl ClientDomain {
         let remote_tab_id = inner
             .local_to_remote_tab(local_tab_id)
             .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
+        let viewport = self.translate_client_viewport(viewport)?;
+        let reported = viewport.clone();
         let state = inner
             .client
             .claim_client_viewport(codec::ClaimClientViewport {
                 tab_id: remote_tab_id,
+                viewport,
             })
             .await?;
+        inner.remember_reported_viewport(remote_tab_id, reported);
         self.process_remote_viewport_state(state.clone());
+        Ok(state)
+    }
+
+    pub async fn set_frontend_access_mode(
+        &self,
+        local_tab_id: TabId,
+        mode: codec::FrontendAccessMode,
+        viewport: codec::ClientViewport,
+    ) -> anyhow::Result<codec::FrontendAccessState> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let remote_tab_id = inner
+            .local_to_remote_tab(local_tab_id)
+            .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
+        let viewport = self.translate_client_viewport(viewport)?;
+        let reported = viewport.clone();
+        let state = inner
+            .client
+            .set_frontend_access_mode(codec::SetFrontendAccessMode {
+                mode,
+                tab_id: remote_tab_id,
+                viewport,
+            })
+            .await?;
+        inner.remember_reported_viewport(remote_tab_id, reported);
+        self.process_remote_access_state(state.clone());
         Ok(state)
     }
 
@@ -1389,7 +1779,187 @@ impl ClientDomain {
 
 #[cfg(test)]
 mod tests {
-    use super::remote_move_pane_id;
+    use super::{
+        accepts_generation, owns_remote_viewport_from_states, remote_frontend_gate_from_state,
+        remote_move_pane_id, RemoteFrontendGate,
+    };
+    use crate::client::ClientConnectionPhase;
+
+    fn client_id(hostname: &str, id: usize) -> mux::client::ClientId {
+        mux::client::ClientId {
+            hostname: hostname.to_string(),
+            username: "test-user".to_string(),
+            pid: 42,
+            epoch: 123,
+            id,
+            ssh_auth_sock: None,
+        }
+    }
+
+    fn access(
+        mode: codec::FrontendAccessMode,
+        owner: Option<mux::client::ClientId>,
+        generation: u64,
+    ) -> codec::FrontendAccessState {
+        codec::FrontendAccessState {
+            mode,
+            owner,
+            generation,
+        }
+    }
+
+    fn viewport(
+        tab_id: mux::tab::TabId,
+        owner: Option<mux::client::ClientId>,
+        access: codec::FrontendAccessState,
+    ) -> codec::ClientViewportState {
+        codec::ClientViewportState {
+            tab_id,
+            owner,
+            canonical_size: wezterm_term::TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            view: None,
+            generation: 1,
+            access,
+        }
+    }
+
+    #[test]
+    fn equal_or_older_frontend_generations_are_ignored() {
+        assert!(accepts_generation(None, 0));
+        assert!(accepts_generation(Some(9), 10));
+        assert!(!accepts_generation(Some(9), 9));
+        assert!(!accepts_generation(Some(9), 8));
+    }
+
+    #[test]
+    fn handoff_ownership_uses_latest_connection_state_across_tabs() {
+        let mac = client_id("mac", 1);
+        let vm = client_id("vm", 2);
+        let stale_tab = viewport(
+            7,
+            Some(mac.clone()),
+            access(codec::FrontendAccessMode::Handoff, Some(mac.clone()), 1),
+        );
+
+        // The VM claimed globally while another tab was active.  This tab's
+        // viewport snapshot is stale, but it must immediately become blocked.
+        let vm_owns = access(codec::FrontendAccessMode::Handoff, Some(vm.clone()), 2);
+        assert_eq!(
+            owns_remote_viewport_from_states(&mac, Some(&vm_owns), Some(&stale_tab)),
+            Some(false)
+        );
+
+        // After the Mac claims its currently selected tab, it must immediately
+        // use its full local size even before that tab receives another lease
+        // publication.
+        let mac_owns = access(codec::FrontendAccessMode::Handoff, Some(mac.clone()), 3);
+        assert_eq!(
+            owns_remote_viewport_from_states(&mac, Some(&mac_owns), Some(&stale_tab)),
+            Some(true)
+        );
+        assert_eq!(
+            owns_remote_viewport_from_states(&mac, Some(&mac_owns), None),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn collaborative_ownership_remains_per_tab() {
+        let mac = client_id("mac", 1);
+        let vm = client_id("vm", 2);
+        let shared = access(codec::FrontendAccessMode::TmuxLatest, Some(vm.clone()), 4);
+        let mac_tab = viewport(7, Some(mac.clone()), shared.clone());
+        let vm_tab = viewport(8, Some(vm), shared.clone());
+
+        assert_eq!(
+            owns_remote_viewport_from_states(&mac, Some(&shared), Some(&mac_tab)),
+            Some(true)
+        );
+        assert_eq!(
+            owns_remote_viewport_from_states(&mac, Some(&shared), Some(&vm_tab)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn frontend_gate_separates_connection_health_from_handoff_ownership() {
+        let mac = client_id("mac", 1);
+        let vm = client_id("vm", 2);
+        let mac_owns = access(codec::FrontendAccessMode::Handoff, Some(mac.clone()), 1);
+        let vm_owns = access(codec::FrontendAccessMode::Handoff, Some(vm.clone()), 2);
+        let unowned = access(codec::FrontendAccessMode::Handoff, None, 3);
+        let shared = access(codec::FrontendAccessMode::TmuxLatest, Some(vm), 4);
+
+        assert_eq!(
+            remote_frontend_gate_from_state(ClientConnectionPhase::Ready, Some(&mac_owns), &mac,),
+            RemoteFrontendGate::Visible
+        );
+        assert_eq!(
+            remote_frontend_gate_from_state(ClientConnectionPhase::Ready, Some(&vm_owns), &mac,),
+            RemoteFrontendGate::Claimable {
+                owner: vm_owns.owner.clone(),
+            }
+        );
+        assert_eq!(
+            remote_frontend_gate_from_state(ClientConnectionPhase::Ready, Some(&unowned), &mac,),
+            RemoteFrontendGate::Claimable { owner: None }
+        );
+        assert_eq!(
+            remote_frontend_gate_from_state(ClientConnectionPhase::Ready, Some(&shared), &mac,),
+            RemoteFrontendGate::Visible
+        );
+        assert_eq!(
+            remote_frontend_gate_from_state(ClientConnectionPhase::Ready, None, &mac),
+            RemoteFrontendGate::Syncing
+        );
+
+        for (phase, expected) in [
+            (
+                ClientConnectionPhase::Connecting,
+                RemoteFrontendGate::Connecting,
+            ),
+            (
+                ClientConnectionPhase::Registering,
+                RemoteFrontendGate::Reconnecting,
+            ),
+            (
+                ClientConnectionPhase::Reconnecting,
+                RemoteFrontendGate::Reconnecting,
+            ),
+            (ClientConnectionPhase::Syncing, RemoteFrontendGate::Syncing),
+            (
+                ClientConnectionPhase::Suspended,
+                RemoteFrontendGate::Offline,
+            ),
+            (ClientConnectionPhase::Detached, RemoteFrontendGate::Offline),
+        ] {
+            assert_eq!(
+                remote_frontend_gate_from_state(phase, Some(&vm_owns), &mac),
+                expected
+            );
+        }
+
+        assert_eq!(
+            RemoteFrontendGate::Reconnecting.overlay_message(),
+            Some((
+                "Connection lost — Reconnecting…".to_string(),
+                "Terminal will resume automatically".to_string(),
+            ))
+        );
+        assert_eq!(
+            RemoteFrontendGate::Claimable { owner: None }.overlay_message(),
+            Some((
+                "Terminal is available".to_string(),
+                "Click or scroll to take control".to_string(),
+            ))
+        );
+    }
 
     #[test]
     fn remote_move_uses_the_remote_source_id() {
@@ -1455,6 +2025,10 @@ impl Domain for ClientDomain {
         let pane = local_pane
             .downcast_ref::<ClientPane>()
             .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", base_pane_id))?;
+
+        if !inner.prepare_remote_tab_input(pane.remote_tab_id()).await? {
+            bail!("terminal is being operated on another device");
+        }
 
         let result = inner
             .client
@@ -1540,6 +2114,10 @@ impl Domain for ClientDomain {
             );
         }
 
+        if !inner.prepare_remote_tab_input(target_remote_tab_id).await? {
+            bail!("terminal is being operated on another device");
+        }
+
         // This feature is restricted to one top-level tab. Apply the
         // already-validated move locally before the network round-trip so
         // dropping the drag preview does not reveal the old layout for one
@@ -1584,6 +2162,10 @@ impl Domain for ClientDomain {
         let pane = local_pane
             .downcast_ref::<ClientPane>()
             .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", pane_id))?;
+
+        if !inner.prepare_remote_tab_input(pane.remote_tab_id()).await? {
+            bail!("terminal is being operated on another device");
+        }
 
         let remote_window_id =
             window_id.and_then(|local_window| self.local_to_remote_window_id(local_window));
@@ -1703,6 +2285,10 @@ impl Domain for ClientDomain {
         }
         let target_remote_pane_id = pane.remote_pane_id();
         let target_remote_tab_id = pane.remote_tab_id();
+
+        if !inner.prepare_remote_tab_input(target_remote_tab_id).await? {
+            bail!("terminal is being operated on another device");
+        }
 
         let (command, command_dir, move_pane_id, moved_local_pane, source_tab_id) = match source {
             SplitSource::Spawn {
@@ -1994,6 +2580,10 @@ impl ClientDomain {
                 "failed to fetch the ThinkTerm tree from {}: {err:#}",
                 self.config.name()
             );
+        }
+
+        if let Some(inner) = self.inner() {
+            inner.client.mark_ready();
         }
 
         ui.output_str("Attached!\n");

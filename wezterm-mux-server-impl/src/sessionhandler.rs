@@ -9,8 +9,9 @@ use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
 use mux::{
-    ClientRegistrationId, FrontendPaneViewport, FrontendViewport, FrontendViewportState, Mux,
-    PaletteSessionId,
+    ClientRegistrationId, FrontendAccessMode as MuxFrontendAccessMode,
+    FrontendAccessState as MuxFrontendAccessState, FrontendPaneViewport, FrontendViewport,
+    FrontendViewportState, Mux, PaletteSessionId,
 };
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
@@ -265,6 +266,29 @@ pub(crate) fn codec_viewport_state(state: FrontendViewportState) -> ClientViewpo
                 .collect(),
         }),
         generation: state.generation,
+        access: codec_access_state(state.access),
+    }
+}
+
+pub(crate) fn codec_access_state(state: MuxFrontendAccessState) -> FrontendAccessState {
+    FrontendAccessState {
+        mode: codec_access_mode(state.mode),
+        owner: state.owner,
+        generation: state.generation,
+    }
+}
+
+fn codec_access_mode(mode: MuxFrontendAccessMode) -> FrontendAccessMode {
+    match mode {
+        MuxFrontendAccessMode::TmuxLatest => FrontendAccessMode::TmuxLatest,
+        MuxFrontendAccessMode::Handoff => FrontendAccessMode::Handoff,
+    }
+}
+
+fn mux_access_mode(mode: FrontendAccessMode) -> MuxFrontendAccessMode {
+    match mode {
+        FrontendAccessMode::TmuxLatest => MuxFrontendAccessMode::TmuxLatest,
+        FrontendAccessMode::Handoff => MuxFrontendAccessMode::Handoff,
     }
 }
 
@@ -300,15 +324,60 @@ fn claim_viewport_for_pane(
     registration: Option<ClientRegistrationId>,
     pane_id: PaneId,
 ) -> anyhow::Result<TabId> {
+    let client_id =
+        client_id.ok_or_else(|| anyhow!("terminal input requires an identified client"))?;
+    let registration = registration
+        .ok_or_else(|| anyhow!("terminal input requires a live client registration"))?;
+    if mux
+        .registered_client_has_frontend_access(client_id, registration)
+        .is_none()
+    {
+        anyhow::bail!("terminal input came from a superseded client connection");
+    }
     let (_domain_id, _window_id, tab_id) = mux
         .resolve_pane_id(pane_id)
         .ok_or_else(|| anyhow!("no such pane {pane_id}"))?;
-    if let (Some(client_id), Some(registration)) = (client_id, registration) {
-        if !mux.registered_client_had_tab_input(client_id, registration, tab_id) {
-            anyhow::bail!("client connection was superseded");
+    if !mux.registered_client_had_tab_input(client_id, registration, tab_id) {
+        match mux.registered_client_has_frontend_access(client_id, registration) {
+            None => anyhow::bail!("client connection was superseded"),
+            Some(false) => anyhow::bail!("terminal is being operated on another device"),
+            Some(true) => anyhow::bail!("unable to acquire the frontend layout"),
         }
     }
     Ok(tab_id)
+}
+
+fn require_registered_frontend_access(
+    mux: &Mux,
+    client_id: Option<&Arc<ClientId>>,
+    registration: Option<ClientRegistrationId>,
+) -> anyhow::Result<()> {
+    let client_id = client_id.ok_or_else(|| anyhow!("request requires an identified client"))?;
+    let registration =
+        registration.ok_or_else(|| anyhow!("request requires a live client registration"))?;
+    match mux.registered_client_has_frontend_access(client_id, registration) {
+        None => anyhow::bail!("client connection was superseded"),
+        Some(false) => anyhow::bail!("terminal is being operated on another device"),
+        Some(true) => Ok(()),
+    }
+}
+
+/// Mutations which can be reached through tab/menu chrome must still obey B's
+/// global owner, but checking them must not itself claim A's layout lease.
+fn requires_existing_frontend_access(pdu: &Pdu) -> bool {
+    matches!(
+        pdu,
+        Pdu::EraseScrollbackRequest(_)
+            | Pdu::KillPane(_)
+            | Pdu::SetPaneZoomed(_)
+            | Pdu::SpawnV2(_)
+            | Pdu::SplitPane(_)
+            | Pdu::SpawnPaneInStack(_)
+            | Pdu::ActivatePaneInStack(_)
+            | Pdu::MovePaneToStack(_)
+            | Pdu::MovePaneToNewTab(_)
+            | Pdu::AdjustPaneSize(_)
+    )
 }
 
 fn activate_client_palette(
@@ -416,31 +485,6 @@ impl SessionHandler {
             if decoded.pdu.is_user_input() {
                 let mux = Mux::get();
                 mux.registered_client_had_input(client_id, registration);
-                // Whoever last acted *on a terminal* decides how big it is —
-                // typing, pasting, a mouse event a program asked for. Not a
-                // resize: a renderer reports its pane sizes on its first frame,
-                // so counting that made opening a second client take the grid
-                // away from the one someone was using. Without
-                // this the first renderer to attach kept the tab at its own
-                // size for as long as it stayed connected, so picking up a
-                // phone while a desktop was still open left the phone reading a
-                // grid shaped for the desktop and unable to do anything about
-                // it. Claiming needs a viewport this client has already
-                // advertised, so a client that has yet to draw changes nothing.
-                if let Some(tab_id) = decoded
-                    .pdu
-                    .is_terminal_interaction()
-                    .then(|| decoded.pdu.pane_id())
-                    .flatten()
-                    .and_then(|pane_id| mux.resolve_pane_id(pane_id))
-                    .map(|(_, _, tab_id)| tab_id)
-                {
-                    if let Err(err) =
-                        mux.claim_registered_client_viewport(client_id, registration, tab_id)
-                    {
-                        log::trace!("input did not move the viewport for tab {tab_id}: {err:#}");
-                    }
-                }
             }
         }
 
@@ -454,6 +498,17 @@ impl SessionHandler {
             log::trace!("{} processing time {:?}", serial, start.elapsed());
             sender.send(DecodedPdu { pdu, serial }).ok();
         };
+
+        if requires_existing_frontend_access(&decoded.pdu) {
+            if let Err(err) = require_registered_frontend_access(
+                &Mux::get(),
+                self.client_id.as_ref(),
+                self.client_registration,
+            ) {
+                send_response(Err(err));
+                return;
+            }
+        }
 
         fn catch<F, SND>(f: F, send_response: SND)
         where
@@ -539,11 +594,10 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
-                            claim_viewport_for_pane(
+                            require_registered_frontend_access(
                                 &mux,
                                 client_id.as_ref(),
                                 registration,
-                                pane_id,
                             )?;
 
                             if let Some(palette) = configured_palette {
@@ -1170,7 +1224,7 @@ impl SessionHandler {
                 })
                 .detach();
             }
-            Pdu::ClaimClientViewport(ClaimClientViewport { tab_id }) => {
+            Pdu::ClaimClientViewport(ClaimClientViewport { tab_id, viewport }) => {
                 let client_id = self.client_id.clone();
                 let registration = self.client_registration;
                 spawn_into_main_thread(async move {
@@ -1183,9 +1237,73 @@ impl SessionHandler {
                                 anyhow!("ClaimClientViewport requires a live client registration")
                             })?;
                             let state = Mux::get()
-                                .claim_registered_client_viewport(&client_id, registration, tab_id)?
+                                .claim_registered_client_viewport(
+                                    &client_id,
+                                    registration,
+                                    tab_id,
+                                    mux_viewport(viewport),
+                                )?
                                 .ok_or_else(|| anyhow!("client connection was superseded"))?;
                             Ok(Pdu::ClientViewportState(codec_viewport_state(state)))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
+            Pdu::SetFrontendAccessMode(SetFrontendAccessMode {
+                mode,
+                tab_id,
+                viewport,
+            }) => {
+                let client_id = self.client_id.clone();
+                let registration = self.client_registration;
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let client_id = client_id.ok_or_else(|| {
+                                anyhow!("SetFrontendAccessMode requires an identified client")
+                            })?;
+                            let registration = registration.ok_or_else(|| {
+                                anyhow!("SetFrontendAccessMode requires a live client registration")
+                            })?;
+                            let mux = Mux::get();
+                            let target_mode = mux_access_mode(mode);
+                            let viewport = mux_viewport(viewport);
+                            mux.validate_registered_frontend_access_mode_change(
+                                &client_id,
+                                registration,
+                                target_mode,
+                                tab_id,
+                                &viewport,
+                            )?;
+                            let prior_mode = mux.frontend_access_state().mode;
+                            crate::thinkterm_access::persist_mode(target_mode)?;
+                            match mux.set_registered_frontend_access_mode(
+                                &client_id,
+                                registration,
+                                target_mode,
+                                tab_id,
+                                viewport,
+                            ) {
+                                Ok(state) => {
+                                    Ok(Pdu::FrontendAccessState(codec_access_state(state)))
+                                }
+                                Err(err) => {
+                                    if prior_mode != target_mode {
+                                        if let Err(rollback) =
+                                            crate::thinkterm_access::persist_mode(prior_mode)
+                                        {
+                                            log::error!(
+                                                "failed to roll back persisted frontend mode: \
+                                                 {rollback:#}"
+                                            );
+                                        }
+                                    }
+                                    Err(err)
+                                }
+                            }
                         },
                         send_response,
                     )
@@ -1483,6 +1601,7 @@ impl SessionHandler {
             | Pdu::ThinkTermSessionState { .. }
             | Pdu::EnsureThinkTermThreadResponse { .. }
             | Pdu::ClientViewportState { .. }
+            | Pdu::FrontendAccessState { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }
@@ -1536,24 +1655,47 @@ async fn ensure_thinkterm_thread(
     let spawned = if has_live_pane {
         false
     } else {
-        let command_dir = match landing.project_path.trim() {
-            "" => None,
-            path if path.starts_with("wezterm-mux://") => None,
-            path => Some(path.to_string()),
-        };
-        mux.spawn_tab_or_window(
-            None,
-            SpawnTabDomain::DefaultDomain,
-            None,
-            command_dir,
+        crate::thinkterm_layout::begin_restore(&landing.workspace);
+        let restored = crate::thinkterm_layout::restore_thread_layout(
+            &landing.thread_id,
+            &landing.workspace,
+            &landing.project_path,
             request.size,
-            None,
-            landing.workspace.clone(),
-            None,
         )
-        .await?;
-        crate::thinkterm_session::publish_changed();
-        true
+        .await;
+
+        let (materialized, preserve_saved_layout) = match restored {
+            Ok(true) => (Ok(()), false),
+            Ok(false) => (
+                spawn_default_thinkterm_thread(&mux, &landing, request.size).await,
+                false,
+            ),
+            Err(err) => {
+                log::warn!(
+                    "failed to restore ThinkTerm layout for thread {}: {err:#}; \
+                     opening one default shell",
+                    landing.thread_id
+                );
+                (
+                    spawn_default_thinkterm_thread(&mux, &landing, request.size)
+                        .await
+                        .context("spawn fallback shell after layout restore failure"),
+                    true,
+                )
+            }
+        };
+
+        match materialized {
+            Ok(()) => {
+                crate::thinkterm_layout::finish_restore(&landing.workspace, !preserve_saved_layout);
+                crate::thinkterm_session::publish_changed();
+                true
+            }
+            Err(err) => {
+                crate::thinkterm_layout::finish_restore(&landing.workspace, false);
+                return Err(err);
+            }
+        }
     };
 
     Ok(Pdu::EnsureThinkTermThreadResponse(
@@ -1563,6 +1705,30 @@ async fn ensure_thinkterm_thread(
             spawned,
         },
     ))
+}
+
+async fn spawn_default_thinkterm_thread(
+    mux: &Mux,
+    landing: &crate::thinkterm_tree::LandingRecord,
+    size: wezterm_term::TerminalSize,
+) -> anyhow::Result<()> {
+    let command_dir = match landing.project_path.trim() {
+        "" => None,
+        path if path.starts_with("wezterm-mux://") => None,
+        path => Some(path.to_string()),
+    };
+    mux.spawn_tab_or_window(
+        None,
+        SpawnTabDomain::DefaultDomain,
+        None,
+        command_dir,
+        size,
+        None,
+        landing.workspace.clone(),
+        None,
+    )
+    .await?;
+    Ok(())
 }
 
 fn schedule_split_pane<SND>(split: SplitPane, send_response: SND, client_id: Option<Arc<ClientId>>)
@@ -1736,8 +1902,46 @@ async fn move_pane(
 
 #[cfg(test)]
 mod tests {
-    use super::PerPane;
+    use super::{claim_viewport_for_pane, requires_existing_frontend_access, PerPane};
+    use codec::{EnsureThinkTermThread, Pdu};
+    use mux::client::ClientId;
+    use mux::Mux;
+    use std::sync::Arc;
     use wezterm_term::color::ColorPalette;
+    use wezterm_term::TerminalSize;
+
+    #[test]
+    fn cold_thread_materialization_does_not_require_an_existing_owner() {
+        let request = Pdu::EnsureThinkTermThread(EnsureThinkTermThread {
+            preferred_thread_id: Some("thread-main".to_string()),
+            size: TerminalSize::default(),
+        });
+
+        assert!(!requires_existing_frontend_access(&request));
+    }
+
+    #[test]
+    fn terminal_input_requires_identity_and_a_live_registration() {
+        let mux = Mux::new(None);
+        let missing_identity = claim_viewport_for_pane(&mux, None, None, usize::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_identity.contains("identified client"));
+
+        let client = Arc::new(ClientId::new());
+        let missing_registration = claim_viewport_for_pane(&mux, Some(&client), None, usize::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_registration.contains("live client registration"));
+
+        let stale_registration = mux.register_client(Arc::clone(&client));
+        mux.unregister_client(&client, stale_registration);
+        let superseded =
+            claim_viewport_for_pane(&mux, Some(&client), Some(stale_registration), usize::MAX)
+                .unwrap_err()
+                .to_string();
+        assert!(superseded.contains("superseded client connection"));
+    }
 
     #[test]
     fn application_palette_delivery_distinguishes_unsent_from_reset() {

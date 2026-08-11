@@ -350,6 +350,7 @@ pub(crate) enum NoteEditorCommand {
 #[derive(Clone, Debug)]
 pub(crate) enum ContextMenuApplicationAction {
     Note(NoteEditorCommand),
+    SetFrontendAccessMode(codec::FrontendAccessMode),
     /// Notification bell entry: jump to a thread, switching Space first when
     /// it lives elsewhere, and acknowledge its unseen work.
     ActivateWorkspaceThread {
@@ -1269,6 +1270,38 @@ enum EventState {
     InProgressWithQueued(Option<PaneId>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontendGeometryPhase {
+    Previewing { epoch: u64 },
+    Committing { epoch: u64 },
+    TakeoverSyncing { epoch: u64 },
+}
+
+impl FrontendGeometryPhase {
+    pub(crate) fn epoch(self) -> u64 {
+        match self {
+            Self::Previewing { epoch }
+            | Self::Committing { epoch }
+            | Self::TakeoverSyncing { epoch } => epoch,
+        }
+    }
+
+    pub(crate) fn obscures_terminal(self) -> bool {
+        matches!(self, Self::TakeoverSyncing { .. })
+    }
+
+    pub(crate) fn is_in_flight(self) -> bool {
+        matches!(self, Self::Committing { .. } | Self::TakeoverSyncing { .. })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FrontendGeometryConfirmation {
+    pub(crate) epoch: u64,
+    pub(crate) panes: Vec<(PaneId, TerminalSize)>,
+    pub(crate) ready_since: Option<Instant>,
+}
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -1285,6 +1318,20 @@ pub struct TermWindow {
     pending_scale_changes: LinkedList<resize::ScaleChange>,
     /// Terminal dimensions
     terminal_size: TerminalSize,
+    /// Per-tab preview and submission state. Current-owner geometry commits
+    /// remain visible; only a real takeover or unknown initial owner obscures
+    /// the terminal until the matching epoch is acknowledged.
+    frontend_geometry_phases: HashMap<TabId, FrontendGeometryPhase>,
+    /// A takeover RPC acknowledges PTY resize before the remote application
+    /// redraw has reached this renderer. Keep its expected pane snapshots here
+    /// and reveal only after every visible row has been refreshed and stable.
+    frontend_geometry_confirmations: HashMap<TabId, FrontendGeometryConfirmation>,
+    frontend_geometry_resync_after_epoch: HashSet<TabId>,
+    next_frontend_geometry_epoch: u64,
+    frontend_viewport_report_pending: Arc<AtomicBool>,
+    /// A blocked press is consumed even if the takeover round-trip completes
+    /// before its matching release arrives.
+    frontend_handoff_consumed_press: bool,
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     pub render_metrics: RenderMetrics,
@@ -2020,6 +2067,12 @@ impl TermWindow {
             crate::workspace_threads::space_note_vault(&active_space_id).is_some();
 
         let myself = Self {
+            frontend_geometry_phases: HashMap::new(),
+            frontend_geometry_confirmations: HashMap::new(),
+            frontend_geometry_resync_after_epoch: HashSet::new(),
+            next_frontend_geometry_epoch: 1,
+            frontend_viewport_report_pending: Arc::new(AtomicBool::new(false)),
+            frontend_handoff_consumed_press: false,
             created: Instant::now(),
             connection_name,
             last_fps_check_time: Instant::now(),
@@ -2406,6 +2459,14 @@ impl TermWindow {
                 myself.sync_current_workspace_thread();
             }
             myself.maybe_show_onboarding();
+            // The mux window can predate this native window, so no
+            // TabAddedToWindow notification is guaranteed after the GUI has
+            // subscribed. Converge the already-active tab before the first
+            // visible frame; an unknown remote owner enters the opaque
+            // takeover epoch here rather than exposing its saved/TUI grid.
+            if !myself.content_view_foreground() {
+                myself.resize_mux_tabs_to_current_terminal_size();
+            }
             window.show();
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
@@ -2915,47 +2976,55 @@ impl TermWindow {
                     tab_id,
                 } => {
                     let mux = Mux::get();
-                    let mut size = self.terminal_size;
                     if let Some(tab) = mux.get_tab(tab_id) {
-                        // If we attached to a remote domain and loaded in
-                        // a tab async, we need to fixup its size, either
-                        // by resizing it or resizes ourselves.
-                        // The strategy here is to adjust both by taking
-                        // the maximal size in both horizontal and vertical
-                        // dimensions and applying that. In practice that
-                        // means that a new local client will resize larger
-                        // to adjust to the size of an existing client.
-                        let tab_size = tab.get_size();
-                        size.rows = size.rows.max(tab_size.rows);
-                        size.cols = size.cols.max(tab_size.cols);
+                        let is_remote_thinkterm_tab = tab.get_active_pane().is_some_and(|pane| {
+                            pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                                .is_some()
+                        }) && mux
+                            .get_window(self.mux_window_id)
+                            .is_some_and(|mux_window| {
+                                let workspace = mux_window.get_workspace();
+                                crate::workspace_threads::is_thread_workspace_name(workspace)
+                                    || crate::workspace_threads::workspace_has_thread_binding(
+                                        workspace,
+                                    )
+                            });
 
-                        if size.rows != self.terminal_size.rows
-                            || size.cols != self.terminal_size.cols
-                            || size.pixel_width != self.terminal_size.pixel_width
-                            || size.pixel_height != self.terminal_size.pixel_height
-                        {
-                            self.set_window_size(size, window)?;
-                        } else if tab_size != self.terminal_size {
-                            // A tab that arrived via a mux resync carries the
-                            // server's size (its pane dims, which sit below the
-                            // window size by the pane nav bar reservation).
-                            // The window geometry is authoritative locally:
-                            // impose it so that the first activation doesn't
-                            // subtract the nav bar from an already-reduced
-                            // size. Tab::resize no-ops when sizes agree.
-                            tab.resize(self.terminal_size);
+                        if is_remote_thinkterm_tab {
+                            // Bind this notification to its own tab. A
+                            // background remote tab keeps the server's
+                            // canonical geometry; only the tab currently being
+                            // drawn is converged to this GUI.
+                            if mux
+                                .get_active_tab_for_window(self.mux_window_id)
+                                .is_some_and(|active| active.tab_id() == tab_id)
+                            {
+                                self.stage_workspace_thread_font_scales();
+                                self.sync_active_tab_geometry_now();
+                            }
+                        } else {
+                            // Preserve upstream behavior for ordinary WezTerm
+                            // domains. ThinkTerm thread tabs deliberately do
+                            // not enlarge the OS window to a remote renderer's
+                            // historical rows/cols.
+                            let mut size = self.terminal_size;
+                            let tab_size = tab.get_size();
+                            size.rows = size.rows.max(tab_size.rows);
+                            size.cols = size.cols.max(tab_size.cols);
+
+                            if size.rows != self.terminal_size.rows
+                                || size.cols != self.terminal_size.cols
+                                || size.pixel_width != self.terminal_size.pixel_width
+                                || size.pixel_height != self.terminal_size.pixel_height
+                            {
+                                self.set_window_size(size, window)?;
+                            } else if tab_size != self.terminal_size {
+                                tab.resize(self.terminal_size);
+                            }
+                            self.stage_workspace_thread_font_scales();
+                            self.force_sync_active_mux_tab_pane_sizes();
                         }
                     }
-                    // Tabs arriving via a mux resync (switch-back re-fold,
-                    // reattach) get their persisted per-pane font scales
-                    // re-applied; the adopt-time application ran before
-                    // these panes existed.
-                    self.stage_workspace_thread_font_scales();
-                    // Remote panes are skipped by Tab::resize. A tab can arrive
-                    // while the connection content view suppresses paint-time
-                    // pane sync, so impose the final font-scaled GUI geometry
-                    // exactly once.
-                    self.force_sync_active_mux_tab_pane_sizes();
                     self.persist_workspace_layout_after_mutation("tab added");
                 }
                 MuxNotification::PaneOutput(pane_id) => {
@@ -2989,6 +3058,13 @@ impl TermWindow {
                         }
                         window.invalidate();
                     }
+                }
+                MuxNotification::FrontendAccessChanged(_) => {
+                    if self.owns_frontend_viewport() {
+                        self.resize_mux_tabs_to_current_terminal_size();
+                    }
+                    self.update_title_post_status();
+                    window.invalidate();
                 }
                 MuxNotification::PaneFocused(pane_id) => {
                     // Also handled by clientpane
@@ -3098,6 +3174,7 @@ impl TermWindow {
             // Space-switch reflow can settle now since there is no other
             // window to protect from the resize.
             self.consume_pending_sidebar_reflow();
+            self.sync_active_tab_geometry_now();
             return;
         }
 
@@ -3430,6 +3507,10 @@ impl TermWindow {
                 } else {
                     return true;
                 }
+            }
+            MuxNotification::FrontendAccessChanged(_) => {
+                // Connection-wide: every window may need to replace terminal
+                // contents with (or remove) the opaque handoff surface.
             }
             MuxNotification::Alert {
                 alert: Alert::ToastNotification { .. },
@@ -4722,21 +4803,46 @@ impl TermWindow {
             }
         };
 
-        if let Some(state) = Mux::get()
-            .get_active_tab_for_window(self.mux_window_id)
-            .and_then(|tab| tab.get_active_pane())
-            .and_then(|pane| {
-                pane.downcast_ref::<wezterm_client::pane::ClientPane>()
-                    .and_then(|pane| {
-                        pane.remote_viewport_state()
-                            .filter(|_| pane.owns_remote_viewport() == Some(false))
-                    })
-            })
-        {
-            title.push_str(&format!(
-                " · VIEW {}×{} · input to take control",
-                state.canonical_size.cols, state.canonical_size.rows
-            ));
+        if let Some(access) = self.active_frontend_access_state() {
+            match access.mode {
+                mux::FrontendAccessMode::TmuxLatest => {
+                    title.push_str(" · A SHARED");
+                    if let Some(state) = self
+                        .active_remote_frontend_viewport_state()
+                        .filter(|_| !self.owns_frontend_viewport())
+                    {
+                        title.push_str(&format!(
+                            " · VIEW {}×{}",
+                            state.canonical_size.cols, state.canonical_size.rows
+                        ));
+                    }
+                }
+                mux::FrontendAccessMode::Handoff => match self.frontend_terminal_gate() {
+                    wezterm_client::domain::RemoteFrontendGate::Visible => {
+                        title.push_str(" · B ACTIVE");
+                    }
+                    wezterm_client::domain::RemoteFrontendGate::Claimable { owner } => {
+                        let owner = owner
+                            .as_ref()
+                            .map(|owner| owner.hostname.as_str())
+                            .filter(|hostname| !hostname.trim().is_empty())
+                            .unwrap_or("available");
+                        title.push_str(&format!(" · B VIEW on {owner} · click to continue"));
+                    }
+                    wezterm_client::domain::RemoteFrontendGate::Connecting => {
+                        title.push_str(" · CONNECTING");
+                    }
+                    wezterm_client::domain::RemoteFrontendGate::Reconnecting => {
+                        title.push_str(" · RECONNECTING");
+                    }
+                    wezterm_client::domain::RemoteFrontendGate::Offline => {
+                        title.push_str(" · OFFLINE");
+                    }
+                    wezterm_client::domain::RemoteFrontendGate::Syncing => {
+                        title.push_str(" · SYNCING");
+                    }
+                },
+            }
         }
 
         if let Some(window) = self.window.as_ref() {
@@ -4871,6 +4977,10 @@ impl TermWindow {
 
             self.update_title();
             self.update_scrollbar();
+            // A discrete top-level tab switch must converge before its first
+            // paint; it is not part of the 120ms continuous-window-resize
+            // debounce. This never claims a passive tab.
+            self.sync_active_tab_geometry_now();
             self.persist_workspace_layout_after_mutation("active tab changed");
         }
         Ok(())
@@ -6314,6 +6424,9 @@ impl TermWindow {
                 }
             }
             AdjustPaneSize(direction, amount) => {
+                if self.frontend_surface_blocked() {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
@@ -6324,10 +6437,15 @@ impl TermWindow {
 
                 if self.tab_state(tab_id).overlay.is_none() {
                     tab.adjust_pane_size(*direction, *amount);
+                    self.preview_active_tab_geometry_now();
+                    self.sync_active_tab_geometry_now();
                     self.persist_workspace_layout_after_mutation("pane size adjusted");
                 }
             }
             ActivatePaneByIndex(index) => {
+                if self.frontend_surface_blocked() {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
@@ -6337,6 +6455,7 @@ impl TermWindow {
                 let tab_id = tab.tab_id();
 
                 if self.tab_state(tab_id).overlay.is_none() {
+                    self.claim_frontend_viewport_for_interaction();
                     let panes = tab.iter_panes();
                     if panes.iter().position(|p| p.index == *index).is_some() {
                         tab.set_active_idx(*index);
@@ -6344,6 +6463,9 @@ impl TermWindow {
                 }
             }
             ActivatePaneDirection(direction) => {
+                if self.frontend_surface_blocked() {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
@@ -6353,24 +6475,39 @@ impl TermWindow {
                 let tab_id = tab.tab_id();
 
                 if self.tab_state(tab_id).overlay.is_none() {
+                    self.claim_frontend_viewport_for_interaction();
                     tab.activate_pane_direction(*direction);
                 }
             }
             TogglePaneZoomState => {
+                if self.frontend_surface_blocked() {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
                 };
+                self.claim_frontend_viewport_for_interaction();
                 tab.toggle_zoom();
+                // Zoom changes which panes occupy the tab root. Remote
+                // mirrors are deliberately skipped by Tab::resize, so adopt
+                // every resulting pane surface and publish one complete
+                // viewport instead of waiting for a later window resize.
+                self.sync_active_tab_geometry_now();
             }
             SetPaneZoomState(zoomed) => {
+                if self.frontend_surface_blocked() {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
                 };
+                self.claim_frontend_viewport_for_interaction();
                 tab.set_zoomed(*zoomed);
+                self.sync_active_tab_geometry_now();
             }
             SwitchWorkspaceRelative(delta) => {
                 let mux = Mux::get();
@@ -6477,6 +6614,9 @@ impl TermWindow {
                 // NOP here; handled by the overlay directly
             }
             RotatePanes(direction) => {
+                if self.frontend_surface_blocked() {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let mux = Mux::get();
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
@@ -6486,9 +6626,14 @@ impl TermWindow {
                     RotationDirection::Clockwise => tab.rotate_clockwise(),
                     RotationDirection::CounterClockwise => tab.rotate_counter_clockwise(),
                 }
+                self.preview_active_tab_geometry_now();
+                self.sync_active_tab_geometry_now();
                 self.persist_workspace_layout_after_mutation("panes rotated");
             }
             SplitPane(split) => {
+                if self.frontend_surface_blocked() {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 log::trace!("SplitPane {:?}", split);
                 self.restore_collapsed_panes_for_active_tab();
                 self.spawn_command(
@@ -6576,35 +6721,26 @@ impl TermWindow {
         }
     }
 
-    pub(crate) fn reapply_collapsed_panes_for_window(&mut self) {
+    /// Reapply collapse state only to the tab whose geometry is being
+    /// converged. Background tabs retain the server's canonical split tree
+    /// until they are activated or explicitly claimed.
+    pub(crate) fn reapply_collapsed_panes_for_tab(&mut self, tab_id: TabId) {
         if self.collapsed_pane_layouts.is_empty() {
             return;
         }
 
-        let mux = Mux::get();
-        let Some(window) = mux.get_window(self.mux_window_id) else {
-            self.collapsed_pane_layouts.clear();
+        let Some(tab) = Mux::get().get_tab(tab_id) else {
             return;
         };
-
         let min_cells = self.collapsed_pane_min_cells();
         let layouts: Vec<_> = self.collapsed_pane_layouts.values().copied().collect();
         for layout in layouts {
-            let mut found_stack = false;
-            for tab in window.iter() {
-                let contains_stack = tab
-                    .iter_panes_ignoring_zoom()
-                    .into_iter()
-                    .any(|pane| pane.pane_stack_id == layout.pane_stack_id);
-                if contains_stack {
-                    found_stack = true;
-                    tab.reapply_collapsed_pane(layout, min_cells);
-                    break;
-                }
-            }
-
-            if !found_stack {
-                self.collapsed_pane_layouts.remove(&layout.pane_stack_id);
+            let contains_stack = tab
+                .iter_panes_ignoring_zoom()
+                .into_iter()
+                .any(|pane| pane.pane_stack_id == layout.pane_stack_id);
+            if contains_stack {
+                tab.reapply_collapsed_pane(layout, min_cells);
             }
         }
     }

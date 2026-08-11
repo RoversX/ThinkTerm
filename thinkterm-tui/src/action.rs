@@ -39,6 +39,8 @@ pub enum DestructiveAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
+    ClaimFrontendAccess,
+    SetFrontendAccessMode(codec::FrontendAccessMode),
     Detach,
     ToggleSidebar,
     ToggleHelp,

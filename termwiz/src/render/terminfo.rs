@@ -158,11 +158,20 @@ impl TerminfoRenderer {
                 match (has_true_color, attr.foreground()) {
                     (true, ColorAttribute::TrueColorWithPaletteFallback(tc, _))
                     | (true, ColorAttribute::TrueColorWithDefaultFallback(tc)) => {
-                        write!(
-                            out,
-                            "{}",
-                            CSI::Sgr(Sgr::Foreground(ColorSpec::TrueColor(tc)))
-                        )?;
+                        let (red, green, blue, alpha) = tc.to_srgb_u8();
+                        if alpha == 255 {
+                            // The semicolon form is the de-facto truecolor
+                            // sequence emitted by applications such as btop.
+                            // A number of otherwise truecolor-capable terminal
+                            // emulators still mishandle the ISO colon form.
+                            write!(out, "\x1b[38;2;{red};{green};{blue}m")?;
+                        } else {
+                            write!(
+                                out,
+                                "{}",
+                                CSI::Sgr(Sgr::Foreground(ColorSpec::TrueColor(tc)))
+                            )?;
+                        }
                     }
                     (false, ColorAttribute::TrueColorWithDefaultFallback(_))
                     | (_, ColorAttribute::Default) => {
@@ -194,11 +203,16 @@ impl TerminfoRenderer {
                 match (has_true_color, attr.background()) {
                     (true, ColorAttribute::TrueColorWithPaletteFallback(tc, _))
                     | (true, ColorAttribute::TrueColorWithDefaultFallback(tc)) => {
-                        write!(
-                            out,
-                            "{}",
-                            CSI::Sgr(Sgr::Background(ColorSpec::TrueColor(tc)))
-                        )?;
+                        let (red, green, blue, alpha) = tc.to_srgb_u8();
+                        if alpha == 255 {
+                            write!(out, "\x1b[48;2;{red};{green};{blue}m")?;
+                        } else {
+                            write!(
+                                out,
+                                "{}",
+                                CSI::Sgr(Sgr::Background(ColorSpec::TrueColor(tc)))
+                            )?;
+                        }
                     }
                     (false, ColorAttribute::TrueColorWithDefaultFallback(_))
                     | (_, ColorAttribute::Default) => {
@@ -1260,6 +1274,8 @@ mod test {
         ])
         .unwrap();
 
+        assert_eq!(out.write.buf, b"\x1b[38;2;255;128;64mA");
+
         let result = out.parse();
         assert_eq!(
             result,
@@ -1283,6 +1299,8 @@ mod test {
         ])
         .unwrap();
 
+        assert_eq!(out.write.buf, b"\x1b[38;2;255;128;64mA");
+
         let result = out.parse();
         assert_eq!(
             result,
@@ -1293,5 +1311,19 @@ mod test {
                 Action::Print('A'),
             ]
         );
+    }
+
+    #[test]
+    fn truecolor_background_uses_compatible_semicolon_form() {
+        let mut out = FakeTerm::new(xterm_terminfo());
+        out.render(&[
+            Change::Attribute(AttributeChange::Background(
+                ColorSpec::TrueColor((12, 34, 56).into()).into(),
+            )),
+            Change::Text("A".into()),
+        ])
+        .unwrap();
+
+        assert_eq!(out.write.buf, b"\x1b[48;2;12;34;56mA");
     }
 }

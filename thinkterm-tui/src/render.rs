@@ -22,6 +22,26 @@ pub struct RenderResult {
     pub active_pane: Option<PaneId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandoffAnimationFrame {
+    eyes_closed: bool,
+}
+
+impl Default for HandoffAnimationFrame {
+    fn default() -> Self {
+        Self { eyes_closed: false }
+    }
+}
+
+impl HandoffAnimationFrame {
+    pub fn at(elapsed: std::time::Duration) -> Self {
+        let millis = elapsed.as_millis() as u64;
+        Self {
+            eyes_closed: millis % 5_000 >= 4_750,
+        }
+    }
+}
+
 /// Rendering is intentionally read-only. Selection normalization and geometry
 /// are completed before this function is called, so a draw can never change
 /// what the next mouse event means.
@@ -32,6 +52,9 @@ pub fn render(
     local_tab: Option<&Arc<Tab>>,
     view: &ViewLayout,
     viewport_status: Option<&str>,
+    handoff_message: Option<&(String, String)>,
+    handoff_animation: HandoffAnimationFrame,
+    shared_grid: bool,
     settings: &TuiConfig,
 ) -> RenderResult {
     let mut result = RenderResult {
@@ -51,8 +74,13 @@ pub fn render(
     render_tabs(frame, view);
     render_status(frame, model, ui, view, viewport_status);
 
-    if let Some(tab) = local_tab {
+    if let Some((title, hint)) = handoff_message {
+        render_handoff(frame, view.content, title, hint, handoff_animation);
+    } else if let Some(tab) = local_tab {
         result.active_pane = tab.get_active_pane().map(|pane| pane.pane_id());
+        if shared_grid {
+            render_shared_grid(frame, view.content);
+        }
         render_panes(frame, tab, ui, view);
     } else {
         let message = match model.selected_row() {
@@ -65,6 +93,63 @@ pub fn render(
 
     render_overlays(frame, ui, view, settings);
     result
+}
+
+fn render_handoff(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    hint: &str,
+    animation: HandoffAnimationFrame,
+) {
+    frame.render_widget(Clear, area);
+    fill(frame, area, " ", chrome());
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let show_eyes = area.width >= 12 && area.height >= 5;
+    let group_height = if show_eyes { 4 } else { 2 };
+    let start_y = area.y + area.height.saturating_sub(group_height) / 2;
+    if show_eyes {
+        let eyes = if animation.eyes_closed {
+            "─  ─"
+        } else {
+            "•  •"
+        };
+        render_center(
+            frame,
+            Rect::new(area.x, start_y, area.width, 1),
+            eyes,
+            chrome_accent_text(),
+        );
+    }
+    let title_y = start_y + if show_eyes { 2 } else { 0 };
+    render_center(
+        frame,
+        Rect::new(area.x, title_y, area.width, 1),
+        title,
+        chrome_bold(),
+    );
+    if title_y + 1 < area.bottom() {
+        render_center(
+            frame,
+            Rect::new(area.x, title_y + 1, area.width, 1),
+            hint,
+            chrome_dim(),
+        );
+    }
+}
+
+fn render_shared_grid(frame: &mut Frame<'_>, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if (x + y) % 2 == 0 {
+                frame.buffer_mut()[(x, y)]
+                    .set_symbol("·")
+                    .set_style(chrome_dim());
+            }
+        }
+    }
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, view: &ViewLayout) {
@@ -558,12 +643,17 @@ fn render_status(
         format!(" {} on {}… ", pending.label, pending.domain_name)
     } else if !ui.status.is_empty() {
         format!(" {} ", ui.status)
-    } else if let Some(viewport) = viewport_status {
-        format!(" {viewport} ")
     } else {
         format!(" r{} · #{} ", model.tree_revision(), model.generation())
     };
-    let reserve_right = if model.attention_count() > 0 { 18 } else { 8 };
+    let base_right = if model.attention_count() > 0 { 18 } else { 8 };
+    let access_marker = viewport_status.map(|status| format!(" {status} "));
+    let access_width = access_marker
+        .as_deref()
+        .map(|marker| unicode_column_width(marker, None).min(28) as u16)
+        .unwrap_or(0)
+        .min(view.status.width.saturating_sub(base_right));
+    let reserve_right = base_right + access_width;
     let message_width = unicode_column_width(&message, None)
         .min(view.status.width.saturating_sub(reserve_right) as usize)
         as u16;
@@ -577,6 +667,23 @@ fn render_status(
             1,
         );
         draw_text(frame, rect, &message, chrome_dim());
+    }
+
+    if let (Some(marker), width) = (access_marker.as_deref(), access_width) {
+        if width > 0 {
+            let rect = Rect::new(
+                view.status.right().saturating_sub(base_right + width),
+                view.status.y,
+                width,
+                1,
+            );
+            draw_text(
+                frame,
+                rect,
+                marker,
+                chrome_accent_text().add_modifier(Modifier::BOLD),
+            );
+        }
     }
 
     if model.attention_count() > 0 && view.status.width >= 18 {
@@ -1137,6 +1244,80 @@ mod tests {
         // panes beside it.
         assert_eq!(chrome().bg, Some(Color::Reset));
         assert_eq!(chrome_selected().bg, Some(Color::Rgb(137, 180, 250)));
+    }
+
+    #[test]
+    fn handoff_overlay_clears_previously_rendered_terminal_cells() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(44, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                fill(frame, area, "S", chrome());
+                render_handoff(
+                    frame,
+                    area,
+                    "Terminal is being used on devbox",
+                    "Click or scroll to continue",
+                    HandoffAnimationFrame::default(),
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains('S'));
+        assert!(rendered.contains("Terminal is being used on devbox"));
+        assert!(rendered.contains("Click or scroll to continue"));
+    }
+
+    #[test]
+    fn roomy_handoff_overlay_draws_centered_eyes() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_handoff(
+                    frame,
+                    frame.area(),
+                    "Terminal is being used on devbox",
+                    "Click or scroll to continue",
+                    HandoffAnimationFrame::default(),
+                );
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("•  •"));
+        assert!(!rendered.contains('╭'));
+        assert!(!rendered.contains(">_"));
+    }
+
+    #[test]
+    fn handoff_animation_blinks_the_eyes_briefly() {
+        let ordinary = HandoffAnimationFrame::at(std::time::Duration::from_millis(750));
+        assert!(!ordinary.eyes_closed);
+
+        let blink = HandoffAnimationFrame::at(std::time::Duration::from_millis(4_800));
+        assert!(blink.eyes_closed);
     }
 
     /// A program's `ESC[31m` has to reach the host terminal as "red", not as

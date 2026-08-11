@@ -1797,6 +1797,43 @@ pub async fn materialize_thread(
         return Ok(());
     }
 
+    // A remote mux owns both its ThinkTerm tree and terminal topology.  Use
+    // its dedicated, serialized materialization RPC instead of sending an
+    // ordinary SpawnV2 from sidebar chrome.  In handoff mode an ordinary
+    // spawn is correctly rejected for a non-owner, but that used to leave a
+    // cold Thread with no terminal surface on which the user could click to
+    // take control.  EnsureThinkTermThread creates only the missing backing
+    // terminal and deliberately does not claim the frontend lease; after the
+    // resync below, the opaque terminal surface can perform the real claim.
+    if let Some((_project_id, thread_id)) = parse_thread_workspace_name(&workspace_name) {
+        if let Ok(domain) = mux.resolve_spawn_tab_domain(None, &default_domain) {
+            if let Some(client_domain) =
+                domain.downcast_ref::<wezterm_client::domain::ClientDomain>()
+            {
+                let response = client_domain
+                    .ensure_thinkterm_thread(Some(thread_id), size)
+                    .await
+                    .context("ensure remote ThinkTerm thread")?;
+                if response.workspace != workspace_name {
+                    anyhow::bail!(
+                        "remote selected workspace {}, expected {} for thread {}",
+                        response.workspace,
+                        workspace_name,
+                        response.thread_id
+                    );
+                }
+                if mux.iter_windows_in_workspace(&workspace_name).is_empty() {
+                    anyhow::bail!(
+                        "remote materialized thread {} but resync installed no window in {}",
+                        response.thread_id,
+                        workspace_name
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+
     // Decoding before the branch, rather than inside `materialize_layout`, is
     // what makes a layout this build cannot read a lost *arrangement* instead
     // of a Thread that will not open: an undecodable snapshot falls through to

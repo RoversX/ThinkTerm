@@ -43,7 +43,7 @@ use termwiz::terminal::{new_terminal, ScreenSize, TerminalWaker};
 use uuid::Uuid;
 use view::{HitTarget, PaneTool, TabBarControl, TreeAction, ViewLayout};
 use wezterm_client::client::Client;
-use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
+use wezterm_client::domain::{ClientDomain, ClientDomainConfig, RemoteFrontendGate};
 use wezterm_client::pane::ClientPane;
 use wezterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
 use wezterm_term::TerminalSize;
@@ -78,6 +78,48 @@ const RESIZE_REDRAW_WINDOW: Duration = Duration::from_millis(1500);
 /// Pace of those extra draws. Fast enough to look immediate, slow enough that
 /// the prefetch throttle refills between attempts.
 const RESIZE_REDRAW_INTERVAL: Duration = Duration::from_millis(60);
+const TAKEOVER_RESYNC_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct TakeoverEpochs {
+    pending: HashMap<(String, TabId), u64>,
+    next: u64,
+}
+
+impl TakeoverEpochs {
+    fn begin(&mut self, domain_name: &str, tab_id: TabId) -> u64 {
+        self.next = self.next.wrapping_add(1).max(1);
+        let epoch = self.next;
+        self.pending
+            .insert((domain_name.to_string(), tab_id), epoch);
+        epoch
+    }
+
+    fn contains(&self, domain_name: &str, tab_id: TabId) -> bool {
+        self.pending
+            .contains_key(&(domain_name.to_string(), tab_id))
+    }
+
+    fn finish(&mut self, domain_name: &str, tab_id: TabId, epoch: u64) -> bool {
+        let key = (domain_name.to_string(), tab_id);
+        if self.pending.get(&key) != Some(&epoch) {
+            return false;
+        }
+        self.pending.remove(&key);
+        true
+    }
+}
+
+fn effective_frontend_gate(
+    takeover_pending: bool,
+    remote_gate: RemoteFrontendGate,
+) -> RemoteFrontendGate {
+    if takeover_pending {
+        RemoteFrontendGate::Syncing
+    } else {
+        remote_gate
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
@@ -614,9 +656,10 @@ struct TuiState {
     /// so: a handover changes what the server does with the same numbers, so it
     /// has to count as something new to say.
     last_viewports: HashMap<(String, TabId), Option<(TerminalSize, bool)>>,
-    /// A deliberate frontend layout change (such as hiding the sidebar)
-    /// should make this renderer's newly advertised grid authoritative.
-    claim_viewport_after_layout: bool,
+    /// Keep the release paired with a press on B's takeover surface from
+    /// reaching the pane if the claim round-trip completed very quickly.
+    handoff_consumed_press: bool,
+    takeover_epochs: TakeoverEpochs,
     /// When the panes were last asked for new content, so the loop keeps asking
     /// even while nothing local has changed.
     last_pane_poll: Instant,
@@ -650,6 +693,7 @@ struct TuiState {
     settings: TuiConfig,
     settings_path: PathBuf,
     state_path: PathBuf,
+    animation_epoch: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -715,7 +759,8 @@ impl TuiState {
             layout: ViewLayout::default(),
             last_mouse_buttons: MouseButtons::NONE,
             last_viewports: HashMap::new(),
-            claim_viewport_after_layout: false,
+            handoff_consumed_press: false,
+            takeover_epochs: TakeoverEpochs::default(),
             last_pane_poll: Instant::now(),
             shared_view: None,
             shared_view_at: None,
@@ -732,6 +777,7 @@ impl TuiState {
             settings,
             settings_path,
             state_path,
+            animation_epoch: Instant::now(),
         };
         sync_connection_statuses(&mut state);
         state
@@ -774,16 +820,67 @@ impl TuiState {
         domain.owns_remote_viewport(tab.tab_id()) != Some(false)
     }
 
+    fn active_frontend_access(&self) -> Option<codec::FrontendAccessState> {
+        let (_, domain, _, _) = self.active_tab()?;
+        domain.remote_access_state()
+    }
+
+    fn frontend_gate(&self) -> RemoteFrontendGate {
+        let Some((domain_name, domain, _, remote_tab_id)) = self.active_tab() else {
+            return RemoteFrontendGate::Visible;
+        };
+        effective_frontend_gate(
+            self.takeover_epochs.contains(&domain_name, remote_tab_id),
+            domain.remote_frontend_gate(),
+        )
+    }
+
+    fn frontend_surface_blocked(&self) -> bool {
+        self.frontend_gate().obscures_terminal()
+    }
+
+    fn frontend_takeover_claimable(&self) -> bool {
+        self.frontend_gate().is_claimable()
+    }
+
+    fn frontend_overlay_message(&self) -> Option<(String, String)> {
+        self.frontend_gate().overlay_message()
+    }
+
+    fn shared_grid_is_visible(&self) -> bool {
+        self.active_frontend_access()
+            .is_some_and(|state| state.mode == codec::FrontendAccessMode::TmuxLatest)
+            && !self.owns_active_viewport()
+    }
+
     fn viewport_status(&self) -> Option<String> {
         let (_, domain, tab, _) = self.active_tab()?;
+        let access = domain.remote_access_state()?;
         let state = domain.remote_viewport_state(tab.tab_id())?;
-        if domain.owns_remote_viewport(tab.tab_id()) == Some(false) {
-            Some(format!(
-                "VIEW {}×{} · input to take control",
-                state.canonical_size.cols, state.canonical_size.rows
-            ))
-        } else {
-            None
+        match access.mode {
+            codec::FrontendAccessMode::TmuxLatest => {
+                if domain.owns_remote_viewport(tab.tab_id()) == Some(false) {
+                    Some(format!(
+                        "A SHARED · VIEW {}×{}",
+                        state.canonical_size.cols, state.canonical_size.rows
+                    ))
+                } else {
+                    Some("A SHARED".to_string())
+                }
+            }
+            codec::FrontendAccessMode::Handoff => {
+                if domain.has_remote_access() == Some(true) {
+                    Some("B ACTIVE".to_string())
+                } else {
+                    let owner = access
+                        .owner
+                        .as_ref()
+                        .map(|owner| owner.hostname.as_str())
+                        .filter(|hostname| !hostname.trim().is_empty())
+                        .unwrap_or("other");
+                    Some(format!("B VIEW · {owner}"))
+                }
+            }
         }
     }
 
@@ -915,6 +1012,12 @@ async fn run_terminal(
         if state.last_pane_poll.elapsed() >= PANE_POLL_INTERVAL {
             poll_panes(&state);
             state.last_pane_poll = Instant::now();
+            // The blocked surface is the only TUI view with ambient motion.
+            // Piggyback on the existing pane poll instead of adding another
+            // timer; normal terminal rendering stays event driven.
+            if state.frontend_surface_blocked() {
+                state.dirty = true;
+            }
         }
 
         if state.share_view_pending && share_view_is_due(&state) {
@@ -925,6 +1028,11 @@ async fn run_terminal(
             let active = state.active_tab();
             let local_tab = active.as_ref().map(|(_, _, tab, _)| Arc::clone(tab));
             let viewport_status = state.viewport_status();
+            let frontend_gate = state.frontend_gate();
+            let handoff_message = frontend_gate.overlay_message();
+            let handoff_animation =
+                render::HandoffAnimationFrame::at(state.animation_epoch.elapsed());
+            let shared_grid = state.shared_grid_is_visible();
             let mut rendered = render::RenderResult::default();
             let mut next_layout = ViewLayout::default();
             state.ui.begin_frame();
@@ -938,6 +1046,9 @@ async fn run_terminal(
                     local_tab.as_ref(),
                     &next_layout,
                     viewport_status.as_deref(),
+                    handoff_message.as_ref(),
+                    handoff_animation,
+                    shared_grid,
                     &state.settings,
                 );
             })?;
@@ -1296,28 +1407,6 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
     }
     push_pane_sizes(state, &domain, local_tab_id, screen);
     share_view_if_changed(state, &domain, local_tab_id).await;
-
-    if state.claim_viewport_after_layout {
-        state.claim_viewport_after_layout = false;
-        match domain.claim_client_viewport(local_tab_id).await {
-            Ok(viewport) => {
-                // Deliberately no pane push here. `state.layout` still
-                // describes the tab at the size the *other* renderer left it,
-                // and pushing those rectangles immediately after adopting a new
-                // tab size hands the server the old geometry back — the claim
-                // undoing itself. Resizing the tab dirties the frame, and the
-                // next one pushes rectangles that match.
-                adopt_local_tab_size(
-                    local_tab_id,
-                    local_tab_size(&domain, local_tab_id, size, viewport.canonical_size),
-                );
-            }
-            Err(err) => {
-                state.ui.status = format!("Viewport control: {err}");
-                state.dirty = true;
-            }
-        }
-    }
 }
 
 /// Ask every pane on screen whether anything changed.
@@ -1561,23 +1650,113 @@ async fn dispatch_actions(state: &mut TuiState) {
 async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
     let (domain_name, domain, tab, remote_tab_id) =
         state.active_tab().context("no live tab selected")?;
-    let local_tab_id = tab.tab_id();
-    if !state
-        .last_viewports
-        .contains_key(&(domain_name, remote_tab_id))
-    {
-        anyhow::bail!("viewport is not ready; retry after the terminal redraws");
+    if !matches!(
+        domain.remote_frontend_gate(),
+        RemoteFrontendGate::Visible | RemoteFrontendGate::Claimable { .. }
+    ) {
+        anyhow::bail!("terminal connection is not ready for takeover");
     }
-    domain.claim_client_viewport(local_tab_id).await?;
+    let local_tab_id = tab.tab_id();
+    if domain.owns_remote_viewport(local_tab_id) == Some(true) {
+        return Ok(tab);
+    }
+    let size = state
+        .last_viewports
+        .get(&(domain_name.clone(), remote_tab_id))
+        .and_then(|entry| *entry)
+        .map(|(size, _)| size)
+        .context("viewport is not ready; retry after the terminal redraws")?;
+    let epoch = state.takeover_epochs.begin(&domain_name, remote_tab_id);
+    state.dirty = true;
+    let claimed = match domain
+        .claim_client_viewport(local_tab_id, ClientViewport::CellGrid { size })
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(err) => {
+            state
+                .takeover_epochs
+                .finish(&domain_name, remote_tab_id, epoch);
+            return Err(err);
+        }
+    };
     if domain.owns_remote_viewport(local_tab_id) != Some(true) {
+        state
+            .takeover_epochs
+            .finish(&domain_name, remote_tab_id, epoch);
         anyhow::bail!("the server did not grant viewport ownership");
     }
-    Ok(tab)
+
+    adopt_local_tab_size(local_tab_id, claimed.canonical_size);
+    let resync = domain.resync().await;
+    let final_local_tab_id = domain
+        .remote_to_local_tab_id(remote_tab_id)
+        .unwrap_or(local_tab_id);
+    adopt_local_tab_size(final_local_tab_id, claimed.canonical_size);
+    let final_tab = Mux::get().get_tab(final_local_tab_id).unwrap_or(tab);
+    if let Err(err) = resync {
+        log::warn!(
+            "resyncing {domain_name} after TUI viewport takeover: {err:#}; using acknowledged geometry"
+        );
+        schedule_takeover_resync(domain_name.clone(), Arc::clone(&domain));
+    }
+    state
+        .takeover_epochs
+        .finish(&domain_name, remote_tab_id, epoch);
+    for pane in &state.layout.panes {
+        state.ui.set_scroll_offset(pane.pane_id, 0);
+    }
+    state.shared_view = None;
+    state.followed_view = None;
+    Ok(final_tab)
+}
+
+fn schedule_takeover_resync(domain_name: String, domain: Arc<ClientDomain>) {
+    promise::spawn::spawn(async move {
+        smol::Timer::after(TAKEOVER_RESYNC_RETRY_DELAY).await;
+        if let Err(err) = domain.resync().await {
+            log::warn!("retrying {domain_name} topology after TUI takeover: {err:#}");
+        }
+        wake_terminal();
+        Ok::<(), anyhow::Error>(())
+    })
+    .detach();
+}
+
+async fn set_active_frontend_access_mode(
+    state: &mut TuiState,
+    mode: codec::FrontendAccessMode,
+) -> Result<()> {
+    let (domain_name, domain, tab, remote_tab_id) =
+        state.active_tab().context("no live tab selected")?;
+    let local_tab_id = tab.tab_id();
+    let size = state
+        .last_viewports
+        .get(&(domain_name, remote_tab_id))
+        .and_then(|entry| *entry)
+        .map(|(size, _)| size)
+        .context("viewport is not ready; retry after the terminal redraws")?;
+    domain
+        .set_frontend_access_mode(local_tab_id, mode, ClientViewport::CellGrid { size })
+        .await?;
+    for pane in &state.layout.panes {
+        state.ui.set_scroll_offset(pane.pane_id, 0);
+    }
+    state.shared_view = None;
+    state.followed_view = None;
+    state.clear_selected_viewport_cache();
+    Ok(())
 }
 
 async fn dispatch_action(state: &mut TuiState, action: Action) -> Result<()> {
     match action {
         Action::None => {}
+        Action::ClaimFrontendAccess => {
+            claim_active_viewport(state).await?;
+        }
+        Action::SetFrontendAccessMode(mode) => {
+            set_active_frontend_access_mode(state, mode).await?;
+        }
         Action::Detach => state.ui.exit = true,
         Action::ToggleSidebar => {
             state.ui.sidebar_visible = !state.ui.sidebar_visible;
@@ -1592,7 +1771,6 @@ async fn dispatch_action(state: &mut TuiState, action: Action) -> Result<()> {
                 save_tui_settings(state)?;
             }
             state.clear_selected_viewport_cache();
-            state.claim_viewport_after_layout = true;
         }
         Action::ToggleHelp => {
             state.ui.mode = if state.ui.mode == AppMode::Help {
@@ -1643,21 +1821,27 @@ async fn dispatch_action(state: &mut TuiState, action: Action) -> Result<()> {
             }
         }
         Action::FocusPane(direction) => {
+            claim_active_viewport(state).await?;
             if let Some((_, _, tab, _)) = state.active_tab() {
                 tab.activate_pane_direction(direction);
             }
         }
         Action::FocusPaneId(pane_id) => {
+            claim_active_viewport(state).await?;
             if let (Some((_, _, tab, _)), Some(pane)) = (state.active_tab(), state.pane(pane_id)) {
                 tab.set_active_pane(&pane);
             }
         }
-        Action::CyclePane(delta) => cycle_pane(state, delta),
+        Action::CyclePane(delta) => {
+            claim_active_viewport(state).await?;
+            cycle_pane(state, delta);
+        }
         Action::NewTab => spawn_tab_for_selected_thread(state).await?,
         Action::RenameTab => begin_rename_tab(state),
         Action::NewPaneInStack(pane_id) => new_pane_in_stack(state, pane_id).await?,
         Action::SplitPane(axis) => split_active_pane(state, axis).await?,
         Action::ToggleZoom => {
+            claim_active_viewport(state).await?;
             if let Some((_, _, tab, _)) = state.active_tab() {
                 tab.toggle_zoom();
             }
@@ -1678,8 +1862,14 @@ async fn dispatch_action(state: &mut TuiState, action: Action) -> Result<()> {
             state.ui.copy = None;
             state.ui.mode = AppMode::Terminal;
         }
-        Action::ScrollPane { pane_id, lines } => scroll_pane(state, pane_id, lines),
-        Action::ScrollToBottom { pane_id } => state.ui.set_scroll_offset(pane_id, 0),
+        Action::ScrollPane { pane_id, lines } => {
+            claim_active_viewport(state).await?;
+            scroll_pane(state, pane_id, lines);
+        }
+        Action::ScrollToBottom { pane_id } => {
+            claim_active_viewport(state).await?;
+            state.ui.set_scroll_offset(pane_id, 0);
+        }
         Action::CopySelection => copy_selection(state)?,
         Action::PasteClipboard => paste_clipboard(state)?,
         Action::BeginSearch { backwards } => begin_search(state, backwards),
@@ -1807,7 +1997,6 @@ fn adjust_setting(state: &mut TuiState, index: usize, delta: isize) -> Result<()
             state.ui.sidebar_visible = !state.ui.sidebar_visible;
             state.settings.sidebar_visible = state.ui.sidebar_visible;
             state.clear_selected_viewport_cache();
-            state.claim_viewport_after_layout = true;
         }
         2 => {
             state.settings.pane_nav_bar = !state.settings.pane_nav_bar;
@@ -1815,19 +2004,16 @@ fn adjust_setting(state: &mut TuiState, index: usize, delta: isize) -> Result<()
             // All three of these hand columns and rows between the chrome and
             // the grid, so the server has to be told the pane changed size.
             state.clear_selected_viewport_cache();
-            state.claim_viewport_after_layout = true;
         }
         3 => {
             state.settings.pane_borders = !state.settings.pane_borders;
             state.ui.pane_borders = state.settings.pane_borders;
             state.clear_selected_viewport_cache();
-            state.claim_viewport_after_layout = true;
         }
         4 => {
             state.settings.pane_scrollbars = !state.settings.pane_scrollbars;
             state.ui.pane_scrollbars = state.settings.pane_scrollbars;
             state.clear_selected_viewport_cache();
-            state.claim_viewport_after_layout = true;
         }
         5 => state.settings.mouse = !state.settings.mouse,
         6 => state.settings.copy_on_select = !state.settings.copy_on_select,
@@ -1841,7 +2027,6 @@ fn adjust_setting(state: &mut TuiState, index: usize, delta: isize) -> Result<()
             };
             state.ui.touch_targets = state.settings.touch_targets;
             state.clear_selected_viewport_cache();
-            state.claim_viewport_after_layout = true;
         }
         8 => {
             state.settings.scroll_lines =
@@ -1866,7 +2051,6 @@ async fn select_thread(state: &mut TuiState, key: &ThreadKey) -> Result<()> {
     if state.layout.class == ViewClass::Narrow && state.ui.sidebar_visible {
         state.ui.sidebar_visible = false;
         state.clear_selected_viewport_cache();
-        state.claim_viewport_after_layout = true;
     }
     mark_thread_seen(state, key).await?;
     ensure_selected_thread_live(state, false, None).await
@@ -3203,10 +3387,31 @@ fn handle_key(event: KeyEvent, state: &mut TuiState) {
             return;
         }
         AppMode::Prefix => {
+            if state.frontend_surface_blocked() {
+                state.ui.mode = AppMode::Terminal;
+                state.ui.status = state
+                    .frontend_overlay_message()
+                    .map(|(_, hint)| hint)
+                    .unwrap_or_default();
+                state.dirty = true;
+                return;
+            }
             handle_prefix_key(key, modifiers, state);
             return;
         }
         AppMode::Terminal => {}
+    }
+
+    if state.frontend_surface_blocked() {
+        // B deliberately does not let the keyboard steal control: there is no
+        // safe way to distinguish a takeover gesture from text intended for
+        // the still-hidden terminal.
+        state.ui.status = state
+            .frontend_overlay_message()
+            .map(|(_, hint)| hint)
+            .unwrap_or_default();
+        state.dirty = true;
+        return;
     }
 
     if is_prefix {
@@ -3720,6 +3925,10 @@ fn open_context_menu(state: &mut TuiState, x: u16, y: u16, target: Option<HitTar
 }
 
 fn open_main_menu(state: &mut TuiState, x: u16, y: u16) {
+    let current_mode = state
+        .active_frontend_access()
+        .map(|state| state.mode)
+        .unwrap_or(codec::FrontendAccessMode::Handoff);
     state.ui.context_menu = Some(ContextMenuState {
         anchor: (x, y),
         selected: 0,
@@ -3730,6 +3939,22 @@ fn open_main_menu(state: &mut TuiState, x: u16, y: u16) {
             menu_entry("Copy Mode", Action::EnterCopyMode),
             menu_entry("Paste", Action::PasteClipboard),
             menu_entry("Connections", Action::OpenConnections),
+            menu_entry(
+                if current_mode == codec::FrontendAccessMode::TmuxLatest {
+                    "✓ A · Shared (tmux-like)"
+                } else {
+                    "A · Shared (tmux-like)"
+                },
+                Action::SetFrontendAccessMode(codec::FrontendAccessMode::TmuxLatest),
+            ),
+            menu_entry(
+                if current_mode == codec::FrontendAccessMode::Handoff {
+                    "✓ B · Handoff (exclusive)"
+                } else {
+                    "B · Handoff (exclusive)"
+                },
+                Action::SetFrontendAccessMode(codec::FrontendAccessMode::Handoff),
+            ),
             menu_entry("TUI Settings", Action::OpenSettings),
             menu_entry("Toggle Sidebar", Action::ToggleSidebar),
             menu_entry("Help", Action::ToggleHelp),
@@ -3816,24 +4041,35 @@ fn handle_mouse(event: TermwizMouseEvent, state: &mut TuiState) {
     let wheel =
         current.contains(MouseButtons::VERT_WHEEL) || current.contains(MouseButtons::HORZ_WHEEL);
 
-    // Before any of the branches below, every one of which returns early.
-    //
-    // Touching a renderer is the plainest statement that it is the one being
-    // looked at, and the server only hands the viewport over on input it can
-    // see — a click or a scroll on a pane that has not asked for mouse
-    // reporting never leaves this process. Hanging this off the left-click
-    // branch alone was not enough: the wheel is handled and returned several
-    // branches earlier, so scrolling, which is most of what a phone does, never
-    // took the viewport at all. Motion is excluded on purpose; a pointer
-    // crossing the window is not a statement about anything.
-    if (left_pressed || right_pressed || middle_pressed || wheel) && !state.owns_active_viewport() {
-        state.claim_viewport_after_layout = true;
+    let pointer_release = !current
+        .intersects(MouseButtons::LEFT | MouseButtons::RIGHT | MouseButtons::MIDDLE)
+        && prior.intersects(MouseButtons::LEFT | MouseButtons::RIGHT | MouseButtons::MIDDLE);
+    if state.handoff_consumed_press && pointer_release {
+        state.handoff_consumed_press = false;
+        state.last_mouse_buttons = current;
+        state.dirty = true;
+        return;
     }
 
     if modal_mouse_input(state, x, y, left_pressed) {
         state.last_mouse_buttons = current;
         state.dirty = true;
         return;
+    }
+
+    let terminal_surface = state.layout.content.contains((x, y).into());
+    let takeover_gesture = left_pressed || right_pressed || middle_pressed || wheel;
+    if state.ui.mode == AppMode::Terminal && terminal_surface && state.frontend_surface_blocked() {
+        if takeover_gesture && state.frontend_takeover_claimable() {
+            state.handoff_consumed_press = left_pressed || right_pressed || middle_pressed;
+            state.queue(Action::ClaimFrontendAccess);
+        }
+        state.last_mouse_buttons = current;
+        state.dirty = true;
+        return;
+    }
+    if state.ui.mode == AppMode::Terminal && terminal_surface && takeover_gesture {
+        state.queue(Action::ClaimFrontendAccess);
     }
 
     if let Some(pane_id) = state.forwarded_mouse_pane {
@@ -4036,10 +4272,6 @@ fn handle_mouse(event: TermwizMouseEvent, state: &mut TuiState) {
             Some(DragState::SidebarResize) => {
                 state.ui.sidebar_width = x.saturating_sub(state.layout.screen.x).clamp(18, 36);
                 state.clear_selected_viewport_cache();
-                // Dragging the divider is as deliberate as toggling the sidebar
-                // away, so it earns the same authority over the grid; without
-                // this the terminal keeps whichever width another client chose.
-                state.claim_viewport_after_layout = true;
             }
             Some(DragState::TreeNode { .. }) => {}
             Some(DragState::SplitResize {
@@ -4475,6 +4707,36 @@ fn mouse_transition(prior: &MouseButtons, current: &MouseButtons) -> (MouseEvent
 mod tests {
     use super::*;
 
+    #[test]
+    fn takeover_epochs_are_scoped_to_domain_and_top_level_tab() {
+        let mut epochs = TakeoverEpochs::default();
+        let first = epochs.begin("devbox", 7);
+        let second = epochs.begin("devbox", 8);
+
+        assert!(epochs.contains("devbox", 7));
+        assert!(epochs.contains("devbox", 8));
+        assert!(!epochs.finish("devbox", 7, first.wrapping_add(10)));
+        assert!(epochs.contains("devbox", 7));
+        assert!(epochs.finish("devbox", 7, first));
+        assert!(!epochs.contains("devbox", 7));
+        assert!(epochs.contains("devbox", 8));
+        assert!(epochs.finish("devbox", 8, second));
+    }
+
+    #[test]
+    fn takeover_pending_forces_the_tui_gate_to_syncing() {
+        let claimable = RemoteFrontendGate::Claimable { owner: None };
+        assert_eq!(
+            effective_frontend_gate(true, claimable.clone()),
+            RemoteFrontendGate::Syncing
+        );
+        assert_eq!(effective_frontend_gate(false, claimable.clone()), claimable);
+        assert_eq!(
+            effective_frontend_gate(true, RemoteFrontendGate::Visible),
+            RemoteFrontendGate::Syncing
+        );
+    }
+
     fn model_for_reorder() -> AppModel {
         let mut model = AppModel::default();
         model.apply_snapshot(
@@ -4700,6 +4962,11 @@ mod tests {
                 canonical_size: TerminalSize::default(),
                 view: None,
                 generation: 1,
+                access: mux::FrontendAccessState {
+                    mode: mux::FrontendAccessMode::Handoff,
+                    owner: None,
+                    generation: 1,
+                },
             })
         ));
     }

@@ -616,10 +616,9 @@ impl SshHostsView {
                 // nothing resolves the domain to connect, and every rename or
                 // delete is refused because it has to go through a server this
                 // device can no longer name.
-                let orphaned_spaces =
-                    workspace_threads::space_ids_for_domains(&ssh_hosts::domain_names_for_host(
-                        &entry.spec,
-                    ));
+                let orphaned_spaces = workspace_threads::space_ids_for_domains(
+                    &ssh_hosts::domain_names_for_host(&entry.spec),
+                );
 
                 if let Err(err) = ssh_hosts::try_remove_host(&id) {
                     log::error!("failed to delete SSH host {id}: {err:#}");

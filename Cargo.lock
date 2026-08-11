@@ -8097,6 +8097,7 @@ dependencies = [
  "promise",
  "rangeset",
  "rcgen",
+ "serde",
  "serde_json",
  "smol",
  "tempfile",

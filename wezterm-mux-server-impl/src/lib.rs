@@ -9,6 +9,8 @@ pub mod dispatch;
 pub mod local;
 pub mod pki;
 pub mod sessionhandler;
+pub mod thinkterm_access;
+pub mod thinkterm_layout;
 pub mod thinkterm_session;
 pub mod thinkterm_tree;
 
@@ -40,6 +42,9 @@ pub fn update_mux_domains_for_server(config: &ConfigHandle) -> anyhow::Result<()
 
 fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> anyhow::Result<()> {
     let mux = Mux::get();
+
+    thinkterm_access::initialize_mux(&mux);
+    thinkterm_layout::initialize_mux(&mux);
 
     for client_config in client_domains(&config) {
         if mux.get_domain_by_name(client_config.name()).is_some() {
