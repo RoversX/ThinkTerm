@@ -54,7 +54,9 @@ case $OSTYPE in
     done
 
     set +x
-    if [ -n "$MACOS_TEAM_ID" ] ; then
+    if [[ -n "${MACOS_SIGNING_MODE:-}" ]] ; then
+      bash ci/macos-sign-local.sh "$zipdir/ThinkTerm.app" "$MACOS_SIGNING_MODE"
+    elif [ -n "$MACOS_TEAM_ID" ] ; then
       MACOS_PW=$(echo $MACOS_CERT_PW | base64 --decode)
       echo "pw sha"
       echo $MACOS_PW | shasum
@@ -85,13 +87,18 @@ case $OSTYPE in
       security default-keychain -d user -s $def_keychain
       echo "Remove build.keychain"
       security delete-keychain build.keychain || true
+    else
+      # A normal local package should still be a correctly sealed app bundle.
+      # Development/Developer ID identities remain opt-in, but ad-hoc signing
+      # is a safer and less surprising default than producing an invalid app.
+      bash ci/macos-sign-local.sh "$zipdir/ThinkTerm.app" adhoc
     fi
 
     set -x
     zip -r $zipname $zipdir
     set +x
 
-    if [ -n "$MACOS_TEAM_ID" ] ; then
+    if [[ -z "${MACOS_SIGNING_MODE:-}" && -n "$MACOS_TEAM_ID" ]] ; then
       echo "Notarize"
       xcrun notarytool submit $zipname --wait --team-id "$MACOS_TEAM_ID" --apple-id "$MACOS_APPLEID" --password "$MACOS_APP_PW"
     fi
