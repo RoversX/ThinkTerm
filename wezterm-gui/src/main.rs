@@ -425,6 +425,94 @@ pub(crate) fn connect_domain_from_ssh_host(name: &str) -> anyhow::Result<Arc<dyn
     Ok(domain)
 }
 
+async fn current_gui_terminal_size(
+    mux_window_id: mux::window::WindowId,
+    fallback: wezterm_term::TerminalSize,
+) -> wezterm_term::TerminalSize {
+    let Some(gui_window) = crate::frontend::front_end().gui_window_for_mux_window(mux_window_id)
+    else {
+        return fallback;
+    };
+    let (tx, rx) = smol::channel::bounded(1);
+    gui_window
+        .window
+        .notify(crate::termwindow::TermWindowNotif::GetTerminalSize(tx));
+    rx.recv().await.unwrap_or(fallback)
+}
+
+async fn adopt_materialized_workspace_window(
+    source_window_id: mux::window::WindowId,
+    workspace: &str,
+    domain_id: mux::domain::DomainId,
+) -> anyhow::Result<()> {
+    let mux = Mux::get();
+    if mux.get_window(source_window_id).is_some_and(|window| {
+        window.get_workspace() == workspace
+            && window.iter().any(|tab| {
+                tab.iter_all_panes()
+                    .iter()
+                    .any(|pane| pane.domain_id() == domain_id)
+            })
+    }) {
+        // Initial attach may already have folded the restored remote window
+        // into the claimed native window. Do not jump to a second mux window
+        // in the same workspace and kill this one: that would turn local GUI
+        // adoption into a remote pane close when a workspace temporarily has
+        // multiple mux windows.
+        return Ok(());
+    }
+    let Some(target_window_id) =
+        mux.iter_windows_in_workspace(workspace)
+            .into_iter()
+            .find(|window_id| {
+                *window_id != source_window_id
+                    && mux.get_window(*window_id).is_some_and(|window| {
+                        window.iter().any(|tab| {
+                            tab.iter_all_panes()
+                                .iter()
+                                .any(|pane| pane.domain_id() == domain_id)
+                        })
+                    })
+            })
+    else {
+        anyhow::bail!("restored workspace {workspace} has no live window for domain {domain_id}");
+    };
+    let Some(gui_window) = crate::frontend::front_end().gui_window_for_mux_window(source_window_id)
+    else {
+        return Ok(());
+    };
+    crate::frontend::front_end().set_switching_workspaces(true);
+    let (tx, rx) = smol::channel::bounded(1);
+    gui_window
+        .window
+        .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+            move |term_window| {
+                let switched = if term_window.mux_window_id == source_window_id {
+                    term_window.switch_to_mux_window(target_window_id);
+                    term_window.mux_window_id == target_window_id
+                } else {
+                    false
+                };
+                let _ = tx.try_send(switched);
+            },
+        )));
+    let switched = rx
+        .recv()
+        .await
+        .context("waiting for GUI to adopt restored mux window");
+    crate::frontend::front_end().set_switching_workspaces(false);
+    let switched = switched?;
+    if !switched
+        || crate::frontend::front_end()
+            .gui_window_for_mux_window(target_window_id)
+            .is_none()
+    {
+        anyhow::bail!("GUI did not confirm adoption of restored mux window {target_window_id}");
+    }
+    mux.kill_window(source_window_id);
+    Ok(())
+}
+
 pub(crate) async fn connect_domain_into_space(
     cmd: Option<CommandBuilder>,
     domain: Arc<dyn Domain>,
@@ -571,22 +659,13 @@ pub(crate) async fn connect_domain_into_space(
     let settled_workspace = workspace_threads::ensure_mux_thread_workspace(&settled);
     workspace_threads::reconcile_remote_subtree(&domain_name);
 
-    // Spawn the thread's first shell when its workspace has no panes on the
-    // server. Keying this off "does the domain have any panes at all" left
-    // the connect window empty whenever the server had unrelated windows
-    // (its own startup window, other threads) — the old blind window
-    // adoption papered over that by grabbing one of them as a tab.
-    let thread_workspace_filter = Some(thread_workspace.clone());
-    if settled_workspace != thread_workspace {
-        // The invented Space is gone from the store, so the window created
-        // above is being re-homed onto one the server really has, and that
-        // path materializes the destination thread itself. Spawning here
-        // would strand a shell in a workspace no row on the server names.
-        log::info!(
-            "{domain_name} has its own Spaces; leaving {settled_workspace} \
-             to the re-home instead of spawning into {thread_workspace}"
-        );
-    } else if !have_panes_in_domain_and_ws(&domain, &thread_workspace_filter) {
+    // Ordinary GUI startup always enters through EnsureThinkTermThread. It is
+    // idempotent when the workspace is already live and is the only path that
+    // can restore a saved multi-tab/split layout after a mux replacement.
+    // In particular, do not let an unrelated server startup shell or an early
+    // primary-window fold suppress recovery. An explicit custom command keeps
+    // the traditional direct-spawn semantics below.
+    if cmd.is_none() {
         let _config_subscription = config::subscribe_to_config_reload(move || {
             promise::spawn::spawn_into_main_thread(async move {
                 if let Err(err) = update_mux_domains(&config::configuration()) {
@@ -598,14 +677,42 @@ pub(crate) async fn connect_domain_into_space(
         });
 
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
-        let _tab = domain
-            .spawn(
-                config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
-                cmd,
-                None,
-                window_id,
-            )
+        let fallback_size = config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?));
+        let size = current_gui_terminal_size(window_id, fallback_size).await;
+        let client = domain
+            .downcast_ref::<ClientDomain>()
+            .ok_or_else(|| anyhow!("{domain_name} is not a multiplexing client domain"))?;
+        crate::frontend::front_end().set_switching_workspaces(true);
+        let ensured = client
+            .ensure_thinkterm_thread(Some(settled.thread_id.clone()), size)
+            .await;
+        crate::frontend::front_end().set_switching_workspaces(false);
+        let response = ensured.context("restore remote ThinkTerm landing layout")?;
+        if response.workspace != settled_workspace {
+            anyhow::bail!(
+                "remote restored workspace {}, expected {}",
+                response.workspace,
+                settled_workspace
+            );
+        }
+        adopt_materialized_workspace_window(window_id, &response.workspace, domain.domain_id())
             .await?;
+    } else {
+        let thread_workspace_filter = Some(thread_workspace.clone());
+        if !have_panes_in_domain_and_ws(&domain, &thread_workspace_filter) {
+            let _config_subscription = config::subscribe_to_config_reload(move || {
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Err(err) = update_mux_domains(&config::configuration()) {
+                        log::error!("Error updating mux domains: {:#}", err);
+                    }
+                })
+                .detach();
+                true
+            });
+            let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
+            let size = config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?));
+            let _tab = domain.spawn(size, cmd, None, window_id).await?;
+        }
     }
     drop(connect_activity);
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
@@ -1039,6 +1146,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     wezterm_client::domain::set_thinkterm_connect_sink(|domain_name, _connection_generation| {
         crate::workspace_threads::note_remote_connected(domain_name);
     });
+    wezterm_client::domain::set_thinkterm_frontend_recovery_sink(
+        crate::frontend::request_thinkterm_frontend_recovery,
+    );
 
     let config = config::configuration();
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();

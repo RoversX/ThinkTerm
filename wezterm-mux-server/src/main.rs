@@ -228,6 +228,8 @@ fn run() -> anyhow::Result<()> {
     let mux = Arc::new(mux::Mux::new(Some(domain.clone())));
     Mux::set_mux(&mux);
 
+    install_shutdown_signal_handler()?;
+
     let executor = promise::spawn::SimpleExecutor::new();
 
     spawn_listener().map_err(|e| {
@@ -302,7 +304,35 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
 
 fn terminate_with_error(err: anyhow::Error) -> ! {
     log::error!("{:#}; terminating", err);
+    if let Err(flush_err) = wezterm_mux_server_impl::thinkterm_layout::flush_now() {
+        log::error!("flushing ThinkTerm layouts before termination: {flush_err:#}");
+    }
     std::process::exit(1);
+}
+
+#[cfg(unix)]
+fn install_shutdown_signal_handler() -> anyhow::Result<()> {
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Err(err) = wezterm_mux_server_impl::thinkterm_layout::flush_now() {
+                    log::error!("flushing ThinkTerm layouts before shutdown: {err:#}");
+                }
+                std::process::exit(0);
+            })
+            .detach();
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_signal_handler() -> anyhow::Result<()> {
+    Ok(())
 }
 
 mod ossl;

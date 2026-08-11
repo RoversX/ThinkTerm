@@ -57,6 +57,11 @@ struct StoredTerminalSpec {
     pane_id: PaneId,
     cwd: Option<String>,
     domain: Option<String>,
+    /// Older snapshots written while pane titles were intentionally omitted
+    /// do not contain this field. Titles are not used to restore the layout,
+    /// but continuing to write them keeps snapshots readable by older server
+    /// binaries after a downgrade.
+    #[serde(default)]
     title: String,
 }
 
@@ -224,6 +229,14 @@ fn schedule_snapshot() {
     .detach();
 }
 
+/// Persist the latest complete mux topology synchronously. The mux-server
+/// calls this before controlled termination so the debounce window cannot
+/// discard the user's final split/tab/focus change.
+pub fn flush_now() -> Result<()> {
+    let generation = CHANGE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    snapshot_live_layouts(generation)
+}
+
 fn thread_records(tree: &codec::ThinkTermTree) -> Vec<(String, String)> {
     tree.projects
         .iter()
@@ -302,14 +315,17 @@ fn snapshot_live_layouts(_generation: u64) -> Result<()> {
 }
 
 fn snapshot_workspace(mux: &Mux, workspace: &str) -> Result<Option<StoredThreadLayout>> {
-    for window_id in mux.iter_windows_in_workspace(workspace) {
+    let mut window_ids = mux.iter_windows_in_workspace(workspace);
+    window_ids.sort_unstable();
+    let mut windows = Vec::new();
+
+    for window_id in window_ids {
         let Some(window) = mux.get_window(window_id) else {
             continue;
         };
         if !window.iter().any(|tab| !tab.iter_all_panes().is_empty()) {
             continue;
         }
-        let active_tab = window.get_active_idx();
         let mut terminal_specs = Vec::new();
         let mut tabs = Vec::new();
         for tab in window.iter() {
@@ -317,17 +333,40 @@ fn snapshot_workspace(mux: &Mux, workspace: &str) -> Result<Option<StoredThreadL
             collect_terminal_specs(mux, &node, &mut terminal_specs);
             tabs.push(serde_json::to_value(node).context("serialize pane tree")?);
         }
-        if tabs.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(StoredThreadLayout {
-            workspace: workspace.to_string(),
-            active_tab,
-            tabs,
-            terminal_specs,
-        }));
+        windows.push((window.get_active_idx(), tabs, terminal_specs));
     }
-    Ok(None)
+
+    Ok(merge_workspace_snapshots(workspace, windows))
+}
+
+fn merge_workspace_snapshots(
+    workspace: &str,
+    windows: Vec<(usize, Vec<serde_json::Value>, Vec<StoredTerminalSpec>)>,
+) -> Option<StoredThreadLayout> {
+    let mut active_tab = 0;
+    let mut saw_live_window = false;
+    let mut terminal_specs = Vec::new();
+    let mut tabs = Vec::new();
+    for (window_active_tab, window_tabs, window_specs) in windows {
+        if window_tabs.is_empty() {
+            continue;
+        }
+        if !saw_live_window {
+            active_tab = tabs.len() + window_active_tab.min(window_tabs.len() - 1);
+            saw_live_window = true;
+        }
+        tabs.extend(window_tabs);
+        terminal_specs.extend(window_specs);
+    }
+    if tabs.is_empty() {
+        return None;
+    }
+    Some(StoredThreadLayout {
+        workspace: workspace.to_string(),
+        active_tab: active_tab.min(tabs.len() - 1),
+        tabs,
+        terminal_specs,
+    })
 }
 
 fn collect_terminal_specs(
@@ -795,6 +834,36 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_without_terminal_title_remains_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thinkterm_layout.json");
+        let mut stored = StoredLayouts::default();
+        stored
+            .layouts
+            .insert("thread-1".to_string(), sample_layout("workspace-1"));
+
+        let mut json = serde_json::to_value(&stored).unwrap();
+        json["layouts"]["thread-1"]["terminal_specs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("title");
+        std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let loaded = load_from_path(&path).unwrap();
+        assert_eq!(loaded.layouts["thread-1"].terminal_specs[0].title, "");
+
+        // Keep emitting the field so a later downgrade to a server that still
+        // requires it can read the snapshot produced by this version.
+        save_to_path(&path, &loaded).unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["layouts"]["thread-1"]["terminal_specs"][0]["title"],
+            ""
+        );
+    }
+
+    #[test]
     fn malformed_or_unknown_layout_file_is_not_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let malformed = dir.path().join("malformed.json");
@@ -938,6 +1007,49 @@ mod tests {
             layout_structure_fingerprint(&one),
             layout_structure_fingerprint(&extra_tab)
         );
+    }
+
+    #[test]
+    fn multiple_workspace_windows_are_merged_in_stable_order() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let tab = |pane_id| {
+            serde_json::to_value(PaneNode::Leaf(pane_entry(pane_id, size, false))).unwrap()
+        };
+        let spec = |pane_id| StoredTerminalSpec {
+            pane_id,
+            cwd: None,
+            domain: Some("local".to_string()),
+            title: "shell".to_string(),
+        };
+        let merged = merge_workspace_snapshots(
+            "workspace-1",
+            vec![
+                (1, vec![tab(10), tab(11)], vec![spec(10), spec(11)]),
+                (0, vec![tab(20)], vec![spec(20)]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(merged.active_tab, 1);
+        assert_eq!(merged.tabs.len(), 3);
+        assert_eq!(merged.terminal_specs.len(), 3);
+        let panes = merged
+            .tabs
+            .iter()
+            .map(
+                |tab| match serde_json::from_value::<PaneNode>(tab.clone()).unwrap() {
+                    PaneNode::Leaf(entry) => entry.pane_id,
+                    other => panic!("unexpected tab node: {:?}", other),
+                },
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(panes, vec![10, 11, 20]);
     }
 
     #[test]

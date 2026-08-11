@@ -5126,10 +5126,7 @@ impl super::TermWindow {
         } else {
             (None, None)
         };
-        let size = self.config.initial_size(
-            self.dimensions.dpi as u32,
-            crate::cell_pixel_dims(&self.config, self.dimensions.dpi as f64).ok(),
-        );
+        let size = self.terminal_size;
         let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
             Arc::new(TermConfig::with_config(self.config.clone()));
         let window = self.window.clone();
@@ -5471,11 +5468,7 @@ impl super::TermWindow {
             )
         };
         let layout = crate::workspace_threads::thread_layout(&plan.thread_id);
-        let dpi = self.dimensions.dpi as u32;
-        let size = self.config.initial_size(
-            dpi,
-            crate::cell_pixel_dims(&self.config, self.dimensions.dpi as f64).ok(),
-        );
+        let size = self.terminal_size;
         let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
             Arc::new(TermConfig::with_config(self.config.clone()));
         // Suppress the additive reconcile while we materialize the target
@@ -5711,10 +5704,7 @@ impl super::TermWindow {
 
         let workspace_name = plan.workspace_name.clone();
         let layout = crate::workspace_threads::thread_layout(&plan.thread_id);
-        let size = self.config.initial_size(
-            self.dimensions.dpi as u32,
-            crate::cell_pixel_dims(&self.config, self.dimensions.dpi as f64).ok(),
-        );
+        let size = self.terminal_size;
         let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
             Arc::new(TermConfig::with_config(self.config.clone()));
 

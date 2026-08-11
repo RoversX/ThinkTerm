@@ -17,8 +17,136 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use wezterm_term::TerminalSize;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FrontendRecoverySlot {
+    /// A thin frontend with a single selected terminal, currently the TUI.
+    Primary,
+    /// A stable native GUI window identity.  This is deliberately not a mux
+    /// WindowId: the mux id changes when the native window switches Threads.
+    Window(u64),
+}
+
+#[derive(Clone, Debug)]
+struct ReconnectRecoveryTarget {
+    slot: FrontendRecoverySlot,
+    workspace: String,
+    size: TerminalSize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThinkTermFrontendRecoveryTarget {
+    pub slot: FrontendRecoverySlot,
+    pub window_id: WindowId,
+    pub tab_id: TabId,
+}
+
+#[derive(Clone, Debug)]
+struct FrontendRecoveryBarrier {
+    generation: u64,
+    pending: HashMap<FrontendRecoverySlot, TabId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontendRecoveryAck {
+    Ignored,
+    Pending,
+    Complete,
+}
+
+fn acknowledge_recovery_target(
+    barrier: &mut Option<FrontendRecoveryBarrier>,
+    slot: FrontendRecoverySlot,
+    local_tab_id: TabId,
+    generation: u64,
+    current_generation: u64,
+) -> FrontendRecoveryAck {
+    let Some(active) = barrier.as_mut() else {
+        return FrontendRecoveryAck::Ignored;
+    };
+    if active.generation != generation
+        || generation != current_generation
+        || active.pending.get(&slot) != Some(&local_tab_id)
+    {
+        return FrontendRecoveryAck::Ignored;
+    }
+    active.pending.remove(&slot);
+    if active.pending.is_empty() {
+        *barrier = None;
+        FrontendRecoveryAck::Complete
+    } else {
+        FrontendRecoveryAck::Pending
+    }
+}
+
+#[derive(Default)]
+struct ServerReplacementMirrors {
+    windows_by_workspace: HashMap<String, WindowId>,
+    old_tabs: Vec<TabId>,
+}
+
+fn pane_node_workspace(node: &mux::tab::PaneNode) -> Option<&str> {
+    match node {
+        mux::tab::PaneNode::Empty => None,
+        mux::tab::PaneNode::Leaf(entry) => Some(entry.workspace.as_str()),
+        mux::tab::PaneNode::Stack(stack) => stack
+            .panes
+            .get(stack.active)
+            .or_else(|| stack.panes.first())
+            .map(|entry| entry.workspace.as_str()),
+        mux::tab::PaneNode::Split { left, right, .. } => {
+            pane_node_workspace(left).or_else(|| pane_node_workspace(right))
+        }
+    }
+}
+
+fn thread_id_for_workspace(tree: &codec::ThinkTermTree, workspace: &str) -> Option<String> {
+    tree.projects.iter().find_map(|project| {
+        project.threads.iter().find_map(|thread| {
+            let thread_workspace = thread
+                .materialized_workspace_name
+                .as_deref()
+                .or(thread.planned_workspace_name.as_deref());
+            (thread_workspace == Some(workspace)).then(|| thread.id.clone())
+        })
+    })
+}
+
+fn server_runtime_replaced(ready_server_id: Option<&str>, observed_server_id: &str) -> bool {
+    ready_server_id.is_some_and(|ready| ready != observed_server_id)
+}
+
+fn active_remote_tabs_by_workspace(state: &codec::ThinkTermSessionState) -> HashMap<String, TabId> {
+    let mut active = HashMap::new();
+    for project in &state.projects {
+        for thread in &project.threads {
+            let Some(workspace) = thread
+                .materialized_workspace_name
+                .as_deref()
+                .or(thread.planned_workspace_name.as_deref())
+            else {
+                continue;
+            };
+            if let Some(tab) = thread
+                .tabs
+                .iter()
+                .find(|tab| tab.is_active)
+                .or_else(|| thread.tabs.first())
+            {
+                active.insert(workspace.to_string(), tab.tab_id);
+            }
+        }
+    }
+    active
+}
+
 fn accepts_generation(prior: Option<u64>, incoming: u64) -> bool {
     prior.is_none_or(|prior| incoming > prior)
+}
+
+fn consistent_remote_tab_id(ids: impl IntoIterator<Item = TabId>) -> Option<TabId> {
+    let mut ids = ids.into_iter();
+    let first = ids.next()?;
+    ids.all(|id| id == first).then_some(first)
 }
 
 fn remote_owner_matches_client(
@@ -151,6 +279,11 @@ pub struct ClientInner {
     /// Latest geometry this renderer actually reported for each remote tab.
     /// Explicit claims copy this geometry into the same PDU as the owner move.
     reported_viewports: Mutex<HashMap<TabId, codec::ClientViewport>>,
+    /// Frontend-owned recovery intents. GUI windows use independent stable
+    /// slots; the TUI overwrites its single Primary slot as selection changes.
+    /// This keeps every visible GUI Thread while avoiding eager restoration of
+    /// every Thread a TUI visited earlier in its lifetime.
+    frontend_recovery_intents: Mutex<HashMap<FrontendRecoverySlot, ReconnectRecoveryTarget>>,
     /// Claims on a tab are coalesced behind one request-scoped async lock. A
     /// second input rechecks ownership after the first request completes.
     frontend_claim_locks: Mutex<HashMap<TabId, Arc<futures::lock::Mutex<()>>>>,
@@ -173,6 +306,24 @@ pub struct ClientInner {
     /// A resync arrived while a mutation was in flight; run one when the
     /// last mutation completes.
     resync_deferred: std::sync::atomic::AtomicBool,
+    /// A replacement mux runtime has installed new topology but one or more
+    /// frontend slots have not yet confirmed their final local geometry.
+    /// Ordinary viewport RPCs never modify this barrier.
+    frontend_recovery_barrier: Mutex<Option<FrontendRecoveryBarrier>>,
+    /// The mux runtime whose topology and frontend geometry were last fully
+    /// committed. `Client::remote_server_id` changes as soon as version
+    /// bootstrap succeeds, which is too early: a later Ensure/ListPanes/
+    /// viewport failure must continue to be treated as a replacement runtime
+    /// on the next retry.
+    ready_server_id: Mutex<Option<String>>,
+    /// Recovery intent survives a failed replacement attempt even after the
+    /// old remote-id maps have been cleared. It is released only when the
+    /// frontend acknowledges geometry for the replacement topology.
+    pending_recovery_targets: Mutex<HashMap<FrontendRecoverySlot, ReconnectRecoveryTarget>>,
+    /// Stable frontend windows retained across replacement retries. Once the
+    /// old remote-id maps are cleared, this is what prevents a failed retry
+    /// from materializing duplicate native windows on its next attempt.
+    pending_recovery_windows: Mutex<HashMap<String, WindowId>>,
 }
 
 /// RAII scope for a structure-mutating RPC; defers resyncs for its lifetime
@@ -322,13 +473,38 @@ impl ClientInner {
     }
 
     fn local_to_remote_tab(&self, local_tab_id: TabId) -> Option<TabId> {
-        let map = self.remote_to_local_tab.lock().unwrap();
-        for (remote, local) in map.iter() {
-            if *local == local_tab_id {
-                return Some(*remote);
+        {
+            let map = self.remote_to_local_tab.lock().unwrap();
+            for (remote, local) in map.iter() {
+                if *local == local_tab_id {
+                    return Some(*remote);
+                }
             }
         }
-        None
+
+        // A replacement runtime installs fresh ClientPanes before the GUI is
+        // allowed to publish its recovery viewport.  If a concurrent topology
+        // sweep dropped only the tab map, the panes still carry an
+        // unambiguous, generation-bound remote tab id. Reconstruct that
+        // derived index instead of leaving the frontend permanently stuck in
+        // Syncing with `tab ... has no remote mapping`.
+        let tab = Mux::get().get_tab(local_tab_id)?;
+        let remote_server_id = self.client.remote_server_id();
+        let remote_tab_id =
+            consistent_remote_tab_id(tab.iter_all_panes().into_iter().filter_map(|pane| {
+                pane.downcast_ref::<ClientPane>()
+                    .filter(|pane| {
+                        pane.domain_id() == self.local_domain_id
+                            && pane.belongs_to_remote_server(remote_server_id.as_deref())
+                    })
+                    .map(ClientPane::remote_tab_id)
+            }))?;
+
+        self.record_remote_to_local_tab_mapping(remote_tab_id, local_tab_id);
+        log::info!(
+            "recovered missing remote tab mapping {remote_tab_id} -> {local_tab_id} from live panes"
+        );
+        Some(remote_tab_id)
     }
 
     fn local_to_remote_window(&self, local_window_id: WindowId) -> Option<WindowId> {
@@ -343,9 +519,22 @@ impl ClientInner {
 
     pub fn remote_to_local_pane_id(&self, remote_pane_id: PaneId) -> Option<TabId> {
         let mut pane_map = self.remote_to_local_pane.lock().unwrap();
+        let remote_server_id = self.client.remote_server_id();
 
-        if let Some(id) = pane_map.get(&remote_pane_id) {
-            return Some(*id);
+        if let Some(id) = pane_map.get(&remote_pane_id).copied() {
+            let mapping_is_current = Mux::get().get_pane(id).is_some_and(|pane| {
+                pane.downcast_ref::<ClientPane>().is_some_and(|pane| {
+                    pane.domain_id() == self.local_domain_id
+                        && pane.belongs_to_remote_server(remote_server_id.as_deref())
+                })
+            });
+            if mapping_is_current {
+                return Some(id);
+            }
+            log::debug!(
+                "discarding stale remote pane mapping {remote_pane_id} -> {id} after mux runtime change"
+            );
+            pane_map.remove(&remote_pane_id);
         }
 
         let mux = Mux::get();
@@ -355,7 +544,9 @@ impl ClientInner {
                 continue;
             }
             if let Some(pane) = pane.downcast_ref::<ClientPane>() {
-                if pane.remote_pane_id() == remote_pane_id {
+                if pane.remote_pane_id() == remote_pane_id
+                    && pane.belongs_to_remote_server(remote_server_id.as_deref())
+                {
                     let local_pane_id = pane.pane_id();
                     pane_map.insert(remote_pane_id, local_pane_id);
                     return Some(local_pane_id);
@@ -454,6 +645,69 @@ impl ClientInner {
         self.remote_viewports.lock().unwrap().clear();
         *self.remote_access.lock().unwrap() = None;
         self.frontend_claim_locks.lock().unwrap().clear();
+        *self.frontend_recovery_barrier.lock().unwrap() = None;
+    }
+
+    /// Capture only workspaces for which this frontend actually advertised a
+    /// viewport. Every mux client mirrors the server's complete topology, so
+    /// using every mirrored window here would eagerly restart background
+    /// Threads that this device was not displaying.
+    fn reconnect_recovery_targets(&self) -> Vec<ReconnectRecoveryTarget> {
+        let mut targets = self
+            .frontend_recovery_intents
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|target| target.slot);
+        targets
+    }
+
+    /// Prepare to bind a fresh mux runtime into the local windows that were
+    /// already displaying it. The old tabs stay alive and opaque until the
+    /// replacement topology has been installed; they are removed only after
+    /// new tabs exist, so the native GUI window is never pruned mid-recovery.
+    fn prepare_server_replacement(&self) -> ServerReplacementMirrors {
+        let mux = Mux::get();
+        let local_windows = self
+            .remote_to_local_window
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut mirrors = ServerReplacementMirrors {
+            windows_by_workspace: self.pending_recovery_windows.lock().unwrap().clone(),
+            old_tabs: Vec::new(),
+        };
+        for window_id in local_windows {
+            let Some(window) = mux.get_window(window_id) else {
+                continue;
+            };
+            mirrors
+                .windows_by_workspace
+                .entry(window.get_workspace().to_string())
+                .or_insert(window_id);
+        }
+        // Recompute this from all retained windows so a partial prior attempt
+        // is cleaned up together with the original mirror after a successful
+        // retry.
+        for window_id in mirrors.windows_by_workspace.values().copied() {
+            if let Some(window) = mux.get_window(window_id) {
+                mirrors
+                    .old_tabs
+                    .extend(window.iter().map(|tab| tab.tab_id()));
+            }
+        }
+        *self.pending_recovery_windows.lock().unwrap() = mirrors.windows_by_workspace.clone();
+
+        self.remote_to_local_window.lock().unwrap().clear();
+        self.remote_to_local_tab.lock().unwrap().clear();
+        self.remote_to_local_pane.lock().unwrap().clear();
+        self.remote_to_local_stack.lock().unwrap().clear();
+        self.reported_viewports.lock().unwrap().clear();
+        mirrors
     }
 
     fn reported_viewports_for_live_tabs(&self) -> Vec<(TabId, codec::ClientViewport)> {
@@ -635,6 +889,7 @@ impl ClientInner {
         local_echo_threshold_ms: Option<u64>,
         overlay_lag_indicator: bool,
     ) -> Self {
+        let ready_server_id = client.remote_server_id();
         Self {
             client,
             local_domain_id,
@@ -646,12 +901,17 @@ impl ClientInner {
             remote_viewports: Mutex::new(HashMap::new()),
             remote_access: Mutex::new(None),
             reported_viewports: Mutex::new(HashMap::new()),
+            frontend_recovery_intents: Mutex::new(HashMap::new()),
             frontend_claim_locks: Mutex::new(HashMap::new()),
             remote_to_local_stack: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
             focus_advised_at: Mutex::new(None),
             mutations_in_flight: std::sync::atomic::AtomicUsize::new(0),
             resync_deferred: std::sync::atomic::AtomicBool::new(false),
+            frontend_recovery_barrier: Mutex::new(None),
+            ready_server_id: Mutex::new(ready_server_id),
+            pending_recovery_targets: Mutex::new(HashMap::new()),
+            pending_recovery_windows: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -674,6 +934,98 @@ impl ClientInner {
     fn defer_resync(&self) {
         self.resync_deferred
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn begin_frontend_recovery(
+        &self,
+        generation: u64,
+        targets: impl IntoIterator<Item = (FrontendRecoverySlot, TabId)>,
+    ) {
+        let pending = targets.into_iter().collect::<HashMap<_, _>>();
+        *self.frontend_recovery_barrier.lock().unwrap() = Some(FrontendRecoveryBarrier {
+            generation,
+            pending,
+        });
+    }
+
+    fn ready_server_id(&self) -> Option<String> {
+        self.ready_server_id.lock().unwrap().clone()
+    }
+
+    fn mark_server_recovered(&self) {
+        *self.ready_server_id.lock().unwrap() = self.client.remote_server_id();
+        self.pending_recovery_targets.lock().unwrap().clear();
+        self.pending_recovery_windows.lock().unwrap().clear();
+    }
+
+    fn recovery_targets(&self) -> Vec<ReconnectRecoveryTarget> {
+        let pending = self.pending_recovery_targets.lock().unwrap();
+        if pending.is_empty() {
+            drop(pending);
+            self.reconnect_recovery_targets()
+        } else {
+            let mut targets = pending.values().cloned().collect::<Vec<_>>();
+            targets.sort_by_key(|target| target.slot);
+            targets
+        }
+    }
+
+    fn remember_recovery_targets(&self, targets: &[ReconnectRecoveryTarget]) {
+        let mut pending = self.pending_recovery_targets.lock().unwrap();
+        if pending.is_empty() {
+            pending.extend(targets.iter().cloned().map(|target| (target.slot, target)));
+        }
+    }
+
+    fn pending_frontend_recovery(
+        &self,
+        slot: FrontendRecoverySlot,
+        local_tab_id: TabId,
+    ) -> Option<u64> {
+        let barrier = self.frontend_recovery_barrier.lock().unwrap();
+        let barrier = barrier.as_ref()?;
+        (barrier.generation == self.client.connection_generation()
+            && barrier.pending.get(&slot) == Some(&local_tab_id))
+        .then_some(barrier.generation)
+    }
+
+    fn acknowledge_frontend_recovery(
+        &self,
+        slot: FrontendRecoverySlot,
+        local_tab_id: TabId,
+        generation: u64,
+    ) -> bool {
+        let ack = {
+            let mut barrier = self.frontend_recovery_barrier.lock().unwrap();
+            acknowledge_recovery_target(
+                &mut barrier,
+                slot,
+                local_tab_id,
+                generation,
+                self.client.connection_generation(),
+            )
+        };
+        if ack == FrontendRecoveryAck::Complete {
+            self.mark_server_recovered();
+            self.client.mark_ready();
+            log::info!("frontend geometry restored for mux generation {generation}");
+            wake_thinkterm_frontend();
+        }
+        ack != FrontendRecoveryAck::Ignored
+    }
+
+    fn fail_frontend_recovery(
+        &self,
+        slot: FrontendRecoverySlot,
+        local_tab_id: TabId,
+        generation: u64,
+        reason: String,
+    ) -> bool {
+        if self.pending_frontend_recovery(slot, local_tab_id) != Some(generation) {
+            return false;
+        }
+        self.client.abort_connection_generation(generation, reason);
+        true
     }
 }
 
@@ -854,11 +1206,23 @@ pub type ThinkTermConnectSink = fn(domain_name: &str, connection_generation: u64
 /// executor can run without a fixed polling timer.
 pub type ThinkTermFrontendWakeSink = fn();
 
+/// Requests one geometry publication after a replacement mux topology has
+/// been installed and its recovery barrier is armed.  TabAddedToWindow is
+/// emitted while the replacement is still being assembled, so a GUI can
+/// otherwise publish too early and leave the barrier waiting forever when no
+/// later resize or tab switch happens.
+pub type ThinkTermFrontendRecoverySink = fn(
+    domain_id: DomainId,
+    connection_generation: u64,
+    recovery_targets: Vec<ThinkTermFrontendRecoveryTarget>,
+);
+
 lazy_static::lazy_static! {
     static ref THINKTERM_TREE_SINK: Mutex<Option<ThinkTermTreeSink>> = Mutex::new(None);
     static ref THINKTERM_CONNECT_SINK: Mutex<Option<ThinkTermConnectSink>> = Mutex::new(None);
     static ref THINKTERM_SESSION_SINK: Mutex<Option<ThinkTermSessionSink>> = Mutex::new(None);
     static ref THINKTERM_FRONTEND_WAKE_SINK: Mutex<Option<ThinkTermFrontendWakeSink>> = Mutex::new(None);
+    static ref THINKTERM_FRONTEND_RECOVERY_SINK: Mutex<Option<ThinkTermFrontendRecoverySink>> = Mutex::new(None);
 }
 
 pub fn set_thinkterm_tree_sink(sink: ThinkTermTreeSink) {
@@ -877,10 +1241,28 @@ pub fn set_thinkterm_frontend_wake_sink(sink: ThinkTermFrontendWakeSink) {
     THINKTERM_FRONTEND_WAKE_SINK.lock().unwrap().replace(sink);
 }
 
+pub fn set_thinkterm_frontend_recovery_sink(sink: ThinkTermFrontendRecoverySink) {
+    THINKTERM_FRONTEND_RECOVERY_SINK
+        .lock()
+        .unwrap()
+        .replace(sink);
+}
+
 pub(crate) fn wake_thinkterm_frontend() {
     let sink = *THINKTERM_FRONTEND_WAKE_SINK.lock().unwrap();
     if let Some(sink) = sink {
         sink();
+    }
+}
+
+fn request_thinkterm_frontend_recovery(
+    domain_id: DomainId,
+    connection_generation: u64,
+    recovery_targets: Vec<ThinkTermFrontendRecoveryTarget>,
+) {
+    let sink = *THINKTERM_FRONTEND_RECOVERY_SINK.lock().unwrap();
+    if let Some(sink) = sink {
+        sink(domain_id, connection_generation, recovery_targets);
     }
 }
 
@@ -1012,6 +1394,80 @@ impl ClientDomain {
         Some(self.inner()?.client.connection_generation())
     }
 
+    /// Record which terminal this frontend slot is actively presenting. This
+    /// is local reconnect metadata only; it is not sent over the wire.
+    pub fn set_frontend_recovery_intent(
+        &self,
+        slot: FrontendRecoverySlot,
+        local_tab_id: TabId,
+        viewport: &codec::ClientViewport,
+    ) -> anyhow::Result<()> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        inner
+            .local_to_remote_tab(local_tab_id)
+            .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
+        let mux = Mux::get();
+        let window_id = mux
+            .window_containing_tab(local_tab_id)
+            .ok_or_else(|| anyhow!("tab {local_tab_id} is not attached to a window"))?;
+        let workspace = mux
+            .get_window(window_id)
+            .map(|window| window.get_workspace().to_string())
+            .ok_or_else(|| anyhow!("window {window_id} disappeared"))?;
+        inner.frontend_recovery_intents.lock().unwrap().insert(
+            slot,
+            ReconnectRecoveryTarget {
+                slot,
+                workspace,
+                size: viewport.size(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn clear_frontend_recovery_intent(&self, slot: FrontendRecoverySlot) {
+        if let Some(inner) = self.inner() {
+            inner
+                .frontend_recovery_intents
+                .lock()
+                .unwrap()
+                .remove(&slot);
+        }
+    }
+
+    pub fn pending_frontend_recovery(
+        &self,
+        slot: FrontendRecoverySlot,
+        local_tab_id: TabId,
+    ) -> Option<u64> {
+        self.inner()?.pending_frontend_recovery(slot, local_tab_id)
+    }
+
+    pub fn acknowledge_frontend_recovery(
+        &self,
+        slot: FrontendRecoverySlot,
+        local_tab_id: TabId,
+        generation: u64,
+    ) -> bool {
+        self.inner().is_some_and(|inner| {
+            inner.acknowledge_frontend_recovery(slot, local_tab_id, generation)
+        })
+    }
+
+    pub fn fail_frontend_recovery(
+        &self,
+        slot: FrontendRecoverySlot,
+        local_tab_id: TabId,
+        generation: u64,
+        reason: impl Into<String>,
+    ) -> bool {
+        self.inner().is_some_and(|inner| {
+            inner.fail_frontend_recovery(slot, local_tab_id, generation, reason.into())
+        })
+    }
+
     pub fn remote_viewport_state(&self, local_tab_id: TabId) -> Option<codec::ClientViewportState> {
         let inner = self.inner()?;
         let remote_tab_id = inner.local_to_remote_tab(local_tab_id)?;
@@ -1125,18 +1581,22 @@ impl ClientDomain {
         domain_id: DomainId,
         connection_generation: u64,
         ui: ConnectionUI,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
         if inner.client.connection_generation() != connection_generation {
             bail!("generation {connection_generation} was superseded before reattach began");
         }
+        let prior_server_id = inner.ready_server_id();
+        let recovery_targets = inner.recovery_targets();
         inner.begin_remote_generation();
         let domain = Mux::get()
             .get_domain(domain_id)
             .ok_or_else(|| anyhow!("domain {domain_id} disappeared during reattach"))?;
 
         ui.output_str("Checking server version and restoring client identity\n");
-        inner.client.verify_version_compat(&ui).await?;
+        let server = inner.client.verify_version_compat(&ui).await?;
+        let server_replaced =
+            server_runtime_replaced(prior_server_id.as_deref(), &server.server_id);
         if inner.client.connection_generation() != connection_generation {
             bail!("generation {connection_generation} was superseded during registration");
         }
@@ -1151,9 +1611,6 @@ impl ClientDomain {
         // same fetch.
         deliver_thinkterm_connected(domain.domain_name(), connection_generation);
 
-        let panes = inner.client.list_panes().await?;
-        Self::process_pane_list(Arc::clone(&inner), panes, None, true)?;
-
         // Pull the tree exactly as a first attach does. Pushes only carry what
         // changes from now on, so without this the sidebar would keep showing
         // whatever it held when the link dropped. Ordinary RPCs remain behind
@@ -1161,6 +1618,203 @@ impl ClientDomain {
         let client = domain
             .downcast_ref::<ClientDomain>()
             .ok_or_else(|| anyhow!("domain {domain_id} changed type during reattach"))?;
+        let tree = inner
+            .client
+            .get_thinkterm_tree()
+            .await
+            .with_context(|| {
+                format!(
+                    "fetching the ThinkTerm tree after reconnecting to {}",
+                    client.config.name()
+                )
+            })?
+            .tree;
+        deliver_thinkterm_tree(client.config.name(), tree.clone());
+
+        let mut restored_targets = Vec::new();
+        if server_replaced {
+            inner.remember_recovery_targets(&recovery_targets);
+            log::info!(
+                "mux runtime changed from {:?} to {}; restoring {} visible workspaces",
+                prior_server_id,
+                server.server_id,
+                recovery_targets.len()
+            );
+            let mut used_fallback = false;
+            let mut restored_workspaces = HashMap::<String, String>::new();
+            for target in &recovery_targets {
+                if let Some(restored_workspace) = restored_workspaces.get(&target.workspace) {
+                    restored_targets.push(ReconnectRecoveryTarget {
+                        slot: target.slot,
+                        workspace: restored_workspace.clone(),
+                        size: target.size,
+                    });
+                    continue;
+                }
+                let preferred_thread_id = thread_id_for_workspace(&tree, &target.workspace);
+                if preferred_thread_id.is_none() && used_fallback {
+                    continue;
+                }
+                used_fallback |= preferred_thread_id.is_none();
+                let response = inner
+                    .client
+                    .ensure_thinkterm_thread(codec::EnsureThinkTermThread {
+                        preferred_thread_id,
+                        size: target.size,
+                    })
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "restoring visible ThinkTerm workspace {} on replacement mux",
+                            target.workspace
+                        )
+                    })?;
+                restored_workspaces.insert(target.workspace.clone(), response.workspace.clone());
+                restored_targets.push(ReconnectRecoveryTarget {
+                    slot: target.slot,
+                    workspace: response.workspace,
+                    size: target.size,
+                });
+            }
+        }
+
+        let replacement_session = if server_replaced {
+            let state = inner
+                .client
+                .get_thinkterm_session_state()
+                .await
+                .context("fetching replacement mux topology snapshot")?;
+            deliver_thinkterm_session(client.config.name(), connection_generation, state.clone());
+            Some(state)
+        } else {
+            None
+        };
+        let panes = inner.client.list_panes().await?;
+        if server_replaced && !restored_targets.is_empty() {
+            let live_workspaces = panes
+                .tabs
+                .iter()
+                .filter_map(pane_node_workspace)
+                .collect::<HashSet<_>>();
+            for target in &restored_targets {
+                if !live_workspaces.contains(target.workspace.as_str()) {
+                    bail!(
+                        "replacement mux did not materialize restored workspace {}",
+                        target.workspace
+                    );
+                }
+            }
+        }
+        let mut replacement = None;
+        if server_replaced {
+            if restored_targets.is_empty() {
+                bail!(
+                    "replacement mux has no visible frontend workspace to restore for generation {connection_generation}"
+                );
+            }
+            // Do not discard the old id maps until every Ensure and the first
+            // authoritative ListPanes have succeeded. A failure before this
+            // point must leave enough information for the retry to identify
+            // the frontend's selected Thread and current size.
+            replacement = Some(inner.prepare_server_replacement());
+        }
+        Self::process_pane_list(
+            Arc::clone(&inner),
+            panes,
+            None,
+            true,
+            replacement
+                .as_mut()
+                .map(|state| &mut state.windows_by_workspace),
+        )?;
+
+        if let Some(replacement) = replacement {
+            {
+                let _activity = mux::activity::Activity::new();
+                let mux = Mux::get();
+                for tab_id in replacement.old_tabs {
+                    if mux.get_tab(tab_id).is_some() {
+                        mux.remove_tab(tab_id);
+                    }
+                }
+            }
+            Mux::get().prune_dead_windows();
+        }
+
+        if server_replaced {
+            let active_remote_tabs = replacement_session
+                .as_ref()
+                .map(active_remote_tabs_by_workspace)
+                .unwrap_or_default();
+            // The old and replacement tabs briefly coexist in the retained
+            // local window. Resolve both the retained local window and its
+            // authoritative replacement tab only after the old mirror has
+            // been removed. Passing this exact pair to the GUI is important:
+            // its cached active tab can still name the removed mirror for one
+            // notification turn, and merely asking "is your active tab in this
+            // set?" can otherwise miss the only post-barrier geometry request.
+            let mux = Mux::get();
+            let mut frontend_targets = Vec::new();
+            for target in &restored_targets {
+                let authoritative_tab = active_remote_tabs
+                    .get(&target.workspace)
+                    .and_then(|remote_tab_id| inner.remote_to_local_tab_id(*remote_tab_id));
+                let fallback_tab = || {
+                    mux.iter_windows_in_workspace(&target.workspace)
+                        .into_iter()
+                        .filter_map(|window_id| mux.get_window(window_id))
+                        .flat_map(|window| window.iter().cloned().collect::<Vec<_>>())
+                        .find(|tab| inner.local_to_remote_tab(tab.tab_id()).is_some())
+                        .map(|tab| tab.tab_id())
+                };
+                let Some(local_tab_id) = authoritative_tab.or_else(fallback_tab) else {
+                    continue;
+                };
+                let Some(window_id) = mux.window_containing_tab(local_tab_id) else {
+                    continue;
+                };
+                let Some(mut window) = mux.get_window_mut(window_id) else {
+                    continue;
+                };
+                if window.get_workspace() != target.workspace {
+                    continue;
+                }
+                let Some(index) = window.idx_by_id(local_tab_id) else {
+                    continue;
+                };
+                window.save_and_then_set_active(index);
+                frontend_targets.push(ThinkTermFrontendRecoveryTarget {
+                    slot: target.slot,
+                    window_id,
+                    tab_id: local_tab_id,
+                });
+            }
+            if frontend_targets.is_empty() {
+                bail!(
+                    "replacement mux restored no active frontend tab for generation {connection_generation}"
+                );
+            }
+            frontend_targets
+                .sort_unstable_by_key(|target| (target.slot, target.window_id, target.tab_id));
+            frontend_targets.dedup();
+            let recovery_targets = frontend_targets
+                .iter()
+                .map(|target| (target.slot, target.tab_id));
+            inner.begin_frontend_recovery(connection_generation, recovery_targets);
+            if inner.client.connection_generation() != connection_generation {
+                bail!("generation {connection_generation} was superseded during topology sync");
+            }
+            // TabAddedToWindow is emitted while process_pane_list is still
+            // assembling the replacement. A fast GUI can therefore publish
+            // before begin_frontend_recovery and have that ACK ignored. Make
+            // one explicit post-barrier request using the replacement local
+            // ids; the generation check in the frontend rejects late work.
+            request_thinkterm_frontend_recovery(domain_id, connection_generation, frontend_targets);
+            // The TUI uses the ordinary wake hook to break out of its blocking
+            // input poll and publish its current CellGrid.
+            wake_thinkterm_frontend();
+            return Ok(false);
+        }
 
         // SetClientId deliberately does not restore ownership.  Re-advertise
         // the exact geometry this frontend rendered before the outage so the
@@ -1172,7 +1826,7 @@ impl ClientDomain {
                 .client
                 .set_client_viewport(codec::SetClientViewport {
                     tab_id: remote_tab_id,
-                    viewport,
+                    viewport: viewport.clone(),
                 })
                 .await
                 .with_context(|| {
@@ -1189,16 +1843,11 @@ impl ClientDomain {
             );
         }
 
-        client.fetch_thinkterm_tree().await.with_context(|| {
-            format!(
-                "fetching the ThinkTerm tree after reconnecting to {}",
-                client.config.name()
-            )
-        })?;
         if inner.client.connection_generation() != connection_generation {
             bail!("generation {connection_generation} was superseded during topology sync");
         }
-        Ok(())
+        inner.mark_server_recovered();
+        Ok(true)
     }
 
     pub async fn resync(&self) -> anyhow::Result<()> {
@@ -1218,7 +1867,7 @@ impl ClientDomain {
                 inner.defer_resync();
                 return Ok(());
             }
-            Self::process_pane_list(inner, panes, None, false)?;
+            Self::process_pane_list(inner, panes, None, false, None)?;
         }
         Ok(())
     }
@@ -1458,6 +2107,7 @@ impl ClientDomain {
         panes: ListPanesResponse,
         mut primary_window_id: Option<WindowId>,
         resend_palette: bool,
+        mut replacement_windows: Option<&mut HashMap<String, WindowId>>,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
         // A native/mux window can disappear while an attach or structural RPC
@@ -1644,6 +2294,27 @@ impl ClientDomain {
                         .remove(&remote_window_id);
                 }
 
+                if let (Some(workspace_name), Some(replacements)) =
+                    (workspace.as_ref(), replacement_windows.as_deref_mut())
+                {
+                    if let Some(local_window_id) = replacements.remove(workspace_name) {
+                        if mux.get_window(local_window_id).is_some() {
+                            log::info!(
+                                "rebinding fresh remote window {} into local window {} for {}",
+                                remote_window_id,
+                                local_window_id,
+                                workspace_name
+                            );
+                            inner.record_remote_to_local_window_mapping(
+                                remote_window_id,
+                                local_window_id,
+                            );
+                            mux.add_tab_to_window(&tab, local_window_id)?;
+                            continue;
+                        }
+                    }
+                }
+
                 if let Some(local_window_id) = primary_window_id {
                     // Adopt the remote window into the local primary window
                     // only when the workspaces agree. Adopting on the
@@ -1771,7 +2442,7 @@ impl ClientDomain {
             guard.replace(Arc::clone(&inner));
         }
 
-        Self::process_pane_list(inner, panes, primary_window_id, false)?;
+        Self::process_pane_list(inner, panes, primary_window_id, false, None)?;
 
         Ok(())
     }
@@ -1780,10 +2451,14 @@ impl ClientDomain {
 #[cfg(test)]
 mod tests {
     use super::{
-        accepts_generation, owns_remote_viewport_from_states, remote_frontend_gate_from_state,
-        remote_move_pane_id, RemoteFrontendGate,
+        accepts_generation, acknowledge_recovery_target, active_remote_tabs_by_workspace,
+        consistent_remote_tab_id, owns_remote_viewport_from_states,
+        remote_frontend_gate_from_state, remote_move_pane_id, server_runtime_replaced,
+        thread_id_for_workspace, FrontendRecoveryAck, FrontendRecoveryBarrier,
+        FrontendRecoverySlot, RemoteFrontendGate,
     };
     use crate::client::ClientConnectionPhase;
+    use std::collections::HashMap;
 
     fn client_id(hostname: &str, id: usize) -> mux::client::ClientId {
         mux::client::ClientId {
@@ -1975,6 +2650,124 @@ mod tests {
     #[test]
     fn remote_move_rejects_duplicate_local_mirrors() {
         assert!(remote_move_pane_id(41, 7, 42, 7, 3, 3).is_err());
+    }
+
+    #[test]
+    fn replacement_is_compared_with_the_last_fully_recovered_runtime() {
+        assert!(!server_runtime_replaced(None, "server-b"));
+        assert!(!server_runtime_replaced(Some("server-b"), "server-b"));
+        assert!(server_runtime_replaced(Some("server-a"), "server-b"));
+        // A failed recovery must keep comparing against server-a on its next
+        // attempt even though the transport has already observed server-b.
+        assert!(server_runtime_replaced(Some("server-a"), "server-b"));
+    }
+
+    #[test]
+    fn recovery_resolves_materialized_then_planned_thread_workspaces() {
+        let tree = codec::ThinkTermTree {
+            projects: vec![codec::TtProject {
+                id: "project".to_string(),
+                threads: vec![
+                    codec::TtThread {
+                        id: "materialized".to_string(),
+                        planned_workspace_name: Some("planned-old".to_string()),
+                        materialized_workspace_name: Some("live-workspace".to_string()),
+                        ..Default::default()
+                    },
+                    codec::TtThread {
+                        id: "planned".to_string(),
+                        planned_workspace_name: Some("planned-workspace".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            thread_id_for_workspace(&tree, "live-workspace").as_deref(),
+            Some("materialized")
+        );
+        assert_eq!(
+            thread_id_for_workspace(&tree, "planned-workspace").as_deref(),
+            Some("planned")
+        );
+        assert_eq!(thread_id_for_workspace(&tree, "missing"), None);
+    }
+
+    #[test]
+    fn recovery_uses_the_authoritative_active_top_level_tab() {
+        let state = codec::ThinkTermSessionState {
+            projects: vec![codec::ThinkTermSessionProject {
+                threads: vec![codec::ThinkTermSessionThread {
+                    materialized_workspace_name: Some("thread-workspace".to_string()),
+                    tabs: vec![
+                        codec::ThinkTermSessionTab {
+                            tab_id: 10,
+                            is_active: false,
+                            ..Default::default()
+                        },
+                        codec::ThinkTermSessionTab {
+                            tab_id: 11,
+                            is_active: true,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            active_remote_tabs_by_workspace(&state).get("thread-workspace"),
+            Some(&11)
+        );
+    }
+
+    #[test]
+    fn missing_tab_mapping_is_recoverable_only_from_consistent_live_panes() {
+        assert_eq!(consistent_remote_tab_id([11, 11, 11]), Some(11));
+        assert_eq!(consistent_remote_tab_id([]), None);
+        assert_eq!(consistent_remote_tab_id([11, 12]), None);
+    }
+
+    #[test]
+    fn replacement_barrier_waits_for_every_frontend_slot() {
+        let mut barrier = Some(FrontendRecoveryBarrier {
+            generation: 9,
+            pending: HashMap::from([
+                (FrontendRecoverySlot::Window(1), 41),
+                (FrontendRecoverySlot::Window(2), 42),
+            ]),
+        });
+        assert_eq!(
+            acknowledge_recovery_target(&mut barrier, FrontendRecoverySlot::Window(1), 41, 9, 9,),
+            FrontendRecoveryAck::Pending
+        );
+        assert!(barrier.is_some());
+        assert_eq!(
+            acknowledge_recovery_target(&mut barrier, FrontendRecoverySlot::Window(2), 42, 9, 9,),
+            FrontendRecoveryAck::Complete
+        );
+        assert!(barrier.is_none());
+    }
+
+    #[test]
+    fn replacement_barrier_rejects_stale_generation_and_wrong_tab() {
+        let mut barrier = Some(FrontendRecoveryBarrier {
+            generation: 9,
+            pending: HashMap::from([(FrontendRecoverySlot::Primary, 41)]),
+        });
+        assert_eq!(
+            acknowledge_recovery_target(&mut barrier, FrontendRecoverySlot::Primary, 42, 9, 9,),
+            FrontendRecoveryAck::Ignored
+        );
+        assert_eq!(
+            acknowledge_recovery_target(&mut barrier, FrontendRecoverySlot::Primary, 41, 8, 9,),
+            FrontendRecoveryAck::Ignored
+        );
+        assert!(barrier.is_some());
     }
 }
 

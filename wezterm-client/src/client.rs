@@ -1526,9 +1526,19 @@ impl Client {
                         )
                         .await
                         {
-                            Ok(()) => {
-                                phase.store(ClientConnectionPhase::Ready as u8, Ordering::Release);
-                                log::info!("Reconnected and restored generation {generation}");
+                            Ok(mark_ready) => {
+                                if mark_ready {
+                                    phase.store(
+                                        ClientConnectionPhase::Ready as u8,
+                                        Ordering::Release,
+                                    );
+                                    log::info!("Reconnected and restored generation {generation}");
+                                } else {
+                                    log::info!(
+                                        "Replacement mux topology restored for generation \
+                                         {generation}; waiting for frontend geometry"
+                                    );
+                                }
                                 reattach_ui.close();
                                 crate::domain::wake_thinkterm_frontend();
                             }

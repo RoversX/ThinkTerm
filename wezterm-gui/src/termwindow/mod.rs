@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::image::ImageData;
 use termwiz::surface::SequenceNo;
-use wezterm_client::domain::ClientDomain;
+use wezterm_client::domain::{ClientDomain, FrontendRecoverySlot};
 use wezterm_dynamic::Value;
 use wezterm_font::FontConfiguration;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
@@ -283,6 +283,7 @@ pub enum TermWindowNotif {
     SetLeftStatus(String),
     SetRightStatus(String),
     GetDimensions(Sender<(Dimensions, WindowState)>),
+    GetTerminalSize(Sender<TerminalSize>),
     GetSelectionForPane {
         pane_id: PaneId,
         tx: Sender<String>,
@@ -1302,6 +1303,14 @@ pub(crate) struct FrontendGeometryConfirmation {
     pub(crate) ready_since: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrontendRecoveryGeometry {
+    pub(crate) epoch: u64,
+    pub(crate) domain_id: DomainId,
+    pub(crate) slot: FrontendRecoverySlot,
+    pub(crate) generation: u64,
+}
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -1326,6 +1335,9 @@ pub struct TermWindow {
     /// redraw has reached this renderer. Keep its expected pane snapshots here
     /// and reveal only after every visible row has been refreshed and stable.
     frontend_geometry_confirmations: HashMap<TabId, FrontendGeometryConfirmation>,
+    /// Replacement-mux recovery is completed only after the matching geometry
+    /// epoch reaches the normal local render-surface confirmation point.
+    frontend_recovery_geometry: HashMap<TabId, FrontendRecoveryGeometry>,
     frontend_geometry_resync_after_epoch: HashSet<TabId>,
     next_frontend_geometry_epoch: u64,
     frontend_viewport_report_pending: Arc<AtomicBool>,
@@ -2069,6 +2081,7 @@ impl TermWindow {
         let myself = Self {
             frontend_geometry_phases: HashMap::new(),
             frontend_geometry_confirmations: HashMap::new(),
+            frontend_recovery_geometry: HashMap::new(),
             frontend_geometry_resync_after_epoch: HashSet::new(),
             next_frontend_geometry_epoch: 1,
             frontend_viewport_report_pending: Arc::new(AtomicBool::new(false)),
@@ -2495,6 +2508,7 @@ impl TermWindow {
         match event {
             WindowEvent::Destroyed => {
                 self.flush_right_sidebar_note_blocking();
+                self.clear_gui_recovery_intent();
                 // Ensure that we cancel any overlays we had running, so
                 // that the mux can empty out, otherwise the mux keeps
                 // the TermWindow alive via the frontend even though
@@ -2883,6 +2897,11 @@ impl TermWindow {
                 tx.try_send((self.dimensions, self.window_state))
                     .map_err(chan_err)
                     .context("send GetDimensions response")?;
+            }
+            TermWindowNotif::GetTerminalSize(tx) => {
+                tx.try_send(self.terminal_size)
+                    .map_err(chan_err)
+                    .context("send GetTerminalSize response")?;
             }
             TermWindowNotif::GetEffectiveConfig(tx) => {
                 tx.try_send(self.config.clone())
@@ -4080,7 +4099,13 @@ impl TermWindow {
             self.load_os_parameters();
             self.apply_scale_change(&dimensions, self.fonts.get_font_scale());
             self.apply_dimensions(&dimensions, None, &window);
-            self.apply_workspace_thread_font_scales();
+            // Config reload may also restore a persisted per-pane font scale.
+            // That changes the pane's rows/cols even when the window's overall
+            // TerminalSize is unchanged, so publish a complete viewport rather
+            // than limiting the update to the local render surface.
+            if self.stage_workspace_thread_font_scales() {
+                self.sync_active_tab_geometry_now();
+            }
             window.config_did_change(&config);
             window.invalidate();
         }
@@ -7319,6 +7344,7 @@ impl Drop for TermWindow {
         // from leaving its Space permanently marked as occupied.
         crate::workspace_threads::release_window_space(self.space_owner_id);
         crate::input_diagnostics::remove_gauges_for_source(self.space_owner_id);
+        self.clear_gui_recovery_intent();
         gpu_debug(format!(
             "drop main_window backend={} size={}x{} dpi={}",
             if self.webgpu.is_some() {

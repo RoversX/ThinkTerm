@@ -175,8 +175,19 @@ impl PaletteDelivery {
     }
 }
 
+fn remote_server_identity_matches(created: Option<&str>, current: Option<&str>) -> bool {
+    created == current
+}
+
 pub struct ClientPane {
     client: Arc<ClientInner>,
+    /// The mux runtime that allocated `remote_pane_id`.
+    ///
+    /// Pane ids are process-local and restart from small values when a mux
+    /// server is replaced.  Keeping the allocating runtime here prevents a
+    /// replacement resync from mistaking a disconnected, same-numbered pane
+    /// for the fresh server's pane.
+    remote_server_id: Option<String>,
     local_pane_id: PaneId,
     pub remote_pane_id: PaneId,
     remote_tab_id: Arc<AtomicUsize>,
@@ -364,6 +375,7 @@ impl ClientPane {
 
         Self {
             client: Arc::clone(client),
+            remote_server_id: client.client.remote_server_id(),
             mouse,
             remote_pane_id,
             local_pane_id,
@@ -527,6 +539,10 @@ impl ClientPane {
             _ => bail!("unhandled unilateral pdu: {:?}", pdu),
         };
         Ok(())
+    }
+
+    pub(crate) fn belongs_to_remote_server(&self, server_id: Option<&str>) -> bool {
+        remote_server_identity_matches(self.remote_server_id.as_deref(), server_id)
     }
 
     pub fn remote_pane_id(&self) -> PaneId {
@@ -1208,6 +1224,22 @@ mod test {
             pixel_height: size.pixel_height,
             ..RenderableDimensions::default()
         }
+    }
+
+    #[test]
+    fn remote_pane_ids_are_reusable_only_within_the_same_mux_runtime() {
+        assert!(remote_server_identity_matches(
+            Some("devbox:100:runtime-a"),
+            Some("devbox:100:runtime-a")
+        ));
+        assert!(!remote_server_identity_matches(
+            Some("devbox:100:runtime-a"),
+            Some("devbox:200:runtime-b")
+        ));
+        assert!(!remote_server_identity_matches(
+            None,
+            Some("devbox:200:runtime-b")
+        ));
     }
 
     #[test]

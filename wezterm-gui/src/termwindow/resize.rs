@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use wezterm_client::domain::{ClientDomain, RemoteFrontendGate};
+use wezterm_client::domain::{ClientDomain, FrontendRecoverySlot, RemoteFrontendGate};
 use wezterm_client::pane::ClientPane;
 use wezterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
@@ -69,6 +69,43 @@ pub enum ScaleChange {
 }
 
 impl super::TermWindow {
+    pub(crate) fn frontend_recovery_slot(&self) -> FrontendRecoverySlot {
+        FrontendRecoverySlot::Window(self.space_owner_id)
+    }
+
+    fn remember_gui_recovery_intent(
+        &self,
+        domain: &ClientDomain,
+        tab_id: mux::tab::TabId,
+        viewport: &codec::ClientViewport,
+    ) {
+        let slot = self.frontend_recovery_slot();
+        let mux = Mux::get();
+        for candidate in mux.iter_domains() {
+            let Some(client) = candidate.downcast_ref::<ClientDomain>() else {
+                continue;
+            };
+            if candidate.domain_id() != domain.domain_id() {
+                client.clear_frontend_recovery_intent(slot);
+            }
+        }
+        if let Err(err) = domain.set_frontend_recovery_intent(slot, tab_id, viewport) {
+            log::trace!("recording GUI frontend recovery intent: {err:#}");
+        }
+    }
+
+    pub(crate) fn clear_gui_recovery_intent(&self) {
+        let slot = self.frontend_recovery_slot();
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        for candidate in mux.iter_domains() {
+            if let Some(client) = candidate.downcast_ref::<ClientDomain>() {
+                client.clear_frontend_recovery_intent(slot);
+            }
+        }
+    }
+
     pub(crate) fn active_frontend_access_state(&self) -> Option<mux::FrontendAccessState> {
         let pane = Mux::get()
             .get_active_tab_for_window(self.mux_window_id)?
@@ -211,6 +248,28 @@ impl super::TermWindow {
             return;
         }
 
+        if !succeeded {
+            if let Some(recovery) = self.frontend_recovery_geometry.remove(&tab_id) {
+                if recovery.epoch == epoch {
+                    if let Some(domain) = Mux::get().get_domain(recovery.domain_id) {
+                        if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                            client.fail_frontend_recovery(
+                                recovery.slot,
+                                tab_id,
+                                recovery.generation,
+                                format!(
+                                    "GUI geometry recovery failed for tab {tab_id} generation {}",
+                                    recovery.generation
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    self.frontend_recovery_geometry.insert(tab_id, recovery);
+                }
+            }
+        }
+
         let mux = Mux::get();
         for (pane_id, size) in adopted {
             let Some(pane) = mux.get_pane(*pane_id) else {
@@ -262,6 +321,21 @@ impl super::TermWindow {
         let keep_follow_up_obscured = phase.obscures_terminal();
         self.frontend_geometry_confirmations.remove(&tab_id);
         self.frontend_geometry_phases.remove(&tab_id);
+        if let Some(recovery) = self.frontend_recovery_geometry.remove(&tab_id) {
+            if recovery.epoch == epoch {
+                if let Some(domain) = Mux::get().get_domain(recovery.domain_id) {
+                    if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                        client.acknowledge_frontend_recovery(
+                            recovery.slot,
+                            tab_id,
+                            recovery.generation,
+                        );
+                    }
+                }
+            } else {
+                self.frontend_recovery_geometry.insert(tab_id, recovery);
+            }
+        }
         let needs_follow_up = self.frontend_geometry_resync_after_epoch.remove(&tab_id);
         if needs_follow_up && self.active_tab_is(tab_id) {
             // Starting the follow-up synchronously keeps the tab opaque: the
@@ -500,6 +574,9 @@ impl super::TermWindow {
             self.invalidate_window();
             return;
         };
+        if let Some(client_domain) = domain.downcast_ref::<ClientDomain>() {
+            self.remember_gui_recovery_intent(client_domain, tab_id, &viewport);
+        }
         let Some(window) = self.window.as_ref().cloned() else {
             self.frontend_geometry_phases.remove(&tab_id);
             return;
@@ -724,6 +801,141 @@ impl super::TermWindow {
     /// events (activation, tab creation, split completion and divider release)
     /// use this instead of the window-resize debounce so the first paint is
     /// already based on the current GUI geometry.
+    pub(crate) fn sync_replacement_frontend_geometry(
+        &mut self,
+        tab_id: mux::tab::TabId,
+        slot: FrontendRecoverySlot,
+        generation: u64,
+    ) -> bool {
+        if slot != self.frontend_recovery_slot() {
+            return false;
+        }
+        let mux = Mux::get();
+        let Some(mut window) = mux.get_window_mut(self.mux_window_id) else {
+            return false;
+        };
+        let Some(tab_idx) = window.idx_by_id(tab_id) else {
+            return false;
+        };
+        let changed = window
+            .get_active()
+            .is_none_or(|active| active.tab_id() != tab_id);
+        if changed {
+            window.save_and_then_set_active(tab_idx);
+        }
+        drop(window);
+
+        if changed {
+            if let Some(tab) = mux.get_tab(tab_id) {
+                if let Some(pane) = tab.get_active_pane() {
+                    pane.focus_changed(true);
+                }
+            }
+            self.update_title();
+            self.update_scrollbar();
+        }
+
+        let Some(tab) = mux.get_tab(tab_id) else {
+            return false;
+        };
+        let Some(active_pane) = tab.get_active_pane() else {
+            return false;
+        };
+        let Some(client_pane) = active_pane.downcast_ref::<ClientPane>() else {
+            return false;
+        };
+        let Some(domain) = mux.get_domain(client_pane.domain_id()) else {
+            return false;
+        };
+        let Some(client_domain) = domain.downcast_ref::<ClientDomain>() else {
+            return false;
+        };
+        if client_domain.pending_frontend_recovery(slot, tab_id) != Some(generation) {
+            return false;
+        }
+
+        // Another device already owns B. Confirm that state through a
+        // dedicated recovery report, but do not reshape this hidden mirror.
+        if client_domain.owns_remote_viewport(tab_id) == Some(false) {
+            let Some((domain, viewport)) = self.client_viewport_for_tab(&tab, false) else {
+                return false;
+            };
+            let Some(client_domain) = domain.downcast_ref::<ClientDomain>() else {
+                return false;
+            };
+            self.remember_gui_recovery_intent(client_domain, tab_id, &viewport);
+            let Some(window) = self.window.as_ref().cloned() else {
+                return false;
+            };
+            let domain_id = client_domain.domain_id();
+            let domain_for_task = Arc::clone(&domain);
+            promise::spawn::spawn(async move {
+                let Some(client_domain) = domain_for_task.downcast_ref::<ClientDomain>() else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                let result = client_domain.set_client_viewport(tab_id, viewport).await;
+                match result {
+                    Ok(_) if client_domain.owns_remote_viewport(tab_id) == Some(false) => {
+                        client_domain.acknowledge_frontend_recovery(slot, tab_id, generation);
+                    }
+                    Ok(_) => {
+                        // The passive report made this client the first owner.
+                        // Re-enter on the GUI thread and install Native geometry
+                        // before acknowledging the recovery barrier.
+                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            if !term_window
+                                .sync_replacement_frontend_geometry(tab_id, slot, generation)
+                            {
+                                if let Some(domain) = Mux::get().get_domain(domain_id) {
+                                    if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                                        client.fail_frontend_recovery(
+                                            slot,
+                                            tab_id,
+                                            generation,
+                                            "GUI could not converge replacement geometry",
+                                        );
+                                    }
+                                }
+                            }
+                        })));
+                    }
+                    Err(err) => {
+                        client_domain.fail_frontend_recovery(
+                            slot,
+                            tab_id,
+                            generation,
+                            format!("GUI replacement viewport failed: {err:#}"),
+                        );
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .detach();
+            return true;
+        }
+
+        self.sync_active_tab_geometry_now();
+        let Some(phase) = self.frontend_geometry_phases.get(&tab_id).copied() else {
+            return false;
+        };
+        let epoch = phase.epoch();
+        self.frontend_geometry_phases.insert(
+            tab_id,
+            super::FrontendGeometryPhase::TakeoverSyncing { epoch },
+        );
+        self.frontend_recovery_geometry.insert(
+            tab_id,
+            super::FrontendRecoveryGeometry {
+                epoch,
+                domain_id: client_pane.domain_id(),
+                slot,
+                generation,
+            },
+        );
+        self.invalidate_window();
+        true
+    }
+
     pub(crate) fn sync_active_tab_geometry_now(&mut self) {
         if self.content_view_foreground() {
             return;
@@ -784,6 +996,9 @@ impl super::TermWindow {
             self.invalidate_window();
             return;
         };
+        if let Some(client_domain) = domain.downcast_ref::<ClientDomain>() {
+            self.remember_gui_recovery_intent(client_domain, tab_id, &viewport);
+        }
         let Some(window) = self.window.as_ref().cloned() else {
             self.frontend_geometry_phases.remove(&tab_id);
             return;
@@ -842,6 +1057,9 @@ impl super::TermWindow {
             let Some((domain, viewport)) = self.client_viewport_for_tab(tab, include_panes) else {
                 return;
             };
+            if let Some(client_domain) = domain.downcast_ref::<ClientDomain>() {
+                self.remember_gui_recovery_intent(client_domain, tab_id, &viewport);
+            }
             let adopted = match &viewport {
                 codec::ClientViewport::Native { panes, .. } => panes
                     .iter()
@@ -1726,7 +1944,13 @@ impl super::TermWindow {
         }
         self.persist_workspace_pane_font_scales();
 
-        self.sync_pane_font_sizes();
+        // A pane-local font change leaves the tab root unchanged, but changes
+        // the number of rows and columns that fit inside this pane.  Adopting
+        // only the local ClientPane surface makes the renderer look resized
+        // while the remote PTY keeps its previous geometry.  Converge the
+        // complete active-tab viewport so Cmd/Ctrl +/-/0, menu actions and
+        // split panes all update the authoritative PTY size as one layout.
+        self.sync_active_tab_geometry_now();
         self.quad_generation += 1;
         self.shape_generation += 1;
         self.shape_cache.borrow_mut().clear();

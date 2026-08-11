@@ -7,6 +7,8 @@ use anyhow::{anyhow, Context, Error};
 use config::keyassignment::{KeyAssignment, SpawnCommand, SpawnTabDomain};
 use config::{ConfigSubscription, NotificationHandling};
 use mux::client::ClientId;
+use mux::domain::DomainId;
+use mux::tab::TabId;
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use promise::{Future, Promise};
@@ -14,11 +16,116 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use wezterm_client::domain::{ClientDomain, ThinkTermFrontendRecoveryTarget};
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
 
 fn should_spawn_reconciled_gui_window(is_domain_owned: bool, workspace: &str) -> bool {
     !is_domain_owned || crate::workspace_threads::is_thread_workspace_name(workspace)
+}
+
+fn frontend_recovery_tab(
+    current_generation: Option<u64>,
+    requested_generation: u64,
+    mux_window_id: MuxWindowId,
+    slot: wezterm_client::domain::FrontendRecoverySlot,
+    recovery_targets: &[ThinkTermFrontendRecoveryTarget],
+) -> Option<TabId> {
+    if current_generation != Some(requested_generation) {
+        return None;
+    }
+    recovery_targets
+        .iter()
+        .find(|target| target.window_id == mux_window_id && target.slot == slot)
+        .map(|target| target.tab_id)
+}
+
+/// Run exactly once after the client has installed a replacement mux
+/// topology and armed its frontend recovery barrier.  The normal
+/// TabAddedToWindow notification is too early to serve as that barrier's
+/// trigger: it is emitted while the replacement is still being assembled.
+pub fn request_thinkterm_frontend_recovery(
+    domain_id: DomainId,
+    connection_generation: u64,
+    recovery_targets: Vec<ThinkTermFrontendRecoveryTarget>,
+) {
+    promise::spawn::spawn_into_main_thread(async move {
+        let Some(frontend) = try_front_end() else {
+            return;
+        };
+
+        // Address each retained native window explicitly. A missing window is
+        // a failed recovery target, not a reason to leave the domain parked in
+        // Syncing forever.
+        for target in recovery_targets {
+            let Some(gui_window) = frontend.gui_window_for_mux_window(target.window_id) else {
+                if let Some(domain) = Mux::get().get_domain(domain_id) {
+                    if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                        client.fail_frontend_recovery(
+                            target.slot,
+                            target.tab_id,
+                            connection_generation,
+                            format!(
+                                "GUI window {} disappeared during mux recovery",
+                                target.window_id
+                            ),
+                        );
+                    }
+                }
+                continue;
+            };
+            gui_window
+                .window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let mux = Mux::get();
+                    let current_generation = mux.get_domain(domain_id).and_then(|domain| {
+                        domain
+                            .downcast_ref::<ClientDomain>()
+                            .and_then(ClientDomain::connection_generation)
+                    });
+                    let tab_id = frontend_recovery_tab(
+                        current_generation,
+                        connection_generation,
+                        term_window.mux_window_id,
+                        term_window.frontend_recovery_slot(),
+                        &[target],
+                    );
+                    if let Some(tab_id) = tab_id {
+                        if !term_window.sync_replacement_frontend_geometry(
+                            tab_id,
+                            target.slot,
+                            connection_generation,
+                        ) {
+                            log::warn!(
+                                "cannot restore GUI frontend geometry for mux window {} tab {}",
+                                term_window.mux_window_id,
+                                tab_id
+                            );
+                            if let Some(domain) = mux.get_domain(domain_id) {
+                                if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                                    client.fail_frontend_recovery(
+                                        target.slot,
+                                        tab_id,
+                                        connection_generation,
+                                        "GUI recovery target could not start geometry sync",
+                                    );
+                                }
+                            }
+                        }
+                    } else if let Some(domain) = mux.get_domain(domain_id) {
+                        if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                            client.fail_frontend_recovery(
+                                target.slot,
+                                target.tab_id,
+                                connection_generation,
+                                "GUI recovery target no longer matches its native window",
+                            );
+                        }
+                    }
+                })));
+        }
+    })
+    .detach();
 }
 
 pub struct GuiFrontEnd {
@@ -833,7 +940,8 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_spawn_reconciled_gui_window;
+    use super::{frontend_recovery_tab, should_spawn_reconciled_gui_window};
+    use wezterm_client::domain::{FrontendRecoverySlot, ThinkTermFrontendRecoveryTarget};
 
     #[test]
     fn reconcile_keeps_local_windows_visible() {
@@ -867,5 +975,71 @@ mod tests {
             true,
             "thinkterm:muxdomain-host::space::space-1:thread-2:remote-default"
         ));
+    }
+
+    #[test]
+    fn replacement_recovery_targets_the_retained_window_in_the_current_generation() {
+        let recovery_targets = [
+            ThinkTermFrontendRecoveryTarget {
+                slot: FrontendRecoverySlot::Window(70),
+                window_id: 7,
+                tab_id: 41,
+            },
+            ThinkTermFrontendRecoveryTarget {
+                slot: FrontendRecoverySlot::Window(80),
+                window_id: 8,
+                tab_id: 42,
+            },
+        ];
+        assert_eq!(
+            frontend_recovery_tab(
+                Some(7),
+                7,
+                8,
+                FrontendRecoverySlot::Window(80),
+                &recovery_targets,
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            frontend_recovery_tab(
+                Some(8),
+                7,
+                8,
+                FrontendRecoverySlot::Window(80),
+                &recovery_targets,
+            ),
+            None
+        );
+        assert_eq!(
+            frontend_recovery_tab(
+                Some(7),
+                7,
+                9,
+                FrontendRecoverySlot::Window(80),
+                &recovery_targets,
+            ),
+            None
+        );
+        assert_eq!(
+            frontend_recovery_tab(
+                None,
+                7,
+                8,
+                FrontendRecoverySlot::Window(80),
+                &recovery_targets,
+            ),
+            None
+        );
+        assert_eq!(
+            frontend_recovery_tab(
+                Some(7),
+                7,
+                8,
+                FrontendRecoverySlot::Window(70),
+                &recovery_targets,
+            ),
+            None
+        );
     }
 }

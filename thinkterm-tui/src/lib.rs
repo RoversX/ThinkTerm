@@ -43,7 +43,9 @@ use termwiz::terminal::{new_terminal, ScreenSize, TerminalWaker};
 use uuid::Uuid;
 use view::{HitTarget, PaneTool, TabBarControl, TreeAction, ViewLayout};
 use wezterm_client::client::Client;
-use wezterm_client::domain::{ClientDomain, ClientDomainConfig, RemoteFrontendGate};
+use wezterm_client::domain::{
+    ClientDomain, ClientDomainConfig, FrontendRecoverySlot, RemoteFrontendGate,
+};
 use wezterm_client::pane::ClientPane;
 use wezterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
 use wezterm_term::TerminalSize;
@@ -119,6 +121,19 @@ fn effective_frontend_gate(
     } else {
         remote_gate
     }
+}
+
+fn handoff_geometry_is_pending(
+    remote_gate: &RemoteFrontendGate,
+    access: Option<&codec::FrontendAccessState>,
+    owns: Option<bool>,
+    ready_generation: Option<u64>,
+) -> bool {
+    matches!(remote_gate, RemoteFrontendGate::Visible)
+        && owns == Some(true)
+        && access
+            .filter(|access| access.mode == codec::FrontendAccessMode::Handoff)
+            .is_some_and(|access| ready_generation != Some(access.generation))
 }
 
 #[derive(Debug, Clone)]
@@ -648,14 +663,18 @@ struct TuiState {
     dirty: bool,
     layout: ViewLayout,
     last_mouse_buttons: MouseButtons,
-    /// Each tab's last advertised grid, and — through the key alone — whether
-    /// this renderer has advertised one at all. Forgetting a size re-sends it
+    /// Each tab's last advertised viewport, and — through the key alone —
+    /// whether this renderer has advertised one at all. Forgetting it re-sends it
     /// on the next frame; the key has to outlive that, because taking control
     /// of a tab requires the server to already hold a viewport for us.
     /// Also carries whether this renderer owned the viewport when it last said
     /// so: a handover changes what the server does with the same numbers, so it
     /// has to count as something new to say.
-    last_viewports: HashMap<(String, TabId), Option<(TerminalSize, bool)>>,
+    last_viewports: HashMap<(String, TabId), Option<(ClientViewport, bool)>>,
+    /// B grants visibility for the whole mux, but geometry is still installed
+    /// one top-level tab at a time. A tab is safe to reveal only after this TUI
+    /// has acknowledged a complete viewport in the current access generation.
+    handoff_geometry_ready: HashMap<(String, TabId), u64>,
     /// Keep the release paired with a press on B's takeover surface from
     /// reaching the pane if the claim round-trip completed very quickly.
     handoff_consumed_press: bool,
@@ -665,14 +684,18 @@ struct TuiState {
     last_pane_poll: Instant,
     /// The view last offered to the server, and when, so a flick of the wheel
     /// does not become a round trip per notch.
-    shared_view: Option<codec::ClientView>,
-    shared_view_at: Option<Instant>,
+    shared_views: HashMap<(String, TabId), codec::ClientView>,
+    shared_view_at: HashMap<(String, TabId), Instant>,
     /// A view change arrived inside the coalescing window and still has to go
     /// out once that window closes.
-    share_view_pending: bool,
+    share_view_pending: HashSet<(String, TabId)>,
     /// The view last adopted from the owner, so following it is idempotent and
     /// does not fight this renderer's own scrolling every frame.
-    followed_view: Option<codec::ClientView>,
+    followed_views: HashMap<(String, TabId), codec::ClientView>,
+    /// Latest physical cell/pixel information from the TTY. Takeover actions
+    /// run between frames, so they use this to build the same native viewport
+    /// the most recent frame used.
+    screen_size: Option<ScreenSize>,
     /// When the terminal last changed size, plus the time it has to stay still
     /// before that size is worth forwarding. `None` once it has been forwarded.
     resize_settles_at: Option<Instant>,
@@ -759,13 +782,15 @@ impl TuiState {
             layout: ViewLayout::default(),
             last_mouse_buttons: MouseButtons::NONE,
             last_viewports: HashMap::new(),
+            handoff_geometry_ready: HashMap::new(),
             handoff_consumed_press: false,
             takeover_epochs: TakeoverEpochs::default(),
             last_pane_poll: Instant::now(),
-            shared_view: None,
-            shared_view_at: None,
-            share_view_pending: false,
-            followed_view: None,
+            shared_views: HashMap::new(),
+            shared_view_at: HashMap::new(),
+            share_view_pending: HashSet::new(),
+            followed_views: HashMap::new(),
+            screen_size: None,
             resize_settles_at: None,
             redraw_until: None,
             connection_generations,
@@ -791,6 +816,12 @@ impl TuiState {
         let local_id = domain.remote_to_local_tab_id(remote_tab_id)?;
         let tab = Mux::get().get_tab(local_id)?;
         Some((domain_name, domain, tab, remote_tab_id))
+    }
+
+    fn active_view_cache_key(&self) -> Option<(String, TabId)> {
+        let remote_tab_id = self.model.selected_tab()?.tab_id;
+        let domain_name = self.model.selected_row()?.key.domain_name.clone();
+        Some((domain_name, remote_tab_id))
     }
 
     fn active_pane(&self) -> Option<Arc<dyn Pane>> {
@@ -826,12 +857,22 @@ impl TuiState {
     }
 
     fn frontend_gate(&self) -> RemoteFrontendGate {
-        let Some((domain_name, domain, _, remote_tab_id)) = self.active_tab() else {
+        let Some((domain_name, domain, tab, remote_tab_id)) = self.active_tab() else {
             return RemoteFrontendGate::Visible;
         };
+        let remote_gate = domain.remote_frontend_gate();
+        let access = domain.remote_access_state();
+        let handoff_geometry_pending = handoff_geometry_is_pending(
+            &remote_gate,
+            access.as_ref(),
+            domain.owns_remote_viewport(tab.tab_id()),
+            self.handoff_geometry_ready
+                .get(&(domain_name.clone(), remote_tab_id))
+                .copied(),
+        );
         effective_frontend_gate(
-            self.takeover_epochs.contains(&domain_name, remote_tab_id),
-            domain.remote_frontend_gate(),
+            self.takeover_epochs.contains(&domain_name, remote_tab_id) || handoff_geometry_pending,
+            remote_gate,
         )
     }
 
@@ -1020,11 +1061,25 @@ async fn run_terminal(
             }
         }
 
-        if state.share_view_pending && share_view_is_due(&state) {
-            state.dirty = true;
+        if let Some(cache_key) = state.active_view_cache_key() {
+            if state.share_view_pending.contains(&cache_key)
+                && share_view_is_due(&state, &cache_key)
+            {
+                state.dirty = true;
+            }
         }
 
         if state.dirty {
+            if let Ok(screen) = terminal.backend_mut().screen_size() {
+                state.screen_size = Some(screen);
+                let area: ratatui::layout::Rect = terminal.size()?.into();
+                let recovery_pending = state.active_tab().is_some_and(|(_, domain, tab, _)| {
+                    domain
+                        .pending_frontend_recovery(FrontendRecoverySlot::Primary, tab.tab_id())
+                        .is_some()
+                });
+                prepare_active_native_viewport(&mut state, area, screen, recovery_pending);
+            }
             let active = state.active_tab();
             let local_tab = active.as_ref().map(|(_, _, tab, _)| Arc::clone(tab));
             let viewport_status = state.viewport_status();
@@ -1070,11 +1125,16 @@ async fn run_terminal(
         let until_poll =
             PANE_POLL_INTERVAL.saturating_sub(now.saturating_duration_since(state.last_pane_poll));
         wait = Some(wait.map_or(until_poll, |wait| wait.min(until_poll)));
-        if state.share_view_pending {
-            let until_share = state.shared_view_at.map_or(Duration::ZERO, |at| {
-                SHARE_VIEW_INTERVAL.saturating_sub(now.saturating_duration_since(at))
-            });
-            wait = Some(wait.map_or(until_share, |wait| wait.min(until_share)));
+        if let Some(cache_key) = state.active_view_cache_key() {
+            if state.share_view_pending.contains(&cache_key) {
+                let until_share = state
+                    .shared_view_at
+                    .get(&cache_key)
+                    .map_or(Duration::ZERO, |at| {
+                        SHARE_VIEW_INTERVAL.saturating_sub(now.saturating_duration_since(*at))
+                    });
+                wait = Some(wait.map_or(until_share, |wait| wait.min(until_share)));
+            }
         }
         // Nothing else will wake this loop once the terminal stops changing, so
         // the settle deadline has to be one of the things it waits on.
@@ -1260,6 +1320,21 @@ fn drain_events(receiver: &Receiver<AppEvent>, state: &mut TuiState) {
                     state
                         .last_viewports
                         .retain(|(domain, _), _| domain != &domain_name);
+                    state
+                        .handoff_geometry_ready
+                        .retain(|(domain, _), _| domain != &domain_name);
+                    state
+                        .shared_views
+                        .retain(|(domain, _), _| domain != &domain_name);
+                    state
+                        .shared_view_at
+                        .retain(|(domain, _), _| domain != &domain_name);
+                    state
+                        .share_view_pending
+                        .retain(|(domain, _)| domain != &domain_name);
+                    state
+                        .followed_views
+                        .retain(|(domain, _), _| domain != &domain_name);
                     state.dirty = true;
                 }
             }
@@ -1333,6 +1408,61 @@ async fn refresh_sessions(state: &mut TuiState) {
     }
 }
 
+/// Reflow the selected top-level tab to this TUI and derive the pane grids from
+/// that same layout pass. `force` is used by an explicit takeover while another
+/// renderer still owns the tab; normal frames only preview geometry we already
+/// own, so a passive renderer never disturbs the shared local mirror.
+fn prepare_active_native_viewport(
+    state: &mut TuiState,
+    area: ratatui::layout::Rect,
+    screen: ScreenSize,
+    force: bool,
+) -> Option<ClientViewport> {
+    let (_, domain, tab, _) = state.active_tab()?;
+    if !force && domain.owns_remote_viewport(tab.tab_id()) != Some(true) {
+        return None;
+    }
+
+    let shell = view::compute_view(area, &state.model, &state.ui, None);
+    if shell.content.width == 0 || shell.content.height == 0 {
+        return None;
+    }
+    let root = terminal_size(
+        shell.content.width as usize,
+        shell.content.height as usize,
+        screen,
+    );
+    tab.resize(root);
+
+    let layout = view::compute_view(area, &state.model, &state.ui, Some(&tab));
+    let mut panes = Vec::new();
+    for pane in &layout.panes {
+        let handle = Mux::get().get_pane(pane.pane_id)?;
+        let client = handle.downcast_ref::<ClientPane>()?;
+        let size = terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen);
+        client.adopt_frontend_geometry(size);
+        panes.push(codec::ClientPaneViewport {
+            pane_id: pane.pane_id,
+            size,
+        });
+    }
+    state.layout = layout;
+    Some(ClientViewport::Native { size: root, panes })
+}
+
+fn forget_native_viewport_geometry(viewport: &ClientViewport) {
+    let ClientViewport::Native { panes, .. } = viewport else {
+        return;
+    };
+    for pane in panes {
+        if let Some(handle) = Mux::get().get_pane(pane.pane_id) {
+            if let Some(client) = handle.downcast_ref::<ClientPane>() {
+                client.forget_frontend_geometry(pane.size);
+            }
+        }
+    }
+}
+
 async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
     state: &mut TuiState,
     remote_tab_id: Option<TabId>,
@@ -1370,43 +1500,135 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
             return;
         }
     };
+    state.screen_size = Some(screen);
     let size = terminal_size(content.width as usize, content.height as usize, screen);
-    // Reported as one grid for the whole tab, never per pane. The server owns
-    // how a tab divides into panes and answers with a tab-level size that this
-    // renderer then adopts; describing the panes as well means both sides are
-    // deciding the same split from different inputs, and dragging a divider
-    // leaves every pty a step behind the layout it was drawn for.
-    // Ownership is part of what was said, not just the numbers. A device that
-    // takes the viewport by typing changes what the server will do with the
-    // very same grid, and the tab this renderer lays out from is still the
-    // shape the *other* device left it. Keying the cache on both means the
-    // next frame notices and says it again — and stops as soon as the two
-    // agree, which reacting to the server's own publication did not: that
-    // published back at us and cost a thousand frames a second.
-    let owns = domain.owns_remote_viewport(local_tab_id) != Some(false);
-    let cache_key = (domain_name, remote_tab_id);
-    if state.last_viewports.get(&cache_key) != Some(&Some((size, owns))) {
+    // A passive renderer advertises only the screen it could take over with.
+    // Once it owns the tab, the pre-draw geometry pass has exact pane grids,
+    // including TUI borders/nav bars, so publish them together with the root.
+    // This replaces the old CellGrid-then-detached-Resize sequence whose
+    // intermediate split trees were visible to a concurrently attached GUI.
+    let ownership = domain.owns_remote_viewport(local_tab_id);
+    let owns = ownership != Some(false);
+    let recovery_generation =
+        domain.pending_frontend_recovery(FrontendRecoverySlot::Primary, local_tab_id);
+    let viewport = if ownership == Some(true) || recovery_generation.is_some() {
+        let panes = state
+            .layout
+            .panes
+            .iter()
+            .filter_map(|pane| {
+                let handle = Mux::get().get_pane(pane.pane_id)?;
+                handle.downcast_ref::<ClientPane>()?;
+                Some(codec::ClientPaneViewport {
+                    pane_id: pane.pane_id,
+                    size: terminal_size(
+                        pane.rect.width as usize,
+                        pane.rect.height as usize,
+                        screen,
+                    ),
+                })
+            })
+            .collect();
+        ClientViewport::Native { size, panes }
+    } else {
+        ClientViewport::CellGrid { size }
+    };
+    let cache_key = (domain_name.clone(), remote_tab_id);
+    let handoff_generation = domain
+        .remote_access_state()
+        .filter(|access| access.mode == codec::FrontendAccessMode::Handoff)
+        .map(|access| access.generation);
+    let geometry_generation_is_stale = ownership == Some(true)
+        && handoff_generation.is_some_and(|generation| {
+            state.handoff_geometry_ready.get(&cache_key) != Some(&generation)
+        });
+    for candidate in state.domains.values() {
+        if candidate.domain_id() != domain.domain_id() {
+            candidate.clear_frontend_recovery_intent(FrontendRecoverySlot::Primary);
+        }
+    }
+    if let Err(err) =
+        domain.set_frontend_recovery_intent(FrontendRecoverySlot::Primary, local_tab_id, &viewport)
+    {
+        log::trace!("recording TUI frontend recovery intent: {err:#}");
+    }
+
+    if recovery_generation.is_some()
+        || geometry_generation_is_stale
+        || state.last_viewports.get(&cache_key) != Some(&Some((viewport.clone(), owns)))
+    {
         match domain
-            .set_client_viewport(local_tab_id, ClientViewport::CellGrid { size })
+            .set_client_viewport(local_tab_id, viewport.clone())
             .await
         {
-            Ok(viewport) => {
+            Ok(response) => {
                 let owns = domain.owns_remote_viewport(local_tab_id) != Some(false);
-                state.last_viewports.insert(cache_key, Some((size, owns)));
+                state
+                    .last_viewports
+                    .insert(cache_key.clone(), Some((viewport.clone(), owns)));
                 adopt_local_tab_size(
                     local_tab_id,
-                    local_tab_size(&domain, local_tab_id, size, viewport.canonical_size),
+                    local_tab_size(&domain, local_tab_id, size, response.canonical_size),
                 );
+                if let Some(generation) = recovery_generation {
+                    if let Err(err) = domain.resync().await {
+                        forget_native_viewport_geometry(&viewport);
+                        domain.fail_frontend_recovery(
+                            FrontendRecoverySlot::Primary,
+                            local_tab_id,
+                            generation,
+                            format!("TUI replacement topology resync failed: {err:#}"),
+                        );
+                        state.ui.status = format!("Restoring terminal: {err:#}");
+                        state.dirty = true;
+                        return;
+                    }
+                    let final_local_tab_id = domain
+                        .remote_to_local_tab_id(remote_tab_id)
+                        .unwrap_or(local_tab_id);
+                    adopt_local_tab_size(final_local_tab_id, response.canonical_size);
+                    if !domain.acknowledge_frontend_recovery(
+                        FrontendRecoverySlot::Primary,
+                        local_tab_id,
+                        generation,
+                    ) {
+                        state.dirty = true;
+                        return;
+                    }
+                }
+                if owns && matches!(viewport, ClientViewport::Native { .. }) {
+                    if response.access.mode == codec::FrontendAccessMode::Handoff {
+                        let prior = state
+                            .handoff_geometry_ready
+                            .insert(cache_key.clone(), response.access.generation);
+                        if prior != Some(response.access.generation) {
+                            state.dirty = true;
+                        }
+                    }
+                } else if owns {
+                    // The first passive advertisement may have made this TUI B's
+                    // initial owner. Keep the mask and draw once more so the next
+                    // request carries the exact pane geometry as Native.
+                    state.dirty = true;
+                }
             }
             Err(err) => {
+                forget_native_viewport_geometry(&viewport);
+                if let Some(generation) = recovery_generation {
+                    domain.fail_frontend_recovery(
+                        FrontendRecoverySlot::Primary,
+                        local_tab_id,
+                        generation,
+                        format!("TUI replacement viewport failed: {err:#}"),
+                    );
+                }
                 state.ui.status = format!("Viewport: {err}");
                 state.dirty = true;
                 return;
             }
         }
     }
-    push_pane_sizes(state, &domain, local_tab_id, screen);
-    share_view_if_changed(state, &domain, local_tab_id).await;
+    share_view_if_changed(state, &domain, local_tab_id, &cache_key).await;
 }
 
 /// Ask every pane on screen whether anything changed.
@@ -1432,10 +1654,11 @@ fn poll_panes(state: &TuiState) {
 const SHARE_VIEW_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Whether the coalescing window has closed on a deferred view change.
-fn share_view_is_due(state: &TuiState) -> bool {
+fn share_view_is_due(state: &TuiState, cache_key: &(String, TabId)) -> bool {
     state
         .shared_view_at
-        .map_or(true, |at| at.elapsed() >= SHARE_VIEW_INTERVAL)
+        .get(cache_key)
+        .is_none_or(|at| at.elapsed() >= SHARE_VIEW_INTERVAL)
 }
 
 /// Offer what this renderer is looking at, so the other renderers on this tab
@@ -1452,9 +1675,10 @@ async fn share_view_if_changed(
     state: &mut TuiState,
     domain: &Arc<ClientDomain>,
     local_tab_id: TabId,
+    cache_key: &(String, TabId),
 ) {
     if domain.owns_remote_viewport(local_tab_id) == Some(false) {
-        follow_shared_view(state, domain, local_tab_id);
+        follow_shared_view(state, domain, local_tab_id, cache_key);
         return;
     }
     let mut scroll = Vec::new();
@@ -1477,28 +1701,33 @@ async fn share_view_if_changed(
     }
     scroll.sort_by_key(|entry| entry.pane_id);
     let view = codec::ClientView { scroll };
-    if state.shared_view.as_ref() == Some(&view) {
-        state.share_view_pending = false;
+    if state.shared_views.get(cache_key) == Some(&view) {
+        state.share_view_pending.remove(cache_key);
         return;
     }
     if state
         .shared_view_at
+        .get(cache_key)
         .is_some_and(|at| at.elapsed() < SHARE_VIEW_INTERVAL)
     {
         // Deferred, not dropped. Skipping outright leaves the follower one
         // notch behind for good, because the last notch of a flick is exactly
         // the one that lands inside the window and nothing draws afterwards to
         // try again.
-        state.share_view_pending = true;
+        state.share_view_pending.insert(cache_key.clone());
         return;
     }
-    state.shared_view_at = Some(Instant::now());
-    state.share_view_pending = false;
+    state
+        .shared_view_at
+        .insert(cache_key.clone(), Instant::now());
+    state.share_view_pending.remove(cache_key);
     match domain.set_client_view(local_tab_id, view.clone()).await {
-        Ok(()) => state.shared_view = Some(view),
+        Ok(()) => {
+            state.shared_views.insert(cache_key.clone(), view);
+        }
         Err(err) => {
             log::trace!("sharing the view of tab {local_tab_id}: {err:#}");
-            state.share_view_pending = true;
+            state.share_view_pending.insert(cache_key.clone());
         }
     }
 }
@@ -1510,14 +1739,19 @@ async fn share_view_if_changed(
 /// the scrollback should sit. When nobody has offered a view — because the
 /// owner is a renderer that does not publish one — this leaves the follower
 /// exactly where it was rather than pulling it somewhere arbitrary.
-fn follow_shared_view(state: &mut TuiState, domain: &Arc<ClientDomain>, local_tab_id: TabId) {
+fn follow_shared_view(
+    state: &mut TuiState,
+    domain: &Arc<ClientDomain>,
+    local_tab_id: TabId,
+    cache_key: &(String, TabId),
+) {
     let Some(remote) = domain.remote_viewport_state(local_tab_id) else {
         return;
     };
     let Some(view) = remote.view else {
         return;
     };
-    if state.followed_view.as_ref() == Some(&view) {
+    if state.followed_views.get(cache_key) == Some(&view) {
         return;
     }
     for pane in &state.layout.panes {
@@ -1538,48 +1772,8 @@ fn follow_shared_view(state: &mut TuiState, domain: &Arc<ClientDomain>, local_ta
         let offset = offset.min(dims.scrollback_rows.saturating_sub(dims.viewport_rows));
         state.ui.set_scroll_offset(pane.pane_id, offset);
     }
-    state.followed_view = Some(view);
+    state.followed_views.insert(cache_key.clone(), view);
     state.dirty = true;
-}
-
-/// Tell each remote pane the size this layout actually gave its grid.
-///
-/// `PaneStack::resize` skips remote mirrors on purpose: only the frontend knows
-/// how much of a pane's rectangle went to chrome, so sizing them is its job —
-/// and it must report the grid it actually drew, not the rectangle it was
-/// given, or every row spent on a pane's own nav bar goes unaccounted for.
-///
-/// Two guards, both copied from the GUI's `sync_active_mux_tab_pane_sizes`:
-/// a renderer that does not own the viewport does not get to set sizes, and a
-/// pane that already has the size it is about to be told is left alone. The
-/// second is what makes this safe to run on every layout — without it, each
-/// call would resize panes the server then answers with a fresh pane tree,
-/// which is another layout, which resizes again.
-fn push_pane_sizes(
-    state: &TuiState,
-    domain: &Arc<ClientDomain>,
-    local_tab_id: TabId,
-    screen: ScreenSize,
-) {
-    // `Some(true)`, not "anything but no": until the server has answered, this
-    // renderer does not know whether it owns the grid, and guessing yes means
-    // its very first frame resizes panes that another device is using.
-    if domain.owns_remote_viewport(local_tab_id) != Some(true) {
-        return;
-    }
-    for pane in &state.layout.panes {
-        let Some(handle) = Mux::get().get_pane(pane.pane_id) else {
-            continue;
-        };
-        let size = terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen);
-        let dims = handle.get_dimensions();
-        if dims.cols == size.cols && dims.viewport_rows == size.rows {
-            continue;
-        }
-        if let Err(err) = handle.resize(size) {
-            log::trace!("pane {} declined {size:?}: {err:#}", pane.pane_id);
-        }
-    }
 }
 
 /// Which size this renderer's own copy of the tab should be laid out at.
@@ -1660,20 +1854,34 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
     if domain.owns_remote_viewport(local_tab_id) == Some(true) {
         return Ok(tab);
     }
-    let size = state
-        .last_viewports
-        .get(&(domain_name.clone(), remote_tab_id))
-        .and_then(|entry| *entry)
-        .map(|(size, _)| size)
+    let screen = state
+        .screen_size
         .context("viewport is not ready; retry after the terminal redraws")?;
+    let handoff = domain
+        .remote_access_state()
+        .is_some_and(|access| access.mode == codec::FrontendAccessMode::Handoff);
+    let viewport = if handoff {
+        let area = state.layout.screen;
+        prepare_active_native_viewport(state, area, screen, true)
+            .context("viewport is not ready; retry after the terminal redraws")?
+    } else {
+        state
+            .last_viewports
+            .get(&(domain_name.clone(), remote_tab_id))
+            .and_then(|entry| entry.as_ref())
+            .map(|(viewport, _)| viewport.clone())
+            .context("viewport is not ready; retry after the terminal redraws")?
+    };
+    let reported_size = viewport.size();
     let epoch = state.takeover_epochs.begin(&domain_name, remote_tab_id);
     state.dirty = true;
     let claimed = match domain
-        .claim_client_viewport(local_tab_id, ClientViewport::CellGrid { size })
+        .claim_client_viewport(local_tab_id, viewport.clone())
         .await
     {
         Ok(claimed) => claimed,
         Err(err) => {
+            forget_native_viewport_geometry(&viewport);
             state
                 .takeover_epochs
                 .finish(&domain_name, remote_tab_id, epoch);
@@ -1681,18 +1889,19 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
         }
     };
     if domain.owns_remote_viewport(local_tab_id) != Some(true) {
+        forget_native_viewport_geometry(&viewport);
         state
             .takeover_epochs
             .finish(&domain_name, remote_tab_id, epoch);
         anyhow::bail!("the server did not grant viewport ownership");
     }
 
-    adopt_local_tab_size(local_tab_id, claimed.canonical_size);
+    adopt_local_tab_size(local_tab_id, reported_size);
     let resync = domain.resync().await;
     let final_local_tab_id = domain
         .remote_to_local_tab_id(remote_tab_id)
         .unwrap_or(local_tab_id);
-    adopt_local_tab_size(final_local_tab_id, claimed.canonical_size);
+    adopt_local_tab_size(final_local_tab_id, reported_size);
     let final_tab = Mux::get().get_tab(final_local_tab_id).unwrap_or(tab);
     if let Err(err) = resync {
         log::warn!(
@@ -1703,11 +1912,22 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
     state
         .takeover_epochs
         .finish(&domain_name, remote_tab_id, epoch);
+    let cache_key = (domain_name, remote_tab_id);
+    state
+        .last_viewports
+        .insert(cache_key.clone(), Some((viewport, true)));
+    if claimed.access.mode == codec::FrontendAccessMode::Handoff {
+        state
+            .handoff_geometry_ready
+            .insert(cache_key.clone(), claimed.access.generation);
+    }
     for pane in &state.layout.panes {
         state.ui.set_scroll_offset(pane.pane_id, 0);
     }
-    state.shared_view = None;
-    state.followed_view = None;
+    state.shared_views.remove(&cache_key);
+    state.shared_view_at.remove(&cache_key);
+    state.share_view_pending.remove(&cache_key);
+    state.followed_views.remove(&cache_key);
     Ok(final_tab)
 }
 
@@ -1730,20 +1950,31 @@ async fn set_active_frontend_access_mode(
     let (domain_name, domain, tab, remote_tab_id) =
         state.active_tab().context("no live tab selected")?;
     let local_tab_id = tab.tab_id();
-    let size = state
-        .last_viewports
-        .get(&(domain_name, remote_tab_id))
-        .and_then(|entry| *entry)
-        .map(|(size, _)| size)
+    let screen = state
+        .screen_size
         .context("viewport is not ready; retry after the terminal redraws")?;
-    domain
-        .set_frontend_access_mode(local_tab_id, mode, ClientViewport::CellGrid { size })
+    let area = state.layout.screen;
+    let viewport = prepare_active_native_viewport(state, area, screen, false)
+        .context("viewport is not ready; retry after the terminal redraws")?;
+    let access = domain
+        .set_frontend_access_mode(local_tab_id, mode, viewport.clone())
         .await?;
+    let cache_key = (domain_name, remote_tab_id);
+    state
+        .last_viewports
+        .insert(cache_key.clone(), Some((viewport, true)));
+    if access.mode == codec::FrontendAccessMode::Handoff {
+        state
+            .handoff_geometry_ready
+            .insert(cache_key.clone(), access.generation);
+    }
     for pane in &state.layout.panes {
         state.ui.set_scroll_offset(pane.pane_id, 0);
     }
-    state.shared_view = None;
-    state.followed_view = None;
+    state.shared_views.remove(&cache_key);
+    state.shared_view_at.remove(&cache_key);
+    state.share_view_pending.remove(&cache_key);
+    state.followed_views.remove(&cache_key);
     state.clear_selected_viewport_cache();
     Ok(())
 }
@@ -1941,6 +2172,19 @@ async fn dispatch_action(state: &mut TuiState, action: Action) -> Result<()> {
             state
                 .last_viewports
                 .retain(|(domain, _), _| domain != &name);
+            state
+                .handoff_geometry_ready
+                .retain(|(domain, _), _| domain != &name);
+            state.shared_views.retain(|(domain, _), _| domain != &name);
+            state
+                .shared_view_at
+                .retain(|(domain, _), _| domain != &name);
+            state
+                .share_view_pending
+                .retain(|(domain, _)| domain != &name);
+            state
+                .followed_views
+                .retain(|(domain, _), _| domain != &name);
             state.ui.mode = AppMode::Terminal;
             state.ui.status = format!("{name}: disconnected; remote sessions are still running");
             sync_connection_statuses(state);
@@ -2094,7 +2338,7 @@ async fn ensure_selected_thread_live(
     });
     state.ui.status = format!("Opening terminal on {domain_name}…");
     let response = domain
-        .ensure_thinkterm_thread(preferred_thread_id, spawn_size(state))
+        .ensure_thinkterm_thread(preferred_thread_id, materialize_size(state))
         .await
         .with_context(|| format!("materializing a Thread on {domain_name}"))?;
     if domain.state() != DomainState::Attached
@@ -2770,6 +3014,16 @@ fn spawn_size(state: &TuiState) -> TerminalSize {
             dpi: dims.dpi,
         };
     }
+    TerminalSize {
+        rows: state.layout.content.height.max(2) as usize,
+        cols: state.layout.content.width.max(2) as usize,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 96,
+    }
+}
+
+fn materialize_size(state: &TuiState) -> TerminalSize {
     TerminalSize {
         rows: state.layout.content.height.max(2) as usize,
         cols: state.layout.content.width.max(2) as usize,
@@ -4737,6 +4991,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handoff_reveals_each_tab_only_after_its_geometry_generation_is_ready() {
+        let access = codec::FrontendAccessState {
+            mode: codec::FrontendAccessMode::Handoff,
+            owner: None,
+            generation: 17,
+        };
+        assert!(handoff_geometry_is_pending(
+            &RemoteFrontendGate::Visible,
+            Some(&access),
+            Some(true),
+            None,
+        ));
+        assert!(handoff_geometry_is_pending(
+            &RemoteFrontendGate::Visible,
+            Some(&access),
+            Some(true),
+            Some(16),
+        ));
+        assert!(!handoff_geometry_is_pending(
+            &RemoteFrontendGate::Visible,
+            Some(&access),
+            Some(true),
+            Some(17),
+        ));
+        assert!(!handoff_geometry_is_pending(
+            &RemoteFrontendGate::Claimable { owner: None },
+            Some(&access),
+            Some(false),
+            None,
+        ));
+        let collaborative = codec::FrontendAccessState {
+            mode: codec::FrontendAccessMode::TmuxLatest,
+            ..access
+        };
+        assert!(!handoff_geometry_is_pending(
+            &RemoteFrontendGate::Visible,
+            Some(&collaborative),
+            Some(true),
+            None,
+        ));
+    }
+
     fn model_for_reorder() -> AppModel {
         let mut model = AppModel::default();
         model.apply_snapshot(
@@ -5061,10 +5358,12 @@ mod tests {
         state.last_viewports.insert(
             key.clone(),
             Some((
-                TerminalSize {
-                    rows: 24,
-                    cols: 80,
-                    ..Default::default()
+                ClientViewport::CellGrid {
+                    size: TerminalSize {
+                        rows: 24,
+                        cols: 80,
+                        ..Default::default()
+                    },
                 },
                 true,
             )),
@@ -5073,6 +5372,31 @@ mod tests {
         state.clear_selected_viewport_cache();
 
         assert_eq!(state.last_viewports.get(&key), Some(&None));
+    }
+
+    #[test]
+    fn shared_view_debounce_and_payload_are_scoped_to_each_tab() {
+        let model = model_for_reorder();
+        let mut state = TuiState::new(
+            BTreeMap::new(),
+            vec![],
+            BTreeMap::new(),
+            model,
+            String::new(),
+            TuiConfig::default(),
+            PathBuf::from("/tmp/test-tui.toml"),
+            PathBuf::from("/tmp/test-tui.json"),
+        );
+        let first = ("server".to_string(), 7);
+        let second = ("server".to_string(), 8);
+        state.shared_view_at.insert(first.clone(), Instant::now());
+        state
+            .shared_views
+            .insert(first.clone(), codec::ClientView::default());
+
+        assert!(!share_view_is_due(&state, &first));
+        assert!(share_view_is_due(&state, &second));
+        assert!(!state.shared_views.contains_key(&second));
     }
 
     /// A fingertip covers several cells and the touchscreen picks one, so a tap
