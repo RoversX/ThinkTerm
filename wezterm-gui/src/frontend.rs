@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use wezterm_client::domain::{ClientDomain, ThinkTermFrontendRecoveryTarget};
+use wezterm_client::domain::{ClientDomain, FrontendRecoverySlot, ThinkTermFrontendRecoveryTarget};
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
 
@@ -27,8 +27,7 @@ fn should_spawn_reconciled_gui_window(is_domain_owned: bool, workspace: &str) ->
 fn frontend_recovery_tab(
     current_generation: Option<u64>,
     requested_generation: u64,
-    mux_window_id: MuxWindowId,
-    slot: wezterm_client::domain::FrontendRecoverySlot,
+    slot: FrontendRecoverySlot,
     recovery_targets: &[ThinkTermFrontendRecoveryTarget],
 ) -> Option<TabId> {
     if current_generation != Some(requested_generation) {
@@ -36,7 +35,7 @@ fn frontend_recovery_tab(
     }
     recovery_targets
         .iter()
-        .find(|target| target.window_id == mux_window_id && target.slot == slot)
+        .find(|target| target.slot == slot)
         .map(|target| target.tab_id)
 }
 
@@ -58,7 +57,13 @@ pub fn request_thinkterm_frontend_recovery(
         // a failed recovery target, not a reason to leave the domain parked in
         // Syncing forever.
         for target in recovery_targets {
-            let Some(gui_window) = frontend.gui_window_for_mux_window(target.window_id) else {
+            // A mux WindowId is process-local and can change when the remote
+            // server is replaced. Locate the retained native window through
+            // its stable frontend slot, then rebind that window to the fresh
+            // mux id below. Looking it up by target.window_id here caused a
+            // failed recovery to abort and retry forever while allocating a
+            // new mux window on every generation.
+            let Some(gui_window) = frontend.gui_window_for_recovery_slot(target.slot) else {
                 if let Some(domain) = Mux::get().get_domain(domain_id) {
                     if let Some(client) = domain.downcast_ref::<ClientDomain>() {
                         client.fail_frontend_recovery(
@@ -66,8 +71,8 @@ pub fn request_thinkterm_frontend_recovery(
                             target.tab_id,
                             connection_generation,
                             format!(
-                                "GUI window {} disappeared during mux recovery",
-                                target.window_id
+                                "GUI frontend slot {:?} disappeared during mux recovery",
+                                target.slot
                             ),
                         );
                     }
@@ -86,11 +91,32 @@ pub fn request_thinkterm_frontend_recovery(
                     let tab_id = frontend_recovery_tab(
                         current_generation,
                         connection_generation,
-                        term_window.mux_window_id,
                         term_window.frontend_recovery_slot(),
                         &[target],
                     );
                     if let Some(tab_id) = tab_id {
+                        let target_is_live = mux
+                            .get_window(target.window_id)
+                            .is_some_and(|window| window.idx_by_id(tab_id).is_some());
+                        if !target_is_live {
+                            if let Some(domain) = mux.get_domain(domain_id) {
+                                if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                                    client.fail_frontend_recovery(
+                                        target.slot,
+                                        tab_id,
+                                        connection_generation,
+                                        format!(
+                                            "replacement mux window {} no longer contains tab {}",
+                                            target.window_id, tab_id
+                                        ),
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                        if term_window.mux_window_id != target.window_id {
+                            term_window.switch_to_mux_window(target.window_id);
+                        }
                         if !term_window.sync_replacement_frontend_geometry(
                             tab_id,
                             target.slot,
@@ -138,6 +164,10 @@ pub struct GuiFrontEnd {
     switching_workspaces: RefCell<usize>,
     spawned_mux_window: RefCell<HashSet<MuxWindowId>>,
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
+    /// Stable native-window lookup used across replacement mux runtimes.
+    /// Unlike `known_windows`, this is keyed by the frontend-owned slot and
+    /// therefore remains valid while remote WindowIds are being replaced.
+    recovery_windows: RefCell<BTreeMap<FrontendRecoverySlot, Window>>,
     /// Set when the LAST GUI window closed and we detached whatever client
     /// domains were attached at that moment. A domain whose attach was still
     /// in flight shows as Detached then, escapes that sweep, and completes
@@ -169,6 +199,7 @@ impl GuiFrontEnd {
             switching_workspaces: RefCell::new(0),
             spawned_mux_window: RefCell::new(HashSet::new()),
             known_windows: RefCell::new(BTreeMap::new()),
+            recovery_windows: RefCell::new(BTreeMap::new()),
             detach_when_windowless: std::cell::Cell::new(false),
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
@@ -751,13 +782,21 @@ impl GuiFrontEnd {
         self.reconcile_workspace();
     }
 
-    pub fn record_known_window(&self, window: Window, mux_window_id: MuxWindowId) {
+    pub fn record_known_window(
+        &self,
+        window: Window,
+        mux_window_id: MuxWindowId,
+        recovery_slot: FrontendRecoverySlot,
+    ) {
         // A GUI window exists again: any pending last-window cleanup is moot.
         self.detach_when_windowless.set(false);
         // Mark this mux window as having a GUI window so the additive reconcile
         // never re-creates a window for it (e.g. after the user closes it while
         // its mux window keeps running in the background).
         self.spawned_mux_window.borrow_mut().insert(mux_window_id);
+        self.recovery_windows
+            .borrow_mut()
+            .insert(recovery_slot, window.clone());
         self.known_windows
             .borrow_mut()
             .insert(window, mux_window_id);
@@ -767,6 +806,9 @@ impl GuiFrontEnd {
     }
 
     pub fn forget_known_window(&self, window: &Window) {
+        self.recovery_windows
+            .borrow_mut()
+            .retain(|_, candidate| candidate != window);
         let now_empty = {
             let mut windows = self.known_windows.borrow_mut();
             windows.remove(window);
@@ -878,6 +920,15 @@ impl GuiFrontEnd {
         }
         None
     }
+
+    pub fn gui_window_for_recovery_slot(&self, slot: FrontendRecoverySlot) -> Option<GuiWin> {
+        let window = self.recovery_windows.borrow().get(&slot)?.clone();
+        let mux_window_id = self.known_windows.borrow().get(&window).copied()?;
+        Some(GuiWin {
+            mux_window_id,
+            window,
+        })
+    }
 }
 
 thread_local! {
@@ -978,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_recovery_targets_the_retained_window_in_the_current_generation() {
+    fn replacement_recovery_targets_the_stable_slot_in_the_current_generation() {
         let recovery_targets = [
             ThinkTermFrontendRecoveryTarget {
                 slot: FrontendRecoverySlot::Window(70),
@@ -995,7 +1046,6 @@ mod tests {
             frontend_recovery_tab(
                 Some(7),
                 7,
-                8,
                 FrontendRecoverySlot::Window(80),
                 &recovery_targets,
             ),
@@ -1005,41 +1055,23 @@ mod tests {
             frontend_recovery_tab(
                 Some(8),
                 7,
-                8,
                 FrontendRecoverySlot::Window(80),
                 &recovery_targets,
             ),
+            None
+        );
+        assert_eq!(
+            frontend_recovery_tab(None, 7, FrontendRecoverySlot::Window(80), &recovery_targets,),
             None
         );
         assert_eq!(
             frontend_recovery_tab(
                 Some(7),
                 7,
-                9,
-                FrontendRecoverySlot::Window(80),
-                &recovery_targets,
-            ),
-            None
-        );
-        assert_eq!(
-            frontend_recovery_tab(
-                None,
-                7,
-                8,
-                FrontendRecoverySlot::Window(80),
-                &recovery_targets,
-            ),
-            None
-        );
-        assert_eq!(
-            frontend_recovery_tab(
-                Some(7),
-                7,
-                8,
                 FrontendRecoverySlot::Window(70),
                 &recovery_targets,
             ),
-            None
+            Some(41)
         );
     }
 }

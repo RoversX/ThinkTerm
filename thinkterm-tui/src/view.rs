@@ -177,6 +177,9 @@ pub struct PaneView {
     /// The frame drawn around the pane, when it has one. Encloses the grid, its
     /// scrollbar and its nav bar.
     pub border: Option<Rect>,
+    /// A split branch too short to show normal chrome and a useful grid. It is
+    /// painted as an explicit compact pane instead of an orphaned output row.
+    pub collapsed: Option<Rect>,
 }
 
 #[derive(Clone, Debug)]
@@ -845,6 +848,7 @@ fn compute_panes(tab: &Arc<Tab>, ui: &UiState, area: Rect, view: &mut ViewLayout
         if rect.is_empty() {
             continue;
         }
+        let collapsed = (pane_count > 1 && rect.height < PANE_NAV_MIN_ROWS).then_some(rect);
         // Only where there is another pane to be told apart from. A lone pane
         // already has the window's own edges; framing it spends a row and two
         // columns to draw a line around the only thing on screen.
@@ -864,15 +868,20 @@ fn compute_panes(tab: &Arc<Tab>, ui: &UiState, area: Rect, view: &mut ViewLayout
         };
         // Above the grid, never over it, for the same reason as the scrollbar:
         // the row it takes is a row the terminal is then told it does not have.
-        let nav = compute_pane_nav(
-            pane_id,
-            &tab.pane_stack_tabs(pane_id),
-            positioned.is_zoomed,
-            ui.pane_nav_bar,
-            touch,
-            bar_area,
-            view,
-        );
+        let stack = tab.pane_stack_tabs(pane_id);
+        let nav = if collapsed.is_some() && ui.pane_nav_bar {
+            compute_collapsed_pane_nav(pane_id, &stack, positioned.is_zoomed, touch, bar_area, view)
+        } else {
+            compute_pane_nav(
+                pane_id,
+                &stack,
+                positioned.is_zoomed,
+                ui.pane_nav_bar,
+                touch,
+                bar_area,
+                view,
+            )
+        };
         let bar_rows = nav.as_ref().map_or(0, |nav| nav.rect.height);
         let rect = if framed {
             // The top edge is already spent on the bar (or is a plain edge when
@@ -913,6 +922,7 @@ fn compute_panes(tab: &Arc<Tab>, ui: &UiState, area: Rect, view: &mut ViewLayout
             scrollbar,
             nav,
             border,
+            collapsed,
         });
         view.hits.push(HitRegion {
             rect,
@@ -945,6 +955,63 @@ fn compute_panes(tab: &Arc<Tab>, ui: &UiState, area: Rect, view: &mut ViewLayout
 /// the desktop's order and deliberately so: on a phone, a pane that has just
 /// been split needs to be able to un-split itself by zooming far more than it
 /// needs to split again.
+/// A two-row split cannot afford the normal pane bar and its promised two rows
+/// of grid. Spend one row on a compact, zoomable identity and leave the other
+/// as the PTY grid. A one-row split keeps its only row as the grid, but the
+/// renderer still replaces its output with an explicit collapsed marker.
+fn compute_collapsed_pane_nav(
+    pane_id: PaneId,
+    stack: &[PaneStackTab],
+    zoomed: bool,
+    touch: bool,
+    rect: Rect,
+    view: &mut ViewLayout,
+) -> Option<PaneNav> {
+    let button = if touch { 3u16 } else { 2u16 };
+    if rect.height < 2 || rect.width < MIN_LABEL_COLUMNS.saturating_add(button) {
+        return None;
+    }
+    let bar = Rect::new(rect.x, rect.y, rect.width, 1);
+    let zoom = PaneTool::Zoom { zoomed };
+    let tool = Rect::new(bar.right() - button, bar.y, button, 1);
+    view.hits.push(HitRegion {
+        rect: tool,
+        target: HitTarget::PaneTool(pane_id, zoom),
+    });
+
+    let tabs = stack
+        .iter()
+        .find(|entry| entry.is_active)
+        .or_else(|| stack.first())
+        .map(|entry| {
+            let title = if entry.title.trim().is_empty() {
+                "shell"
+            } else {
+                entry.title.trim()
+            };
+            let tab = Rect::new(bar.x, bar.y, bar.width - button, 1);
+            view.hits.push(HitRegion {
+                rect: tab,
+                target: HitTarget::PaneNavTab(entry.pane_id),
+            });
+            PaneNavTab {
+                rect: tab,
+                pane_id: entry.pane_id,
+                label: format!(" … {title} "),
+                active: true,
+                close: None,
+            }
+        })
+        .into_iter()
+        .collect();
+
+    Some(PaneNav {
+        rect: bar,
+        tabs,
+        tools: vec![(tool, zoom)],
+    })
+}
+
 fn compute_pane_nav(
     pane_id: PaneId,
     stack: &[PaneStackTab],
@@ -1353,6 +1420,28 @@ mod tests {
             )
             .is_some(),
             "a seven-row pane keeps its controls"
+        );
+    }
+
+    #[test]
+    fn a_two_row_collapsed_pane_keeps_a_zoomable_identity() {
+        let entries = stack(&["shell"], 0);
+        let mut view = ViewLayout::default();
+        let nav = compute_collapsed_pane_nav(
+            1,
+            &entries,
+            false,
+            false,
+            Rect::new(4, 7, 30, 2),
+            &mut view,
+        )
+        .expect("two rows can show a compact bar and one grid row");
+        assert_eq!(nav.rect, Rect::new(4, 7, 30, 1));
+        assert_eq!(nav.tabs[0].label, " … shell ");
+        assert_eq!(nav.tools[0].1, PaneTool::Zoom { zoomed: false });
+        assert_eq!(
+            view.hit(nav.tools[0].0.x, nav.tools[0].0.y),
+            Some(&HitTarget::PaneTool(1, PaneTool::Zoom { zoomed: false }))
         );
     }
 

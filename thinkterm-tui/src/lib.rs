@@ -81,6 +81,10 @@ const RESIZE_REDRAW_WINDOW: Duration = Duration::from_millis(1500);
 /// the prefetch throttle refills between attempts.
 const RESIZE_REDRAW_INTERVAL: Duration = Duration::from_millis(60);
 const TAKEOVER_RESYNC_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Full-screen programs redraw after SIGWINCH asynchronously. Keep the
+/// takeover surface opaque until the acknowledged grid and all of its visible
+/// rows have stayed ready long enough for that redraw to land.
+const TAKEOVER_GEOMETRY_SETTLE: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 struct TakeoverEpochs {
@@ -102,6 +106,12 @@ impl TakeoverEpochs {
             .contains_key(&(domain_name.to_string(), tab_id))
     }
 
+    fn current(&self, domain_name: &str, tab_id: TabId) -> Option<u64> {
+        self.pending
+            .get(&(domain_name.to_string(), tab_id))
+            .copied()
+    }
+
     fn finish(&mut self, domain_name: &str, tab_id: TabId, epoch: u64) -> bool {
         let key = (domain_name.to_string(), tab_id);
         if self.pending.get(&key) != Some(&epoch) {
@@ -110,6 +120,28 @@ impl TakeoverEpochs {
         self.pending.remove(&key);
         true
     }
+
+    fn clear_domain(&mut self, domain_name: &str) {
+        self.pending.retain(|(domain, _), _| domain != domain_name);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TakeoverGeometryConfirmation {
+    epoch: u64,
+    root_size: TerminalSize,
+    panes: Vec<(PaneId, TerminalSize)>,
+    access_generation: u64,
+    ready_since: Option<Instant>,
+}
+
+fn takeover_geometry_settled(ready: bool, now: Instant, ready_since: &mut Option<Instant>) -> bool {
+    if !ready {
+        *ready_since = None;
+        return false;
+    }
+    let started = ready_since.get_or_insert(now);
+    now.duration_since(*started) >= TAKEOVER_GEOMETRY_SETTLE
 }
 
 fn effective_frontend_gate(
@@ -679,6 +711,10 @@ struct TuiState {
     /// reaching the pane if the claim round-trip completed very quickly.
     handoff_consumed_press: bool,
     takeover_epochs: TakeoverEpochs,
+    /// A successful ownership RPC is only the start of a handoff. Keep the
+    /// locally previewed pane surfaces pinned until the server has echoed the
+    /// same geometry and every visible row has been fetched.
+    takeover_geometry_confirmations: HashMap<(String, TabId), TakeoverGeometryConfirmation>,
     /// When the panes were last asked for new content, so the loop keeps asking
     /// even while nothing local has changed.
     last_pane_poll: Instant,
@@ -785,6 +821,7 @@ impl TuiState {
             handoff_geometry_ready: HashMap::new(),
             handoff_consumed_press: false,
             takeover_epochs: TakeoverEpochs::default(),
+            takeover_geometry_confirmations: HashMap::new(),
             last_pane_poll: Instant::now(),
             shared_views: HashMap::new(),
             shared_view_at: HashMap::new(),
@@ -874,6 +911,28 @@ impl TuiState {
             self.takeover_epochs.contains(&domain_name, remote_tab_id) || handoff_geometry_pending,
             remote_gate,
         )
+    }
+
+    /// Start (or reuse) the geometry epoch that keeps an automatically granted
+    /// B-mode owner opaque. Explicit claims create their epoch before sending
+    /// the RPC; this covers the first renderer, which becomes owner through an
+    /// ordinary viewport report instead.
+    fn ensure_active_handoff_geometry_epoch(&mut self) -> Option<u64> {
+        let (domain_name, domain, tab, remote_tab_id) = self.active_tab()?;
+        let access = domain.remote_access_state()?;
+        if access.mode != codec::FrontendAccessMode::Handoff
+            || domain.owns_remote_viewport(tab.tab_id()) != Some(true)
+            || self
+                .handoff_geometry_ready
+                .get(&(domain_name.clone(), remote_tab_id))
+                == Some(&access.generation)
+        {
+            return None;
+        }
+        if let Some(epoch) = self.takeover_epochs.current(&domain_name, remote_tab_id) {
+            return Some(epoch);
+        }
+        Some(self.takeover_epochs.begin(&domain_name, remote_tab_id))
     }
 
     fn frontend_surface_blocked(&self) -> bool {
@@ -1078,7 +1137,14 @@ async fn run_terminal(
                         .pending_frontend_recovery(FrontendRecoverySlot::Primary, tab.tab_id())
                         .is_some()
                 });
-                prepare_active_native_viewport(&mut state, area, screen, recovery_pending);
+                let preview_epoch = state.ensure_active_handoff_geometry_epoch();
+                prepare_active_native_viewport(
+                    &mut state,
+                    area,
+                    screen,
+                    recovery_pending,
+                    preview_epoch,
+                );
             }
             let active = state.active_tab();
             let local_tab = active.as_ref().map(|(_, _, tab, _)| Arc::clone(tab));
@@ -1116,6 +1182,7 @@ async fn run_terminal(
             state.dirty = false;
             report_viewport_if_changed(&mut state, rendered.selected_tab, terminal.backend_mut())
                 .await;
+            advance_takeover_geometry_confirmation(&mut state);
         }
 
         let now = Instant::now();
@@ -1311,6 +1378,7 @@ fn drain_events(receiver: &Receiver<AppEvent>, state: &mut TuiState) {
                         && domain.connection_generation() == Some(connection_generation)
                 });
                 if current {
+                    cancel_takeover_geometry_for_domain(state, &domain_name);
                     connection_changed = true;
                     state
                         .connection_generations
@@ -1417,6 +1485,7 @@ fn prepare_active_native_viewport(
     area: ratatui::layout::Rect,
     screen: ScreenSize,
     force: bool,
+    preview_epoch: Option<u64>,
 ) -> Option<ClientViewport> {
     let (_, domain, tab, _) = state.active_tab()?;
     if !force && domain.owns_remote_viewport(tab.tab_id()) != Some(true) {
@@ -1438,13 +1507,25 @@ fn prepare_active_native_viewport(
     let mut panes = Vec::new();
     for pane in &layout.panes {
         let handle = Mux::get().get_pane(pane.pane_id)?;
-        let client = handle.downcast_ref::<ClientPane>()?;
+        handle.downcast_ref::<ClientPane>()?;
         let size = terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen);
-        client.adopt_frontend_geometry(size);
         panes.push(codec::ClientPaneViewport {
             pane_id: pane.pane_id,
             size,
         });
+    }
+    // Validate the complete pane set before mutating any surface. A topology
+    // notification can remove one pane between the two layout passes; applying
+    // half a viewport would recreate the very mixed geometry this path is
+    // meant to prevent.
+    for pane in &panes {
+        let handle = Mux::get().get_pane(pane.pane_id)?;
+        let client = handle.downcast_ref::<ClientPane>()?;
+        if let Some(epoch) = preview_epoch {
+            client.preview_frontend_geometry(epoch, pane.size);
+        } else {
+            client.adopt_frontend_geometry(pane.size);
+        }
     }
     state.layout = layout;
     Some(ClientViewport::Native { size: root, panes })
@@ -1461,6 +1542,188 @@ fn forget_native_viewport_geometry(viewport: &ClientViewport) {
             }
         }
     }
+}
+
+fn finish_native_viewport_preview(viewport: &ClientViewport, epoch: u64, succeeded: bool) {
+    let ClientViewport::Native { panes, .. } = viewport else {
+        return;
+    };
+    for pane in panes {
+        if let Some(handle) = Mux::get().get_pane(pane.pane_id) {
+            if let Some(client) = handle.downcast_ref::<ClientPane>() {
+                client.finish_frontend_geometry_preview(epoch, pane.size, succeeded);
+            }
+        }
+    }
+}
+
+fn begin_takeover_geometry_confirmation(
+    state: &mut TuiState,
+    cache_key: (String, TabId),
+    epoch: u64,
+    viewport: &ClientViewport,
+    access_generation: u64,
+) {
+    let ClientViewport::Native { size, panes } = viewport else {
+        return;
+    };
+    state.takeover_geometry_confirmations.insert(
+        cache_key,
+        TakeoverGeometryConfirmation {
+            epoch,
+            root_size: *size,
+            panes: panes.iter().map(|pane| (pane.pane_id, pane.size)).collect(),
+            access_generation,
+            ready_since: None,
+        },
+    );
+    state.redraw_until = Some(Instant::now() + RESIZE_REDRAW_WINDOW);
+    state.dirty = true;
+}
+
+fn cancel_takeover_geometry_confirmation(
+    state: &mut TuiState,
+    cache_key: &(String, TabId),
+    confirmation: &TakeoverGeometryConfirmation,
+) {
+    let viewport = ClientViewport::Native {
+        size: confirmation.root_size,
+        panes: confirmation
+            .panes
+            .iter()
+            .map(|(pane_id, size)| codec::ClientPaneViewport {
+                pane_id: *pane_id,
+                size: *size,
+            })
+            .collect(),
+    };
+    finish_native_viewport_preview(&viewport, confirmation.epoch, false);
+    state
+        .takeover_epochs
+        .finish(&cache_key.0, cache_key.1, confirmation.epoch);
+    state.takeover_geometry_confirmations.remove(cache_key);
+    if state.handoff_geometry_ready.get(cache_key) == Some(&confirmation.access_generation) {
+        state.handoff_geometry_ready.remove(cache_key);
+    }
+    state.dirty = true;
+}
+
+fn cancel_takeover_geometry_for_domain(state: &mut TuiState, domain_name: &str) {
+    let keys: Vec<_> = state
+        .takeover_geometry_confirmations
+        .keys()
+        .filter(|(domain, _)| domain == domain_name)
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(confirmation) = state.takeover_geometry_confirmations.get(&key).cloned() {
+            cancel_takeover_geometry_confirmation(state, &key, &confirmation);
+        }
+    }
+    state.takeover_epochs.clear_domain(domain_name);
+}
+
+fn active_layout_matches_takeover(
+    state: &TuiState,
+    tab: &Arc<Tab>,
+    confirmation: &TakeoverGeometryConfirmation,
+) -> bool {
+    if tab.get_size() != confirmation.root_size {
+        return false;
+    }
+    let Some(screen) = state.screen_size else {
+        return false;
+    };
+    if terminal_size(
+        state.layout.content.width as usize,
+        state.layout.content.height as usize,
+        screen,
+    ) != confirmation.root_size
+    {
+        return false;
+    }
+    confirmation.panes.iter().all(|(pane_id, expected)| {
+        state
+            .layout
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == *pane_id)
+            .is_some_and(|pane| {
+                terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen)
+                    == *expected
+            })
+    })
+}
+
+/// Confirm the same three layers before revealing a handoff: the local split
+/// tree covers this TTY, every pane surface still has the previewed size, and
+/// the server has returned a complete snapshot at that size. The preview pins
+/// late deltas from the prior GUI until all three agree.
+fn advance_takeover_geometry_confirmation(state: &mut TuiState) {
+    let Some((domain_name, domain, tab, remote_tab_id)) = state.active_tab() else {
+        return;
+    };
+    let cache_key = (domain_name, remote_tab_id);
+    let Some(mut confirmation) = state
+        .takeover_geometry_confirmations
+        .get(&cache_key)
+        .cloned()
+    else {
+        return;
+    };
+
+    let access = domain.remote_access_state();
+    let still_owned = domain.owns_remote_viewport(tab.tab_id()) == Some(true)
+        && access.as_ref().is_some_and(|access| {
+            access.mode == codec::FrontendAccessMode::Handoff
+                && access.generation == confirmation.access_generation
+        })
+        && state.takeover_epochs.current(&cache_key.0, cache_key.1) == Some(confirmation.epoch);
+    if !still_owned {
+        cancel_takeover_geometry_confirmation(state, &cache_key, &confirmation);
+        return;
+    }
+
+    let mut ready = active_layout_matches_takeover(state, &tab, &confirmation)
+        && !confirmation.panes.is_empty();
+    for (pane_id, size) in &confirmation.panes {
+        let pane_ready = Mux::get()
+            .get_pane(*pane_id)
+            .and_then(|pane| {
+                pane.downcast_ref::<ClientPane>()
+                    .map(|client| client.prime_frontend_geometry(*size))
+            })
+            .unwrap_or(false);
+        ready &= pane_ready;
+    }
+
+    if !takeover_geometry_settled(ready, Instant::now(), &mut confirmation.ready_since) {
+        state
+            .takeover_geometry_confirmations
+            .insert(cache_key, confirmation);
+        return;
+    }
+
+    let viewport = ClientViewport::Native {
+        size: confirmation.root_size,
+        panes: confirmation
+            .panes
+            .iter()
+            .map(|(pane_id, size)| codec::ClientPaneViewport {
+                pane_id: *pane_id,
+                size: *size,
+            })
+            .collect(),
+    };
+    finish_native_viewport_preview(&viewport, confirmation.epoch, true);
+    state
+        .takeover_epochs
+        .finish(&cache_key.0, cache_key.1, confirmation.epoch);
+    state
+        .handoff_geometry_ready
+        .insert(cache_key.clone(), confirmation.access_generation);
+    state.takeover_geometry_confirmations.remove(&cache_key);
+    state.dirty = true;
 }
 
 async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
@@ -1542,6 +1805,9 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
         && handoff_generation.is_some_and(|generation| {
             state.handoff_geometry_ready.get(&cache_key) != Some(&generation)
         });
+    let geometry_confirmation_pending = state
+        .takeover_geometry_confirmations
+        .contains_key(&cache_key);
     for candidate in state.domains.values() {
         if candidate.domain_id() != domain.domain_id() {
             candidate.clear_frontend_recovery_intent(FrontendRecoverySlot::Primary);
@@ -1554,7 +1820,7 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
     }
 
     if recovery_generation.is_some()
-        || geometry_generation_is_stale
+        || (geometry_generation_is_stale && !geometry_confirmation_pending)
         || state.last_viewports.get(&cache_key) != Some(&Some((viewport.clone(), owns)))
     {
         match domain
@@ -1572,7 +1838,18 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
                 );
                 if let Some(generation) = recovery_generation {
                     if let Err(err) = domain.resync().await {
-                        forget_native_viewport_geometry(&viewport);
+                        if let Some(epoch) =
+                            state.takeover_epochs.current(&cache_key.0, cache_key.1)
+                        {
+                            finish_native_viewport_preview(&viewport, epoch, false);
+                            state
+                                .takeover_epochs
+                                .finish(&cache_key.0, cache_key.1, epoch);
+                            state.takeover_geometry_confirmations.remove(&cache_key);
+                            state.handoff_geometry_ready.remove(&cache_key);
+                        } else {
+                            forget_native_viewport_geometry(&viewport);
+                        }
                         domain.fail_frontend_recovery(
                             FrontendRecoverySlot::Primary,
                             local_tab_id,
@@ -1598,11 +1875,26 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
                 }
                 if owns && matches!(viewport, ClientViewport::Native { .. }) {
                     if response.access.mode == codec::FrontendAccessMode::Handoff {
-                        let prior = state
-                            .handoff_geometry_ready
-                            .insert(cache_key.clone(), response.access.generation);
-                        if prior != Some(response.access.generation) {
-                            state.dirty = true;
+                        if let Some(epoch) =
+                            state.takeover_epochs.current(&cache_key.0, cache_key.1)
+                        {
+                            begin_takeover_geometry_confirmation(
+                                state,
+                                cache_key.clone(),
+                                epoch,
+                                &viewport,
+                                response.access.generation,
+                            );
+                        } else {
+                            // An ordinary resize by an already-confirmed owner
+                            // does not obscure the terminal. Its access
+                            // generation is unchanged and remains ready.
+                            let prior = state
+                                .handoff_geometry_ready
+                                .insert(cache_key.clone(), response.access.generation);
+                            if prior != Some(response.access.generation) {
+                                state.dirty = true;
+                            }
                         }
                     }
                 } else if owns {
@@ -1613,7 +1905,16 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
                 }
             }
             Err(err) => {
-                forget_native_viewport_geometry(&viewport);
+                if let Some(epoch) = state.takeover_epochs.current(&cache_key.0, cache_key.1) {
+                    finish_native_viewport_preview(&viewport, epoch, false);
+                    state
+                        .takeover_epochs
+                        .finish(&cache_key.0, cache_key.1, epoch);
+                    state.takeover_geometry_confirmations.remove(&cache_key);
+                    state.handoff_geometry_ready.remove(&cache_key);
+                } else {
+                    forget_native_viewport_geometry(&viewport);
+                }
                 if let Some(generation) = recovery_generation {
                     domain.fail_frontend_recovery(
                         FrontendRecoverySlot::Primary,
@@ -1860,20 +2161,35 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
     let handoff = domain
         .remote_access_state()
         .is_some_and(|access| access.mode == codec::FrontendAccessMode::Handoff);
+    let epoch = state.takeover_epochs.begin(&domain_name, remote_tab_id);
     let viewport = if handoff {
         let area = state.layout.screen;
-        prepare_active_native_viewport(state, area, screen, true)
-            .context("viewport is not ready; retry after the terminal redraws")?
+        match prepare_active_native_viewport(state, area, screen, true, Some(epoch)) {
+            Some(viewport) => viewport,
+            None => {
+                state
+                    .takeover_epochs
+                    .finish(&domain_name, remote_tab_id, epoch);
+                anyhow::bail!("viewport is not ready; retry after the terminal redraws");
+            }
+        }
     } else {
-        state
+        match state
             .last_viewports
             .get(&(domain_name.clone(), remote_tab_id))
             .and_then(|entry| entry.as_ref())
             .map(|(viewport, _)| viewport.clone())
-            .context("viewport is not ready; retry after the terminal redraws")?
+        {
+            Some(viewport) => viewport,
+            None => {
+                state
+                    .takeover_epochs
+                    .finish(&domain_name, remote_tab_id, epoch);
+                anyhow::bail!("viewport is not ready; retry after the terminal redraws");
+            }
+        }
     };
     let reported_size = viewport.size();
-    let epoch = state.takeover_epochs.begin(&domain_name, remote_tab_id);
     state.dirty = true;
     let claimed = match domain
         .claim_client_viewport(local_tab_id, viewport.clone())
@@ -1881,7 +2197,11 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
     {
         Ok(claimed) => claimed,
         Err(err) => {
-            forget_native_viewport_geometry(&viewport);
+            if handoff {
+                finish_native_viewport_preview(&viewport, epoch, false);
+            } else {
+                forget_native_viewport_geometry(&viewport);
+            }
             state
                 .takeover_epochs
                 .finish(&domain_name, remote_tab_id, epoch);
@@ -1889,7 +2209,11 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
         }
     };
     if domain.owns_remote_viewport(local_tab_id) != Some(true) {
-        forget_native_viewport_geometry(&viewport);
+        if handoff {
+            finish_native_viewport_preview(&viewport, epoch, false);
+        } else {
+            forget_native_viewport_geometry(&viewport);
+        }
         state
             .takeover_epochs
             .finish(&domain_name, remote_tab_id, epoch);
@@ -1909,17 +2233,22 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
         );
         schedule_takeover_resync(domain_name.clone(), Arc::clone(&domain));
     }
-    state
-        .takeover_epochs
-        .finish(&domain_name, remote_tab_id, epoch);
     let cache_key = (domain_name, remote_tab_id);
     state
         .last_viewports
-        .insert(cache_key.clone(), Some((viewport, true)));
+        .insert(cache_key.clone(), Some((viewport.clone(), true)));
     if claimed.access.mode == codec::FrontendAccessMode::Handoff {
+        begin_takeover_geometry_confirmation(
+            state,
+            cache_key.clone(),
+            epoch,
+            &viewport,
+            claimed.access.generation,
+        );
+    } else {
         state
-            .handoff_geometry_ready
-            .insert(cache_key.clone(), claimed.access.generation);
+            .takeover_epochs
+            .finish(&cache_key.0, cache_key.1, epoch);
     }
     for pane in &state.layout.panes {
         state.ui.set_scroll_offset(pane.pane_id, 0);
@@ -1954,7 +2283,7 @@ async fn set_active_frontend_access_mode(
         .screen_size
         .context("viewport is not ready; retry after the terminal redraws")?;
     let area = state.layout.screen;
-    let viewport = prepare_active_native_viewport(state, area, screen, false)
+    let viewport = prepare_active_native_viewport(state, area, screen, false, None)
         .context("viewport is not ready; retry after the terminal redraws")?;
     let access = domain
         .set_frontend_access_mode(local_tab_id, mode, viewport.clone())
@@ -2163,6 +2492,7 @@ async fn dispatch_action(state: &mut TuiState, action: Action) -> Result<()> {
             retry_domain(state, &name).await?
         }
         Action::DisconnectDomain(name) => {
+            cancel_takeover_geometry_for_domain(state, &name);
             if let Some(domain) = state.domains.get(&name) {
                 domain.perform_detach();
             }
@@ -4989,6 +5319,29 @@ mod tests {
             effective_frontend_gate(true, RemoteFrontendGate::Visible),
             RemoteFrontendGate::Syncing
         );
+    }
+
+    #[test]
+    fn takeover_geometry_requires_a_quiet_ready_window() {
+        let started = Instant::now();
+        let mut ready_since = None;
+        assert!(!takeover_geometry_settled(true, started, &mut ready_since));
+        assert!(!takeover_geometry_settled(
+            true,
+            started + TAKEOVER_GEOMETRY_SETTLE / 2,
+            &mut ready_since
+        ));
+        assert!(takeover_geometry_settled(
+            true,
+            started + TAKEOVER_GEOMETRY_SETTLE,
+            &mut ready_since
+        ));
+        assert!(!takeover_geometry_settled(
+            false,
+            started + TAKEOVER_GEOMETRY_SETTLE * 2,
+            &mut ready_since
+        ));
+        assert!(ready_since.is_none());
     }
 
     #[test]

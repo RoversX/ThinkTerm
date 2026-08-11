@@ -2534,8 +2534,14 @@ impl TermWindow {
         // switch_to_mux_window. Recording the stale construction id would point
         // known_windows at a mux window the restore just orphaned (and possibly
         // killed), and the next reconcile would then close this brand-new window.
-        let adopted_mux_window_id = tw.borrow().mux_window_id;
-        front_end().record_known_window(window, adopted_mux_window_id);
+        let (adopted_mux_window_id, recovery_slot) = {
+            let term_window = tw.borrow();
+            (
+                term_window.mux_window_id,
+                term_window.frontend_recovery_slot(),
+            )
+        };
+        front_end().record_known_window(window, adopted_mux_window_id, recovery_slot);
 
         Ok(())
     }

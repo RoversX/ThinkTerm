@@ -1,7 +1,7 @@
 use crate::model::AppModel;
 use crate::settings::TuiConfig;
 use crate::state::{AppMode, ConnectionStatus, SelectionPoint, TextSelection, UiState, ViewClass};
-use crate::view::{PaneNav, ViewLayout};
+use crate::view::{PaneNav, PaneView, SplitView, ViewLayout};
 use mux::pane::{Pane, PaneId, SearchResult};
 use mux::tab::{SplitDirection, Tab, TabId};
 use ratatui::layout::{Alignment, Rect};
@@ -305,6 +305,17 @@ fn render_panes(frame: &mut Frame<'_>, tab: &Arc<Tab>, ui: &UiState, view: &View
         else {
             continue;
         };
+        if let Some(collapsed) = pane_view.collapsed {
+            paint_collapsed_pane(
+                frame,
+                &positioned.pane,
+                pane_view,
+                collapsed,
+                tab.get_active_pane()
+                    .is_some_and(|active| active.pane_id() == pane_view.pane_id),
+            );
+            continue;
+        }
         if let Some(border) = pane_view.border {
             let focused = tab
                 .get_active_pane()
@@ -335,14 +346,16 @@ fn render_panes(frame: &mut Frame<'_>, tab: &Arc<Tab>, ui: &UiState, view: &View
     // frames is a third line of chrome in a row that has two. When the frames
     // were not drawn — too small, or turned off — the divider is the only thing
     // separating them.
-    let framed = view.panes.iter().any(|pane| pane.border.is_some());
-    for split in view.splits.iter().filter(|_| !framed) {
+    for split in &view.splits {
         let symbol = match split.direction {
             SplitDirection::Horizontal => "│",
             SplitDirection::Vertical => "─",
         };
         for y in split.rect.y..split.rect.bottom() {
             for x in split.rect.x..split.rect.right() {
+                if !split_cell_needs_divider(view, split, x, y) {
+                    continue;
+                }
                 frame.buffer_mut()[(x, y)]
                     .set_symbol(symbol)
                     .set_style(chrome_border());
@@ -354,7 +367,7 @@ fn render_panes(frame: &mut Frame<'_>, tab: &Arc<Tab>, ui: &UiState, view: &View
         if let Some(pane_view) = view
             .panes
             .iter()
-            .find(|pane| pane.pane_id == active.pane_id())
+            .find(|pane| pane.pane_id == active.pane_id() && pane.collapsed.is_none())
         {
             let dims = active.get_dimensions();
             let offset = ui.scroll_offset(active.pane_id());
@@ -373,6 +386,69 @@ fn render_panes(frame: &mut Frame<'_>, tab: &Arc<Tab>, ui: &UiState, view: &View
             }
         }
     }
+}
+
+fn split_cell_needs_divider(view: &ViewLayout, split: &SplitView, x: u16, y: u16) -> bool {
+    let framed_on_both_sides = match split.direction {
+        SplitDirection::Horizontal => {
+            let left = view.panes.iter().any(|pane| {
+                pane.border.is_some_and(|border| {
+                    border.right() == x && y >= border.y && y < border.bottom()
+                })
+            });
+            let right = view.panes.iter().any(|pane| {
+                pane.border.is_some_and(|border| {
+                    border.x == x.saturating_add(1) && y >= border.y && y < border.bottom()
+                })
+            });
+            left && right
+        }
+        SplitDirection::Vertical => {
+            let above = view.panes.iter().any(|pane| {
+                pane.border.is_some_and(|border| {
+                    border.bottom() == y && x >= border.x && x < border.right()
+                })
+            });
+            let below = view.panes.iter().any(|pane| {
+                pane.border.is_some_and(|border| {
+                    border.y == y.saturating_add(1) && x >= border.x && x < border.right()
+                })
+            });
+            above && below
+        }
+    };
+    !framed_on_both_sides
+}
+
+fn paint_collapsed_pane(
+    frame: &mut Frame<'_>,
+    pane: &Arc<dyn Pane>,
+    pane_view: &PaneView,
+    area: Rect,
+    focused: bool,
+) {
+    fill(frame, area, " ", chrome());
+    if let Some(nav) = &pane_view.nav {
+        paint_pane_nav(frame, nav, focused);
+        return;
+    }
+    let title = pane.get_title();
+    let title = if title.trim().is_empty() {
+        "shell"
+    } else {
+        title.trim()
+    };
+    let label = format!(" … {title} (pane too small) ");
+    draw_text(
+        frame,
+        area,
+        &label,
+        if focused {
+            chrome_accent_text().add_modifier(Modifier::BOLD)
+        } else {
+            chrome_dim()
+        },
+    );
 }
 
 /// Draw one pane's own strip: what is stacked behind it, and what can be done
@@ -1211,6 +1287,35 @@ mod tests {
     use super::*;
 
     static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn divider_test_pane(pane_id: PaneId, border: Option<Rect>) -> PaneView {
+        PaneView {
+            pane_id,
+            rect: border.unwrap_or_default(),
+            scrollbar: None,
+            nav: None,
+            border,
+            collapsed: None,
+        }
+    }
+
+    #[test]
+    fn mixed_pane_frames_keep_the_uncovered_divider() {
+        let split = SplitView {
+            index: 0,
+            rect: Rect::new(5, 0, 1, 4),
+            direction: SplitDirection::Horizontal,
+        };
+        let mut view = ViewLayout::default();
+        view.panes = vec![
+            divider_test_pane(1, Some(Rect::new(0, 0, 5, 4))),
+            divider_test_pane(2, Some(Rect::new(6, 0, 5, 4))),
+        ];
+        assert!(!split_cell_needs_divider(&view, &split, 5, 2));
+
+        view.panes[1].border = None;
+        assert!(split_cell_needs_divider(&view, &split, 5, 2));
+    }
 
     #[test]
     fn fit_text_respects_cell_width() {
