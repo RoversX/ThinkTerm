@@ -166,6 +166,30 @@ pub(crate) enum NativeBottomQuoteMode {
     PseudoRandom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeRemotePaneResizeMode {
+    Auto,
+    Live,
+    OnRelease,
+}
+
+impl Default for NativeRemotePaneResizeMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl NativeRemotePaneResizeMode {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Live,
+            Self::Live => Self::OnRelease,
+            Self::OnRelease => Self::Auto,
+        }
+    }
+}
+
 impl Default for NativeBottomQuoteMode {
     fn default() -> Self {
         Self::Timed
@@ -193,10 +217,15 @@ pub(crate) struct NativeAppearanceSettings {
 pub(crate) struct NativeTerminalSettings {
     pub(crate) font_size: Option<f64>,
     pub(crate) font_family: Option<String>,
+    pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
     pub(crate) bottom_quote_enabled: bool,
     pub(crate) bottom_quote_mode: NativeBottomQuoteMode,
     pub(crate) bottom_quote_interval_minutes: Option<u32>,
     pub(crate) bottom_quote_font_size: Option<f64>,
+}
+
+pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
+    load().terminal.remote_pane_resize_mode
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -792,6 +821,34 @@ mod tests {
             settings.workspaces.remote_sftp_idle_minutes,
             DEFAULT_REMOTE_SFTP_IDLE_MINUTES
         );
+    }
+
+    #[test]
+    fn older_settings_default_remote_pane_resize_to_auto() {
+        let settings: ThinkTermNativeSettings = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert_eq!(
+            settings.terminal.remote_pane_resize_mode,
+            NativeRemotePaneResizeMode::Auto
+        );
+    }
+
+    #[test]
+    fn remote_pane_resize_modes_use_stable_snake_case_values() {
+        for (mode, encoded) in [
+            (NativeRemotePaneResizeMode::Auto, "auto"),
+            (NativeRemotePaneResizeMode::Live, "live"),
+            (NativeRemotePaneResizeMode::OnRelease, "on_release"),
+        ] {
+            let mut settings = ThinkTermNativeSettings::default();
+            settings.terminal.remote_pane_resize_mode = mode;
+            let value = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                value["terminal"]["remote_pane_resize_mode"],
+                serde_json::Value::String(encoded.to_string())
+            );
+            let decoded: ThinkTermNativeSettings = serde_json::from_value(value).unwrap();
+            assert_eq!(decoded.terminal.remote_pane_resize_mode, mode);
+        }
     }
 
     #[test]

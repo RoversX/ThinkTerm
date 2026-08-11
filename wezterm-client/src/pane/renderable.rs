@@ -33,6 +33,12 @@ struct FetchToken {
     started_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrontendPreviewGeometry {
+    epoch: u64,
+    size: wezterm_term::TerminalSize,
+}
+
 #[derive(Debug)]
 enum LineEntry {
     // Up to date wrt. server and has been rendered at least once
@@ -98,6 +104,22 @@ fn render_dimensions_match_terminal_size(
         && dimensions.dpi == size.dpi
 }
 
+fn resolve_server_geometry(
+    visible: RenderableDimensions,
+    previous_server: RenderableDimensions,
+    next_server: RenderableDimensions,
+    preview_active: bool,
+) -> (RenderableDimensions, Option<bool>) {
+    if preview_active {
+        let invalidation = render_geometry_changed(previous_server, next_server).then_some(true);
+        (visible, invalidation)
+    } else if render_geometry_changed(visible, next_server) {
+        (next_server, Some(visible.cols == next_server.cols))
+    } else {
+        (next_server, None)
+    }
+}
+
 fn fetch_token_is_current(token: FetchToken, epoch: u64) -> bool {
     token.epoch == epoch
 }
@@ -118,6 +140,11 @@ pub struct RenderableInner {
     /// server value separate lets it remain masked until a post-resize render
     /// snapshot has actually arrived.
     server_dimensions: RenderableDimensions,
+    /// While a native GUI divider is moving, this is the authoritative render
+    /// surface. Remote snapshots continue updating `server_dimensions` and
+    /// line contents, but cannot bounce the visible surface back to an older
+    /// grid between mouse-move frames.
+    frontend_preview: Option<FrontendPreviewGeometry>,
 
     lines: LruCache<StableRowIndex, LineEntry>,
     line_cache_epoch: u64,
@@ -161,6 +188,7 @@ impl RenderableInner {
             cursor_position: StableCursorPosition::default(),
             dimensions,
             server_dimensions: dimensions,
+            frontend_preview: None,
             lines: LruCache::new(
                 NonZeroUsize::new(configuration().scrollback_lines.max(128)).unwrap(),
             ),
@@ -406,13 +434,19 @@ impl RenderableInner {
         {
             self.cursor_position = delta.cursor_position;
         }
+        let prior_server_dimensions = self.server_dimensions;
         self.server_dimensions = delta.dimensions;
-        if render_geometry_changed(self.dimensions, delta.dimensions) {
-            let preserve_lines = self.dimensions.cols == delta.dimensions.cols;
-            self.dimensions = delta.dimensions;
+        let (visible_dimensions, invalidate) = resolve_server_geometry(
+            self.dimensions,
+            prior_server_dimensions,
+            delta.dimensions,
+            self.frontend_preview.is_some(),
+        );
+        self.dimensions = visible_dimensions;
+        if let Some(preserve_lines) = invalidate {
+            // During a preview, retain old rows while marking them stale. This
+            // prevents a blank flash as a full-screen application redraws.
             self.invalidate_line_cache(preserve_lines);
-        } else {
-            self.dimensions = delta.dimensions;
         }
         self.title = delta.title;
         self.working_dir = delta.working_dir.map(Into::into);
@@ -524,6 +558,53 @@ impl RenderableInner {
         self.dimensions.pixel_height = size.pixel_height;
         self.dimensions.dpi = size.dpi;
         self.invalidate_line_cache(preserve_lines);
+        true
+    }
+
+    pub(crate) fn begin_frontend_preview(
+        &mut self,
+        epoch: u64,
+        size: wezterm_term::TerminalSize,
+    ) -> bool {
+        if self
+            .frontend_preview
+            .is_some_and(|preview| preview.epoch > epoch)
+        {
+            return false;
+        }
+        self.frontend_preview = Some(FrontendPreviewGeometry { epoch, size });
+        if render_dimensions_match_terminal_size(self.dimensions, size) {
+            return false;
+        }
+        self.dimensions.cols = size.cols;
+        self.dimensions.viewport_rows = size.rows;
+        self.dimensions.pixel_width = size.pixel_width;
+        self.dimensions.pixel_height = size.pixel_height;
+        self.dimensions.dpi = size.dpi;
+        true
+    }
+
+    pub(crate) fn server_geometry_matches(&self, size: wezterm_term::TerminalSize) -> bool {
+        render_dimensions_match_terminal_size(self.server_dimensions, size)
+    }
+
+    pub(crate) fn end_frontend_preview(&mut self, epoch: u64, succeeded: bool) -> bool {
+        let Some(preview) = self.frontend_preview else {
+            return false;
+        };
+        if preview.epoch != epoch {
+            return false;
+        }
+        self.frontend_preview = None;
+        if succeeded && self.server_geometry_matches(preview.size) {
+            self.dimensions = self.server_dimensions;
+            return true;
+        }
+        if !succeeded && render_geometry_changed(self.dimensions, self.server_dimensions) {
+            let preserve_lines = self.dimensions.cols == self.server_dimensions.cols;
+            self.dimensions = self.server_dimensions;
+            self.invalidate_line_cache(preserve_lines);
+        }
         true
     }
 
@@ -1064,6 +1145,21 @@ mod test {
         let mut new_dpi = current;
         new_dpi.dpi += 1;
         assert!(render_geometry_changed(current, new_dpi));
+    }
+
+    #[test]
+    fn server_updates_cannot_replace_a_pinned_preview_grid() {
+        let server = dimensions(80, 24, 96);
+        let preview = dimensions(140, 42, 96);
+        let next_server = dimensions(100, 30, 96);
+
+        let (visible, invalidation) = resolve_server_geometry(preview, server, next_server, true);
+        assert_eq!(visible, preview);
+        assert_eq!(invalidation, Some(true));
+
+        let (visible, invalidation) = resolve_server_geometry(server, server, next_server, false);
+        assert_eq!(visible, next_server);
+        assert_eq!(invalidation, Some(false));
     }
 
     #[test]

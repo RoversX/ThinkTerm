@@ -36,9 +36,10 @@ use window::{
 };
 
 use crate::native_settings::{
-    NativeAppIcon, NativeBottomQuoteMode, NativeRendererBackend, NativeThemeMode,
-    ThinkTermNativeSettings, DEFAULT_HOME_FONT_SIZE, DEFAULT_PANE_HEADER_FONT_SIZE,
-    DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE, DEFAULT_TAB_FONT_SIZE,
+    NativeAppIcon, NativeBottomQuoteMode, NativeRemotePaneResizeMode, NativeRendererBackend,
+    NativeThemeMode, ThinkTermNativeSettings, DEFAULT_HOME_FONT_SIZE,
+    DEFAULT_PANE_HEADER_FONT_SIZE, DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE,
+    DEFAULT_TAB_FONT_SIZE,
 };
 use fluent_bundle::FluentArgs;
 
@@ -356,6 +357,14 @@ fn localized_quote_mode_label(mode: NativeBottomQuoteMode) -> String {
     })
 }
 
+fn localized_remote_pane_resize_mode_label(mode: NativeRemotePaneResizeMode) -> String {
+    crate::i18n::tr(match mode {
+        NativeRemotePaneResizeMode::Auto => "settings-remote-pane-resize-mode-auto",
+        NativeRemotePaneResizeMode::Live => "settings-remote-pane-resize-mode-live",
+        NativeRemotePaneResizeMode::OnRelease => "settings-remote-pane-resize-mode-on-release",
+    })
+}
+
 fn settings_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
     let mut args = FluentArgs::new();
     for (name, value) in values {
@@ -399,6 +408,7 @@ enum SettingsAction {
     RestartApplication,
     QuitApplication,
     ToggleBottomQuote,
+    CycleRemotePaneResizeMode,
     CycleBottomQuoteMode,
     DecreaseBottomQuoteFontSize,
     IncreaseBottomQuoteFontSize,
@@ -3048,6 +3058,39 @@ impl SettingsWindow {
                 };
                 self.save_and_apply_bottom_quote_settings(status);
             }
+            SettingsAction::CycleRemotePaneResizeMode => {
+                self.ui.open_dropdown = None;
+                self.native_settings.terminal.remote_pane_resize_mode =
+                    self.native_settings.terminal.remote_pane_resize_mode.next();
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.invalidate_all_windows();
+                        }
+                        self.status = settings_tr(
+                            "settings-status-value-now",
+                            &[
+                                (
+                                    "setting",
+                                    crate::i18n::tr("settings-remote-pane-resize-mode"),
+                                ),
+                                (
+                                    "value",
+                                    localized_remote_pane_resize_mode_label(
+                                        self.native_settings.terminal.remote_pane_resize_mode,
+                                    ),
+                                ),
+                            ],
+                        );
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-terminal-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::CycleBottomQuoteMode => {
                 self.ui.open_dropdown = None;
                 self.native_settings.terminal.bottom_quote_mode =
@@ -3470,11 +3513,11 @@ impl SettingsWindow {
                     {
                         let size = size.max(current_size);
                         crate::perf::log_counter("settings_atlas_reallocate", size);
-                        let recreated = self
-                            .render_state
-                            .as_mut()
-                            .unwrap()
-                            .recreate_texture_atlas(&self.fonts, &self.metrics, Some(size));
+                        let recreated = self.render_state.as_mut().unwrap().recreate_texture_atlas(
+                            &self.fonts,
+                            &self.metrics,
+                            Some(size),
+                        );
                         // Every cached glyph now points into the old atlas,
                         // whether or not the new one was allocated.
                         self.invalidate_shaped_text();
@@ -4429,8 +4472,8 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Each settings card owns its row count because rows are painted manually.
-        // Terminal currently paints eight rows below; the count drives card height and scroll extent.
-        let row_count = 8;
+        // Terminal currently paints nine rows below; the count drives card height and scroll extent.
+        let row_count = 9;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         let button_y = card_y + card_height + self.settings_section_card_gap();
@@ -4518,10 +4561,23 @@ impl SettingsWindow {
             SettingsAction::FontFamilyInput,
             true,
         )?;
-        self.paint_toggle_setting_row(
+        self.paint_action_setting_row(
             layers,
             row_x,
             first_row_y + row_step * 4.0,
+            row_width,
+            &crate::i18n::tr("settings-remote-pane-resize-mode"),
+            &crate::i18n::tr("settings-remote-pane-resize-mode-description"),
+            &localized_remote_pane_resize_mode_label(
+                self.native_settings.terminal.remote_pane_resize_mode,
+            ),
+            SettingsAction::CycleRemotePaneResizeMode,
+            true,
+        )?;
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 5.0,
             row_width,
             &crate::i18n::tr("settings-bottom-quote"),
             &crate::i18n::tr("settings-bottom-quote-description"),
@@ -4532,7 +4588,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 5.0,
+            first_row_y + row_step * 6.0,
             row_width,
             &crate::i18n::tr("settings-quote-font-size"),
             &crate::i18n::tr("settings-quote-font-size-description"),
@@ -4546,7 +4602,7 @@ impl SettingsWindow {
         self.paint_action_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 6.0,
+            first_row_y + row_step * 7.0,
             row_width,
             &crate::i18n::tr("settings-quote-rotation"),
             &crate::i18n::tr("settings-quote-rotation-description"),
@@ -4557,7 +4613,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 7.0,
+            first_row_y + row_step * 8.0,
             row_width,
             &crate::i18n::tr("settings-quote-interval"),
             &crate::i18n::tr("settings-quote-interval-description"),

@@ -1311,6 +1311,33 @@ pub(crate) struct FrontendRecoveryGeometry {
     pub(crate) generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteDividerResizeStrategy {
+    Live,
+    OnRelease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedRemoteDividerGeometry {
+    pub(crate) viewport: codec::ClientViewport,
+    pub(crate) panes: Vec<(PaneId, TerminalSize)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteDividerResizeStream {
+    pub(crate) epoch: u64,
+    pub(crate) strategy: RemoteDividerResizeStrategy,
+    pub(crate) domain_id: DomainId,
+    pub(crate) connection_generation: u64,
+    pub(crate) claim_first: bool,
+    pub(crate) finishing: bool,
+    pub(crate) latest: PreparedRemoteDividerGeometry,
+    pub(crate) pending: Option<PreparedRemoteDividerGeometry>,
+    pub(crate) in_flight: Option<codec::ClientViewport>,
+    pub(crate) last_acknowledged: Option<codec::ClientViewport>,
+    pub(crate) final_acknowledged_at: Option<Instant>,
+}
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -1339,6 +1366,10 @@ pub struct TermWindow {
     /// epoch reaches the normal local render-surface confirmation point.
     frontend_recovery_geometry: HashMap<TabId, FrontendRecoveryGeometry>,
     frontend_geometry_resync_after_epoch: HashSet<TabId>,
+    /// Latest-only full-viewport streams for native divider drags. A stream
+    /// owns the matching ClientPane preview epoch until its final target is
+    /// confirmed or explicitly rolled back.
+    remote_divider_resize_streams: HashMap<TabId, RemoteDividerResizeStream>,
     next_frontend_geometry_epoch: u64,
     frontend_viewport_report_pending: Arc<AtomicBool>,
     /// A blocked press is consumed even if the takeover round-trip completes
@@ -1788,6 +1819,7 @@ impl TermWindow {
     }
 
     fn close_requested(&mut self, window: &Window) {
+        self.cancel_remote_divider_resizes_except(None);
         self.flush_right_sidebar_note_blocking();
         self.persist_workspace_layout_after_mutation("window close requested");
 
@@ -1870,6 +1902,14 @@ impl TermWindow {
             self.right_sidebar_file_drag = None;
             self.pane_tab_drag = None;
             self.sidebar_row_drag = None;
+            let lost_split_drag = self
+                .dragging
+                .as_ref()
+                .is_some_and(|(item, _)| matches!(item.item_type, UIItemType::Split(_)));
+            if lost_split_drag {
+                self.finish_remote_split_drag();
+                self.persist_workspace_layout_after_mutation("split drag lost focus");
+            }
             self.dragging = None;
         }
 
@@ -2083,6 +2123,7 @@ impl TermWindow {
             frontend_geometry_confirmations: HashMap::new(),
             frontend_recovery_geometry: HashMap::new(),
             frontend_geometry_resync_after_epoch: HashSet::new(),
+            remote_divider_resize_streams: HashMap::new(),
             next_frontend_geometry_epoch: 1,
             frontend_viewport_report_pending: Arc::new(AtomicBool::new(false)),
             frontend_handoff_consumed_press: false,
@@ -3197,6 +3238,7 @@ impl TermWindow {
             return;
         }
 
+        self.cancel_remote_divider_resizes_except(None);
         self.mux_window_id = mux_window_id;
         *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
 

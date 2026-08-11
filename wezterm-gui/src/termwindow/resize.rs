@@ -11,8 +11,10 @@ use mux::Mux;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
-use wezterm_client::domain::{ClientDomain, FrontendRecoverySlot, RemoteFrontendGate};
+use std::time::{Duration, Instant};
+use wezterm_client::domain::{
+    AutomaticRemotePaneResize, ClientDomain, FrontendRecoverySlot, RemoteFrontendGate,
+};
 use wezterm_client::pane::ClientPane;
 use wezterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
@@ -35,6 +37,23 @@ fn frontend_geometry_action(
         Some(true) => FrontendGeometryAction::Set { takeover: false },
         None => FrontendGeometryAction::Set { takeover: true },
     }
+}
+
+fn remote_divider_target_is_owed(
+    in_flight: Option<&codec::ClientViewport>,
+    acknowledged: Option<&codec::ClientViewport>,
+    target: &codec::ClientViewport,
+) -> bool {
+    in_flight != Some(target) && acknowledged != Some(target)
+}
+
+fn remote_divider_can_pump(
+    strategy: super::RemoteDividerResizeStrategy,
+    finishing: bool,
+    in_flight: bool,
+    has_pending: bool,
+) -> bool {
+    !in_flight && has_pending && (strategy == super::RemoteDividerResizeStrategy::Live || finishing)
 }
 
 // Full-screen TUIs handle SIGWINCH asynchronously after the server-side PTY
@@ -418,6 +437,18 @@ impl super::TermWindow {
         codec::ClientViewport,
         Vec<(PaneId, TerminalSize)>,
     )> {
+        self.prepare_client_frontend_geometry_with_preview(tab, None)
+    }
+
+    fn prepare_client_frontend_geometry_with_preview(
+        &mut self,
+        tab: &Arc<mux::tab::Tab>,
+        preview_epoch: Option<u64>,
+    ) -> Option<(
+        Arc<dyn Domain>,
+        codec::ClientViewport,
+        Vec<(PaneId, TerminalSize)>,
+    )> {
         if !self.active_tab_is(tab.tab_id()) {
             return None;
         }
@@ -460,8 +491,12 @@ impl super::TermWindow {
         }
         for (pane_id, size) in &adopted {
             let pane = Mux::get().get_pane(*pane_id)?;
-            pane.downcast_ref::<ClientPane>()?
-                .adopt_frontend_geometry(*size);
+            let pane = pane.downcast_ref::<ClientPane>()?;
+            if let Some(epoch) = preview_epoch {
+                pane.preview_frontend_geometry(epoch, *size);
+            } else {
+                pane.adopt_frontend_geometry(*size);
+            }
         }
 
         Some((
@@ -475,9 +510,9 @@ impl super::TermWindow {
     }
 
     /// Keep a remote split visually attached to its divider while it is being
-    /// dragged. Tab's split tree intentionally skips remote mirror PTY
-    /// resizes; adopt the exact GUI pane surfaces locally and defer the one
-    /// complete viewport RPC until release.
+    /// dragged. The selected policy is frozen at drag start: Live pumps at
+    /// most one RPC plus one replaceable newest target; OnRelease only keeps
+    /// the local pinned preview until the drag ends.
     pub(crate) fn preview_active_tab_geometry_now(&mut self) {
         if self.content_view_foreground() {
             return;
@@ -500,16 +535,366 @@ impl super::TermWindow {
         if mode == Some(mux::FrontendAccessMode::Handoff) && ownership != Some(true) {
             return;
         }
-        if self.prepare_client_frontend_geometry(&tab).is_none() {
+        let epoch = if let Some(stream) = self.remote_divider_resize_streams.get(&tab_id) {
+            stream.epoch
+        } else {
+            let epoch = self.next_frontend_geometry_epoch;
+            self.next_frontend_geometry_epoch =
+                self.next_frontend_geometry_epoch.wrapping_add(1).max(1);
+            epoch
+        };
+        let Some((domain, viewport, panes)) =
+            self.prepare_client_frontend_geometry_with_preview(&tab, Some(epoch))
+        else {
+            return;
+        };
+        let Some(client_domain) = domain.downcast_ref::<ClientDomain>() else {
+            return;
+        };
+        let Some(connection_generation) = client_domain.connection_generation() else {
+            return;
+        };
+        let prepared = super::PreparedRemoteDividerGeometry { viewport, panes };
+
+        if let Some(stream) = self.remote_divider_resize_streams.get_mut(&tab_id) {
+            stream.latest = prepared.clone();
+            stream.pending = remote_divider_target_is_owed(
+                stream.in_flight.as_ref(),
+                stream.last_acknowledged.as_ref(),
+                &prepared.viewport,
+            )
+            .then_some(prepared);
+        } else {
+            let pane_is_tardy = self.get_panes_to_render().into_iter().any(|positioned| {
+                positioned
+                    .pane
+                    .downcast_ref::<ClientPane>()
+                    .is_some_and(ClientPane::is_remote_tardy)
+            });
+            let strategy = match crate::native_settings::remote_pane_resize_mode() {
+                crate::native_settings::NativeRemotePaneResizeMode::Live => {
+                    super::RemoteDividerResizeStrategy::Live
+                }
+                crate::native_settings::NativeRemotePaneResizeMode::OnRelease => {
+                    super::RemoteDividerResizeStrategy::OnRelease
+                }
+                crate::native_settings::NativeRemotePaneResizeMode::Auto => {
+                    match client_domain.automatic_remote_pane_resize(pane_is_tardy) {
+                        AutomaticRemotePaneResize::Live => super::RemoteDividerResizeStrategy::Live,
+                        AutomaticRemotePaneResize::OnRelease => {
+                            super::RemoteDividerResizeStrategy::OnRelease
+                        }
+                    }
+                }
+            };
+            let collaborative = mode == Some(mux::FrontendAccessMode::TmuxLatest);
+            self.remote_divider_resize_streams.insert(
+                tab_id,
+                super::RemoteDividerResizeStream {
+                    epoch,
+                    strategy,
+                    domain_id: domain.domain_id(),
+                    connection_generation,
+                    claim_first: collaborative && ownership == Some(false),
+                    finishing: false,
+                    latest: prepared.clone(),
+                    pending: Some(prepared),
+                    in_flight: None,
+                    last_acknowledged: None,
+                    final_acknowledged_at: None,
+                },
+            );
+        }
+
+        self.frontend_geometry_confirmations.remove(&tab_id);
+        self.frontend_geometry_phases
+            .insert(tab_id, super::FrontendGeometryPhase::Previewing { epoch });
+        self.pump_remote_divider_resize(tab_id);
+        self.invalidate_window();
+    }
+
+    fn pump_remote_divider_resize(&mut self, tab_id: mux::tab::TabId) {
+        let Some(stream) = self.remote_divider_resize_streams.get_mut(&tab_id) else {
+            return;
+        };
+        if !remote_divider_can_pump(
+            stream.strategy,
+            stream.finishing,
+            stream.in_flight.is_some(),
+            stream.pending.is_some(),
+        ) {
+            return;
+        }
+        let Some(prepared) = stream.pending.take() else {
+            return;
+        };
+        let epoch = stream.epoch;
+        let domain_id = stream.domain_id;
+        let generation = stream.connection_generation;
+        let claim = stream.claim_first;
+        stream.claim_first = false;
+        stream.in_flight = Some(prepared.viewport.clone());
+
+        let Some(domain) = Mux::get().get_domain(domain_id) else {
+            self.abort_remote_divider_resize(tab_id, epoch, true);
+            return;
+        };
+        let Some(client_domain) = domain.downcast_ref::<ClientDomain>() else {
+            self.abort_remote_divider_resize(tab_id, epoch, true);
+            return;
+        };
+        if client_domain.connection_generation() != Some(generation) {
+            self.abort_remote_divider_resize(tab_id, epoch, true);
+            return;
+        }
+        self.remember_gui_recovery_intent(client_domain, tab_id, &prepared.viewport);
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.abort_remote_divider_resize(tab_id, epoch, false);
+            return;
+        };
+        let sent = prepared.viewport.clone();
+        promise::spawn::spawn(async move {
+            let succeeded = match domain.downcast_ref::<ClientDomain>() {
+                Some(client_domain)
+                    if client_domain.connection_generation() == Some(generation) =>
+                {
+                    let result = if claim {
+                        client_domain
+                            .claim_client_viewport(tab_id, sent.clone())
+                            .await
+                    } else {
+                        client_domain
+                            .set_client_viewport(tab_id, sent.clone())
+                            .await
+                    };
+                    if let Err(err) = &result {
+                        log::warn!("streaming remote divider resize: {err:#}");
+                    }
+                    result.is_ok() && client_domain.owns_remote_viewport(tab_id) == Some(true)
+                }
+                Some(_) | None => false,
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window
+                    .remote_divider_resize_rpc_finished(tab_id, epoch, generation, sent, succeeded);
+            })));
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn remote_divider_resize_rpc_finished(
+        &mut self,
+        tab_id: mux::tab::TabId,
+        epoch: u64,
+        generation: u64,
+        sent: codec::ClientViewport,
+        succeeded: bool,
+    ) {
+        let valid = self
+            .remote_divider_resize_streams
+            .get(&tab_id)
+            .is_some_and(|stream| {
+                stream.epoch == epoch
+                    && stream.connection_generation == generation
+                    && stream.in_flight.as_ref() == Some(&sent)
+            });
+        if !valid {
+            return;
+        }
+        if !succeeded || !self.active_tab_is(tab_id) {
+            self.abort_remote_divider_resize(tab_id, epoch, true);
             return;
         }
 
-        let epoch = self.next_frontend_geometry_epoch;
-        self.next_frontend_geometry_epoch =
-            self.next_frontend_geometry_epoch.wrapping_add(1).max(1);
-        self.frontend_geometry_phases
-            .insert(tab_id, super::FrontendGeometryPhase::Previewing { epoch });
+        let mut should_pump = false;
+        let mut should_confirm = false;
+        if let Some(stream) = self.remote_divider_resize_streams.get_mut(&tab_id) {
+            stream.in_flight = None;
+            stream.last_acknowledged = Some(sent);
+            if stream.pending.is_some() {
+                should_pump = true;
+            } else if stream.finishing
+                && stream.last_acknowledged.as_ref() == Some(&stream.latest.viewport)
+            {
+                stream
+                    .final_acknowledged_at
+                    .get_or_insert_with(Instant::now);
+                should_confirm = true;
+            }
+        }
+        if should_pump {
+            self.pump_remote_divider_resize(tab_id);
+        } else if should_confirm {
+            self.confirm_remote_divider_resize(tab_id, epoch);
+        }
+    }
+
+    pub(crate) fn finish_remote_split_drag(&mut self) {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let tab_id = tab.tab_id();
+        let (epoch, should_confirm) = {
+            let Some(stream) = self.remote_divider_resize_streams.get_mut(&tab_id) else {
+                self.sync_active_tab_geometry_now();
+                return;
+            };
+            stream.finishing = true;
+            if remote_divider_target_is_owed(
+                stream.in_flight.as_ref(),
+                stream.last_acknowledged.as_ref(),
+                &stream.latest.viewport,
+            ) {
+                stream.pending = Some(stream.latest.clone());
+            }
+            let should_confirm = stream.in_flight.is_none()
+                && stream.pending.is_none()
+                && stream.last_acknowledged.as_ref() == Some(&stream.latest.viewport);
+            if should_confirm {
+                stream
+                    .final_acknowledged_at
+                    .get_or_insert_with(Instant::now);
+            }
+            (stream.epoch, should_confirm)
+        };
+        self.pump_remote_divider_resize(tab_id);
+        if should_confirm {
+            self.confirm_remote_divider_resize(tab_id, epoch);
+        }
+    }
+
+    fn confirm_remote_divider_resize(&mut self, tab_id: mux::tab::TabId, epoch: u64) {
+        let Some(stream) = self.remote_divider_resize_streams.get(&tab_id) else {
+            return;
+        };
+        if stream.epoch != epoch || !stream.finishing || stream.in_flight.is_some() {
+            return;
+        }
+        let generation = stream.connection_generation;
+        let domain_id = stream.domain_id;
+        let panes = stream.latest.panes.clone();
+        let started = stream.final_acknowledged_at.unwrap_or_else(Instant::now);
+        let domain_generation_matches = Mux::get().get_domain(domain_id).and_then(|domain| {
+            domain
+                .downcast_ref::<ClientDomain>()
+                .and_then(ClientDomain::connection_generation)
+        }) == Some(generation);
+        let mut ready = domain_generation_matches && !panes.is_empty();
+        for (pane_id, size) in &panes {
+            let pane_ready = Mux::get()
+                .get_pane(*pane_id)
+                .and_then(|pane| {
+                    pane.downcast_ref::<ClientPane>().map(|client| {
+                        let matches = client.server_geometry_matches(*size);
+                        if !matches {
+                            let _ = client.prime_frontend_geometry(*size);
+                        }
+                        matches
+                    })
+                })
+                .unwrap_or(false);
+            ready &= pane_ready;
+        }
+        if ready {
+            self.complete_remote_divider_resize(tab_id, epoch);
+            return;
+        }
+        if started.elapsed() >= Duration::from_secs(2) {
+            log::warn!("remote divider resize did not converge for tab {tab_id}");
+            self.abort_remote_divider_resize(tab_id, epoch, true);
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            self.abort_remote_divider_resize(tab_id, epoch, false);
+            return;
+        };
+        promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(25)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.confirm_remote_divider_resize(tab_id, epoch);
+            })));
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn complete_remote_divider_resize(&mut self, tab_id: mux::tab::TabId, epoch: u64) {
+        let Some(stream) = self.remote_divider_resize_streams.remove(&tab_id) else {
+            return;
+        };
+        if stream.epoch != epoch {
+            self.remote_divider_resize_streams.insert(tab_id, stream);
+            return;
+        }
+        for (pane_id, size) in &stream.latest.panes {
+            if let Some(pane) = Mux::get().get_pane(*pane_id) {
+                if let Some(client) = pane.downcast_ref::<ClientPane>() {
+                    client.finish_frontend_geometry_preview(epoch, *size, true);
+                }
+            }
+        }
+        if self
+            .frontend_geometry_phases
+            .get(&tab_id)
+            .is_some_and(|phase| phase.epoch() == epoch)
+        {
+            self.frontend_geometry_phases.remove(&tab_id);
+        }
+        self.update_title_post_status();
         self.invalidate_window();
+    }
+
+    fn abort_remote_divider_resize(&mut self, tab_id: mux::tab::TabId, epoch: u64, resync: bool) {
+        let Some(stream) = self.remote_divider_resize_streams.remove(&tab_id) else {
+            return;
+        };
+        if stream.epoch != epoch {
+            self.remote_divider_resize_streams.insert(tab_id, stream);
+            return;
+        }
+        for (pane_id, size) in &stream.latest.panes {
+            if let Some(pane) = Mux::get().get_pane(*pane_id) {
+                if let Some(client) = pane.downcast_ref::<ClientPane>() {
+                    client.finish_frontend_geometry_preview(epoch, *size, false);
+                }
+            }
+        }
+        if self
+            .frontend_geometry_phases
+            .get(&tab_id)
+            .is_some_and(|phase| phase.epoch() == epoch)
+        {
+            self.frontend_geometry_phases.remove(&tab_id);
+        }
+        if resync {
+            if let Some(domain) = Mux::get().get_domain(stream.domain_id) {
+                promise::spawn::spawn(async move {
+                    if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                        if let Err(err) = client.resync().await {
+                            log::warn!("resyncing after failed divider resize: {err:#}");
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .detach();
+            }
+        }
+        self.update_title_post_status();
+        self.invalidate_window();
+    }
+
+    pub(crate) fn cancel_remote_divider_resizes_except(&mut self, keep: Option<mux::tab::TabId>) {
+        let stale = self
+            .remote_divider_resize_streams
+            .iter()
+            .filter_map(|(tab_id, stream)| {
+                (Some(*tab_id) != keep).then_some((*tab_id, stream.epoch))
+            })
+            .collect::<Vec<_>>();
+        for (tab_id, epoch) in stale {
+            self.abort_remote_divider_resize(tab_id, epoch, true);
+        }
     }
 
     /// Take the viewport because someone is using this window right now.
@@ -945,6 +1330,7 @@ impl super::TermWindow {
             return;
         };
         let tab_id = tab.tab_id();
+        self.cancel_remote_divider_resizes_except(Some(tab_id));
         let Some(active_pane) = tab.get_active_pane() else {
             return;
         };
@@ -2095,10 +2481,10 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 #[cfg(test)]
 mod frontend_geometry_tests {
     use super::{
-        frontend_geometry_action, geometry_confirmation_settled, FrontendGeometryAction,
-        FRONTEND_GEOMETRY_SETTLE,
+        frontend_geometry_action, geometry_confirmation_settled, remote_divider_can_pump,
+        remote_divider_target_is_owed, FrontendGeometryAction, FRONTEND_GEOMETRY_SETTLE,
     };
-    use crate::termwindow::FrontendGeometryPhase;
+    use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2160,5 +2546,51 @@ mod frontend_geometry_tests {
             start + FRONTEND_GEOMETRY_SETTLE,
             &mut ready_since
         ));
+    }
+
+    #[test]
+    fn remote_divider_stream_has_one_in_flight_and_release_gates_slow_mode() {
+        assert!(remote_divider_can_pump(
+            RemoteDividerResizeStrategy::Live,
+            false,
+            false,
+            true
+        ));
+        assert!(!remote_divider_can_pump(
+            RemoteDividerResizeStrategy::Live,
+            false,
+            true,
+            true
+        ));
+        assert!(!remote_divider_can_pump(
+            RemoteDividerResizeStrategy::OnRelease,
+            false,
+            false,
+            true
+        ));
+        assert!(remote_divider_can_pump(
+            RemoteDividerResizeStrategy::OnRelease,
+            true,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn remote_divider_latest_target_replaces_only_unsent_work() {
+        let viewport = |cols| codec::ClientViewport::CellGrid {
+            size: wezterm_term::TerminalSize {
+                rows: 24,
+                cols,
+                pixel_width: cols * 10,
+                pixel_height: 480,
+                dpi: 96,
+            },
+        };
+        let first = viewport(80);
+        let latest = viewport(120);
+        assert!(!remote_divider_target_is_owed(Some(&first), None, &first));
+        assert!(remote_divider_target_is_owed(Some(&first), None, &latest));
+        assert!(!remote_divider_target_is_owed(None, Some(&latest), &latest));
     }
 }

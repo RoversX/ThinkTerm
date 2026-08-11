@@ -15,6 +15,7 @@ use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use wezterm_term::TerminalSize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -190,6 +191,78 @@ pub enum RemoteFrontendGate {
     Syncing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomaticRemotePaneResize {
+    Live,
+    OnRelease,
+}
+
+const VIEWPORT_RTT_LIVE_MS: f64 = 80.0;
+const VIEWPORT_RTT_ON_RELEASE_MS: f64 = 140.0;
+const VIEWPORT_RTT_MIN_SAMPLES: u32 = 3;
+const VIEWPORT_RTT_EWMA_ALPHA: f64 = 0.25;
+const VIEWPORT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct ViewportLatencyState {
+    ewma_ms: Option<f64>,
+    successful_samples: u32,
+    selected: AutomaticRemotePaneResize,
+    degraded_until: Option<Instant>,
+}
+
+impl Default for ViewportLatencyState {
+    fn default() -> Self {
+        Self {
+            ewma_ms: None,
+            successful_samples: 0,
+            selected: AutomaticRemotePaneResize::Live,
+            degraded_until: None,
+        }
+    }
+}
+
+impl ViewportLatencyState {
+    fn record_success(&mut self, elapsed: Duration) {
+        let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+        self.ewma_ms = Some(match self.ewma_ms {
+            Some(previous) => {
+                previous * (1.0 - VIEWPORT_RTT_EWMA_ALPHA) + elapsed_ms * VIEWPORT_RTT_EWMA_ALPHA
+            }
+            None => elapsed_ms,
+        });
+        self.successful_samples = self.successful_samples.saturating_add(1);
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.selected = AutomaticRemotePaneResize::OnRelease;
+        self.degraded_until = now.checked_add(VIEWPORT_FAILURE_COOLDOWN);
+    }
+
+    fn choose(&mut self, now: Instant, ready: bool, tardy: bool) -> AutomaticRemotePaneResize {
+        if !ready || tardy {
+            return AutomaticRemotePaneResize::OnRelease;
+        }
+        if self.degraded_until.is_some_and(|until| now < until) {
+            return AutomaticRemotePaneResize::OnRelease;
+        }
+        self.degraded_until = None;
+        if self.successful_samples < VIEWPORT_RTT_MIN_SAMPLES {
+            return AutomaticRemotePaneResize::Live;
+        }
+        match self.ewma_ms {
+            Some(ewma) if ewma <= VIEWPORT_RTT_LIVE_MS => {
+                self.selected = AutomaticRemotePaneResize::Live;
+            }
+            Some(ewma) if ewma >= VIEWPORT_RTT_ON_RELEASE_MS => {
+                self.selected = AutomaticRemotePaneResize::OnRelease;
+            }
+            _ => {}
+        }
+        self.selected
+    }
+}
+
 impl RemoteFrontendGate {
     pub fn obscures_terminal(&self) -> bool {
         !matches!(self, Self::Visible)
@@ -324,6 +397,9 @@ pub struct ClientInner {
     /// old remote-id maps are cleared, this is what prevents a failed retry
     /// from materializing duplicate native windows on its next attempt.
     pending_recovery_windows: Mutex<HashMap<String, WindowId>>,
+    /// Measured end-to-end latency of complete viewport RPCs. GUI Auto mode
+    /// consults this once at drag start; it never changes policy mid-drag.
+    viewport_latency: Mutex<ViewportLatencyState>,
 }
 
 /// RAII scope for a structure-mutating RPC; defers resyncs for its lifetime
@@ -912,6 +988,7 @@ impl ClientInner {
             ready_server_id: Mutex::new(ready_server_id),
             pending_recovery_targets: Mutex::new(HashMap::new()),
             pending_recovery_windows: Mutex::new(HashMap::new()),
+            viewport_latency: Mutex::new(ViewportLatencyState::default()),
         }
     }
 }
@@ -1332,6 +1409,18 @@ impl ClientDomain {
     pub fn is_reconnecting(&self) -> bool {
         self.inner()
             .map_or(false, |inner| inner.client.is_reconnecting())
+    }
+
+    pub fn automatic_remote_pane_resize(&self, pane_is_tardy: bool) -> AutomaticRemotePaneResize {
+        let Some(inner) = self.inner() else {
+            return AutomaticRemotePaneResize::OnRelease;
+        };
+        let choice = inner.viewport_latency.lock().unwrap().choose(
+            Instant::now(),
+            inner.client.connection_phase() == ClientConnectionPhase::Ready,
+            pane_is_tardy,
+        );
+        choice
     }
 
     /// Automatic reconnection failed for long enough that the retry loop
@@ -1989,13 +2078,32 @@ impl ClientDomain {
             .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
         let viewport = self.translate_client_viewport(viewport)?;
         let reported = viewport.clone();
-        let state = inner
+        let started_at = Instant::now();
+        let result = inner
             .client
             .set_client_viewport(codec::SetClientViewport {
                 tab_id: remote_tab_id,
                 viewport,
             })
-            .await?;
+            .await;
+        let state = match result {
+            Ok(state) => {
+                inner
+                    .viewport_latency
+                    .lock()
+                    .unwrap()
+                    .record_success(started_at.elapsed());
+                state
+            }
+            Err(err) => {
+                inner
+                    .viewport_latency
+                    .lock()
+                    .unwrap()
+                    .record_failure(Instant::now());
+                return Err(err);
+            }
+        };
         inner.remember_reported_viewport(remote_tab_id, reported);
         self.process_remote_viewport_state(state.clone());
         Ok(state)
@@ -2043,13 +2151,32 @@ impl ClientDomain {
             .ok_or_else(|| anyhow!("tab {local_tab_id} has no remote mapping"))?;
         let viewport = self.translate_client_viewport(viewport)?;
         let reported = viewport.clone();
-        let state = inner
+        let started_at = Instant::now();
+        let result = inner
             .client
             .claim_client_viewport(codec::ClaimClientViewport {
                 tab_id: remote_tab_id,
                 viewport,
             })
-            .await?;
+            .await;
+        let state = match result {
+            Ok(state) => {
+                inner
+                    .viewport_latency
+                    .lock()
+                    .unwrap()
+                    .record_success(started_at.elapsed());
+                state
+            }
+            Err(err) => {
+                inner
+                    .viewport_latency
+                    .lock()
+                    .unwrap()
+                    .record_failure(Instant::now());
+                return Err(err);
+            }
+        };
         inner.remember_reported_viewport(remote_tab_id, reported);
         self.process_remote_viewport_state(state.clone());
         Ok(state)
@@ -2454,11 +2581,12 @@ mod tests {
         accepts_generation, acknowledge_recovery_target, active_remote_tabs_by_workspace,
         consistent_remote_tab_id, owns_remote_viewport_from_states,
         remote_frontend_gate_from_state, remote_move_pane_id, server_runtime_replaced,
-        thread_id_for_workspace, FrontendRecoveryAck, FrontendRecoveryBarrier,
-        FrontendRecoverySlot, RemoteFrontendGate,
+        thread_id_for_workspace, AutomaticRemotePaneResize, FrontendRecoveryAck,
+        FrontendRecoveryBarrier, FrontendRecoverySlot, RemoteFrontendGate, ViewportLatencyState,
     };
     use crate::client::ClientConnectionPhase;
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     fn client_id(hostname: &str, id: usize) -> mux::client::ClientId {
         mux::client::ClientId {
@@ -2510,6 +2638,72 @@ mod tests {
         assert!(accepts_generation(Some(9), 10));
         assert!(!accepts_generation(Some(9), 9));
         assert!(!accepts_generation(Some(9), 8));
+    }
+
+    #[test]
+    fn automatic_remote_resize_uses_samples_and_hysteresis() {
+        let now = Instant::now();
+        let mut state = ViewportLatencyState::default();
+        assert_eq!(
+            state.choose(now, true, false),
+            AutomaticRemotePaneResize::Live
+        );
+
+        for _ in 0..3 {
+            state.record_success(Duration::from_millis(50));
+        }
+        assert_eq!(
+            state.choose(now, true, false),
+            AutomaticRemotePaneResize::Live
+        );
+
+        state.record_success(Duration::from_millis(500));
+        assert_eq!(
+            state.choose(now, true, false),
+            AutomaticRemotePaneResize::OnRelease
+        );
+
+        // The 80-140ms band retains the previous decision instead of
+        // oscillating at a threshold while the connection jitters.
+        state.ewma_ms = Some(110.0);
+        assert_eq!(
+            state.choose(now, true, false),
+            AutomaticRemotePaneResize::OnRelease
+        );
+        state.ewma_ms = Some(70.0);
+        assert_eq!(
+            state.choose(now, true, false),
+            AutomaticRemotePaneResize::Live
+        );
+    }
+
+    #[test]
+    fn automatic_remote_resize_degrades_for_failure_tardy_and_reconnect() {
+        let now = Instant::now();
+        let mut state = ViewportLatencyState::default();
+        for _ in 0..3 {
+            state.record_success(Duration::from_millis(40));
+        }
+        state.record_failure(now);
+        assert_eq!(
+            state.choose(now, true, false),
+            AutomaticRemotePaneResize::OnRelease
+        );
+
+        state.degraded_until = Some(now - Duration::from_millis(1));
+        state.ewma_ms = Some(40.0);
+        assert_eq!(
+            state.choose(now, true, false),
+            AutomaticRemotePaneResize::Live
+        );
+        assert_eq!(
+            state.choose(now, true, true),
+            AutomaticRemotePaneResize::OnRelease
+        );
+        assert_eq!(
+            state.choose(now, false, false),
+            AutomaticRemotePaneResize::OnRelease
+        );
     }
 
     #[test]

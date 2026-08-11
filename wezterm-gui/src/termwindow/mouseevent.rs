@@ -1405,7 +1405,7 @@ impl super::TermWindow {
                         .as_ref()
                         .is_some_and(|(item, _)| matches!(item.item_type, UIItemType::Split(_)))
                     {
-                        self.sync_active_tab_geometry_now();
+                        self.finish_remote_split_drag();
                         self.persist_workspace_layout_after_mutation("split drag released");
                     }
                     if completed_drag.as_ref().is_some_and(|(item, _)| {

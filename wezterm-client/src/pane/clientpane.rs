@@ -640,6 +640,51 @@ impl ClientPane {
         changed
     }
 
+    /// Pin the local render surface to a divider preview epoch. Unlike a
+    /// normal adoption this deliberately preserves cached rows and ignores
+    /// older server dimensions until the final full viewport is confirmed.
+    pub fn preview_frontend_geometry(&self, epoch: u64, size: TerminalSize) -> bool {
+        *self.requested_size.lock() = Some(size);
+        let render = self.renderable.lock();
+        let mut inner = render.inner.borrow_mut();
+        let changed = inner.begin_frontend_preview(epoch, size);
+        if changed {
+            inner.update_last_send();
+        }
+        changed
+    }
+
+    pub fn server_geometry_matches(&self, size: TerminalSize) -> bool {
+        self.renderable
+            .lock()
+            .inner
+            .borrow()
+            .server_geometry_matches(size)
+    }
+
+    pub fn finish_frontend_geometry_preview(
+        &self,
+        epoch: u64,
+        size: TerminalSize,
+        succeeded: bool,
+    ) -> bool {
+        if !succeeded {
+            let mut requested = self.requested_size.lock();
+            if requested.as_ref() == Some(&size) {
+                requested.take();
+            }
+        }
+        self.renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .end_frontend_preview(epoch, succeeded)
+    }
+
+    pub fn is_remote_tardy(&self) -> bool {
+        self.renderable.lock().inner.borrow().is_tardy()
+    }
+
     /// Forget a geometry adoption when the complete viewport RPC failed.
     /// A later authoritative resync can then establish the server's actual
     /// dimensions instead of having the failed request remain a dedupe key.
