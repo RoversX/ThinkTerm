@@ -14,7 +14,7 @@ use crate::ui::{
     TextInputSpec, TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::utilsprites::RenderMetrics;
-use anyhow::Context;
+use anyhow::{Context, Error};
 use config::{configuration, Dimension, GeometryOrigin};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -514,64 +514,80 @@ impl ImportFieldId {
         }
     }
 
-    fn category(self) -> &'static str {
-        match self {
+    fn category(self) -> String {
+        crate::i18n::tr(match self {
             Self::ColorScheme
             | Self::WindowBackgroundOpacity
             | Self::MacosWindowBackgroundBlur
-            | Self::InactivePaneHsb => "Appearance",
+            | Self::InactivePaneHsb => "settings-import-category-appearance",
             Self::FontSize
             | Self::Font
             | Self::LineHeight
             | Self::CellWidth
             | Self::DefaultProg
-            | Self::DefaultCwd => "Terminal",
-            Self::FrontEnd | Self::WindowDecorations => "Window",
-            Self::DisableDefaultKeyBindings | Self::Keys | Self::KeyTables => "Keymap",
-        }
+            | Self::DefaultCwd => "settings-import-category-terminal",
+            Self::FrontEnd | Self::WindowDecorations => "settings-import-category-window",
+            Self::DisableDefaultKeyBindings | Self::Keys | Self::KeyTables => {
+                "settings-import-category-keymap"
+            }
+        })
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::ColorScheme => "Color Scheme",
-            Self::WindowBackgroundOpacity => "Window Background Opacity",
-            Self::MacosWindowBackgroundBlur => "macOS Background Blur",
-            Self::InactivePaneHsb => "Inactive Pane HSB",
-            Self::FontSize => "Font Size",
-            Self::Font => "Font",
-            Self::LineHeight => "Line Height",
-            Self::CellWidth => "Cell Width",
-            Self::DefaultProg => "Default Program",
-            Self::DefaultCwd => "Default CWD",
-            Self::FrontEnd => "Renderer Backend",
-            Self::WindowDecorations => "Window Decorations",
-            Self::DisableDefaultKeyBindings => "Disable Default Key Bindings",
-            Self::Keys => "Key Bindings",
-            Self::KeyTables => "Key Tables",
-        }
+    fn label(self) -> String {
+        crate::i18n::tr(match self {
+            Self::ColorScheme => "settings-import-field-color-scheme",
+            Self::WindowBackgroundOpacity => "settings-import-field-window-opacity",
+            Self::MacosWindowBackgroundBlur => "settings-import-field-macos-blur",
+            Self::InactivePaneHsb => "settings-import-field-inactive-pane",
+            Self::FontSize => "settings-import-field-font-size",
+            Self::Font => "settings-import-field-font",
+            Self::LineHeight => "settings-import-field-line-height",
+            Self::CellWidth => "settings-import-field-cell-width",
+            Self::DefaultProg => "settings-import-field-default-program",
+            Self::DefaultCwd => "settings-import-field-default-directory",
+            Self::FrontEnd => "settings-import-field-renderer",
+            Self::WindowDecorations => "settings-import-field-window-decorations",
+            Self::DisableDefaultKeyBindings => "settings-import-field-disable-default-keys",
+            Self::Keys => "settings-import-field-key-bindings",
+            Self::KeyTables => "settings-import-field-key-tables",
+        })
     }
 
     fn description(self, config: &config::Config) -> String {
         match self {
-            Self::ColorScheme => "Theme name from the source config.".to_string(),
-            Self::WindowBackgroundOpacity => "Terminal window opacity.".to_string(),
-            Self::MacosWindowBackgroundBlur => {
-                "macOS blur amount behind transparent windows.".to_string()
+            Self::Keys | Self::KeyTables => {
+                let count = if self == Self::Keys {
+                    config.keys.len()
+                } else {
+                    config.key_tables.len()
+                };
+                settings_tr(
+                    if self == Self::Keys {
+                        "settings-import-description-key-bindings"
+                    } else {
+                        "settings-import-description-key-tables"
+                    },
+                    &[("count", count.to_string())],
+                )
             }
-            Self::InactivePaneHsb => "Color transform for inactive split panes.".to_string(),
-            Self::FontSize => "Terminal cell font size.".to_string(),
-            Self::Font => "Terminal font stack.".to_string(),
-            Self::LineHeight => "Terminal line-height multiplier.".to_string(),
-            Self::CellWidth => "Terminal cell-width multiplier.".to_string(),
-            Self::DefaultProg => "Default shell or command launched in new panes.".to_string(),
-            Self::DefaultCwd => "Default working directory for new panes.".to_string(),
-            Self::FrontEnd => "OpenGL/WebGpu renderer choice.".to_string(),
-            Self::WindowDecorations => "Native/custom window decoration flags.".to_string(),
-            Self::DisableDefaultKeyBindings => {
-                "Whether built-in key bindings are disabled.".to_string()
-            }
-            Self::Keys => format!("{} custom key binding entries.", config.keys.len()),
-            Self::KeyTables => format!("{} custom key tables.", config.key_tables.len()),
+            _ => crate::i18n::tr(match self {
+                Self::ColorScheme => "settings-import-description-color-scheme",
+                Self::WindowBackgroundOpacity => "settings-import-description-window-opacity",
+                Self::MacosWindowBackgroundBlur => "settings-import-description-macos-blur",
+                Self::InactivePaneHsb => "settings-import-description-inactive-pane",
+                Self::FontSize => "settings-import-description-font-size",
+                Self::Font => "settings-import-description-font",
+                Self::LineHeight => "settings-import-description-line-height",
+                Self::CellWidth => "settings-import-description-cell-width",
+                Self::DefaultProg => "settings-import-description-default-program",
+                Self::DefaultCwd => "settings-import-description-default-directory",
+                Self::FrontEnd => "settings-import-description-renderer",
+                Self::WindowDecorations => "settings-import-description-window-decorations",
+                Self::DisableDefaultKeyBindings => {
+                    "settings-import-description-disable-default-keys"
+                }
+                Self::Keys | Self::KeyTables => unreachable!(),
+            }),
         }
     }
 
@@ -580,7 +596,7 @@ impl ImportFieldId {
             Self::ColorScheme => config
                 .color_scheme
                 .clone()
-                .unwrap_or_else(|| "Custom colors".to_string()),
+                .unwrap_or_else(|| crate::i18n::tr("settings-import-preview-custom-colors")),
             Self::WindowBackgroundOpacity => format!("{:.2}", config.window_background_opacity),
             Self::MacosWindowBackgroundBlur => config.macos_window_background_blur.to_string(),
             Self::InactivePaneHsb => format!(
@@ -595,7 +611,7 @@ impl ImportFieldId {
                 .font
                 .first()
                 .map(|font| font.family.clone())
-                .unwrap_or_else(|| "Font table".to_string()),
+                .unwrap_or_else(|| crate::i18n::tr("settings-import-preview-font-table")),
             Self::LineHeight => format!("{:.2}", config.line_height),
             Self::CellWidth => format!("{:.2}", config.cell_width),
             Self::DefaultProg => config
@@ -636,8 +652,8 @@ impl ImportFieldId {
 #[derive(Debug, Clone)]
 struct ImportableField {
     id: ImportFieldId,
-    category: &'static str,
-    label: &'static str,
+    category: String,
+    label: String,
     description: String,
     preview: String,
     lua_value: Option<String>,
@@ -645,9 +661,7 @@ struct ImportableField {
 
 #[derive(Debug, Clone, Default)]
 struct CompatibilityImportState {
-    loaded_source: Option<PathBuf>,
     fields: Vec<ImportableField>,
-    warnings: Vec<String>,
     error: Option<String>,
 }
 
@@ -1391,6 +1405,11 @@ struct SettingsWindow {
     /// keep — it returns only once the fallback is in place, so a cached run
     /// is final rather than a first guess to be revised.
     shape_cache: RefCell<HashMap<ShapedTextKey, Rc<ShapedText>>>,
+    /// Glyph allocation can discover that the shared texture atlas is full
+    /// while a helper is only measuring text and cannot return an error. Keep
+    /// the first failure here so the enclosing paint pass can grow the atlas
+    /// and retry the whole frame instead of caching a run with missing glyphs.
+    pending_glyph_error: RefCell<Option<Error>>,
 }
 
 impl SettingsWindow {
@@ -1490,6 +1509,7 @@ impl SettingsWindow {
             compatibility_import: CompatibilityImportState::default(),
             status: Self::initial_status(),
             shape_cache: RefCell::new(HashMap::new()),
+            pending_glyph_error: RefCell::new(None),
         }));
 
         let event_settings = Rc::clone(&settings);
@@ -2898,22 +2918,28 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 let path = Self::thinkterm_compatible_config_path();
                 if path.exists() {
-                    self.status = format!("Opening ThinkTerm config {}", path.display());
+                    self.status = settings_tr(
+                        "settings-status-opening-thinkterm-config",
+                        &[("path", path.display().to_string())],
+                    );
                     Self::open_path(path);
                 } else {
-                    self.status = format!(
-                        "No ThinkTerm config yet. Copy or create {} first.",
-                        path.display()
+                    self.status = settings_tr(
+                        "settings-status-no-thinkterm-config",
+                        &[("path", path.display().to_string())],
                     );
                 }
             }
             SettingsAction::OpenWezTermConfigFile => {
                 self.ui.open_dropdown = None;
-                if let Some(path) = Self::first_wezterm_config_path() {
-                    self.status = format!("Opening WezTerm source config {}", path.display());
+                if let Some(path) = self.selected_wezterm_source_path() {
+                    self.status = settings_tr(
+                        "settings-status-opening-wezterm-config",
+                        &[("path", path.display().to_string())],
+                    );
                     Self::open_path(path);
                 } else {
-                    self.status = "No existing WezTerm config was found to open.".to_string();
+                    self.status = crate::i18n::tr("settings-status-no-wezterm-config");
                 }
             }
             SettingsAction::LoadWezTermSource => {
@@ -2922,7 +2948,10 @@ impl SettingsWindow {
                     Ok(()) => window.invalidate(),
                     Err(err) => {
                         self.compatibility_import.error = Some(err.to_string());
-                        self.status = format!("Unable to load WezTerm source: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-load-wezterm-error",
+                            &[("error", format!("{err:#}"))],
+                        );
                     }
                 }
             }
@@ -2930,18 +2959,20 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 match self.import_selected_compatibility_fields() {
                     Ok((count, entry_created)) => {
-                        self.status = format!(
-                            "Imported {count} selected field{} into ThinkTerm's managed config layer{}.",
-                            if count == 1 { "" } else { "s" },
+                        self.status = settings_tr(
                             if entry_created {
-                                " and created the ThinkTerm config entry"
+                                "settings-status-import-complete-created"
                             } else {
-                                ""
-                            }
+                                "settings-status-import-complete"
+                            },
+                            &[("count", count.to_string())],
                         );
                     }
                     Err(err) => {
-                        self.status = format!("Unable to import selected fields: {err:#}");
+                        self.status = settings_tr(
+                            "settings-status-import-error",
+                            &[("error", format!("{err:#}"))],
+                        );
                     }
                 }
             }
@@ -3567,6 +3598,7 @@ impl SettingsWindow {
     }
 
     fn paint_pass(&mut self) -> anyhow::Result<()> {
+        self.pending_glyph_error.borrow_mut().take();
         if let Some(render_state) = self.render_state.as_ref() {
             for layer in render_state.layers.borrow().iter() {
                 layer.clear_quad_allocation();
@@ -3586,6 +3618,10 @@ impl SettingsWindow {
         self.paint_content(&mut layers)?;
         self.paint_content_chrome_mask(&mut layers)?;
         self.paint_window_chrome(&mut layers)?;
+
+        if let Some(err) = self.pending_glyph_error.borrow_mut().take() {
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -4472,8 +4508,8 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Each settings card owns its row count because rows are painted manually.
-        // Terminal currently paints nine rows below; the count drives card height and scroll extent.
-        let row_count = 9;
+        // Terminal currently paints eight rows below; the count drives card height and scroll extent.
+        let row_count = 8;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         let button_y = card_y + card_height + self.settings_section_card_gap();
@@ -4548,23 +4584,10 @@ impl SettingsWindow {
             SettingsAction::IncreaseFontSize,
             true,
         )?;
-        let native_font_family = self.ui.font_family_input.text().to_string();
-        self.paint_text_setting_row(
-            layers,
-            row_x,
-            first_row_y + row_step * 3.0,
-            row_width,
-            &crate::i18n::tr("settings-terminal-native-font-family"),
-            &crate::i18n::tr("settings-terminal-native-font-family-description"),
-            &native_font_family,
-            "JetBrains Mono",
-            SettingsAction::FontFamilyInput,
-            true,
-        )?;
         self.paint_action_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 4.0,
+            first_row_y + row_step * 3.0,
             row_width,
             &crate::i18n::tr("settings-remote-pane-resize-mode"),
             &crate::i18n::tr("settings-remote-pane-resize-mode-description"),
@@ -4577,7 +4600,7 @@ impl SettingsWindow {
         self.paint_toggle_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 5.0,
+            first_row_y + row_step * 4.0,
             row_width,
             &crate::i18n::tr("settings-bottom-quote"),
             &crate::i18n::tr("settings-bottom-quote-description"),
@@ -4588,7 +4611,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 6.0,
+            first_row_y + row_step * 5.0,
             row_width,
             &crate::i18n::tr("settings-quote-font-size"),
             &crate::i18n::tr("settings-quote-font-size-description"),
@@ -4602,7 +4625,7 @@ impl SettingsWindow {
         self.paint_action_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 7.0,
+            first_row_y + row_step * 6.0,
             row_width,
             &crate::i18n::tr("settings-quote-rotation"),
             &crate::i18n::tr("settings-quote-rotation-description"),
@@ -4613,7 +4636,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 8.0,
+            first_row_y + row_step * 7.0,
             row_width,
             &crate::i18n::tr("settings-quote-interval"),
             &crate::i18n::tr("settings-quote-interval-description"),
@@ -5630,7 +5653,7 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let field_count = self.compatibility_import.fields.len();
-        let row_count = 4 + field_count.max(1);
+        let row_count = 3 + field_count;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         let buttons_y = card_y + card_height + self.settings_section_card_gap();
@@ -5648,40 +5671,42 @@ impl SettingsWindow {
             args.set("path", thinkterm_path.display().to_string());
             crate::i18n::tr_args("settings-thinkterm-config-missing", &args)
         };
-        let wezterm_source = Self::first_wezterm_config_path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| crate::i18n::tr("settings-wezterm-source-missing"));
-        let loaded_source = self
-            .compatibility_import
-            .loaded_source
+        let wezterm_source_path = self.selected_wezterm_source_path();
+        let wezterm_source = wezterm_source_path
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| crate::i18n::tr("settings-not-loaded"));
-        let loaded_source_description = if self.compatibility_import.warnings.is_empty() {
-            loaded_source
-        } else {
-            let mut args = FluentArgs::new();
-            args.set("source", loaded_source);
-            args.set("count", self.compatibility_import.warnings.len());
-            crate::i18n::tr_args("settings-loaded-source-warnings", &args)
-        };
+            .unwrap_or_else(|| crate::i18n::tr("settings-wezterm-source-missing"));
         let thinkterm_status = if thinkterm_path.exists() {
-            crate::i18n::tr("common-independent")
+            crate::i18n::tr("settings-import-config-ready")
         } else {
-            crate::i18n::tr("common-defaults")
+            crate::i18n::tr("settings-import-config-will-create")
         };
-        let wezterm_status = if Self::first_wezterm_config_path().is_some() {
+        let wezterm_status = if wezterm_source_path.is_some() {
             crate::i18n::tr("common-found")
         } else {
             crate::i18n::tr("common-missing")
         };
-        let loaded_status = if self.compatibility_import.error.is_some() {
+        let selected_count = self
+            .compatibility_import
+            .fields
+            .iter()
+            .filter(|field| field.lua_value.is_some() && self.import_field_selected(field.id))
+            .count();
+        let selection_status = if self.compatibility_import.error.is_some() {
             crate::i18n::tr("common-error")
-        } else if field_count > 0 {
-            crate::i18n::tr("common-parsed")
+        } else if field_count == 0 {
+            crate::i18n::tr("settings-not-loaded")
         } else {
-            crate::i18n::tr("common-idle")
+            let mut args = FluentArgs::new();
+            args.set("selected", selected_count);
+            args.set("total", field_count);
+            crate::i18n::tr_args("settings-fields-selected", &args)
         };
+        let selection_description = self
+            .compatibility_import
+            .error
+            .clone()
+            .unwrap_or_else(|| crate::i18n::tr("settings-import-selection-description"));
 
         self.draw_text(
             layers,
@@ -5721,61 +5746,14 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 2.0,
             row_width,
-            &crate::i18n::tr("settings-loaded-source"),
-            &loaded_source_description,
-            &loaded_status,
+            &crate::i18n::tr("settings-import-selection"),
+            &selection_description,
+            &selection_status,
             true,
         )?;
 
         let mut row_y = first_row_y + row_step * 3.0;
-        let selected_count = self
-            .compatibility_import
-            .fields
-            .iter()
-            .filter(|field| field.lua_value.is_some() && self.import_field_selected(field.id))
-            .count();
-        let detected_label = if field_count == 0 {
-            crate::i18n::tr("settings-no-fields-loaded")
-        } else {
-            let mut args = FluentArgs::new();
-            args.set("selected", selected_count);
-            args.set("total", field_count);
-            crate::i18n::tr_args("settings-fields-selected", &args)
-        };
-        self.paint_setting_row(
-            layers,
-            row_x,
-            row_y,
-            row_width,
-            &crate::i18n::tr("settings-importable-fields"),
-            &crate::i18n::tr("settings-importable-fields-description"),
-            &detected_label,
-            true,
-        )?;
-        row_y += row_step;
-
-        if self.compatibility_import.fields.is_empty() {
-            let empty_description = self
-                .compatibility_import
-                .error
-                .clone()
-                .unwrap_or_else(|| crate::i18n::tr("settings-load-source-description"));
-            let empty_status = if self.compatibility_import.error.is_some() {
-                crate::i18n::tr("common-error")
-            } else {
-                crate::i18n::tr("common-empty")
-            };
-            self.paint_setting_row(
-                layers,
-                row_x,
-                row_y,
-                row_width,
-                &crate::i18n::tr("settings-detected-fields"),
-                &empty_description,
-                &empty_status,
-                true,
-            )?;
-        } else {
+        if !self.compatibility_import.fields.is_empty() {
             let fields = self.compatibility_import.fields.clone();
             for field in fields {
                 self.paint_import_field_row(layers, row_x, row_y, row_width, &field, true)?;
@@ -6953,11 +6931,7 @@ impl SettingsWindow {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
-        let button_label = if self.main_renderer_restart_required() {
-            crate::i18n::tr("settings-restart-app")
-        } else {
-            crate::i18n::tr("settings-restart")
-        };
+        let button_label = crate::i18n::tr("settings-restart-app");
         let button_width = self
             .button_width_for_label(&button_label, 0.0)
             .max(self.ui_px(220.0));
@@ -7857,15 +7831,21 @@ impl SettingsWindow {
         let render_state = self.render_state.as_ref()?;
         let mut glyph_cache = render_state.glyph_cache.borrow_mut();
         let style = font.style();
-        let glyphs: Vec<Rc<CachedGlyph>> = infos
+        let glyphs = infos
             .into_iter()
-            .filter_map(|info| {
-                glyph_cache
-                    .cached_glyph(&info, style, false, font, &self.metrics, 1)
-                    .ok()
-            })
-            .collect();
+            .map(|info| glyph_cache.cached_glyph(&info, style, false, font, &self.metrics, 1))
+            .collect::<anyhow::Result<Vec<Rc<CachedGlyph>>>>();
         drop(glyph_cache);
+        let glyphs = match glyphs {
+            Ok(glyphs) => glyphs,
+            Err(err) => {
+                let mut pending = self.pending_glyph_error.borrow_mut();
+                if pending.is_none() {
+                    *pending = Some(err);
+                }
+                return None;
+            }
+        };
 
         let shaped = Rc::new(ShapedText {
             width: glyphs
@@ -8039,16 +8019,22 @@ impl SettingsWindow {
         self.native_settings.compatibility.source_path = Some(loaded.file_name.clone());
         let _ = crate::native_settings::save(&self.native_settings);
         let field_count = fields.len();
+        let warning_count = loaded.warnings.len();
         self.compatibility_import = CompatibilityImportState {
-            loaded_source: Some(loaded.file_name.clone()),
             fields,
-            warnings: loaded.warnings,
             error: None,
         };
-        self.status = format!(
-            "Loaded {} and found {field_count} supported field{}.",
-            loaded.file_name.display(),
-            if field_count == 1 { "" } else { "s" }
+        self.status = settings_tr(
+            if warning_count == 0 {
+                "settings-status-wezterm-config-loaded"
+            } else {
+                "settings-status-wezterm-config-loaded-warnings"
+            },
+            &[
+                ("path", loaded.file_name.display().to_string()),
+                ("count", field_count.to_string()),
+                ("warnings", warning_count.to_string()),
+            ],
         );
         Ok(())
     }
@@ -8124,17 +8110,26 @@ impl SettingsWindow {
                 .compatibility
                 .selected_fields
                 .remove(pos);
-            self.status = format!("{} disabled for import.", field_id.label());
+            self.status = settings_tr(
+                "settings-status-import-field-disabled",
+                &[("field", field_id.label())],
+            );
         } else {
             self.native_settings
                 .compatibility
                 .selected_fields
                 .push(key.to_string());
-            self.status = format!("{} enabled for import.", field_id.label());
+            self.status = settings_tr(
+                "settings-status-import-field-enabled",
+                &[("field", field_id.label())],
+            );
         }
 
         if let Err(err) = crate::native_settings::save(&self.native_settings) {
-            self.status = format!("Unable to save import field selection: {err:#}");
+            self.status = settings_tr(
+                "settings-status-import-selection-error",
+                &[("error", format!("{err:#}"))],
+            );
         }
     }
 
@@ -8150,13 +8145,16 @@ impl SettingsWindow {
         self.native_settings.compatibility.selected_fields = selected;
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
-                self.status = format!(
-                    "{count} importable field{} selected.",
-                    if count == 1 { "" } else { "s" }
+                self.status = settings_tr(
+                    "settings-status-import-all-selected",
+                    &[("count", count.to_string())],
                 );
             }
             Err(err) => {
-                self.status = format!("Unable to save import field selection: {err:#}");
+                self.status = settings_tr(
+                    "settings-status-import-selection-error",
+                    &[("error", format!("{err:#}"))],
+                );
             }
         }
     }
@@ -8165,10 +8163,13 @@ impl SettingsWindow {
         self.native_settings.compatibility.selected_fields.clear();
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
-                self.status = "All import fields cleared.".to_string();
+                self.status = crate::i18n::tr("settings-status-import-all-cleared");
             }
             Err(err) => {
-                self.status = format!("Unable to save import field selection: {err:#}");
+                self.status = settings_tr(
+                    "settings-status-import-selection-error",
+                    &[("error", format!("{err:#}"))],
+                );
             }
         }
     }
