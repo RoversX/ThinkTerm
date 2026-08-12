@@ -1091,9 +1091,14 @@ impl RenderableState {
     pub(crate) fn prime_frontend_geometry(&self, size: wezterm_term::TerminalSize) -> bool {
         let mut visible = {
             let mut inner = self.inner.borrow_mut();
-            let now = Instant::now();
+            // Cancel any backoff this pane had settled into, but leave
+            // `last_poll` alone so `poll` still rate-limits itself. Backdating
+            // it forced a fresh render-changes RPC on *every* call, and the
+            // reply emits PaneOutput, which marks the frontend dirty, which
+            // draws, which calls this again: on a local socket that loop ran
+            // thousands of times a second for the whole takeover window
+            // instead of the ~50 the base interval allows.
             inner.poll_interval = BASE_POLL_INTERVAL;
-            inner.last_poll = now.checked_sub(BASE_POLL_INTERVAL).unwrap_or(now);
             if let Err(err) = inner.poll() {
                 log::trace!("polling takeover geometry: {err:#}");
             }

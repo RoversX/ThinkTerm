@@ -1018,7 +1018,11 @@ pub struct EnsureThinkTermThreadResponse {
 
 /// A complete renderer viewport. Native GUI clients include their per-pane
 /// targets so that font scaling and pane chrome are restored when ownership
-/// changes; cell-grid clients have a single canonical grid.
+/// changes; cell-grid clients have a single canonical grid. Native clients
+/// may include every member of a level-2 pane stack: those entries share one
+/// `frame` but retain independently scaled `size` values. The wire shape is
+/// unchanged; older servers safely treat the extra members as a partial frame
+/// set and skip split-tree reconstruction.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
 pub enum ClientViewport {
     CellGrid {

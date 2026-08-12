@@ -1435,6 +1435,17 @@ impl Mux {
         let tab = self
             .get_tab(tab_id)
             .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+        let native_frames = match viewport {
+            FrontendViewport::Native { panes, .. } => {
+                let frames = panes
+                    .iter()
+                    .map(|pane| (pane.pane_id, pane.frame))
+                    .collect::<Vec<_>>();
+                let covers_all_stacks = tab.frontend_frames_cover_all_stacks(&frames)?;
+                Some((frames, covers_all_stacks))
+            }
+            FrontendViewport::CellGrid { .. } => None,
+        };
         if crate::geometrytrace::trace_enabled() {
             let incoming = match viewport {
                 FrontendViewport::CellGrid { size } => {
@@ -1443,9 +1454,9 @@ impl Mux {
                 FrontendViewport::Native { size, panes } => format!(
                     "kind=native in={} covers_all={} in_panes=[{}]",
                     crate::geometrytrace::size(size),
-                    tab.viewport_covers_all_panes(
-                        &panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>()
-                    ),
+                    native_frames
+                        .as_ref()
+                        .is_some_and(|(_, covers_all)| *covers_all),
                     panes
                         .iter()
                         .map(|pane| format!(
@@ -1470,8 +1481,6 @@ impl Mux {
             tab.resize(size);
 
             if let FrontendViewport::Native { panes, .. } = viewport {
-                let pane_ids = panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>();
-                let viewport_covers_all_panes = tab.viewport_covers_all_panes(&pane_ids);
                 for pane_viewport in panes {
                     let pane = self
                         .get_pane(pane_viewport.pane_id)
@@ -1482,12 +1491,8 @@ impl Mux {
                     self.frontend_geometry_step("resizing a native pane")?;
                     pane.resize(pane_viewport.size)?;
                 }
-                if !panes.is_empty() && viewport_covers_all_panes {
-                    let frames = panes
-                        .iter()
-                        .map(|pane| (pane.pane_id, pane.frame))
-                        .collect::<HashMap<_, _>>();
-                    tab.rebuild_splits_sizes_from_frontend_frames(&frames)?;
+                if let Some((frames, true)) = native_frames.as_ref() {
+                    tab.rebuild_splits_sizes_from_frontend_frames(frames)?;
                 }
                 return Ok(());
             }

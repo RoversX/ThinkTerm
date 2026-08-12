@@ -4,11 +4,11 @@ use crate::ui::rescale_ui_usize;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
-use mux::Mux;
 use mux::domain::Domain;
 use mux::pane::{Pane, PaneId};
 use mux::tab::PositionedPane;
-use std::collections::HashMap;
+use mux::Mux;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,6 +37,17 @@ fn frontend_geometry_action(
         Some(true) => FrontendGeometryAction::Set { takeover: false },
         None => FrontendGeometryAction::Set { takeover: true },
     }
+}
+
+fn visible_geometry_targets(
+    adopted: &[(PaneId, TerminalSize)],
+    visible_panes: &HashSet<PaneId>,
+) -> Vec<(PaneId, TerminalSize)> {
+    adopted
+        .iter()
+        .filter(|(pane_id, _)| visible_panes.contains(pane_id))
+        .copied()
+        .collect()
 }
 
 fn remote_divider_target_is_owed(
@@ -313,11 +324,16 @@ impl super::TermWindow {
             // PTY resize, not that the resized screen has reached this
             // renderer. Keep the opaque takeover state and actively fetch a
             // complete post-resize snapshot before revealing it.
+            let visible_panes = self
+                .get_panes_to_render()
+                .into_iter()
+                .map(|positioned| positioned.pane.pane_id())
+                .collect::<HashSet<_>>();
             self.frontend_geometry_confirmations.insert(
                 tab_id,
                 super::FrontendGeometryConfirmation {
                     epoch,
-                    panes: adopted.to_vec(),
+                    panes: visible_geometry_targets(adopted, &visible_panes),
                     ready_since: None,
                 },
             );
@@ -515,29 +531,15 @@ impl super::TermWindow {
         let mut panes = Vec::new();
         let mut adopted = Vec::new();
         for positioned in self.get_panes_to_render() {
-            let pane = positioned.pane.downcast_ref::<ClientPane>()?;
-            if pane.domain_id() != domain_id {
-                return None;
-            }
-            let font_scale = self.pane_font_scale(positioned.pane.pane_id());
-            let metrics = if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
-                self.render_metrics
-            } else {
-                match self.pane_font_resources(font_scale) {
-                    Ok((_, metrics)) => metrics,
-                    Err(err) => {
-                        log::warn!("cannot calculate native viewport: {err:#}");
-                        return None;
-                    }
+            for member in self.positioned_panes_for_stack(tab, &positioned)? {
+                let pane = member.pane.downcast_ref::<ClientPane>()?;
+                if pane.domain_id() != domain_id {
+                    return None;
                 }
-            };
-            let size = self.terminal_size_for_positioned_pane(&positioned, metrics);
-            panes.push(codec::ClientPaneViewport {
-                pane_id: positioned.pane.pane_id(),
-                size,
-                frame: self.frontend_frame_for_positioned_pane(&positioned),
-            });
-            adopted.push((positioned.pane.pane_id(), size));
+                let viewport = self.frontend_viewport_for_positioned_pane(&member)?;
+                adopted.push((viewport.pane_id, viewport.size));
+                panes.push(viewport);
+            }
         }
         for (pane_id, size) in &adopted {
             let pane = Mux::get().get_pane(*pane_id)?;
@@ -1151,33 +1153,17 @@ impl super::TermWindow {
             return None;
         }
         let panes = if include_panes {
-            self.get_panes_to_render()
-                .into_iter()
-                .filter_map(|positioned| {
-                    let pane = positioned.pane.downcast_ref::<ClientPane>()?;
+            let mut panes = Vec::new();
+            for positioned in self.get_panes_to_render() {
+                for member in self.positioned_panes_for_stack(tab, &positioned)? {
+                    let pane = member.pane.downcast_ref::<ClientPane>()?;
                     if pane.domain_id() != domain_id {
                         return None;
                     }
-                    let font_scale = self.pane_font_scale(positioned.pane.pane_id());
-                    let metrics = if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
-                        self.render_metrics
-                    } else {
-                        match self.pane_font_resources(font_scale) {
-                            Ok((_, metrics)) => metrics,
-                            Err(err) => {
-                                log::warn!("cannot calculate native viewport: {err:#}");
-                                return None;
-                            }
-                        }
-                    };
-                    let size = self.terminal_size_for_positioned_pane(&positioned, metrics);
-                    Some(codec::ClientPaneViewport {
-                        pane_id: positioned.pane.pane_id(),
-                        size,
-                        frame: self.frontend_frame_for_positioned_pane(&positioned),
-                    })
-                })
-                .collect()
+                    panes.push(self.frontend_viewport_for_positioned_pane(&member)?);
+                }
+            }
+            panes
         } else {
             Vec::new()
         };
@@ -1578,34 +1564,30 @@ impl super::TermWindow {
 
     fn local_frontend_viewport_for_tab(
         &self,
-        _tab: &Arc<mux::tab::Tab>,
+        tab: &Arc<mux::tab::Tab>,
         include_panes: bool,
     ) -> mux::FrontendViewport {
         let panes = if include_panes {
-            self.get_panes_to_render()
-                .into_iter()
-                .filter(|positioned| !positioned.pane.is_remote_mirror())
-                .filter_map(|positioned| {
-                    let font_scale = self.pane_font_scale(positioned.pane.pane_id());
-                    let metrics = if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
-                        self.render_metrics
-                    } else {
-                        match self.pane_font_resources(font_scale) {
-                            Ok((_, metrics)) => metrics,
-                            Err(err) => {
-                                log::warn!("cannot calculate local viewport: {err:#}");
-                                return None;
-                            }
-                        }
+            let mut panes = Vec::new();
+            for positioned in self.get_panes_to_render() {
+                let Some(members) = self.positioned_panes_for_stack(tab, &positioned) else {
+                    continue;
+                };
+                for member in members {
+                    if member.pane.is_remote_mirror() {
+                        continue;
+                    }
+                    let Some(viewport) = self.frontend_viewport_for_positioned_pane(&member) else {
+                        continue;
                     };
-                    let size = self.terminal_size_for_positioned_pane(&positioned, metrics);
-                    Some(mux::FrontendPaneViewport {
-                        pane_id: positioned.pane.pane_id(),
-                        size,
-                        frame: self.frontend_frame_for_positioned_pane(&positioned),
-                    })
-                })
-                .collect()
+                    panes.push(mux::FrontendPaneViewport {
+                        pane_id: viewport.pane_id,
+                        size: viewport.size,
+                        frame: viewport.frame,
+                    });
+                }
+            }
+            panes
         } else {
             Vec::new()
         };
@@ -1875,6 +1857,60 @@ impl super::TermWindow {
         }
     }
 
+    /// Expand the currently visible member of a pane stack into every level-2
+    /// tab that occupies the same split rectangle. Hidden members need their
+    /// own PTY/render target before they become active; otherwise divider or
+    /// window resize leaves them on their last visible geometry and the first
+    /// frame after a level-2 switch visibly jumps.
+    fn positioned_panes_for_stack(
+        &self,
+        tab: &Arc<mux::tab::Tab>,
+        positioned: &PositionedPane,
+    ) -> Option<Vec<PositionedPane>> {
+        let stack_tabs = tab.pane_stack_tabs(positioned.pane.pane_id());
+        if stack_tabs.is_empty() {
+            return Some(vec![positioned.clone()]);
+        }
+
+        let mux = Mux::get();
+        stack_tabs
+            .into_iter()
+            .map(|stack_tab| {
+                let mut member = positioned.clone();
+                member.pane = mux.get_pane(stack_tab.pane_id)?;
+                member.is_active = positioned.is_active && stack_tab.is_active;
+                member.is_zoomed = positioned.is_zoomed && stack_tab.is_active;
+                Some(member)
+            })
+            .collect()
+    }
+
+    /// A stack shares a frame but not necessarily a terminal grid: pane-local
+    /// font scaling means each member must convert that frame using its own
+    /// cell metrics.
+    fn frontend_viewport_for_positioned_pane(
+        &self,
+        positioned: &PositionedPane,
+    ) -> Option<codec::ClientPaneViewport> {
+        let font_scale = self.pane_font_scale(positioned.pane.pane_id());
+        let metrics = if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
+            self.render_metrics
+        } else {
+            match self.pane_font_resources(font_scale) {
+                Ok((_, metrics)) => metrics,
+                Err(err) => {
+                    log::warn!("cannot calculate pane-stack viewport: {err:#}");
+                    return None;
+                }
+            }
+        };
+        Some(codec::ClientPaneViewport {
+            pane_id: positioned.pane.pane_id(),
+            size: self.terminal_size_for_positioned_pane(positioned, metrics),
+            frame: self.frontend_frame_for_positioned_pane(positioned),
+        })
+    }
+
     pub(crate) fn terminal_size_for_positioned_pane(
         &self,
         pos: &PositionedPane,
@@ -1943,13 +1979,21 @@ impl super::TermWindow {
         if !self.owns_frontend_viewport() {
             return;
         }
-        for pos in self.get_panes_to_render() {
-            if let Err(err) = self.sync_positioned_pane_font_size(&pos) {
-                log::error!(
-                    "failed to sync font-scaled pane size for pane {}: {:#}",
-                    pos.pane.pane_id(),
-                    err
-                );
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        for positioned in self.get_panes_to_render() {
+            let Some(members) = self.positioned_panes_for_stack(&tab, &positioned) else {
+                continue;
+            };
+            for pos in members {
+                if let Err(err) = self.sync_positioned_pane_font_size(&pos) {
+                    log::error!(
+                        "failed to sync font-scaled pane size for pane {}: {:#}",
+                        pos.pane.pane_id(),
+                        err
+                    );
+                }
             }
         }
     }
@@ -2569,10 +2613,12 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 #[cfg(test)]
 mod frontend_geometry_tests {
     use super::{
-        FRONTEND_GEOMETRY_SETTLE, FrontendGeometryAction, frontend_geometry_action,
-        geometry_confirmation_settled, remote_divider_can_pump, remote_divider_target_is_owed,
+        frontend_geometry_action, geometry_confirmation_settled, remote_divider_can_pump,
+        remote_divider_target_is_owed, visible_geometry_targets, FrontendGeometryAction,
+        FRONTEND_GEOMETRY_SETTLE,
     };
     use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy};
+    use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2634,6 +2680,24 @@ mod frontend_geometry_tests {
             start + FRONTEND_GEOMETRY_SETTLE,
             &mut ready_since
         ));
+    }
+
+    #[test]
+    fn hidden_stack_targets_do_not_delay_the_takeover_mask() {
+        let size = |cols| wezterm_term::TerminalSize {
+            cols,
+            rows: 24,
+            pixel_width: cols * 10,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let adopted = vec![(10, size(80)), (11, size(120))];
+        let visible = HashSet::from([10]);
+
+        assert_eq!(
+            visible_geometry_targets(&adopted, &visible),
+            vec![(10, size(80))]
+        );
     }
 
     #[test]

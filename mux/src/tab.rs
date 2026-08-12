@@ -786,6 +786,56 @@ fn copy_split_geometry_if_topology_matches(old: &Tree, new: &mut Tree) -> bool {
     }
 }
 
+/// Restore the invariant that only the axis a node actually splits may differ
+/// between its two children: a vertical (top/bottom) split gives both children
+/// the same width, a horizontal (left/right) split the same height.
+///
+/// Both bottom-up rebuilds below can violate it.  Measuring leaves
+/// independently rounds font-scaled panes to different cell counts, and a
+/// frontend's per-pane chrome costs a *column* of stacked panes more rows than
+/// a column holding one pane, so two sides of the same split disagree by the
+/// number of panes between them.
+///
+/// Writing the agreed size into `data.first`/`data.second` is only enough when
+/// that child is a leaf, because then the parent's record *is* the child's
+/// size.  When the child is itself a split, its own children still hold the
+/// short size and `SplitDirectionAndSize::size` re-derives the child from
+/// them, so the parent's record becomes a lie: the tab claims 38 rows, the
+/// column beneath it distributes 36, and the two rows in between belong to no
+/// pane.  Nothing later repairs that — `resize` only ever applies a delta to
+/// the short column, and a rebuild from the frames it reports re-derives the
+/// same disagreement — so grow the short subtree here, where the difference is
+/// still known.
+fn reassert_cross_axis(
+    data: &mut SplitDirectionAndSize,
+    left: &mut Tree,
+    right: &mut Tree,
+    tab_cell: &TerminalSize,
+) {
+    match data.direction {
+        SplitDirection::Vertical => {
+            let cols = data.first.cols.max(data.second.cols);
+            adjust_x_size(left, cols as isize - data.first.cols as isize, tab_cell);
+            adjust_x_size(right, cols as isize - data.second.cols as isize, tab_cell);
+            let pixel_width = cols.saturating_mul(tab_cell.pixel_width.max(1));
+            data.first.cols = cols;
+            data.first.pixel_width = pixel_width;
+            data.second.cols = cols;
+            data.second.pixel_width = pixel_width;
+        }
+        SplitDirection::Horizontal => {
+            let rows = data.first.rows.max(data.second.rows);
+            adjust_y_size(left, rows as isize - data.first.rows as isize, tab_cell);
+            adjust_y_size(right, rows as isize - data.second.rows as isize, tab_cell);
+            let pixel_height = rows.saturating_mul(tab_cell.pixel_height.max(1));
+            data.first.rows = rows;
+            data.first.pixel_height = pixel_height;
+            data.second.rows = rows;
+            data.second.pixel_height = pixel_height;
+        }
+    }
+}
+
 /// Recompute split node sizes bottom-up from the contained panes'
 /// current dimensions, returning the aggregate size of the tree.
 ///
@@ -837,37 +887,7 @@ fn compute_tree_size_from_panes(node: &mut Tree, tab_cell: &TerminalSize) -> Opt
                     data.second = second;
                 }
 
-                // Only the axis that this node actually splits may differ
-                // between its children.  A vertical (top/bottom) split gives
-                // both children the same width, and a horizontal (left/right)
-                // split gives both children the same height.  Font-scaled
-                // panes snap their PTY pixel dimensions to a different cell
-                // width/height, so converting each leaf independently can
-                // otherwise produce (for example) 65 columns above and 64
-                // below.  SplitDirectionAndSize::size observes only the first
-                // child on that cross axis, leaving the second child one cell
-                // short; the next viewport then feeds that short rectangle
-                // back in and the pane chrome visibly walks one cell at a
-                // time.  Reassert the split invariant before aggregating the
-                // node so repeated viewport reports are idempotent.
-                match data.direction {
-                    SplitDirection::Vertical => {
-                        let cols = data.first.cols.max(data.second.cols);
-                        let pixel_width = cols.saturating_mul(tab_cell.pixel_width.max(1));
-                        data.first.cols = cols;
-                        data.first.pixel_width = pixel_width;
-                        data.second.cols = cols;
-                        data.second.pixel_width = pixel_width;
-                    }
-                    SplitDirection::Horizontal => {
-                        let rows = data.first.rows.max(data.second.rows);
-                        let pixel_height = rows.saturating_mul(tab_cell.pixel_height.max(1));
-                        data.first.rows = rows;
-                        data.first.pixel_height = pixel_height;
-                        data.second.rows = rows;
-                        data.second.pixel_height = pixel_height;
-                    }
-                }
+                reassert_cross_axis(data, left, right, tab_cell);
                 Some(data.size())
             } else {
                 None
@@ -882,14 +902,13 @@ fn compute_tree_size_from_panes(node: &mut Tree, tab_cell: &TerminalSize) -> Opt
 /// nested splits without guessing at font-scale rounding or nav-bar height.
 fn compute_tree_size_from_frames(
     node: &mut Tree,
-    frames: &HashMap<PaneId, TerminalSize>,
+    frames: &HashMap<PaneStackId, TerminalSize>,
     tab_cell: &TerminalSize,
 ) -> Option<TerminalSize> {
     match node {
         Tree::Empty => None,
         Tree::Leaf(stack) => {
-            let pane_id = stack.active_pane()?.pane_id();
-            let frame = *frames.get(&pane_id)?;
+            let frame = *frames.get(&stack.id())?;
             if frame.cols == 0 || frame.rows == 0 {
                 return None;
             }
@@ -905,23 +924,53 @@ fn compute_tree_size_from_frames(
             let data = data.as_mut()?;
             data.first = compute_tree_size_from_frames(left, frames, tab_cell)?;
             data.second = compute_tree_size_from_frames(right, frames, tab_cell)?;
-            match data.direction {
-                SplitDirection::Vertical => {
-                    let cols = data.first.cols.max(data.second.cols);
-                    data.first.cols = cols;
-                    data.second.cols = cols;
-                    data.first.pixel_width = cols.saturating_mul(tab_cell.pixel_width.max(1));
-                    data.second.pixel_width = data.first.pixel_width;
-                }
-                SplitDirection::Horizontal => {
-                    let rows = data.first.rows.max(data.second.rows);
-                    data.first.rows = rows;
-                    data.second.rows = rows;
-                    data.first.pixel_height = rows.saturating_mul(tab_cell.pixel_height.max(1));
-                    data.second.pixel_height = data.first.pixel_height;
+            reassert_cross_axis(data, left, right, tab_cell);
+            Some(data.size())
+        }
+    }
+}
+
+/// Resolve the per-pane frames in a native frontend viewport into one common
+/// frame per pane stack.  A stack's panes occupy the same rectangle even when
+/// their independently scaled terminal surfaces have different row/column
+/// counts.  Accepting any member also makes frame composition independent of a
+/// concurrently delivered level-2 tab activation; when multiple members are
+/// present they must all describe that same rectangle.
+fn collect_frontend_stack_frames(
+    node: &Tree,
+    pane_frames: &HashMap<PaneId, TerminalSize>,
+    stack_frames: &mut HashMap<PaneStackId, TerminalSize>,
+) -> anyhow::Result<bool> {
+    match node {
+        Tree::Empty => Ok(false),
+        Tree::Leaf(stack) => {
+            let mut stack_frame = None;
+            for pane in &stack.panes {
+                let Some(frame) = pane_frames.get(&pane.pane_id()).copied() else {
+                    continue;
+                };
+                if let Some(prior) = stack_frame {
+                    if prior != frame {
+                        anyhow::bail!(
+                            "frontend panes in stack {} disagree on their frame",
+                            stack.id()
+                        );
+                    }
+                } else {
+                    stack_frame = Some(frame);
                 }
             }
-            Some(data.size())
+            if let Some(frame) = stack_frame {
+                stack_frames.insert(stack.id(), frame);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Tree::Node { left, right, .. } => {
+            let left_complete = collect_frontend_stack_frames(left, pane_frames, stack_frames)?;
+            let right_complete = collect_frontend_stack_frames(right, pane_frames, stack_frames)?;
+            Ok(left_complete && right_complete)
         }
     }
 }
@@ -1026,12 +1075,11 @@ impl Tab {
         self.inner.lock().geometry_trace()
     }
 
-    pub(crate) fn viewport_covers_all_panes(&self, pane_ids: &[PaneId]) -> bool {
-        let panes = self.inner.lock().iter_panes_ignoring_zoom();
-        panes.len() == pane_ids.len()
-            && panes
-                .iter()
-                .all(|pane| pane_ids.contains(&pane.pane.pane_id()))
+    pub(crate) fn frontend_frames_cover_all_stacks(
+        &self,
+        frames: &[(PaneId, TerminalSize)],
+    ) -> anyhow::Result<bool> {
+        Ok(self.inner.lock().frontend_stack_frames(frames)?.is_some())
     }
 
     pub fn iter_panes(&self) -> Vec<PositionedPane> {
@@ -1107,7 +1155,7 @@ impl Tab {
     /// to attach this tab.
     pub fn rebuild_splits_sizes_from_frontend_frames(
         &self,
-        frames: &HashMap<PaneId, TerminalSize>,
+        frames: &[(PaneId, TerminalSize)],
     ) -> anyhow::Result<()> {
         self.inner
             .lock()
@@ -2133,7 +2181,7 @@ impl TabInner {
 
     fn rebuild_splits_sizes_from_frontend_frames(
         &mut self,
-        frames: &HashMap<PaneId, TerminalSize>,
+        frames: &[(PaneId, TerminalSize)],
     ) -> anyhow::Result<()> {
         if self.zoomed.is_some() {
             if crate::geometrytrace::trace_enabled() {
@@ -2144,6 +2192,9 @@ impl TabInner {
             return Ok(());
         }
 
+        let stack_frames = self
+            .frontend_stack_frames(frames)?
+            .ok_or_else(|| anyhow::anyhow!("frontend frames do not cover tab {}", self.id))?;
         let root_size = self.size;
         let cell = cell_dimensions(&root_size);
         let tab_id = self.id;
@@ -2152,7 +2203,7 @@ impl TabInner {
             .as_ref()
             .map(clone_pane_tree)
             .ok_or_else(|| anyhow::anyhow!("tab {tab_id} has no pane tree"))?;
-        let derived = compute_tree_size_from_frames(&mut candidate, frames, &cell)
+        let derived = compute_tree_size_from_frames(&mut candidate, &stack_frames, &cell)
             .ok_or_else(|| anyhow::anyhow!("frontend frames do not cover tab {tab_id}"))?;
         if derived.cols != root_size.cols || derived.rows != root_size.rows {
             anyhow::bail!(
@@ -2187,19 +2238,13 @@ impl TabInner {
             return Ok(());
         }
 
-        let panes = self.iter_panes_ignoring_zoom();
-        if panes.len() != frames.len()
-            || !panes
-                .iter()
-                .all(|pane| frames.iter().any(|(id, _)| *id == pane.pane.pane_id()))
-        {
+        let Some(stack_frames) = self.frontend_stack_frames(frames)? else {
             // A partial viewport can race with the separate zoom/topology RPC.
             // apply_frontend_viewport deliberately resizes those surfaces but
             // does not rebuild the complete split tree.
             return Ok(());
-        }
+        };
 
-        let frames = frames.iter().copied().collect::<HashMap<_, _>>();
         let tab_id = self.id;
         let mut candidate = self
             .pane
@@ -2223,7 +2268,7 @@ impl TabInner {
             }
         };
         let cell = cell_dimensions(&root_size);
-        let derived = compute_tree_size_from_frames(&mut candidate, &frames, &cell)
+        let derived = compute_tree_size_from_frames(&mut candidate, &stack_frames, &cell)
             .ok_or_else(|| anyhow::anyhow!("frontend frames do not cover tab {tab_id}"))?;
         if derived.cols != root_size.cols || derived.rows != root_size.rows {
             anyhow::bail!(
@@ -2235,6 +2280,24 @@ impl TabInner {
             );
         }
         Ok(())
+    }
+
+    fn frontend_stack_frames(
+        &self,
+        frames: &[(PaneId, TerminalSize)],
+    ) -> anyhow::Result<Option<HashMap<PaneStackId, TerminalSize>>> {
+        let mut pane_frames = HashMap::with_capacity(frames.len());
+        for (pane_id, frame) in frames {
+            if pane_frames.insert(*pane_id, *frame).is_some() {
+                anyhow::bail!("frontend viewport contains pane {pane_id} more than once");
+            }
+        }
+        let Some(tree) = self.pane.as_ref() else {
+            anyhow::bail!("tab {} has no pane tree", self.id);
+        };
+        let mut stack_frames = HashMap::new();
+        let complete = collect_frontend_stack_frames(tree, &pane_frames, &mut stack_frames)?;
+        Ok(complete.then_some(stack_frames))
     }
 
     fn resize_split_by(&mut self, split_index: usize, delta: isize) {
@@ -4405,9 +4468,17 @@ mod test {
             .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
             .collect::<Vec<_>>();
 
-        assert!(tab.viewport_covers_all_panes(&[1, 2]));
+        let complete_frames = tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), positioned_frame(&pane, tab_size.dpi)))
+            .collect::<Vec<_>>();
+        assert!(tab
+            .frontend_frames_cover_all_stacks(&complete_frames)
+            .unwrap());
         assert!(
-            !tab.viewport_covers_all_panes(&[2]),
+            !tab.frontend_frames_cover_all_stacks(&complete_frames[1..])
+                .unwrap(),
             "a zoom viewport can race ahead of SetPaneZoomed and must remain partial"
         );
 
@@ -4531,6 +4602,77 @@ mod test {
         assert!(!mux.client_owns_frontend_lease(&client, tab.tab_id()));
     }
 
+    /// A frontend spends its per-pane chrome once per *pane*, so a column of
+    /// two stacked panes reports one row less of PTY than the single pane
+    /// beside it.  Rebuilding the tree from those dimensions must widen the
+    /// short column itself, not merely record it as taller: everything
+    /// downstream (`resize`, and the frames the frontend then reports) only
+    /// ever applies deltas, so a gap left here is permanent and shows up as a
+    /// pane whose bottom rows belong to nobody.
+    #[test]
+    fn rebuilding_from_pane_dimensions_keeps_a_stacked_column_full_height() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let (tab, _first, _second) = split_tab_for_viewport(tab_size);
+        let request = SplitRequest {
+            direction: SplitDirection::Vertical,
+            ..Default::default()
+        };
+        let split_size = tab
+            .compute_split_size(0, request)
+            .expect("the left column can split");
+        let third = FakePane::new(3, split_size.second);
+        tab.split_and_insert(0, request, Arc::clone(&third))
+            .expect("split succeeds");
+        Mux::get().add_pane(&third).unwrap();
+
+        // Charge every pane one row and two columns of frontend chrome, the
+        // way a TUI pane spends rows on its nav bar and columns on its border.
+        for positioned in tab.iter_panes() {
+            let cell_width = tab_size.pixel_width / tab_size.cols;
+            let cell_height = tab_size.pixel_height / tab_size.rows;
+            let cols = positioned.width - 2;
+            let rows = positioned.height - 1;
+            positioned
+                .pane
+                .resize(TerminalSize {
+                    cols,
+                    rows,
+                    pixel_width: cols * cell_width,
+                    pixel_height: rows * cell_height,
+                    dpi: tab_size.dpi,
+                })
+                .unwrap();
+        }
+
+        // What sync_with_pane_tree does for a tab whose topology arrived from
+        // the wire: re-derive the root from the panes, then re-impose the
+        // size this frontend actually has.
+        {
+            let mut inner = tab.inner.lock();
+            let cell = cell_dimensions(&tab_size);
+            let derived = compute_tree_size_from_panes(inner.pane.as_mut().unwrap(), &cell)
+                .expect("the tree measures");
+            inner.size = derived;
+        }
+        tab.resize(tab_size);
+
+        let panes = tab.iter_panes();
+        let bottom = panes
+            .iter()
+            .find(|pane| pane.pane.pane_id() == 3)
+            .expect("the stacked column's lower pane");
+        assert_eq!(
+            bottom.top + bottom.height,
+            tab_size.rows,
+            "the stacked column must reach the bottom of the tab: {:?}",
+            panes
+                .iter()
+                .map(|pane| (pane.pane.pane_id(), pane.top, pane.height))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn frontend_frame_preflight_uses_the_split_minimum_root() {
         let _mux = install_mux();
@@ -4545,6 +4687,104 @@ mod test {
 
         tab.validate_frontend_frames(cell, &[(1, cell), (2, cell)])
             .expect("two one-cell leaves plus their divider compose to the clamped 3x1 root");
+    }
+
+    #[test]
+    fn native_viewport_sizes_all_stack_members_without_mixing_font_units() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let (tab, first, second) = split_tab_for_viewport(tab_size);
+        let third = FakePane::new(3, tab_size);
+        tab.add_pane_to_stack(first.pane_id(), Arc::clone(&third))
+            .unwrap();
+        mux.add_pane(&third).unwrap();
+
+        let positioned = tab.iter_panes_ignoring_zoom();
+        let first_stack = positioned
+            .iter()
+            .find(|pane| pane.pane_stack_id == tab.pane_stack_id(first.pane_id()).unwrap())
+            .unwrap();
+        let second_stack = positioned
+            .iter()
+            .find(|pane| pane.pane.pane_id() == second.pane_id())
+            .unwrap();
+        let shared_frame = positioned_frame(first_stack, tab_size.dpi);
+        let ordinary_size = TerminalSize {
+            cols: first_stack.width,
+            rows: first_stack.height,
+            pixel_width: first_stack.pixel_width,
+            pixel_height: first_stack.pixel_height,
+            dpi: tab_size.dpi,
+        };
+        let scaled_size = TerminalSize {
+            cols: first_stack.width * 2,
+            rows: first_stack.height,
+            pixel_width: first_stack.pixel_width,
+            pixel_height: first_stack.pixel_height,
+            dpi: tab_size.dpi,
+        };
+        let mut panes = vec![
+            FrontendPaneViewport {
+                pane_id: first.pane_id(),
+                size: scaled_size,
+                frame: shared_frame,
+            },
+            FrontendPaneViewport {
+                pane_id: third.pane_id(),
+                size: ordinary_size,
+                frame: shared_frame,
+            },
+            FrontendPaneViewport {
+                pane_id: second.pane_id(),
+                size: TerminalSize {
+                    cols: second_stack.width,
+                    rows: second_stack.height,
+                    pixel_width: second_stack.pixel_width,
+                    pixel_height: second_stack.pixel_height,
+                    dpi: tab_size.dpi,
+                },
+                frame: positioned_frame(second_stack, tab_size.dpi),
+            },
+        ];
+
+        mux.apply_frontend_viewport(
+            tab.tab_id(),
+            &FrontendViewport::Native {
+                size: tab_size,
+                panes: panes.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(first.get_dimensions().cols, scaled_size.cols);
+        assert_eq!(third.get_dimensions().cols, ordinary_size.cols);
+        assert_eq!(tab.get_size(), tab_size);
+
+        let before = (
+            first.get_dimensions(),
+            second.get_dimensions(),
+            third.get_dimensions(),
+        );
+        panes[1].frame.cols += 1;
+        let err = mux
+            .apply_frontend_viewport(
+                tab.tab_id(),
+                &FrontendViewport::Native {
+                    size: tab_size,
+                    panes,
+                },
+            )
+            .expect_err("members of one stack cannot describe different frames");
+        assert!(err.to_string().contains("disagree on their frame"));
+        assert_eq!(
+            before,
+            (
+                first.get_dimensions(),
+                second.get_dimensions(),
+                third.get_dimensions(),
+            ),
+            "frame validation must happen before any live PTY is resized"
+        );
     }
 
     #[test]

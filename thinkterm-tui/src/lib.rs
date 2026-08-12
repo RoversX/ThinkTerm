@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use async_channel::{Receiver, Sender};
 use backend::TermwizBackend;
 use clipboard::{ClipboardProvider, SystemClipboard};
-use codec::{ClientViewport, ThinkTermSessionState};
+use codec::{ClientViewport, FrontendAccessMode, ThinkTermSessionState};
 use config::keyassignment::{PaneDirection, SpawnTabDomain};
 use config::{ConfigHandle, SshMultiplexing};
 use model::{AppModel, ThreadKey, TreeNodeKey};
@@ -194,7 +194,13 @@ struct TakeoverGeometryConfirmation {
     epoch: u64,
     screen_size: ScreenSize,
     root_size: TerminalSize,
+    /// Visible panes whose rendered rows must be fetched before the handoff
+    /// mask can lift.
     panes: Vec<(PaneId, TerminalSize)>,
+    /// Every stack member carried by the acknowledged viewport. Hidden
+    /// members do not block the mask, but their previews can finish
+    /// successfully once the server has accepted their individual targets.
+    acknowledged_panes: Vec<(PaneId, TerminalSize)>,
     access_generation: u64,
     ready_since: Option<Instant>,
 }
@@ -764,9 +770,14 @@ struct TuiState {
     /// on the next frame; the key has to outlive that, because taking control
     /// of a tab requires the server to already hold a viewport for us.
     /// Also carries whether this renderer owned the viewport when it last said
-    /// so: a handover changes what the server does with the same numbers, so it
-    /// has to count as something new to say.
-    last_viewports: HashMap<(String, TabId), Option<(ClientViewport, bool)>>,
+    /// so, and under which access mode: a handover changes what the server does
+    /// with the same numbers, so it has to count as something new to say. The
+    /// mode is in here for the same reason — a non-owner keeps its own geometry
+    /// under Handoff and mirrors the owner's under a shared view, so the same
+    /// viewport and the same `owns` mean two different local tab sizes, and a
+    /// mode flip has to reach `adopt_local_tab_size` rather than dedupe away.
+    last_viewports:
+        HashMap<(String, TabId), Option<(ClientViewport, bool, Option<FrontendAccessMode>)>>,
     /// B grants visibility for the whole mux, but geometry is still installed
     /// one top-level tab at a time. A tab is safe to reveal only after this TUI
     /// has acknowledged a complete viewport in the current access generation.
@@ -807,6 +818,13 @@ struct TuiState {
     /// Deadline until which to keep drawing regardless of whether anything
     /// asked for it, so a pane whose refetch was throttled away still recovers.
     redraw_until: Option<Instant>,
+    /// When the last frame was drawn, so the unconditional redraw above happens
+    /// at a frame rate rather than as fast as the loop can spin. Every frame
+    /// re-primes the pane previews, whose own mux notifications wake the loop
+    /// again immediately; left ungoverned that ran ~3000 frames a second for
+    /// the whole window. Only the forced redraw consults this — a frame that
+    /// something actually asked for still draws at once.
+    last_draw: Instant,
     /// Current transport generation accepted for each domain. Session pushes
     /// from any other generation are stale even when the restarted server has
     /// the same runtime id and a numerically newer snapshot generation.
@@ -900,6 +918,7 @@ impl TuiState {
             screen_size: None,
             resize_settles_at: None,
             redraw_until: None,
+            last_draw: Instant::now(),
             connection_generations,
             refresh_sessions: HashSet::new(),
             actions: VecDeque::new(),
@@ -1167,7 +1186,15 @@ async fn run_terminal(
         // renderer that draws on demand sits on the pre-resize picture until
         // the next keystroke. Drawing for a moment longer lets it retry.
         match state.redraw_until {
-            Some(until) if Instant::now() < until => state.dirty = true,
+            Some(until) if Instant::now() < until => {
+                // At a frame rate, not at loop speed: the poll below already
+                // wakes within RESIZE_REDRAW_INTERVAL, and drawing faster only
+                // repeats the pane-preview pass that woke this loop in the
+                // first place.
+                if state.last_draw.elapsed() >= RESIZE_REDRAW_INTERVAL {
+                    state.dirty = true;
+                }
+            }
             Some(_) => state.redraw_until = None,
             None => {}
         }
@@ -1245,6 +1272,7 @@ async fn run_terminal(
                 );
             })?;
             state.layout = next_layout;
+            state.last_draw = Instant::now();
             // Cleared before the trip to the server, never after — the same
             // rule the wake flag follows, and for the same reason. Adopting the
             // owner's scroll position happens in there, and clearing afterwards
@@ -1587,11 +1615,13 @@ fn prepare_active_native_viewport(
         let handle = Mux::get().get_pane(pane.pane_id)?;
         handle.downcast_ref::<ClientPane>()?;
         let size = terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen);
-        panes.push(codec::ClientPaneViewport {
-            pane_id: pane.pane_id,
+        append_tui_stack_viewports(
+            &tab,
+            pane.pane_id,
             size,
-            frame: *frames.get(&pane.pane_id)?,
-        });
+            *frames.get(&pane.pane_id)?,
+            &mut panes,
+        )?;
     }
     // Validate the complete pane set before mutating any surface. A topology
     // notification can remove one pane between the two layout passes; applying
@@ -1626,6 +1656,39 @@ fn tui_pane_frame_sizes(tab: &Tab, screen: ScreenSize) -> HashMap<PaneId, Termin
             )
         })
         .collect()
+}
+
+/// A TUI uses one cell grid for every member of a level-2 pane stack. Carry
+/// each member as an independently resizeable PTY target while keeping the
+/// common split frame. This keeps hidden panes current across a resize without
+/// turning them into extra split-tree leaves.
+fn append_tui_stack_viewports(
+    tab: &Tab,
+    visible_pane_id: PaneId,
+    size: TerminalSize,
+    frame: TerminalSize,
+    panes: &mut Vec<codec::ClientPaneViewport>,
+) -> Option<()> {
+    let stack_tabs = tab.pane_stack_tabs(visible_pane_id);
+    let pane_ids = if stack_tabs.is_empty() {
+        vec![visible_pane_id]
+    } else {
+        stack_tabs.into_iter().map(|tab| tab.pane_id).collect()
+    };
+    for pane_id in &pane_ids {
+        let handle = Mux::get().get_pane(*pane_id)?;
+        handle.downcast_ref::<ClientPane>()?;
+    }
+    for pane_id in pane_ids {
+        let handle = Mux::get().get_pane(pane_id)?;
+        handle.downcast_ref::<ClientPane>()?;
+        panes.push(codec::ClientPaneViewport {
+            pane_id,
+            size,
+            frame,
+        });
+    }
+    Some(())
 }
 
 fn forget_native_viewport_geometry(viewport: &ClientViewport) {
@@ -1675,19 +1738,42 @@ fn begin_takeover_geometry_confirmation(
     let ClientViewport::Native { size, panes } = viewport else {
         return;
     };
+    let visible_pane_ids = state
+        .layout
+        .panes
+        .iter()
+        .map(|visible| visible.pane_id)
+        .collect::<Vec<_>>();
+    let visible_panes = visible_takeover_targets(&visible_pane_ids, panes);
     state.takeover_geometry_confirmations.insert(
         cache_key,
         TakeoverGeometryConfirmation {
             epoch,
             screen_size,
             root_size: *size,
-            panes: panes.iter().map(|pane| (pane.pane_id, pane.size)).collect(),
+            panes: visible_panes,
+            acknowledged_panes: panes.iter().map(|pane| (pane.pane_id, pane.size)).collect(),
             access_generation,
             ready_since: None,
         },
     );
     state.redraw_until = Some(Instant::now() + RESIZE_REDRAW_WINDOW);
     state.dirty = true;
+}
+
+fn visible_takeover_targets(
+    visible_pane_ids: &[PaneId],
+    panes: &[codec::ClientPaneViewport],
+) -> Vec<(PaneId, TerminalSize)> {
+    visible_pane_ids
+        .iter()
+        .filter_map(|visible_pane_id| {
+            panes
+                .iter()
+                .find(|pane| pane.pane_id == *visible_pane_id)
+                .map(|pane| (pane.pane_id, pane.size))
+        })
+        .collect()
 }
 
 fn cancel_takeover_geometry_confirmation(
@@ -1867,7 +1953,7 @@ fn advance_takeover_geometry_confirmation(state: &mut TuiState) {
         state,
         &cache_key,
         confirmation.epoch,
-        Some(&confirmation.panes),
+        Some(&confirmation.acknowledged_panes),
     );
     state
         .takeover_epochs
@@ -1933,22 +2019,16 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
         };
         let frames = tui_pane_frame_sizes(&tab, screen);
         let native_root = tab.get_size();
-        let panes = state
-            .layout
-            .panes
-            .iter()
-            .filter_map(|pane| {
-                let handle = Mux::get().get_pane(pane.pane_id)?;
-                handle.downcast_ref::<ClientPane>()?;
-                let size =
-                    terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen);
-                Some(codec::ClientPaneViewport {
-                    pane_id: pane.pane_id,
-                    size,
-                    frame: *frames.get(&pane.pane_id)?,
-                })
-            })
-            .collect();
+        let mut panes = Vec::new();
+        for pane in &state.layout.panes {
+            let size = terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen);
+            let Some(frame) = frames.get(&pane.pane_id).copied() else {
+                return;
+            };
+            if append_tui_stack_viewports(&tab, pane.pane_id, size, frame, &mut panes).is_none() {
+                return;
+            }
+        }
         ClientViewport::Native {
             size: native_root,
             panes,
@@ -1979,9 +2059,11 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
         log::trace!("recording TUI frontend recovery intent: {err:#}");
     }
 
+    let access_mode = domain.remote_access_state().map(|access| access.mode);
     if recovery_generation.is_some()
         || (geometry_generation_is_stale && !geometry_confirmation_pending)
-        || state.last_viewports.get(&cache_key) != Some(&Some((viewport.clone(), owns)))
+        || state.last_viewports.get(&cache_key)
+            != Some(&Some((viewport.clone(), owns, access_mode)))
     {
         match domain
             .set_client_viewport(local_tab_id, viewport.clone())
@@ -1989,9 +2071,10 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
         {
             Ok(response) => {
                 let owns = domain.owns_remote_viewport(local_tab_id) != Some(false);
-                state
-                    .last_viewports
-                    .insert(cache_key.clone(), Some((viewport.clone(), owns)));
+                state.last_viewports.insert(
+                    cache_key.clone(),
+                    Some((viewport.clone(), owns, Some(response.access.mode))),
+                );
                 adopt_local_tab_size(
                     local_tab_id,
                     local_tab_size(&domain, local_tab_id, size, response.canonical_size),
@@ -2244,12 +2327,23 @@ fn follow_shared_view(
 /// size it just reported and the server applied; a passive renderer has no
 /// local geometry authority and follows the canonical answer.
 fn choose_local_tab_size(
+    mode: Option<codec::FrontendAccessMode>,
     owns: Option<bool>,
     reported: TerminalSize,
     canonical: TerminalSize,
 ) -> TerminalSize {
-    match owns {
-        Some(false) => canonical,
+    match (mode, owns) {
+        // Handoff gives the terminal to one renderer at a time, and the ones
+        // without it are masked rather than mirroring. Adopting the owner's
+        // geometry would relay out every local pane for a window this TTY does
+        // not have — panes sized for a 175x43 GUI clipped onto a 157x38
+        // terminal — and lay them out a second time when the terminal comes
+        // back. Keep the size this TTY actually has; it is the size the mask
+        // lifts onto.
+        (Some(codec::FrontendAccessMode::Handoff), Some(false)) => reported,
+        // A shared view is a mirror of the owner's grid, so matching its size
+        // is the whole point.
+        (_, Some(false)) => canonical,
         _ => reported,
     }
 }
@@ -2261,6 +2355,7 @@ fn local_tab_size(
     canonical: TerminalSize,
 ) -> TerminalSize {
     choose_local_tab_size(
+        domain.remote_access_state().map(|access| access.mode),
         domain.owns_remote_viewport(local_tab_id),
         reported,
         canonical,
@@ -2330,7 +2425,7 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
             .last_viewports
             .get(&(domain_name.clone(), remote_tab_id))
             .and_then(|entry| entry.as_ref())
-            .map(|(viewport, _)| viewport.clone())
+            .map(|(viewport, _, _)| viewport.clone())
         {
             Some(viewport) => viewport,
             None => {
@@ -2385,9 +2480,10 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
         );
         schedule_takeover_resync(domain_name.clone(), Arc::clone(&domain));
     }
-    state
-        .last_viewports
-        .insert(cache_key.clone(), Some((viewport.clone(), true)));
+    state.last_viewports.insert(
+        cache_key.clone(),
+        Some((viewport.clone(), true, Some(claimed.access.mode))),
+    );
     if claimed.access.mode == codec::FrontendAccessMode::Handoff {
         begin_takeover_geometry_confirmation(
             state,
@@ -2443,7 +2539,7 @@ async fn set_active_frontend_access_mode(
     let cache_key = (domain_name, remote_tab_id);
     state
         .last_viewports
-        .insert(cache_key.clone(), Some((viewport, true)));
+        .insert(cache_key.clone(), Some((viewport, true, Some(access.mode))));
     if access.mode == codec::FrontendAccessMode::Handoff {
         state
             .handoff_geometry_ready
@@ -5497,6 +5593,30 @@ mod tests {
     }
 
     #[test]
+    fn hidden_stack_targets_do_not_block_visible_takeover_confirmation() {
+        let visible = takeover_test_size(80, 24);
+        let hidden_scaled = takeover_test_size(120, 24);
+        let panes = vec![
+            codec::ClientPaneViewport {
+                pane_id: 10,
+                size: visible,
+                frame: visible,
+            },
+            codec::ClientPaneViewport {
+                pane_id: 11,
+                size: hidden_scaled,
+                frame: visible,
+            },
+        ];
+
+        assert_eq!(
+            visible_takeover_targets(&[10], &panes),
+            vec![(10, visible)],
+            "the hidden sibling is acknowledged and previewed but does not need rows fetched before the mask lifts"
+        );
+    }
+
+    #[test]
     fn takeover_confirmation_rejects_a_newly_visible_pane() {
         let first = takeover_test_size(80, 24);
         let mut current = HashMap::from([(1, first)]);
@@ -5734,20 +5854,31 @@ mod tests {
             cols: 100,
             ..TerminalSize::default()
         };
+        let shared = Some(codec::FrontendAccessMode::TmuxLatest);
         assert_eq!(
-            choose_local_tab_size(Some(true), reported, echo),
+            choose_local_tab_size(shared, Some(true), reported, echo),
             reported,
             "an owner must not adopt the shrunken echo"
         );
         assert_eq!(
-            choose_local_tab_size(None, reported, echo),
+            choose_local_tab_size(shared, None, reported, echo),
             reported,
             "an unknown lease is treated as ours, as it is before the first answer"
         );
         assert_eq!(
-            choose_local_tab_size(Some(false), reported, echo),
+            choose_local_tab_size(shared, Some(false), reported, echo),
             echo,
             "a viewer has no geometry of its own and draws what the panes have"
+        );
+        assert_eq!(
+            choose_local_tab_size(
+                Some(codec::FrontendAccessMode::Handoff),
+                Some(false),
+                reported,
+                echo
+            ),
+            reported,
+            "a masked renderer keeps the size its own terminal will come back to"
         );
     }
 
@@ -5772,7 +5903,12 @@ mod tests {
         let mut grid = 0;
         for _ in 0..5 {
             grid = laid_out.rows - 1;
-            laid_out = choose_local_tab_size(Some(true), reported, rows(grid));
+            laid_out = choose_local_tab_size(
+                Some(codec::FrontendAccessMode::TmuxLatest),
+                Some(true),
+                reported,
+                rows(grid),
+            );
         }
         assert_eq!(laid_out.rows, 30, "the tab is still the size we asked for");
         assert_eq!(grid, 29, "and the bar has cost exactly one row, once");
@@ -5781,7 +5917,12 @@ mod tests {
         // and settles, because it never spends the row it was not asked to.
         let mut viewing = reported;
         for _ in 0..5 {
-            viewing = choose_local_tab_size(Some(false), reported, rows(29));
+            viewing = choose_local_tab_size(
+                Some(codec::FrontendAccessMode::TmuxLatest),
+                Some(false),
+                reported,
+                rows(29),
+            );
         }
         assert_eq!(viewing.rows, 29);
     }
@@ -5937,6 +6078,7 @@ mod tests {
                     },
                 },
                 true,
+                Some(FrontendAccessMode::Handoff),
             )),
         );
 
