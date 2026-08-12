@@ -884,6 +884,11 @@ impl Mux {
                     anyhow::bail!("viewport for pane {} is empty", pane.pane_id);
                 }
             }
+            let frames = panes
+                .iter()
+                .map(|pane| (pane.pane_id, pane.frame))
+                .collect::<Vec<_>>();
+            tab.validate_frontend_frames(viewport.size(), &frames)?;
         }
         Ok(())
     }

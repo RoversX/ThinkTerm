@@ -1114,6 +1114,20 @@ impl Tab {
             .rebuild_splits_sizes_from_frontend_frames(frames)
     }
 
+    /// Check that a complete native frontend frame set will compose after the
+    /// requested root has gone through the same minimum-size clamp as resize.
+    /// Partial (notably zoomed) viewports do not rebuild the split tree and
+    /// therefore have nothing to preflight here.
+    pub(crate) fn validate_frontend_frames(
+        &self,
+        requested_root: TerminalSize,
+        frames: &[(PaneId, TerminalSize)],
+    ) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .validate_frontend_frames(requested_root, frames)
+    }
+
     /// Given split_index, the topological index of a split returned by
     /// iter_splits() as PositionedSplit::index, revised the split position
     /// by the provided delta; positive values move the split to the right/bottom,
@@ -2161,6 +2175,65 @@ impl TabInner {
             crate::zoom_trace!("{head} | {geometry}");
         }
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        Ok(())
+    }
+
+    fn validate_frontend_frames(
+        &mut self,
+        requested_root: TerminalSize,
+        frames: &[(PaneId, TerminalSize)],
+    ) -> anyhow::Result<()> {
+        if self.zoomed.is_some() || frames.is_empty() {
+            return Ok(());
+        }
+
+        let panes = self.iter_panes_ignoring_zoom();
+        if panes.len() != frames.len()
+            || !panes
+                .iter()
+                .all(|pane| frames.iter().any(|(id, _)| *id == pane.pane.pane_id()))
+        {
+            // A partial viewport can race with the separate zoom/topology RPC.
+            // apply_frontend_viewport deliberately resizes those surfaces but
+            // does not rebuild the complete split tree.
+            return Ok(());
+        }
+
+        let frames = frames.iter().copied().collect::<HashMap<_, _>>();
+        let tab_id = self.id;
+        let mut candidate = self
+            .pane
+            .as_ref()
+            .map(clone_pane_tree)
+            .ok_or_else(|| anyhow::anyhow!("tab {tab_id} has no pane tree"))?;
+
+        let root_size = if requested_root == self.size {
+            self.size
+        } else {
+            let dims = cell_dimensions(&requested_root);
+            let (min_x, min_y) = compute_min_size(&mut candidate);
+            let cols = requested_root.cols.max(min_x);
+            let rows = requested_root.rows.max(min_y);
+            TerminalSize {
+                rows,
+                cols,
+                pixel_width: cols * dims.pixel_width,
+                pixel_height: rows * dims.pixel_height,
+                dpi: dims.dpi,
+            }
+        };
+        let cell = cell_dimensions(&root_size);
+        let derived = compute_tree_size_from_frames(&mut candidate, &frames, &cell)
+            .ok_or_else(|| anyhow::anyhow!("frontend frames do not cover tab {tab_id}"))?;
+        if derived.cols != root_size.cols || derived.rows != root_size.rows {
+            anyhow::bail!(
+                "frontend frames {}x{} do not compose to requested tab {}x{}",
+                derived.cols,
+                derived.rows,
+                root_size.cols,
+                root_size.rows
+            );
+        }
         Ok(())
     }
 
@@ -4403,6 +4476,75 @@ mod test {
             pixel_height: positioned.pixel_height,
             dpi,
         }
+    }
+
+    #[test]
+    fn invalid_frontend_frames_are_rejected_before_geometry_or_ownership_changes() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let (tab, first, second) = split_tab_for_viewport(tab_size);
+        let client = crate::client::ClientId::new();
+        let before_layout = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+        let before_first = first.get_dimensions();
+        let before_second = second.get_dimensions();
+        let mut panes = tab
+            .iter_panes()
+            .into_iter()
+            .map(|positioned| {
+                let frame = positioned_frame(&positioned, tab_size.dpi);
+                FrontendPaneViewport {
+                    pane_id: positioned.pane.pane_id(),
+                    size: frame,
+                    frame,
+                }
+            })
+            .collect::<Vec<_>>();
+        panes[0].frame.cols += 1;
+        panes[0].frame.pixel_width += tab_size.pixel_width / tab_size.cols;
+
+        let err = mux
+            .set_client_viewport(
+                &client,
+                tab.tab_id(),
+                FrontendViewport::Native {
+                    size: tab_size,
+                    panes,
+                },
+            )
+            .expect_err("non-composing frames must fail preflight");
+        assert!(err.to_string().contains("do not compose"));
+        assert_eq!(tab.get_size(), tab_size);
+        assert_eq!(first.get_dimensions(), before_first);
+        assert_eq!(second.get_dimensions(), before_second);
+        assert_eq!(
+            tab.iter_panes()
+                .into_iter()
+                .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                .collect::<Vec<_>>(),
+            before_layout
+        );
+        assert!(!mux.client_owns_frontend_lease(&client, tab.tab_id()));
+    }
+
+    #[test]
+    fn frontend_frame_preflight_uses_the_split_minimum_root() {
+        let _mux = install_mux();
+        let (tab, _first, _second) = split_tab_for_viewport(test_size());
+        let cell = TerminalSize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 10,
+            pixel_height: 25,
+            dpi: 96,
+        };
+
+        tab.validate_frontend_frames(cell, &[(1, cell), (2, cell)])
+            .expect("two one-cell leaves plus their divider compose to the clamped 3x1 root");
     }
 
     #[test]
