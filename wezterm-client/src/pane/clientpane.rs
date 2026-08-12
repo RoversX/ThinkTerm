@@ -668,17 +668,15 @@ impl ClientPane {
         size: TerminalSize,
         succeeded: bool,
     ) -> bool {
-        if !succeeded {
-            let mut requested = self.requested_size.lock();
-            if requested.as_ref() == Some(&size) {
-                requested.take();
-            }
-        }
-        self.renderable
+        let finished = self
+            .renderable
             .lock()
             .inner
             .borrow_mut()
-            .end_frontend_preview(epoch, succeeded)
+            .end_frontend_preview(epoch, succeeded);
+        let mut requested = self.requested_size.lock();
+        finish_preview_request(&mut requested, size, succeeded, finished);
+        finished
     }
 
     pub fn is_remote_tardy(&self) -> bool {
@@ -727,6 +725,17 @@ impl ClientPane {
             })
             .await?;
         Ok(())
+    }
+}
+
+fn finish_preview_request(
+    requested: &mut Option<TerminalSize>,
+    size: TerminalSize,
+    succeeded: bool,
+    finished: bool,
+) {
+    if finished && !succeeded && requested.as_ref() == Some(&size) {
+        requested.take();
     }
 }
 
@@ -1407,6 +1416,18 @@ mod test {
                 send_rpc: false,
             }
         );
+    }
+
+    #[test]
+    fn stale_preview_completion_cannot_clear_a_newer_requested_size() {
+        let geometry = size(120, 40, 96);
+        let mut requested = Some(geometry);
+
+        finish_preview_request(&mut requested, geometry, false, false);
+        assert_eq!(requested, Some(geometry));
+
+        finish_preview_request(&mut requested, geometry, false, true);
+        assert_eq!(requested, None);
     }
 }
 

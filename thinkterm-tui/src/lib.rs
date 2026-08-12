@@ -124,11 +124,75 @@ impl TakeoverEpochs {
     fn clear_domain(&mut self, domain_name: &str) {
         self.pending.retain(|(domain, _), _| domain != domain_name);
     }
+
+    fn except(&self, active: Option<&(String, TabId)>) -> Vec<((String, TabId), u64)> {
+        self.pending
+            .iter()
+            .filter(|((domain, tab_id), _)| match active {
+                Some((active_domain, active_tab_id)) => {
+                    domain != active_domain || tab_id != active_tab_id
+                }
+                None => true,
+            })
+            .map(|((domain, tab_id), epoch)| ((domain.clone(), *tab_id), *epoch))
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct TakeoverPreviews {
+    panes: HashMap<(String, TabId, u64), HashMap<PaneId, TerminalSize>>,
+}
+
+impl TakeoverPreviews {
+    fn record(
+        &mut self,
+        cache_key: &(String, TabId),
+        epoch: u64,
+        pane_id: PaneId,
+        size: TerminalSize,
+    ) {
+        self.panes
+            .entry((cache_key.0.clone(), cache_key.1, epoch))
+            .or_default()
+            .insert(pane_id, size);
+    }
+
+    fn take(
+        &mut self,
+        cache_key: &(String, TabId),
+        epoch: u64,
+    ) -> Option<HashMap<PaneId, TerminalSize>> {
+        self.panes
+            .remove(&(cache_key.0.clone(), cache_key.1, epoch))
+    }
+
+    fn for_domain(&self, domain_name: &str) -> Vec<((String, TabId), u64)> {
+        self.panes
+            .keys()
+            .filter(|(domain, _, _)| domain == domain_name)
+            .map(|(domain, tab_id, epoch)| ((domain.clone(), *tab_id), *epoch))
+            .collect()
+    }
+
+    fn except(&self, active: Option<&(String, TabId)>) -> Vec<((String, TabId), u64)> {
+        self.panes
+            .keys()
+            .filter(|(domain, tab_id, _)| match active {
+                Some((active_domain, active_tab_id)) => {
+                    domain != active_domain || tab_id != active_tab_id
+                }
+                None => true,
+            })
+            .map(|(domain, tab_id, epoch)| ((domain.clone(), *tab_id), *epoch))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
 struct TakeoverGeometryConfirmation {
     epoch: u64,
+    screen_size: ScreenSize,
     root_size: TerminalSize,
     panes: Vec<(PaneId, TerminalSize)>,
     access_generation: u64,
@@ -715,6 +779,11 @@ struct TuiState {
     /// locally previewed pane surfaces pinned until the server has echoed the
     /// same geometry and every visible row has been fetched.
     takeover_geometry_confirmations: HashMap<(String, TabId), TakeoverGeometryConfirmation>,
+    /// Every pane surface touched by a takeover preview, including panes that
+    /// later become hidden or newly visible while the same epoch is pending.
+    /// The latest size is required to clear ClientPane::requested_size on a
+    /// failed/cancelled preview without disturbing a newer epoch.
+    takeover_previews: TakeoverPreviews,
     /// When the panes were last asked for new content, so the loop keeps asking
     /// even while nothing local has changed.
     last_pane_poll: Instant,
@@ -822,6 +891,7 @@ impl TuiState {
             handoff_consumed_press: false,
             takeover_epochs: TakeoverEpochs::default(),
             takeover_geometry_confirmations: HashMap::new(),
+            takeover_previews: TakeoverPreviews::default(),
             last_pane_poll: Instant::now(),
             shared_views: HashMap::new(),
             shared_view_at: HashMap::new(),
@@ -1129,6 +1199,7 @@ async fn run_terminal(
         }
 
         if state.dirty {
+            cancel_inactive_takeover_geometry(&mut state);
             if let Ok(screen) = terminal.backend_mut().screen_size() {
                 state.screen_size = Some(screen);
                 let area: ratatui::layout::Rect = terminal.size()?.into();
@@ -1487,7 +1558,7 @@ fn prepare_active_native_viewport(
     force: bool,
     preview_epoch: Option<u64>,
 ) -> Option<ClientViewport> {
-    let (_, domain, tab, _) = state.active_tab()?;
+    let (domain_name, domain, tab, remote_tab_id) = state.active_tab()?;
     if !force && domain.owns_remote_viewport(tab.tab_id()) != Some(true) {
         return None;
     }
@@ -1531,6 +1602,12 @@ fn prepare_active_native_viewport(
         let client = handle.downcast_ref::<ClientPane>()?;
         if let Some(epoch) = preview_epoch {
             client.preview_frontend_geometry(epoch, pane.size);
+            state.takeover_previews.record(
+                &(domain_name.clone(), remote_tab_id),
+                epoch,
+                pane.pane_id,
+                pane.size,
+            );
         } else {
             client.adopt_frontend_geometry(pane.size);
         }
@@ -1564,14 +1641,24 @@ fn forget_native_viewport_geometry(viewport: &ClientViewport) {
     }
 }
 
-fn finish_native_viewport_preview(viewport: &ClientViewport, epoch: u64, succeeded: bool) {
-    let ClientViewport::Native { panes, .. } = viewport else {
+fn finish_takeover_geometry_preview(
+    state: &mut TuiState,
+    cache_key: &(String, TabId),
+    epoch: u64,
+    confirmed: Option<&[(PaneId, TerminalSize)]>,
+) {
+    let Some(panes) = state.takeover_previews.take(cache_key, epoch) else {
         return;
     };
-    for pane in panes {
-        if let Some(handle) = Mux::get().get_pane(pane.pane_id) {
+    for (pane_id, size) in panes {
+        let succeeded = confirmed.is_some_and(|panes| {
+            panes.iter().any(|(confirmed_id, confirmed_size)| {
+                *confirmed_id == pane_id && *confirmed_size == size
+            })
+        });
+        if let Some(handle) = Mux::get().get_pane(pane_id) {
             if let Some(client) = handle.downcast_ref::<ClientPane>() {
-                client.finish_frontend_geometry_preview(epoch, pane.size, succeeded);
+                client.finish_frontend_geometry_preview(epoch, size, succeeded);
             }
         }
     }
@@ -1582,6 +1669,7 @@ fn begin_takeover_geometry_confirmation(
     cache_key: (String, TabId),
     epoch: u64,
     viewport: &ClientViewport,
+    screen_size: ScreenSize,
     access_generation: u64,
 ) {
     let ClientViewport::Native { size, panes } = viewport else {
@@ -1591,6 +1679,7 @@ fn begin_takeover_geometry_confirmation(
         cache_key,
         TakeoverGeometryConfirmation {
             epoch,
+            screen_size,
             root_size: *size,
             panes: panes.iter().map(|pane| (pane.pane_id, pane.size)).collect(),
             access_generation,
@@ -1606,19 +1695,7 @@ fn cancel_takeover_geometry_confirmation(
     cache_key: &(String, TabId),
     confirmation: &TakeoverGeometryConfirmation,
 ) {
-    let viewport = ClientViewport::Native {
-        size: confirmation.root_size,
-        panes: confirmation
-            .panes
-            .iter()
-            .map(|(pane_id, size)| codec::ClientPaneViewport {
-                pane_id: *pane_id,
-                size: *size,
-                frame: *size,
-            })
-            .collect(),
-    };
-    finish_native_viewport_preview(&viewport, confirmation.epoch, false);
+    finish_takeover_geometry_preview(state, cache_key, confirmation.epoch, None);
     state
         .takeover_epochs
         .finish(&cache_key.0, cache_key.1, confirmation.epoch);
@@ -1641,7 +1718,48 @@ fn cancel_takeover_geometry_for_domain(state: &mut TuiState, domain_name: &str) 
             cancel_takeover_geometry_confirmation(state, &key, &confirmation);
         }
     }
+    let orphaned_previews = state.takeover_previews.for_domain(domain_name);
+    for (cache_key, epoch) in orphaned_previews {
+        finish_takeover_geometry_preview(state, &cache_key, epoch, None);
+        state
+            .takeover_epochs
+            .finish(&cache_key.0, cache_key.1, epoch);
+        state.takeover_geometry_confirmations.remove(&cache_key);
+        state.handoff_geometry_ready.remove(&cache_key);
+    }
     state.takeover_epochs.clear_domain(domain_name);
+}
+
+fn cancel_inactive_takeover_geometry(state: &mut TuiState) {
+    let active = state.active_view_cache_key();
+    let inactive_epochs = state.takeover_epochs.except(active.as_ref());
+    for (cache_key, epoch) in inactive_epochs {
+        if let Some(confirmation) = state
+            .takeover_geometry_confirmations
+            .get(&cache_key)
+            .filter(|confirmation| confirmation.epoch == epoch)
+            .cloned()
+        {
+            cancel_takeover_geometry_confirmation(state, &cache_key, &confirmation);
+        } else {
+            finish_takeover_geometry_preview(state, &cache_key, epoch, None);
+            state
+                .takeover_epochs
+                .finish(&cache_key.0, cache_key.1, epoch);
+            state.takeover_geometry_confirmations.remove(&cache_key);
+            state.handoff_geometry_ready.remove(&cache_key);
+        }
+    }
+
+    let orphaned_previews = state.takeover_previews.except(active.as_ref());
+    for (cache_key, epoch) in orphaned_previews {
+        finish_takeover_geometry_preview(state, &cache_key, epoch, None);
+        state
+            .takeover_epochs
+            .finish(&cache_key.0, cache_key.1, epoch);
+        state.takeover_geometry_confirmations.remove(&cache_key);
+        state.handoff_geometry_ready.remove(&cache_key);
+    }
 }
 
 fn active_layout_matches_takeover(
@@ -1655,23 +1773,38 @@ fn active_layout_matches_takeover(
     let Some(screen) = state.screen_size else {
         return false;
     };
+    if screen != confirmation.screen_size {
+        return false;
+    }
     // A deeply split tab has a structural minimum. Its authoritative root can
     // therefore be larger than the drawable TTY content while the visible
     // pane surfaces below are intentionally clipped. Requiring the drawable
     // rectangle itself to equal the full root leaves takeover permanently in
     // `Syncing`; the root tree and every visible surface are the two relevant
     // confirmations.
-    confirmation.panes.iter().all(|(pane_id, expected)| {
-        state
-            .layout
-            .panes
-            .iter()
-            .find(|pane| pane.pane_id == *pane_id)
-            .is_some_and(|pane| {
-                terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen)
-                    == *expected
-            })
-    })
+    let current = state
+        .layout
+        .panes
+        .iter()
+        .map(|pane| {
+            (
+                pane.pane_id,
+                terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    pane_geometry_matches_confirmation(&current, &confirmation.panes)
+}
+
+fn pane_geometry_matches_confirmation(
+    current: &HashMap<PaneId, TerminalSize>,
+    expected: &[(PaneId, TerminalSize)],
+) -> bool {
+    if current.len() != expected.len() {
+        return false;
+    }
+    let expected = expected.iter().copied().collect::<HashMap<_, _>>();
+    expected.len() == current.len() && &expected == current
 }
 
 /// Confirm the same three layers before revealing a handoff: the local split
@@ -1703,8 +1836,15 @@ fn advance_takeover_geometry_confirmation(state: &mut TuiState) {
         return;
     }
 
-    let mut ready = active_layout_matches_takeover(state, &tab, &confirmation)
-        && !confirmation.panes.is_empty();
+    if !active_layout_matches_takeover(state, &tab, &confirmation) {
+        cancel_takeover_geometry_confirmation(state, &cache_key, &confirmation);
+        let now = Instant::now();
+        state.resize_settles_at = Some(now + RESIZE_SETTLE);
+        state.redraw_until = Some(now + RESIZE_REDRAW_WINDOW);
+        return;
+    }
+
+    let mut ready = !confirmation.panes.is_empty();
     for (pane_id, size) in &confirmation.panes {
         let pane_ready = Mux::get()
             .get_pane(*pane_id)
@@ -1723,19 +1863,12 @@ fn advance_takeover_geometry_confirmation(state: &mut TuiState) {
         return;
     }
 
-    let viewport = ClientViewport::Native {
-        size: confirmation.root_size,
-        panes: confirmation
-            .panes
-            .iter()
-            .map(|(pane_id, size)| codec::ClientPaneViewport {
-                pane_id: *pane_id,
-                size: *size,
-                frame: *size,
-            })
-            .collect(),
-    };
-    finish_native_viewport_preview(&viewport, confirmation.epoch, true);
+    finish_takeover_geometry_preview(
+        state,
+        &cache_key,
+        confirmation.epoch,
+        Some(&confirmation.panes),
+    );
     state
         .takeover_epochs
         .finish(&cache_key.0, cache_key.1, confirmation.epoch);
@@ -1868,7 +2001,7 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
                         if let Some(epoch) =
                             state.takeover_epochs.current(&cache_key.0, cache_key.1)
                         {
-                            finish_native_viewport_preview(&viewport, epoch, false);
+                            finish_takeover_geometry_preview(state, &cache_key, epoch, None);
                             state
                                 .takeover_epochs
                                 .finish(&cache_key.0, cache_key.1, epoch);
@@ -1910,6 +2043,7 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
                                 cache_key.clone(),
                                 epoch,
                                 &viewport,
+                                screen,
                                 response.access.generation,
                             );
                         } else {
@@ -1933,7 +2067,7 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
             }
             Err(err) => {
                 if let Some(epoch) = state.takeover_epochs.current(&cache_key.0, cache_key.1) {
-                    finish_native_viewport_preview(&viewport, epoch, false);
+                    finish_takeover_geometry_preview(state, &cache_key, epoch, None);
                     state
                         .takeover_epochs
                         .finish(&cache_key.0, cache_key.1, epoch);
@@ -2179,6 +2313,7 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
         .remote_access_state()
         .is_some_and(|access| access.mode == codec::FrontendAccessMode::Handoff);
     let epoch = state.takeover_epochs.begin(&domain_name, remote_tab_id);
+    let cache_key = (domain_name.clone(), remote_tab_id);
     let viewport = if handoff {
         let area = state.layout.screen;
         match prepare_active_native_viewport(state, area, screen, true, Some(epoch)) {
@@ -2215,7 +2350,7 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
         Ok(claimed) => claimed,
         Err(err) => {
             if handoff {
-                finish_native_viewport_preview(&viewport, epoch, false);
+                finish_takeover_geometry_preview(state, &cache_key, epoch, None);
             } else {
                 forget_native_viewport_geometry(&viewport);
             }
@@ -2227,7 +2362,7 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
     };
     if domain.owns_remote_viewport(local_tab_id) != Some(true) {
         if handoff {
-            finish_native_viewport_preview(&viewport, epoch, false);
+            finish_takeover_geometry_preview(state, &cache_key, epoch, None);
         } else {
             forget_native_viewport_geometry(&viewport);
         }
@@ -2250,7 +2385,6 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
         );
         schedule_takeover_resync(domain_name.clone(), Arc::clone(&domain));
     }
-    let cache_key = (domain_name, remote_tab_id);
     state
         .last_viewports
         .insert(cache_key.clone(), Some((viewport.clone(), true)));
@@ -2260,6 +2394,7 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
             cache_key.clone(),
             epoch,
             &viewport,
+            screen,
             claimed.access.generation,
         );
     } else {
@@ -5320,12 +5455,74 @@ mod tests {
 
         assert!(epochs.contains("devbox", 7));
         assert!(epochs.contains("devbox", 8));
+        assert_eq!(
+            epochs.except(Some(&("devbox".to_string(), 8))),
+            vec![(("devbox".to_string(), 7), first)]
+        );
         assert!(!epochs.finish("devbox", 7, first.wrapping_add(10)));
         assert!(epochs.contains("devbox", 7));
         assert!(epochs.finish("devbox", 7, first));
         assert!(!epochs.contains("devbox", 7));
         assert!(epochs.contains("devbox", 8));
         assert!(epochs.finish("devbox", 8, second));
+    }
+
+    fn takeover_test_size(cols: usize, rows: usize) -> TerminalSize {
+        TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * 10,
+            pixel_height: rows * 20,
+            dpi: 96,
+        }
+    }
+
+    #[test]
+    fn takeover_preview_geometry_is_latest_and_scoped_by_epoch() {
+        let cache_key = ("devbox".to_string(), 7);
+        let mut previews = TakeoverPreviews::default();
+        let first = takeover_test_size(80, 24);
+        let revised = takeover_test_size(100, 30);
+        let newer = takeover_test_size(120, 40);
+
+        previews.record(&cache_key, 1, 10, first);
+        previews.record(&cache_key, 1, 10, revised);
+        previews.record(&cache_key, 1, 11, first);
+        previews.record(&cache_key, 2, 10, newer);
+
+        let first_epoch = previews.take(&cache_key, 1).unwrap();
+        assert_eq!(first_epoch[&10], revised);
+        assert_eq!(first_epoch[&11], first);
+        assert_eq!(previews.take(&cache_key, 2).unwrap()[&10], newer);
+    }
+
+    #[test]
+    fn takeover_confirmation_rejects_a_newly_visible_pane() {
+        let first = takeover_test_size(80, 24);
+        let mut current = HashMap::from([(1, first)]);
+        let expected = vec![(1, first)];
+        current.insert(2, takeover_test_size(20, 24));
+
+        assert!(!pane_geometry_matches_confirmation(&current, &expected));
+    }
+
+    #[test]
+    fn takeover_confirmation_rejects_a_hidden_pane() {
+        let first = takeover_test_size(80, 24);
+        let second = takeover_test_size(20, 24);
+        let current = HashMap::from([(1, first)]);
+        let expected = vec![(1, first), (2, second)];
+
+        assert!(!pane_geometry_matches_confirmation(&current, &expected));
+    }
+
+    #[test]
+    fn takeover_confirmation_rejects_changed_pane_geometry() {
+        let first = takeover_test_size(80, 24);
+        let current = HashMap::from([(1, takeover_test_size(100, 30))]);
+        let expected = vec![(1, first)];
+
+        assert!(!pane_geometry_matches_confirmation(&current, &expected));
     }
 
     #[test]
