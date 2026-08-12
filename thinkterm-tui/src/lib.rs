@@ -80,6 +80,12 @@ const RESIZE_REDRAW_WINDOW: Duration = Duration::from_millis(1500);
 /// Pace of those extra draws. Fast enough to look immediate, slow enough that
 /// the prefetch throttle refills between attempts.
 const RESIZE_REDRAW_INTERVAL: Duration = Duration::from_millis(60);
+/// Pace pointer-selection autoscroll by the clock rather than by mouse move
+/// events. A pointer held still at an edge produces no more input events.
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
+/// Keep acceleration useful for long scrollback without letting a pointer far
+/// outside a small split skip an uncontrollable amount on every tick.
+const SELECTION_AUTOSCROLL_MAX_STEP: usize = 6;
 const TAKEOVER_RESYNC_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Full-screen programs redraw after SIGWINCH asynchronously. Keep the
 /// takeover surface opaque until the acknowledged grid and all of its visible
@@ -846,6 +852,10 @@ struct TuiState {
 enum DragState {
     Selection {
         pane_id: usize,
+        pointer_x: u16,
+        pointer_y: u16,
+        moved: bool,
+        autoscroll_at: Option<Instant>,
     },
     TreeNode {
         key: TreeNodeKey,
@@ -1166,7 +1176,8 @@ async fn run_terminal(
             state.dirty = true;
         }
 
-        if terminal.backend_mut().check_for_resize()? {
+        let terminal_resized = terminal.backend_mut().check_for_resize()?;
+        if terminal_resized {
             terminal.resize(terminal.backend().size()?.into())?;
             state.dirty = true;
             state.clear_selected_viewport_cache();
@@ -1177,6 +1188,12 @@ async fn run_terminal(
             // Redraw locally at once; tell the server only where it landed.
             state.resize_settles_at = Some(Instant::now() + RESIZE_SETTLE);
             state.redraw_until = Some(Instant::now() + RESIZE_REDRAW_WINDOW);
+        }
+
+        // A resize invalidates the old pane rectangles. Draw those first, then
+        // let an already-due tick run on the next loop with the new layout.
+        if !terminal_resized {
+            step_selection_autoscroll(&mut state, Instant::now());
         }
 
         // A resize dirties every row at once, which can outrun the client's
@@ -1316,6 +1333,10 @@ async fn run_terminal(
         {
             let tick = remaining.min(RESIZE_REDRAW_INTERVAL);
             wait = Some(wait.map_or(tick, |wait| wait.min(tick)));
+        }
+        if let Some(deadline) = selection_autoscroll_deadline(&state) {
+            let remaining = deadline.saturating_duration_since(now);
+            wait = Some(wait.map_or(remaining, |wait| wait.min(remaining)));
         }
         if let Some(first) = terminal.backend_mut().poll_input(wait)? {
             // Termwiz may decode a single tty read into many key events. Drain
@@ -3018,6 +3039,161 @@ fn scroll_pane(state: &mut TuiState, pane_id: usize, lines: isize) {
     }
     .min(dims.scrollback_rows.saturating_sub(dims.viewport_rows));
     state.ui.set_scroll_offset(pane_id, next);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionScrollDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionScrollStep {
+    direction: SelectionScrollDirection,
+    lines: usize,
+}
+
+fn selection_edge_scroll(
+    layout: &ViewLayout,
+    pane_id: PaneId,
+    pointer_y: u16,
+    moved: bool,
+) -> Option<SelectionScrollStep> {
+    if !moved {
+        return None;
+    }
+    let rect = layout
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)?
+        .rect;
+    if rect.height < 2 {
+        return None;
+    }
+    let bottom = rect.bottom().saturating_sub(1);
+    let (direction, distance) = if pointer_y <= rect.y {
+        (SelectionScrollDirection::Older, rect.y - pointer_y)
+    } else if pointer_y >= bottom {
+        (SelectionScrollDirection::Newer, pointer_y - bottom)
+    } else {
+        return None;
+    };
+    Some(SelectionScrollStep {
+        direction,
+        lines: (distance as usize + 1).min(SELECTION_AUTOSCROLL_MAX_STEP),
+    })
+}
+
+fn selection_edge_scroll_direction(
+    layout: &ViewLayout,
+    pane_id: PaneId,
+    pointer_y: u16,
+    moved: bool,
+) -> Option<SelectionScrollDirection> {
+    selection_edge_scroll(layout, pane_id, pointer_y, moved).map(|step| step.direction)
+}
+
+fn selection_autoscroll_deadline(state: &TuiState) -> Option<Instant> {
+    match &state.drag {
+        Some(DragState::Selection { autoscroll_at, .. }) => *autoscroll_at,
+        _ => None,
+    }
+}
+
+fn next_selection_scroll_offset(
+    current: usize,
+    maximum: usize,
+    direction: SelectionScrollDirection,
+    lines: usize,
+) -> usize {
+    match direction {
+        SelectionScrollDirection::Older => current.saturating_add(lines).min(maximum),
+        SelectionScrollDirection::Newer => current.saturating_sub(lines),
+    }
+}
+
+fn cancel_pointer_selection(state: &mut TuiState) {
+    state.drag = None;
+    if state
+        .ui
+        .selection
+        .as_ref()
+        .is_some_and(|selection| !selection.finalized)
+    {
+        state.ui.selection = None;
+    }
+}
+
+/// Apply one pointer-selection autoscroll step.
+///
+/// Mouse move events arm this timer, but the loop drives subsequent steps from
+/// the last pointer position so a stationary pointer keeps travelling through
+/// scrollback until it leaves the edge or reaches the end.
+fn step_selection_autoscroll(state: &mut TuiState, now: Instant) -> bool {
+    if state.ui.mode != AppMode::Terminal
+        || state.ui.selection.is_none()
+        || state.frontend_surface_blocked()
+        || !state.owns_active_viewport()
+    {
+        if matches!(state.drag, Some(DragState::Selection { .. })) {
+            cancel_pointer_selection(state);
+        }
+        return false;
+    }
+    let Some(DragState::Selection {
+        pane_id,
+        pointer_x,
+        pointer_y,
+        moved,
+        autoscroll_at: Some(deadline),
+    }) = state.drag.clone()
+    else {
+        return false;
+    };
+    if now < deadline {
+        return false;
+    }
+    if !state
+        .layout
+        .panes
+        .iter()
+        .any(|pane| pane.pane_id == pane_id)
+    {
+        cancel_pointer_selection(state);
+        return false;
+    }
+    let Some(step) = selection_edge_scroll(&state.layout, pane_id, pointer_y, moved) else {
+        if let Some(DragState::Selection { autoscroll_at, .. }) = state.drag.as_mut() {
+            *autoscroll_at = None;
+        }
+        return false;
+    };
+    let Some(pane) = state.pane(pane_id) else {
+        cancel_pointer_selection(state);
+        return false;
+    };
+    let dims = pane.get_dimensions();
+    let current = state.ui.scroll_offset(pane_id);
+    let maximum = dims.scrollback_rows.saturating_sub(dims.viewport_rows);
+    let next = next_selection_scroll_offset(current, maximum, step.direction, step.lines);
+    if next == current {
+        if let Some(DragState::Selection { autoscroll_at, .. }) = state.drag.as_mut() {
+            *autoscroll_at = None;
+        }
+        return false;
+    }
+
+    state.ui.set_scroll_offset(pane_id, next);
+    if let Some(point) = pane_point(state, pane_id, pointer_x, pointer_y) {
+        if let Some(selection) = state.ui.selection.as_mut() {
+            selection.head = point;
+        }
+    }
+    if let Some(DragState::Selection { autoscroll_at, .. }) = state.drag.as_mut() {
+        *autoscroll_at = Some(now + SELECTION_AUTOSCROLL_INTERVAL);
+    }
+    state.dirty = true;
+    true
 }
 
 fn copy_selection(state: &mut TuiState) -> Result<()> {
@@ -5064,7 +5240,13 @@ fn handle_mouse(event: TermwizMouseEvent, state: &mut TuiState) {
                             head: point,
                             finalized: false,
                         });
-                        state.drag = Some(DragState::Selection { pane_id });
+                        state.drag = Some(DragState::Selection {
+                            pane_id,
+                            pointer_x: x,
+                            pointer_y: y,
+                            moved: false,
+                            autoscroll_at: None,
+                        });
                     }
                 }
             }
@@ -5095,7 +5277,31 @@ fn handle_mouse(event: TermwizMouseEvent, state: &mut TuiState) {
         }
     } else if current.contains(MouseButtons::LEFT) {
         match state.drag.clone() {
-            Some(DragState::Selection { pane_id }) => {
+            Some(DragState::Selection {
+                pane_id,
+                pointer_x,
+                pointer_y,
+                moved,
+                autoscroll_at,
+            }) => {
+                let moved = moved || pointer_x != x || pointer_y != y;
+                let prior_direction =
+                    selection_edge_scroll_direction(&state.layout, pane_id, pointer_y, moved);
+                let direction = selection_edge_scroll_direction(&state.layout, pane_id, y, moved);
+                let autoscroll_at = match direction {
+                    None => None,
+                    Some(_) if prior_direction != direction || autoscroll_at.is_none() => {
+                        Some(Instant::now())
+                    }
+                    Some(_) => autoscroll_at,
+                };
+                state.drag = Some(DragState::Selection {
+                    pane_id,
+                    pointer_x: x,
+                    pointer_y: y,
+                    moved,
+                    autoscroll_at,
+                });
                 if let Some(point) = pane_point(state, pane_id, x, y) {
                     if let Some(selection) = state.ui.selection.as_mut() {
                         selection.head = point;
@@ -5489,14 +5695,41 @@ fn pane_point(
         .find(|pane| pane.pane_id == pane_id)?;
     let pane = state.pane(pane_id)?;
     let dims = pane.get_dimensions();
-    let offset = state.ui.scroll_offset(pane_id).min(dims.scrollback_rows);
+    selection_point_in_pane(
+        dims,
+        view.rect,
+        state.ui.scroll_offset(pane_id),
+        screen_x,
+        screen_y,
+    )
+}
+
+fn selection_point_in_pane(
+    dims: mux::renderable::RenderableDimensions,
+    rect: ratatui::layout::Rect,
+    scroll_offset: usize,
+    screen_x: u16,
+    screen_y: u16,
+) -> Option<SelectionPoint> {
+    if rect.is_empty() || dims.cols == 0 || dims.viewport_rows == 0 {
+        return None;
+    }
+    let offset = scroll_offset.min(dims.scrollback_rows);
     let top = dims
         .physical_top
         .saturating_sub(offset as wezterm_term::StableRowIndex)
         .max(dims.scrollback_top);
+    let visible_row = screen_y
+        .saturating_sub(rect.y)
+        .min(rect.height.saturating_sub(1)) as wezterm_term::StableRowIndex;
+    let latest_row =
+        dims.physical_top + dims.viewport_rows.saturating_sub(1) as wezterm_term::StableRowIndex;
     Some(SelectionPoint {
-        row: top + screen_y.saturating_sub(view.rect.y) as wezterm_term::StableRowIndex,
-        col: screen_x.saturating_sub(view.rect.x) as usize,
+        row: (top + visible_row).clamp(dims.scrollback_top, latest_row),
+        col: (screen_x
+            .saturating_sub(rect.x)
+            .min(rect.width.saturating_sub(1)) as usize)
+            .min(dims.cols.saturating_sub(1)),
     })
 }
 
@@ -6237,6 +6470,111 @@ mod tests {
         let mut selection = Some(selection);
         assert!(finish_pointer_selection(&mut selection));
         assert!(selection.is_some_and(|selection| selection.finalized));
+    }
+
+    #[test]
+    fn pointer_selection_edges_arm_autoscroll_only_after_movement() {
+        let mut layout = ViewLayout::default();
+        layout.panes.push(crate::view::PaneView {
+            pane_id: 7,
+            rect: ratatui::layout::Rect::new(10, 5, 20, 10),
+            scrollbar: None,
+            nav: None,
+            border: None,
+            collapsed: None,
+        });
+
+        assert_eq!(
+            selection_edge_scroll_direction(&layout, 7, 5, true),
+            Some(SelectionScrollDirection::Older)
+        );
+        assert_eq!(
+            selection_edge_scroll_direction(&layout, 7, 14, true),
+            Some(SelectionScrollDirection::Newer)
+        );
+        assert_eq!(selection_edge_scroll_direction(&layout, 7, 9, true), None);
+        assert_eq!(
+            selection_edge_scroll_direction(&layout, 7, 5, false),
+            None,
+            "a click or still long-press must not scroll"
+        );
+        assert_eq!(selection_edge_scroll_direction(&layout, 8, 5, true), None);
+
+        assert_eq!(
+            selection_edge_scroll(&layout, 7, 5, true),
+            Some(SelectionScrollStep {
+                direction: SelectionScrollDirection::Older,
+                lines: 1,
+            }),
+            "touching the edge stays precise"
+        );
+        assert_eq!(
+            selection_edge_scroll(&layout, 7, 3, true),
+            Some(SelectionScrollStep {
+                direction: SelectionScrollDirection::Older,
+                lines: 3,
+            }),
+            "moving farther outside accelerates"
+        );
+        assert_eq!(
+            selection_edge_scroll(&layout, 7, u16::MAX, true),
+            Some(SelectionScrollStep {
+                direction: SelectionScrollDirection::Newer,
+                lines: SELECTION_AUTOSCROLL_MAX_STEP,
+            }),
+            "acceleration is capped"
+        );
+    }
+
+    #[test]
+    fn pointer_selection_autoscroll_moves_one_row_and_stops_at_bounds() {
+        assert_eq!(
+            next_selection_scroll_offset(4, 10, SelectionScrollDirection::Older, 3),
+            7
+        );
+        assert_eq!(
+            next_selection_scroll_offset(10, 10, SelectionScrollDirection::Older, 3),
+            10
+        );
+        assert_eq!(
+            next_selection_scroll_offset(4, 10, SelectionScrollDirection::Newer, 3),
+            1
+        );
+        assert_eq!(
+            next_selection_scroll_offset(0, 10, SelectionScrollDirection::Newer, 3),
+            0
+        );
+    }
+
+    #[test]
+    fn pointer_selection_coordinates_stay_inside_the_pane_grid() {
+        let dims = mux::renderable::RenderableDimensions {
+            cols: 5,
+            viewport_rows: 6,
+            scrollback_rows: 106,
+            physical_top: 100,
+            scrollback_top: 0,
+            ..mux::renderable::RenderableDimensions::default()
+        };
+        let rect = ratatui::layout::Rect::new(10, 5, 8, 4);
+
+        assert_eq!(
+            selection_point_in_pane(dims, rect, 10, 0, 0),
+            Some(SelectionPoint { row: 90, col: 0 })
+        );
+        assert_eq!(
+            selection_point_in_pane(dims, rect, 10, u16::MAX, u16::MAX),
+            Some(SelectionPoint { row: 93, col: 4 })
+        );
+        assert_eq!(
+            selection_point_in_pane(dims, rect, usize::MAX, 10, 5),
+            Some(SelectionPoint { row: 0, col: 0 }),
+            "scrolling beyond retained history clamps to its first row"
+        );
+        assert_eq!(
+            selection_point_in_pane(dims, ratatui::layout::Rect::default(), 0, 0, 0),
+            None
+        );
     }
 
     #[test]
