@@ -4,10 +4,10 @@ use crate::ui::rescale_ui_usize;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
+use mux::Mux;
 use mux::domain::Domain;
 use mux::pane::{Pane, PaneId};
 use mux::tab::PositionedPane;
-use mux::Mux;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -355,13 +355,19 @@ impl super::TermWindow {
                 self.frontend_recovery_geometry.insert(tab_id, recovery);
             }
         }
-        let needs_follow_up = self.frontend_geometry_resync_after_epoch.remove(&tab_id);
+        // Only consume the owed resync if we are actually about to run it.
+        // Removing it unconditionally discarded the geometry a background tab
+        // was still waiting for: the flag was cleared, the sync never ran, and
+        // nothing re-armed it, so that tab kept stale geometry until an
+        // unrelated window resize happened to push it again.
+        let needs_follow_up = self.frontend_geometry_resync_after_epoch.contains(&tab_id);
+        let active = self.active_tab_is(tab_id);
         mux::zoom_trace!(
             "gui.sync.complete tab={tab_id} epoch={epoch} follow_up={needs_follow_up} \
-             active={}",
-            self.active_tab_is(tab_id)
+             active={active}"
         );
-        if needs_follow_up && self.active_tab_is(tab_id) {
+        if needs_follow_up && active {
+            self.frontend_geometry_resync_after_epoch.remove(&tab_id);
             mux::zoom_trace!("gui.sync.followup tab={tab_id} after_epoch={epoch}");
             // Starting the follow-up synchronously keeps the tab opaque: the
             // old epoch is replaced before this callback can paint.
@@ -389,6 +395,19 @@ impl super::TermWindow {
             return;
         };
         let tab_id = tab.tab_id();
+        // A confirmation owed to a tab the user has switched away from is
+        // never advanced here, and its overlay is not painted either, so
+        // nothing schedules the frames that would settle it.
+        if mux::geometrytrace::trace_enabled() {
+            for (pending_tab, pending) in &self.frontend_geometry_confirmations {
+                if *pending_tab != tab_id {
+                    mux::zoom_trace!(
+                        "gui.confirm.stranded tab={pending_tab} epoch={} active_tab={tab_id}",
+                        pending.epoch
+                    );
+                }
+            }
+        }
         let Some(confirmation) = self.frontend_geometry_confirmations.get(&tab_id).cloned() else {
             return;
         };
@@ -405,6 +424,7 @@ impl super::TermWindow {
 
         let mux = Mux::get();
         let mut ready = !confirmation.panes.is_empty();
+        let mut blockers = Vec::new();
         for (pane_id, size) in &confirmation.panes {
             let pane_ready = mux
                 .get_pane(*pane_id)
@@ -413,6 +433,23 @@ impl super::TermWindow {
                         .map(|client| client.prime_frontend_geometry(*size))
                 })
                 .unwrap_or(false);
+            if !pane_ready && mux::geometrytrace::trace_enabled() {
+                // Distinguish "the server never agreed on this size" (a
+                // permanent stall) from "rows are still being fetched" (which
+                // resolves on its own).
+                let why = mux
+                    .get_pane(*pane_id)
+                    .and_then(|pane| {
+                        pane.downcast_ref::<ClientPane>()
+                            .map(|client| client.frontend_geometry_mismatch(*size))
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| "rows_pending".to_string());
+                blockers.push(format!(
+                    "{pane_id}:want={} {why}",
+                    mux::geometrytrace::size(size)
+                ));
+            }
             ready &= pane_ready;
         }
 
@@ -422,6 +459,12 @@ impl super::TermWindow {
         } else {
             false
         };
+        mux::zoom_trace!(
+            "gui.confirm.tick tab={tab_id} epoch={} ready={ready} settled={settled} \
+             blockers=[{}]",
+            confirmation.epoch,
+            blockers.join("; ")
+        );
         if settled {
             self.complete_frontend_geometry_epoch(tab_id, confirmation.epoch);
         }
@@ -492,6 +535,7 @@ impl super::TermWindow {
             panes.push(codec::ClientPaneViewport {
                 pane_id: positioned.pane.pane_id(),
                 size,
+                frame: self.frontend_frame_for_positioned_pane(&positioned),
             });
             adopted.push((positioned.pane.pane_id(), size));
         }
@@ -1126,9 +1170,11 @@ impl super::TermWindow {
                             }
                         }
                     };
+                    let size = self.terminal_size_for_positioned_pane(&positioned, metrics);
                     Some(codec::ClientPaneViewport {
                         pane_id: positioned.pane.pane_id(),
-                        size: self.terminal_size_for_positioned_pane(&positioned, metrics),
+                        size,
+                        frame: self.frontend_frame_for_positioned_pane(&positioned),
                     })
                 })
                 .collect()
@@ -1408,10 +1454,7 @@ impl super::TermWindow {
                 .unwrap_or_else(|| "-".to_string()),
             adopted
                 .iter()
-                .map(|(pane_id, size)| format!(
-                    "{pane_id}:{}",
-                    mux::geometrytrace::size(size)
-                ))
+                .map(|(pane_id, size)| format!("{pane_id}:{}", mux::geometrytrace::size(size)))
                 .collect::<Vec<_>>()
                 .join(" ")
         );
@@ -1555,9 +1598,11 @@ impl super::TermWindow {
                             }
                         }
                     };
+                    let size = self.terminal_size_for_positioned_pane(&positioned, metrics);
                     Some(mux::FrontendPaneViewport {
                         pane_id: positioned.pane.pane_id(),
-                        size: self.terminal_size_for_positioned_pane(&positioned, metrics),
+                        size,
+                        frame: self.frontend_frame_for_positioned_pane(&positioned),
                     })
                 })
                 .collect()
@@ -1853,6 +1898,16 @@ impl super::TermWindow {
             cols,
             pixel_width: cols * cell_width,
             pixel_height: rows * cell_height,
+            dpi: self.dimensions.dpi as u32,
+        }
+    }
+
+    fn frontend_frame_for_positioned_pane(&self, pos: &PositionedPane) -> TerminalSize {
+        TerminalSize {
+            rows: pos.height,
+            cols: pos.width,
+            pixel_width: pos.pixel_width,
+            pixel_height: pos.pixel_height,
             dpi: self.dimensions.dpi as u32,
         }
     }
@@ -2514,8 +2569,8 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 #[cfg(test)]
 mod frontend_geometry_tests {
     use super::{
-        frontend_geometry_action, geometry_confirmation_settled, remote_divider_can_pump,
-        remote_divider_target_is_owed, FrontendGeometryAction, FRONTEND_GEOMETRY_SETTLE,
+        FRONTEND_GEOMETRY_SETTLE, FrontendGeometryAction, frontend_geometry_action,
+        geometry_confirmation_settled, remote_divider_can_pump, remote_divider_target_is_owed,
     };
     use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy};
     use std::time::{Duration, Instant};

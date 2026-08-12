@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 #![allow(clippy::range_plus_one)]
 
-use anyhow::{bail, Context as _, Error};
+use anyhow::{Context as _, Error, bail};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
@@ -38,8 +38,8 @@ use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 
 pub mod thinkterm_tree;
 pub use thinkterm_tree::{
-    apply_op, ensure_unique_thread_names, ThinkTermTree, TreeOp, TtProject, TtProjectId, TtSpace,
-    TtSpaceId, TtThread, TtThreadId,
+    ThinkTermTree, TreeOp, TtProject, TtProjectId, TtSpace, TtSpaceId, TtThread, TtThreadId,
+    apply_op, ensure_unique_thread_names,
 };
 
 #[derive(Error, Debug)]
@@ -461,7 +461,7 @@ macro_rules! pdu {
 /// 56: Pane entries carry that state too, so a renderer knows it on arrival.
 /// 57: Frontends publish and follow a shared per-tab scroll position.
 /// 58: Connection-wide A/B access modes and atomic geometry-bearing claims.
-pub const CODEC_VERSION: usize = 58;
+pub const CODEC_VERSION: usize = 59;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1041,7 +1041,13 @@ impl ClientViewport {
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
 pub struct ClientPaneViewport {
     pub pane_id: PaneId,
+    /// The PTY/render surface after subtracting frontend-only pane chrome and
+    /// snapping to this pane's (possibly independently scaled) cell size.
     pub size: TerminalSize,
+    /// The pane's containing rectangle in the root viewport's common cell
+    /// and pixel coordinate system.  Split geometry must be rebuilt from this
+    /// value rather than attempting to infer it from `size`.
+    pub frame: TerminalSize,
 }
 
 /// Advertise one renderer's desired viewport for a remote tab. Advertising
@@ -1627,8 +1633,8 @@ mod test {
     }
 
     #[test]
-    fn thinkterm_session_viewport_and_landing_protocol_round_trip_at_version_58() {
-        assert_eq!(CODEC_VERSION, 58);
+    fn thinkterm_session_viewport_and_landing_protocol_round_trip_at_version_59() {
+        assert_eq!(CODEC_VERSION, 59);
         let size = TerminalSize {
             rows: 40,
             cols: 132,
@@ -1638,7 +1644,20 @@ mod test {
         };
         let viewport = SetClientViewport {
             tab_id: 17,
-            viewport: ClientViewport::CellGrid { size },
+            viewport: ClientViewport::Native {
+                size,
+                panes: vec![ClientPaneViewport {
+                    pane_id: 23,
+                    size: TerminalSize {
+                        rows: 38,
+                        cols: 129,
+                        pixel_width: 1032,
+                        pixel_height: 608,
+                        dpi: 96,
+                    },
+                    frame: size,
+                }],
+            },
         };
         let mut encoded = Vec::new();
         Pdu::SetClientViewport(viewport.clone())

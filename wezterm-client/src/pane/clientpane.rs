@@ -1,6 +1,6 @@
 use crate::domain::ClientInner;
 use crate::pane::mousestate::MouseState;
-use crate::pane::renderable::{hydrate_lines, RenderableInner, RenderableState};
+use crate::pane::renderable::{RenderableInner, RenderableState, hydrate_lines};
 use anyhow::bail;
 use async_trait::async_trait;
 use codec::*;
@@ -9,8 +9,8 @@ use config::keyassignment::ScrollbackEraseMode;
 use futures::lock::Mutex as AsyncMutex;
 use mux::domain::DomainId;
 use mux::pane::{
-    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
-    Pattern, SearchResult, WithPaneLines,
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
+    SearchResult, WithPaneLines, alloc_pane_id,
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -21,8 +21,8 @@ use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use termwiz::input::KeyEvent;
 use termwiz::surface::SequenceNo;
 use url::Url;
@@ -703,6 +703,12 @@ impl ClientPane {
         self.renderable.lock().prime_frontend_geometry(size)
     }
 
+    /// Which geometry fields still block a takeover from settling, or None
+    /// once the server agrees.  Diagnostic only; see `mux::geometrytrace`.
+    pub fn frontend_geometry_mismatch(&self, size: TerminalSize) -> Option<String> {
+        self.renderable.lock().frontend_geometry_mismatch(size)
+    }
+
     /// End the remote pane and wait for the mux server to acknowledge it.
     /// Destructive compound workflows use this instead of `Pane::kill`, whose
     /// fire-and-forget task can lose a race with detaching the last window.
@@ -908,8 +914,8 @@ impl Pane for ClientPane {
             // relayout) the advertised dims legitimately disagree with the
             // GUI's still-stale layout for a moment, and re-asserting the
             // stale size would revert the server's pane resize and bake a
-            // corrupt geometry into its split tree via
-            // rebuild_splits_sizes_from_contained_panes.
+            // stale terminal surface. Split geometry is committed only by a
+            // complete Native viewport carrying exact pane frames.
             let mut requested = self.requested_size.lock();
             let prior_requested = *requested;
             let render = self.renderable.lock();
@@ -1406,7 +1412,7 @@ mod test {
 
 #[cfg(test)]
 mod palette_delivery_tests {
-    use super::{application_palette_transition, PaletteDelivery};
+    use super::{PaletteDelivery, application_palette_transition};
     use wezterm_term::color::ColorPalette;
 
     fn palette(fg: f32) -> ColorPalette {

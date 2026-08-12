@@ -836,11 +836,105 @@ fn compute_tree_size_from_panes(node: &mut Tree, tab_cell: &TerminalSize) -> Opt
                 if let Some(second) = compute_tree_size_from_panes(right, tab_cell) {
                     data.second = second;
                 }
+
+                // Only the axis that this node actually splits may differ
+                // between its children.  A vertical (top/bottom) split gives
+                // both children the same width, and a horizontal (left/right)
+                // split gives both children the same height.  Font-scaled
+                // panes snap their PTY pixel dimensions to a different cell
+                // width/height, so converting each leaf independently can
+                // otherwise produce (for example) 65 columns above and 64
+                // below.  SplitDirectionAndSize::size observes only the first
+                // child on that cross axis, leaving the second child one cell
+                // short; the next viewport then feeds that short rectangle
+                // back in and the pane chrome visibly walks one cell at a
+                // time.  Reassert the split invariant before aggregating the
+                // node so repeated viewport reports are idempotent.
+                match data.direction {
+                    SplitDirection::Vertical => {
+                        let cols = data.first.cols.max(data.second.cols);
+                        let pixel_width = cols.saturating_mul(tab_cell.pixel_width.max(1));
+                        data.first.cols = cols;
+                        data.first.pixel_width = pixel_width;
+                        data.second.cols = cols;
+                        data.second.pixel_width = pixel_width;
+                    }
+                    SplitDirection::Horizontal => {
+                        let rows = data.first.rows.max(data.second.rows);
+                        let pixel_height = rows.saturating_mul(tab_cell.pixel_height.max(1));
+                        data.first.rows = rows;
+                        data.first.pixel_height = pixel_height;
+                        data.second.rows = rows;
+                        data.second.pixel_height = pixel_height;
+                    }
+                }
                 Some(data.size())
             } else {
                 None
             }
         }
+    }
+}
+
+/// Rebuild a split tree from frontend pane *frames*. Unlike a PTY surface,
+/// every frame is measured in the root viewport's common cell grid and still
+/// includes frontend-only pane chrome. It therefore composes exactly across
+/// nested splits without guessing at font-scale rounding or nav-bar height.
+fn compute_tree_size_from_frames(
+    node: &mut Tree,
+    frames: &HashMap<PaneId, TerminalSize>,
+    tab_cell: &TerminalSize,
+) -> Option<TerminalSize> {
+    match node {
+        Tree::Empty => None,
+        Tree::Leaf(stack) => {
+            let pane_id = stack.active_pane()?.pane_id();
+            let frame = *frames.get(&pane_id)?;
+            if frame.cols == 0 || frame.rows == 0 {
+                return None;
+            }
+            Some(TerminalSize {
+                cols: frame.cols,
+                rows: frame.rows,
+                pixel_width: frame.cols.saturating_mul(tab_cell.pixel_width.max(1)),
+                pixel_height: frame.rows.saturating_mul(tab_cell.pixel_height.max(1)),
+                dpi: tab_cell.dpi,
+            })
+        }
+        Tree::Node { left, right, data } => {
+            let data = data.as_mut()?;
+            data.first = compute_tree_size_from_frames(left, frames, tab_cell)?;
+            data.second = compute_tree_size_from_frames(right, frames, tab_cell)?;
+            match data.direction {
+                SplitDirection::Vertical => {
+                    let cols = data.first.cols.max(data.second.cols);
+                    data.first.cols = cols;
+                    data.second.cols = cols;
+                    data.first.pixel_width = cols.saturating_mul(tab_cell.pixel_width.max(1));
+                    data.second.pixel_width = data.first.pixel_width;
+                }
+                SplitDirection::Horizontal => {
+                    let rows = data.first.rows.max(data.second.rows);
+                    data.first.rows = rows;
+                    data.second.rows = rows;
+                    data.first.pixel_height = rows.saturating_mul(tab_cell.pixel_height.max(1));
+                    data.second.pixel_height = data.first.pixel_height;
+                }
+            }
+            Some(data.size())
+        }
+    }
+}
+
+fn clone_pane_tree(tree: &Tree) -> Tree {
+    match tree {
+        Tree::Empty => Tree::Empty,
+        Tree::Leaf(stack) => Tree::Leaf(stack.clone()),
+        Tree::Node { left, right, data } => Tree::Node {
+            left: Box::new(clone_pane_tree(left)),
+            right: Box::new(clone_pane_tree(right)),
+            data: *data,
+        },
     }
 }
 
@@ -1011,10 +1105,13 @@ impl Tab {
     /// Without this step, disconnecting and reconnecting would cause
     /// the GUI to use stale size information for the window it spawns
     /// to attach this tab.
-    pub fn rebuild_splits_sizes_from_contained_panes(&self) {
+    pub fn rebuild_splits_sizes_from_frontend_frames(
+        &self,
+        frames: &HashMap<PaneId, TerminalSize>,
+    ) -> anyhow::Result<()> {
         self.inner
             .lock()
-            .rebuild_splits_sizes_from_contained_panes()
+            .rebuild_splits_sizes_from_frontend_frames(frames)
     }
 
     /// Given split_index, the topological index of a split returned by
@@ -2020,55 +2117,51 @@ impl TabInner {
         }
     }
 
-    fn rebuild_splits_sizes_from_contained_panes(&mut self) {
+    fn rebuild_splits_sizes_from_frontend_frames(
+        &mut self,
+        frames: &HashMap<PaneId, TerminalSize>,
+    ) -> anyhow::Result<()> {
         if self.zoomed.is_some() {
             if crate::geometrytrace::trace_enabled() {
                 let head = format!("tab.rebuild.skip tab={} reason=zoomed", self.id);
                 let geometry = self.geometry_trace();
                 crate::zoom_trace!("{head} | {geometry}");
             }
-            return;
+            return Ok(());
         }
 
-        // The contained panes cannot describe the tab root on their own: a
-        // frontend reserves per-pane chrome, so their dimensions always sum
-        // to less than the tab it is rendering.  Adopting that sum makes the
-        // *next* report look like a size change that never happened, and
-        // Tab::resize then redistributes that phantom delta across the
-        // dividers.  Keep the root the frontend declared and stretch the
-        // rebuilt proportions onto it, which also makes repeating an
-        // unchanged report converge instead of walking the splits.
         let root_size = self.size;
         let cell = cell_dimensions(&root_size);
-        let mut derived = None;
-        if let Some(root) = self.pane.as_mut() {
-            if let Some(size) = compute_tree_size_from_panes(root, &cell) {
-                derived = Some(size);
-                adjust_x_size(
-                    root,
-                    root_size.cols as isize - size.cols as isize,
-                    &cell,
-                );
-                adjust_y_size(
-                    root,
-                    root_size.rows as isize - size.rows as isize,
-                    &cell,
-                );
-            }
+        let tab_id = self.id;
+        let mut candidate = self
+            .pane
+            .as_ref()
+            .map(clone_pane_tree)
+            .ok_or_else(|| anyhow::anyhow!("tab {tab_id} has no pane tree"))?;
+        let derived = compute_tree_size_from_frames(&mut candidate, frames, &cell)
+            .ok_or_else(|| anyhow::anyhow!("frontend frames do not cover tab {tab_id}"))?;
+        if derived.cols != root_size.cols || derived.rows != root_size.rows {
+            anyhow::bail!(
+                "frontend frames {}x{} do not compose to tab {}x{}",
+                derived.cols,
+                derived.rows,
+                root_size.cols,
+                root_size.rows
+            );
         }
+        self.pane = Some(candidate);
         if crate::geometrytrace::trace_enabled() {
             let head = format!(
-                "tab.rebuild tab={} root={} derived={} (root kept)",
+                "tab.rebuild.frames tab={} root={} derived={}",
                 self.id,
                 crate::geometrytrace::size(&root_size),
-                derived
-                    .map(|size| crate::geometrytrace::size(&size))
-                    .unwrap_or_else(|| "-".to_string())
+                crate::geometrytrace::size(&derived)
             );
             let geometry = self.geometry_trace();
             crate::zoom_trace!("{head} | {geometry}");
         }
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        Ok(())
     }
 
     fn resize_split_by(&mut self, split_index: usize, delta: isize) {
@@ -4257,6 +4350,7 @@ mod test {
                 panes: vec![FrontendPaneViewport {
                     pane_id: second.pane_id(),
                     size: tab_size,
+                    frame: tab_size,
                 }],
             },
         )
@@ -4301,6 +4395,16 @@ mod test {
         (tab, first, second)
     }
 
+    fn positioned_frame(positioned: &PositionedPane, dpi: u32) -> TerminalSize {
+        TerminalSize {
+            cols: positioned.width,
+            rows: positioned.height,
+            pixel_width: positioned.pixel_width,
+            pixel_height: positioned.pixel_height,
+            dpi,
+        }
+    }
+
     #[test]
     fn a_font_scaled_pane_must_not_redefine_the_tab_root() {
         let _mux = install_mux();
@@ -4327,6 +4431,7 @@ mod test {
                         pixel_height: positioned.pixel_height,
                         dpi: tab_size.dpi,
                     },
+                    frame: positioned_frame(&positioned, tab_size.dpi),
                 }
             })
             .collect::<Vec<_>>();
@@ -4340,7 +4445,8 @@ mod test {
             .into_iter()
             .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
             .collect::<Vec<_>>();
-        mux.apply_frontend_viewport(tab.tab_id(), &viewport).unwrap();
+        mux.apply_frontend_viewport(tab.tab_id(), &viewport)
+            .unwrap();
         assert_eq!(
             tab.get_size(),
             tab_size,
@@ -4364,7 +4470,8 @@ mod test {
         // root was re-derived from the panes, every repeat looked like a size
         // change and Tab::resize walked the divider a little further.
         for _ in 0..5 {
-            mux.apply_frontend_viewport(tab.tab_id(), &viewport).unwrap();
+            mux.apply_frontend_viewport(tab.tab_id(), &viewport)
+                .unwrap();
             assert_eq!(tab.get_size(), tab_size);
             assert_eq!(
                 tab.iter_panes()
@@ -4375,6 +4482,397 @@ mod test {
                 "repeating an unchanged viewport must not move the dividers"
             );
         }
+    }
+
+    #[test]
+    fn font_scaled_pane_cannot_shrink_a_vertical_splits_cross_axis() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let tab = Arc::new(Tab::new(&tab_size));
+        let first = FakePane::new(1, tab_size);
+        tab.assign_pane(&first);
+        mux.add_tab_no_panes(&tab);
+        mux.add_pane(&first).unwrap();
+
+        let request = SplitRequest {
+            direction: SplitDirection::Vertical,
+            ..Default::default()
+        };
+        let split_size = tab
+            .compute_split_size(0, request)
+            .expect("initial tab can split");
+        let second = FakePane::new(2, split_size.second);
+        tab.split_and_insert(0, request, Arc::clone(&second))
+            .expect("split succeeds");
+        mux.add_pane(&second).unwrap();
+
+        let before = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+        assert_eq!(before[0].1, before[1].1);
+
+        // Both panes occupy the same pixel-width rectangle.  The lower pane
+        // uses a narrower independent font, so its PTY grid snaps to 791px
+        // (113 * 7) rather than the tab grid's 800px (80 * 10).  Converting
+        // those pixels independently yields 80 and 79 tab columns even though
+        // a top/bottom split cannot have different child widths.
+        let viewport = FrontendViewport::Native {
+            size: tab_size,
+            panes: tab
+                .iter_panes()
+                .into_iter()
+                .map(|positioned| FrontendPaneViewport {
+                    pane_id: positioned.pane.pane_id(),
+                    size: if positioned.pane.pane_id() == 2 {
+                        TerminalSize {
+                            cols: 113,
+                            rows: positioned.height,
+                            pixel_width: 791,
+                            pixel_height: positioned.pixel_height,
+                            dpi: tab_size.dpi,
+                        }
+                    } else {
+                        TerminalSize {
+                            cols: positioned.width,
+                            rows: positioned.height,
+                            pixel_width: positioned.pixel_width,
+                            pixel_height: positioned.pixel_height,
+                            dpi: tab_size.dpi,
+                        }
+                    },
+                    frame: positioned_frame(&positioned, tab_size.dpi),
+                })
+                .collect(),
+        };
+
+        for _ in 0..8 {
+            mux.apply_frontend_viewport(tab.tab_id(), &viewport)
+                .unwrap();
+            let panes = tab.iter_panes();
+            assert_eq!(tab.get_size(), tab_size);
+            assert_eq!(
+                panes[0].width, panes[1].width,
+                "top/bottom pane chrome must share one width"
+            );
+            assert_eq!(
+                panes
+                    .into_iter()
+                    .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                    .collect::<Vec<_>>(),
+                before,
+                "repeating the same mixed-font viewport must not walk the pane left"
+            );
+        }
+    }
+
+    #[test]
+    fn font_scaled_pane_cannot_shrink_a_horizontal_splits_cross_axis() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let (tab, _first, _second) = split_tab_for_viewport(tab_size);
+        let before = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+        assert_eq!(before[0].2, before[1].2);
+
+        // Symmetric case: left/right children share a height.  A pane-local
+        // line height can leave one PTY just below the next tab-row boundary.
+        let viewport = FrontendViewport::Native {
+            size: tab_size,
+            panes: tab
+                .iter_panes()
+                .into_iter()
+                .map(|positioned| FrontendPaneViewport {
+                    pane_id: positioned.pane.pane_id(),
+                    size: if positioned.pane.pane_id() == 2 {
+                        TerminalSize {
+                            cols: positioned.width,
+                            rows: 27,
+                            pixel_width: positioned.pixel_width,
+                            pixel_height: 594,
+                            dpi: tab_size.dpi,
+                        }
+                    } else {
+                        TerminalSize {
+                            cols: positioned.width,
+                            rows: positioned.height,
+                            pixel_width: positioned.pixel_width,
+                            pixel_height: positioned.pixel_height,
+                            dpi: tab_size.dpi,
+                        }
+                    },
+                    frame: positioned_frame(&positioned, tab_size.dpi),
+                })
+                .collect(),
+        };
+
+        for _ in 0..8 {
+            mux.apply_frontend_viewport(tab.tab_id(), &viewport)
+                .unwrap();
+            let panes = tab.iter_panes();
+            assert_eq!(tab.get_size(), tab_size);
+            assert_eq!(
+                panes[0].height, panes[1].height,
+                "left/right pane chrome must share one height"
+            );
+            assert_eq!(
+                panes
+                    .into_iter()
+                    .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                    .collect::<Vec<_>>(),
+                before,
+                "repeating the same mixed-font viewport must not walk the pane upward"
+            );
+        }
+    }
+
+    #[test]
+    fn font_scaled_right_pane_cannot_walk_a_vertical_divider() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let (tab, _first, _second) = split_tab_for_viewport(tab_size);
+        let before = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+
+        // The right pane uses 7px cells while the tab grid uses 10px cells.
+        // Its terminal surface is therefore rounded down to a multiple of 7
+        // inside the pane rectangle.  Rebuilding the divider from a floored
+        // tab-cell conversion assigns that harmless remainder to the left
+        // pane; the next GUI report then repeats the process against the new
+        // rectangle and walks the vertical divider left-to-right one cell at
+        // a time.
+        for _ in 0..8 {
+            let viewport = FrontendViewport::Native {
+                size: tab_size,
+                panes: tab
+                    .iter_panes()
+                    .into_iter()
+                    .map(|positioned| {
+                        let pane_cell_width = if positioned.pane.pane_id() == 2 {
+                            7
+                        } else {
+                            10
+                        };
+                        let cols = (positioned.pixel_width / pane_cell_width).max(1);
+                        FrontendPaneViewport {
+                            pane_id: positioned.pane.pane_id(),
+                            size: TerminalSize {
+                                cols,
+                                rows: positioned.height,
+                                pixel_width: cols * pane_cell_width,
+                                pixel_height: positioned.pixel_height,
+                                dpi: tab_size.dpi,
+                            },
+                            frame: positioned_frame(&positioned, tab_size.dpi),
+                        }
+                    })
+                    .collect(),
+            };
+            mux.apply_frontend_viewport(tab.tab_id(), &viewport)
+                .unwrap();
+            assert_eq!(
+                tab.iter_panes()
+                    .into_iter()
+                    .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                    .collect::<Vec<_>>(),
+                before,
+                "repeating a mixed-font viewport must not walk the vertical divider"
+            );
+        }
+    }
+
+    #[test]
+    fn font_scaled_bottom_pane_cannot_walk_a_horizontal_divider() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let tab = Arc::new(Tab::new(&tab_size));
+        let first = FakePane::new(1, tab_size);
+        tab.assign_pane(&first);
+        mux.add_tab_no_panes(&tab);
+        mux.add_pane(&first).unwrap();
+
+        let request = SplitRequest {
+            direction: SplitDirection::Vertical,
+            ..Default::default()
+        };
+        let split_size = tab
+            .compute_split_size(0, request)
+            .expect("initial tab can split");
+        let second = FakePane::new(2, split_size.second);
+        tab.split_and_insert(0, request, Arc::clone(&second))
+            .expect("split succeeds");
+        mux.add_pane(&second).unwrap();
+        let before = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+
+        for _ in 0..8 {
+            let viewport = FrontendViewport::Native {
+                size: tab_size,
+                panes: tab
+                    .iter_panes()
+                    .into_iter()
+                    .map(|positioned| {
+                        let pane_cell_height = if positioned.pane.pane_id() == 2 {
+                            22
+                        } else {
+                            25
+                        };
+                        let rows = (positioned.pixel_height / pane_cell_height).max(1);
+                        FrontendPaneViewport {
+                            pane_id: positioned.pane.pane_id(),
+                            size: TerminalSize {
+                                cols: positioned.width,
+                                rows,
+                                pixel_width: positioned.pixel_width,
+                                pixel_height: rows * pane_cell_height,
+                                dpi: tab_size.dpi,
+                            },
+                            frame: positioned_frame(&positioned, tab_size.dpi),
+                        }
+                    })
+                    .collect(),
+            };
+            mux.apply_frontend_viewport(tab.tab_id(), &viewport)
+                .unwrap();
+            assert_eq!(
+                tab.iter_panes()
+                    .into_iter()
+                    .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                    .collect::<Vec<_>>(),
+                before,
+                "repeating a mixed-font viewport must not walk the horizontal divider"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_mixed_font_frames_are_idempotent() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let (tab, _first, _second) = split_tab_for_viewport(tab_size);
+
+        for (target, pane_id) in [(1, 3), (2, 4)] {
+            let target_index = tab.pane_index_for_pane(target).unwrap();
+            let request = SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..Default::default()
+            };
+            let split = tab.compute_split_size(target_index, request).unwrap();
+            let pane = FakePane::new(pane_id, split.second);
+            tab.split_and_insert(target_index, request, Arc::clone(&pane))
+                .unwrap();
+            mux.add_pane(&pane).unwrap();
+        }
+        tab.resize_split_by(0, -7);
+        let before = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+
+        // This is the shape from the real failure: a left/right root whose
+        // two columns are independently split top/bottom, with pane-local
+        // font metrics and one row of frontend-only chrome. The PTY surfaces
+        // deliberately do not compose to the root; their frames do.
+        for _ in 0..12 {
+            let viewport = FrontendViewport::Native {
+                size: tab_size,
+                panes: tab
+                    .iter_panes()
+                    .into_iter()
+                    .map(|positioned| {
+                        let pane_id = positioned.pane.pane_id();
+                        let cell_width = [10, 13, 7, 19][pane_id - 1];
+                        let cell_height = [25, 22, 17, 29][pane_id - 1];
+                        let cols = (positioned.pixel_width / cell_width).max(1);
+                        let content_height = positioned.pixel_height.saturating_sub(25);
+                        let rows = (content_height / cell_height).max(1);
+                        FrontendPaneViewport {
+                            pane_id,
+                            size: TerminalSize {
+                                cols,
+                                rows,
+                                pixel_width: cols * cell_width,
+                                pixel_height: rows * cell_height,
+                                dpi: tab_size.dpi,
+                            },
+                            frame: positioned_frame(&positioned, tab_size.dpi),
+                        }
+                    })
+                    .collect(),
+            };
+            mux.apply_frontend_viewport(tab.tab_id(), &viewport)
+                .unwrap();
+            assert_eq!(
+                tab.iter_panes()
+                    .into_iter()
+                    .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                    .collect::<Vec<_>>(),
+                before,
+                "nested split frames must not drift when PTY surfaces use mixed units"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_frontend_frames_do_not_mutate_the_split_tree() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let (tab, _first, _second) = split_tab_for_viewport(tab_size);
+        let before = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+        let panes = tab
+            .iter_panes()
+            .into_iter()
+            .map(|positioned| {
+                let mut frame = positioned_frame(&positioned, tab_size.dpi);
+                if positioned.pane.pane_id() == 2 {
+                    frame.cols += 5;
+                    frame.pixel_width += 50;
+                }
+                FrontendPaneViewport {
+                    pane_id: positioned.pane.pane_id(),
+                    size: frame,
+                    frame,
+                }
+            })
+            .collect();
+        assert!(
+            mux.apply_frontend_viewport(
+                tab.tab_id(),
+                &FrontendViewport::Native {
+                    size: tab_size,
+                    panes,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(
+            tab.iter_panes()
+                .into_iter()
+                .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 
     #[test]

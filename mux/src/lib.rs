@@ -3,13 +3,13 @@ use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::{Window, WindowId, WindowUiSurfaceId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -34,7 +34,7 @@ use wezterm_term::{
     Clipboard, ClipboardSelection, DownloadHandler, TerminalConfiguration, TerminalSize,
 };
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -161,6 +161,7 @@ pub struct PaletteSelectionChange {
 pub struct FrontendPaneViewport {
     pub pane_id: PaneId,
     pub size: wezterm_term::TerminalSize,
+    pub frame: wezterm_term::TerminalSize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1443,9 +1444,10 @@ impl Mux {
                     panes
                         .iter()
                         .map(|pane| format!(
-                            "{}:{}",
+                            "{}:pty={} frame={}",
                             pane.pane_id,
-                            crate::geometrytrace::size(&pane.size)
+                            crate::geometrytrace::size(&pane.size),
+                            crate::geometrytrace::size(&pane.frame)
                         ))
                         .collect::<Vec<_>>()
                         .join(" ")
@@ -1476,7 +1478,11 @@ impl Mux {
                     pane.resize(pane_viewport.size)?;
                 }
                 if !panes.is_empty() && viewport_covers_all_panes {
-                    tab.rebuild_splits_sizes_from_contained_panes();
+                    let frames = panes
+                        .iter()
+                        .map(|pane| (pane.pane_id, pane.frame))
+                        .collect::<HashMap<_, _>>();
+                    tab.rebuild_splits_sizes_from_frontend_frames(&frames)?;
                 }
                 return Ok(());
             }
@@ -3070,9 +3076,10 @@ mod tests {
         let client = client_id(201);
         mux.frontend_geometry_failures.lock().push_back(true);
 
-        assert!(mux
-            .set_client_viewport(&client, tab_id, frontend_test_viewport(120, 40))
-            .is_err());
+        assert!(
+            mux.set_client_viewport(&client, tab_id, frontend_test_viewport(120, 40))
+                .is_err()
+        );
         let lease = mux.frontend_lease.lock();
         assert_eq!(lease.handoff_owner, None);
         assert!(lease.handoff_ever_owned);
@@ -3094,9 +3101,10 @@ mod tests {
         }
         mux.frontend_geometry_failures.lock().push_back(true);
 
-        assert!(mux
-            .claim_frontend_viewport(&second, tab_id, frontend_test_viewport(120, 40))
-            .is_err());
+        assert!(
+            mux.claim_frontend_viewport(&second, tab_id, frontend_test_viewport(120, 40))
+                .is_err()
+        );
         let lease = mux.frontend_lease.lock();
         assert_eq!(lease.handoff_owner, None);
         assert_eq!(lease.tabs[&tab_id].owner, None);
@@ -3116,14 +3124,15 @@ mod tests {
         }
         mux.frontend_geometry_failures.lock().push_back(true);
 
-        assert!(mux
-            .set_frontend_access_mode(
+        assert!(
+            mux.set_frontend_access_mode(
                 &owner,
                 FrontendAccessMode::TmuxLatest,
                 tab_id,
                 frontend_test_viewport(120, 40),
             )
-            .is_err());
+            .is_err()
+        );
         let access = mux.frontend_access_state();
         assert_eq!(access.mode, FrontendAccessMode::Handoff);
         assert_eq!(access.owner, None);
@@ -3527,15 +3536,16 @@ mod tests {
         mux.set_registered_client_viewport(&second, second_registration, tab_id, grid.clone())
             .unwrap();
 
-        assert!(mux
-            .set_registered_frontend_access_mode(
+        assert!(
+            mux.set_registered_frontend_access_mode(
                 &second,
                 second_registration,
                 FrontendAccessMode::TmuxLatest,
                 tab_id,
                 grid.clone(),
             )
-            .is_err());
+            .is_err()
+        );
         mux.set_registered_frontend_access_mode(
             &first,
             first_registration,
@@ -3549,15 +3559,16 @@ mod tests {
         // the one allowed to make itself B's global owner.
         mux.claim_registered_client_viewport(&second, second_registration, tab_id, grid.clone())
             .unwrap();
-        assert!(mux
-            .set_registered_frontend_access_mode(
+        assert!(
+            mux.set_registered_frontend_access_mode(
                 &first,
                 first_registration,
                 FrontendAccessMode::Handoff,
                 tab_id,
                 grid.clone(),
             )
-            .is_err());
+            .is_err()
+        );
         let access = mux
             .set_registered_frontend_access_mode(
                 &second,

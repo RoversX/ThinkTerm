@@ -1049,6 +1049,42 @@ impl RenderableState {
         self.inner.borrow().dimensions
     }
 
+    /// What the server last advertised.  This, not `get_dimensions`, is what
+    /// `prime_frontend_geometry` compares a takeover against, and the two can
+    /// disagree — so a takeover that never completes is only explainable from
+    /// this value.
+    pub(crate) fn server_dimensions(&self) -> RenderableDimensions {
+        self.inner.borrow().server_dimensions
+    }
+
+    /// Which fields block a takeover from settling on `size`, for zoomtrace.
+    pub(crate) fn frontend_geometry_mismatch(
+        &self,
+        size: wezterm_term::TerminalSize,
+    ) -> Option<String> {
+        let dims = self.inner.borrow().server_dimensions;
+        if render_dimensions_match_terminal_size(dims, size) {
+            return None;
+        }
+        let mut fields = Vec::new();
+        if dims.cols != size.cols {
+            fields.push(format!("cols {}!={}", dims.cols, size.cols));
+        }
+        if dims.viewport_rows != size.rows {
+            fields.push(format!("rows {}!={}", dims.viewport_rows, size.rows));
+        }
+        if dims.pixel_width != size.pixel_width {
+            fields.push(format!("px_w {}!={}", dims.pixel_width, size.pixel_width));
+        }
+        if dims.pixel_height != size.pixel_height {
+            fields.push(format!("px_h {}!={}", dims.pixel_height, size.pixel_height));
+        }
+        if dims.dpi != size.dpi {
+            fields.push(format!("dpi {}!={}", dims.dpi, size.dpi));
+        }
+        Some(fields.join(","))
+    }
+
     /// Drive a render poll and populate every currently visible line while a
     /// takeover overlay is still opaque.  Returns true only after the server
     /// has confirmed `size` and none of those rows is stale or in flight.

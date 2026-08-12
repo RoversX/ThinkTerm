@@ -22,8 +22,8 @@ use mux::domain::{Domain, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId, Pattern};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use mux::{Mux, MuxNotification};
-use ratatui::backend::Backend;
 use ratatui::Terminal;
+use ratatui::backend::Backend;
 use settings::{TuiConfig, TuiPersistentState};
 use state::{
     AppMode, ConfirmationState, ConnectionItem, ConnectionStatus, ContextMenuState, CopyState,
@@ -39,7 +39,7 @@ use termwiz::caps::{Capabilities, ProbeHints};
 use termwiz::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent as TermwizMouseEvent,
 };
-use termwiz::terminal::{new_terminal, ScreenSize, TerminalWaker};
+use termwiz::terminal::{ScreenSize, TerminalWaker, new_terminal};
 use uuid::Uuid;
 use view::{HitTarget, PaneTool, TabBarControl, TreeAction, ViewLayout};
 use wezterm_client::client::Client;
@@ -47,8 +47,8 @@ use wezterm_client::domain::{
     ClientDomain, ClientDomainConfig, FrontendRecoverySlot, RemoteFrontendGate,
 };
 use wezterm_client::pane::ClientPane;
-use wezterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
 use wezterm_term::TerminalSize;
+use wezterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
 
 static EVENT_SENDER: OnceLock<Sender<AppEvent>> = OnceLock::new();
 static TERMINAL_WAKER: OnceLock<TerminalWaker> = OnceLock::new();
@@ -1502,6 +1502,13 @@ fn prepare_active_native_viewport(
         screen,
     );
     tab.resize(root);
+    // `compute_view` clips panes to the portion of the split tree that fits on
+    // this TTY.  That clipped rectangle is the PTY/render surface, but it is
+    // not the authoritative split frame: using it as the frame makes a small
+    // TUI claim fail the server's complete-tree validation.  Capture the
+    // frames from the Tab itself after resize, before adding TUI-only chrome.
+    let root = tab.get_size();
+    let frames = tui_pane_frame_sizes(&tab, screen);
 
     let layout = view::compute_view(area, &state.model, &state.ui, Some(&tab));
     let mut panes = Vec::new();
@@ -1512,6 +1519,7 @@ fn prepare_active_native_viewport(
         panes.push(codec::ClientPaneViewport {
             pane_id: pane.pane_id,
             size,
+            frame: *frames.get(&pane.pane_id)?,
         });
     }
     // Validate the complete pane set before mutating any surface. A topology
@@ -1529,6 +1537,18 @@ fn prepare_active_native_viewport(
     }
     state.layout = layout;
     Some(ClientViewport::Native { size: root, panes })
+}
+
+fn tui_pane_frame_sizes(tab: &Tab, screen: ScreenSize) -> HashMap<PaneId, TerminalSize> {
+    tab.iter_panes()
+        .into_iter()
+        .map(|pane| {
+            (
+                pane.pane.pane_id(),
+                terminal_size(pane.width, pane.height, screen),
+            )
+        })
+        .collect()
 }
 
 fn forget_native_viewport_geometry(viewport: &ClientViewport) {
@@ -1594,6 +1614,7 @@ fn cancel_takeover_geometry_confirmation(
             .map(|(pane_id, size)| codec::ClientPaneViewport {
                 pane_id: *pane_id,
                 size: *size,
+                frame: *size,
             })
             .collect(),
     };
@@ -1634,14 +1655,12 @@ fn active_layout_matches_takeover(
     let Some(screen) = state.screen_size else {
         return false;
     };
-    if terminal_size(
-        state.layout.content.width as usize,
-        state.layout.content.height as usize,
-        screen,
-    ) != confirmation.root_size
-    {
-        return false;
-    }
+    // A deeply split tab has a structural minimum. Its authoritative root can
+    // therefore be larger than the drawable TTY content while the visible
+    // pane surfaces below are intentionally clipped. Requiring the drawable
+    // rectangle itself to equal the full root leaves takeover permanently in
+    // `Syncing`; the root tree and every visible surface are the two relevant
+    // confirmations.
     confirmation.panes.iter().all(|(pane_id, expected)| {
         state
             .layout
@@ -1712,6 +1731,7 @@ fn advance_takeover_geometry_confirmation(state: &mut TuiState) {
             .map(|(pane_id, size)| codec::ClientPaneViewport {
                 pane_id: *pane_id,
                 size: *size,
+                frame: *size,
             })
             .collect(),
     };
@@ -1775,6 +1795,11 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
     let recovery_generation =
         domain.pending_frontend_recovery(FrontendRecoverySlot::Primary, local_tab_id);
     let viewport = if ownership == Some(true) || recovery_generation.is_some() {
+        let Some(tab) = Mux::get().get_tab(local_tab_id) else {
+            return;
+        };
+        let frames = tui_pane_frame_sizes(&tab, screen);
+        let native_root = tab.get_size();
         let panes = state
             .layout
             .panes
@@ -1782,17 +1807,19 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
             .filter_map(|pane| {
                 let handle = Mux::get().get_pane(pane.pane_id)?;
                 handle.downcast_ref::<ClientPane>()?;
+                let size =
+                    terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen);
                 Some(codec::ClientPaneViewport {
                     pane_id: pane.pane_id,
-                    size: terminal_size(
-                        pane.rect.width as usize,
-                        pane.rect.height as usize,
-                        screen,
-                    ),
+                    size,
+                    frame: *frames.get(&pane.pane_id)?,
                 })
             })
             .collect();
-        ClientViewport::Native { size, panes }
+        ClientViewport::Native {
+            size: native_root,
+            panes,
+        }
     } else {
         ClientViewport::CellGrid { size }
     };
@@ -2079,19 +2106,9 @@ fn follow_shared_view(
 
 /// Which size this renderer's own copy of the tab should be laid out at.
 ///
-/// `canonical_size` is the *server's* tab size, and the server derives it back
-/// from the pane sizes it was told (`rebuild_splits_sizes_from_contained_panes`).
-/// Once a pane's rectangle loses a row to its own nav bar, that shrunken row
-/// count is what comes home in the echo — adopting it costs another row on the
-/// next layout, and another after that. The GUI never adopts it either: the
-/// only use of `canonical_size` on that side is the `VIEW 73×28` title, and
-/// `ClientDomain`'s own resync refuses the wire size for the same reason
-/// ("would shrink the tab by the chrome height on every resync").
-///
-/// So the owner lays out at the size it just reported and the server just
-/// applied. A renderer that does *not* own the viewport has nothing of its own
-/// to lay out at and still needs to draw the grid the panes really have, so it
-/// keeps taking the server's answer.
+/// `canonical_size` is the server's root tab size. The owner lays out at the
+/// size it just reported and the server applied; a passive renderer has no
+/// local geometry authority and follows the canonical answer.
 fn choose_local_tab_size(
     owns: Option<bool>,
     reported: TerminalSize,
@@ -3453,7 +3470,9 @@ fn begin_confirmation(state: &mut TuiState, action: DestructiveAction) {
             (
                 "Delete Thread",
                 if *end_sessions {
-                    format!("Delete this server-owned Thread and end {count} remote pane(s) for every client?")
+                    format!(
+                        "Delete this server-owned Thread and end {count} remote pane(s) for every client?"
+                    )
                 } else {
                     "Delete this server-owned Thread on every client? Its sessions will keep running.".into()
                 },
@@ -3485,7 +3504,9 @@ fn begin_confirmation(state: &mut TuiState, action: DestructiveAction) {
             (
                 "Delete Space",
                 if *end_sessions {
-                    format!("Delete this Space on the authoritative server and end {count} remote pane(s)?")
+                    format!(
+                        "Delete this Space on the authoritative server and end {count} remote pane(s)?"
+                    )
                 } else {
                     "Delete this Space from the authoritative server on every client? Remote sessions keep running.".into()
                 },

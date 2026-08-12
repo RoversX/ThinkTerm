@@ -1,8 +1,8 @@
 use crate::PKI;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use codec::*;
-use config::keyassignment::SpawnTabDomain;
 use config::TermConfig;
+use config::keyassignment::SpawnTabDomain;
 use mux::client::ClientId;
 use mux::domain::SplitSource;
 use mux::pane::{CachePolicy, Pane, PaneId};
@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use termwiz::surface::SequenceNo;
 use url::Url;
+use wezterm_term::StableRowIndex;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::terminal::Alert;
-use wezterm_term::StableRowIndex;
 
 lazy_static::lazy_static! {
     /// Serializes the authoritative tree decision with the live-workspace
@@ -312,6 +312,7 @@ fn mux_viewport(viewport: ClientViewport) -> FrontendViewport {
                 .map(|pane| FrontendPaneViewport {
                     pane_id: pane.pane_id,
                     size: pane.size,
+                    frame: pane.frame,
                 })
                 .collect(),
         },
@@ -995,7 +996,13 @@ impl SessionHandler {
                                 anyhow::bail!("pane {pane_id} is not in tab {containing_tab_id}");
                             }
                             pane.resize(size)?;
-                            tab.rebuild_splits_sizes_from_contained_panes();
+                            // A legacy single-pane Resize carries no pane
+                            // frame. It may update the PTY surface, but it
+                            // cannot safely redefine split geometry: font
+                            // scaling and frontend chrome make the surface
+                            // smaller than its containing rectangle. Complete
+                            // Native viewports carry exact frames and are the
+                            // sole source for divider reconstruction.
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -1570,7 +1577,7 @@ impl SessionHandler {
                                     return Err(anyhow!(
                                         "Failed to retrieve tab with ID {}",
                                         tab_id
-                                    ))
+                                    ));
                                 }
                             };
 
@@ -1912,13 +1919,13 @@ async fn move_pane(
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_viewport_for_pane, requires_existing_frontend_access, PerPane};
+    use super::{PerPane, claim_viewport_for_pane, requires_existing_frontend_access};
     use codec::{EnsureThinkTermThread, Pdu};
-    use mux::client::ClientId;
     use mux::Mux;
+    use mux::client::ClientId;
     use std::sync::Arc;
-    use wezterm_term::color::ColorPalette;
     use wezterm_term::TerminalSize;
+    use wezterm_term::color::ColorPalette;
 
     #[test]
     fn cold_thread_materialization_does_not_require_an_existing_owner() {

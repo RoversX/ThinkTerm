@@ -1,12 +1,12 @@
 use crate::client::{Client, ClientConnectionPhase};
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::connui::{ConnectionUI, ConnectionUIParams};
-use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
+use mux::domain::{Domain, DomainId, DomainState, SplitSource, alloc_domain_id};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitRequest, Tab, TabId};
 use mux::window::WindowId;
@@ -2054,6 +2054,7 @@ impl ClientDomain {
                     remote_panes.push(codec::ClientPaneViewport {
                         pane_id: remote,
                         size: pane.size,
+                        frame: pane.frame,
                     });
                 }
                 codec::ClientViewport::Native {
@@ -2078,9 +2079,10 @@ impl ClientDomain {
                 panes
                     .iter()
                     .map(|pane| format!(
-                        "r{}:{}",
+                        "r{}:pty={} frame={}",
                         pane.pane_id,
-                        mux::geometrytrace::size(&pane.size)
+                        mux::geometrytrace::size(&pane.size),
+                        mux::geometrytrace::size(&pane.frame)
                     ))
                     .collect::<Vec<_>>()
                     .join(" ")
@@ -2637,11 +2639,11 @@ impl ClientDomain {
 #[cfg(test)]
 mod tests {
     use super::{
-        accepts_generation, acknowledge_recovery_target, active_remote_tabs_by_workspace,
-        consistent_remote_tab_id, owns_remote_viewport_from_states,
-        remote_frontend_gate_from_state, remote_move_pane_id, server_runtime_replaced,
-        thread_id_for_workspace, AutomaticRemotePaneResize, FrontendRecoveryAck,
-        FrontendRecoveryBarrier, FrontendRecoverySlot, RemoteFrontendGate, ViewportLatencyState,
+        AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
+        FrontendRecoverySlot, RemoteFrontendGate, ViewportLatencyState, accepts_generation,
+        acknowledge_recovery_target, active_remote_tabs_by_workspace, consistent_remote_tab_id,
+        owns_remote_viewport_from_states, remote_frontend_gate_from_state, remote_move_pane_id,
+        server_runtime_replaced, thread_id_for_workspace,
     };
     use crate::client::ClientConnectionPhase;
     use std::collections::HashMap;

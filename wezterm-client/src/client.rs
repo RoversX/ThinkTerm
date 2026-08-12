@@ -276,6 +276,7 @@ macro_rules! rpc {
             metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
             match result {
                 Ok(Pdu::$response_type(res)) => Ok(res),
+                Ok(Pdu::ErrorResponse(err)) => bail!(err.reason),
                 Ok(_) => bail!("unexpected response {:?}", result),
                 Err(err) => Err(err),
             }
@@ -295,6 +296,7 @@ macro_rules! rpc {
             metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
             match result {
                 Ok(Pdu::$response_type(res)) => Ok(res),
+                Ok(Pdu::ErrorResponse(err)) => bail!(err.reason),
                 Ok(_) => bail!("unexpected response {:?}", result),
                 Err(err) => Err(err),
             }

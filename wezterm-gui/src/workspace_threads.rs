@@ -354,6 +354,7 @@ lazy_static::lazy_static! {
         Mutex::new(std::collections::HashSet::new());
     static ref WORK_RUNNING_LAST_SEEN: Mutex<HashMap<String, std::time::Instant>> =
         Mutex::new(HashMap::new());
+    static ref WORK_SOUND_TIMING: Mutex<WorkSoundTiming> = Mutex::new(WorkSoundTiming::default());
     static ref WORK_STATUS_RECHECK_PENDING: Mutex<std::collections::HashSet<String>> =
         Mutex::new(std::collections::HashSet::new());
     /// The sidebar tree each mux server last told us it had, keyed by domain
@@ -1448,6 +1449,63 @@ pub fn refresh_thread_work_for_pane(pane_id: PaneId) -> bool {
 /// Running through short Idle observations; a deferred re-check settles the
 /// state to Idle once the grace period truly elapses.
 const WORK_RUNNING_FALL_DEBOUNCE: Duration = Duration::from_millis(800);
+const MIN_FINISHED_SOUND_DURATION: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct WorkRunTiming {
+    started_at: std::time::Instant,
+    first_idle_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Default)]
+struct WorkSoundTiming {
+    runs: HashMap<String, WorkRunTiming>,
+}
+
+impl WorkSoundTiming {
+    fn observe(
+        &mut self,
+        workspace: &str,
+        observed: WorkspaceThreadWorkStatus,
+        now: std::time::Instant,
+    ) {
+        match observed {
+            WorkspaceThreadWorkStatus::Running => {
+                let run = self
+                    .runs
+                    .entry(workspace.to_string())
+                    .or_insert(WorkRunTiming {
+                        started_at: now,
+                        first_idle_at: None,
+                    });
+                // A brief false Idle is already tolerated by the status
+                // debounce. If Running returns, that candidate was not the
+                // task's completion and must not determine its duration.
+                run.first_idle_at = None;
+            }
+            WorkspaceThreadWorkStatus::Idle | WorkspaceThreadWorkStatus::FinishedUnseen => {
+                if let Some(run) = self.runs.get_mut(workspace) {
+                    run.first_idle_at.get_or_insert(now);
+                }
+            }
+            WorkspaceThreadWorkStatus::NeedsAttention => {
+                if let Some(run) = self.runs.get_mut(workspace) {
+                    run.first_idle_at = None;
+                }
+            }
+        }
+    }
+
+    fn take_finished_duration(&mut self, workspace: &str) -> Option<Duration> {
+        let run = self.runs.remove(workspace)?;
+        let finished_at = run.first_idle_at.unwrap_or_else(std::time::Instant::now);
+        Some(finished_at.saturating_duration_since(run.started_at))
+    }
+
+    fn forget(&mut self, workspace: &str) {
+        self.runs.remove(workspace);
+    }
+}
 
 fn debounce_work_status(
     workspace: &str,
@@ -1509,11 +1567,26 @@ static NEEDS_INPUT_WAV: &[u8] = include_bytes!("../../assets/sounds/needs-input.
 /// business making noise, and neither does a machine someone is presenting on.
 const DISABLE_SOUND_ENV: &str = "THINKTERM_DISABLE_SOUND";
 
-fn announce_work(announcement: WorkAnnouncement) {
+fn should_play_work_sound(
+    announcement: WorkAnnouncement,
+    finished_after: Option<Duration>,
+) -> bool {
+    match announcement {
+        WorkAnnouncement::Finished => finished_after
+            .map(|duration| duration >= MIN_FINISHED_SOUND_DURATION)
+            .unwrap_or(true),
+        WorkAnnouncement::NeedsInput => true,
+    }
+}
+
+fn announce_work(announcement: WorkAnnouncement, finished_after: Option<Duration>) {
     if std::env::var_os(DISABLE_SOUND_ENV).is_some() {
         return;
     }
     if !crate::native_settings::notification_sounds_enabled() {
+        return;
+    }
+    if !should_play_work_sound(announcement, finished_after) {
         return;
     }
     let wav = match announcement {
@@ -1531,8 +1604,8 @@ fn announce_work(announcement: WorkAnnouncement) {
 }
 
 pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
-    let observed = scan_workspace_work_status(workspace);
-    let observed = debounce_work_status(workspace, observed);
+    let raw_observed = scan_workspace_work_status(workspace);
+    let observed = debounce_work_status(workspace, raw_observed);
     let change = {
         let mut store = THREAD_STORE.lock();
         let Some(change) = store.observe_thread_work_for_workspace(workspace, observed) else {
@@ -1540,8 +1613,17 @@ pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
         };
         change
     };
+    let finished_after = {
+        let mut timing = WORK_SOUND_TIMING.lock();
+        timing.observe(workspace, raw_observed, std::time::Instant::now());
+        if change.announce == Some(WorkAnnouncement::Finished) {
+            timing.take_finished_duration(workspace)
+        } else {
+            None
+        }
+    };
     if let Some(announcement) = change.announce {
-        announce_work(announcement);
+        announce_work(announcement, finished_after);
     }
     if change.should_persist {
         schedule_workspace_thread_store_persist();
@@ -1565,6 +1647,7 @@ pub fn refresh_all_thread_work() -> bool {
 }
 
 pub fn acknowledge_thread_work_for_workspace(workspace: &str) -> bool {
+    WORK_SOUND_TIMING.lock().forget(workspace);
     let mut store = THREAD_STORE.lock();
     let change = store.acknowledge_thread_work_for_workspace(workspace);
     if change.should_persist {
@@ -1629,6 +1712,7 @@ pub fn hidden_statuses_cover_all(hidden: &[WorkspaceThreadWorkStatus]) -> bool {
 }
 
 pub fn acknowledge_thread_work_for_workspace_deferred(workspace: &str) -> bool {
+    WORK_SOUND_TIMING.lock().forget(workspace);
     let mut store = THREAD_STORE.lock();
     let change = store.acknowledge_thread_work_for_workspace(workspace);
     if change.should_persist {
@@ -7117,6 +7201,75 @@ mod tests {
         assert_eq!(
             observe(&mut store, WorkspaceThreadWorkStatus::Idle),
             Some(WorkAnnouncement::Finished)
+        );
+    }
+
+    #[test]
+    fn short_finished_work_is_silent_but_five_seconds_plays() {
+        assert!(!should_play_work_sound(
+            WorkAnnouncement::Finished,
+            Some(Duration::from_millis(4_999))
+        ));
+        assert!(should_play_work_sound(
+            WorkAnnouncement::Finished,
+            Some(Duration::from_secs(5))
+        ));
+        assert!(should_play_work_sound(
+            WorkAnnouncement::NeedsInput,
+            Some(Duration::from_millis(1))
+        ));
+    }
+
+    #[test]
+    fn finished_sound_duration_excludes_the_idle_confirmation_delay() {
+        let mut timing = WorkSoundTiming::default();
+        let started_at = std::time::Instant::now();
+        timing.observe(
+            "workspace-1",
+            WorkspaceThreadWorkStatus::Running,
+            started_at,
+        );
+        timing.observe(
+            "workspace-1",
+            WorkspaceThreadWorkStatus::Idle,
+            started_at + Duration::from_millis(2_500),
+        );
+
+        assert_eq!(
+            timing.take_finished_duration("workspace-1"),
+            Some(Duration::from_millis(2_500)),
+            "the 800ms status debounce must not turn a short task into an audible one"
+        );
+    }
+
+    #[test]
+    fn transient_idle_does_not_end_the_timed_run() {
+        let mut timing = WorkSoundTiming::default();
+        let started_at = std::time::Instant::now();
+        timing.observe(
+            "workspace-1",
+            WorkspaceThreadWorkStatus::Running,
+            started_at,
+        );
+        timing.observe(
+            "workspace-1",
+            WorkspaceThreadWorkStatus::Idle,
+            started_at + Duration::from_secs(1),
+        );
+        timing.observe(
+            "workspace-1",
+            WorkspaceThreadWorkStatus::Running,
+            started_at + Duration::from_millis(1_100),
+        );
+        timing.observe(
+            "workspace-1",
+            WorkspaceThreadWorkStatus::Idle,
+            started_at + Duration::from_secs(4),
+        );
+
+        assert_eq!(
+            timing.take_finished_duration("workspace-1"),
+            Some(Duration::from_secs(4))
         );
     }
 
