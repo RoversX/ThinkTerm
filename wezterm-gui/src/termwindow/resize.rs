@@ -356,7 +356,13 @@ impl super::TermWindow {
             }
         }
         let needs_follow_up = self.frontend_geometry_resync_after_epoch.remove(&tab_id);
+        mux::zoom_trace!(
+            "gui.sync.complete tab={tab_id} epoch={epoch} follow_up={needs_follow_up} \
+             active={}",
+            self.active_tab_is(tab_id)
+        );
         if needs_follow_up && self.active_tab_is(tab_id) {
+            mux::zoom_trace!("gui.sync.followup tab={tab_id} after_epoch={epoch}");
             // Starting the follow-up synchronously keeps the tab opaque: the
             // old epoch is replaced before this callback can paint.
             self.sync_active_tab_geometry_now();
@@ -1358,6 +1364,7 @@ impl super::TermWindow {
         // releasing its divider claims and commits that final geometry.
         let action = frontend_geometry_action(ownership, collaborative, previewing);
         if action == FrontendGeometryAction::Passive {
+            mux::zoom_trace!("gui.sync.skip tab={tab_id} reason=passive");
             self.frontend_geometry_phases.remove(&tab_id);
             self.report_frontend_viewport_for_tab(&tab);
             self.invalidate_window();
@@ -1369,19 +1376,45 @@ impl super::TermWindow {
             .copied()
             .is_some_and(super::FrontendGeometryPhase::is_in_flight)
         {
+            // The post-zoom (or post-unzoom) viewport is not sent here; it is
+            // owed to complete_frontend_geometry_epoch. If a transition ends
+            // mismatched, check whether the matching gui.sync.followup ever
+            // ran.
+            mux::zoom_trace!(
+                "gui.sync.defer tab={tab_id} reason=epoch_in_flight phase={:?}",
+                self.frontend_geometry_phases.get(&tab_id)
+            );
             self.frontend_geometry_resync_after_epoch.insert(tab_id);
             return;
         }
         let takeover = action == FrontendGeometryAction::Set { takeover: true };
         let claim = action == FrontendGeometryAction::Claim;
         let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, takeover) else {
+            mux::zoom_trace!("gui.sync.skip tab={tab_id} reason=epoch_denied");
             return;
         };
         let Some((domain, viewport, adopted)) = self.prepare_client_frontend_geometry(&tab) else {
+            mux::zoom_trace!("gui.sync.skip tab={tab_id} epoch={epoch} reason=prepare_failed");
             self.frontend_geometry_phases.remove(&tab_id);
             self.invalidate_window();
             return;
         };
+        mux::zoom_trace!(
+            "gui.sync.begin tab={tab_id} epoch={epoch} rpc={} takeover={takeover} \
+             local_zoom={} adopted=[{}]",
+            if claim { "claim" } else { "set" },
+            tab.get_zoomed_pane()
+                .map(|pane| pane.pane_id().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            adopted
+                .iter()
+                .map(|(pane_id, size)| format!(
+                    "{pane_id}:{}",
+                    mux::geometrytrace::size(size)
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         if let Some(client_domain) = domain.downcast_ref::<ClientDomain>() {
             self.remember_gui_recovery_intent(client_domain, tab_id, &viewport);
         }

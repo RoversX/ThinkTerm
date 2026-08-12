@@ -2064,6 +2064,37 @@ impl ClientDomain {
         })
     }
 
+    /// Summarize an outgoing viewport for the `zoomtrace` log target, using
+    /// the remote pane ids so a GUI record can be lined up with the mux
+    /// server's `srv.viewport.recv` for the same PDU.
+    fn viewport_trace(viewport: &codec::ClientViewport) -> String {
+        match viewport {
+            codec::ClientViewport::CellGrid { size } => {
+                format!("kind=cellgrid out={}", mux::geometrytrace::size(size))
+            }
+            codec::ClientViewport::Native { size, panes } => format!(
+                "kind=native out={} out_panes=[{}]",
+                mux::geometrytrace::size(size),
+                panes
+                    .iter()
+                    .map(|pane| format!(
+                        "r{}:{}",
+                        pane.pane_id,
+                        mux::geometrytrace::size(&pane.size)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        }
+    }
+
+    fn local_tab_geometry_trace(local_tab_id: TabId) -> String {
+        Mux::get()
+            .get_tab(local_tab_id)
+            .map(|tab| tab.geometry_trace())
+            .unwrap_or_else(|| "<no local tab>".to_string())
+    }
+
     /// Report the viewport for a locally mirrored tab to the frontend mux.
     pub async fn set_client_viewport(
         &self,
@@ -2079,6 +2110,15 @@ impl ClientDomain {
         let viewport = self.translate_client_viewport(viewport)?;
         let reported = viewport.clone();
         let started_at = Instant::now();
+        if mux::geometrytrace::trace_enabled() {
+            let summary = Self::viewport_trace(&viewport);
+            let geometry = Self::local_tab_geometry_trace(local_tab_id);
+            mux::zoom_trace!(
+                "gui.viewport.send rpc=set tab={local_tab_id}/r{remote_tab_id} gen={} \
+                 {summary} | {geometry}",
+                inner.client.connection_generation()
+            );
+        }
         let result = inner
             .client
             .set_client_viewport(codec::SetClientViewport {
@@ -2086,6 +2126,11 @@ impl ClientDomain {
                 viewport,
             })
             .await;
+        mux::zoom_trace!(
+            "gui.viewport.ack rpc=set tab={local_tab_id}/r{remote_tab_id} ok={} elapsed={:?}",
+            result.is_ok(),
+            started_at.elapsed()
+        );
         let state = match result {
             Ok(state) => {
                 inner
@@ -2152,6 +2197,15 @@ impl ClientDomain {
         let viewport = self.translate_client_viewport(viewport)?;
         let reported = viewport.clone();
         let started_at = Instant::now();
+        if mux::geometrytrace::trace_enabled() {
+            let summary = Self::viewport_trace(&viewport);
+            let geometry = Self::local_tab_geometry_trace(local_tab_id);
+            mux::zoom_trace!(
+                "gui.viewport.send rpc=claim tab={local_tab_id}/r{remote_tab_id} gen={} \
+                 {summary} | {geometry}",
+                inner.client.connection_generation()
+            );
+        }
         let result = inner
             .client
             .claim_client_viewport(codec::ClaimClientViewport {
@@ -2159,6 +2213,11 @@ impl ClientDomain {
                 viewport,
             })
             .await;
+        mux::zoom_trace!(
+            "gui.viewport.ack rpc=claim tab={local_tab_id}/r{remote_tab_id} ok={} elapsed={:?}",
+            result.is_ok(),
+            started_at.elapsed()
+        );
         let state = match result {
             Ok(state) => {
                 inner

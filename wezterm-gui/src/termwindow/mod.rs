@@ -6561,6 +6561,11 @@ impl TermWindow {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
                 };
+                mux::zoom_trace!(
+                    "gui.gesture site=TogglePaneZoomState tab={} zoom={}",
+                    tab.tab_id(),
+                    tab.get_zoomed_pane().is_some()
+                );
                 self.claim_frontend_viewport_for_interaction();
                 tab.toggle_zoom();
                 // Zoom changes which panes occupy the tab root. Remote
@@ -6578,6 +6583,11 @@ impl TermWindow {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
                 };
+                mux::zoom_trace!(
+                    "gui.gesture site=SetPaneZoomState tab={} want={zoomed} zoom={}",
+                    tab.tab_id(),
+                    tab.get_zoomed_pane().is_some()
+                );
                 self.claim_frontend_viewport_for_interaction();
                 tab.set_zoomed(*zoomed);
                 self.sync_active_tab_geometry_now();

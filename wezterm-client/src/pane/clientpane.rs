@@ -845,26 +845,55 @@ impl Pane for ClientPane {
     }
 
     fn set_zoomed(&self, zoomed: bool) {
+        let local_pane_id = self.local_pane_id;
+        let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id();
         if self.client.remote_tab_input_is_blocked() {
+            mux::zoom_trace!(
+                "gui.zoom.skip pane={local_pane_id}/r{remote_pane_id} rtab={remote_tab_id} \
+                 zoomed={zoomed} reason=input_blocked"
+            );
             return;
         }
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
         let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let remote_tab_id = self.remote_tab_id();
         // Invalidate any cached rows on a resize
         inner.make_all_stale();
         promise::spawn::spawn(async move {
-            if client.prepare_remote_tab_input(remote_tab_id).await? {
-                client
+            // Traced separately from the send below: this await can be a full
+            // claim round-trip (or refuse outright) while SetClientViewport
+            // has no such gate, which is the suspected source of the zoom
+            // state and the zoom geometry reaching the server out of order.
+            let prepared = client.prepare_remote_tab_input(remote_tab_id).await;
+            mux::zoom_trace!(
+                "gui.zoom.prepared pane={local_pane_id}/r{remote_pane_id} rtab={remote_tab_id} \
+                 zoomed={zoomed} gen={} owns={}",
+                client.client.connection_generation(),
+                match &prepared {
+                    Ok(owns) => owns.to_string(),
+                    Err(err) => format!("err({err:#})"),
+                }
+            );
+            if prepared? {
+                mux::zoom_trace!(
+                    "gui.zoom.send pane={local_pane_id}/r{remote_pane_id} \
+                     rtab={remote_tab_id} zoomed={zoomed}"
+                );
+                let result = client
                     .client
                     .set_zoomed(SetPaneZoomed {
                         containing_tab_id: remote_tab_id,
                         pane_id: remote_pane_id,
                         zoomed,
                     })
-                    .await?;
+                    .await;
+                mux::zoom_trace!(
+                    "gui.zoom.ack pane={local_pane_id}/r{remote_pane_id} rtab={remote_tab_id} \
+                     zoomed={zoomed} ok={}",
+                    result.is_ok()
+                );
+                result?;
             }
             Ok::<(), anyhow::Error>(())
         })

@@ -40,6 +40,7 @@ pub mod activity;
 pub mod client;
 pub mod connui;
 pub mod domain;
+pub mod geometrytrace;
 pub mod localpane;
 pub mod pane;
 pub mod renderable;
@@ -1428,6 +1429,33 @@ impl Mux {
         let tab = self
             .get_tab(tab_id)
             .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+        if crate::geometrytrace::trace_enabled() {
+            let incoming = match viewport {
+                FrontendViewport::CellGrid { size } => {
+                    format!("kind=cellgrid in={}", crate::geometrytrace::size(size))
+                }
+                FrontendViewport::Native { size, panes } => format!(
+                    "kind=native in={} covers_all={} in_panes=[{}]",
+                    crate::geometrytrace::size(size),
+                    tab.viewport_covers_all_panes(
+                        &panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>()
+                    ),
+                    panes
+                        .iter()
+                        .map(|pane| format!(
+                            "{}:{}",
+                            pane.pane_id,
+                            crate::geometrytrace::size(&pane.size)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            };
+            crate::zoom_trace!(
+                "srv.viewport.recv tab={tab_id} {incoming} | {}",
+                tab.geometry_trace()
+            );
+        }
         let mut transaction = self.begin_tab_geometry_transaction(tab_id);
         let result = (|| {
             let size = viewport.size();
@@ -1435,6 +1463,8 @@ impl Mux {
             tab.resize(size);
 
             if let FrontendViewport::Native { panes, .. } = viewport {
+                let pane_ids = panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>();
+                let viewport_covers_all_panes = tab.viewport_covers_all_panes(&pane_ids);
                 for pane_viewport in panes {
                     let pane = self
                         .get_pane(pane_viewport.pane_id)
@@ -1445,7 +1475,7 @@ impl Mux {
                     self.frontend_geometry_step("resizing a native pane")?;
                     pane.resize(pane_viewport.size)?;
                 }
-                if !panes.is_empty() {
+                if !panes.is_empty() && viewport_covers_all_panes {
                     tab.rebuild_splits_sizes_from_contained_panes();
                 }
                 return Ok(());
@@ -1461,6 +1491,11 @@ impl Mux {
         if result.is_ok() {
             transaction.commit();
         }
+        crate::zoom_trace!(
+            "srv.viewport.done tab={tab_id} ok={} | {}",
+            result.is_ok(),
+            tab.geometry_trace()
+        );
         result
     }
 

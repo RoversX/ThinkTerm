@@ -856,6 +856,11 @@ impl SessionHandler {
                                 .get_tab(containing_tab_id)
                                 .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
                             activate_client_palette(&mux, &pane, palette_session_id)?;
+                            mux::zoom_trace!(
+                                "srv.zoom.recv tab={containing_tab_id} pane={pane_id} \
+                                 want_zoomed={zoomed} | {}",
+                                tab.geometry_trace()
+                            );
                             match tab.get_zoomed_pane() {
                                 Some(p) => {
                                     let is_zoomed = p.pane_id() == pane_id;
@@ -874,6 +879,11 @@ impl SessionHandler {
                                     }
                                 }
                             }
+                            mux::zoom_trace!(
+                                "srv.zoom.done tab={containing_tab_id} pane={pane_id} \
+                                 want_zoomed={zoomed} | {}",
+                                tab.geometry_trace()
+                            );
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,

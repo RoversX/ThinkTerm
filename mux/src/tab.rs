@@ -788,27 +788,52 @@ fn copy_split_geometry_if_topology_matches(old: &Tree, new: &mut Tree) -> bool {
 
 /// Recompute split node sizes bottom-up from the contained panes'
 /// current dimensions, returning the aggregate size of the tree.
-fn compute_tree_size_from_panes(node: &mut Tree) -> Option<TerminalSize> {
+///
+/// `tab_cell` carries the tab's own cell size, as produced by
+/// [`cell_dimensions`].  The split tree is denominated in tab cells, but a
+/// pane with its own font scale measures the same rectangle in a different
+/// number of *its* cells.  Taking `dims.cols` straight from such a pane and
+/// adding it to a sibling's sums two different units: a 1708px pane of
+/// 14px cells reports 122 columns next to a 475px sibling of 19px cells
+/// reporting 25, and `SplitDirectionAndSize::size` then calls the parent
+/// 148 columns wide when the tab is really 116.  Convert through pixels,
+/// which are the one unit every pane in the tab agrees on.
+fn compute_tree_size_from_panes(node: &mut Tree, tab_cell: &TerminalSize) -> Option<TerminalSize> {
     match node {
         Tree::Empty => None,
         Tree::Leaf(stack) => {
             let pane = stack.active_pane()?;
             let dims = pane.get_dimensions();
+            let cell_width = tab_cell.pixel_width;
+            let cell_height = tab_cell.pixel_height;
+            // Fall back to the pane's own counts when it cannot describe
+            // itself in pixels; that is the pre-conversion behaviour and is
+            // still correct for a pane whose cells match the tab's.
+            let cols = if cell_width > 0 && dims.pixel_width > 0 {
+                (dims.pixel_width / cell_width).max(1)
+            } else {
+                dims.cols
+            };
+            let rows = if cell_height > 0 && dims.pixel_height > 0 {
+                (dims.pixel_height / cell_height).max(1)
+            } else {
+                dims.viewport_rows
+            };
             let size = TerminalSize {
-                cols: dims.cols,
-                rows: dims.viewport_rows,
-                pixel_height: dims.pixel_height,
-                pixel_width: dims.pixel_width,
+                cols,
+                rows,
+                pixel_width: cols * cell_width.max(1),
+                pixel_height: rows * cell_height.max(1),
                 dpi: dims.dpi,
             };
             Some(size)
         }
         Tree::Node { left, right, data } => {
             if let Some(data) = data {
-                if let Some(first) = compute_tree_size_from_panes(left) {
+                if let Some(first) = compute_tree_size_from_panes(left, tab_cell) {
                     data.first = first;
                 }
-                if let Some(second) = compute_tree_size_from_panes(right) {
+                if let Some(second) = compute_tree_size_from_panes(right, tab_cell) {
                     data.second = second;
                 }
                 Some(data.size())
@@ -894,6 +919,25 @@ impl Tab {
 
     pub fn contains_pane(&self, pane: PaneId) -> bool {
         self.inner.lock().contains_pane(pane)
+    }
+
+    /// Whether a native frontend viewport describes every split leaf in this
+    /// tab.  Zoomed frontends intentionally report just the pane that fills
+    /// the root, and that viewport can race ahead of the separate zoom RPC.
+    /// Such a partial report must not be used to rebuild the full split tree.
+    /// One-line geometry snapshot for the `zoomtrace` log target.  Takes the
+    /// tab lock once so the splits and the pane dimensions in one record
+    /// describe the same instant.  See [`crate::geometrytrace`].
+    pub fn geometry_trace(&self) -> String {
+        self.inner.lock().geometry_trace()
+    }
+
+    pub(crate) fn viewport_covers_all_panes(&self, pane_ids: &[PaneId]) -> bool {
+        let panes = self.inner.lock().iter_panes_ignoring_zoom();
+        panes.len() == pane_ids.len()
+            && panes
+                .iter()
+                .all(|pane| pane_ids.contains(&pane.pane.pane_id()))
     }
 
     pub fn iter_panes(&self) -> Vec<PositionedPane> {
@@ -1301,8 +1345,16 @@ impl TabInner {
         // the geometry) was preserved above, skip the recompute so the
         // resize sees agreeing sizes and no-ops without a TabResized.
         if !geometry_preserved {
+            // Measure the wire's panes against the cells of the size we are
+            // about to impose; a pane carrying its own font scale counts a
+            // different number of its own cells across the same pixels.
+            let cell = cell_dimensions(if size.rows > 0 && size.cols > 0 {
+                &size
+            } else {
+                &self.size
+            });
             if let Some(root) = self.pane.as_mut() {
-                if let Some(tree_size) = compute_tree_size_from_panes(root) {
+                if let Some(tree_size) = compute_tree_size_from_panes(root, &cell) {
                     self.size = tree_size;
                 }
             }
@@ -1377,6 +1429,17 @@ impl TabInner {
         }
     }
 
+    fn geometry_trace(&mut self) -> String {
+        let root = self.size;
+        let zoomed = self.zoomed.as_ref().map(|pane| pane.pane_id());
+        let splits = self.iter_splits();
+        let panes = self.iter_panes_ignoring_zoom();
+        let mirror = panes
+            .first()
+            .is_some_and(|positioned| positioned.pane.is_remote_mirror());
+        crate::geometrytrace::geometry(mirror, &root, zoomed, &splits, &panes)
+    }
+
     /// Sets the zoom state, returns the prior state
     fn set_zoomed(&mut self, zoomed: bool) -> bool {
         if self.zoomed.is_some() == zoomed {
@@ -1390,14 +1453,33 @@ impl TabInner {
 
     fn toggle_zoom(&mut self) {
         let size = self.size;
-        if self.zoomed.take().is_some() {
+        let zooming = self.zoomed.is_none();
+        let action = if zooming { "zoom" } else { "unzoom" };
+        if crate::geometrytrace::trace_enabled() {
+            let head = format!(
+                "tab.zoom.begin tab={} action={action} before_zoom={}",
+                self.id,
+                crate::geometrytrace::size(&self.size_before_zoom)
+            );
+            let geometry = self.geometry_trace();
+            crate::zoom_trace!("{head} | {geometry}");
+        }
+        // Only the unzoom branch consults Tab::resize; `n/a` distinguishes
+        // "the zoom branch never asked" from "the resize was a no-op".
+        let mut resize_applied = "n/a".to_string();
+        if let Some(zoomed) = self.zoomed.take() {
             // We were zoomed, but now we are not.
-            // Re-apply the size to the panes
-            if let Some(pane) = self.get_active_pane() {
-                pane.set_zoomed(false);
-            }
+            // Clear the flag on the pane that actually holds the zoom rather
+            // than on whatever is active now.  Pane-nav selects its target
+            // index before toggling, and unzoom_on_switch_pane unzooms from
+            // inside a focus change, so the active pane is routinely some
+            // other pane by this point.  A mux client that names the wrong
+            // pane makes the server's SetPaneZoomed handler compare against a
+            // pane that was never zoomed, conclude nothing needs to change,
+            // and stay zoomed while this frontend has already unzoomed.
+            zoomed.set_zoomed(false);
             self.size = self.size_before_zoom;
-            self.resize(size);
+            resize_applied = self.resize(size).to_string();
         } else {
             // We weren't zoomed, but now we want to zoom.
             // Locate the active pane
@@ -1417,6 +1499,16 @@ impl TabInner {
                 }
                 self.zoomed.replace(pane);
             }
+        }
+        if crate::geometrytrace::trace_enabled() {
+            let head = format!(
+                "tab.zoom.end tab={} action={action} resize_applied={resize_applied} \
+                 before_zoom={}",
+                self.id,
+                crate::geometrytrace::size(&self.size_before_zoom)
+            );
+            let geometry = self.geometry_trace();
+            crate::zoom_trace!("{head} | {geometry}");
         }
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
@@ -1802,6 +1894,7 @@ impl TabInner {
             // Ignore "impossible" resize requests
             return false;
         }
+        let current = self.size;
 
         // No-op resizes must not emit TabResized: for mux client tabs the
         // notification round-trips through the server and triggers a resync
@@ -1809,6 +1902,11 @@ impl TabInner {
         // transient client/server size disagreement into an endless
         // resize/resync storm that visibly flickers the window contents.
         if size == self.size {
+            crate::zoom_trace!(
+                "tab.resize.noop tab={} reason=unchanged want={}",
+                self.id,
+                crate::geometrytrace::size(&size)
+            );
             return false;
         }
 
@@ -1841,6 +1939,11 @@ impl TabInner {
             // this second check, a GUI recovery pass can emit TabResized on
             // every frame even though no geometry can change.
             if size == self.size {
+                crate::zoom_trace!(
+                    "tab.resize.noop tab={} reason=clamped_to_min want={} min={min_x}x{min_y}",
+                    self.id,
+                    crate::geometrytrace::size(&size)
+                );
                 return false;
             }
 
@@ -1864,6 +1967,16 @@ impl TabInner {
             }
         }
 
+        if crate::geometrytrace::trace_enabled() {
+            let head = format!(
+                "tab.resize tab={} {} -> {}",
+                self.id,
+                crate::geometrytrace::size(&current),
+                crate::geometrytrace::size(&self.size)
+            );
+            let geometry = self.geometry_trace();
+            crate::zoom_trace!("{head} | {geometry}");
+        }
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
         true
     }
@@ -1909,13 +2022,51 @@ impl TabInner {
 
     fn rebuild_splits_sizes_from_contained_panes(&mut self) {
         if self.zoomed.is_some() {
+            if crate::geometrytrace::trace_enabled() {
+                let head = format!("tab.rebuild.skip tab={} reason=zoomed", self.id);
+                let geometry = self.geometry_trace();
+                crate::zoom_trace!("{head} | {geometry}");
+            }
             return;
         }
 
+        // The contained panes cannot describe the tab root on their own: a
+        // frontend reserves per-pane chrome, so their dimensions always sum
+        // to less than the tab it is rendering.  Adopting that sum makes the
+        // *next* report look like a size change that never happened, and
+        // Tab::resize then redistributes that phantom delta across the
+        // dividers.  Keep the root the frontend declared and stretch the
+        // rebuilt proportions onto it, which also makes repeating an
+        // unchanged report converge instead of walking the splits.
+        let root_size = self.size;
+        let cell = cell_dimensions(&root_size);
+        let mut derived = None;
         if let Some(root) = self.pane.as_mut() {
-            if let Some(size) = compute_tree_size_from_panes(root) {
-                self.size = size;
+            if let Some(size) = compute_tree_size_from_panes(root, &cell) {
+                derived = Some(size);
+                adjust_x_size(
+                    root,
+                    root_size.cols as isize - size.cols as isize,
+                    &cell,
+                );
+                adjust_y_size(
+                    root,
+                    root_size.rows as isize - size.rows as isize,
+                    &cell,
+                );
             }
+        }
+        if crate::geometrytrace::trace_enabled() {
+            let head = format!(
+                "tab.rebuild tab={} root={} derived={} (root kept)",
+                self.id,
+                crate::geometrytrace::size(&root_size),
+                derived
+                    .map(|size| crate::geometrytrace::size(&size))
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            let geometry = self.geometry_trace();
+            crate::zoom_trace!("{head} | {geometry}");
         }
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
@@ -3532,6 +3683,7 @@ impl Into<String> for SerdeUrl {
 mod test {
     use super::*;
     use crate::renderable::*;
+    use crate::{FrontendPaneViewport, FrontendViewport};
     use parking_lot::{MappedMutexGuard, Mutex};
     use rangeset::RangeSet;
     use std::ops::Range;
@@ -3544,6 +3696,9 @@ mod test {
         id: PaneId,
         size: Mutex<TerminalSize>,
         remote_mirror: bool,
+        /// The most recent Pane::set_zoomed argument, so tests can assert
+        /// which pane a zoom transition actually addressed.
+        last_set_zoomed: Mutex<Option<bool>>,
     }
 
     impl FakePane {
@@ -3552,6 +3707,7 @@ mod test {
                 id,
                 size: Mutex::new(size),
                 remote_mirror: false,
+                last_set_zoomed: Mutex::new(None),
             })
         }
 
@@ -3560,8 +3716,17 @@ mod test {
                 id,
                 size: Mutex::new(size),
                 remote_mirror: true,
+                last_set_zoomed: Mutex::new(None),
             })
         }
+    }
+
+    fn last_set_zoomed(pane: &Arc<dyn Pane>) -> Option<bool> {
+        *pane
+            .downcast_ref::<FakePane>()
+            .expect("test panes are FakePane")
+            .last_set_zoomed
+            .lock()
     }
 
     impl Pane for FakePane {
@@ -3639,6 +3804,10 @@ mod test {
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
             *self.size.lock() = size;
             Ok(())
+        }
+
+        fn set_zoomed(&self, zoomed: bool) {
+            self.last_set_zoomed.lock().replace(zoomed);
         }
 
         fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
@@ -3964,6 +4133,287 @@ mod test {
         assert_eq!(dimensions.viewport_rows, pane_size.rows);
         assert_eq!(tab.iter_panes()[0].width, tab_size.cols);
         assert_eq!(tab.iter_panes()[0].height, tab_size.rows);
+    }
+
+    #[test]
+    fn unzoom_preserves_the_divider_and_leaves_pty_sizing_to_the_frontend() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let tab = Tab::new(&tab_size);
+        let first = FakePane::new(1, tab_size);
+        tab.assign_pane(&first);
+
+        let split_size = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .expect("initial tab can split");
+        let second = FakePane::new(2, split_size.second);
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            Arc::clone(&second),
+        )
+        .expect("split succeeds");
+
+        // Reproduce the GUI sequence: establish a non-default divider,
+        // zoom the active pane without changing the tab root, then unzoom.
+        tab.resize_split_by(0, 7);
+        let before_zoom = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+        tab.toggle_zoom();
+        assert_eq!(second.get_dimensions().cols, tab_size.cols);
+        tab.toggle_zoom();
+
+        let after_unzoom = tab.iter_panes();
+        assert_eq!(
+            after_unzoom
+                .iter()
+                .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                .collect::<Vec<_>>(),
+            before_zoom,
+            "unzoom must preserve the divider position"
+        );
+
+        // The tab deliberately does NOT push its split rectangles back onto
+        // the PTYs here.  Those rectangles are denominated in tab cells, and
+        // a pane carrying its own font scale needs a different column count
+        // for the very same pixels, so re-applying them would overwrite a
+        // correct size with a wrong one.  Sizing is the frontend's job: both
+        // the mux (Native viewport) and local (sync_positioned_pane_font_size)
+        // paths follow every zoom transition with a font-scale-aware resize
+        // of each visible pane.
+        assert_eq!(
+            second.get_dimensions().cols,
+            tab_size.cols,
+            "the formerly zoomed PTY keeps its zoom size until the frontend resizes it"
+        );
+    }
+
+    #[test]
+    fn partial_zoom_viewport_does_not_rebuild_split_tree_before_zoom_rpc() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let tab = Arc::new(Tab::new(&tab_size));
+        let first = FakePane::new(1, tab_size);
+        tab.assign_pane(&first);
+        mux.add_tab_no_panes(&tab);
+        mux.add_pane(&first).unwrap();
+
+        let split_size = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .expect("initial tab can split");
+        let second = FakePane::new(2, split_size.second);
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            Arc::clone(&second),
+        )
+        .expect("split succeeds");
+        mux.add_pane(&second).unwrap();
+
+        tab.resize_split_by(0, 7);
+        let before_zoom = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+
+        assert!(tab.viewport_covers_all_panes(&[1, 2]));
+        assert!(
+            !tab.viewport_covers_all_panes(&[2]),
+            "a zoom viewport can race ahead of SetPaneZoomed and must remain partial"
+        );
+
+        // The GUI's zoom viewport can arrive before SetPaneZoomed. It only
+        // contains the active pane at the full root size. Applying that pane
+        // size is harmless, but rebuilding the whole split tree here would
+        // add the full-width pane to its sibling and permanently enlarge the
+        // tab root before the zoom RPC arrives.
+        mux.apply_frontend_viewport(
+            tab.tab_id(),
+            &FrontendViewport::Native {
+                size: tab_size,
+                panes: vec![FrontendPaneViewport {
+                    pane_id: second.pane_id(),
+                    size: tab_size,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(tab.get_size(), tab_size);
+
+        // Complete the actual out-of-order sequence and verify that unzoom
+        // returns the divider to its original position.  The PTY dimensions
+        // are the frontend's to restore; see
+        // unzoom_preserves_the_divider_and_leaves_pty_sizing_to_the_frontend.
+        tab.toggle_zoom();
+        tab.toggle_zoom();
+        assert_eq!(
+            tab.iter_panes()
+                .iter()
+                .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                .collect::<Vec<_>>(),
+            before_zoom
+        );
+    }
+
+    /// Build a two-pane horizontally split tab registered with the mux.
+    fn split_tab_for_viewport(tab_size: TerminalSize) -> (Arc<Tab>, Arc<dyn Pane>, Arc<dyn Pane>) {
+        let mux = Mux::get();
+        let tab = Arc::new(Tab::new(&tab_size));
+        let first = FakePane::new(1, tab_size);
+        tab.assign_pane(&first);
+        mux.add_tab_no_panes(&tab);
+        mux.add_pane(&first).unwrap();
+
+        let request = SplitRequest {
+            direction: SplitDirection::Horizontal,
+            ..Default::default()
+        };
+        let split_size = tab
+            .compute_split_size(0, request)
+            .expect("initial tab can split");
+        let second = FakePane::new(2, split_size.second);
+        tab.split_and_insert(0, request, Arc::clone(&second))
+            .expect("split succeeds");
+        mux.add_pane(&second).unwrap();
+        (tab, first, second)
+    }
+
+    #[test]
+    fn a_font_scaled_pane_must_not_redefine_the_tab_root() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let mux = Mux::get();
+        let (tab, _first, _second) = split_tab_for_viewport(tab_size);
+
+        // The frontend renders the left pane with half-width cells: the same
+        // pixel rectangle, twice the columns.  Adding that column count to a
+        // sibling measured in the tab's own cells is adding two different
+        // units, and it is what made a 116-column tab report itself as 148.
+        let viewport_panes = tab
+            .iter_panes()
+            .into_iter()
+            .map(|positioned| {
+                let scaled = positioned.pane.pane_id() == 1;
+                let divisor = if scaled { 2 } else { 1 };
+                FrontendPaneViewport {
+                    pane_id: positioned.pane.pane_id(),
+                    size: TerminalSize {
+                        cols: positioned.width * divisor,
+                        rows: positioned.height,
+                        pixel_width: positioned.pixel_width,
+                        pixel_height: positioned.pixel_height,
+                        dpi: tab_size.dpi,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let viewport = FrontendViewport::Native {
+            size: tab_size,
+            panes: viewport_panes,
+        };
+
+        let before = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+        mux.apply_frontend_viewport(tab.tab_id(), &viewport).unwrap();
+        assert_eq!(
+            tab.get_size(),
+            tab_size,
+            "the frontend's reported root is authoritative; a font-scaled \
+             pane's column count must not redefine it"
+        );
+        let settled = tab
+            .iter_panes()
+            .into_iter()
+            .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            settled, before,
+            "the viewport describes the layout the tab already has, so \
+             applying it must leave the divider alone; counting the scaled \
+             pane's own columns instead makes the tree look far too wide and \
+             the correcting shrink drags the divider across the tab"
+        );
+
+        // Re-reporting the identical viewport has to be inert too.  When the
+        // root was re-derived from the panes, every repeat looked like a size
+        // change and Tab::resize walked the divider a little further.
+        for _ in 0..5 {
+            mux.apply_frontend_viewport(tab.tab_id(), &viewport).unwrap();
+            assert_eq!(tab.get_size(), tab_size);
+            assert_eq!(
+                tab.iter_panes()
+                    .into_iter()
+                    .map(|pane| (pane.pane.pane_id(), pane.width, pane.height))
+                    .collect::<Vec<_>>(),
+                settled,
+                "repeating an unchanged viewport must not move the dividers"
+            );
+        }
+    }
+
+    #[test]
+    fn unzoom_clears_the_zoom_flag_on_the_pane_that_holds_it() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let (tab, first, second) = split_tab_for_viewport(tab_size);
+
+        let index_of = |pane_id: PaneId| {
+            tab.iter_panes_ignoring_zoom()
+                .into_iter()
+                .find(|positioned| positioned.pane.pane_id() == pane_id)
+                .map(|positioned| positioned.index)
+                .expect("pane is in the tab")
+        };
+
+        tab.set_active_idx(index_of(2));
+        tab.toggle_zoom();
+        assert_eq!(last_set_zoomed(&second), Some(true));
+
+        // Pane-nav selects the pane it is acting on before toggling, and
+        // unzoom_on_switch_pane unzooms from inside a focus change, so the
+        // active pane is routinely not the zoomed one by the time unzoom
+        // runs.  Addressing the active pane here made a mux client send
+        // SetPaneZoomed for a pane the server never had zoomed, whose
+        // handler then concluded nothing had to change and stayed zoomed.
+        tab.set_active_idx(index_of(1));
+        tab.toggle_zoom();
+
+        assert_eq!(
+            last_set_zoomed(&second),
+            Some(false),
+            "unzoom must clear the flag on the pane that was zoomed"
+        );
+        assert_eq!(
+            last_set_zoomed(&first),
+            None,
+            "the merely-active pane was never zoomed and must not be told to unzoom"
+        );
     }
 
     #[test]

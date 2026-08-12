@@ -6020,6 +6020,12 @@ impl super::TermWindow {
             PaneNavAction::ToggleZoom => {
                 self.claim_frontend_viewport_for_interaction();
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
+                    mux::zoom_trace!(
+                        "gui.gesture site=PaneNavToggleZoom tab={} pane={pane_id} \
+                         index={pane_index} zoom={}",
+                        tab.tab_id(),
+                        tab.get_zoomed_pane().is_some()
+                    );
                     tab.set_active_idx(pane_index);
                     tab.toggle_zoom();
                 }
