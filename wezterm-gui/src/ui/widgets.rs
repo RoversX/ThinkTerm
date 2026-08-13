@@ -64,11 +64,42 @@ pub(crate) fn draw_button<A: Copy + PartialEq>(
     palette: UiPalette,
     spec: ButtonSpec<A>,
 ) -> anyhow::Result<()> {
+    draw_button_with_layers(ctx, layers, font, widgets, palette, spec, 0, 1)
+}
+
+/// Draw the complete button on a single explicit layer. Full-window views use
+/// this for confirmation controls that must sit above embedded terminal glyphs
+/// while retaining the same shared geometry and interaction styling.
+pub(crate) fn draw_button_on_layer<A: Copy + PartialEq>(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    font: &Rc<LoadedFont>,
+    widgets: &mut UiContext<A>,
+    palette: UiPalette,
+    spec: ButtonSpec<A>,
+    layer_num: usize,
+) -> anyhow::Result<()> {
+    draw_button_with_layers(
+        ctx, layers, font, widgets, palette, spec, layer_num, layer_num,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_button_with_layers<A: Copy + PartialEq>(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    font: &Rc<LoadedFont>,
+    widgets: &mut UiContext<A>,
+    palette: UiPalette,
+    spec: ButtonSpec<A>,
+    background_layer: usize,
+    text_layer: usize,
+) -> anyhow::Result<()> {
     widgets.push(spec.rect, spec.kind, spec.action);
     let (background, border) = spec.state.colors(palette);
     ctx.draw_rounded_frame(
         layers,
-        0,
+        background_layer,
         spec.rect.origin.x,
         spec.rect.origin.y,
         spec.rect.size.width,
@@ -77,8 +108,9 @@ pub(crate) fn draw_button<A: Copy + PartialEq>(
         border,
         ctx.px(BUTTON_RADIUS),
     )?;
-    ctx.draw_text(
+    ctx.draw_text_on_layer(
         layers,
+        text_layer,
         font,
         spec.rect.origin.x + ctx.px(BUTTON_TEXT_PAD),
         control_text_y(ctx, spec.rect.origin.y, spec.rect.size.height),
@@ -103,6 +135,39 @@ pub(crate) fn draw_icon_button<A: Copy + PartialEq>(
     icon: SvgIcon,
     action: A,
 ) -> anyhow::Result<()> {
+    draw_icon_button_on_layer(
+        ctx,
+        layers,
+        widgets,
+        interaction,
+        palette,
+        x,
+        y,
+        size,
+        icon,
+        action,
+        0,
+    )
+}
+
+/// The standard icon button with its optional hover/press surface placed on a
+/// caller-selected layer. This is useful for fixed chrome that must be redrawn
+/// above a scrolling-content mask while retaining the shared sizing, padding,
+/// colors and hit target.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_icon_button_on_layer<A: Copy + PartialEq>(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    widgets: &mut UiContext<A>,
+    interaction: &InteractionState<A>,
+    palette: UiPalette,
+    x: f32,
+    y: f32,
+    size: f32,
+    icon: SvgIcon,
+    action: A,
+    background_layer: usize,
+) -> anyhow::Result<()> {
     let rect = RectF::new(euclid::point2(x, y), euclid::size2(size, size));
     widgets.push(rect, WidgetKind::Button, action);
     let hovered = interaction.hovered == Some(action);
@@ -115,7 +180,16 @@ pub(crate) fn draw_icon_button<A: Copy + PartialEq>(
         LinearRgba::TRANSPARENT
     };
     if bg.3 > 0.0 {
-        ctx.draw_rounded_rect(layers, 0, x, y, size, size, bg, ctx.px(ICON_BUTTON_RADIUS))?;
+        ctx.draw_rounded_rect(
+            layers,
+            background_layer,
+            x,
+            y,
+            size,
+            size,
+            bg,
+            ctx.px(ICON_BUTTON_RADIUS),
+        )?;
     }
     // cell_size already tracks the window DPI, so only the padding and the
     // clamp bounds need converting from design pixels.
@@ -366,13 +440,28 @@ pub(crate) fn draw_scrollbar(
     area: RectF,
     scroll: ScrollState,
 ) -> anyhow::Result<()> {
+    draw_scrollbar_on_layer(ctx, layers, palette, tokens, area, scroll, 0)
+}
+
+/// Draw the shared scrollbar thumb on a caller-selected layer. Scrollable
+/// full-window views use this after their viewport masks so the thumb remains
+/// crisp at the outer window edge.
+pub(crate) fn draw_scrollbar_on_layer(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    palette: UiPalette,
+    tokens: UiTokens,
+    area: RectF,
+    scroll: ScrollState,
+    layer_num: usize,
+) -> anyhow::Result<()> {
     let spec = ScrollbarSpec::from_area(area, tokens);
     if let Some((thumb_y, thumb_h)) =
         scroll.thumb_with_min(spec.y, spec.height, tokens.scrollbar_min_thumb)
     {
         ctx.draw_rounded_rect(
             layers,
-            0,
+            layer_num,
             spec.x,
             thumb_y,
             spec.width,

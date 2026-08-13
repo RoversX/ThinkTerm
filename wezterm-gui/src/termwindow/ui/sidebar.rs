@@ -2305,17 +2305,27 @@ impl crate::TermWindow {
                 .saturating_add(settings_row_width)
                 .saturating_sub(settings_action_size);
             let settings_action_y = settings_row_y;
-            // SSH hosts (link-2) button sits just left of the view-options button.
+            // SSH hosts sits left of view options; Live Overview sits left of
+            // SSH so the settings label remains the primary footer action.
             let ssh_action_x = settings_action_x
                 .saturating_sub(settings_action_size + self.ui_px(SIDEBAR_INSET) / 2);
             let ssh_action_y = settings_row_y;
+            let overview_action_x =
+                ssh_action_x.saturating_sub(settings_action_size + self.ui_px(SIDEBAR_INSET) / 2);
+            let overview_action_y = settings_row_y;
             let ssh_action_hovered = self.is_pointer_over_ui_rect(
                 ssh_action_x,
                 ssh_action_y,
                 settings_action_size,
                 settings_action_size,
             );
-            let settings_body_width = ssh_action_x
+            let overview_action_hovered = self.is_pointer_over_ui_rect(
+                overview_action_x,
+                overview_action_y,
+                settings_action_size,
+                settings_action_size,
+            );
+            let settings_body_width = overview_action_x
                 .saturating_sub(settings_row_x)
                 .saturating_sub(self.ui_px(SIDEBAR_INSET) / 2);
             let settings_hovered = self.is_pointer_over_ui_rect(
@@ -2411,6 +2421,45 @@ impl crate::TermWindow {
                     },
                 )?;
             }
+            if overview_action_hovered {
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        overview_action_x as f32,
+                        overview_action_y as f32,
+                        settings_action_size as f32,
+                        settings_action_size as f32,
+                    ),
+                    chrome.sidebar_button_hover_bg,
+                    self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
+                )
+                .context("sidebar live overview hover")?;
+            }
+            self.ui_items.push(UIItem {
+                x: overview_action_x,
+                y: overview_action_y,
+                width: settings_action_size,
+                height: settings_action_size,
+                item_type: UIItemType::WorkspaceSidebarLiveOverview,
+            });
+            {
+                let overview_icon_size = icon_size.min(settings_row_height.saturating_sub(8));
+                self.paint_sidebar_icon(
+                    layers,
+                    SvgIcon::Grid2x2,
+                    overview_action_x
+                        + ((settings_action_size.saturating_sub(overview_icon_size)) / 2),
+                    overview_action_y
+                        + ((settings_action_size.saturating_sub(overview_icon_size)) / 2),
+                    overview_icon_size,
+                    if overview_action_hovered {
+                        foreground
+                    } else {
+                        muted_fg
+                    },
+                )?;
+            }
             let settings_icon_size = icon_size.min(settings_row_height.saturating_sub(8));
             let settings_icon_x = settings_row_x + self.ui_px(SIDEBAR_SETTINGS_ICON_EXTRA_INSET);
             let settings_icon_y =
@@ -2434,7 +2483,9 @@ impl crate::TermWindow {
                 &crate::i18n::tr("sidebar-settings"),
                 settings_text_x,
                 settings_text_y,
-                settings_action_x.saturating_sub(settings_text_x + self.ui_px(SIDEBAR_INSET)),
+                settings_body_width
+                    .saturating_sub(settings_text_x.saturating_sub(settings_row_x))
+                    .saturating_sub(self.ui_px(SIDEBAR_INSET)),
                 foreground,
             )?;
             let settings_action_icon_size = settings_icon_size;

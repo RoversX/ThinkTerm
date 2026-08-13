@@ -1,13 +1,82 @@
-use crate::quad::{QuadTrait, TripleLayerQuadAllocator};
+use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
+use crate::termwindow::content_view::{ContentViewTypography, TerminalPreviewRequest};
+use crate::termwindow::render::{LineToEleShapeCacheKey, RenderScreenLineParams};
 use crate::termwindow::{RenderFrame, TermWindowNotif};
 use crate::ui::{DrawContext, UiPalette};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::color::LinearRgba;
 use ::window::WindowOps;
 use anyhow::Context;
+use mux::renderable::StableCursorPosition;
+use mux::tab::SplitDirection;
 use smol::Timer;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 use wezterm_font::ClearShapeCache;
+use wezterm_term::color::ColorAttribute;
+
+const TERMINAL_PREVIEW_EXTENT_BUCKET_DESIGN_PX: f32 = 8.0;
+const TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT: f64 = 128.0;
+
+fn quantized_terminal_preview_extent(extent: f32, dpi: usize) -> f32 {
+    let bucket = crate::ui::scale_ui_f32(TERMINAL_PREVIEW_EXTENT_BUCKET_DESIGN_PX, dpi).max(1.0);
+    if extent <= bucket {
+        extent.max(1.0)
+    } else {
+        (extent / bucket).floor() * bucket
+    }
+}
+
+fn minimum_terminal_preview_scale(font_size: f64, dpi: usize, global_scale: f64) -> f64 {
+    let global_scale = global_scale.max(1.0 / TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT);
+    if !font_size.is_finite() || font_size <= 0.0 || dpi == 0 {
+        return (1.0 / TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT).min(global_scale);
+    }
+    (72.0 / (font_size * dpi as f64))
+        .max(1.0 / TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT)
+        .min(global_scale)
+}
+
+fn quantize_terminal_preview_scale_down(scale: f64, minimum: f64) -> f64 {
+    if !scale.is_finite() {
+        return minimum;
+    }
+    ((scale * TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT).floor()
+        / TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT)
+        .max(minimum)
+}
+
+#[cfg(test)]
+mod terminal_preview_tests {
+    use super::{
+        minimum_terminal_preview_scale, quantize_terminal_preview_scale_down,
+        quantized_terminal_preview_extent,
+    };
+
+    #[test]
+    fn preview_extent_uses_four_logical_pixel_buckets() {
+        let design_dpi = if cfg!(target_os = "macos") { 144 } else { 192 };
+        let one_x_dpi = if cfg!(target_os = "macos") { 72 } else { 96 };
+        assert_eq!(quantized_terminal_preview_extent(103.0, design_dpi), 96.0);
+        assert_eq!(quantized_terminal_preview_extent(104.0, design_dpi), 104.0);
+        assert_eq!(quantized_terminal_preview_extent(103.0, one_x_dpi), 100.0);
+    }
+
+    #[test]
+    fn preview_scale_can_shrink_below_the_old_twelve_percent_floor() {
+        let minimum = minimum_terminal_preview_scale(14.0, 144, 1.0);
+        assert!(minimum < 0.12);
+        assert_eq!(
+            quantize_terminal_preview_scale_down(0.08, minimum),
+            0.078125
+        );
+        assert_eq!(
+            quantize_terminal_preview_scale_down(0.001, minimum),
+            minimum
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllowImage {
@@ -351,17 +420,34 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator<'_>,
     ) -> anyhow::Result<()> {
         let settings = crate::native_settings::load();
-        let font_size = crate::native_settings::home_font_size(&settings);
         let font_weight = crate::native_settings::settings_font_weight(&settings);
-        let ui_font = self
-            .fonts
-            .command_palette_font_with_size_and_weight(font_size, font_weight)?;
-        let title_font = self
-            .fonts
-            .title_font_with_size_and_weight(font_size + 10.0, font_weight.max(760))?;
-        let section_font = self
-            .fonts
-            .title_font_with_size_and_weight(font_size + 2.0, font_weight.max(700))?;
+        let active_content_view_idx = self.active_content_view_index();
+        let typography = active_content_view_idx
+            .map(|idx| self.content_views[idx].view.typography())
+            .unwrap_or_default();
+        let (ui_font, title_font, section_font) = match typography {
+            ContentViewTypography::Default => {
+                let font_size = crate::native_settings::home_font_size(&settings);
+                (
+                    self.fonts
+                        .command_palette_font_with_size_and_weight(font_size, font_weight)?,
+                    self.fonts
+                        .title_font_with_size_and_weight(font_size + 10.0, font_weight.max(760))?,
+                    self.fonts
+                        .title_font_with_size_and_weight(font_size + 2.0, font_weight.max(700))?,
+                )
+            }
+            ContentViewTypography::Overview => (
+                self.fonts.command_palette_font_with_size_and_weight(
+                    crate::native_settings::settings_font_size(&settings),
+                    font_weight,
+                )?,
+                self.fonts
+                    .title_font_with_size(crate::native_settings::sidebar_font_size())?,
+                self.fonts
+                    .title_font_with_size(crate::native_settings::pane_header_font_size())?,
+            ),
+        };
         let render_metrics =
             crate::utilsprites::RenderMetrics::with_font_metrics(&ui_font.metrics());
         let dimensions = self.dimensions;
@@ -370,8 +456,12 @@ impl crate::TermWindow {
         // Occupy the terminal content area between the workspace and right
         // sidebars, below the top tab bar and above a bottom tab bar.
         let area = self.content_view_area();
-        let active_content_view_idx = self.active_content_view_index();
-
+        let surface = euclid::rect(
+            0.0,
+            0.0,
+            dimensions.pixel_width as f32,
+            dimensions.pixel_height as f32,
+        );
         // Cursor blink: only animate when the view wants it (focused input).
         let wants_blink = active_content_view_idx
             .map(|idx| self.content_views[idx].view.wants_cursor_blink())
@@ -390,25 +480,347 @@ impl crate::TermWindow {
             self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(blink_ms)));
         }
 
-        let gl_state = self.render_state.as_ref().unwrap();
-        let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
-        let next_frame = if let Some(idx) = active_content_view_idx {
-            let view = self.content_views[idx].view.as_mut();
-            view.paint(
-                &ctx,
-                layers,
-                area,
-                palette,
-                &ui_font,
-                &title_font,
-                &section_font,
-                cursor_on,
-            )?;
-            view.next_frame_time()
-        } else {
-            None
+        let (next_frame, previews) = {
+            let gl_state = self.render_state.as_ref().unwrap();
+            let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
+            if let Some(idx) = active_content_view_idx {
+                let view = self.content_views[idx].view.as_mut();
+                view.paint_surface_background(&ctx, layers, surface, palette)?;
+                view.paint(
+                    &ctx,
+                    layers,
+                    area,
+                    palette,
+                    &ui_font,
+                    &title_font,
+                    &section_font,
+                    cursor_on,
+                )?;
+                (view.next_frame_time(), view.terminal_previews())
+            } else {
+                (None, Vec::new())
+            }
         };
+        self.paint_terminal_previews(layers, &previews)?;
+        {
+            let gl_state = self.render_state.as_ref().unwrap();
+            let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
+            if let Some(idx) = active_content_view_idx {
+                self.content_views[idx].view.paint_after_terminal_previews(
+                    &ctx,
+                    layers,
+                    area,
+                    palette,
+                    &ui_font,
+                    &title_font,
+                    &section_font,
+                )?;
+            }
+        }
         self.update_next_frame_time(next_frame);
+        Ok(())
+    }
+
+    /// Render live, read-only terminal thumbnails requested by a ContentView.
+    /// This reuses the normal screen-line renderer at a smaller font scale;
+    /// panes are never resized and no input or focus is sent to them.
+    fn paint_terminal_previews(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        previews: &[TerminalPreviewRequest],
+    ) -> anyhow::Result<()> {
+        for preview in previews {
+            self.paint_terminal_preview(layers, preview)?;
+        }
+        Ok(())
+    }
+
+    fn paint_terminal_preview(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        preview: &TerminalPreviewRequest,
+    ) -> anyhow::Result<()> {
+        let mut heap = HeapQuadAllocator::default();
+        {
+            let mut clipped_layers = TripleLayerQuadAllocator::Heap(&mut heap);
+            self.paint_terminal_preview_unclipped(&mut clipped_layers, preview)?;
+        }
+        heap.apply_to_clipped(
+            layers,
+            preview.clip,
+            self.dimensions.pixel_width as f32,
+            self.dimensions.pixel_height as f32,
+        )
+    }
+
+    fn paint_terminal_preview_unclipped(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        preview: &TerminalPreviewRequest,
+    ) -> anyhow::Result<()> {
+        let snapshot = &preview.snapshot;
+        let tab_size = snapshot.tab_size;
+        if tab_size.cols == 0 || tab_size.rows == 0 {
+            return Ok(());
+        }
+        if snapshot.panes.is_empty() {
+            return Ok(());
+        }
+
+        // A thumbnail represents the whole terminal surface, not just the
+        // shrunken PTY grid. Fill any aspect-ratio remainder with the active
+        // terminal's own background so the card never looks letterboxed.
+        let preview_background = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.is_active)
+            .or_else(|| snapshot.panes.first())
+            .map(|pane| pane.palette.resolve_bg(ColorAttribute::Default).to_linear())
+            .expect("checked that the tab has panes");
+        self.filled_rectangle(layers, 0, preview.clip, preview_background)?;
+
+        // Quantization bounds the number of cached FontConfigurations even
+        // when cards continuously resize. Flooring guarantees the terminal
+        // grid stays inside its preview rather than clipping the last column.
+        let bucketed_width =
+            quantized_terminal_preview_extent(preview.area.size.width, self.dimensions.dpi);
+        let bucketed_height =
+            quantized_terminal_preview_extent(preview.area.size.height, self.dimensions.dpi);
+        let width_ratio = bucketed_width
+            / (tab_size.cols as f32 * self.render_metrics.cell_size.width.max(1) as f32);
+        let height_ratio = bucketed_height
+            / (tab_size.rows as f32 * self.render_metrics.cell_size.height.max(1) as f32);
+        let global_scale = self.fonts.get_font_scale();
+        let minimum_scale = minimum_terminal_preview_scale(
+            self.config.font_size,
+            self.dimensions.dpi,
+            global_scale,
+        );
+        let maximum_scale = (global_scale * 0.84).max(minimum_scale);
+        let desired_scale = (global_scale * f64::from(width_ratio.min(height_ratio)))
+            .clamp(minimum_scale, maximum_scale);
+        let mut quantized_scale =
+            quantize_terminal_preview_scale_down(desired_scale, minimum_scale);
+        let (mut font_config, mut metrics) = self.pane_font_resources(quantized_scale)?;
+
+        // Font raster metrics are integer pixels and therefore do not scale
+        // perfectly linearly. Correct the analytical estimate once using the
+        // actual metrics; if the one-pixel raster floor is still too large, the
+        // hard quad clip below remains the final safety boundary.
+        let rendered_width = tab_size.cols as f32 * metrics.cell_size.width.max(1) as f32;
+        let rendered_height = tab_size.rows as f32 * metrics.cell_size.height.max(1) as f32;
+        let correction = (bucketed_width / rendered_width)
+            .min(bucketed_height / rendered_height)
+            .min(1.0);
+        if correction < 1.0 {
+            let corrected_scale = quantize_terminal_preview_scale_down(
+                quantized_scale * f64::from(correction) * 0.999,
+                minimum_scale,
+            );
+            if corrected_scale < quantized_scale {
+                quantized_scale = corrected_scale;
+                (font_config, metrics) = self.pane_font_resources(quantized_scale)?;
+            }
+        }
+
+        let still_too_wide =
+            tab_size.cols as f32 * metrics.cell_size.width.max(1) as f32 > bucketed_width;
+        let still_too_tall =
+            tab_size.rows as f32 * metrics.cell_size.height.max(1) as f32 > bucketed_height;
+        if (still_too_wide || still_too_tall) && quantized_scale > minimum_scale {
+            quantized_scale = minimum_scale;
+            (font_config, metrics) = self.pane_font_resources(quantized_scale)?;
+        }
+        let cell_width = metrics.cell_size.width.max(1) as f32;
+        let cell_height = metrics.cell_size.height.max(1) as f32;
+        // Terminal content begins at the same top-left origin as the real
+        // terminal. Any remainder stays on the right/bottom and is visually
+        // continuous with the background painted above.
+        let origin_x = preview.area.origin.x;
+        let origin_y = preview.area.origin.y;
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let white_space = gl_state.util_sprites.white_space.texture_coords();
+        let filled_box = gl_state.util_sprites.filled_box.texture_coords();
+        let mut hidden_cursor = StableCursorPosition::default();
+        hidden_cursor.y = isize::MIN;
+
+        for pane in &snapshot.panes {
+            let palette = &pane.palette;
+            let pane_x = origin_x + pane.left as f32 * cell_width;
+            let pane_y = origin_y + pane.top as f32 * cell_height;
+            let pane_width = pane.width as f32 * cell_width;
+            let pane_height = pane.height as f32 * cell_height;
+            let pane_rect = euclid::rect(pane_x, pane_y, pane_width, pane_height);
+            if let Some(visible) = pane_rect.intersection(&preview.clip) {
+                self.filled_rectangle(
+                    layers,
+                    0,
+                    visible,
+                    palette.resolve_bg(ColorAttribute::Default).to_linear(),
+                )?;
+            }
+
+            let source_dims = pane.dimensions;
+            let rows = pane.rows;
+            let cols = pane.cols;
+            if rows == 0 || cols == 0 {
+                continue;
+            }
+
+            let mut render_dims = source_dims;
+            render_dims.cols = cols;
+            render_dims.viewport_rows = rows;
+            render_dims.pixel_width = (cols as f32 * cell_width).round() as usize;
+            render_dims.pixel_height = (rows as f32 * cell_height).round() as usize;
+            let rendered_y = pane_y + pane.height.saturating_sub(rows) as f32 * cell_height;
+            let foreground = palette.foreground.to_linear();
+            let default_bg = palette.background.to_linear();
+            // LineToElementShape caches resolved colors as well as glyph
+            // geometry. Include the pane palette so two terminals with the
+            // same text/ANSI indexes cannot reuse each other's resolved color
+            // values inside the overview.
+            let mut palette_hasher = DefaultHasher::new();
+            palette.colors.0.hash(&mut palette_hasher);
+            palette.foreground.hash(&mut palette_hasher);
+            palette.background.hash(&mut palette_hasher);
+            palette.cursor_fg.hash(&mut palette_hasher);
+            palette.cursor_bg.hash(&mut palette_hasher);
+            palette.cursor_border.hash(&mut palette_hasher);
+            palette.selection_fg.hash(&mut palette_hasher);
+            palette.selection_bg.hash(&mut palette_hasher);
+            let palette_identity = palette_hasher.finish();
+            let font_identity = quantized_scale.to_bits()
+                ^ palette_identity.rotate_left(17)
+                ^ 0x4c49_5645_5052_4556;
+
+            for (line_idx, line) in pane.lines.iter().enumerate() {
+                let y = rendered_y + line_idx as f32 * cell_height;
+                if y + cell_height <= preview.clip.min_y() || y >= preview.clip.max_y() {
+                    continue;
+                }
+                let shape_hash = self.shape_hash_for_line(line);
+                self.render_screen_line(
+                    RenderScreenLineParams {
+                        top_pixel_y: y,
+                        left_pixel_x: pane_x,
+                        pixel_width: cols as f32 * cell_width,
+                        stable_line_idx: Some(pane.resolved_top + line_idx as isize),
+                        line,
+                        selection: 0..0,
+                        cursor: &hidden_cursor,
+                        palette,
+                        dims: &render_dims,
+                        config: &self.config,
+                        pane: None,
+                        white_space,
+                        filled_box,
+                        cursor_border_color: palette.cursor_border.to_linear(),
+                        foreground,
+                        is_active: true,
+                        selection_fg: palette.selection_fg.to_linear(),
+                        selection_bg: palette.selection_bg.to_linear(),
+                        cursor_fg: palette.cursor_fg.to_linear(),
+                        cursor_bg: palette.cursor_bg.to_linear(),
+                        cursor_is_default_color: true,
+                        window_is_transparent: false,
+                        default_bg,
+                        font: None,
+                        style: None,
+                        use_pixel_positioning: false,
+                        render_metrics: metrics,
+                        font_config: Some(font_config.clone()),
+                        font_identity,
+                        shape_key: Some(LineToEleShapeCacheKey {
+                            shape_hash,
+                            composing: None,
+                            shape_generation: self.shape_generation,
+                            font_identity,
+                        }),
+                        password_input: false,
+                        allow_images: false,
+                    },
+                    layers,
+                )?;
+            }
+
+            // Draw a non-blinking cursor for the active split. The regular
+            // renderer intentionally receives a hidden cursor above, so this
+            // thumbnail cannot start the foreground cursor animation timer.
+            if pane.is_active {
+                let cursor = pane.cursor;
+                let cursor_row = cursor.y.saturating_sub(pane.resolved_top);
+                if cursor.visibility == termwiz::surface::CursorVisibility::Visible
+                    && cursor_row >= 0
+                    && (cursor_row as usize) < rows
+                    && cursor.x < cols
+                {
+                    let cursor_rect = euclid::rect(
+                        pane_x + cursor.x as f32 * cell_width,
+                        rendered_y + cursor_row as f32 * cell_height,
+                        cell_width,
+                        cell_height,
+                    );
+                    if let Some(cursor_rect) = cursor_rect.intersection(&preview.clip) {
+                        let color = palette.cursor_border.to_linear().mul_alpha(0.72);
+                        let stroke = 1.0_f32.min(cursor_rect.size.width / 2.0);
+                        self.filled_rectangle(
+                            layers,
+                            2,
+                            euclid::rect(
+                                cursor_rect.origin.x,
+                                cursor_rect.origin.y,
+                                cursor_rect.size.width,
+                                stroke,
+                            ),
+                            color,
+                        )?;
+                        self.filled_rectangle(
+                            layers,
+                            2,
+                            euclid::rect(
+                                cursor_rect.origin.x,
+                                cursor_rect.max_y() - stroke,
+                                cursor_rect.size.width,
+                                stroke,
+                            ),
+                            color,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Preserve split topology in the thumbnail.  PositionedSplit is part
+        // of the immutable snapshot, so this pass also performs no mux reads.
+        let split_color = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.is_active)
+            .or_else(|| snapshot.panes.first())
+            .map(|pane| pane.palette.split.to_linear())
+            .unwrap_or(preview_background);
+        let split_stroke = (metrics.underline_height as f32 * 0.7).max(1.0);
+        for split in &snapshot.splits {
+            let rect = if split.direction == SplitDirection::Horizontal {
+                euclid::rect(
+                    origin_x + (split.left as f32 + 0.5) * cell_width,
+                    origin_y + (split.top as f32 - 0.5) * cell_height,
+                    split_stroke,
+                    (1.0 + split.size as f32) * cell_height,
+                )
+            } else {
+                euclid::rect(
+                    origin_x + (split.left as f32 - 0.5) * cell_width,
+                    origin_y + (split.top as f32 + 0.5) * cell_height,
+                    (1.0 + split.size as f32) * cell_width,
+                    split_stroke,
+                )
+            };
+            if let Some(visible) = rect.intersection(&preview.clip) {
+                self.filled_rectangle(layers, 2, visible, split_color)?;
+            }
+        }
         Ok(())
     }
 
@@ -938,13 +1350,23 @@ impl crate::TermWindow {
                 .context("paint_content_view")?;
         }
 
-        self.paint_workspace_sidebar(&mut layers)
-            .context("paint_workspace_sidebar")?;
-        self.paint_right_sidebar(&mut layers)
-            .context("paint_right_sidebar")?;
+        // A full-window ContentView owns all ThinkTerm chrome below the native
+        // title bar. This is presentation-only: sidebar widths/collapse state
+        // and terminal geometry stay unchanged behind the view.
+        if self.content_view_is_full_window() {
+            let mut chrome_items = self
+                .paint_full_window_chrome(&mut layers)
+                .context("paint full-window client chrome")?;
+            self.ui_items.append(&mut chrome_items);
+        } else {
+            self.paint_workspace_sidebar(&mut layers)
+                .context("paint_workspace_sidebar")?;
+            self.paint_right_sidebar(&mut layers)
+                .context("paint_right_sidebar")?;
 
-        if self.show_tab_bar {
-            self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
+            if self.show_tab_bar {
+                self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
+            }
         }
 
         self.paint_window_borders(&mut layers)

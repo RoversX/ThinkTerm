@@ -28,6 +28,7 @@ pub enum SvgIcon {
     FolderPlus,
     FolderTree,
     Globe,
+    Grid2x2,
     House,
     Info,
     Keyboard,
@@ -129,6 +130,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/folder-tree.svg")
             }
             Self::Globe => include_bytes!("../../../../third_party/lucide/icons/globe.svg"),
+            Self::Grid2x2 => include_bytes!("../../../../third_party/lucide/icons/grid-2x2.svg"),
             Self::House => include_bytes!("../../../../third_party/lucide/icons/house.svg"),
             Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
             Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),

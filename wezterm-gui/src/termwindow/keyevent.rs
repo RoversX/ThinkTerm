@@ -188,6 +188,34 @@ enum OnlyKeyBindings {
     No,
 }
 
+fn content_view_consumes_unhandled_key(
+    only_key_bindings: OnlyKeyBindings,
+    content_view_foreground: bool,
+) -> bool {
+    only_key_bindings == OnlyKeyBindings::No && content_view_foreground
+}
+
+#[cfg(test)]
+mod content_view_key_routing_tests {
+    use super::{content_view_consumes_unhandled_key, OnlyKeyBindings};
+
+    #[test]
+    fn foreground_content_view_owns_unhandled_terminal_input() {
+        assert!(content_view_consumes_unhandled_key(
+            OnlyKeyBindings::No,
+            true
+        ));
+        assert!(!content_view_consumes_unhandled_key(
+            OnlyKeyBindings::Yes,
+            true
+        ));
+        assert!(!content_view_consumes_unhandled_key(
+            OnlyKeyBindings::No,
+            false
+        ));
+    }
+}
+
 impl super::TermWindow {
     fn paste_text_into_inline_tab_rename(&mut self, text: &str) {
         if let Some(rename) = self.inline_tab_rename.as_mut() {
@@ -611,6 +639,14 @@ impl super::TermWindow {
         // keyboard protocols can report key releases, which made the terminal
         // appear to retain focus while typing in Notes.
         if only_key_bindings == OnlyKeyBindings::No && self.right_sidebar_has_text_focus() {
+            return true;
+        }
+
+        // Foreground content views get first refusal above, followed by the
+        // application's configured key bindings.  If neither handled the
+        // event, the view still owns it: falling through here would encode the
+        // press/release for the terminal pane hidden underneath the view.
+        if content_view_consumes_unhandled_key(only_key_bindings, self.content_view_foreground()) {
             return true;
         }
 

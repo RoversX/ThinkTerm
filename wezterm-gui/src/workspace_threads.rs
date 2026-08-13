@@ -681,6 +681,19 @@ pub fn release_window_space(owner_id: u64) {
     WINDOW_SPACES.lock().remove(&owner_id);
 }
 
+fn window_owner_for_space_in(assignments: &HashMap<u64, SpaceId>, space_id: &str) -> Option<u64> {
+    assignments
+        .iter()
+        .find_map(|(owner_id, active_space)| (active_space == space_id).then_some(*owner_id))
+}
+
+/// Return the native-window owner currently displaying `space_id`, if any.
+/// Space ownership remains exclusive; this is a read-only lookup used by
+/// global UI such as Live Overview to focus the window that already owns it.
+pub fn window_owner_for_space(space_id: &str) -> Option<u64> {
+    window_owner_for_space_in(&WINDOW_SPACES.lock(), space_id)
+}
+
 pub fn switch_window_space(owner_id: u64, space_id: &str) -> bool {
     if WINDOW_SPACES
         .lock()
@@ -2111,6 +2124,26 @@ pub fn ordered_project_ids(space_id: &str) -> Vec<ProjectId> {
         .filter(|project| project.space_id == space_id)
         .map(|project| project.id.clone())
         .collect()
+}
+
+/// Every thread in a project in its persisted render order. Unlike
+/// [`unpinned_thread_ids`], this includes pinned threads because global views
+/// such as Live Overview group by Space/Project rather than duplicating the
+/// sidebar's pinned section.
+pub fn ordered_thread_ids(project_id: &str) -> Vec<WorkspaceThreadId> {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| {
+            project
+                .threads
+                .iter()
+                .map(|session| session.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The thread ids a project shows under its own row, in render order —
@@ -6344,6 +6377,15 @@ fn now_ts() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_owner_lookup_tracks_claims_without_changing_them() {
+        let assignments = HashMap::from([(11, "space-a".to_string()), (22, "space-b".to_string())]);
+        assert_eq!(window_owner_for_space_in(&assignments, "space-a"), Some(11));
+        assert_eq!(window_owner_for_space_in(&assignments, "space-b"), Some(22));
+        assert_eq!(window_owner_for_space_in(&assignments, "space-c"), None);
+        assert_eq!(assignments.len(), 2);
+    }
     use tempfile::tempdir;
 
     fn test_store() -> WorkspaceThreadStore {

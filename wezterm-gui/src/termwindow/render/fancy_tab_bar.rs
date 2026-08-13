@@ -363,6 +363,69 @@ impl crate::TermWindow {
         Ok(ui_items)
     }
 
+    /// Paint only the essential native/client window chrome over a full-window
+    /// ContentView. The normal tabs and sidebar actions stay suppressed, while
+    /// the blank row retains window dragging and integrated buttons retain the
+    /// exact same hit targets and visual treatment as the fancy tab bar.
+    pub(crate) fn paint_full_window_chrome(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<Vec<UIItem>> {
+        let row_height = self.full_window_client_chrome_height().ceil() as usize;
+        if row_height == 0 {
+            return Ok(Vec::new());
+        }
+
+        let border = self.get_os_border();
+        let row_x = border.left.get() as usize;
+        let row_y = border.top.get() as usize;
+        let row_right = self
+            .dimensions
+            .pixel_width
+            .saturating_sub(border.right.get() as usize);
+        let row_width = row_right.saturating_sub(row_x);
+        if row_width == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut ui_items = vec![UIItem {
+            x: row_x,
+            y: row_y,
+            width: row_width,
+            height: row_height,
+            item_type: UIItemType::TabBar(TabBarItem::None),
+        }];
+
+        if self.fancy_tab_bar_shows_window_buttons() {
+            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let font = self
+                .fonts
+                .title_font_with_size(crate::native_settings::tab_font_size())?;
+            let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+            let content_top_spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height);
+            let content_row_y = row_y + content_top_spacer;
+            let content_row_height = row_height.saturating_sub(content_top_spacer);
+            let icon_size = fancy_tab_icon_size(&metrics, content_row_height as f32) as usize;
+            let button_size = content_row_height
+                .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
+                .max(icon_size);
+            let action_right = row_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
+            self.paint_window_tab_window_buttons(
+                layers,
+                &mut ui_items,
+                action_right,
+                content_row_y,
+                content_row_height,
+                button_size,
+                icon_size,
+                chrome.text,
+                chrome.secondary_text,
+            )?;
+        }
+
+        Ok(ui_items)
+    }
+
     fn fancy_tab_bar_shows_window_buttons(&self) -> bool {
         uses_integrated_window_buttons(self.config.window_decorations, self.window_state)
             && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative

@@ -2098,9 +2098,15 @@ impl super::TermWindow {
             log::trace!("new dimensions are zero: NOP!");
             return;
         }
+        let content_view_resize_state_changed = self
+            .active_content_view_mut()
+            .is_some_and(|view| view.set_live_resizing(live_resizing));
         if self.dimensions == dimensions && self.window_state == window_state {
             // It didn't really change
             log::trace!("dimensions didn't change NOP!");
+            if content_view_resize_state_changed {
+                window.invalidate();
+            }
             return;
         }
         super::gpu_debug(format!(
@@ -2244,6 +2250,7 @@ impl super::TermWindow {
         self.terminal_size = size;
         if terminal_size_changed {
             if self.content_view_foreground() {
+                self.content_view_deferred_mux_resize = true;
                 log::trace!("content view foreground; deferring mux tab resize");
             } else {
                 self.resize_mux_tabs_to_current_terminal_size();

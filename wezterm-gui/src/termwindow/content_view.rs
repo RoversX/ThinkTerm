@@ -6,14 +6,68 @@
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::TermWindow;
 use crate::ui::{DrawContext, UiPalette};
+use mux::pane::PaneId;
+use mux::renderable::{RenderableDimensions, StableCursorPosition};
+use mux::tab::PositionedSplit;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 use wezterm_font::LoadedFont;
-use wezterm_term::{KeyCode, KeyModifiers};
+use wezterm_term::color::ColorPalette;
+use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex, TerminalSize};
 use window::{MouseEventKind as WMEK, RectF};
 
 pub(crate) type ContentViewId = u64;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ContentViewPresentation {
+    #[default]
+    ContentArea,
+    FullWindow,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ContentViewTypography {
+    #[default]
+    Default,
+    Overview,
+}
+
+/// Immutable terminal state captured once by the owning ContentView.  The
+/// renderer consumes this value without looking the tab up in the mux again,
+/// so a transient detach cannot turn a card into a blank rectangle halfway
+/// through a frame.
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalPreviewSnapshot {
+    pub tab_size: TerminalSize,
+    pub panes: Vec<TerminalPreviewPaneSnapshot>,
+    pub splits: Vec<PositionedSplit>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalPreviewPaneSnapshot {
+    pub pane_id: PaneId,
+    pub is_active: bool,
+    pub left: usize,
+    pub top: usize,
+    pub width: usize,
+    pub height: usize,
+    pub cols: usize,
+    pub rows: usize,
+    pub resolved_top: StableRowIndex,
+    pub lines: Vec<Line>,
+    pub dimensions: RenderableDimensions,
+    pub palette: ColorPalette,
+    pub cursor: StableCursorPosition,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalPreviewRequest {
+    pub snapshot: Arc<TerminalPreviewSnapshot>,
+    pub area: RectF,
+    pub clip: RectF,
+}
 
 /// Progress of an SSH connection that a content view kicked off, pushed by the
 /// owning `TermWindow` while it polls the remote domain. Only the remote-thread
@@ -46,6 +100,34 @@ pub(crate) trait ContentView {
         true
     }
 
+    /// How much of the native window this view owns while it is foreground.
+    /// Full-window views preserve the OS title bar but temporarily suppress
+    /// ThinkTerm's tab bar and sidebars without changing their saved state.
+    fn presentation(&self) -> ContentViewPresentation {
+        ContentViewPresentation::ContentArea
+    }
+
+    /// Paint the background for the complete client surface before the view's
+    /// safe content area is laid out. Full-window views can use this to blend
+    /// through the native title-bar region without placing controls beneath
+    /// the traffic lights.
+    fn paint_surface_background(
+        &mut self,
+        _ctx: &DrawContext,
+        _layers: &mut TripleLayerQuadAllocator<'_>,
+        _surface: RectF,
+        _palette: UiPalette,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Select a native chrome font role rather than inventing view-local font
+    /// sizes.  Overview uses the same sidebar, pane-header and settings roles
+    /// as the rest of ThinkTerm.
+    fn typography(&self) -> ContentViewTypography {
+        ContentViewTypography::Default
+    }
+
     /// Stable key used to activate an existing tab instead of opening a duplicate.
     fn tab_key(&self) -> Option<String> {
         None
@@ -76,6 +158,43 @@ pub(crate) trait ContentView {
     /// Schedule a follow-up repaint for view-local animations.
     fn next_frame_time(&self) -> Option<Instant> {
         None
+    }
+
+    /// Inform the active view that the native window is in an interactive
+    /// resize. Returning true means the state changed and a final repaint is
+    /// required even if the last resize event repeats the same dimensions.
+    fn set_live_resizing(&mut self, _live_resizing: bool) -> bool {
+        false
+    }
+
+    /// Terminal tabs to paint as read-only live thumbnails after the view's
+    /// regular UI layers have been prepared.
+    fn terminal_previews(&self) -> Vec<TerminalPreviewRequest> {
+        Vec::new()
+    }
+
+    /// Paint masks and chrome that must sit above terminal preview glyphs.
+    /// Most ContentViews do not embed terminal snapshots and need no second
+    /// pass.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_after_terminal_previews(
+        &mut self,
+        _ctx: &DrawContext,
+        _layers: &mut TripleLayerQuadAllocator<'_>,
+        _area: RectF,
+        _palette: UiPalette,
+        _font: &Rc<LoadedFont>,
+        _title_font: &Rc<LoadedFont>,
+        _section_font: &Rc<LoadedFont>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether output from this pane should invalidate the view. Normal
+    /// content views do not display panes; Live Overview opts in only for the
+    /// previews currently intersecting its viewport.
+    fn wants_pane_output(&self, _pane_id: PaneId) -> bool {
+        false
     }
 
     /// Paint the view into `area` (the terminal content rect). `cursor_on` is
@@ -121,5 +240,50 @@ pub(crate) trait ContentView {
     /// selection should return text only when that selection is active.
     fn cut_text(&mut self) -> Option<String> {
         None
+    }
+}
+
+/// ContentViews defer mux geometry while they own the foreground.  Consume the
+/// deferred resize only on the transition back to terminal content; opening
+/// and closing a view without an intervening size change is a strict no-op.
+pub(crate) fn take_deferred_mux_resize_on_exit(
+    deferred: &mut bool,
+    was_foreground: bool,
+    is_foreground: bool,
+) -> bool {
+    if was_foreground && !is_foreground && *deferred {
+        *deferred = false;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_deferred_mux_resize_on_exit;
+
+    #[test]
+    fn deferred_mux_resize_flushes_once_on_terminal_return() {
+        let mut deferred = true;
+        assert!(!take_deferred_mux_resize_on_exit(&mut deferred, true, true));
+        assert!(deferred);
+        assert!(take_deferred_mux_resize_on_exit(&mut deferred, true, false));
+        assert!(!deferred);
+        assert!(!take_deferred_mux_resize_on_exit(
+            &mut deferred,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn closing_unresized_content_view_does_not_touch_mux_geometry() {
+        let mut deferred = false;
+        assert!(!take_deferred_mux_resize_on_exit(
+            &mut deferred,
+            true,
+            false
+        ));
     }
 }

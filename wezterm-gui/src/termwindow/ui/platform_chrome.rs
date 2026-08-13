@@ -78,6 +78,19 @@ pub fn uses_integrated_window_buttons(
         && !window_state.contains(WindowState::SERVER_DECORATED)
 }
 
+/// A full-window content view hides ThinkTerm's tab strip, but still needs a
+/// top client-chrome row when native controls share the client surface or when
+/// ThinkTerm owns the window buttons. Server-decorated and fullscreen windows
+/// already provide (or intentionally hide) that chrome elsewhere.
+pub fn full_window_needs_client_chrome(
+    decorations: WindowDecorations,
+    window_state: WindowState,
+    native_macos_surface: bool,
+) -> bool {
+    !window_state.contains(WindowState::FULL_SCREEN)
+        && (native_macos_surface || uses_integrated_window_buttons(decorations, window_state))
+}
+
 impl WindowTabChromeParams {
     fn px(self, value: usize) -> usize {
         scale_ui_usize(value, self.dpi)
@@ -226,6 +239,31 @@ mod tests {
         assert!(!uses_integrated_window_buttons(
             decorations,
             WindowState::SERVER_DECORATED
+        ));
+    }
+
+    #[test]
+    fn full_window_client_chrome_matches_platform_ownership() {
+        let integrated = WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE;
+        assert!(full_window_needs_client_chrome(
+            integrated,
+            WindowState::default(),
+            false
+        ));
+        assert!(!full_window_needs_client_chrome(
+            integrated,
+            WindowState::SERVER_DECORATED,
+            false
+        ));
+        assert!(!full_window_needs_client_chrome(
+            integrated,
+            WindowState::FULL_SCREEN,
+            false
+        ));
+        assert!(full_window_needs_client_chrome(
+            WindowDecorations::RESIZE,
+            WindowState::default(),
+            true
         ));
     }
 

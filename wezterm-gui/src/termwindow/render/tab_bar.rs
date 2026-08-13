@@ -147,6 +147,7 @@ impl crate::TermWindow {
                 font_identity: self.fonts.get_font_scale().to_bits(),
                 shape_key: None,
                 password_input: false,
+                allow_images: true,
             },
             layers,
         )?;

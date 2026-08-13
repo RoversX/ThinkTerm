@@ -758,6 +758,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Shell"],
             icon: Some("md_server_network"),
         },
+        ToggleLiveOverview => CommandDef {
+            brief: "Live Overview".into(),
+            doc: "Shows all live ThinkTerm threads grouped by Space".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("cod_multiple_windows"),
+        },
         SpawnWindow => CommandDef {
             brief: "New Window".into(),
             doc: "Launches the default program into a new window".into(),
@@ -2265,6 +2273,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         #[cfg(target_os = "macos")]
         QuitApplication,
         // ----------------- Shell
+        ToggleLiveOverview,
         OpenSshHosts,
         SpawnTab(SpawnTabDomain::CurrentPaneDomain),
         SpawnWindow,

@@ -9,11 +9,16 @@
 //! becomes the borrowed `self.render_state` field.
 
 use crate::customglyph::{BlockKey, Poly};
-use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::quad::{
+    HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
+};
 use crate::renderstate::RenderState;
 use crate::termwindow::render::corners::{
-    BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
-    TOP_RIGHT_ROUNDED_CORNER,
+    BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_LEFT_ROUNDED_CORNER_MASK,
+    BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE, BOTTOM_RIGHT_ROUNDED_CORNER,
+    BOTTOM_RIGHT_ROUNDED_CORNER_MASK, BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE, TOP_LEFT_ROUNDED_CORNER,
+    TOP_LEFT_ROUNDED_CORNER_MASK, TOP_LEFT_ROUNDED_CORNER_OUTLINE, TOP_RIGHT_ROUNDED_CORNER,
+    TOP_RIGHT_ROUNDED_CORNER_MASK, TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
 };
 use crate::termwindow::ui::icons::{BrandIcon, SvgIcon};
 use crate::utilsprites::RenderMetrics;
@@ -21,7 +26,7 @@ use std::rc::Rc;
 use wezterm_bidi::Direction;
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
-use window::Dimensions;
+use window::{Dimensions, RectF};
 
 /// Borrowed handles needed by every primitive. Cheap to build each frame.
 pub(crate) struct DrawContext<'a> {
@@ -84,6 +89,225 @@ impl<'a> DrawContext<'a> {
         quad.set_fg_color(color);
         quad.set_hsv(None);
         Ok(())
+    }
+
+    /// Draw a true GPU-interpolated gradient using a single quad. This keeps
+    /// full-window native UI backgrounds smooth without uploading a texture or
+    /// exposing visible color bands on large displays.
+    pub(crate) fn draw_vertical_gradient(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        area: RectF,
+        top: LinearRgba,
+        bottom: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if area.size.width <= 0.0 || area.size.height <= 0.0 {
+            return Ok(());
+        }
+
+        let mut quad = layers.allocate(layer_num)?;
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        quad.set_position(
+            area.origin.x - left_offset,
+            area.origin.y - top_offset,
+            area.max_x() - left_offset,
+            area.max_y() - top_offset,
+        );
+        quad.set_texture(self.render_state.util_sprites.filled_box.texture_coords());
+        quad.set_is_background();
+        quad.set_vertical_gradient(top, bottom);
+        quad.set_alt_color_and_mix_value(top, 0.0);
+        quad.set_hsv(None);
+        Ok(())
+    }
+
+    /// Draw a smoothly interpolated four-corner gradient with one GPU quad.
+    /// This is intended for restrained native surfaces where a flat vertical
+    /// blend is visually too uniform but a texture or blur would be wasteful.
+    pub(crate) fn draw_corner_gradient(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        area: RectF,
+        top_left: LinearRgba,
+        top_right: LinearRgba,
+        bottom_left: LinearRgba,
+        bottom_right: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if area.size.width <= 0.0 || area.size.height <= 0.0 {
+            return Ok(());
+        }
+
+        let mut quad = layers.allocate(layer_num)?;
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        quad.set_position(
+            area.origin.x - left_offset,
+            area.origin.y - top_offset,
+            area.max_x() - left_offset,
+            area.max_y() - top_offset,
+        );
+        quad.set_texture(self.render_state.util_sprites.filled_box.texture_coords());
+        quad.set_is_background();
+        quad.set_corner_gradient(top_left, top_right, bottom_left, bottom_right);
+        quad.set_alt_color_and_mix_value(top_left, 0.0);
+        quad.set_hsv(None);
+        Ok(())
+    }
+
+    /// Standard elevated surface used by overview cards. Two restrained
+    /// layers provide depth without a hard concentric halo.
+    pub(crate) fn draw_elevated_surface(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        rect: RectF,
+        fill: LinearRgba,
+        border: LinearRgba,
+        shadow: LinearRgba,
+        radius: f32,
+    ) -> anyhow::Result<()> {
+        for (spread, offset_y, alpha) in [
+            (self.px(6.0), self.px(5.0), 0.14),
+            (self.px(2.0), self.px(3.0), 0.24),
+        ] {
+            self.draw_rounded_rect(
+                layers,
+                layer_num,
+                rect.origin.x - spread,
+                rect.origin.y - spread + offset_y,
+                rect.size.width + spread * 2.0,
+                rect.size.height + spread * 2.0,
+                color_with_alpha(shadow, shadow.3 * alpha),
+                radius + spread,
+            )?;
+        }
+        self.draw_rounded_frame(
+            layers,
+            layer_num,
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+            fill,
+            border,
+            radius,
+        )
+    }
+
+    /// Cover the four wedges outside a rounded preview after the terminal has
+    /// been painted, then redraw its thin outline. The complete chrome is
+    /// emitted into a heap buffer and clipped as quads, so a corner crossing a
+    /// scroll boundary remains rounded instead of disappearing all at once.
+    pub(crate) fn draw_rounded_preview_chrome(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        rect: RectF,
+        clip: RectF,
+        mask: LinearRgba,
+        border: LinearRgba,
+        radius: f32,
+    ) -> anyhow::Result<()> {
+        let radius = radius
+            .min(rect.size.width / 2.0)
+            .min(rect.size.height / 2.0)
+            .round()
+            .max(0.0);
+        if radius <= 0.0 {
+            return Ok(());
+        }
+        let size = euclid::size2(radius, radius);
+
+        let corners = [
+            (
+                rect.min_x(),
+                rect.min_y(),
+                TOP_LEFT_ROUNDED_CORNER_MASK,
+                TOP_LEFT_ROUNDED_CORNER_OUTLINE,
+            ),
+            (
+                rect.max_x() - radius,
+                rect.min_y(),
+                TOP_RIGHT_ROUNDED_CORNER_MASK,
+                TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
+            ),
+            (
+                rect.min_x(),
+                rect.max_y() - radius,
+                BOTTOM_LEFT_ROUNDED_CORNER_MASK,
+                BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE,
+            ),
+            (
+                rect.max_x() - radius,
+                rect.max_y() - radius,
+                BOTTOM_RIGHT_ROUNDED_CORNER_MASK,
+                BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE,
+            ),
+        ];
+        let mut heap = HeapQuadAllocator::default();
+        {
+            let mut clipped_layers = TripleLayerQuadAllocator::Heap(&mut heap);
+            for (x, y, mask_poly, outline_poly) in corners {
+                self.draw_corner(&mut clipped_layers, layer_num, x, y, mask_poly, size, mask)?;
+                self.draw_corner(
+                    &mut clipped_layers,
+                    layer_num,
+                    x,
+                    y,
+                    outline_poly,
+                    size,
+                    border,
+                )?;
+            }
+
+            let stroke = self.px(1.0).max(1.0);
+            let edges: [RectF; 4] = [
+                euclid::rect(
+                    rect.min_x() + radius,
+                    rect.min_y(),
+                    rect.size.width - radius * 2.0,
+                    stroke,
+                ),
+                euclid::rect(
+                    rect.min_x() + radius,
+                    rect.max_y() - stroke,
+                    rect.size.width - radius * 2.0,
+                    stroke,
+                ),
+                euclid::rect(
+                    rect.min_x(),
+                    rect.min_y() + radius,
+                    stroke,
+                    rect.size.height - radius * 2.0,
+                ),
+                euclid::rect(
+                    rect.max_x() - stroke,
+                    rect.min_y() + radius,
+                    stroke,
+                    rect.size.height - radius * 2.0,
+                ),
+            ];
+            for edge in edges {
+                self.draw_rect(
+                    &mut clipped_layers,
+                    layer_num,
+                    edge.origin.x,
+                    edge.origin.y,
+                    edge.size.width,
+                    edge.size.height,
+                    border,
+                )?;
+            }
+        }
+        heap.apply_to_clipped(
+            layers,
+            clip,
+            self.dimensions.pixel_width as f32,
+            self.dimensions.pixel_height as f32,
+        )
     }
 
     pub(crate) fn draw_rounded_rect(
@@ -460,4 +684,8 @@ impl<'a> DrawContext<'a> {
 
         format!("{}{}", text[..boundaries[best]].trim_end(), ellipsis)
     }
+}
+
+fn color_with_alpha(color: LinearRgba, alpha: f32) -> LinearRgba {
+    LinearRgba(color.0, color.1, color.2, alpha.clamp(0.0, 1.0))
 }

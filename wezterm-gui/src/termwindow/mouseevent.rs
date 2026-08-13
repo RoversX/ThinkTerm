@@ -1016,6 +1016,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarSettings
             | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::WorkspaceSidebarSshHosts
+            | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::RightSidebarToggle
             | UIItemType::RightSidebarMode(_)
@@ -1097,6 +1098,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarSettings
             | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::WorkspaceSidebarSshHosts
+            | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::RightSidebarToggle
             | UIItemType::RightSidebarMode(_)
@@ -3024,6 +3026,12 @@ impl super::TermWindow {
                     self.toggle_ssh_hosts_view();
                 }
             }
+            UIItemType::WorkspaceSidebarLiveOverview => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_live_overview_view();
+                }
+            }
             UIItemType::ContentViewClose(id) => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
@@ -3416,6 +3424,12 @@ impl super::TermWindow {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
                     self.toggle_ssh_hosts_view();
+                }
+            }
+            UIItemType::WorkspaceSidebarLiveOverview => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_live_overview_view();
                 }
             }
             UIItemType::WorkspaceSidebarViewOptions => {

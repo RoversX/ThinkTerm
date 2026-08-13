@@ -18,7 +18,7 @@ use crate::tabbar::{TabBarItem, TabBarState};
 use crate::termwindow::background::{
     load_background_image, reload_background_image, LoadedBackgroundLayer,
 };
-use crate::termwindow::content_view::{ContentView, ContentViewId};
+use crate::termwindow::content_view::{ContentView, ContentViewId, ContentViewPresentation};
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::paint::AllowImage;
@@ -150,6 +150,7 @@ pub mod charselect;
 pub mod clipboard;
 pub mod content_view;
 pub mod keyevent;
+pub(crate) mod live_overview;
 pub mod modal;
 mod mouseevent;
 pub mod onboarding;
@@ -437,6 +438,7 @@ pub enum UIItemType {
     WorkspaceSidebarSettings,
     WorkspaceSidebarViewOptions,
     WorkspaceSidebarSshHosts,
+    WorkspaceSidebarLiveOverview,
     WorkspaceSidebarNotifications,
     RightSidebarToggle,
     RightSidebarMode(RightSidebarMode),
@@ -1476,6 +1478,10 @@ pub struct TermWindow {
     content_views: Vec<ContentViewTab>,
     active_content_view_id: Option<ContentViewId>,
     content_view_response_tab_id: Option<ContentViewId>,
+    /// A real terminal-size change arrived while a ContentView owned the
+    /// foreground.  It is flushed once when terminal content becomes visible
+    /// again; merely opening and closing a view must not resize mux tabs.
+    content_view_deferred_mux_resize: bool,
     next_content_view_id: ContentViewId,
     registered_content_view_surfaces: HashMap<ContentViewId, MuxWindowId>,
     /// Tracks SSH connections kicked off by `RemoteThreadView`s.
@@ -2255,6 +2261,7 @@ impl TermWindow {
             content_views: vec![],
             active_content_view_id: None,
             content_view_response_tab_id: None,
+            content_view_deferred_mux_resize: false,
             next_content_view_id: 1,
             registered_content_view_surfaces: HashMap::new(),
             remote_connects: HashMap::new(),
@@ -3485,7 +3492,10 @@ impl TermWindow {
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
-        if self.is_pane_visible(pane_id) {
+        let content_view_wants_output = self
+            .active_content_view()
+            .is_some_and(|view| view.wants_pane_output(pane_id));
+        if content_view_wants_output || self.is_pane_visible(pane_id) {
             if let Some(ref win) = self.window {
                 win.invalidate();
             }
@@ -4177,8 +4187,47 @@ impl TermWindow {
         self.active_content_view_index().is_some()
     }
 
+    pub(crate) fn active_content_view_presentation(&self) -> ContentViewPresentation {
+        self.active_content_view()
+            .map(|view| view.presentation())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn content_view_is_full_window(&self) -> bool {
+        self.content_view_foreground()
+            && self.active_content_view_presentation() == ContentViewPresentation::FullWindow
+    }
+
+    pub(crate) fn full_window_client_chrome_height(&self) -> f32 {
+        if crate::termwindow::ui::platform_chrome::full_window_needs_client_chrome(
+            self.config.window_decorations,
+            self.window_state,
+            cfg!(target_os = "macos"),
+        ) {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        }
+    }
+
     pub(crate) fn content_view_area(&self) -> RectF {
         let border = self.get_os_border();
+        if self.content_view_is_full_window() {
+            let left = border.left.get() as f32;
+            // Full-window views suppress the app tab strip, not the platform's
+            // essential controls. Reserve the same row independently of
+            // enable_tab_bar/hide_tab_bar_if_only_one_tab.
+            let top = border.top.get() as f32 + self.full_window_client_chrome_height();
+            let right = self
+                .dimensions
+                .pixel_width
+                .saturating_sub(border.right.get() as usize) as f32;
+            let bottom = self
+                .dimensions
+                .pixel_height
+                .saturating_sub(border.bottom.get() as usize) as f32;
+            return euclid::rect(left, top, (right - left).max(0.0), (bottom - top).max(0.0));
+        }
         let top_tab_h = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
             self.tab_bar_pixel_height().unwrap_or(0.0)
         } else {
@@ -4350,7 +4399,12 @@ impl TermWindow {
         });
         self.sync_content_view_surfaces_with_mux();
         self.sync_workspace_sidebar_pending_thread_selection();
-        if was_foreground && !self.content_view_foreground() {
+        let is_foreground = self.content_view_foreground();
+        if crate::termwindow::content_view::take_deferred_mux_resize_on_exit(
+            &mut self.content_view_deferred_mux_resize,
+            was_foreground,
+            is_foreground,
+        ) {
             self.resize_mux_tabs_to_current_terminal_size();
         }
         self.invalidate_window();
@@ -4420,7 +4474,12 @@ impl TermWindow {
         self.sync_content_view_surfaces_with_mux();
         self.sync_workspace_sidebar_pending_thread_selection();
 
-        if was_foreground && !self.content_view_foreground() {
+        let is_foreground = self.content_view_foreground();
+        if crate::termwindow::content_view::take_deferred_mux_resize_on_exit(
+            &mut self.content_view_deferred_mux_resize,
+            was_foreground,
+            is_foreground,
+        ) {
             self.resize_mux_tabs_to_current_terminal_size();
         }
         self.invalidate_window();
@@ -4515,6 +4574,39 @@ impl TermWindow {
         } else {
             self.open_content_view(Box::new(
                 crate::termwindow::ssh_hosts_view::SshHostsView::new(),
+            ));
+        }
+    }
+
+    /// Toggle the global Safari-style live terminal overview. It is a
+    /// full-window ContentView, but keeps the terminal grid and the user's
+    /// sidebar preferences untouched behind it.
+    pub(crate) fn toggle_live_overview_view(&mut self) {
+        let key = crate::termwindow::live_overview::LIVE_OVERVIEW_CONTENT_VIEW_KEY;
+        if self.active_content_view_key_is(key) {
+            self.close_content_view();
+        } else if let Some(id) = self.content_view_id_for_key(key) {
+            self.activate_content_view(id);
+        } else {
+            let active_workspace = self
+                .current_mux_workspace()
+                .unwrap_or_else(|| Mux::get().active_workspace());
+            let host_preview_aspect = if self.terminal_size.pixel_height > 0 {
+                self.terminal_size.pixel_width as f32 / self.terminal_size.pixel_height as f32
+            } else {
+                let width = self.terminal_size.cols as f32
+                    * self.render_metrics.cell_size.width.max(1) as f32;
+                let height = self.terminal_size.rows as f32
+                    * self.render_metrics.cell_size.height.max(1) as f32;
+                width / height.max(1.0)
+            };
+            self.open_content_view(Box::new(
+                crate::termwindow::live_overview::LiveOverviewView::new(
+                    self.space_owner_id,
+                    &self.active_space_id,
+                    &active_workspace,
+                    host_preview_aspect,
+                ),
             ));
         }
     }
@@ -6769,6 +6861,9 @@ impl TermWindow {
             }
             OpenSshHosts => {
                 self.toggle_ssh_hosts_view();
+            }
+            ToggleLiveOverview => {
+                self.toggle_live_overview_view();
             }
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);

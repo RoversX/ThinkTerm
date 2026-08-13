@@ -1622,6 +1622,7 @@ impl crate::TermWindow {
                                 font_identity: self.font_identity,
                                 shape_key: Some(shape_key),
                                 password_input,
+                                allow_images: true,
                             },
                             &mut TripleLayerQuadAllocator::Heap(&mut buf),
                         )

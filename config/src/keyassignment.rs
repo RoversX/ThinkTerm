@@ -682,6 +682,7 @@ pub enum KeyAssignment {
     OpenUri(String),
     OpenSettings,
     OpenSshHosts,
+    ToggleLiveOverview,
     ActivateCommandPalette,
     ActivateWindow(usize),
     ActivateWindowRelative(isize),

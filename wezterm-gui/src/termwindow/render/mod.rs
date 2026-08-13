@@ -184,6 +184,11 @@ pub struct RenderScreenLineParams<'a> {
     pub font_identity: u64,
     pub shape_key: Option<LineToEleShapeCacheKey>,
     pub password_input: bool,
+
+    /// Whether terminal image cells should be emitted for this render pass.
+    /// Live Overview keeps the source line untouched and suppresses only the
+    /// image quads; regular terminal painting enables them.
+    pub allow_images: bool,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
