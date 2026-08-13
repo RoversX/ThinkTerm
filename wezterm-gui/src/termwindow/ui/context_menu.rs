@@ -296,6 +296,13 @@ impl crate::TermWindow {
         }
 
         if cfg!(target_os = "macos") && !crate::native_settings::force_fallback_context_menu() {
+            // AppKit tracks a native menu in a nested event loop that eats the
+            // mouse-up belonging to the click that opened it, and only reports
+            // back via `ContextMenuDismissed` when the menu closed *without* a
+            // selection. Choosing an item therefore leaves us believing the
+            // button is still down forever. Release that bookkeeping here,
+            // where we know the release can no longer be observed.
+            self.release_pointer_ownership_for_native_menu();
             context.show_context_menu(coords, items);
             return;
         }

@@ -1,6 +1,8 @@
 use crate::frontend::front_end;
 use crate::tabbar::TabBarItem;
 use crate::termwindow::content_view::ContentViewId;
+#[cfg(target_os = "macos")]
+use crate::termwindow::space_swipe::{SidebarSpaceSwipeFinish, SidebarSpaceSwipeUpdate};
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::sidebar::SpaceConnectionState;
 use crate::termwindow::ui::tokens::{
@@ -13,6 +15,8 @@ use crate::termwindow::{
     PaneDropZone, PaneNavAction, PaneTabDragState, PaneTabDropTarget, PositionedSplit, ScrollHit,
     TabWheelSurface, TermWindowNotif, UIItem, UIItemType, TMB,
 };
+#[cfg(target_os = "macos")]
+use ::window::ScrollPhase;
 use ::window::{
     ContextMenuIcon, ContextMenuItem, IntegratedTitleButtonStyle, MouseButtons as WMB, MouseCursor,
     MouseEvent, MouseEventKind as WMEK, MousePress, WindowOps, WindowState,
@@ -790,6 +794,11 @@ impl super::TermWindow {
         event: &MouseEvent,
         context: &dyn WindowOps,
     ) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(handled) = self.mouse_wheel_workspace_sidebar_space_swipe(event, context) {
+            return handled;
+        }
+
         let Some(rect) = self.workspace_sidebar_rect() else {
             return false;
         };
@@ -816,9 +825,17 @@ impl super::TermWindow {
             return true;
         }
 
+        self.scroll_workspace_sidebar_by(delta, context);
+        true
+    }
+
+    fn scroll_workspace_sidebar_by(&mut self, delta: f32, context: &dyn WindowOps) {
+        if delta.abs() <= f32::EPSILON {
+            return;
+        }
         let max_offset = self.workspace_sidebar_scroll_max();
         if max_offset <= 0.0 {
-            return true;
+            return;
         }
 
         self.show_workspace_sidebar_scrollbar();
@@ -829,7 +846,268 @@ impl super::TermWindow {
         } else {
             context.invalidate();
         }
-        true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mouse_wheel_workspace_sidebar_space_swipe(
+        &mut self,
+        event: &MouseEvent,
+        context: &dyn WindowOps,
+    ) -> Option<bool> {
+        if !matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)) {
+            return None;
+        }
+
+        if matches!(event.momentum_phase, Some(ScrollPhase::Began)) && event.scroll_phase.is_none()
+        {
+            // Some macOS trackpads transition directly from Changed into
+            // momentum without emitting a scroll-phase Ended event. Treat the
+            // beginning of momentum as the finger-up boundary so a horizontal
+            // gesture can commit instead of remaining stuck in Tracking.
+            self.finish_workspace_sidebar_space_swipe(Instant::now(), context);
+        }
+
+        if let Some(momentum_phase) = event.momentum_phase {
+            let ended = matches!(momentum_phase, ScrollPhase::Ended | ScrollPhase::Cancelled);
+            if self.workspace_sidebar_swipe.consume_momentum(ended) {
+                return Some(true);
+            }
+        }
+
+        let scroll_phase = event.scroll_phase?;
+        let (delta_x, delta_y) = event
+            .precise_scroll_delta
+            .map(|delta| (delta.x, delta.y))
+            .unwrap_or((0.0, 0.0));
+        let inside_sidebar = self.workspace_sidebar_rect().is_some_and(|rect| {
+            let x = event.coords.x;
+            let y = event.coords.y;
+            x >= rect.x as isize
+                && x < rect.x.saturating_add(rect.width) as isize
+                && y >= rect.y as isize
+                && y < rect.y.saturating_add(rect.height) as isize
+        });
+        if !inside_sidebar && !self.workspace_sidebar_swipe.is_active() {
+            return None;
+        }
+
+        let can_begin_without_space_lookup = inside_sidebar
+            && !self.workspace_sidebar_collapsed
+            && self.context_menu.is_none()
+            && self.modal.borrow().is_none()
+            && self.inline_tab_rename.is_none()
+            && self.current_mouse_capture.is_none()
+            && self.dragging.is_none()
+            && self.sidebar_row_drag.is_none()
+            && self.right_sidebar_file_drag.is_none()
+            && self.pane_tab_drag.is_none();
+        let now = Instant::now();
+
+        if matches!(scroll_phase, ScrollPhase::MayBegin) {
+            if !can_begin_without_space_lookup {
+                return None;
+            }
+            let active_space_is_local =
+                crate::workspace_threads::spaces_for_window(self.space_owner_id)
+                    .iter()
+                    .any(|space| space.id == self.active_space_id && !space.is_remote);
+            if active_space_is_local {
+                self.prepare_workspace_space_swipe_source_capture();
+                context.invalidate();
+                return Some(true);
+            }
+            return None;
+        }
+
+        let needs_begin = matches!(scroll_phase, ScrollPhase::Began)
+            || (matches!(scroll_phase, ScrollPhase::Changed)
+                && !self.workspace_sidebar_swipe.is_active());
+        if needs_begin {
+            if !can_begin_without_space_lookup {
+                return None;
+            }
+            if matches!(scroll_phase, ScrollPhase::Began)
+                && self.workspace_sidebar_swipe.is_active()
+            {
+                // A fresh gesture supersedes any unfinished/settling visual
+                // from the preceding gesture.
+                self.workspace_sidebar_swipe.cancel_immediately();
+                self.clear_workspace_space_swipe_frame_transition();
+            }
+            let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
+            if !spaces
+                .iter()
+                .any(|space| space.id == self.active_space_id && !space.is_remote)
+            {
+                return None;
+            }
+            let (previous, next) =
+                crate::workspace_threads::adjacent_local_space_ids(&spaces, &self.active_space_id);
+            if self.workspace_space_swipe_source_frame.is_none() {
+                self.prepare_workspace_space_swipe_source_capture();
+            }
+            // Whether the pages tracked is a fact about *this* gesture. The
+            // previous one having tracked must not decide how this one opens.
+            self.workspace_space_swipe_tracked = false;
+            self.workspace_sidebar_swipe.begin(
+                self.active_space_id.clone(),
+                previous,
+                next,
+                self.workspace_sidebar_scroll_offset,
+                now,
+            );
+        }
+
+        if matches!(scroll_phase, ScrollPhase::Began | ScrollPhase::Changed)
+            && (delta_x.abs() > f32::EPSILON || delta_y.abs() > f32::EPSILON)
+        {
+            let update = self.workspace_sidebar_swipe.update(delta_x, delta_y, now);
+            match update {
+                SidebarSpaceSwipeUpdate::Pending => {}
+                SidebarSpaceSwipeUpdate::Horizontal => context.invalidate(),
+                SidebarSpaceSwipeUpdate::Vertical(delta_y) => {
+                    self.clear_workspace_space_swipe_frame_transition();
+                    self.scroll_workspace_sidebar_by(-delta_y, context);
+                }
+            }
+        }
+
+        match scroll_phase {
+            ScrollPhase::Ended => {
+                self.finish_workspace_sidebar_space_swipe(now, context);
+            }
+            ScrollPhase::Cancelled => {
+                self.workspace_sidebar_swipe.cancel_immediately();
+                self.clear_workspace_space_swipe_frame_transition();
+                context.invalidate();
+            }
+            _ => {}
+        }
+
+        Some(true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_workspace_sidebar_space_swipe(
+        &mut self,
+        now: Instant,
+        context: &dyn WindowOps,
+    ) -> bool {
+        let width = self.workspace_sidebar_width() as f32;
+        let finish = self.workspace_sidebar_swipe.finish(now, width);
+        match finish {
+            SidebarSpaceSwipeFinish::Switch(target) => {
+                let direction = self
+                    .workspace_sidebar_swipe
+                    .visual(now, width)
+                    .map(|visual| visual.offset.signum())
+                    .unwrap_or(0.0);
+                self.workspace_space_swipe_pending_commit = Some((target, direction));
+                if self.workspace_space_swipe_source_frame.is_none() {
+                    // A very fast flick can end before AppKit presents even
+                    // one source-sidebar paint. Defer the actual Space adoption
+                    // until paint_pass has mirrored the still-current sidebar;
+                    // this keeps its list-page transition from degrading into
+                    // an immediate destination flash.
+                    self.workspace_space_swipe_capture_source = true;
+                } else {
+                    self.complete_workspace_space_swipe_switch();
+                }
+                context.invalidate();
+                true
+            }
+            SidebarSpaceSwipeFinish::AnimateBack => {
+                // The pages already followed the finger out, so they have to
+                // travel back rather than blink into place. `finish` has put
+                // the state machine into a settle that does exactly that;
+                // leave the captured neighbour alive to be composited until
+                // `advance` retires it.
+                context.invalidate();
+                true
+            }
+            SidebarSpaceSwipeFinish::FlushVertical(delta_y) => {
+                self.clear_workspace_space_swipe_frame_transition();
+                self.scroll_workspace_sidebar_by(-delta_y, context);
+                true
+            }
+            SidebarSpaceSwipeFinish::None => {
+                // `None` means "this call had no gesture to settle". That is
+                // true both when nothing was in flight and when a previous
+                // call already moved the state machine into AwaitingCommit or
+                // Settling -- macOS routinely delivers a trailing Ended after
+                // momentum has already ended the gesture, so this runs a
+                // second time right after a commit. Only tear down the frame
+                // transition when the state machine really is idle; otherwise
+                // the just-committed push is destroyed before its first frame.
+                if !self.workspace_sidebar_swipe.is_active() {
+                    self.clear_workspace_space_swipe_frame_transition();
+                }
+                false
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn complete_workspace_space_swipe_switch(&mut self) {
+        let Some((target, direction)) = self.workspace_space_swipe_pending_commit.take() else {
+            return;
+        };
+        let width = self.workspace_sidebar_width() as f32;
+        let now = Instant::now();
+        let source_is_current = self
+            .workspace_sidebar_swipe
+            .visual(now, width)
+            .is_some_and(|visual| visual.source_space_id == self.active_space_id);
+        let target_is_available = crate::workspace_threads::spaces_for_window(self.space_owner_id)
+            .iter()
+            .any(|space| {
+                space.id == target && !space.is_remote && !space.is_occupied_by_other_window
+            });
+        let gui_window = self.window.clone();
+        let switched = source_is_current
+            && target_is_available
+            && gui_window
+                .as_ref()
+                .is_some_and(|window| self.switch_space_to_thread(target, None, window));
+
+        self.workspace_space_swipe_push_active =
+            switched && direction != 0.0 && self.workspace_space_swipe_source_frame.is_some();
+        self.workspace_space_swipe_direction = if self.workspace_space_swipe_push_active {
+            direction
+        } else {
+            0.0
+        };
+        self.workspace_space_swipe_capture_source = false;
+        // The Space this held is the one now adopted, so it is the live paint
+        // from here on; keeping the capture would only leave the compositor a
+        // stale copy to choose.
+        self.workspace_space_swipe_target_frame = None;
+        self.workspace_space_swipe_needs_settle_start = self.workspace_space_swipe_push_active;
+        if !switched {
+            self.workspace_sidebar_swipe.resolve_switch(
+                false,
+                Instant::now(),
+                width,
+                crate::termwindow::space_swipe::SettleOpening::WhereTheFingerLeftIt,
+            );
+        }
+        if !self.workspace_space_swipe_push_active {
+            self.workspace_sidebar_swipe.cancel_immediately();
+            self.workspace_space_swipe_source_frame = None;
+        }
+        if let Some(window) = gui_window {
+            window.invalidate();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_workspace_space_swipe_source_capture(&mut self) {
+        self.workspace_space_swipe_source_frame = None;
+        self.workspace_space_swipe_capture_source = true;
+        self.workspace_space_swipe_push_active = false;
+        self.workspace_space_swipe_direction = 0.0;
+        self.workspace_space_swipe_pending_commit = None;
+        self.workspace_space_swipe_needs_settle_start = false;
     }
 
     fn scroll_right_sidebar_note_table_at(&mut self, x: f32, y: f32, delta: f32) -> bool {
@@ -1219,6 +1497,32 @@ impl super::TermWindow {
         }
     }
 
+    /// Release the pointer-ownership bookkeeping for a `Release` that is
+    /// about to be consumed by an early return.
+    ///
+    /// `mouse_event_impl` normally clears these in its `Release` arm, but two
+    /// context-menu paths return before reaching it: the suppressed release
+    /// that follows a menu choice, and any release delivered while a menu is
+    /// open. Suppressing the *action* is intended; forgetting that the button
+    /// physically came up is not. Left armed, `current_mouse_capture` and
+    /// `current_mouse_buttons` stay set for the rest of the session and
+    /// silently veto every guard that tests them -- which disabled the
+    /// sidebar space swipe permanently after any context-menu use.
+    fn release_pointer_ownership(&mut self, event: &MouseEvent) {
+        if let WMEK::Release(ref press) = event.kind {
+            self.current_mouse_capture = None;
+            self.current_mouse_buttons.retain(|p| p != press);
+        }
+    }
+
+    /// Same bookkeeping, for the case where the release will never arrive at
+    /// all: a native AppKit menu tracks in a nested event loop that consumes
+    /// the mouse-up outright. See the call site in `show_term_context_menu`.
+    pub(crate) fn release_pointer_ownership_for_native_menu(&mut self) {
+        self.current_mouse_capture = None;
+        self.current_mouse_buttons.clear();
+    }
+
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
         let pane = self.get_active_pane_or_overlay();
@@ -1248,10 +1552,16 @@ impl super::TermWindow {
         });
         let terminal_surface = point_is_in_terminal_area
             && (self.resolve_ui_item(&event).is_none() || terminal_ui_item);
-        let takeover_gesture = matches!(
-            event.kind,
-            WMEK::Press(_) | WMEK::VertWheel(_) | WMEK::HorzWheel(_)
-        );
+        let wheel_has_motion = match event.kind {
+            WMEK::VertWheel(amount) | WMEK::HorzWheel(amount) => {
+                amount != 0
+                    || event.precise_scroll_delta.is_some_and(|delta| {
+                        delta.x.abs() > f32::EPSILON || delta.y.abs() > f32::EPSILON
+                    })
+            }
+            _ => false,
+        };
+        let takeover_gesture = matches!(event.kind, WMEK::Press(_)) || wheel_has_motion;
 
         if terminal_surface && self.frontend_surface_blocked() {
             if takeover_gesture && self.frontend_takeover_claimable() {
@@ -1273,11 +1583,13 @@ impl super::TermWindow {
         self.current_mouse_event.replace(event.clone());
 
         if self.consume_context_menu_suppressed_release(&event) {
+            self.release_pointer_ownership(&event);
             return;
         }
 
         if let Some(pane) = pane.as_ref() {
             if self.mouse_event_context_menu(&event, pane, context) {
+                self.release_pointer_ownership(&event);
                 return;
             }
         } else if matches!(

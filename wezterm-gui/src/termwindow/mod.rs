@@ -9,6 +9,7 @@ use crate::overlay::{
     start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
     QuickSelectOverlay,
 };
+use crate::quad::{HeapQuadAllocator, HeapQuadMark};
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::scripting::guiwin::GuiWin;
 use crate::scrollbar::*;
@@ -163,6 +164,7 @@ pub(crate) mod remote_walk;
 pub mod render;
 pub mod resize;
 mod selection;
+mod space_swipe;
 pub mod spawn;
 pub mod ssh_hosts_view;
 pub(crate) mod transfer_walk;
@@ -1340,6 +1342,17 @@ pub(crate) struct RemoteDividerResizeStream {
     pub(crate) final_acknowledged_at: Option<Instant>,
 }
 
+/// A recorded left sidebar, kept so the outgoing Space can be composited
+/// against the incoming one.
+pub(crate) struct CapturedSidebar {
+    pub(crate) quads: HeapQuadAllocator,
+    /// The stretch of `quads` holding the scrolling project list. The rest is
+    /// chrome that deliberately overlaps it -- the bottom fade, the settings
+    /// row -- so only a split by paint order, never by screen position, can
+    /// separate what slides from what stays.
+    pub(crate) list: Option<(HeapQuadMark, HeapQuadMark)>,
+}
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -1505,6 +1518,40 @@ pub struct TermWindow {
     workspace_sidebar_pending_thread_selection: Option<String>,
     workspace_sidebar_collapsed: bool,
     workspace_sidebar_scroll_offset: f32,
+    /// Where each Space's sidebar was scrolled to when the window last left
+    /// it. Switching used to send every Space back to the top, so glancing at
+    /// a neighbour cost you your place in a long list.
+    workspace_sidebar_scroll_offsets: HashMap<String, f32>,
+    workspace_sidebar_swipe: space_swipe::SidebarSpaceSwipeState,
+    /// A CPU-side copy of the source Space's left sidebar. During a committed
+    /// switch only its middle project/thread list viewport is composited beside
+    /// the destination; sidebar chrome and the rest of the window stay live.
+    workspace_space_swipe_source_frame: Option<CapturedSidebar>,
+    workspace_space_swipe_capture_source: bool,
+    workspace_space_swipe_push_active: bool,
+    workspace_space_swipe_direction: f32,
+    workspace_space_swipe_pending_commit: Option<(String, f32)>,
+    workspace_space_swipe_needs_settle_start: bool,
+    /// The Space whose sidebar is being painted right now, when that is not
+    /// the adopted one. A swipe paints the neighbouring Space into an
+    /// offscreen buffer so it can slide in under the finger; this is how that
+    /// paint reads the neighbour's projects and threads without the window
+    /// actually switching to it.
+    workspace_sidebar_preview_space_id: Option<String>,
+    /// The neighbouring Space's sidebar, and which Space it holds. Captured
+    /// once when the axis locks rather than every frame: it is not
+    /// interactive while the finger is down, and re-rasterising its glyphs
+    /// per frame would cost more than the whole animation budget.
+    workspace_space_swipe_target_frame: Option<(String, CapturedSidebar)>,
+    /// Whether any frame was composited with the pages following the finger.
+    /// A flick that begins and ends between two paints never gets one, and
+    /// its transition has to open at rest to be seen at all.
+    workspace_space_swipe_tracked: bool,
+    /// Where the scrolling list began and ended in the most recent
+    /// heap-recorded sidebar paint. `paint_workspace_sidebar` clears this on
+    /// entry and sets it around the row loop, so it describes that paint and
+    /// no other; a paint that bailed out before the list leaves it `None`.
+    workspace_sidebar_list_quads: Option<(HeapQuadMark, HeapQuadMark)>,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
     /// Last notification state painted by this GUI window. Comparing identities
     /// and statuses (rather than just the count) lets the bell pulse when one
@@ -1866,6 +1913,70 @@ impl TermWindow {
         }
     }
 
+    /// Save where the sidebar is scrolled for the Space currently adopted, so
+    /// coming back to it lands where it was left rather than at the top.
+    fn remember_workspace_sidebar_scroll(&mut self) {
+        let offset = self.workspace_sidebar_scroll_offset;
+        self.workspace_sidebar_scroll_offsets
+            .insert(self.active_space_id.clone(), offset);
+    }
+
+    /// Where `active_space_id` was last scrolled to. A Space seen for the
+    /// first time starts at the top. The value is not clamped here: the list
+    /// it belongs to may have grown or shrunk since, and the paint clamps
+    /// against the extent it actually measures.
+    fn remembered_workspace_sidebar_scroll(&self) -> f32 {
+        self.workspace_sidebar_scroll_offsets
+            .get(&self.active_space_id)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// The Space the left sidebar should render. Everything painting sidebar
+    /// content must read this rather than `active_space_id`, or the offscreen
+    /// paint of the neighbouring Space silently draws the adopted one instead
+    /// and the swipe slides a page against its own copy.
+    pub(crate) fn workspace_sidebar_space_id(&self) -> &str {
+        self.workspace_sidebar_preview_space_id
+            .as_deref()
+            .unwrap_or(self.active_space_id.as_str())
+    }
+
+    fn clear_workspace_space_swipe_frame_transition(&mut self) {
+        self.workspace_space_swipe_source_frame = None;
+        self.workspace_space_swipe_target_frame = None;
+        self.workspace_space_swipe_tracked = false;
+        self.workspace_sidebar_preview_space_id = None;
+        self.workspace_space_swipe_capture_source = false;
+        self.workspace_space_swipe_push_active = false;
+        self.workspace_space_swipe_direction = 0.0;
+        self.workspace_space_swipe_pending_commit = None;
+        self.workspace_space_swipe_needs_settle_start = false;
+    }
+
+    /// Drop atlas-backed captures after the glyph atlas is recreated. A fast
+    /// flick that committed before its first source paint has no stale source
+    /// frame yet, so preserve its pending switch and retry that capture.
+    fn recover_workspace_space_swipe_after_atlas_recreation(&mut self) {
+        let preserve_pending =
+            crate::termwindow::space_swipe::preserve_pending_source_capture_after_atlas_recreation(
+                self.workspace_space_swipe_source_frame.is_some(),
+                self.workspace_space_swipe_capture_source,
+                self.workspace_space_swipe_pending_commit.is_some(),
+            );
+        if preserve_pending {
+            self.workspace_space_swipe_target_frame = None;
+            self.workspace_sidebar_preview_space_id = None;
+            self.workspace_space_swipe_tracked = false;
+            self.workspace_space_swipe_push_active = false;
+            self.workspace_space_swipe_direction = 0.0;
+            self.workspace_space_swipe_needs_settle_start = false;
+        } else {
+            self.workspace_sidebar_swipe.cancel_immediately();
+            self.clear_workspace_space_swipe_frame_transition();
+        }
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
@@ -1889,6 +2000,8 @@ impl TermWindow {
         }
 
         if self.focused.is_none() {
+            self.workspace_sidebar_swipe.cancel_immediately();
+            self.clear_workspace_space_swipe_frame_transition();
             self.right_sidebar_note.native_text_input_snapshot_key = None;
             window.set_native_text_input_snapshot(None);
             self.right_sidebar_note.freeze_live_source();
@@ -2277,6 +2390,18 @@ impl TermWindow {
             workspace_sidebar_pending_thread_selection: None,
             workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
+            workspace_sidebar_scroll_offsets: HashMap::new(),
+            workspace_sidebar_swipe: space_swipe::SidebarSpaceSwipeState::default(),
+            workspace_space_swipe_source_frame: None,
+            workspace_space_swipe_capture_source: false,
+            workspace_sidebar_preview_space_id: None,
+            workspace_space_swipe_target_frame: None,
+            workspace_space_swipe_tracked: false,
+            workspace_sidebar_list_quads: None,
+            workspace_space_swipe_push_active: false,
+            workspace_space_swipe_direction: 0.0,
+            workspace_space_swipe_pending_commit: None,
+            workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
             workspace_notification_snapshot: None,
             workspace_notification_pulse_started_at: None,
@@ -2633,6 +2758,16 @@ impl TermWindow {
                 window_state,
                 live_resizing,
             } => {
+                // Switching Spaces can synchronously trigger a layout/size
+                // reconciliation. Preserve the already-committed sidebar
+                // transition through that internal resize; otherwise the
+                // source and target pages snap before the first animation
+                // frame. Interactive/uncommitted gestures are still cancelled
+                // when the user actually resizes the window.
+                if !self.workspace_sidebar_swipe.is_committing_or_committed() {
+                    self.workspace_sidebar_swipe.cancel_immediately();
+                    self.clear_workspace_space_swipe_frame_transition();
+                }
                 self.resize(dimensions, window_state, window, live_resizing);
                 Ok(true)
             }
@@ -3717,6 +3852,10 @@ impl TermWindow {
         preferred_thread: Option<String>,
         window: &Window,
     ) -> bool {
+        if self.workspace_sidebar_swipe.pending_switch_target() != Some(space_id.as_str()) {
+            self.workspace_sidebar_swipe.cancel_immediately();
+            self.clear_workspace_space_swipe_frame_transition();
+        }
         if self.active_space_id == space_id {
             if let Some(thread_id) = preferred_thread {
                 self.clear_right_sidebar_text_focus();
@@ -3738,10 +3877,11 @@ impl TermWindow {
         // correct document and keyboard input can reach the destination pane.
         self.clear_right_sidebar_text_focus();
         self.set_content_view_active(false);
+        self.remember_workspace_sidebar_scroll();
         self.active_space_id = space_id.clone();
         self.refresh_active_space_note_vault_flag();
         self.sync_content_view_surfaces_with_mux();
-        self.workspace_sidebar_scroll_offset = 0.0;
+        self.workspace_sidebar_scroll_offset = self.remembered_workspace_sidebar_scroll();
         // Vault availability differs between Spaces; an expanded Note pane
         // can activate or deactivate here and the terminal must follow. The
         // reflow is deferred until switch_to_mux_window adopts the
@@ -3822,10 +3962,12 @@ impl TermWindow {
                 let deleted_active_space = self.active_space_id == space_id;
                 if deleted_active_space {
                     let previous_sidebar_width = self.right_sidebar_width();
+                    self.workspace_sidebar_scroll_offsets.remove(space_id);
                     self.active_space_id = deleted.fallback_space_id.clone();
                     self.refresh_active_space_note_vault_flag();
                     self.sync_content_view_surfaces_with_mux();
-                    self.workspace_sidebar_scroll_offset = 0.0;
+                    self.workspace_sidebar_scroll_offset =
+                        self.remembered_workspace_sidebar_scroll();
                     // Deferred until the fallback Space's mux window is
                     // adopted so the resize does not hit the deleted Space's
                     // panes.
@@ -4397,6 +4539,10 @@ impl TermWindow {
                 .iter()
                 .any(|tab| tab.id == *id && self.content_view_visible_in_active_space(tab))
         });
+        if self.content_view_is_full_window() {
+            self.workspace_sidebar_swipe.cancel_immediately();
+            self.clear_workspace_space_swipe_frame_transition();
+        }
         self.sync_content_view_surfaces_with_mux();
         self.sync_workspace_sidebar_pending_thread_selection();
         let is_foreground = self.content_view_foreground();

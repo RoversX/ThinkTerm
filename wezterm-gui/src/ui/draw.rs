@@ -10,7 +10,8 @@
 
 use crate::customglyph::{BlockKey, Poly};
 use crate::quad::{
-    HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
+    HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
+    TripleLayerQuadAllocatorTrait,
 };
 use crate::renderstate::RenderState;
 use crate::termwindow::render::corners::{
@@ -302,12 +303,14 @@ impl<'a> DrawContext<'a> {
                 )?;
             }
         }
-        heap.apply_to_clipped(
-            layers,
-            clip,
-            self.dimensions.pixel_width as f32,
-            self.dimensions.pixel_height as f32,
-        )
+        let clip = QuadClipRect::from_top_left_pixels(
+            clip.min_x(),
+            clip.min_y(),
+            clip.max_x(),
+            clip.max_y(),
+            &self.dimensions,
+        );
+        heap.apply_to_clipped(layers, clip)
     }
 
     pub(crate) fn draw_rounded_rect(
