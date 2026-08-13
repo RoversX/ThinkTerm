@@ -182,6 +182,8 @@ impl crate::TermWindow {
     }
 
     pub fn toggle_workspace_sidebar(&mut self) {
+        self.workspace_sidebar_swipe.cancel_immediately();
+        self.clear_workspace_space_swipe_frame_transition();
         self.workspace_sidebar_collapsed = !self.workspace_sidebar_collapsed;
     }
 
@@ -731,6 +733,39 @@ impl crate::TermWindow {
             return None;
         }
         Some((layout.list_top as isize, layout.content_bottom as isize))
+    }
+
+    /// Top of the band that belongs to the stationary footer rather than the
+    /// scrolling list. `content_bottom` is *not* that boundary: the settings
+    /// row is deliberately lifted above `settings_footer_y`, and the scroll
+    /// fade sits higher still. A space-swipe transition that splits the
+    /// sidebar at `content_bottom` therefore slices those elements in half —
+    /// the lower part stays put while the upper sliver slides away with the
+    /// page. Everything from here down must be composited in place.
+    pub(crate) fn workspace_sidebar_footer_chrome_top(&self) -> Option<isize> {
+        let rect = self.workspace_sidebar_rect()?;
+        if self.workspace_sidebar_collapsed {
+            return None;
+        }
+        let ui_cell_height = self.workspace_sidebar_cell_height();
+        let icon_size = (ui_cell_height + self.ui_px(12)).clamp(self.ui_px(30), self.ui_px(36));
+        let layout = self.workspace_sidebar_layout(rect, ui_cell_height, icon_size);
+        if layout.settings_footer_height == 0 {
+            return Some(layout.content_bottom as isize);
+        }
+        let settings_row_top = (layout.settings_footer_y
+            + self.ui_px(SIDEBAR_SETTINGS_ROW_TOP_PADDING))
+        .saturating_sub(self.ui_px(SIDEBAR_SETTINGS_ROW_LIFT));
+        let fade_top = layout
+            .settings_footer_y
+            .saturating_sub(self.ui_px(SIDEBAR_SETTINGS_FADE_HEIGHT));
+        Some(
+            layout
+                .content_bottom
+                .min(settings_row_top)
+                .min(fade_top)
+                .max(layout.list_top) as isize,
+        )
     }
 
     pub fn workspace_sidebar_scroll_geometry(&self) -> Option<WorkspaceSidebarScrollGeometry> {

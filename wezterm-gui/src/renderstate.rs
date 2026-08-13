@@ -586,6 +586,16 @@ impl RenderLayer {
         }
     }
 
+    pub fn tee_quad_allocator<'a>(
+        &'a self,
+        heap: &'a mut HeapQuadAllocator,
+    ) -> TripleLayerQuadAllocator<'a> {
+        match self.quad_allocator() {
+            TripleLayerQuadAllocator::Gpu(gpu) => TripleLayerQuadAllocator::Tee { gpu, heap },
+            _ => unreachable!("render layers always allocate GPU quads"),
+        }
+    }
+
     pub fn need_more_quads(&self, vb_idx: usize) -> Option<usize> {
         self.vb.borrow()[vb_idx].need_more_quads()
     }

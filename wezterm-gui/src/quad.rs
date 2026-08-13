@@ -5,6 +5,7 @@
 use crate::renderstate::BorrowedLayers;
 use ::window::bitmaps::TextureRect;
 use ::window::color::LinearRgba;
+use ::window::Dimensions;
 use config::HsbTransform;
 
 /// Each cell is composed of two triangles built from 4 vertices.
@@ -110,6 +111,7 @@ pub trait QuadTrait {
 pub enum QuadImpl<'a> {
     Vert(Quad<'a>),
     Boxed(&'a mut BoxedQuad),
+    Tee(Quad<'a>, &'a mut BoxedQuad),
 }
 
 impl<'a> QuadTrait for QuadImpl<'a> {
@@ -117,6 +119,10 @@ impl<'a> QuadTrait for QuadImpl<'a> {
         match self {
             Self::Vert(q) => q.set_texture_discrete(x1, x2, y1, y2),
             Self::Boxed(q) => q.set_texture_discrete(x1, x2, y1, y2),
+            Self::Tee(gpu, heap) => {
+                gpu.set_texture_discrete(x1, x2, y1, y2);
+                heap.set_texture_discrete(x1, x2, y1, y2);
+            }
         }
     }
 
@@ -124,6 +130,10 @@ impl<'a> QuadTrait for QuadImpl<'a> {
         match self {
             Self::Vert(q) => q.set_has_color_impl(has_color),
             Self::Boxed(q) => q.set_has_color_impl(has_color),
+            Self::Tee(gpu, heap) => {
+                gpu.set_has_color_impl(has_color);
+                heap.set_has_color_impl(has_color);
+            }
         }
     }
 
@@ -131,6 +141,10 @@ impl<'a> QuadTrait for QuadImpl<'a> {
         match self {
             Self::Vert(q) => q.set_fg_color(color),
             Self::Boxed(q) => q.set_fg_color(color),
+            Self::Tee(gpu, heap) => {
+                gpu.set_fg_color(color);
+                heap.set_fg_color(color);
+            }
         }
     }
 
@@ -138,6 +152,10 @@ impl<'a> QuadTrait for QuadImpl<'a> {
         match self {
             Self::Vert(q) => q.set_alt_color_and_mix_value(color, mix_value),
             Self::Boxed(q) => q.set_alt_color_and_mix_value(color, mix_value),
+            Self::Tee(gpu, heap) => {
+                gpu.set_alt_color_and_mix_value(color, mix_value);
+                heap.set_alt_color_and_mix_value(color, mix_value);
+            }
         }
     }
 
@@ -145,6 +163,10 @@ impl<'a> QuadTrait for QuadImpl<'a> {
         match self {
             Self::Vert(q) => q.set_hsv(hsv),
             Self::Boxed(q) => q.set_hsv(hsv),
+            Self::Tee(gpu, heap) => {
+                gpu.set_hsv(hsv);
+                heap.set_hsv(hsv);
+            }
         }
     }
 
@@ -152,6 +174,10 @@ impl<'a> QuadTrait for QuadImpl<'a> {
         match self {
             Self::Vert(q) => q.set_position(left, top, right, bottom),
             Self::Boxed(q) => q.set_position(left, top, right, bottom),
+            Self::Tee(gpu, heap) => {
+                gpu.set_position(left, top, right, bottom);
+                heap.set_position(left, top, right, bottom);
+            }
         }
     }
 }
@@ -321,6 +347,94 @@ impl std::fmt::Debug for HeapQuadAllocator {
     }
 }
 
+/// A clip rectangle in the window-centre-relative space that quad positions
+/// live in.
+///
+/// Every painter goes through `filled_rectangle` and friends, which subtract
+/// half the window size from each edge, so a quad's `position` is *not* in the
+/// same coordinates as the layout rects (`workspace_sidebar_rect`, the list
+/// viewport, …) that describe where it was asked to go. Clipping against an
+/// un-rebased rect does not fail loudly: every quad simply falls outside and
+/// is dropped. That is how the space-swipe transition once drew an entirely
+/// empty sidebar while every offset in the logs looked correct.
+///
+/// The fields are private and [`Self::from_top_left_pixels`] is the only way
+/// in, so layout coordinates cannot reach the clipper by accident. Bands
+/// carved out of an existing rect go through [`Self::with_vertical`] /
+/// [`Self::with_horizontal`], which inherit the already-converted edges.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuadClipRect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl QuadClipRect {
+    /// Rebase a top-left pixel rect -- sidebar geometry, a list viewport, a
+    /// UI item's bounds -- into the quads' own space.
+    ///
+    /// Takes the window's own [`Dimensions`] rather than a pair of numbers on
+    /// purpose: the conversion is only correct against the surface the quads
+    /// were laid out for, and a caller with two loose `usize`s can silently
+    /// pass the wrong ones (or zeroes) and get a rect that quietly matches
+    /// nothing.
+    pub fn from_top_left_pixels(
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        dimensions: &Dimensions,
+    ) -> Self {
+        let dx = dimensions.pixel_width as f32 / 2.0;
+        let dy = dimensions.pixel_height as f32 / 2.0;
+        Self {
+            left: left - dx,
+            top: top - dy,
+            right: right - dx,
+            bottom: bottom - dy,
+        }
+    }
+
+    pub fn left(&self) -> f32 {
+        self.left
+    }
+
+    pub fn top(&self) -> f32 {
+        self.top
+    }
+
+    pub fn right(&self) -> f32 {
+        self.right
+    }
+
+    pub fn bottom(&self) -> f32 {
+        self.bottom
+    }
+
+    pub fn width(&self) -> f32 {
+        self.right - self.left
+    }
+
+    /// A horizontal band of this rect. Both edges are already centre-relative.
+    pub fn with_vertical(&self, top: f32, bottom: f32) -> Self {
+        Self {
+            top,
+            bottom,
+            ..*self
+        }
+    }
+
+    /// A vertical band of this rect. Both edges are already centre-relative.
+    pub fn with_horizontal(&self, left: f32, right: f32) -> Self {
+        Self {
+            left,
+            right,
+            ..*self
+        }
+    }
+}
+
 impl HeapQuadAllocator {
     pub fn apply_to(&self, other: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
@@ -331,6 +445,94 @@ impl HeapQuadAllocator {
         }
         metrics::histogram!("quad_buffer_apply").record(start.elapsed());
         Ok(())
+    }
+
+    pub fn apply_to_translated_clipped_rect(
+        &self,
+        other: &mut TripleLayerQuadAllocator,
+        offset_x: f32,
+        clip: QuadClipRect,
+    ) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
+        for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {
+            for quad in quads {
+                let Some(vertices) = quad.translated_clipped_vertices(offset_x, clip) else {
+                    continue;
+                };
+                other.extend_with(layer_num, &vertices);
+            }
+        }
+        metrics::histogram!("quad_buffer_translated_rect_clip_apply").record(start.elapsed());
+        Ok(())
+    }
+}
+
+impl BoxedQuad {
+    fn translated_clipped_vertices(
+        &self,
+        offset_x: f32,
+        clip: QuadClipRect,
+    ) -> Option<[Vertex; VERTICES_PER_CELL]> {
+        let (clip_left, clip_top, clip_right, clip_bottom) =
+            (clip.left(), clip.top(), clip.right(), clip.bottom());
+        let (left, top, right, bottom) = self.position;
+        let translated_left = left + offset_x;
+        let translated_right = right + offset_x;
+        if translated_right <= clip_left
+            || translated_left >= clip_right
+            || bottom <= clip_top
+            || top >= clip_bottom
+        {
+            return None;
+        }
+
+        let visible_left = translated_left.max(clip_left);
+        let visible_right = translated_right.min(clip_right);
+        let visible_top = top.max(clip_top);
+        let visible_bottom = bottom.min(clip_bottom);
+        if visible_right <= visible_left
+            || visible_bottom <= visible_top
+            || right <= left
+            || bottom <= top
+        {
+            return None;
+        }
+
+        let left_ratio = (visible_left - translated_left) / (translated_right - translated_left);
+        let right_ratio = (visible_right - translated_left) / (translated_right - translated_left);
+        let top_ratio = (visible_top - top) / (bottom - top);
+        let bottom_ratio = (visible_bottom - top) / (bottom - top);
+        let (tex_left, tex_right, tex_top, tex_bottom) = self.tex;
+        let visible_tex_left = tex_left + (tex_right - tex_left) * left_ratio;
+        let visible_tex_right = tex_left + (tex_right - tex_left) * right_ratio;
+        let visible_tex_top = tex_top + (tex_bottom - tex_top) * top_ratio;
+        let visible_tex_bottom = tex_top + (tex_bottom - tex_top) * bottom_ratio;
+
+        let mut clipped = BoxedQuad {
+            position: (visible_left, visible_top, visible_right, visible_bottom),
+            fg_color: self.fg_color,
+            alt_color: self.alt_color,
+            tex: (
+                visible_tex_left,
+                visible_tex_right,
+                visible_tex_top,
+                visible_tex_bottom,
+            ),
+            hsv: self.hsv,
+            has_color: self.has_color,
+            mix_value: self.mix_value,
+        };
+        // Preserve a zero-width texture interval exactly for solid-colour
+        // quads instead of manufacturing tiny floating-point differences.
+        if tex_left == tex_right {
+            clipped.tex.0 = tex_left;
+            clipped.tex.1 = tex_right;
+        }
+        if tex_top == tex_bottom {
+            clipped.tex.2 = tex_top;
+            clipped.tex.3 = tex_bottom;
+        }
+        Some(clipped.to_vertices())
     }
 }
 
@@ -377,6 +579,10 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
 pub enum TripleLayerQuadAllocator<'a> {
     Gpu(BorrowedLayers),
     Heap(&'a mut HeapQuadAllocator),
+    Tee {
+        gpu: BorrowedLayers,
+        heap: &'a mut HeapQuadAllocator,
+    },
 }
 
 impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
@@ -384,6 +590,14 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
         match self {
             Self::Gpu(b) => b.allocate(layer_num),
             Self::Heap(h) => h.allocate(layer_num),
+            Self::Tee { gpu, heap } => {
+                let gpu_quad = gpu.allocate(layer_num)?;
+                let heap_quad = heap.allocate(layer_num)?;
+                match (gpu_quad, heap_quad) {
+                    (QuadImpl::Vert(gpu), QuadImpl::Boxed(heap)) => Ok(QuadImpl::Tee(gpu, heap)),
+                    _ => unreachable!("tee allocators must pair GPU and heap quads"),
+                }
+            }
         }
     }
 
@@ -391,6 +605,10 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
         match self {
             Self::Gpu(b) => b.extend_with(layer_num, vertices),
             Self::Heap(h) => h.extend_with(layer_num, vertices),
+            Self::Tee { gpu, heap } => {
+                gpu.extend_with(layer_num, vertices);
+                heap.extend_with(layer_num, vertices);
+            }
         }
     }
 }
@@ -400,4 +618,94 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
 fn size() {
     assert_eq!(std::mem::size_of::<Vertex>() * VERTICES_PER_CELL, 272);
     assert_eq!(std::mem::size_of::<BoxedQuad>(), 84);
+}
+
+#[cfg(test)]
+mod translated_clip_tests {
+    use super::*;
+
+    /// Fixtures below that predate the rebase work state their coordinates
+    /// already centre-relative, so they convert against a zero-sized window.
+    const ORIGIN: Dimensions = Dimensions {
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 96,
+    };
+
+    #[test]
+    fn translated_rect_clip_moves_positions_and_crops_texture_coordinates_together() {
+        let quad = BoxedQuad {
+            position: (10.0, 2.0, 30.0, 8.0),
+            tex: (0.2, 0.6, 0.1, 0.9),
+            ..Default::default()
+        };
+        let clip = QuadClipRect::from_top_left_pixels(25.0, 3.0, 35.0, 7.0, &ORIGIN);
+        let vertices = quad
+            .translated_clipped_vertices(10.0, clip)
+            .expect("visible clip");
+
+        assert_eq!(vertices[V_TOP_LEFT].position, [25.0, 3.0]);
+        assert_eq!(vertices[V_BOT_RIGHT].position, [35.0, 7.0]);
+        assert!((vertices[V_TOP_LEFT].tex[0] - 0.3).abs() < 0.0001);
+        assert!((vertices[V_TOP_RIGHT].tex[0] - 0.5).abs() < 0.0001);
+        assert!((vertices[V_TOP_LEFT].tex[1] - (0.1 + 0.8 / 6.0)).abs() < 0.0001);
+        assert!((vertices[V_BOT_LEFT].tex[1] - (0.9 - 0.8 / 6.0)).abs() < 0.0001);
+    }
+
+    /// Regression: the swipe transition built its clip rect straight from the
+    /// sidebar's top-left layout geometry and handed it to the quad clipper,
+    /// whose quads are window-centre relative. Every one of the ~300 quads
+    /// failed the bounds test, so the sidebar drew nothing at all for the
+    /// whole 220ms -- with correct-looking offsets in every log. Nothing about
+    /// that is visible from inside the clipper, so pin the conversion here.
+    #[test]
+    fn a_clip_rect_is_useless_until_it_is_rebased_into_the_quads_own_space() {
+        let window = Dimensions {
+            pixel_width: 2560,
+            pixel_height: 1600,
+            dpi: 144,
+        };
+        // A window of zero size is the only way to express the old bug now.
+        let no_window = Dimensions {
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 144,
+        };
+
+        // A sidebar row as a painter would emit it: laid out at top-left
+        // pixels x 0..465, y 300..320, then written centre-relative.
+        let row = QuadClipRect::from_top_left_pixels(0.0, 300.0, 465.0, 320.0, &window);
+        let quad = BoxedQuad {
+            position: (row.left(), row.top(), row.right(), row.bottom()),
+            ..Default::default()
+        };
+
+        // The list viewport in the layout's own coordinates. Used as-is, it
+        // silently discards a row that is plainly inside it.
+        // `QuadClipRect` has private fields, so this is only expressible in a
+        // test that reaches for the raw numbers on purpose.
+        let unrebased = QuadClipRect::from_top_left_pixels(0.0, 204.0, 465.0, 1316.0, &no_window);
+        assert!(
+            quad.translated_clipped_vertices(0.0, unrebased).is_none(),
+            "an un-rebased clip rect drops everything -- this is the failure \
+             mode, not a healthy result"
+        );
+
+        // Rebased against the real window, the row survives.
+        let list =
+            QuadClipRect::from_top_left_pixels(0.0, 204.0, 465.0, 1316.0, &window);
+        assert!(quad.translated_clipped_vertices(0.0, list).is_some());
+    }
+
+    #[test]
+    fn translated_rect_clip_discards_quads_outside_the_sidebar_page() {
+        let quad = BoxedQuad {
+            position: (10.0, 2.0, 30.0, 8.0),
+            ..Default::default()
+        };
+        let full = QuadClipRect::from_top_left_pixels(0.0, 0.0, 40.0, 10.0, &ORIGIN);
+        let below = QuadClipRect::from_top_left_pixels(0.0, 20.0, 40.0, 30.0, &ORIGIN);
+        assert!(quad.translated_clipped_vertices(-100.0, full).is_none());
+        assert!(quad.translated_clipped_vertices(0.0, below).is_none());
+    }
 }

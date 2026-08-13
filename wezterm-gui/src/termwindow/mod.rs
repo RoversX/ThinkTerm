@@ -9,6 +9,7 @@ use crate::overlay::{
     start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
     QuickSelectOverlay,
 };
+use crate::quad::HeapQuadAllocator;
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::scripting::guiwin::GuiWin;
 use crate::scrollbar::*;
@@ -162,6 +163,7 @@ pub(crate) mod remote_walk;
 pub mod render;
 pub mod resize;
 mod selection;
+mod space_swipe;
 pub mod spawn;
 pub mod ssh_hosts_view;
 pub(crate) mod transfer_walk;
@@ -1499,6 +1501,16 @@ pub struct TermWindow {
     workspace_sidebar_pending_thread_selection: Option<String>,
     workspace_sidebar_collapsed: bool,
     workspace_sidebar_scroll_offset: f32,
+    workspace_sidebar_swipe: space_swipe::SidebarSpaceSwipeState,
+    /// A CPU-side copy of the source Space's left sidebar. During a committed
+    /// switch only its middle project/thread list viewport is composited beside
+    /// the destination; sidebar chrome and the rest of the window stay live.
+    workspace_space_swipe_source_frame: Option<HeapQuadAllocator>,
+    workspace_space_swipe_capture_source: bool,
+    workspace_space_swipe_push_active: bool,
+    workspace_space_swipe_direction: f32,
+    workspace_space_swipe_pending_commit: Option<(String, f32)>,
+    workspace_space_swipe_needs_settle_start: bool,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
     /// Last notification state painted by this GUI window. Comparing identities
     /// and statuses (rather than just the count) lets the bell pulse when one
@@ -1860,6 +1872,15 @@ impl TermWindow {
         }
     }
 
+    fn clear_workspace_space_swipe_frame_transition(&mut self) {
+        self.workspace_space_swipe_source_frame = None;
+        self.workspace_space_swipe_capture_source = false;
+        self.workspace_space_swipe_push_active = false;
+        self.workspace_space_swipe_direction = 0.0;
+        self.workspace_space_swipe_pending_commit = None;
+        self.workspace_space_swipe_needs_settle_start = false;
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
@@ -1883,6 +1904,8 @@ impl TermWindow {
         }
 
         if self.focused.is_none() {
+            self.workspace_sidebar_swipe.cancel_immediately();
+            self.clear_workspace_space_swipe_frame_transition();
             self.right_sidebar_note.native_text_input_snapshot_key = None;
             window.set_native_text_input_snapshot(None);
             self.right_sidebar_note.freeze_live_source();
@@ -2270,6 +2293,13 @@ impl TermWindow {
             workspace_sidebar_pending_thread_selection: None,
             workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
+            workspace_sidebar_swipe: space_swipe::SidebarSpaceSwipeState::default(),
+            workspace_space_swipe_source_frame: None,
+            workspace_space_swipe_capture_source: false,
+            workspace_space_swipe_push_active: false,
+            workspace_space_swipe_direction: 0.0,
+            workspace_space_swipe_pending_commit: None,
+            workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
             workspace_notification_snapshot: None,
             workspace_notification_pulse_started_at: None,
@@ -2626,6 +2656,16 @@ impl TermWindow {
                 window_state,
                 live_resizing,
             } => {
+                // Switching Spaces can synchronously trigger a layout/size
+                // reconciliation. Preserve the already-committed sidebar
+                // transition through that internal resize; otherwise the
+                // source and target pages snap before the first animation
+                // frame. Interactive/uncommitted gestures are still cancelled
+                // when the user actually resizes the window.
+                if !self.workspace_sidebar_swipe.is_committing_or_committed() {
+                    self.workspace_sidebar_swipe.cancel_immediately();
+                    self.clear_workspace_space_swipe_frame_transition();
+                }
                 self.resize(dimensions, window_state, window, live_resizing);
                 Ok(true)
             }
@@ -3707,6 +3747,10 @@ impl TermWindow {
         preferred_thread: Option<String>,
         window: &Window,
     ) -> bool {
+        if self.workspace_sidebar_swipe.pending_switch_target() != Some(space_id.as_str()) {
+            self.workspace_sidebar_swipe.cancel_immediately();
+            self.clear_workspace_space_swipe_frame_transition();
+        }
         if self.active_space_id == space_id {
             if let Some(thread_id) = preferred_thread {
                 self.clear_right_sidebar_text_focus();

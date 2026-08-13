@@ -176,6 +176,53 @@ fn ns_event_phase_to_scroll_phase(phase: NSEventPhase) -> Option<ScrollPhase> {
     }
 }
 
+fn should_dispatch_scroll_event(
+    vert_delta: f64,
+    horz_delta: f64,
+    has_precise_delta: bool,
+    scroll_phase: Option<ScrollPhase>,
+    momentum_phase: Option<ScrollPhase>,
+) -> bool {
+    let phase_only_completion = matches!(
+        scroll_phase,
+        Some(ScrollPhase::Ended | ScrollPhase::Cancelled)
+    ) || matches!(
+        momentum_phase,
+        Some(ScrollPhase::Ended | ScrollPhase::Cancelled)
+    );
+    vert_delta.abs() >= 1.0 || horz_delta.abs() >= 1.0 || has_precise_delta || phase_only_completion
+}
+
+#[cfg(test)]
+mod scroll_phase_tests {
+    use super::{should_dispatch_scroll_event, ScrollPhase};
+
+    #[test]
+    fn zero_delta_scroll_completion_is_still_dispatched() {
+        assert!(should_dispatch_scroll_event(
+            0.0,
+            0.0,
+            false,
+            Some(ScrollPhase::Ended),
+            None,
+        ));
+        assert!(should_dispatch_scroll_event(
+            0.0,
+            0.0,
+            false,
+            None,
+            Some(ScrollPhase::Cancelled),
+        ));
+        assert!(!should_dispatch_scroll_event(
+            0.0,
+            0.0,
+            false,
+            Some(ScrollPhase::Stationary),
+            None,
+        ));
+    }
+}
+
 unsafe fn set_view_background_color(view: id, color: RgbaColor) {
     if view.is_null() {
         return;
@@ -664,6 +711,7 @@ impl Window {
                 gl_context_pair: None,
                 text_cursor_position: Rect::new(Point::new(0, 0), Size::new(0, 0)),
                 tracking_rect_tag: 0,
+                tracking_rect_size: (0.0, 0.0),
                 hscroll_remainder: 0.,
                 vscroll_remainder: 0.,
                 last_wheel: Instant::now(),
@@ -2336,6 +2384,9 @@ struct Inner {
     gl_context_pair: Option<GlContextPair>,
     text_cursor_position: Rect,
     tracking_rect_tag: NSInteger,
+    /// Backing size the live tracking rect was registered for, so
+    /// `updateTrackingAreas` can skip a no-op rebuild. See the comment there.
+    tracking_rect_size: (f64, f64),
     hscroll_remainder: f64,
     vscroll_remainder: f64,
     last_wheel: Instant,
@@ -3148,6 +3199,21 @@ impl WindowView {
                 }
 
                 let tag = inner.tracking_rect_tag;
+                let size = (frame.size.width, frame.size.height);
+
+                // AppKit calls `updateTrackingAreas` for all sorts of reasons
+                // beyond an actual geometry change. Tearing the rect down and
+                // re-adding it is not free: `removeTrackingRect` while the
+                // pointer is inside emits a `mouseExited`, and the replacement
+                // is registered with `assumeInside: NO`, so AppKit then owes us
+                // a fresh `mouseEntered`. That exit/enter pair clears
+                // `current_mouse_event` on the GUI side and makes hover
+                // highlights flicker between hovered and idle. Rebuild only
+                // when the tracked area really changed.
+                if tag != 0 && inner.tracking_rect_size == size {
+                    return;
+                }
+
                 if tag != 0 {
                     unsafe {
                         let () = msg_send![*view, removeTrackingRect: tag];
@@ -3161,6 +3227,7 @@ impl WindowView {
                 inner.tracking_rect_tag = unsafe {
                     msg_send![*view, addTrackingRect: rect owner: *view userData: nil assumeInside: NO]
                 };
+                inner.tracking_rect_size = size;
             }
         }
     }
@@ -3523,7 +3590,13 @@ impl WindowView {
         // even when the legacy line accumulator has not reached a whole line;
         // pixel-scrolling surfaces (Files/Note/sidebars) consume the precise
         // payload directly while terminal grids keep using the integer kind.
-        if vert_delta.abs() < 1.0 && horz_delta.abs() < 1.0 && precise_scroll_delta.is_none() {
+        if !should_dispatch_scroll_event(
+            vert_delta,
+            horz_delta,
+            precise_scroll_delta.is_some(),
+            scroll_phase,
+            momentum_phase,
+        ) {
             return;
         }
 
@@ -3557,6 +3630,60 @@ impl WindowView {
             precise_scroll_delta,
             scroll_phase,
             momentum_phase,
+        );
+    }
+
+    extern "C" fn wants_scroll_events_for_swipe_tracking(
+        _this: &Object,
+        _sel: Sel,
+        axis: NSInteger,
+    ) -> BOOL {
+        if axis == appkit::NSEventGestureAxis::NSEventGestureAxisHorizontal as NSInteger {
+            YES
+        } else {
+            NO
+        }
+    }
+
+    extern "C" fn swipe_with_event(this: &mut Object, _sel: Sel, nsevent: id) {
+        // When AppKit can track a page swipe as scroll events, scroll_wheel
+        // above drives the interactive animation. Some trackpad settings only
+        // deliver this discrete responder callback; synthesize a short precise
+        // horizontal gesture so the same GUI state machine and hit testing are
+        // used in both cases.
+        let recently_received_scroll = Self::get_this(this).is_some_and(|myself| {
+            myself.inner.borrow().last_wheel.elapsed() < std::time::Duration::from_millis(100)
+        });
+        if recently_received_scroll {
+            return;
+        }
+
+        let native_x = unsafe { nsevent.deltaX() };
+        let native_y = unsafe { nsevent.deltaY() };
+        if native_x.abs() <= native_y.abs() || native_x.abs() <= f64::EPSILON {
+            return;
+        }
+
+        // NSEvent uses +1 for a swipe left and -1 for a swipe right, while
+        // precise scroll events use a negative x delta for leftward content
+        // travel. Preserve the latter convention for the shared state machine.
+        let delta_x = -native_x.signum() as f32 * 20.0;
+        let amount = if delta_x < 0.0 { -1 } else { 1 };
+        Self::mouse_common(
+            this,
+            nsevent,
+            MouseEventKind::HorzWheel(amount),
+            Some(PreciseScrollDelta { x: delta_x, y: 0.0 }),
+            Some(ScrollPhase::Began),
+            None,
+        );
+        Self::mouse_common(
+            this,
+            nsevent,
+            MouseEventKind::HorzWheel(0),
+            None,
+            Some(ScrollPhase::Ended),
+            None,
         );
     }
 
@@ -4580,6 +4707,15 @@ impl WindowView {
             cls.add_method(
                 sel!(scrollWheel:),
                 Self::scroll_wheel as extern "C" fn(&mut Object, Sel, id),
+            );
+            cls.add_method(
+                sel!(wantsScrollEventsForSwipeTrackingOnAxis:),
+                Self::wants_scroll_events_for_swipe_tracking
+                    as extern "C" fn(&Object, Sel, NSInteger) -> BOOL,
+            );
+            cls.add_method(
+                sel!(swipeWithEvent:),
+                Self::swipe_with_event as extern "C" fn(&mut Object, Sel, id),
             );
             cls.add_method(
                 sel!(mouseExited:),

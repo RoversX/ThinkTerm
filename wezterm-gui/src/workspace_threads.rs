@@ -334,6 +334,26 @@ pub struct SpaceView {
     pub domain: Option<String>,
 }
 
+pub fn adjacent_local_space_ids(
+    spaces: &[SpaceView],
+    active_space_id: &str,
+) -> (Option<SpaceId>, Option<SpaceId>) {
+    let local = spaces
+        .iter()
+        .filter(|space| !space.is_remote && !space.is_occupied_by_other_window)
+        .collect::<Vec<_>>();
+    let Some(index) = local.iter().position(|space| space.id == active_space_id) else {
+        return (None, None);
+    };
+
+    let previous = index
+        .checked_sub(1)
+        .and_then(|previous| local.get(previous))
+        .map(|space| space.id.clone());
+    let next = local.get(index + 1).map(|space| space.id.clone());
+    (previous, next)
+}
+
 lazy_static::lazy_static! {
     static ref THREAD_STORE: Mutex<WorkspaceThreadStore> =
         Mutex::new(load_workspace_thread_store().unwrap_or_else(|err| {
@@ -6350,6 +6370,43 @@ mod tests {
         let mut store = WorkspaceThreadStore::default();
         store.normalize_after_load();
         store
+    }
+
+    fn space_view(id: &str, is_remote: bool, is_occupied_by_other_window: bool) -> SpaceView {
+        SpaceView {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_active: false,
+            is_default: false,
+            is_occupied_by_other_window,
+            is_remote,
+            domain: is_remote.then(|| "server".to_string()),
+        }
+    }
+
+    #[test]
+    fn adjacent_space_swipe_targets_keep_local_order_and_skip_unavailable_spaces() {
+        let spaces = vec![
+            space_view("local-1", false, false),
+            space_view("remote", true, false),
+            space_view("occupied", false, true),
+            space_view("local-2", false, false),
+            space_view("local-3", false, false),
+        ];
+
+        assert_eq!(
+            adjacent_local_space_ids(&spaces, "local-2"),
+            (Some("local-1".into()), Some("local-3".into()))
+        );
+        assert_eq!(
+            adjacent_local_space_ids(&spaces, "local-1"),
+            (None, Some("local-2".into()))
+        );
+        assert_eq!(
+            adjacent_local_space_ids(&spaces, "local-3"),
+            (Some("local-2".into()), None)
+        );
+        assert_eq!(adjacent_local_space_ids(&spaces, "remote"), (None, None));
     }
 
     /// A store that fails to parse must not come back as an empty one that

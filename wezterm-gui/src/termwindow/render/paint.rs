@@ -1,4 +1,4 @@
-use crate::quad::{QuadTrait, TripleLayerQuadAllocator};
+use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
 use crate::termwindow::{RenderFrame, TermWindowNotif};
 use crate::ui::{DrawContext, UiPalette};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
@@ -767,7 +767,52 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    fn advance_workspace_space_swipe_push(&mut self, now: Instant) {
+        if self.workspace_sidebar_swipe.advance(now) {
+            // Ask for another frame without naming an interval. The native
+            // backend already throttles repaints to
+            // min(config.max_fps, this display's refresh rate), so letting it
+            // set the pace gives 120Hz on a ProMotion panel, 60Hz on a
+            // 60Hz one, and follows the panel when it varies -- whereas the
+            // fixed 16ms this replaces pinned every machine to ~60fps. The
+            // transition is driven by elapsed time, not by a frame count, so
+            // a slower display simply draws fewer frames over the same 220ms.
+            //
+            // `invalidate` is part of `WindowOps`, so the Windows and Linux
+            // gesture backends can reuse this path with their own pacing.
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+
+        if self.workspace_space_swipe_push_active && !self.workspace_sidebar_swipe.is_active() {
+            self.workspace_space_swipe_push_active = false;
+            self.workspace_space_swipe_source_frame = None;
+            self.workspace_space_swipe_direction = 0.0;
+        }
+    }
+
+    fn workspace_space_swipe_push_offsets(
+        &self,
+        now: Instant,
+        page_width: f32,
+    ) -> Option<(f32, f32)> {
+        if !self.workspace_space_swipe_push_active {
+            return None;
+        }
+        let gesture_extent = self.workspace_sidebar_width() as f32;
+        let visual = self.workspace_sidebar_swipe.visual(now, gesture_extent)?;
+        Some(super::super::space_swipe::sidebar_page_push_offsets(
+            visual.offset,
+            gesture_extent,
+            page_width,
+            self.workspace_space_swipe_direction,
+        ))
+    }
+
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
+        let frame_now = Instant::now();
+        self.advance_workspace_space_swipe_push(frame_now);
         {
             let gl_state = self.render_state.as_ref().unwrap();
             for layer in gl_state.layers.borrow().iter() {
@@ -938,8 +983,171 @@ impl crate::TermWindow {
                 .context("paint_content_view")?;
         }
 
-        self.paint_workspace_sidebar(&mut layers)
-            .context("paint_workspace_sidebar")?;
+        // Space switching is a left-sidebar interaction. Keep the terminal,
+        // tab bar, right sidebar and window chrome on the live GPU path, then
+        // isolate just the left sidebar while its middle list page transitions.
+        drop(layers);
+
+        let render_space_push = self.workspace_space_swipe_push_active
+            && self.workspace_space_swipe_source_frame.is_some();
+        let capture_space_source = self.workspace_space_swipe_capture_source && !render_space_push;
+        let mut sidebar_frame = HeapQuadAllocator::default();
+
+        if render_space_push {
+            let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
+            self.paint_workspace_sidebar(&mut sidebar_layers)
+                .context("paint target workspace sidebar")?;
+            drop(sidebar_layers);
+
+            if self.workspace_space_swipe_needs_settle_start {
+                let gesture_extent = self.workspace_sidebar_width() as f32;
+                self.workspace_sidebar_swipe
+                    .resolve_switch(true, Instant::now(), gesture_extent);
+                self.workspace_space_swipe_needs_settle_start = false;
+                // The settle clock does not start until the *next* frame (see
+                // `Settle::started`), so this frame only has to make sure a
+                // next frame happens; `advance` paces everything after it.
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+
+            let mut gpu_layers = layer.quad_allocator();
+            let sidebar_rect = self.workspace_sidebar_rect();
+            let list_viewport = self.workspace_sidebar_list_viewport();
+            if let (Some(rect), Some((list_top, list_bottom))) = (sidebar_rect, list_viewport) {
+                // Quad positions are window-centre relative (see
+                // `filled_rectangle`), while the sidebar rect and list
+                // viewport are top-left pixel coordinates. Rebase the clip
+                // rect into the quads' space, otherwise every quad fails the
+                // bounds test and the sidebar renders empty for the whole
+                // transition.
+                let list_clip = crate::quad::QuadClipRect::from_top_left_pixels(
+                    rect.x as f32,
+                    list_top.max(0) as f32,
+                    rect.x.saturating_add(rect.width) as f32,
+                    list_bottom.max(list_top) as f32,
+                    &self.dimensions,
+                );
+                let (clip_left, clip_top, clip_right, clip_bottom) = (
+                    list_clip.left(),
+                    list_clip.top(),
+                    list_clip.right(),
+                    list_clip.bottom(),
+                );
+                let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+                let window_top = -top_offset;
+                // The one-pixel separator is sidebar chrome, not page content.
+                let page_right = (clip_right - 1.0).max(clip_left);
+                // The settings row is lifted above `content_bottom` and the
+                // scroll fade higher still, so the stationary band starts
+                // above the list's own bottom edge and is drawn over the
+                // moving pages rather than beside them.
+                let footer_chrome_top = self
+                    .workspace_sidebar_footer_chrome_top()
+                    .map(|top| top.max(list_top) as f32 - top_offset)
+                    .unwrap_or(clip_bottom)
+                    .min(clip_bottom);
+                let sidebar_bottom = rect.y.saturating_add(rect.height) as f32 - top_offset;
+                let page_width = page_right - clip_left;
+
+                // The pages stop where the stationary footer band begins, not
+                // at the list's own bottom edge. Overlapping the two bands
+                // leaves a moving sliver of the outgoing settings row visible
+                // whenever the footer's fade is absent (it is only drawn when
+                // the list actually scrolls), so the footer must own that
+                // strip outright.
+                let page_bottom = footer_chrome_top;
+                let page_clip = list_clip
+                    .with_horizontal(clip_left, page_right)
+                    .with_vertical(clip_top, page_bottom);
+                let offsets = self
+                    .workspace_space_swipe_push_offsets(Instant::now(), page_width)
+                    .filter(|_| page_width > 0.0 && page_bottom > clip_top);
+
+                if let Some((source_offset, target_offset)) = offsets {
+                    // Paint the target sidebar chrome in place. Only the
+                    // project/thread list viewport below is double-buffered.
+                    sidebar_frame
+                        .apply_to_translated_clipped_rect(
+                            &mut gpu_layers,
+                            0.0,
+                            list_clip.with_vertical(window_top, clip_top),
+                        )
+                        .context("space swipe stationary sidebar header")?;
+                    sidebar_frame
+                        .apply_to_translated_clipped_rect(
+                            &mut gpu_layers,
+                            0.0,
+                            list_clip.with_horizontal(page_right, clip_right),
+                        )
+                        .context("space swipe stationary sidebar separator")?;
+                    if let Some(source) = self.workspace_space_swipe_source_frame.as_ref() {
+                        source
+                            .apply_to_translated_clipped_rect(
+                                &mut gpu_layers,
+                                source_offset,
+                                page_clip,
+                            )
+                            .context("space swipe source sidebar page")?;
+                    }
+                    sidebar_frame
+                        .apply_to_translated_clipped_rect(
+                            &mut gpu_layers,
+                            target_offset,
+                            page_clip,
+                        )
+                        .context("space swipe target sidebar page")?;
+
+                    // Drawn last: the settings row is lifted above
+                    // `content_bottom` and the scroll fade sits above that, so
+                    // this band overlaps the moving pages instead of abutting
+                    // them. Compositing it after the pages keeps the footer
+                    // whole and lets its fade mask the content sliding beneath.
+                    sidebar_frame
+                        .apply_to_translated_clipped_rect(
+                            &mut gpu_layers,
+                            0.0,
+                            list_clip.with_vertical(footer_chrome_top, sidebar_bottom),
+                        )
+                        .context("space swipe stationary sidebar footer")?;
+                } else {
+                    sidebar_frame
+                        .apply_to(&mut gpu_layers)
+                        .context("space swipe target sidebar fallback")?;
+                }
+            } else {
+                sidebar_frame
+                    .apply_to(&mut gpu_layers)
+                    .context("space swipe target sidebar without viewport")?;
+            }
+            drop(gpu_layers);
+        } else if capture_space_source {
+            let mut sidebar_layers = layer.tee_quad_allocator(&mut sidebar_frame);
+            self.paint_workspace_sidebar(&mut sidebar_layers)
+                .context("capture source workspace sidebar")?;
+            drop(sidebar_layers);
+
+            self.workspace_space_swipe_source_frame = Some(sidebar_frame);
+            self.workspace_space_swipe_capture_source = false;
+            #[cfg(target_os = "macos")]
+            if self.workspace_space_swipe_pending_commit.is_some() {
+                if let Some(window) = self.window.clone() {
+                    window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                        |term_window| {
+                            term_window.complete_workspace_space_swipe_switch();
+                        },
+                    )));
+                }
+            }
+        } else {
+            let mut sidebar_layers = layer.quad_allocator();
+            self.paint_workspace_sidebar(&mut sidebar_layers)
+                .context("paint_workspace_sidebar")?;
+            drop(sidebar_layers);
+        }
+
+        let mut layers = layer.quad_allocator();
         self.paint_right_sidebar(&mut layers)
             .context("paint_right_sidebar")?;
 
@@ -950,6 +1158,7 @@ impl crate::TermWindow {
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);
+
         self.paint_modal().context("paint_modal")?;
         self.paint_context_menu().context("paint_context_menu")?;
         self.paint_pane_tab_drag_overlay()
