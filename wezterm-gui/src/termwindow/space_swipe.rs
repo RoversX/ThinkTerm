@@ -35,11 +35,28 @@ pub(crate) enum SidebarSpaceSwipeUpdate {
     Vertical(f32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SidebarSpaceSwipeFinish {
     None,
     Switch(String),
     AnimateBack,
+    /// The gesture ended before either axis locked, so its vertical travel was
+    /// only ever accumulated. Scroll by it now: the state machine consumed the
+    /// events, so nothing else will.
+    FlushVertical(f32),
+}
+
+/// Where a committed transition should begin its travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleOpening {
+    /// The pages were already following the finger, so carry on from where it
+    /// let go. Restarting at rest would snap them backwards first.
+    WhereTheFingerLeftIt,
+    /// Nothing was ever composited for this gesture -- a flick that began and
+    /// ended inside a single frame -- so the pages are still sitting at rest
+    /// no matter what the gesture's arithmetic says. Travelling the whole way
+    /// is what makes the switch visible rather than an instant cut.
+    AtRest,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -283,7 +300,22 @@ impl SidebarSpaceSwipeState {
                 });
                 SidebarSpaceSwipeFinish::AnimateBack
             }
-            Phase::Candidate(_) | Phase::Vertical => {
+            Phase::Candidate(gesture) => {
+                // Below both lock distances the gesture is still undecided, so
+                // `update` has been swallowing every delta to keep the sidebar
+                // from twitching while the axis is in doubt. A stroke that ends
+                // here never reached the `Vertical` arm that flushes them, so
+                // hand the accumulation over now or a gentle nudge scrolls
+                // nothing at all.
+                self.phase = Phase::Idle;
+                self.suppress_momentum = false;
+                if gesture.raw_y.abs() > f32::EPSILON {
+                    SidebarSpaceSwipeFinish::FlushVertical(gesture.raw_y)
+                } else {
+                    SidebarSpaceSwipeFinish::None
+                }
+            }
+            Phase::Vertical => {
                 self.phase = Phase::Idle;
                 self.suppress_momentum = false;
                 SidebarSpaceSwipeFinish::None
@@ -295,18 +327,19 @@ impl SidebarSpaceSwipeState {
         }
     }
 
-    pub(crate) fn resolve_switch(&mut self, switched: bool, now: Instant, sidebar_width: f32) {
+    pub(crate) fn resolve_switch(
+        &mut self,
+        switched: bool,
+        now: Instant,
+        sidebar_width: f32,
+        opening: SettleOpening,
+    ) {
         let phase = std::mem::take(&mut self.phase);
         match phase {
             Phase::AwaitingCommit(gesture) => {
-                // The renderer captures the source sidebar, adopts and paints
-                // the destination, and only then resolves the switch. Always
-                // start the list-page push at rest so destination preparation
-                // cannot consume or skip its opening frames.
-                let from = if switched {
-                    0.0
-                } else {
-                    gesture.display_offset(sidebar_width)
+                let from = match opening {
+                    SettleOpening::WhereTheFingerLeftIt => gesture.display_offset(sidebar_width),
+                    SettleOpening::AtRest => 0.0,
                 };
                 let target_space_id = gesture.target_space_id().cloned();
                 let target_offset = gesture.target_offset(sidebar_width);
@@ -475,10 +508,16 @@ mod tests {
             swipe.finish(at(start, 30), 300.0),
             SidebarSpaceSwipeFinish::Switch("next".into())
         );
-        swipe.resolve_switch(true, at(start, 30), 300.0);
-        // The frame that commits renders the opening position; `advance`, run
-        // at the top of each paint, starts the clock on the frame after it.
-        assert_eq!(swipe.visual(at(start, 30), 300.0).unwrap().offset, 0.0);
+        swipe.resolve_switch(
+            true,
+            at(start, 30),
+            300.0,
+            SettleOpening::WhereTheFingerLeftIt,
+        );
+        // The frame that commits renders the opening position -- the finger's
+        // own -96 -- and `advance`, run at the top of each paint, starts the
+        // clock on the frame after it.
+        assert_eq!(swipe.visual(at(start, 30), 300.0).unwrap().offset, -96.0);
         assert!(swipe.advance(at(start, 100)));
         assert!(swipe.visual(at(start, 200), 300.0).unwrap().offset < -96.0);
         assert!(!swipe.advance(at(start, 340)));
@@ -500,6 +539,110 @@ mod tests {
         assert_eq!(swipe.visual(at(start, 32), 300.0), None);
         assert_eq!(
             swipe.finish(at(start, 40), 300.0),
+            SidebarSpaceSwipeFinish::None
+        );
+    }
+
+    #[test]
+    fn the_pages_report_an_offset_while_the_finger_is_still_down() {
+        // The whole point of following the finger: an offset exists from the
+        // moment the axis locks, not only once the gesture has been released.
+        let start = Instant::now();
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin("source".into(), None, Some("next".into()), 0.0, start);
+        assert_eq!(
+            swipe.update(-20.0, 0.0, at(start, 16)),
+            SidebarSpaceSwipeUpdate::Horizontal
+        );
+        assert_eq!(swipe.visual(at(start, 16), 300.0).unwrap().offset, -20.0);
+        swipe.update(-30.0, 0.0, at(start, 32));
+        assert_eq!(swipe.visual(at(start, 32), 300.0).unwrap().offset, -50.0);
+
+        // Reversing under the finger walks it back, rather than latching.
+        swipe.update(45.0, 0.0, at(start, 48));
+        assert_eq!(swipe.visual(at(start, 48), 300.0).unwrap().offset, -5.0);
+    }
+
+    #[test]
+    fn reversing_past_the_start_retargets_the_neighbour_on_the_other_side() {
+        // A drag that crosses back over its origin is now approaching the
+        // *other* neighbour. The renderer captures whichever Space this
+        // reports, so getting it wrong composites a page against the Space it
+        // is sliding away from.
+        let start = Instant::now();
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin(
+            "source".into(),
+            Some("previous".into()),
+            Some("next".into()),
+            0.0,
+            start,
+        );
+        swipe.update(-40.0, 0.0, at(start, 16));
+        assert_eq!(
+            swipe.visual(at(start, 16), 300.0).unwrap().target_space_id,
+            Some("next".into())
+        );
+
+        swipe.update(70.0, 0.0, at(start, 32));
+        let visual = swipe.visual(at(start, 32), 300.0).unwrap();
+        assert_eq!(visual.target_space_id, Some("previous".into()));
+        assert_eq!(visual.offset, 30.0);
+    }
+
+    #[test]
+    fn a_rebound_travels_back_instead_of_snapping(){
+        // A gesture too short to commit has still moved the pages, so it owes
+        // them a trip home. Before the pages tracked the finger there was
+        // nothing on screen to return and the settle was simply cancelled.
+        let start = Instant::now();
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin("source".into(), None, Some("next".into()), 0.0, start);
+        swipe.update(-20.0, 0.0, at(start, 16));
+        assert_eq!(
+            swipe.finish(at(start, 24), 300.0),
+            SidebarSpaceSwipeFinish::AnimateBack
+        );
+
+        // Still animating, and starting from where the finger let go.
+        assert_eq!(swipe.visual(at(start, 24), 300.0).unwrap().offset, -20.0);
+        assert!(swipe.advance(at(start, 30)));
+        let midway = swipe.visual(at(start, 130), 300.0).unwrap().offset;
+        assert!(
+            midway > -20.0 && midway < 0.0,
+            "expected travel back toward rest, got {}",
+            midway
+        );
+        assert_eq!(swipe.visual(at(start, 300), 300.0).unwrap().offset, 0.0);
+    }
+
+    #[test]
+    fn a_nudge_too_small_to_lock_an_axis_still_scrolls_by_what_it_travelled() {
+        // Under both lock distances `update` reports Pending and keeps the
+        // deltas to itself, so the sidebar cannot twitch while the axis is
+        // undecided. Nothing downstream sees those events -- the swipe handler
+        // has already claimed them -- so ending here has to hand them back.
+        let start = Instant::now();
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin("source".into(), None, Some("next".into()), 0.0, start);
+        for frame in 1..=3 {
+            assert_eq!(
+                swipe.update(0.0, -4.0, at(start, frame * 16)),
+                SidebarSpaceSwipeUpdate::Pending,
+                "12 pixels is under VERTICAL_LOCK_DISTANCE, so nothing scrolls yet"
+            );
+        }
+        assert_eq!(
+            swipe.finish(at(start, 64), 300.0),
+            SidebarSpaceSwipeFinish::FlushVertical(-12.0)
+        );
+
+        // A gesture that never moved has nothing to hand back, and must not
+        // pass a zero scroll to the sidebar.
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin("source".into(), None, Some("next".into()), 0.0, start);
+        assert_eq!(
+            swipe.finish(at(start, 16), 300.0),
             SidebarSpaceSwipeFinish::None
         );
     }
@@ -597,7 +740,12 @@ mod tests {
             SidebarSpaceSwipeFinish::None
         );
 
-        swipe.resolve_switch(false, at(start, 24), 300.0);
+        swipe.resolve_switch(
+            false,
+            at(start, 24),
+            300.0,
+            SettleOpening::WhereTheFingerLeftIt,
+        );
         let visual = swipe.visual(at(start, 100), 300.0).unwrap();
         assert_eq!(visual.source_scroll_offset, 23.0);
         assert!(visual.offset > -120.0);
@@ -614,7 +762,12 @@ mod tests {
             swipe.finish(at(start, 20), 300.0),
             SidebarSpaceSwipeFinish::Switch("next".into())
         );
-        swipe.resolve_switch(true, at(start, 20), 300.0);
+        swipe.resolve_switch(
+            true,
+            at(start, 20),
+            300.0,
+            SettleOpening::WhereTheFingerLeftIt,
+        );
 
         assert!(swipe.is_committing_or_committed());
         // First paint after the commit: starts the clock, nothing elapsed yet.
@@ -640,7 +793,12 @@ mod tests {
         // switch_space_to_thread can synchronously cause a Resized event
         // before resolve_switch records the successful commit.
         assert!(swipe.is_committing_or_committed());
-        swipe.resolve_switch(true, at(start, 20), 300.0);
+        swipe.resolve_switch(
+            true,
+            at(start, 20),
+            300.0,
+            SettleOpening::WhereTheFingerLeftIt,
+        );
         assert!(swipe.is_committing_or_committed());
     }
 
@@ -658,9 +816,17 @@ mod tests {
         // Model a destination adoption that takes much longer than the visual
         // transition. Resolution supplies a fresh clock after that work.
         let adoption_finished = at(start, 1_000);
-        swipe.resolve_switch(true, adoption_finished, 300.0);
+        swipe.resolve_switch(
+            true,
+            adoption_finished,
+            300.0,
+            SettleOpening::WhereTheFingerLeftIt,
+        );
         assert!(swipe.advance(adoption_finished));
-        assert_eq!(swipe.visual(adoption_finished, 300.0).unwrap().offset, 0.0);
+        assert_eq!(
+            swipe.visual(adoption_finished, 300.0).unwrap().offset,
+            -120.0
+        );
         assert!(swipe.advance(at(start, 1_100)));
         assert!(!swipe.advance(at(start, 1_250)));
     }
@@ -675,7 +841,10 @@ mod tests {
             swipe.finish(at(start, 20), 300.0),
             SidebarSpaceSwipeFinish::Switch("next".into())
         );
-        swipe.resolve_switch(true, at(start, 1_000), 300.0);
+        // A flick this fast is over before a frame is composited, so the pages
+        // never left rest. Opening where the finger "left off" would put them
+        // at the full -300 immediately and the switch would be an instant cut.
+        swipe.resolve_switch(true, at(start, 1_000), 300.0, SettleOpening::AtRest);
 
         let first = swipe.visual(at(start, 1_000), 300.0).unwrap().offset;
         assert_eq!(first, 0.0);
@@ -711,7 +880,12 @@ mod tests {
         assert!(swipe.is_committing_or_committed());
         assert_eq!(swipe.pending_switch_target(), Some("next"));
 
-        swipe.resolve_switch(true, at(start, 22), 300.0);
+        swipe.resolve_switch(
+            true,
+            at(start, 22),
+            300.0,
+            SettleOpening::WhereTheFingerLeftIt,
+        );
         assert!(swipe.advance(at(start, 30)));
 
         // And again once the settle is running.
@@ -741,7 +915,7 @@ mod tests {
             swipe.finish(at(start, 20), 300.0),
             SidebarSpaceSwipeFinish::Switch("next".into())
         );
-        swipe.resolve_switch(true, at(start, 20), 300.0);
+        swipe.resolve_switch(true, at(start, 20), 300.0, SettleOpening::AtRest);
 
         // That first frame takes 500ms to present.
         let after_slow_frame = at(start, 520);
@@ -756,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_push_starts_at_rest_after_destination_preparation() {
+    fn a_committed_push_opens_where_the_finger_let_go() {
         let start = Instant::now();
         let mut swipe = SidebarSpaceSwipeState::default();
         swipe.begin("source".into(), None, Some("next".into()), 0.0, start);
@@ -767,7 +941,15 @@ mod tests {
             swipe.finish(at(start, 90), 300.0),
             SidebarSpaceSwipeFinish::Switch("next".into())
         );
-        swipe.resolve_switch(true, at(start, 100), 300.0);
-        assert_eq!(swipe.visual(at(start, 100), 300.0).unwrap().offset, 0.0);
+        swipe.resolve_switch(
+            true,
+            at(start, 100),
+            300.0,
+            SettleOpening::WhereTheFingerLeftIt,
+        );
+        // The pages have been sitting at -120 under the finger. Opening the
+        // settle anywhere else -- at rest, most temptingly -- yanks them
+        // backwards for one frame before they travel on.
+        assert_eq!(swipe.visual(at(start, 100), 300.0).unwrap().offset, -120.0);
     }
 }

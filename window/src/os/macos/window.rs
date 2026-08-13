@@ -3633,6 +3633,17 @@ impl WindowView {
         );
     }
 
+    /// Opting in here is what makes AppKit deliver a horizontal page swipe as
+    /// phased scroll events, which `scroll_wheel` above turns into the
+    /// interactive sidebar gesture.
+    ///
+    /// Deliberately not paired with a `swipeWithEvent:` fallback. That
+    /// responder callback fires window-wide with no notion of what is under
+    /// the pointer, so synthesizing a wheel event from it injects
+    /// WheelLeft/WheelRight into whatever owns that spot -- a terminal running
+    /// an alt-screen application, most of the time. It also carries a single
+    /// discrete delta rather than a stream, so the gesture it produces can only
+    /// ever cut straight to the destination.
     extern "C" fn wants_scroll_events_for_swipe_tracking(
         _this: &Object,
         _sel: Sel,
@@ -3643,48 +3654,6 @@ impl WindowView {
         } else {
             NO
         }
-    }
-
-    extern "C" fn swipe_with_event(this: &mut Object, _sel: Sel, nsevent: id) {
-        // When AppKit can track a page swipe as scroll events, scroll_wheel
-        // above drives the interactive animation. Some trackpad settings only
-        // deliver this discrete responder callback; synthesize a short precise
-        // horizontal gesture so the same GUI state machine and hit testing are
-        // used in both cases.
-        let recently_received_scroll = Self::get_this(this).is_some_and(|myself| {
-            myself.inner.borrow().last_wheel.elapsed() < std::time::Duration::from_millis(100)
-        });
-        if recently_received_scroll {
-            return;
-        }
-
-        let native_x = unsafe { nsevent.deltaX() };
-        let native_y = unsafe { nsevent.deltaY() };
-        if native_x.abs() <= native_y.abs() || native_x.abs() <= f64::EPSILON {
-            return;
-        }
-
-        // NSEvent uses +1 for a swipe left and -1 for a swipe right, while
-        // precise scroll events use a negative x delta for leftward content
-        // travel. Preserve the latter convention for the shared state machine.
-        let delta_x = -native_x.signum() as f32 * 20.0;
-        let amount = if delta_x < 0.0 { -1 } else { 1 };
-        Self::mouse_common(
-            this,
-            nsevent,
-            MouseEventKind::HorzWheel(amount),
-            Some(PreciseScrollDelta { x: delta_x, y: 0.0 }),
-            Some(ScrollPhase::Began),
-            None,
-        );
-        Self::mouse_common(
-            this,
-            nsevent,
-            MouseEventKind::HorzWheel(0),
-            None,
-            Some(ScrollPhase::Ended),
-            None,
-        );
     }
 
     extern "C" fn right_mouse_down(this: &mut Object, _sel: Sel, nsevent: id) {
@@ -4712,10 +4681,6 @@ impl WindowView {
                 sel!(wantsScrollEventsForSwipeTrackingOnAxis:),
                 Self::wants_scroll_events_for_swipe_tracking
                     as extern "C" fn(&Object, Sel, NSInteger) -> BOOL,
-            );
-            cls.add_method(
-                sel!(swipeWithEvent:),
-                Self::swipe_with_event as extern "C" fn(&mut Object, Sel, id),
             );
             cls.add_method(
                 sel!(mouseExited:),

@@ -946,6 +946,9 @@ impl super::TermWindow {
             if self.workspace_space_swipe_source_frame.is_none() {
                 self.prepare_workspace_space_swipe_source_capture();
             }
+            // Whether the pages tracked is a fact about *this* gesture. The
+            // previous one having tracked must not decide how this one opens.
+            self.workspace_space_swipe_tracked = false;
             self.workspace_sidebar_swipe.begin(
                 self.active_space_id.clone(),
                 previous,
@@ -1014,9 +1017,17 @@ impl super::TermWindow {
                 true
             }
             SidebarSpaceSwipeFinish::AnimateBack => {
-                self.workspace_sidebar_swipe.cancel_immediately();
-                self.clear_workspace_space_swipe_frame_transition();
+                // The pages already followed the finger out, so they have to
+                // travel back rather than blink into place. `finish` has put
+                // the state machine into a settle that does exactly that;
+                // leave the captured neighbour alive to be composited until
+                // `advance` retires it.
                 context.invalidate();
+                true
+            }
+            SidebarSpaceSwipeFinish::FlushVertical(delta_y) => {
+                self.clear_workspace_space_swipe_frame_transition();
+                self.scroll_workspace_sidebar_by(-delta_y, context);
                 true
             }
             SidebarSpaceSwipeFinish::None => {
@@ -1067,10 +1078,18 @@ impl super::TermWindow {
             0.0
         };
         self.workspace_space_swipe_capture_source = false;
+        // The Space this held is the one now adopted, so it is the live paint
+        // from here on; keeping the capture would only leave the compositor a
+        // stale copy to choose.
+        self.workspace_space_swipe_target_frame = None;
         self.workspace_space_swipe_needs_settle_start = self.workspace_space_swipe_push_active;
         if !switched {
-            self.workspace_sidebar_swipe
-                .resolve_switch(false, Instant::now(), width);
+            self.workspace_sidebar_swipe.resolve_switch(
+                false,
+                Instant::now(),
+                width,
+                crate::termwindow::space_swipe::SettleOpening::WhereTheFingerLeftIt,
+            );
         }
         if !self.workspace_space_swipe_push_active {
             self.workspace_sidebar_swipe.cancel_immediately();

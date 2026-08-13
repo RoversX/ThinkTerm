@@ -405,6 +405,52 @@ lazy_static::lazy_static! {
 
 static THREAD_STORE_PERSIST_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static THREAD_STORE_PERSIST_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Orders writes of the store file and discards snapshots that have been
+/// overtaken.
+///
+/// The debounced writer copies the store, releases the store lock, and only
+/// then spends ~88ms serializing and fsyncing. A synchronous save landing
+/// inside that window writes newer data first and is then overwritten when
+/// the older copy finishes its rename -- silently undoing whatever the user
+/// had just done. Serializing the writes alone does not help: the stale copy
+/// would still be the one to land last. Stamping each snapshot as it is taken
+/// is what lets the loser be dropped instead of applied.
+struct StoreWriteGate {
+    next_seq: AtomicU64,
+    last_written: Mutex<u64>,
+}
+
+impl StoreWriteGate {
+    const fn new() -> Self {
+        Self {
+            next_seq: AtomicU64::new(0),
+            last_written: Mutex::new(0),
+        }
+    }
+
+    /// Stamp a snapshot. Callers hold `THREAD_STORE`, so the numbers come out
+    /// in the same order as the mutations they describe.
+    fn claim(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Run `write` unless a later snapshot already reached disk. Returns
+    /// whether it ran. Writes are serialized against each other, so `write`
+    /// never races another copy of the file.
+    fn write_if_newest(&self, seq: u64, write: impl FnOnce() -> bool) -> bool {
+        let mut last_written = self.last_written.lock();
+        if *last_written >= seq {
+            return false;
+        }
+        if !write() {
+            return false;
+        }
+        *last_written = seq;
+        true
+    }
+}
+
+static THREAD_STORE_WRITES: StoreWriteGate = StoreWriteGate::new();
 /// Set when the store on disk exists but could not be read.
 ///
 /// Nothing may be written while it is set. The in-memory store is empty in
@@ -716,7 +762,7 @@ pub fn switch_window_space(owner_id: u64, space_id: &str) -> bool {
     }
     store.last_active_space_id = Some(space_id.to_string());
     store.remember_space_for_domain(space_id);
-    persist_locked(&store);
+    schedule_workspace_thread_store_persist();
     drop(store);
 
     WINDOW_SPACES.lock().insert(owner_id, space_id.to_string());
@@ -1413,7 +1459,7 @@ pub fn activate_thread_record(
 ) -> Option<ActivationPlan> {
     let mut store = THREAD_STORE.lock();
     let plan = store.activate_thread_record(thread_id, live_workspaces);
-    persist_locked(&store);
+    schedule_workspace_thread_store_persist();
     if plan.is_some() {
         submit_thread_state(&store, thread_id);
     }
@@ -1856,7 +1902,7 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
         }
         let mut store = THREAD_STORE.lock();
         if store.snapshot_remote_thread_font_scales(space_id, workspace, scales) {
-            persist_locked(&store);
+            schedule_workspace_thread_store_persist();
         }
         return;
     }
@@ -1870,7 +1916,13 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
 
     let mut store = THREAD_STORE.lock();
     if store.snapshot_active_space_thread_layout(space_id, workspace, snapshot) {
-        persist_locked(&store);
+        // Debounced rather than written through. A Space switch calls this,
+        // `switch_window_space` and `activate_thread_record` back to back, and
+        // each one used to fsync the whole store: three ~88ms stalls on the
+        // main thread for three copies of the same file, which is longer than
+        // the switch animation they were blocking. The background writer
+        // collapses them into one.
+        schedule_workspace_thread_store_persist();
     }
 }
 
@@ -5217,16 +5269,30 @@ fn valid_font_scale(font_scale: Option<f64>) -> Option<f64> {
     font_scale.filter(|scale| scale.is_finite() && *scale > 0.0)
 }
 
+/// Write the store through. Callers hold `THREAD_STORE`, so the snapshot is
+/// current and can be stamped here.
 fn persist_locked(store: &WorkspaceThreadStore) {
+    persist_snapshot(store, THREAD_STORE_WRITES.claim());
+}
+
+fn persist_snapshot(store: &WorkspaceThreadStore, seq: u64) {
     // See `STORE_IS_UNREADABLE`: this write is the one that would destroy the
     // file, so it is the one that has to be refused.
     if STORE_IS_UNREADABLE.load(Ordering::Acquire) {
         return;
     }
-    if let Err(err) = save_workspace_thread_store(store) {
-        log::warn!("failed to save ThinkTerm thread store: {err:#}");
+    let wrote = THREAD_STORE_WRITES.write_if_newest(seq, || {
+        match save_workspace_thread_store(store) {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!("failed to save ThinkTerm thread store: {err:#}");
+                false
+            }
+        }
+    });
+    if wrote {
+        publish_thinkterm_session_changed();
     }
-    publish_thinkterm_session_changed();
 }
 
 fn schedule_workspace_thread_store_persist() {
@@ -5239,8 +5305,14 @@ fn schedule_workspace_thread_store_persist() {
         std::thread::sleep(Duration::from_millis(50));
 
         if THREAD_STORE_PERSIST_DIRTY.swap(false, Ordering::AcqRel) {
-            let store = THREAD_STORE.lock().clone();
-            persist_locked(&store);
+            // Stamp the copy while the store is still held: the number has to
+            // describe this snapshot, not the moment the write gets around to
+            // running.
+            let (store, seq) = {
+                let store = THREAD_STORE.lock();
+                (store.clone(), THREAD_STORE_WRITES.claim())
+            };
+            persist_snapshot(&store, seq);
             continue;
         }
 
@@ -6382,6 +6454,43 @@ mod tests {
             is_remote,
             domain: is_remote.then(|| "server".to_string()),
         }
+    }
+
+    /// Regression: the debounced writer copies the store, releases the store
+    /// lock, then spends ~88ms writing. A synchronous save inside that window
+    /// used to be silently undone -- the older copy finished last and its
+    /// rename replaced the newer file, so a project rename made just after a
+    /// Space switch was gone on restart.
+    #[test]
+    fn a_snapshot_overtaken_before_it_reaches_disk_is_dropped_not_applied() {
+        let gate = StoreWriteGate::new();
+        let mut written = vec![];
+
+        // The debounced writer stamps its copy...
+        let stale = gate.claim();
+        // ...then a rename mutates the store and writes through, beating it.
+        let fresh = gate.claim();
+        assert!(gate.write_if_newest(fresh, || {
+            written.push(fresh);
+            true
+        }));
+        // The older copy must not now replace it.
+        assert!(
+            !gate.write_if_newest(stale, || {
+                written.push(stale);
+                true
+            }),
+            "the stale snapshot would overwrite the rename that beat it to disk"
+        );
+        assert_eq!(written, vec![fresh]);
+
+        // A later snapshot still gets through.
+        let later = gate.claim();
+        assert!(gate.write_if_newest(later, || {
+            written.push(later);
+            true
+        }));
+        assert_eq!(written, vec![fresh, later]);
     }
 
     #[test]

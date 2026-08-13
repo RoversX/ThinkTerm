@@ -628,7 +628,7 @@ impl crate::TermWindow {
         let space_menu_y = y;
         let space_menu_height = top_action_height + self.ui_px(6);
         y += space_menu_height + self.ui_px(SIDEBAR_INSET);
-        let reconnect_row_height = if self.space_connection_state(&self.active_space_id)
+        let reconnect_row_height = if self.space_connection_state(self.workspace_sidebar_space_id())
             == SpaceConnectionState::Disconnected
         {
             ui_cell_height + self.ui_px(SIDEBAR_INSET)
@@ -703,7 +703,7 @@ impl crate::TermWindow {
         let workspaces = mux.iter_workspaces();
         let view =
             self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
-                &self.active_space_id,
+                self.workspace_sidebar_space_id(),
                 &active_workspace,
                 &workspaces,
             ));
@@ -735,39 +735,6 @@ impl crate::TermWindow {
         Some((layout.list_top as isize, layout.content_bottom as isize))
     }
 
-    /// Top of the band that belongs to the stationary footer rather than the
-    /// scrolling list. `content_bottom` is *not* that boundary: the settings
-    /// row is deliberately lifted above `settings_footer_y`, and the scroll
-    /// fade sits higher still. A space-swipe transition that splits the
-    /// sidebar at `content_bottom` therefore slices those elements in half —
-    /// the lower part stays put while the upper sliver slides away with the
-    /// page. Everything from here down must be composited in place.
-    pub(crate) fn workspace_sidebar_footer_chrome_top(&self) -> Option<isize> {
-        let rect = self.workspace_sidebar_rect()?;
-        if self.workspace_sidebar_collapsed {
-            return None;
-        }
-        let ui_cell_height = self.workspace_sidebar_cell_height();
-        let icon_size = (ui_cell_height + self.ui_px(12)).clamp(self.ui_px(30), self.ui_px(36));
-        let layout = self.workspace_sidebar_layout(rect, ui_cell_height, icon_size);
-        if layout.settings_footer_height == 0 {
-            return Some(layout.content_bottom as isize);
-        }
-        let settings_row_top = (layout.settings_footer_y
-            + self.ui_px(SIDEBAR_SETTINGS_ROW_TOP_PADDING))
-        .saturating_sub(self.ui_px(SIDEBAR_SETTINGS_ROW_LIFT));
-        let fade_top = layout
-            .settings_footer_y
-            .saturating_sub(self.ui_px(SIDEBAR_SETTINGS_FADE_HEIGHT));
-        Some(
-            layout
-                .content_bottom
-                .min(settings_row_top)
-                .min(fade_top)
-                .max(layout.list_top) as isize,
-        )
-    }
-
     pub fn workspace_sidebar_scroll_geometry(&self) -> Option<WorkspaceSidebarScrollGeometry> {
         let rect = self.workspace_sidebar_rect()?;
         if self.workspace_sidebar_collapsed {
@@ -794,7 +761,7 @@ impl crate::TermWindow {
         let workspaces = mux.iter_workspaces();
         let view =
             self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
-                &self.active_space_id,
+                self.workspace_sidebar_space_id(),
                 &active_workspace,
                 &workspaces,
             ));
@@ -852,7 +819,7 @@ impl crate::TermWindow {
         ui_cell_height: usize,
         register_ui_item: bool,
     ) -> anyhow::Result<()> {
-        let reconnect_in_flight = workspace_threads::client_domain_for_space(&self.active_space_id)
+        let reconnect_in_flight = workspace_threads::client_domain_for_space(self.workspace_sidebar_space_id())
             .map_or(false, |name| {
                 self.space_reconnects_in_flight.contains(&name)
             });
@@ -917,6 +884,10 @@ impl crate::TermWindow {
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
+        // Clearing here is what keeps the recording honest: every exit below
+        // this point either reached the row loop and recorded a real span, or
+        // left this `None`. It can never describe an earlier paint.
+        self.workspace_sidebar_list_quads = None;
         let rect = match self.workspace_sidebar_rect() {
             Some(rect) => rect,
             None => return Ok(()),
@@ -1010,7 +981,7 @@ impl crate::TermWindow {
         let workspaces = mux.iter_workspaces();
         let view =
             self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
-                &self.active_space_id,
+                self.workspace_sidebar_space_id(),
                 &active_workspace,
                 &workspaces,
             ));
@@ -1207,15 +1178,15 @@ impl crate::TermWindow {
             .saturating_add(space_menu_width)
             .saturating_sub(self.ui_px(SIDEBAR_INSET) + space_action_icon_size + top_action_gap);
         let space_text_x = space_icon_x + space_icon_size + top_action_gap;
-        let space_name = crate::workspace_threads::active_space_name(&self.active_space_id)
+        let space_name = crate::workspace_threads::active_space_name(self.workspace_sidebar_space_id())
             .unwrap_or_else(|| crate::i18n::tr("sidebar-default-space"));
-        let space_title = self.sidebar_space_title(&self.active_space_id, &space_name);
+        let space_title = self.sidebar_space_title(self.workspace_sidebar_space_id(), &space_name);
         let space_label = self.ellipsize_ui_text(
             &ui_font,
             &space_title,
             space_text_right.saturating_sub(space_text_x),
         )?;
-        let connection_state = self.space_connection_state(&self.active_space_id);
+        let connection_state = self.space_connection_state(self.workspace_sidebar_space_id());
         // Swap the icon in place rather than adding text: the indicator
         // must not change the row's width or height, so transient lag
         // spikes can't make the sidebar layout jump.
@@ -1446,9 +1417,15 @@ impl crate::TermWindow {
             );
             total_height.saturating_sub(viewport_height) as f32
         };
-        self.workspace_sidebar_scroll_offset =
-            self.workspace_sidebar_scroll_offset.clamp(0.0, max_scroll);
-        let scroll_offset = self.workspace_sidebar_scroll_offset;
+        let scroll_offset = self.workspace_sidebar_scroll_offset.clamp(0.0, max_scroll);
+        if self.workspace_sidebar_preview_space_id.is_none() {
+            // Writing the clamp back is what stops the sidebar staying scrolled
+            // past the end after a list shrinks. It must not happen while
+            // previewing a neighbouring Space: `max_scroll` then describes
+            // *that* Space's extent, and a shorter one would drag the live
+            // sidebar upward mid-gesture.
+            self.workspace_sidebar_scroll_offset = scroll_offset;
+        }
         let list_top_f = list_top as f32;
         let content_bottom_f = content_bottom as f32;
         let suppress_hover = self
@@ -1456,6 +1433,10 @@ impl crate::TermWindow {
             .as_ref()
             .is_some_and(|event| matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)));
         let mut virtual_y = 0usize;
+        // Everything from here until the end of the project loop scrolls with
+        // `virtual_y`. A space-swipe slides exactly this stretch and leaves the
+        // chrome painted before and after it standing.
+        let list_quads_start = layers.heap_mark();
 
         if !view.pinned_threads.is_empty() {
             let label_top = list_top_f + virtual_y as f32 - scroll_offset;
@@ -2035,6 +2016,8 @@ impl crate::TermWindow {
                 virtual_y += self.ui_px(WORKSPACE_GROUP_EXTRA_GAP);
             }
         }
+
+        self.workspace_sidebar_list_quads = list_quads_start.zip(layers.heap_mark());
 
         let header_mask_height = list_top.saturating_sub(panel_y);
         if header_mask_height > 0 {

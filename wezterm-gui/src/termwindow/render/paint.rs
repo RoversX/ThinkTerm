@@ -264,6 +264,21 @@ impl crate::TermWindow {
                         };
                         self.invalidate_fancy_tab_bar();
                         self.invalidate_modal();
+                        // The captured sidebar holds atlas UV coordinates, not
+                        // pixels, so repacking the atlas leaves them addressing
+                        // whatever now occupies those texels. There is no way
+                        // to re-point them; abandon the transition and let the
+                        // next pass paint the destination outright. Losing the
+                        // tail of a 220ms animation beats drawing garbage.
+                        //
+                        // The state machine has to go with the frames. Dropping
+                        // only the frames can strand it in `AwaitingCommit` --
+                        // reachable here, since rasterising the neighbouring
+                        // Space is exactly what exhausts the atlas -- where it
+                        // reports itself active forever, so nothing retires it
+                        // and momentum stays suppressed until the next gesture.
+                        self.workspace_sidebar_swipe.cancel_immediately();
+                        self.clear_workspace_space_swipe_frame_transition();
 
                         if let Err(err) = result {
                             self.allow_images = match self.allow_images {
@@ -785,29 +800,114 @@ impl crate::TermWindow {
             }
         }
 
-        if self.workspace_space_swipe_push_active && !self.workspace_sidebar_swipe.is_active() {
+        if !self.workspace_sidebar_swipe.is_active() {
+            // The gesture is over, whether it committed, rebounded or never
+            // locked an axis. Retire both captures: holding either one would
+            // keep the compositor splitting a sidebar that is no longer
+            // transitioning.
             self.workspace_space_swipe_push_active = false;
             self.workspace_space_swipe_source_frame = None;
+            self.workspace_space_swipe_target_frame = None;
             self.workspace_space_swipe_direction = 0.0;
+            self.workspace_space_swipe_tracked = false;
         }
     }
 
+    /// Where the outgoing and incoming list pages sit this frame, as
+    /// `(source, target)`. Live throughout the gesture, not just after the
+    /// commit: the pages follow the finger, so an offset exists as soon as the
+    /// axis locks horizontal.
     fn workspace_space_swipe_push_offsets(
         &self,
         now: Instant,
         page_width: f32,
     ) -> Option<(f32, f32)> {
-        if !self.workspace_space_swipe_push_active {
-            return None;
-        }
         let gesture_extent = self.workspace_sidebar_width() as f32;
         let visual = self.workspace_sidebar_swipe.visual(now, gesture_extent)?;
+        // Before the commit the direction is whichever way the finger has
+        // travelled; after it, the committed direction is authoritative,
+        // because the settle animates the offset back through zero and its
+        // sign would otherwise flip mid-transition.
+        let direction = if self.workspace_space_swipe_push_active {
+            self.workspace_space_swipe_direction
+        } else {
+            visual.offset.signum()
+        };
         Some(super::super::space_swipe::sidebar_page_push_offsets(
             visual.offset,
             gesture_extent,
             page_width,
-            self.workspace_space_swipe_direction,
+            direction,
         ))
+    }
+
+    /// Record the neighbouring Space's sidebar so it can slide in beside the
+    /// live one while the finger is still down.
+    ///
+    /// Cheap to call every frame: it repaints only when the neighbour changes,
+    /// which is once when the axis locks and once more if the drag reverses.
+    fn capture_workspace_space_swipe_target(&mut self, now: Instant) -> anyhow::Result<()> {
+        if self.workspace_space_swipe_push_active {
+            // The switch already happened, so the live sidebar *is* the
+            // destination and the outgoing one is held in the source frame.
+            return Ok(());
+        }
+        let gesture_extent = self.workspace_sidebar_width() as f32;
+        let target = self
+            .workspace_sidebar_swipe
+            .visual(now, gesture_extent)
+            .and_then(|visual| visual.target_space_id);
+        let Some(target) = target else {
+            // Either no gesture, or one rubber-banding against the end of the
+            // list with no neighbour to show.
+            self.workspace_space_swipe_target_frame = None;
+            return Ok(());
+        };
+        if self
+            .workspace_space_swipe_target_frame
+            .as_ref()
+            .is_some_and(|(captured, _)| *captured == target)
+        {
+            return Ok(());
+        }
+
+        let ui_items_len = self.ui_items.len();
+        let mut quads = HeapQuadAllocator::default();
+        self.workspace_sidebar_preview_space_id = Some(target.clone());
+        // Draw the neighbour where adopting it would actually put it: at the
+        // offset it was left scrolled to. Using the *outgoing* Space's offset
+        // instead slides in a view that does not exist -- blank, when the
+        // neighbour has fewer threads than the offset scrolls past -- and then
+        // jumps once the switch applies the real one.
+        //
+        // Restoring afterwards is not tidiness. `paint_workspace_sidebar`
+        // clamps this field against the painted Space's own scroll extent and
+        // writes it back, so a shorter neighbour would drag the live sidebar
+        // up under the finger the instant the axis locked.
+        let preview_scroll_offset = self
+            .workspace_sidebar_scroll_offsets
+            .get(&target)
+            .copied()
+            .unwrap_or(0.0);
+        let live_scroll_offset = std::mem::replace(
+            &mut self.workspace_sidebar_scroll_offset,
+            preview_scroll_offset,
+        );
+        let mut layers = TripleLayerQuadAllocator::Heap(&mut quads);
+        let painted = self.paint_workspace_sidebar(&mut layers);
+        drop(layers);
+        self.workspace_sidebar_scroll_offset = live_scroll_offset;
+        self.workspace_sidebar_preview_space_id = None;
+        // This paint laid out hit targets for a Space the window has not
+        // adopted, at positions the pointer will never see, and it ran before
+        // the live paint that owns those slots. Drop them.
+        self.ui_items.truncate(ui_items_len);
+        painted.context("capture neighbouring Space sidebar")?;
+
+        let list = self.workspace_sidebar_list_quads;
+        self.workspace_space_swipe_target_frame =
+            Some((target, crate::termwindow::CapturedSidebar { quads, list }));
+        Ok(())
     }
 
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
@@ -988,21 +1088,45 @@ impl crate::TermWindow {
         // isolate just the left sidebar while its middle list page transitions.
         drop(layers);
 
+        self.capture_workspace_space_swipe_target(frame_now)?;
+
         let render_space_push = self.workspace_space_swipe_push_active
             && self.workspace_space_swipe_source_frame.is_some();
-        let capture_space_source = self.workspace_space_swipe_capture_source && !render_space_push;
+        // Before the commit the window still shows the Space being left, so
+        // the live paint is the *source* page and the captured neighbour is
+        // the target. Committing swaps those roles.
+        let render_space_track = !render_space_push
+            && !self.workspace_space_swipe_push_active
+            && self.workspace_space_swipe_target_frame.is_some();
+        // Only needed when a gesture committed before the pages ever tracked
+        // it -- a flick fast enough to finish inside one frame. Otherwise the
+        // tracking branch below hands over its own last paint.
+        let capture_space_source = self.workspace_space_swipe_capture_source
+            && !render_space_push
+            && !render_space_track;
         let mut sidebar_frame = HeapQuadAllocator::default();
+        let mut composited_tracking_frame = false;
 
-        if render_space_push {
+        if render_space_push || render_space_track {
             let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
             self.paint_workspace_sidebar(&mut sidebar_layers)
-                .context("paint target workspace sidebar")?;
+                .context("paint live workspace sidebar")?;
             drop(sidebar_layers);
+            let live_list = self.workspace_sidebar_list_quads;
 
             if self.workspace_space_swipe_needs_settle_start {
                 let gesture_extent = self.workspace_sidebar_width() as f32;
-                self.workspace_sidebar_swipe
-                    .resolve_switch(true, Instant::now(), gesture_extent);
+                let opening = if self.workspace_space_swipe_tracked {
+                    crate::termwindow::space_swipe::SettleOpening::WhereTheFingerLeftIt
+                } else {
+                    crate::termwindow::space_swipe::SettleOpening::AtRest
+                };
+                self.workspace_sidebar_swipe.resolve_switch(
+                    true,
+                    Instant::now(),
+                    gesture_extent,
+                    opening,
+                );
                 self.workspace_space_swipe_needs_settle_start = false;
                 // The settle clock does not start until the *next* frame (see
                 // `Settle::started`), so this frame only has to make sure a
@@ -1013,108 +1137,89 @@ impl crate::TermWindow {
             }
 
             let mut gpu_layers = layer.quad_allocator();
-            let sidebar_rect = self.workspace_sidebar_rect();
-            let list_viewport = self.workspace_sidebar_list_viewport();
-            if let (Some(rect), Some((list_top, list_bottom))) = (sidebar_rect, list_viewport) {
+            if let Some(rect) = self.workspace_sidebar_rect() {
                 // Quad positions are window-centre relative (see
-                // `filled_rectangle`), while the sidebar rect and list
-                // viewport are top-left pixel coordinates. Rebase the clip
-                // rect into the quads' space, otherwise every quad fails the
-                // bounds test and the sidebar renders empty for the whole
-                // transition.
-                let list_clip = crate::quad::QuadClipRect::from_top_left_pixels(
+                // `filled_rectangle`) while the sidebar rect is in top-left
+                // pixels. Rebase, or every quad fails the bounds test and the
+                // sidebar renders empty for the whole transition.
+                //
+                // This is a containment bound, nothing more: it keeps a page
+                // that has slid partway out of the sidebar from spilling over
+                // the terminal. The pages may use the sidebar's full height --
+                // the masks painted after the list already hide whatever
+                // overshoots the viewport, and they do it without cutting a row
+                // in half the way a clip edge through the middle of the list
+                // would.
+                let sidebar_clip = crate::quad::QuadClipRect::from_top_left_pixels(
                     rect.x as f32,
-                    list_top.max(0) as f32,
+                    rect.y as f32,
                     rect.x.saturating_add(rect.width) as f32,
-                    list_bottom.max(list_top) as f32,
+                    rect.y.saturating_add(rect.height) as f32,
                     &self.dimensions,
                 );
-                let (clip_left, clip_top, clip_right, clip_bottom) = (
-                    list_clip.left(),
-                    list_clip.top(),
-                    list_clip.right(),
-                    list_clip.bottom(),
-                );
-                let top_offset = self.dimensions.pixel_height as f32 / 2.0;
-                let window_top = -top_offset;
                 // The one-pixel separator is sidebar chrome, not page content.
-                let page_right = (clip_right - 1.0).max(clip_left);
-                // The settings row is lifted above `content_bottom` and the
-                // scroll fade higher still, so the stationary band starts
-                // above the list's own bottom edge and is drawn over the
-                // moving pages rather than beside them.
-                let footer_chrome_top = self
-                    .workspace_sidebar_footer_chrome_top()
-                    .map(|top| top.max(list_top) as f32 - top_offset)
-                    .unwrap_or(clip_bottom)
-                    .min(clip_bottom);
-                let sidebar_bottom = rect.y.saturating_add(rect.height) as f32 - top_offset;
-                let page_width = page_right - clip_left;
-
-                // The pages stop where the stationary footer band begins, not
-                // at the list's own bottom edge. Overlapping the two bands
-                // leaves a moving sliver of the outgoing settings row visible
-                // whenever the footer's fade is absent (it is only drawn when
-                // the list actually scrolls), so the footer must own that
-                // strip outright.
-                let page_bottom = footer_chrome_top;
-                let page_clip = list_clip
-                    .with_horizontal(clip_left, page_right)
-                    .with_vertical(clip_top, page_bottom);
+                let page_right = (sidebar_clip.right() - 1.0).max(sidebar_clip.left());
+                let page_width = page_right - sidebar_clip.left();
+                let page_clip = sidebar_clip.with_horizontal(sidebar_clip.left(), page_right);
                 let offsets = self
                     .workspace_space_swipe_push_offsets(Instant::now(), page_width)
-                    .filter(|_| page_width > 0.0 && page_bottom > clip_top);
+                    .filter(|_| page_width > 0.0);
+                // Which Space the live paint holds flips at the commit, so the
+                // offset that belongs to it flips with it. The captured
+                // neighbour always takes the other one.
+                let offscreen = if render_space_push {
+                    self.workspace_space_swipe_source_frame.as_ref()
+                } else {
+                    self.workspace_space_swipe_target_frame
+                        .as_ref()
+                        .map(|(_, captured)| captured)
+                };
+                let offscreen_span = offscreen.and_then(|captured| captured.list);
 
-                if let Some((source_offset, target_offset)) = offsets {
-                    // Paint the target sidebar chrome in place. Only the
-                    // project/thread list viewport below is double-buffered.
-                    sidebar_frame
-                        .apply_to_translated_clipped_rect(
-                            &mut gpu_layers,
-                            0.0,
-                            list_clip.with_vertical(window_top, clip_top),
-                        )
-                        .context("space swipe stationary sidebar header")?;
-                    sidebar_frame
-                        .apply_to_translated_clipped_rect(
-                            &mut gpu_layers,
-                            0.0,
-                            list_clip.with_horizontal(page_right, clip_right),
-                        )
-                        .context("space swipe stationary sidebar separator")?;
-                    if let Some(source) = self.workspace_space_swipe_source_frame.as_ref() {
-                        source
-                            .apply_to_translated_clipped_rect(
+                match (offsets, live_list, offscreen_span) {
+                    (Some((source_offset, target_offset)), Some(live), Some(other)) => {
+                        let (live_offset, offscreen_offset) = if render_space_push {
+                            (target_offset, source_offset)
+                        } else {
+                            (source_offset, target_offset)
+                        };
+                        // Order matters within a layer: the chrome recorded
+                        // after the list is what masks it, so it has to be
+                        // replayed after the pages here too.
+                        sidebar_frame
+                            .apply_before(&mut gpu_layers, &live.0)
+                            .context("space swipe sidebar chrome above the list")?;
+                        if let Some(captured) = offscreen {
+                            captured
+                                .quads
+                                .apply_between(
+                                    &mut gpu_layers,
+                                    &other.0,
+                                    &other.1,
+                                    offscreen_offset,
+                                    page_clip,
+                                )
+                                .context("space swipe offscreen sidebar page")?;
+                        }
+                        sidebar_frame
+                            .apply_between(
                                 &mut gpu_layers,
-                                source_offset,
+                                &live.0,
+                                &live.1,
+                                live_offset,
                                 page_clip,
                             )
-                            .context("space swipe source sidebar page")?;
+                            .context("space swipe live sidebar page")?;
+                        sidebar_frame
+                            .apply_after(&mut gpu_layers, &live.1)
+                            .context("space swipe sidebar chrome below the list")?;
+                        composited_tracking_frame = render_space_track;
                     }
-                    sidebar_frame
-                        .apply_to_translated_clipped_rect(
-                            &mut gpu_layers,
-                            target_offset,
-                            page_clip,
-                        )
-                        .context("space swipe target sidebar page")?;
-
-                    // Drawn last: the settings row is lifted above
-                    // `content_bottom` and the scroll fade sits above that, so
-                    // this band overlaps the moving pages instead of abutting
-                    // them. Compositing it after the pages keeps the footer
-                    // whole and lets its fade mask the content sliding beneath.
-                    sidebar_frame
-                        .apply_to_translated_clipped_rect(
-                            &mut gpu_layers,
-                            0.0,
-                            list_clip.with_vertical(footer_chrome_top, sidebar_bottom),
-                        )
-                        .context("space swipe stationary sidebar footer")?;
-                } else {
-                    sidebar_frame
-                        .apply_to(&mut gpu_layers)
-                        .context("space swipe target sidebar fallback")?;
+                    _ => {
+                        sidebar_frame
+                            .apply_to(&mut gpu_layers)
+                            .context("space swipe sidebar fallback")?;
+                    }
                 }
             } else {
                 sidebar_frame
@@ -1122,13 +1227,48 @@ impl crate::TermWindow {
                     .context("space swipe target sidebar without viewport")?;
             }
             drop(gpu_layers);
+            // Unconditional: the pages either followed the finger this frame
+            // or they did not, and that is true regardless of which branch
+            // captured what. Gating this on the source capture meant the usual
+            // path -- source captured back at `MayBegin`, long before the axis
+            // locked -- never recorded a single tracking frame, so committing
+            // opened `AtRest` and yanked the pages back to zero first.
+            self.workspace_space_swipe_tracked |= composited_tracking_frame;
+
+            // The finger lifted on a committing gesture while the pages were
+            // already tracking it. This paint is the last frame of the Space
+            // being left, so keep it as the outgoing page instead of spending
+            // another frame re-rendering it -- that frame would have to show
+            // the sidebar untransitioned, snapping the pages back to rest just
+            // before the settle animates them forward again.
+            if render_space_track && self.workspace_space_swipe_capture_source {
+                self.workspace_space_swipe_source_frame =
+                    Some(crate::termwindow::CapturedSidebar {
+                        quads: std::mem::take(&mut sidebar_frame),
+                        list: live_list,
+                    });
+                self.workspace_space_swipe_capture_source = false;
+                #[cfg(target_os = "macos")]
+                if self.workspace_space_swipe_pending_commit.is_some() {
+                    if let Some(window) = self.window.clone() {
+                        window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                            |term_window| {
+                                term_window.complete_workspace_space_swipe_switch();
+                            },
+                        )));
+                    }
+                }
+            }
         } else if capture_space_source {
             let mut sidebar_layers = layer.tee_quad_allocator(&mut sidebar_frame);
             self.paint_workspace_sidebar(&mut sidebar_layers)
                 .context("capture source workspace sidebar")?;
             drop(sidebar_layers);
 
-            self.workspace_space_swipe_source_frame = Some(sidebar_frame);
+            self.workspace_space_swipe_source_frame = Some(crate::termwindow::CapturedSidebar {
+                quads: sidebar_frame,
+                list: self.workspace_sidebar_list_quads,
+            });
             self.workspace_space_swipe_capture_source = false;
             #[cfg(target_os = "macos")]
             if self.workspace_space_swipe_pending_commit.is_some() {

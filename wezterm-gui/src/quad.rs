@@ -435,10 +435,47 @@ impl QuadClipRect {
     }
 }
 
+/// How many quads a [`HeapQuadAllocator`] held at some point during a paint.
+///
+/// Splitting a recorded frame by screen position cannot distinguish a scrolling
+/// row from the chrome drawn over it: the two overlap on purpose, so any
+/// horizontal line drawn through them cuts something in half. Recording where
+/// the painter *was* instead splits by what was being drawn, which is the
+/// question a compositor actually needs answered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeapQuadMark {
+    layer0: usize,
+    layer1: usize,
+    layer2: usize,
+}
+
 impl HeapQuadAllocator {
+    /// Where the next quad will land, for later use with [`Self::apply_before`],
+    /// [`Self::apply_between`] and [`Self::apply_after`].
+    pub fn mark(&self) -> HeapQuadMark {
+        HeapQuadMark {
+            layer0: self.layer0.len(),
+            layer1: self.layer1.len(),
+            layer2: self.layer2.len(),
+        }
+    }
+
+    fn layers(&self) -> [(usize, &Vec<Box<BoxedQuad>>); 3] {
+        [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)]
+    }
+
+    fn layer_bounds(mark: &HeapQuadMark, layer_num: usize) -> usize {
+        match layer_num {
+            0 => mark.layer0,
+            1 => mark.layer1,
+            2 => mark.layer2,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn apply_to(&self, other: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
-        for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {
+        for (layer_num, quads) in self.layers() {
             for quad in quads {
                 other.extend_with(layer_num, &quad.to_vertices());
             }
@@ -447,22 +484,63 @@ impl HeapQuadAllocator {
         Ok(())
     }
 
-    pub fn apply_to_translated_clipped_rect(
+    /// Replay everything recorded before `mark`, in place.
+    pub fn apply_before(
         &self,
         other: &mut TripleLayerQuadAllocator,
+        mark: &HeapQuadMark,
+    ) -> anyhow::Result<()> {
+        for (layer_num, quads) in self.layers() {
+            let end = Self::layer_bounds(mark, layer_num).min(quads.len());
+            for quad in &quads[..end] {
+                other.extend_with(layer_num, &quad.to_vertices());
+            }
+        }
+        Ok(())
+    }
+
+    /// Replay everything recorded from `mark` onwards, in place.
+    pub fn apply_after(
+        &self,
+        other: &mut TripleLayerQuadAllocator,
+        mark: &HeapQuadMark,
+    ) -> anyhow::Result<()> {
+        for (layer_num, quads) in self.layers() {
+            let begin = Self::layer_bounds(mark, layer_num).min(quads.len());
+            for quad in &quads[begin..] {
+                other.extend_with(layer_num, &quad.to_vertices());
+            }
+        }
+        Ok(())
+    }
+
+    /// Replay `start..end`, shifted horizontally and clipped.
+    ///
+    /// The clip is a containment bound -- it stops the shifted quads escaping
+    /// the surface they belong to -- and not a way to carve the frame into
+    /// moving and stationary parts. Use the marks for that.
+    pub fn apply_between(
+        &self,
+        other: &mut TripleLayerQuadAllocator,
+        start: &HeapQuadMark,
+        end: &HeapQuadMark,
         offset_x: f32,
         clip: QuadClipRect,
     ) -> anyhow::Result<()> {
-        let start = std::time::Instant::now();
-        for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {
-            for quad in quads {
+        let started = std::time::Instant::now();
+        for (layer_num, quads) in self.layers() {
+            let begin = Self::layer_bounds(start, layer_num).min(quads.len());
+            let finish = Self::layer_bounds(end, layer_num)
+                .min(quads.len())
+                .max(begin);
+            for quad in &quads[begin..finish] {
                 let Some(vertices) = quad.translated_clipped_vertices(offset_x, clip) else {
                     continue;
                 };
                 other.extend_with(layer_num, &vertices);
             }
         }
-        metrics::histogram!("quad_buffer_translated_rect_clip_apply").record(start.elapsed());
+        metrics::histogram!("quad_buffer_translated_rect_clip_apply").record(started.elapsed());
         Ok(())
     }
 }
@@ -585,6 +663,19 @@ pub enum TripleLayerQuadAllocator<'a> {
     },
 }
 
+impl<'a> TripleLayerQuadAllocator<'a> {
+    /// The heap's current position, when there is a heap to record into.
+    /// `Gpu` allocators cannot be replayed, so a painter drawing straight to
+    /// the GPU has nothing to mark.
+    pub fn heap_mark(&self) -> Option<HeapQuadMark> {
+        match self {
+            Self::Gpu(_) => None,
+            Self::Heap(heap) => Some(heap.mark()),
+            Self::Tee { heap, .. } => Some(heap.mark()),
+        }
+    }
+}
+
 impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
     fn allocate(&mut self, layer_num: usize) -> anyhow::Result<QuadImpl<'_>> {
         match self {
@@ -695,6 +786,64 @@ mod translated_clip_tests {
         let list =
             QuadClipRect::from_top_left_pixels(0.0, 204.0, 465.0, 1316.0, &window);
         assert!(quad.translated_clipped_vertices(0.0, list).is_some());
+    }
+
+    /// Regression: the transition used to decide what slides by cutting the
+    /// sidebar at a y coordinate. It cannot work. The bottom fade and the
+    /// settings row are painted *over* the list on purpose, so any horizontal
+    /// line drawn between "moving" and "stationary" runs straight through
+    /// whichever list row happens to reach that far -- the row's top half slid
+    /// away while its bottom half stayed put, already showing the destination.
+    /// Splitting by paint order instead asks the question that has an answer.
+    #[test]
+    fn chrome_painted_over_the_list_stays_put_when_the_list_slides_under_it() {
+        const WINDOW: Dimensions = Dimensions {
+            pixel_width: 1000,
+            pixel_height: 800,
+            dpi: 96,
+        };
+        fn quad_at(left: f32, top: f32, right: f32, bottom: f32) -> Box<BoxedQuad> {
+            let rect = QuadClipRect::from_top_left_pixels(left, top, right, bottom, &WINDOW);
+            Box::new(BoxedQuad {
+                position: (rect.left(), rect.top(), rect.right(), rect.bottom()),
+                ..Default::default()
+            })
+        }
+        // Left edge of a top-left `x`, in the centre-relative space quads use.
+        let at = |x: f32| x - WINDOW.pixel_width as f32 / 2.0;
+
+        let mut frame = HeapQuadAllocator::default();
+        // Chrome above the list.
+        frame.layer2.push(quad_at(0.0, 0.0, 400.0, 100.0));
+
+        let list_start = frame.mark();
+        // A row reaching down into the band the footer chrome covers. Inset
+        // from the sidebar edges so a horizontal shift is visible rather than
+        // being cropped away by the containment clip.
+        frame.layer2.push(quad_at(100.0, 600.0, 300.0, 660.0));
+        let list_end = frame.mark();
+
+        // The fade and the settings row: painted last, and deliberately
+        // overlapping the row above.
+        frame.layer2.push(quad_at(0.0, 620.0, 400.0, 700.0));
+
+        let mut out = HeapQuadAllocator::default();
+        let mut sink = TripleLayerQuadAllocator::Heap(&mut out);
+        let clip = QuadClipRect::from_top_left_pixels(0.0, 0.0, 400.0, 800.0, &WINDOW);
+        frame.apply_before(&mut sink, &list_start).unwrap();
+        frame
+            .apply_between(&mut sink, &list_start, &list_end, -50.0, clip)
+            .unwrap();
+        frame.apply_after(&mut sink, &list_end).unwrap();
+        drop(sink);
+
+        let left_edges: Vec<f32> = out.layer2.iter().map(|q| q.position.0).collect();
+        assert_eq!(
+            left_edges,
+            vec![at(0.0), at(50.0), at(0.0)],
+            "only the marked list span may move, and the chrome recorded after \
+             it must still be replayed last so it keeps masking the row"
+        );
     }
 
     #[test]
