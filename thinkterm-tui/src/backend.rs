@@ -4,7 +4,7 @@ use ratatui::layout::{Position, Size};
 use ratatui::style::{Color, Modifier};
 use std::io;
 use std::time::Duration;
-use termwiz::cell::{unicode_column_width, AttributeChange, Blink, Intensity, Underline};
+use termwiz::cell::{AttributeChange, Blink, Intensity, Underline};
 use termwiz::color::{AnsiColor, ColorAttribute, SrgbaTuple};
 use termwiz::input::InputEvent;
 use termwiz::surface::{Change, CursorVisibility, Position as TermwizPosition};
@@ -61,6 +61,26 @@ impl<T: Terminal> TermwizBackend<T> {
     pub fn waker(&mut self) -> TerminalWaker {
         self.terminal.terminal().waker()
     }
+
+    /// Re-send the complete buffered surface. Ratatui and Termwiz both keep a
+    /// local model, so an out-of-band host-terminal wrap or width disagreement
+    /// otherwise survives indefinitely because neither model sees a diff.
+    pub fn repaint(&mut self) -> anyhow::Result<()> {
+        Ok(self.terminal.repaint()?)
+    }
+}
+
+fn contiguous_ascii_cursor(x: u16, y: u16, symbol: &str, columns: usize) -> Option<(u16, u16)> {
+    let [byte] = symbol.as_bytes() else {
+        return None;
+    };
+    if !byte.is_ascii_graphic() && *byte != b' ' {
+        return None;
+    }
+    let next = x.saturating_add(1);
+    // Never predict through the right margin. Terminals disagree over whether
+    // the cursor is already wrapped or is in a pending-wrap state there.
+    (next < columns.min(u16::MAX as usize) as u16).then_some((next, y))
 }
 
 impl<T: Terminal> Backend for TermwizBackend<T> {
@@ -78,6 +98,7 @@ impl<T: Terminal> Backend for TermwizBackend<T> {
         // does not. Emit each only where it actually differs.
         let mut pen: Option<Pen> = None;
         let mut cursor: Option<(u16, u16)> = None;
+        let (columns, _) = self.terminal.dimensions();
         for (x, y, cell) in content {
             if cursor != Some((x, y)) {
                 self.terminal.add_change(Change::CursorPosition {
@@ -88,14 +109,7 @@ impl<T: Terminal> Backend for TermwizBackend<T> {
             let next = Pen::of(cell);
             let changed = pen != Some(next);
             pen = Some(next);
-            cursor = Some((
-                x.saturating_add(
-                    unicode_column_width(cell.symbol(), None)
-                        .max(1)
-                        .min(u16::MAX as usize) as u16,
-                ),
-                y,
-            ));
+            cursor = contiguous_ascii_cursor(x, y, cell.symbol(), columns);
             if !changed {
                 self.terminal
                     .add_change(Change::Text(cell.symbol().to_string()));
@@ -301,5 +315,14 @@ mod tests {
             to_termwiz_color(Color::Rgb(137, 180, 250)),
             ColorAttribute::TrueColorWithPaletteFallback(_, _)
         ));
+    }
+
+    #[test]
+    fn cursor_elision_is_limited_to_safe_ascii_before_the_margin() {
+        assert_eq!(contiguous_ascii_cursor(4, 2, "x", 20), Some((5, 2)));
+        assert_eq!(contiguous_ascii_cursor(4, 2, " ", 20), Some((5, 2)));
+        assert_eq!(contiguous_ascii_cursor(19, 2, "x", 20), None);
+        assert_eq!(contiguous_ascii_cursor(4, 2, "界", 20), None);
+        assert_eq!(contiguous_ascii_cursor(4, 2, "e\u{301}", 20), None);
     }
 }

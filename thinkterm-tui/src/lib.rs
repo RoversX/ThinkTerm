@@ -22,8 +22,8 @@ use mux::domain::{Domain, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId, Pattern};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use mux::{Mux, MuxNotification};
-use ratatui::Terminal;
 use ratatui::backend::Backend;
+use ratatui::Terminal;
 use settings::{TuiConfig, TuiPersistentState};
 use state::{
     AppMode, ConfirmationState, ConnectionItem, ConnectionStatus, ContextMenuState, CopyState,
@@ -39,7 +39,7 @@ use termwiz::caps::{Capabilities, ProbeHints};
 use termwiz::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent as TermwizMouseEvent,
 };
-use termwiz::terminal::{ScreenSize, TerminalWaker, new_terminal};
+use termwiz::terminal::{new_terminal, ScreenSize, TerminalWaker};
 use uuid::Uuid;
 use view::{HitTarget, PaneTool, TabBarControl, TreeAction, ViewLayout};
 use wezterm_client::client::Client;
@@ -47,8 +47,8 @@ use wezterm_client::domain::{
     ClientDomain, ClientDomainConfig, FrontendRecoverySlot, RemoteFrontendGate,
 };
 use wezterm_client::pane::ClientPane;
-use wezterm_term::TerminalSize;
 use wezterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
+use wezterm_term::TerminalSize;
 
 static EVENT_SENDER: OnceLock<Sender<AppEvent>> = OnceLock::new();
 static TERMINAL_WAKER: OnceLock<TerminalWaker> = OnceLock::new();
@@ -91,6 +91,27 @@ const TAKEOVER_RESYNC_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// takeover surface opaque until the acknowledged grid and all of its visible
 /// rows have stayed ready long enough for that redraw to land.
 const TAKEOVER_GEOMETRY_SETTLE: Duration = Duration::from_millis(200);
+/// After the final divider target is acknowledged, give the PTYs enough time
+/// to echo that geometry and refill the visible row cache before unpinning the
+/// local preview.
+const SPLIT_DRAG_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+/// A local divider follows every mouse event, while PTY resizes are capped at
+/// one per display-frame interval. The final release target bypasses this cap.
+const SPLIT_DRAG_RPC_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeViewportPreview {
+    Takeover(u64),
+    SplitDrag(u64),
+}
+
+impl NativeViewportPreview {
+    fn epoch(self) -> u64 {
+        match self {
+            Self::Takeover(epoch) | Self::SplitDrag(epoch) => epoch,
+        }
+    }
+}
 
 #[derive(Default)]
 struct TakeoverEpochs {
@@ -198,6 +219,7 @@ impl TakeoverPreviews {
 #[derive(Clone, Debug)]
 struct TakeoverGeometryConfirmation {
     epoch: u64,
+    started_at: Instant,
     screen_size: ScreenSize,
     root_size: TerminalSize,
     /// Visible panes whose rendered rows must be fetched before the handoff
@@ -209,6 +231,79 @@ struct TakeoverGeometryConfirmation {
     acknowledged_panes: Vec<(PaneId, TerminalSize)>,
     access_generation: u64,
     ready_since: Option<Instant>,
+    last_wait_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedSplitDragGeometry {
+    viewport: ClientViewport,
+    visible_panes: Vec<(PaneId, TerminalSize)>,
+    acknowledged_panes: Vec<(PaneId, TerminalSize)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitDragGeometryPhase {
+    Dragging,
+    Finishing,
+    Confirming {
+        committed_at: Instant,
+        ready_since: Option<Instant>,
+    },
+}
+
+fn split_drag_target_is_owed(
+    in_flight: Option<&ClientViewport>,
+    acknowledged: Option<&ClientViewport>,
+    target: &ClientViewport,
+) -> bool {
+    in_flight != Some(target) && acknowledged != Some(target)
+}
+
+fn split_drag_can_pump(phase: SplitDragGeometryPhase, in_flight: bool, has_pending: bool) -> bool {
+    !matches!(phase, SplitDragGeometryPhase::Confirming { .. }) && !in_flight && has_pending
+}
+
+fn split_drag_pump_delay(state: &TuiState, now: Instant) -> Option<Duration> {
+    let preview = state.split_drag_geometry.as_ref()?;
+    if !split_drag_can_pump(
+        preview.phase,
+        preview.in_flight.is_some(),
+        preview.pending.is_some(),
+    ) {
+        return None;
+    }
+    if preview.phase == SplitDragGeometryPhase::Finishing {
+        return Some(Duration::ZERO);
+    }
+    Some(preview.last_sent_at.map_or(Duration::ZERO, |sent| {
+        SPLIT_DRAG_RPC_INTERVAL.saturating_sub(now.saturating_duration_since(sent))
+    }))
+}
+
+#[derive(Clone, Debug)]
+struct SplitDragGeometryPreview {
+    epoch: u64,
+    cache_key: (String, TabId),
+    local_tab_id: TabId,
+    connection_generation: u64,
+    phase: SplitDragGeometryPhase,
+    latest: Option<PreparedSplitDragGeometry>,
+    pending: Option<PreparedSplitDragGeometry>,
+    in_flight: Option<ClientViewport>,
+    last_acknowledged: Option<ClientViewport>,
+    last_sent_at: Option<Instant>,
+    /// A pane can enter or leave a stack while a drag is in progress. Remember
+    /// the newest previewed size for every touched surface so cancellation
+    /// cannot leave an old epoch pinned behind.
+    touched_panes: HashMap<PaneId, TerminalSize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SplitDragResyncKey {
+    cache_key: (String, TabId),
+    local_tab_id: TabId,
+    epoch: u64,
+    connection_generation: u64,
 }
 
 fn takeover_geometry_settled(ready: bool, now: Instant, ready_since: &mut Option<Instant>) -> bool {
@@ -277,6 +372,18 @@ enum AppEvent {
     Connected {
         domain_name: String,
         connection_generation: u64,
+    },
+    SplitDragViewportFinished {
+        cache_key: (String, TabId),
+        local_tab_id: TabId,
+        epoch: u64,
+        connection_generation: u64,
+        sent: ClientViewport,
+        result: std::result::Result<codec::ClientViewportState, String>,
+    },
+    SplitDragResyncFinished {
+        key: SplitDragResyncKey,
+        result: std::result::Result<(), String>,
     },
 }
 
@@ -801,6 +908,17 @@ struct TuiState {
     /// The latest size is required to clear ClientPane::requested_size on a
     /// failed/cancelled preview without disturbing a newer epoch.
     takeover_previews: TakeoverPreviews,
+    /// Divider drags render immediately against a local ClientPane preview and
+    /// stream Native viewports without blocking input: one request may be in
+    /// flight and one replaceable latest target may wait behind it. That keeps
+    /// live PTY resize while preventing an unbounded stale-request queue.
+    split_drag_geometry: Option<SplitDragGeometryPreview>,
+    /// Identifies the only divider recovery whose completion may update the
+    /// UI. Late results from an older connection or drag epoch are ignored.
+    split_drag_resync: Option<SplitDragResyncKey>,
+    /// Split previews occupy the high half of the epoch space so they cannot
+    /// collide with takeover epochs on the same ClientPane.
+    next_split_drag_epoch: u64,
     /// When the panes were last asked for new content, so the loop keeps asking
     /// even while nothing local has changed.
     last_pane_poll: Instant,
@@ -831,6 +949,10 @@ struct TuiState {
     /// the whole window. Only the forced redraw consults this — a frame that
     /// something actually asked for still draws at once.
     last_draw: Instant,
+    /// Request one complete Termwiz surface repaint after a live resize has
+    /// converged. This repairs any host-terminal cursor/wrap divergence that a
+    /// normal Ratatui diff cannot observe.
+    terminal_repaint_pending: bool,
     /// Current transport generation accepted for each domain. Session pushes
     /// from any other generation are stale even when the restarted server has
     /// the same runtime id and a numerically newer snapshot generation.
@@ -904,6 +1026,7 @@ impl TuiState {
                 ui.touch_targets = settings.touch_targets;
                 ui.pane_scrollbars = settings.pane_scrollbars;
                 ui.pane_borders = settings.pane_borders;
+                ui.show_status_bar = settings.show_status_bar;
                 ui.pane_nav_bar = settings.pane_nav_bar;
                 ui.connections = connections;
                 if no_attached_domain {
@@ -920,6 +1043,9 @@ impl TuiState {
             takeover_epochs: TakeoverEpochs::default(),
             takeover_geometry_confirmations: HashMap::new(),
             takeover_previews: TakeoverPreviews::default(),
+            split_drag_geometry: None,
+            split_drag_resync: None,
+            next_split_drag_epoch: 1 << 63,
             last_pane_poll: Instant::now(),
             shared_views: HashMap::new(),
             shared_view_at: HashMap::new(),
@@ -929,6 +1055,7 @@ impl TuiState {
             resize_settles_at: None,
             redraw_until: None,
             last_draw: Instant::now(),
+            terminal_repaint_pending: false,
             connection_generations,
             refresh_sessions: HashSet::new(),
             actions: VecDeque::new(),
@@ -958,6 +1085,26 @@ impl TuiState {
         let remote_tab_id = self.model.selected_tab()?.tab_id;
         let domain_name = self.model.selected_row()?.key.domain_name.clone();
         Some((domain_name, remote_tab_id))
+    }
+
+    fn allocate_split_drag_epoch(&mut self) -> u64 {
+        let epoch = self.next_split_drag_epoch;
+        self.next_split_drag_epoch = self.next_split_drag_epoch.wrapping_add(1) | (1 << 63);
+        epoch
+    }
+
+    fn active_split_drag_epoch(&self) -> Option<u64> {
+        let preview = self.split_drag_geometry.as_ref()?;
+        if self.active_view_cache_key().as_ref() != Some(&preview.cache_key) {
+            return None;
+        }
+        let domain = self.domains.get(&preview.cache_key.0)?;
+        if domain.connection_generation() != Some(preview.connection_generation)
+            || domain.owns_remote_viewport(preview.local_tab_id) != Some(true)
+        {
+            return None;
+        }
+        Some(preview.epoch)
     }
 
     fn active_pane(&self) -> Option<Arc<dyn Pane>> {
@@ -1172,7 +1319,8 @@ async fn run_terminal(
         WAKE_PENDING.store(false, Ordering::Release);
         drain_events(&receiver, &mut state);
         refresh_sessions(&mut state).await;
-        if state.ui.expire_toast(std::time::Instant::now()) {
+        let notice_now = Instant::now();
+        if state.ui.expire_toast(notice_now) | state.ui.expire_status(notice_now) {
             state.dirty = true;
         }
 
@@ -1242,8 +1390,13 @@ async fn run_terminal(
             }
         }
 
+        if split_drag_pump_delay(&state, Instant::now()) == Some(Duration::ZERO) {
+            pump_split_drag_geometry(&mut state);
+        }
+
         if state.dirty {
             cancel_inactive_takeover_geometry(&mut state);
+            cancel_inactive_split_drag_geometry(&mut state);
             if let Ok(screen) = terminal.backend_mut().screen_size() {
                 state.screen_size = Some(screen);
                 let area: ratatui::layout::Rect = terminal.size()?.into();
@@ -1252,14 +1405,26 @@ async fn run_terminal(
                         .pending_frontend_recovery(FrontendRecoverySlot::Primary, tab.tab_id())
                         .is_some()
                 });
-                let preview_epoch = state.ensure_active_handoff_geometry_epoch();
-                prepare_active_native_viewport(
+                let preview = if let Some(epoch) = state.active_split_drag_epoch() {
+                    Some(NativeViewportPreview::SplitDrag(epoch))
+                } else {
+                    state
+                        .ensure_active_handoff_geometry_epoch()
+                        .map(NativeViewportPreview::Takeover)
+                };
+                let viewport = prepare_active_native_viewport(
                     &mut state,
                     area,
                     screen,
                     recovery_pending,
-                    preview_epoch,
+                    preview,
                 );
+                if matches!(preview, Some(NativeViewportPreview::SplitDrag(_))) {
+                    if let Some(viewport) = viewport.as_ref() {
+                        record_split_drag_geometry(&mut state, viewport);
+                        pump_split_drag_geometry(&mut state);
+                    }
+                }
             }
             let active = state.active_tab();
             let local_tab = active.as_ref().map(|(_, _, tab, _)| Arc::clone(tab));
@@ -1288,6 +1453,12 @@ async fn run_terminal(
                     &state.settings,
                 );
             })?;
+            if std::mem::take(&mut state.terminal_repaint_pending) {
+                terminal
+                    .backend_mut()
+                    .repaint()
+                    .context("repainting the converged divider surface")?;
+            }
             state.layout = next_layout;
             state.last_draw = Instant::now();
             // Cleared before the trip to the server, never after — the same
@@ -1299,10 +1470,15 @@ async fn run_terminal(
             report_viewport_if_changed(&mut state, rendered.selected_tab, terminal.backend_mut())
                 .await;
             advance_takeover_geometry_confirmation(&mut state);
+            advance_split_drag_geometry_confirmation(&mut state);
         }
 
         let now = Instant::now();
-        let mut wait = input_progress_wait(state.ui.toast_timeout(now), input_progress_until, now);
+        let notice_wait = match (state.ui.toast_timeout(now), state.ui.status_timeout(now)) {
+            (Some(toast), Some(status)) => Some(toast.min(status)),
+            (toast, status) => toast.or(status),
+        };
+        let mut wait = input_progress_wait(notice_wait, input_progress_until, now);
         // Nothing external will wake the loop to ask again, so the next ask has
         // to be one of the things the input poll waits on.
         let until_poll =
@@ -1336,6 +1512,9 @@ async fn run_terminal(
         }
         if let Some(deadline) = selection_autoscroll_deadline(&state) {
             let remaining = deadline.saturating_duration_since(now);
+            wait = Some(wait.map_or(remaining, |wait| wait.min(remaining)));
+        }
+        if let Some(remaining) = split_drag_pump_delay(&state, now) {
             wait = Some(wait.map_or(remaining, |wait| wait.min(remaining)));
         }
         if let Some(first) = terminal.backend_mut().poll_input(wait)? {
@@ -1499,6 +1678,23 @@ fn drain_events(receiver: &Receiver<AppEvent>, state: &mut TuiState) {
                 });
                 if current {
                     cancel_takeover_geometry_for_domain(state, &domain_name);
+                    if state
+                        .split_drag_resync
+                        .as_ref()
+                        .is_some_and(|resync| resync.cache_key.0 == domain_name)
+                    {
+                        state.split_drag_resync = None;
+                        if state.ui.status == "Divider resize is resyncing" {
+                            state.ui.status.clear();
+                        }
+                    }
+                    if state
+                        .split_drag_geometry
+                        .as_ref()
+                        .is_some_and(|preview| preview.cache_key.0 == domain_name)
+                    {
+                        cancel_split_drag_geometry(state, false);
+                    }
                     connection_changed = true;
                     state
                         .connection_generations
@@ -1523,6 +1719,46 @@ fn drain_events(receiver: &Receiver<AppEvent>, state: &mut TuiState) {
                     state
                         .followed_views
                         .retain(|(domain, _), _| domain != &domain_name);
+                    state.dirty = true;
+                }
+            }
+            AppEvent::SplitDragViewportFinished {
+                cache_key,
+                local_tab_id,
+                epoch,
+                connection_generation,
+                sent,
+                result,
+            } => finish_split_drag_viewport_request(
+                state,
+                cache_key,
+                local_tab_id,
+                epoch,
+                connection_generation,
+                sent,
+                result,
+            ),
+            AppEvent::SplitDragResyncFinished { key, result } => {
+                if state.split_drag_resync.as_ref() == Some(&key) {
+                    state.split_drag_resync = None;
+                    let current_generation = state
+                        .domains
+                        .get(&key.cache_key.0)
+                        .and_then(|domain| domain.connection_generation());
+                    if current_generation != Some(key.connection_generation) {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => {
+                            if state.ui.status == "Divider resize is resyncing" {
+                                state.ui.status.clear();
+                            }
+                            state.terminal_repaint_pending = true;
+                        }
+                        Err(err) => {
+                            state.ui.status = format!("Divider resize recovery failed: {err}");
+                        }
+                    }
                     state.dirty = true;
                 }
             }
@@ -1605,7 +1841,7 @@ fn prepare_active_native_viewport(
     area: ratatui::layout::Rect,
     screen: ScreenSize,
     force: bool,
-    preview_epoch: Option<u64>,
+    preview: Option<NativeViewportPreview>,
 ) -> Option<ClientViewport> {
     let (domain_name, domain, tab, remote_tab_id) = state.active_tab()?;
     if !force && domain.owns_remote_viewport(tab.tab_id()) != Some(true) {
@@ -1651,14 +1887,22 @@ fn prepare_active_native_viewport(
     for pane in &panes {
         let handle = Mux::get().get_pane(pane.pane_id)?;
         let client = handle.downcast_ref::<ClientPane>()?;
-        if let Some(epoch) = preview_epoch {
-            client.preview_frontend_geometry(epoch, pane.size);
-            state.takeover_previews.record(
-                &(domain_name.clone(), remote_tab_id),
-                epoch,
-                pane.pane_id,
-                pane.size,
-            );
+        if let Some(preview) = preview {
+            let epoch = preview.epoch();
+            match preview {
+                NativeViewportPreview::Takeover(_) => {
+                    client.preview_frontend_geometry(epoch, pane.size);
+                    state.takeover_previews.record(
+                        &(domain_name.clone(), remote_tab_id),
+                        epoch,
+                        pane.pane_id,
+                        pane.size,
+                    );
+                }
+                NativeViewportPreview::SplitDrag(_) => {
+                    client.preview_live_frontend_geometry(epoch, pane.size);
+                }
+            }
         } else {
             client.adopt_frontend_geometry(pane.size);
         }
@@ -1759,6 +2003,7 @@ fn begin_takeover_geometry_confirmation(
     let ClientViewport::Native { size, panes } = viewport else {
         return;
     };
+    let started_at = Instant::now();
     let visible_pane_ids = state
         .layout
         .panes
@@ -1767,16 +2012,31 @@ fn begin_takeover_geometry_confirmation(
         .collect::<Vec<_>>();
     let visible_panes = visible_takeover_targets(&visible_pane_ids, panes);
     state.takeover_geometry_confirmations.insert(
-        cache_key,
+        cache_key.clone(),
         TakeoverGeometryConfirmation {
             epoch,
+            started_at,
             screen_size,
             root_size: *size,
-            panes: visible_panes,
+            panes: visible_panes.clone(),
             acknowledged_panes: panes.iter().map(|pane| (pane.pane_id, pane.size)).collect(),
             access_generation,
             ready_since: None,
+            last_wait_reason: None,
         },
+    );
+    mux::zoom_trace!(
+        "tui.takeover.begin tab={}/r{} epoch={} access_gen={} root={} panes=[{}]",
+        cache_key.0,
+        cache_key.1,
+        epoch,
+        access_generation,
+        mux::geometrytrace::size(size),
+        visible_panes
+            .iter()
+            .map(|(pane_id, size)| format!("{}:{}", pane_id, mux::geometrytrace::size(size)))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     state.redraw_until = Some(Instant::now() + RESIZE_REDRAW_WINDOW);
     state.dirty = true;
@@ -1795,6 +2055,510 @@ fn visible_takeover_targets(
                 .map(|pane| (pane.pane_id, pane.size))
         })
         .collect()
+}
+
+fn finish_split_drag_preview_panes(
+    preview: &SplitDragGeometryPreview,
+    confirmed: Option<&[(PaneId, TerminalSize)]>,
+) {
+    for (pane_id, size) in &preview.touched_panes {
+        let succeeded = confirmed.is_some_and(|panes| {
+            panes.iter().any(|(confirmed_id, confirmed_size)| {
+                confirmed_id == pane_id && confirmed_size == size
+            })
+        });
+        if let Some(handle) = Mux::get().get_pane(*pane_id) {
+            if let Some(client) = handle.downcast_ref::<ClientPane>() {
+                client.finish_frontend_geometry_preview(preview.epoch, *size, succeeded);
+            }
+        }
+    }
+}
+
+fn schedule_split_drag_resync(preview: &SplitDragGeometryPreview, state: &mut TuiState) {
+    let Some(domain) = state.domains.get(&preview.cache_key.0).cloned() else {
+        return;
+    };
+    if domain.connection_generation() != Some(preview.connection_generation) {
+        return;
+    }
+    let key = SplitDragResyncKey {
+        cache_key: preview.cache_key.clone(),
+        local_tab_id: preview.local_tab_id,
+        epoch: preview.epoch,
+        connection_generation: preview.connection_generation,
+    };
+    state.split_drag_resync = Some(key.clone());
+    state
+        .ui
+        .set_persistent_status("Divider resize is resyncing");
+    promise::spawn::spawn(async move {
+        let result = domain.resync().await.map_err(|err| format!("{err:#}"));
+        send_event(AppEvent::SplitDragResyncFinished { key, result });
+        Ok::<(), anyhow::Error>(())
+    })
+    .detach();
+}
+
+fn cancel_split_drag_geometry(state: &mut TuiState, resync: bool) {
+    let Some(preview) = state.split_drag_geometry.take() else {
+        return;
+    };
+    finish_split_drag_preview_panes(&preview, None);
+    if resync {
+        schedule_split_drag_resync(&preview, state);
+    }
+    log::debug!(
+        target: "zoomtrace",
+        "tui.split_drag.cancel tab={}/r{} epoch={} resync={resync}",
+        preview.local_tab_id,
+        preview.cache_key.1,
+        preview.epoch,
+    );
+    state.dirty = true;
+}
+
+fn complete_split_drag_geometry(state: &mut TuiState, epoch: u64) {
+    let Some(preview) = state.split_drag_geometry.take() else {
+        return;
+    };
+    if preview.epoch != epoch {
+        state.split_drag_geometry = Some(preview);
+        return;
+    }
+    let confirmed = preview
+        .latest
+        .as_ref()
+        .map(|latest| latest.acknowledged_panes.as_slice());
+    finish_split_drag_preview_panes(&preview, confirmed);
+    log::debug!(
+        target: "zoomtrace",
+        "tui.split_drag.complete tab={}/r{} epoch={}",
+        preview.local_tab_id,
+        preview.cache_key.1,
+        preview.epoch,
+    );
+    state.terminal_repaint_pending = true;
+    state.dirty = true;
+}
+
+fn begin_split_drag_geometry(state: &mut TuiState) -> Result<u64> {
+    let (domain_name, domain, tab, remote_tab_id) =
+        state.active_tab().context("no live tab selected")?;
+    let connection_generation = domain
+        .connection_generation()
+        .context("terminal connection generation is unavailable")?;
+    let cache_key = (domain_name, remote_tab_id);
+    if let Some(preview) = state.split_drag_geometry.as_ref() {
+        if preview.cache_key == cache_key
+            && preview.local_tab_id == tab.tab_id()
+            && preview.connection_generation == connection_generation
+            && preview.phase == SplitDragGeometryPhase::Dragging
+        {
+            return Ok(preview.epoch);
+        }
+    }
+
+    if let Some(prior) = state.split_drag_geometry.take() {
+        if matches!(prior.phase, SplitDragGeometryPhase::Confirming { .. }) {
+            let confirmed = prior
+                .latest
+                .as_ref()
+                .map(|latest| latest.acknowledged_panes.as_slice());
+            finish_split_drag_preview_panes(&prior, confirmed);
+        } else {
+            finish_split_drag_preview_panes(&prior, None);
+            schedule_split_drag_resync(&prior, state);
+        }
+    }
+
+    let epoch = state.allocate_split_drag_epoch();
+    state.split_drag_geometry = Some(SplitDragGeometryPreview {
+        epoch,
+        cache_key: cache_key.clone(),
+        local_tab_id: tab.tab_id(),
+        connection_generation,
+        phase: SplitDragGeometryPhase::Dragging,
+        latest: None,
+        pending: None,
+        in_flight: None,
+        last_acknowledged: None,
+        last_sent_at: None,
+        touched_panes: HashMap::new(),
+    });
+    log::debug!(
+        target: "zoomtrace",
+        "tui.split_drag.begin tab={}/r{} epoch={} gen={connection_generation}",
+        tab.tab_id(),
+        remote_tab_id,
+        epoch,
+    );
+    Ok(epoch)
+}
+
+fn record_split_drag_geometry(state: &mut TuiState, viewport: &ClientViewport) {
+    let ClientViewport::Native { panes, .. } = viewport else {
+        return;
+    };
+    let visible_pane_ids = state
+        .layout
+        .panes
+        .iter()
+        .map(|pane| pane.pane_id)
+        .collect::<Vec<_>>();
+    let prepared = PreparedSplitDragGeometry {
+        viewport: viewport.clone(),
+        visible_panes: visible_takeover_targets(&visible_pane_ids, panes),
+        acknowledged_panes: panes.iter().map(|pane| (pane.pane_id, pane.size)).collect(),
+    };
+    let Some(preview) = state.split_drag_geometry.as_mut() else {
+        return;
+    };
+    if matches!(preview.phase, SplitDragGeometryPhase::Confirming { .. }) {
+        return;
+    }
+    for (pane_id, size) in &prepared.acknowledged_panes {
+        preview.touched_panes.insert(*pane_id, *size);
+    }
+    preview.latest = Some(prepared.clone());
+    preview.pending = split_drag_target_is_owed(
+        preview.in_flight.as_ref(),
+        preview.last_acknowledged.as_ref(),
+        &prepared.viewport,
+    )
+    .then_some(prepared);
+}
+
+fn finish_split_drag(state: &mut TuiState) {
+    let active_epoch = state.active_split_drag_epoch();
+    let Some(preview) = state.split_drag_geometry.as_mut() else {
+        return;
+    };
+    if active_epoch != Some(preview.epoch) {
+        cancel_split_drag_geometry(state, true);
+        return;
+    }
+    if preview.phase == SplitDragGeometryPhase::Dragging {
+        preview.phase = SplitDragGeometryPhase::Finishing;
+        if let Some(latest) = preview.latest.as_ref() {
+            if split_drag_target_is_owed(
+                preview.in_flight.as_ref(),
+                preview.last_acknowledged.as_ref(),
+                &latest.viewport,
+            ) {
+                preview.pending = Some(latest.clone());
+            }
+        }
+        state.dirty = true;
+    }
+}
+
+fn maybe_begin_split_drag_confirmation(state: &mut TuiState) {
+    let Some(preview) = state.split_drag_geometry.as_mut() else {
+        return;
+    };
+    if preview.phase != SplitDragGeometryPhase::Finishing
+        || preview.in_flight.is_some()
+        || preview.pending.is_some()
+        || preview.latest.as_ref().map(|latest| &latest.viewport)
+            != preview.last_acknowledged.as_ref()
+    {
+        return;
+    }
+    let now = Instant::now();
+    preview.phase = SplitDragGeometryPhase::Confirming {
+        committed_at: now,
+        ready_since: None,
+    };
+    let redraw_until = now + SPLIT_DRAG_CONFIRM_TIMEOUT;
+    state.redraw_until = Some(
+        state
+            .redraw_until
+            .map_or(redraw_until, |existing| existing.max(redraw_until)),
+    );
+    state.dirty = true;
+}
+
+fn pump_split_drag_geometry(state: &mut TuiState) {
+    let Some(preview) = state.split_drag_geometry.as_mut() else {
+        return;
+    };
+    if !split_drag_can_pump(
+        preview.phase,
+        preview.in_flight.is_some(),
+        preview.pending.is_some(),
+    ) {
+        maybe_begin_split_drag_confirmation(state);
+        return;
+    }
+    let now = Instant::now();
+    let release_is_waiting = preview.phase == SplitDragGeometryPhase::Finishing;
+    if !release_is_waiting
+        && preview
+            .last_sent_at
+            .is_some_and(|sent| now.duration_since(sent) < SPLIT_DRAG_RPC_INTERVAL)
+    {
+        return;
+    }
+    let Some(prepared) = preview.pending.take() else {
+        return;
+    };
+    let cache_key = preview.cache_key.clone();
+    let local_tab_id = preview.local_tab_id;
+    let epoch = preview.epoch;
+    let connection_generation = preview.connection_generation;
+    let sent = prepared.viewport;
+    preview.in_flight = Some(sent.clone());
+    preview.last_sent_at = Some(now);
+
+    let Some(domain) = state.domains.get(&cache_key.0).cloned() else {
+        cancel_split_drag_geometry(state, false);
+        return;
+    };
+    if domain.connection_generation() != Some(connection_generation) {
+        cancel_split_drag_geometry(state, false);
+        return;
+    }
+    for candidate in state.domains.values() {
+        if candidate.domain_id() != domain.domain_id() {
+            candidate.clear_frontend_recovery_intent(FrontendRecoverySlot::Primary);
+        }
+    }
+    if let Err(err) =
+        domain.set_frontend_recovery_intent(FrontendRecoverySlot::Primary, local_tab_id, &sent)
+    {
+        log::trace!("recording TUI divider recovery intent: {err:#}");
+    }
+    log::debug!(
+        target: "zoomtrace",
+        "tui.split_drag.send tab={}/r{} epoch={} finishing={}",
+        local_tab_id,
+        cache_key.1,
+        epoch,
+        matches!(
+            state
+                .split_drag_geometry
+                .as_ref()
+                .map(|preview| preview.phase),
+            Some(SplitDragGeometryPhase::Finishing)
+        ),
+    );
+    promise::spawn::spawn(async move {
+        let result = domain
+            .set_client_viewport(local_tab_id, sent.clone())
+            .await
+            .map_err(|err| format!("{err:#}"));
+        send_event(AppEvent::SplitDragViewportFinished {
+            cache_key,
+            local_tab_id,
+            epoch,
+            connection_generation,
+            sent,
+            result,
+        });
+        Ok::<(), anyhow::Error>(())
+    })
+    .detach();
+}
+
+fn finish_split_drag_viewport_request(
+    state: &mut TuiState,
+    cache_key: (String, TabId),
+    local_tab_id: TabId,
+    epoch: u64,
+    connection_generation: u64,
+    sent: ClientViewport,
+    result: std::result::Result<codec::ClientViewportState, String>,
+) {
+    let valid = state.split_drag_geometry.as_ref().is_some_and(|preview| {
+        preview.cache_key == cache_key
+            && preview.local_tab_id == local_tab_id
+            && preview.epoch == epoch
+            && preview.connection_generation == connection_generation
+            && preview.in_flight.as_ref() == Some(&sent)
+    });
+    if !valid {
+        return;
+    }
+    let Some(domain) = state.domains.get(&cache_key.0).cloned() else {
+        cancel_split_drag_geometry(state, false);
+        return;
+    };
+    let Ok(response) = result else {
+        let err = result.unwrap_err();
+        cancel_split_drag_geometry(state, true);
+        state.ui.status = format!("Divider resize: {err}");
+        return;
+    };
+    if domain.connection_generation() != Some(connection_generation)
+        || domain.owns_remote_viewport(local_tab_id) != Some(true)
+    {
+        cancel_split_drag_geometry(state, true);
+        state.ui.status = "Divider resize lost terminal ownership".to_string();
+        return;
+    }
+
+    state.last_viewports.insert(
+        cache_key.clone(),
+        Some((sent.clone(), true, Some(response.access.mode))),
+    );
+    adopt_local_tab_size(
+        local_tab_id,
+        local_tab_size(&domain, local_tab_id, sent.size(), response.canonical_size),
+    );
+    if response.access.mode == codec::FrontendAccessMode::Handoff {
+        state
+            .handoff_geometry_ready
+            .insert(cache_key.clone(), response.access.generation);
+    }
+    let final_target_was_acknowledged = state.split_drag_geometry.as_ref().is_some_and(|preview| {
+        preview.phase == SplitDragGeometryPhase::Finishing
+            && preview
+                .latest
+                .as_ref()
+                .is_some_and(|latest| latest.viewport == sent)
+    });
+    // A TabResized-triggered resync can finish beside the final viewport ack.
+    // For an unchanged topology it normally preserves local split geometry,
+    // but the TUI's per-pane chrome can leave a one-cell reconstruction
+    // difference. Reapply only the *final* acknowledged frame set; doing this
+    // for intermediate live acks would pull the divider backwards under the
+    // pointer.
+    if final_target_was_acknowledged {
+        if let (Some(tab), ClientViewport::Native { panes, .. }) =
+            (Mux::get().get_tab(local_tab_id), &sent)
+        {
+            let frames = panes
+                .iter()
+                .map(|pane| (pane.pane_id, pane.frame))
+                .collect::<Vec<_>>();
+            if let Err(err) = tab.rebuild_splits_sizes_from_frontend_frames(&frames) {
+                log::warn!("restoring final TUI divider geometry: {err:#}");
+            }
+        }
+    }
+    if let Some(preview) = state
+        .split_drag_geometry
+        .as_mut()
+        .filter(|preview| preview.epoch == epoch)
+    {
+        preview.in_flight = None;
+        preview.last_acknowledged = Some(sent);
+    }
+    state.dirty = true;
+    pump_split_drag_geometry(state);
+}
+
+fn cancel_inactive_split_drag_geometry(state: &mut TuiState) {
+    let Some(epoch) = state
+        .split_drag_geometry
+        .as_ref()
+        .map(|preview| preview.epoch)
+    else {
+        return;
+    };
+    if state.active_split_drag_epoch() != Some(epoch) {
+        cancel_split_drag_geometry(state, true);
+    }
+}
+
+fn active_layout_matches_split_drag(
+    state: &TuiState,
+    tab: &Arc<Tab>,
+    prepared: &PreparedSplitDragGeometry,
+) -> bool {
+    if tab.get_size() != prepared.viewport.size() {
+        return false;
+    }
+    let Some(screen) = state.screen_size else {
+        return false;
+    };
+    let current = state
+        .layout
+        .panes
+        .iter()
+        .map(|pane| {
+            (
+                pane.pane_id,
+                terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    pane_geometry_matches_confirmation(&current, &prepared.visible_panes)
+}
+
+fn advance_split_drag_geometry_confirmation(state: &mut TuiState) {
+    let Some(preview) = state.split_drag_geometry.clone() else {
+        return;
+    };
+    let SplitDragGeometryPhase::Confirming {
+        committed_at,
+        mut ready_since,
+    } = preview.phase
+    else {
+        return;
+    };
+    let Some(prepared) = preview.latest.as_ref() else {
+        cancel_split_drag_geometry(state, true);
+        return;
+    };
+    let Some((_, _, tab, _)) = state.active_tab() else {
+        cancel_split_drag_geometry(state, true);
+        return;
+    };
+    if state.active_split_drag_epoch() != Some(preview.epoch)
+        || !active_layout_matches_split_drag(state, &tab, prepared)
+    {
+        cancel_split_drag_geometry(state, true);
+        return;
+    }
+
+    let mut geometry_ready = !prepared.visible_panes.is_empty();
+    let mut snapshot_ready = geometry_ready;
+    for (pane_id, size) in &prepared.visible_panes {
+        let readiness = Mux::get()
+            .get_pane(*pane_id)
+            .and_then(|pane| {
+                pane.downcast_ref::<ClientPane>().map(|client| {
+                    (
+                        client.server_geometry_matches(*size),
+                        client.prime_frontend_geometry(*size),
+                    )
+                })
+            })
+            .unwrap_or((false, false));
+        geometry_ready &= readiness.0;
+        snapshot_ready &= readiness.1;
+    }
+
+    let now = Instant::now();
+    if takeover_geometry_settled(snapshot_ready, now, &mut ready_since) {
+        complete_split_drag_geometry(state, preview.epoch);
+        return;
+    }
+    if now.duration_since(committed_at) >= SPLIT_DRAG_CONFIRM_TIMEOUT {
+        if geometry_ready {
+            // The server has committed the final PTY size. A slow line fetch is
+            // not a geometry failure and must not launch a whole-domain resync:
+            // the live preview has already normalized retained rows to this
+            // width, and the normal pane poll will replace them as they arrive.
+            complete_split_drag_geometry(state, preview.epoch);
+        } else {
+            state.ui.status = "Divider resize is resyncing".to_string();
+            cancel_split_drag_geometry(state, true);
+        }
+        return;
+    }
+    if let Some(current) = state
+        .split_drag_geometry
+        .as_mut()
+        .filter(|current| current.epoch == preview.epoch)
+    {
+        current.phase = SplitDragGeometryPhase::Confirming {
+            committed_at,
+            ready_since,
+        };
+    }
 }
 
 fn cancel_takeover_geometry_confirmation(
@@ -1939,11 +2703,46 @@ fn advance_takeover_geometry_confirmation(state: &mut TuiState) {
         })
         && state.takeover_epochs.current(&cache_key.0, cache_key.1) == Some(confirmation.epoch);
     if !still_owned {
+        mux::zoom_trace!(
+            "tui.takeover.cancel tab={}/r{} epoch={} reason=ownership access={:?} owns={:?}",
+            cache_key.0,
+            cache_key.1,
+            confirmation.epoch,
+            access,
+            domain.owns_remote_viewport(tab.tab_id())
+        );
         cancel_takeover_geometry_confirmation(state, &cache_key, &confirmation);
         return;
     }
 
     if !active_layout_matches_takeover(state, &tab, &confirmation) {
+        if mux::geometrytrace::trace_enabled() {
+            let screen = state.screen_size;
+            let current = state
+                .layout
+                .panes
+                .iter()
+                .map(|pane| {
+                    let size = screen.map(|screen| {
+                        terminal_size(pane.rect.width as usize, pane.rect.height as usize, screen)
+                    });
+                    format!("{}:{size:?}", pane.pane_id)
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            mux::zoom_trace!(
+                "tui.takeover.cancel tab={}/r{} epoch={} reason=layout root={:?}/{:?} screen={:?}/{:?} current=[{}] expected={:?}",
+                cache_key.0,
+                cache_key.1,
+                confirmation.epoch,
+                tab.get_size(),
+                confirmation.root_size,
+                state.screen_size,
+                confirmation.screen_size,
+                current,
+                confirmation.panes
+            );
+        }
         cancel_takeover_geometry_confirmation(state, &cache_key, &confirmation);
         let now = Instant::now();
         state.resize_settles_at = Some(now + RESIZE_SETTLE);
@@ -1952,15 +2751,71 @@ fn advance_takeover_geometry_confirmation(state: &mut TuiState) {
     }
 
     let mut ready = !confirmation.panes.is_empty();
+    let mut waiting = Vec::new();
     for (pane_id, size) in &confirmation.panes {
-        let pane_ready = Mux::get()
-            .get_pane(*pane_id)
-            .and_then(|pane| {
-                pane.downcast_ref::<ClientPane>()
-                    .map(|client| client.prime_frontend_geometry(*size))
-            })
+        let pane = Mux::get().get_pane(*pane_id);
+        let client = pane
+            .as_ref()
+            .and_then(|pane| pane.downcast_ref::<ClientPane>());
+        let pane_ready = client
+            .map(|client| client.prime_frontend_geometry(*size))
             .unwrap_or(false);
+        if !pane_ready {
+            let reason = client
+                .and_then(|client| client.frontend_geometry_mismatch(*size))
+                .unwrap_or_else(|| {
+                    if pane.is_some() {
+                        "render rows pending".to_string()
+                    } else {
+                        "pane missing".to_string()
+                    }
+                });
+            waiting.push(format!("{pane_id}:{reason}"));
+        }
         ready &= pane_ready;
+    }
+
+    if !ready {
+        let reason = if confirmation.panes.is_empty() {
+            "no visible pane targets".to_string()
+        } else {
+            waiting.join("; ")
+        };
+        if confirmation.last_wait_reason.as_deref() != Some(reason.as_str()) {
+            log::warn!(
+                "TUI takeover waiting tab={}/r{} epoch={} elapsed={:?}: {}",
+                cache_key.0,
+                cache_key.1,
+                confirmation.epoch,
+                confirmation.started_at.elapsed(),
+                reason
+            );
+            mux::zoom_trace!(
+                "tui.takeover.wait tab={}/r{} epoch={} elapsed={:?} reason={}",
+                cache_key.0,
+                cache_key.1,
+                confirmation.epoch,
+                confirmation.started_at.elapsed(),
+                reason
+            );
+            confirmation.last_wait_reason = Some(reason);
+        }
+    } else if confirmation.ready_since.is_none() {
+        log::warn!(
+            "TUI takeover ready tab={}/r{} epoch={} elapsed={:?}",
+            cache_key.0,
+            cache_key.1,
+            confirmation.epoch,
+            confirmation.started_at.elapsed()
+        );
+        mux::zoom_trace!(
+            "tui.takeover.ready tab={}/r{} epoch={} elapsed={:?}",
+            cache_key.0,
+            cache_key.1,
+            confirmation.epoch,
+            confirmation.started_at.elapsed()
+        );
+        confirmation.last_wait_reason = None;
     }
 
     if !takeover_geometry_settled(ready, Instant::now(), &mut confirmation.ready_since) {
@@ -1983,6 +2838,20 @@ fn advance_takeover_geometry_confirmation(state: &mut TuiState) {
         .handoff_geometry_ready
         .insert(cache_key.clone(), confirmation.access_generation);
     state.takeover_geometry_confirmations.remove(&cache_key);
+    log::warn!(
+        "TUI takeover complete tab={}/r{} epoch={} elapsed={:?}",
+        cache_key.0,
+        cache_key.1,
+        confirmation.epoch,
+        confirmation.started_at.elapsed()
+    );
+    mux::zoom_trace!(
+        "tui.takeover.complete tab={}/r{} epoch={} elapsed={:?}",
+        cache_key.0,
+        cache_key.1,
+        confirmation.epoch,
+        confirmation.started_at.elapsed()
+    );
     state.dirty = true;
 }
 
@@ -2058,6 +2927,12 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
         ClientViewport::CellGrid { size }
     };
     let cache_key = (domain_name.clone(), remote_tab_id);
+    // Divider geometry has its own non-blocking latest-only stream. Letting
+    // the ordinary reporter run as well would create a second ordered path
+    // and allow stale mouse positions to alternate on screen.
+    if state.split_drag_geometry.is_some() {
+        return;
+    }
     let handoff_generation = domain
         .remote_access_state()
         .filter(|access| access.mode == codec::FrontendAccessMode::Handoff)
@@ -2432,7 +3307,13 @@ async fn claim_active_viewport(state: &mut TuiState) -> Result<Arc<Tab>> {
     let cache_key = (domain_name.clone(), remote_tab_id);
     let viewport = if handoff {
         let area = state.layout.screen;
-        match prepare_active_native_viewport(state, area, screen, true, Some(epoch)) {
+        match prepare_active_native_viewport(
+            state,
+            area,
+            screen,
+            true,
+            Some(NativeViewportPreview::Takeover(epoch)),
+        ) {
             Some(viewport) => viewport,
             None => {
                 state
@@ -2683,8 +3564,12 @@ async fn dispatch_action(state: &mut TuiState, action: Action) -> Result<()> {
         }
         Action::ResizeSplit { split_index, delta } => {
             let tab = claim_active_viewport(state).await?;
+            begin_split_drag_geometry(state)?;
             tab.resize_split_by(split_index, delta);
-            state.clear_selected_viewport_cache();
+        }
+        Action::FinishSplitResize => {
+            finish_split_drag(state);
+            pump_split_drag_geometry(state);
         }
         Action::EnterCopyMode => enter_copy_mode(state),
         Action::LeaveCopyMode => {
@@ -2797,12 +3682,13 @@ async fn dispatch_action(state: &mut TuiState, action: Action) -> Result<()> {
 /// Drawing, moving the cursor and changing a value all index this one list.
 /// They used to agree only by hand-counted index, which is why three settings
 /// added since could be changed by nobody: the cursor stopped at four.
-pub const SETTINGS: [(&str, &str); 9] = [
+pub const SETTINGS: [(&str, &str); 10] = [
     ("Appearance", "Theme"),
     ("Appearance", "Sidebar"),
     ("Appearance", "Pane nav bar"),
     ("Appearance", "Pane borders"),
     ("Appearance", "Pane scrollbars"),
+    ("Appearance", "Bottom status bar"),
     ("Input", "Application mouse"),
     ("Input", "Copy on select"),
     ("Input", "Touch targets"),
@@ -2817,15 +3703,16 @@ pub fn setting_value(settings: &TuiConfig, sidebar_visible: bool, index: usize) 
         2 => (String::new(), settings.pane_nav_bar),
         3 => (String::new(), settings.pane_borders),
         4 => (String::new(), settings.pane_scrollbars),
-        5 => (String::new(), settings.mouse),
-        6 => (String::new(), settings.copy_on_select),
+        5 => (String::new(), settings.show_status_bar),
+        6 => (String::new(), settings.mouse),
+        7 => (String::new(), settings.copy_on_select),
         // Undecided is a real state here: it means "follow the layout", which
         // is neither on nor off and has to say so.
-        7 => match settings.touch_targets {
+        8 => match settings.touch_targets {
             None => ("Auto".to_string(), false),
             Some(value) => (String::new(), value),
         },
-        8 => (settings.scroll_lines.to_string(), false),
+        9 => (settings.scroll_lines.to_string(), false),
         _ => (String::new(), false),
     }
 }
@@ -2858,11 +3745,16 @@ fn adjust_setting(state: &mut TuiState, index: usize, delta: isize) -> Result<()
             state.ui.pane_scrollbars = state.settings.pane_scrollbars;
             state.clear_selected_viewport_cache();
         }
-        5 => state.settings.mouse = !state.settings.mouse,
-        6 => state.settings.copy_on_select = !state.settings.copy_on_select,
+        5 => {
+            state.settings.show_status_bar = !state.settings.show_status_bar;
+            state.ui.show_status_bar = state.settings.show_status_bar;
+            state.clear_selected_viewport_cache();
+        }
+        6 => state.settings.mouse = !state.settings.mouse,
+        7 => state.settings.copy_on_select = !state.settings.copy_on_select,
         // Cycles through the third state rather than skipping it: following the
         // layout is the default and has to be reachable again.
-        7 => {
+        8 => {
             state.settings.touch_targets = match state.settings.touch_targets {
                 None => Some(true),
                 Some(true) => Some(false),
@@ -2871,7 +3763,7 @@ fn adjust_setting(state: &mut TuiState, index: usize, delta: isize) -> Result<()
             state.ui.touch_targets = state.settings.touch_targets;
             state.clear_selected_viewport_cache();
         }
-        8 => {
+        9 => {
             state.settings.scroll_lines =
                 (state.settings.scroll_lines as isize + delta).clamp(1, 20) as usize;
         }
@@ -5105,6 +5997,42 @@ fn handle_mouse(event: TermwizMouseEvent, state: &mut TuiState) {
     }
 
     if wheel {
+        let direction = if current.contains(MouseButtons::WHEEL_POSITIVE) {
+            -1
+        } else {
+            1
+        };
+        if state.layout.tab_bar.contains((x, y).into())
+            && !state
+                .layout
+                .sidebar_toggle
+                .is_some_and(|toggle| toggle.contains((x, y).into()))
+        {
+            state.ui.tab_scroll = state
+                .layout
+                .tab_scroll_start
+                .saturating_add_signed(direction);
+            state.queue(Action::SelectRelativeTab(direction));
+            state.last_mouse_buttons = current;
+            state.dirty = true;
+            return;
+        }
+        if let Some((pane_id, start)) = state.layout.panes.iter().find_map(|pane| {
+            pane.nav.as_ref().and_then(|nav| {
+                nav.rect
+                    .contains((x, y).into())
+                    .then_some((pane.pane_id, nav.scroll_start))
+            })
+        }) {
+            state
+                .ui
+                .pane_nav_scroll
+                .insert(pane_id, start.saturating_add_signed(direction));
+            activate_relative_pane_in_stack(state, pane_id, direction);
+            state.last_mouse_buttons = current;
+            state.dirty = true;
+            return;
+        }
         if state
             .layout
             .sidebar_body
@@ -5179,6 +6107,13 @@ fn handle_mouse(event: TermwizMouseEvent, state: &mut TuiState) {
                 TabBarControl::Menu => open_main_menu(state, x, y),
                 TabBarControl::NewTab => state.queue(Action::NewTab),
             },
+            Some(HitTarget::TabScroll(direction)) => {
+                state.ui.tab_scroll = state
+                    .layout
+                    .tab_scroll_start
+                    .saturating_add_signed(direction);
+                state.queue(Action::SelectRelativeTab(direction));
+            }
             // Closing a tab takes the same confirmation the menu entry does.
             Some(HitTarget::CloseTab(tab_id)) => {
                 state.queue(Action::Confirm(DestructiveAction::CloseTab { tab_id }))
@@ -5210,6 +6145,20 @@ fn handle_mouse(event: TermwizMouseEvent, state: &mut TuiState) {
             // Closing a pane takes the same confirmation the menu entry does.
             Some(HitTarget::PaneNavClose(pane_id)) => {
                 state.queue(Action::Confirm(DestructiveAction::ClosePane { pane_id }))
+            }
+            Some(HitTarget::PaneNavScroll(pane_id, direction)) => {
+                let start = state
+                    .layout
+                    .panes
+                    .iter()
+                    .find(|pane| pane.pane_id == pane_id)
+                    .and_then(|pane| pane.nav.as_ref())
+                    .map_or(0, |nav| nav.scroll_start);
+                state
+                    .ui
+                    .pane_nav_scroll
+                    .insert(pane_id, start.saturating_add_signed(direction));
+                activate_relative_pane_in_stack(state, pane_id, direction);
             }
             Some(HitTarget::PaneTool(pane_id, tool)) => pane_tool(state, pane_id, tool),
             Some(HitTarget::Scrollbar(pane_id)) => {
@@ -5368,6 +6317,8 @@ fn handle_mouse(event: TermwizMouseEvent, state: &mut TuiState) {
             if let Err(err) = save_tui_settings(state) {
                 state.ui.status = format!("Saving TUI settings: {err:#}");
             }
+        } else if matches!(state.drag, Some(DragState::SplitResize { .. })) {
+            state.queue(Action::FinishSplitResize);
         } else if state.layout.content.contains((x, y).into()) {
             forward_mouse_to_pane(event.clone(), x, y, None, state);
         }
@@ -5461,6 +6412,23 @@ fn activate_pane_in_stack(state: &mut TuiState, pane_id: PaneId) {
         }
     }
     state.queue(Action::FocusPaneId(pane_id));
+}
+
+fn activate_relative_pane_in_stack(state: &mut TuiState, pane_id: PaneId, delta: isize) {
+    let Some((_, _, tab, _)) = state.active_tab() else {
+        return;
+    };
+    let stack = tab.pane_stack_tabs(pane_id);
+    if stack.len() < 2 {
+        return;
+    }
+    let current = stack.iter().position(|entry| entry.is_active).unwrap_or(0);
+    let target = current
+        .saturating_add_signed(delta.signum())
+        .min(stack.len() - 1);
+    if target != current {
+        activate_pane_in_stack(state, stack[target].pane_id);
+    }
 }
 
 /// Every pane tool acts on "the" pane, so the pane whose button was pressed has
@@ -5913,6 +6881,39 @@ mod tests {
             &mut ready_since
         ));
         assert!(ready_since.is_none());
+    }
+
+    #[test]
+    fn split_drag_stream_keeps_one_request_in_flight_and_replaces_pending_with_latest() {
+        let now = Instant::now();
+        let first = ClientViewport::CellGrid {
+            size: takeover_test_size(80, 24),
+        };
+        let latest = ClientViewport::CellGrid {
+            size: takeover_test_size(100, 24),
+        };
+
+        assert!(split_drag_can_pump(
+            SplitDragGeometryPhase::Dragging,
+            false,
+            true
+        ));
+        assert!(!split_drag_can_pump(
+            SplitDragGeometryPhase::Dragging,
+            true,
+            true
+        ));
+        assert!(!split_drag_can_pump(
+            SplitDragGeometryPhase::Confirming {
+                committed_at: now,
+                ready_since: None,
+            },
+            false,
+            true
+        ));
+        assert!(!split_drag_target_is_owed(Some(&first), None, &first));
+        assert!(split_drag_target_is_owed(Some(&first), None, &latest));
+        assert!(!split_drag_target_is_owed(None, Some(&latest), &latest));
     }
 
     #[test]

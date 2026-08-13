@@ -1,6 +1,8 @@
 use crate::domain::ClientInner;
 use crate::pane::mousestate::MouseState;
-use crate::pane::renderable::{RenderableInner, RenderableState, hydrate_lines};
+use crate::pane::renderable::{
+    hydrate_lines, FrontendPreviewPolicy, RenderableInner, RenderableState,
+};
 use anyhow::bail;
 use async_trait::async_trait;
 use codec::*;
@@ -9,8 +11,8 @@ use config::keyassignment::ScrollbackEraseMode;
 use futures::lock::Mutex as AsyncMutex;
 use mux::domain::DomainId;
 use mux::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
-    SearchResult, WithPaneLines, alloc_pane_id,
+    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
+    Pattern, SearchResult, WithPaneLines,
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -21,8 +23,8 @@ use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use termwiz::input::KeyEvent;
 use termwiz::surface::SequenceNo;
 use url::Url;
@@ -644,10 +646,26 @@ impl ClientPane {
     /// normal adoption this deliberately preserves cached rows and ignores
     /// older server dimensions until the final full viewport is confirmed.
     pub fn preview_frontend_geometry(&self, epoch: u64, size: TerminalSize) -> bool {
+        self.preview_frontend_geometry_with_policy(epoch, size, FrontendPreviewPolicy::PreserveRows)
+    }
+
+    /// Preview a divider that remains visible while it is moving. Retained
+    /// rows are normalized to the new width and refetched rather than being
+    /// interpreted as though their old cell storage already matched it.
+    pub fn preview_live_frontend_geometry(&self, epoch: u64, size: TerminalSize) -> bool {
+        self.preview_frontend_geometry_with_policy(epoch, size, FrontendPreviewPolicy::LiveResize)
+    }
+
+    fn preview_frontend_geometry_with_policy(
+        &self,
+        epoch: u64,
+        size: TerminalSize,
+        policy: FrontendPreviewPolicy,
+    ) -> bool {
         *self.requested_size.lock() = Some(size);
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
-        let changed = inner.begin_frontend_preview(epoch, size);
+        let changed = inner.begin_frontend_preview(epoch, size, policy);
         if changed {
             inner.update_last_send();
         }
@@ -1433,7 +1451,7 @@ mod test {
 
 #[cfg(test)]
 mod palette_delivery_tests {
-    use super::{PaletteDelivery, application_palette_transition};
+    use super::{application_palette_transition, PaletteDelivery};
     use wezterm_term::color::ColorPalette;
 
     fn palette(fg: f32) -> ColorPalette {

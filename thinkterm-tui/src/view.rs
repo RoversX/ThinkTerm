@@ -83,9 +83,18 @@ impl PaneTool {
 #[derive(Clone, Debug)]
 pub struct PaneNav {
     pub rect: Rect,
+    pub scroll_start: usize,
     /// One entry per pane in this pane's stack, already positioned.
     pub tabs: Vec<PaneNavTab>,
+    pub overflow: Vec<TabOverflowButton>,
     pub tools: Vec<(Rect, PaneTool)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TabOverflowButton {
+    pub rect: Rect,
+    pub direction: isize,
+    pub hidden: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -113,10 +122,12 @@ pub enum HitTarget {
     Tab(TabId),
     CloseTab(TabId),
     TabControl(TabBarControl),
+    TabScroll(isize),
     Pane(PaneId),
     /// Show this pane, which is stacked behind the one currently drawn there.
     PaneNavTab(PaneId),
     PaneNavClose(PaneId),
+    PaneNavScroll(PaneId, isize),
     PaneTool(PaneId, PaneTool),
     Scrollbar(PaneId),
     Split(usize),
@@ -174,8 +185,8 @@ pub struct PaneView {
     pub scrollbar: Option<Rect>,
     /// The pane's own strip, when it had a row to spare for one.
     pub nav: Option<PaneNav>,
-    /// The frame drawn around the pane, when it has one. Encloses the grid, its
-    /// scrollbar and its nav bar.
+    /// The frame drawn around the pane, when it has one. It starts below the
+    /// pane nav layer and encloses only the grid and scrollbar.
     pub border: Option<Rect>,
     /// A split branch too short to show normal chrome and a useful grid. It is
     /// painted as an explicit compact pane instead of an orphaned output row.
@@ -208,8 +219,14 @@ pub struct ViewLayout {
     pub tab_bar: Rect,
     pub content: Rect,
     pub status: Rect,
+    /// The narrow-screen tree is painted over this terminal surface. Pane
+    /// geometry remains populated for viewport negotiation, but is neither
+    /// painted nor interactive until the tree is dismissed.
+    pub terminal_obscured: bool,
     pub tree_lines: Vec<TreeLine>,
     pub tabs: Vec<TabLine>,
+    pub tab_scroll_start: usize,
+    pub tab_overflow: Vec<TabOverflowButton>,
     /// Trailing tab-bar buttons, already positioned.
     pub tab_controls: Vec<(Rect, TabBarControl)>,
     pub panes: Vec<PaneView>,
@@ -236,8 +253,11 @@ impl Default for ViewLayout {
             tab_bar: Rect::default(),
             content: Rect::default(),
             status: Rect::default(),
+            terminal_obscured: false,
             tree_lines: vec![],
             tabs: vec![],
+            tab_scroll_start: 0,
+            tab_overflow: vec![],
             tab_controls: vec![],
             panes: vec![],
             splits: vec![],
@@ -293,9 +313,8 @@ pub fn compute_view(
     let narrow = view.class == ViewClass::Narrow;
     // A finger needs more than one row to land on reliably, so a screen being
     // pointed at with one spends a second row on the bar that carries every
-    // button — and buys that row back from the footer, which without a keyboard
-    // was spending it to name key chords. Messages still get a row, but only
-    // while there is a message to put in it.
+    // button. Transient messages and mode hints are overlays; only the explicit
+    // bottom-bar preference may reserve a footer row.
     //
     // Tying this to the layout being narrow is only ever a guess: the same
     // phone turned sideways reports enough columns to look like a desktop and
@@ -306,11 +325,7 @@ pub fn compute_view(
     } else {
         u16::from(area.height >= 3)
     };
-    let status_height = if touch {
-        u16::from(area.height >= 2 && (!ui.status.is_empty() || ui.toast.is_some()))
-    } else {
-        u16::from(area.height >= 2)
-    };
+    let status_height = u16::from(ui.show_status_bar && area.height >= 2);
     view.status = Rect::new(
         area.x,
         area.bottom().saturating_sub(status_height),
@@ -468,14 +483,25 @@ pub fn compute_view(
     } else {
         view.tab_bar
     };
-    compute_tabs(model, tabs_area, &mut view);
-    // Skipped only when the tree is genuinely on top of them. Testing `overlay`
-    // alone was wrong: a narrow screen with the tree *dismissed* is the normal
-    // way to use a phone zoomed in, and it left the terminal undrawn — a tab
-    // bar over an empty screen. `content` still says how big the panes are
-    // either way, which is what gets advertised to the server.
-    if let (Some(tab), false) = (tab, tree_covers_terminal(&view)) {
-        compute_panes(tab, ui, view.content, &mut view);
+    compute_tabs(model, ui, tabs_area, &mut view);
+    view.terminal_obscured = tree_covers_terminal(&view);
+    if let Some(tab) = tab {
+        if view.terminal_obscured {
+            // Drawing and sizing are separate decisions. Keep the hidden
+            // terminal's exact pane geometry current so opening/closing the
+            // tree does not advertise an empty viewport and then resize every
+            // PTY one frame later. Discard the scratch hit regions because the
+            // tree owns pointer input while it covers the terminal.
+            let mut geometry = ViewLayout {
+                class: view.class,
+                ..Default::default()
+            };
+            compute_panes(tab, ui, view.content, &mut geometry);
+            view.panes = geometry.panes;
+            view.splits = geometry.splits;
+        } else {
+            compute_panes(tab, ui, view.content, &mut view);
+        }
     }
 
     if view.status.width >= 8 {
@@ -699,7 +725,45 @@ fn compute_tree(model: &AppModel, ui: &UiState, body: Rect, view: &mut ViewLayou
 /// Columns a tree row keeps for its own name before it will host any buttons.
 const MIN_LABEL_COLUMNS: u16 = 12;
 
-fn compute_tabs(model: &AppModel, area: Rect, view: &mut ViewLayout) {
+fn visible_item_window(
+    widths: &[u16],
+    requested_start: usize,
+    selected: usize,
+    budget: u16,
+) -> (usize, usize) {
+    if widths.is_empty() || budget == 0 {
+        return (0, 0);
+    }
+    let mut start = requested_start.min(widths.len() - 1);
+    if selected < start {
+        start = selected;
+    }
+    loop {
+        let mut used = 0u16;
+        let mut end = start;
+        while end < widths.len() {
+            let width = widths[end].min(budget);
+            if end > start && used.saturating_add(width) > budget {
+                break;
+            }
+            used = used.saturating_add(width);
+            end += 1;
+            if used >= budget {
+                break;
+            }
+        }
+        if selected < end || start >= selected {
+            return (start, end.max(start + 1).min(widths.len()));
+        }
+        start += 1;
+    }
+}
+
+fn overflow_button_width(available: u16) -> u16 {
+    5.min((available / 3).max(1))
+}
+
+fn compute_tabs(model: &AppModel, ui: &UiState, area: Rect, view: &mut ViewLayout) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -722,39 +786,78 @@ fn compute_tabs(model: &AppModel, area: Rect, view: &mut ViewLayout) {
     }
     let tabs_right = edge;
     let selected = model.selected_tab().map(|tab| tab.tab_id);
+    let close_width = tab_bar_control_width(area.height);
+    let candidates = model
+        .tabs_for_selected_thread()
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let title = if tab.title.trim().is_empty() {
+                "shell"
+            } else {
+                tab.title.trim()
+            };
+            let label = format!(" {}:{} ", index + 1, title);
+            let label_width =
+                unicode_column_width(&label, None).min(TAB_MAX_COLUMNS as usize) as u16;
+            (tab.tab_id, label, label_width.saturating_add(close_width))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+    let widths = candidates
+        .iter()
+        .map(|(_, _, width)| *width)
+        .collect::<Vec<_>>();
+    let outer_width = tabs_right.saturating_sub(area.x);
+    let overflowing = widths.iter().map(|width| *width as u32).sum::<u32>() > outer_width as u32;
+    let overflow_width =
+        (overflowing && outer_width >= 3).then(|| overflow_button_width(outer_width));
+    let tab_budget = outer_width.saturating_sub(overflow_width.unwrap_or(0).saturating_mul(2));
+    let selected_index = selected
+        .and_then(|selected| candidates.iter().position(|(id, _, _)| *id == selected))
+        .unwrap_or(0);
+    let requested_start = if overflowing { ui.tab_scroll } else { 0 };
+    let (start, end) = visible_item_window(&widths, requested_start, selected_index, tab_budget);
+    view.tab_scroll_start = start;
     let mut x = area.x;
-    for (index, tab) in model.tabs_for_selected_thread().iter().enumerate() {
-        if x >= tabs_right {
-            break;
+    if let Some(button_width) = overflow_width {
+        let rect = Rect::new(x, area.y, button_width, area.height);
+        let hidden = start;
+        if hidden > 0 {
+            view.hits.push(HitRegion {
+                rect,
+                target: HitTarget::TabScroll(-1),
+            });
         }
-        let title = if tab.title.trim().is_empty() {
-            "shell"
-        } else {
-            tab.title.trim()
-        };
-        let label = format!(" {}:{} ", index + 1, title);
-        let desired = unicode_column_width(&label, None).min(u16::MAX as usize) as u16;
-        // Room for the tab's own close button, but only where the name still
-        // has somewhere to go afterwards.
-        let close_width = tab_bar_control_width(area.height);
-        let want_close = tabs_right.saturating_sub(x) >= desired + close_width;
-        let width = (desired + if want_close { close_width } else { 0 }).min(tabs_right - x);
+        view.tab_overflow.push(TabOverflowButton {
+            rect,
+            direction: -1,
+            hidden,
+        });
+        x += button_width;
+    }
+    let visible_right = tabs_right.saturating_sub(overflow_width.unwrap_or(0));
+    for (tab_id, label, desired) in &candidates[start..end] {
+        let width = (*desired).min(visible_right.saturating_sub(x));
         if width == 0 {
             break;
         }
         let rect = Rect::new(x, area.y, width, area.height);
+        let want_close = width >= close_width.saturating_add(3);
         let close = want_close.then(|| {
             let rect = Rect::new(rect.right() - close_width, rect.y, close_width, rect.height);
             view.hits.push(HitRegion {
                 rect,
-                target: HitTarget::CloseTab(tab.tab_id),
+                target: HitTarget::CloseTab(*tab_id),
             });
             rect
         });
         view.tabs.push(TabLine {
             rect,
-            label,
-            selected: selected == Some(tab.tab_id),
+            label: label.clone(),
+            selected: selected == Some(*tab_id),
             close,
         });
         // Pushed before the close button above so the narrower target wins the
@@ -763,10 +866,25 @@ fn compute_tabs(model: &AppModel, area: Rect, view: &mut ViewLayout) {
             view.hits.len().saturating_sub(usize::from(close.is_some())),
             HitRegion {
                 rect,
-                target: HitTarget::Tab(tab.tab_id),
+                target: HitTarget::Tab(*tab_id),
             },
         );
         x = x.saturating_add(width);
+    }
+    if let Some(button_width) = overflow_width {
+        let rect = Rect::new(visible_right, area.y, button_width, area.height);
+        let hidden = candidates.len().saturating_sub(end);
+        if hidden > 0 {
+            view.hits.push(HitRegion {
+                rect,
+                target: HitTarget::TabScroll(1),
+            });
+        }
+        view.tab_overflow.push(TabOverflowButton {
+            rect,
+            direction: 1,
+            hidden,
+        });
     }
 }
 
@@ -777,6 +895,10 @@ pub const TAB_BAR_CONTROLS: [TabBarControl; 2] = [TabBarControl::Menu, TabBarCon
 
 /// Columns the tab bar keeps for tabs before it will host any control.
 const MIN_TAB_COLUMNS: u16 = 10;
+
+/// Natural tab titles remain readable without allowing one command line to
+/// consume the whole row. Overflow scrolls by complete tabs.
+const TAB_MAX_COLUMNS: u16 = 28;
 
 /// Width of one tab-bar control. A bar with room for two rows is a bar meant to
 /// be touched, so its buttons widen to match their new height.
@@ -797,16 +919,10 @@ pub fn tab_bar_control_width(height: u16) -> u16 {
 /// half. The thresholds are what "there is room to spare" means here.
 const SCROLLBAR_MIN_COLUMNS: u16 = 34;
 /// A frame is cheaper than it looks, because the pane's nav bar is drawn *on*
-/// its top edge rather than under it — the way a titled box works. So the frame
-/// costs one row (the bottom edge) and two columns beyond what the bar already
-/// spends, not two rows and two columns. That is affordable on a phone, which
-/// is why these are low.
-/// Tied to what the nav bar already needs, plus the one row and two columns the
-/// frame adds. A pane that can afford a bar can afford a frame, so the two
-/// never disagree — a split where one half is framed and the other is not reads
-/// as broken rather than as economical.
+/// The nav is a separate row above the frame. A framed pane therefore needs
+/// two frame rows in addition to the nav and at least two rows of grid.
 const BORDER_MIN_COLUMNS: u16 = MIN_LABEL_COLUMNS + 2;
-const BORDER_MIN_ROWS: u16 = PANE_NAV_MIN_ROWS + 1;
+const BORDER_MIN_ROWS: u16 = PANE_NAV_MIN_ROWS + 2;
 
 /// Rows a pane keeps for its grid before it will spend one on its own nav bar.
 ///
@@ -822,6 +938,33 @@ const PANE_NAV_MIN_ROWS: u16 = 3;
 /// Widest a level-2 tab may grow, so one long title cannot take the row from
 /// the rest of the stack.
 const PANE_NAV_TAB_MAX_COLUMNS: u16 = 18;
+
+fn pane_frame_and_grid(rect: Rect, bar_rows: u16, framed: bool) -> (Option<Rect>, Rect) {
+    if !framed {
+        return (
+            None,
+            Rect::new(
+                rect.x,
+                rect.y + bar_rows,
+                rect.width,
+                rect.height.saturating_sub(bar_rows),
+            ),
+        );
+    }
+    let border = Rect::new(
+        rect.x,
+        rect.y + bar_rows,
+        rect.width,
+        rect.height.saturating_sub(bar_rows),
+    );
+    let grid = Rect::new(
+        rect.x + 1,
+        rect.y + bar_rows + 1,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(bar_rows + 2),
+    );
+    (Some(border), grid)
+}
 
 fn compute_panes(tab: &Arc<Tab>, ui: &UiState, area: Rect, view: &mut ViewLayout) {
     if area.width == 0 || area.height == 0 {
@@ -849,28 +992,12 @@ fn compute_panes(tab: &Arc<Tab>, ui: &UiState, area: Rect, view: &mut ViewLayout
             continue;
         }
         let collapsed = (pane_count > 1 && rect.height < PANE_NAV_MIN_ROWS).then_some(rect);
-        // Only where there is another pane to be told apart from. A lone pane
-        // already has the window's own edges; framing it spends a row and two
-        // columns to draw a line around the only thing on screen.
-        let framed = ui.pane_borders
-            && pane_count > 1
-            && rect.width >= BORDER_MIN_COLUMNS
-            && rect.height >= BORDER_MIN_ROWS;
-        let border = framed.then_some(rect);
         let pane_id = positioned.pane.pane_id();
-        // The bar sits *on* the frame's top edge, between its corners, so a
-        // framed pane pays one row for the bar and one for the bottom edge
-        // rather than one for each of three lines.
-        let bar_area = if framed {
-            Rect::new(rect.x + 1, rect.y, rect.width - 2, rect.height)
-        } else {
-            rect
-        };
         // Above the grid, never over it, for the same reason as the scrollbar:
         // the row it takes is a row the terminal is then told it does not have.
         let stack = tab.pane_stack_tabs(pane_id);
         let nav = if collapsed.is_some() && ui.pane_nav_bar {
-            compute_collapsed_pane_nav(pane_id, &stack, positioned.is_zoomed, touch, bar_area, view)
+            compute_collapsed_pane_nav(pane_id, &stack, positioned.is_zoomed, touch, rect, view)
         } else {
             compute_pane_nav(
                 pane_id,
@@ -878,28 +1005,21 @@ fn compute_panes(tab: &Arc<Tab>, ui: &UiState, area: Rect, view: &mut ViewLayout
                 positioned.is_zoomed,
                 ui.pane_nav_bar,
                 touch,
-                bar_area,
+                ui.pane_nav_scroll.get(&pane_id).copied().unwrap_or(0),
+                rect,
                 view,
             )
         };
         let bar_rows = nav.as_ref().map_or(0, |nav| nav.rect.height);
-        let rect = if framed {
-            // The top edge is already spent on the bar (or is a plain edge when
-            // there is no bar), so the grid starts one row down either way.
-            Rect::new(
-                rect.x + 1,
-                rect.y + 1,
-                rect.width - 2,
-                rect.height.saturating_sub(2),
-            )
-        } else {
-            Rect::new(
-                rect.x,
-                rect.y + bar_rows,
-                rect.width,
-                rect.height - bar_rows,
-            )
-        };
+        // Only where there is another pane to be told apart from. The nav is a
+        // sibling above the frame, not a title punched through its top edge;
+        // this keeps all four frame edges complete and visually coherent.
+        let framed = ui.pane_borders
+            && pane_count > 1
+            && rect.width >= BORDER_MIN_COLUMNS
+            && rect.height >= BORDER_MIN_ROWS
+            && rect.height.saturating_sub(bar_rows) >= 3;
+        let (border, rect) = pane_frame_and_grid(rect, bar_rows, framed);
         // The scrollbar lives beside the grid, never over it: the column it
         // takes is a column the terminal is then told it does not have, so a
         // program's own right margin still lands where it drew it.
@@ -1007,7 +1127,9 @@ fn compute_collapsed_pane_nav(
 
     Some(PaneNav {
         rect: bar,
+        scroll_start: 0,
         tabs,
+        overflow: vec![],
         tools: vec![(tool, zoom)],
     })
 }
@@ -1018,6 +1140,7 @@ fn compute_pane_nav(
     zoomed: bool,
     enabled: bool,
     touch: bool,
+    requested_start: usize,
     rect: Rect,
     view: &mut ViewLayout,
 ) -> Option<PaneNav> {
@@ -1059,26 +1182,59 @@ fn compute_pane_nav(
     }
     tools.reverse();
 
-    let mut tabs = Vec::new();
+    let candidates = stack
+        .iter()
+        .map(|entry| {
+            let title = if entry.title.trim().is_empty() {
+                "shell"
+            } else {
+                entry.title.trim()
+            };
+            // No icon before the name. `▯` was there to mark a terminal, and on a
+            // phone whose font does not carry U+25AF it drew a tofu box that read
+            // as a bug. The name is doing the naming already.
+            let label = format!(" {title} ");
+            let desired = unicode_column_width(&label, None)
+                .min(u16::MAX as usize)
+                .min(PANE_NAV_TAB_MAX_COLUMNS as usize) as u16
+                + button;
+            (entry, label, desired)
+        })
+        .collect::<Vec<_>>();
+    let widths = candidates
+        .iter()
+        .map(|(_, _, width)| *width)
+        .collect::<Vec<_>>();
+    let outer_width = edge.saturating_sub(bar.x);
+    let overflowing = widths.iter().map(|width| *width as u32).sum::<u32>() > outer_width as u32;
+    let overflow_width =
+        (overflowing && outer_width >= 3).then(|| overflow_button_width(outer_width));
+    let tab_budget = outer_width.saturating_sub(overflow_width.unwrap_or(0).saturating_mul(2));
+    let active = stack.iter().position(|entry| entry.is_active).unwrap_or(0);
+    let requested_start = if overflowing { requested_start } else { 0 };
+    let (start, end) = visible_item_window(&widths, requested_start, active, tab_budget);
+    let mut overflow = Vec::new();
     let mut x = bar.x;
-    for entry in stack {
-        if x >= edge {
-            break;
+    if let Some(width) = overflow_width {
+        let rect = Rect::new(x, bar.y, width, bar.height);
+        let hidden = start;
+        if hidden > 0 {
+            view.hits.push(HitRegion {
+                rect,
+                target: HitTarget::PaneNavScroll(pane_id, -1),
+            });
         }
-        let title = if entry.title.trim().is_empty() {
-            "shell"
-        } else {
-            entry.title.trim()
-        };
-        // No icon before the name. `▯` was there to mark a terminal, and on a
-        // phone whose font does not carry U+25AF it drew a tofu box that read
-        // as a bug. The name is doing the naming already.
-        let label = format!(" {title} ");
-        let desired = unicode_column_width(&label, None)
-            .min(u16::MAX as usize)
-            .min(PANE_NAV_TAB_MAX_COLUMNS as usize) as u16;
-        let want_close = edge.saturating_sub(x) >= desired + button;
-        let width = (desired + if want_close { button } else { 0 }).min(edge - x);
+        overflow.push(TabOverflowButton {
+            rect,
+            direction: -1,
+            hidden,
+        });
+        x += width;
+    }
+    let visible_right = edge.saturating_sub(overflow_width.unwrap_or(0));
+    let mut tabs = Vec::new();
+    for (entry, label, desired) in &candidates[start..end] {
+        let width = (*desired).min(visible_right.saturating_sub(x));
         if width == 0 {
             break;
         }
@@ -1089,7 +1245,7 @@ fn compute_pane_nav(
         });
         // Pushed after the tab so the narrower target wins the hit test —
         // `hit` searches from the back.
-        let close = want_close.then(|| {
+        let close = (width >= button.saturating_add(3)).then(|| {
             let rect = Rect::new(rect.right() - button, rect.y, button, rect.height);
             view.hits.push(HitRegion {
                 rect,
@@ -1100,16 +1256,33 @@ fn compute_pane_nav(
         tabs.push(PaneNavTab {
             rect,
             pane_id: entry.pane_id,
-            label,
+            label: label.clone(),
             active: entry.is_active,
             close,
         });
         x = x.saturating_add(width);
     }
+    if let Some(width) = overflow_width {
+        let rect = Rect::new(visible_right, bar.y, width, bar.height);
+        let hidden = candidates.len().saturating_sub(end);
+        if hidden > 0 {
+            view.hits.push(HitRegion {
+                rect,
+                target: HitTarget::PaneNavScroll(pane_id, 1),
+            });
+        }
+        overflow.push(TabOverflowButton {
+            rect,
+            direction: 1,
+            hidden,
+        });
+    }
 
     Some(PaneNav {
         rect: bar,
+        scroll_start: start,
         tabs,
+        overflow,
         tools,
     })
 }
@@ -1194,7 +1367,13 @@ fn compute_overlays(ui: &UiState, view: &mut ViewLayout) {
         }
     } else if ui.mode == crate::state::AppMode::Settings {
         let width = view.screen.width.saturating_sub(4).clamp(1, 64);
-        let height = 10.min(view.screen.height.saturating_sub(2).max(1));
+        let section_rows = crate::SETTINGS
+            .windows(2)
+            .filter(|rows| rows[0].0 != rows[1].0)
+            .count() as u16
+            + 1;
+        let height = (crate::SETTINGS.len() as u16 + section_rows + 2)
+            .min(view.screen.height.saturating_sub(2).max(1));
         let rect = Rect::new(
             view.screen.x + view.screen.width.saturating_sub(width) / 2,
             view.screen.y + view.screen.height.saturating_sub(height) / 2,
@@ -1202,14 +1381,20 @@ fn compute_overlays(ui: &UiState, view: &mut ViewLayout) {
             height,
         );
         view.dialog = Some(rect);
-        for index in 0..5 {
-            let row = rect.y.saturating_add(2 + index as u16);
+        let mut row = rect.y.saturating_add(1);
+        let mut section = "";
+        for (index, (row_section, _)) in crate::SETTINGS.iter().enumerate() {
+            if *row_section != section {
+                section = row_section;
+                row = row.saturating_add(1);
+            }
             if row < rect.bottom().saturating_sub(1) {
                 view.hits.push(HitRegion {
                     rect: Rect::new(rect.x + 1, row, rect.width.saturating_sub(2), 1),
                     target: HitTarget::Setting(index),
                 });
             }
+            row = row.saturating_add(1);
         }
     } else if ui.prompt.is_some() || ui.confirmation.is_some() {
         let width = view.screen.width.saturating_sub(4).clamp(1, 64);
@@ -1257,7 +1442,7 @@ mod tests {
 
     fn nav(rect: Rect, stack: &[PaneStackTab], zoomed: bool, touch: bool) -> (PaneNav, ViewLayout) {
         let mut view = ViewLayout::default();
-        let nav = compute_pane_nav(1, stack, zoomed, true, touch, rect, &mut view)
+        let nav = compute_pane_nav(1, stack, zoomed, true, touch, 0, rect, &mut view)
             .expect("a pane this size has room for its own bar");
         (nav, view)
     }
@@ -1370,6 +1555,7 @@ mod tests {
                 false,
                 true,
                 false,
+                0,
                 Rect::new(0, 0, 60, 2),
                 &mut view
             )
@@ -1384,6 +1570,7 @@ mod tests {
                 false,
                 true,
                 false,
+                0,
                 Rect::new(0, 0, 11, 20),
                 &mut view
             )
@@ -1397,6 +1584,7 @@ mod tests {
                 false,
                 false,
                 false,
+                0,
                 Rect::new(0, 0, 60, 20),
                 &mut view
             )
@@ -1415,6 +1603,7 @@ mod tests {
                 false,
                 true,
                 false,
+                0,
                 Rect::new(0, 0, 60, 7),
                 &mut short
             )
@@ -1456,6 +1645,49 @@ mod tests {
         assert_eq!(touch.tools[0].0.width, 3);
     }
 
+    #[test]
+    fn level_two_overflow_keeps_the_active_tab_visible_and_uses_complete_buttons() {
+        let entries = stack(
+            &[
+                "shell", "vim", "logs", "server", "tests", "build", "watch", "notes",
+            ],
+            6,
+        );
+        let mut view = ViewLayout::default();
+        let bar = compute_pane_nav(
+            1,
+            &entries,
+            false,
+            true,
+            false,
+            0,
+            Rect::new(0, 0, 42, 20),
+            &mut view,
+        )
+        .unwrap();
+        assert_eq!(bar.overflow.len(), 2);
+        assert!(bar.overflow[0].hidden > 0);
+        assert!(bar.tabs.iter().any(|tab| tab.active));
+        assert!(bar
+            .tabs
+            .windows(2)
+            .all(|tabs| tabs[0].rect.right() <= tabs[1].rect.x));
+        assert!(bar.tabs.last().unwrap().rect.right() <= bar.overflow[1].rect.x);
+        assert!(bar.overflow[1].rect.right() <= bar.tools[0].0.x);
+    }
+
+    #[test]
+    fn pane_frame_starts_below_the_level_two_layer_and_keeps_all_four_edges() {
+        let outer = Rect::new(4, 7, 40, 12);
+        let (border, grid) = pane_frame_and_grid(outer, 1, true);
+        assert_eq!(border, Some(Rect::new(4, 8, 40, 11)));
+        assert_eq!(grid, Rect::new(5, 9, 38, 9));
+        let border = border.unwrap();
+        assert_eq!(border.bottom(), outer.bottom());
+        assert_eq!(grid.y, border.y + 1);
+        assert_eq!(grid.bottom(), border.bottom() - 1);
+    }
+
     fn model_with_threads() -> AppModel {
         let mut model = AppModel::default();
         model.apply_snapshot(
@@ -1482,6 +1714,45 @@ mod tests {
                             ..Default::default()
                         })
                         .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        model
+    }
+
+    fn model_with_many_tabs() -> AppModel {
+        let mut model = AppModel::default();
+        model.apply_snapshot(
+            "server",
+            ThinkTermSessionState {
+                server_id: "runtime".into(),
+                generation: 1,
+                spaces: vec![ThinkTermSessionSpace {
+                    id: "space".into(),
+                    name: "Space".into(),
+                    ..Default::default()
+                }],
+                projects: vec![ThinkTermSessionProject {
+                    id: "project".into(),
+                    space_id: "space".into(),
+                    name: "Project".into(),
+                    threads: vec![codec::ThinkTermSessionThread {
+                        id: "thread".into(),
+                        project_id: "project".into(),
+                        name: "Thread".into(),
+                        tabs: (0..9)
+                            .map(|index| codec::ThinkTermSessionTab {
+                                window_id: 1,
+                                tab_id: index + 1,
+                                pane_ids: vec![index + 1],
+                                title: format!("command-{index}"),
+                                is_active: index == 7,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -1525,17 +1796,40 @@ mod tests {
     }
 
     #[test]
+    fn level_one_overflow_keeps_the_selected_tab_and_exposes_both_directions() {
+        let model = model_with_many_tabs();
+        let mut ui = UiState::new(String::new());
+        ui.sidebar_visible = false;
+        let view = compute_view(Rect::new(0, 0, 64, 20), &model, &ui, None);
+        assert_eq!(view.tab_overflow.len(), 2);
+        assert!(view.tab_overflow[0].hidden > 0);
+        assert!(view.tabs.iter().any(|tab| tab.selected));
+        assert!(view
+            .tabs
+            .windows(2)
+            .all(|tabs| tabs[0].rect.right() <= tabs[1].rect.x));
+        assert!(view.tabs.last().unwrap().rect.right() <= view.tab_overflow[1].rect.x);
+    }
+
+    #[test]
     fn every_settings_row_has_an_exact_modal_hit() {
         let model = model_with_threads();
         let mut ui = UiState::new(String::new());
         ui.mode = crate::state::AppMode::Settings;
         let view = compute_view(Rect::new(0, 0, 100, 30), &model, &ui, None);
         let dialog = view.dialog.unwrap();
-        for index in 0..5 {
+        let mut row = dialog.y + 1;
+        let mut section = "";
+        for (index, (row_section, _)) in crate::SETTINGS.iter().enumerate() {
+            if *row_section != section {
+                section = row_section;
+                row += 1;
+            }
             assert_eq!(
-                view.hit(dialog.x + 2, dialog.y + 2 + index as u16),
+                view.hit(dialog.x + 2, row),
                 Some(&HitTarget::Setting(index))
             );
+            row += 1;
         }
     }
 
@@ -1787,10 +2081,10 @@ mod tests {
         assert_eq!(narrow.tab_bar.height, 1);
     }
 
-    /// A message still needs somewhere to go; it just does not get to keep a
-    /// row of the terminal when there is nothing to report.
+    /// Messages float over the terminal and never resize it. The optional
+    /// persistent status bar is the only setting that spends a row.
     #[test]
-    fn narrow_view_reclaims_the_footer_row_only_while_it_is_empty() {
+    fn narrow_view_messages_never_change_the_footer_geometry() {
         let model = model_with_threads();
         let mut ui = UiState::new(String::new());
         ui.sidebar_visible = false;
@@ -1799,8 +2093,13 @@ mod tests {
 
         ui.status = "Viewport: something went wrong".to_string();
         let noisy = compute_view(Rect::new(0, 0, 40, 20), &model, &ui, None);
-        assert_eq!(noisy.status.height, 1);
-        assert_eq!(noisy.content.height, quiet.content.height - 1);
+        assert_eq!(noisy.status.height, 0);
+        assert_eq!(noisy.content.height, quiet.content.height);
+
+        ui.show_status_bar = true;
+        let with_bar = compute_view(Rect::new(0, 0, 40, 20), &model, &ui, None);
+        assert_eq!(with_bar.status.height, 1);
+        assert_eq!(with_bar.content.height, quiet.content.height - 1);
     }
 
     /// The toggle used to sit on a narrow screen with nothing to toggle: the
@@ -1854,7 +2153,7 @@ mod tests {
         ui.sidebar_visible = false;
         let view = compute_view(Rect::new(0, 0, 100, 30), &model, &ui, None);
         assert!(view.sidebar.is_none());
-        assert_eq!(view.content, Rect::new(0, 1, 100, 28));
+        assert_eq!(view.content, Rect::new(0, 1, 100, 29));
         assert_eq!(view.hit(1, 0), Some(&HitTarget::SidebarToggle));
         assert!(view.tabs.iter().all(|tab| tab.rect.x >= 4));
     }

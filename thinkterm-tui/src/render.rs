@@ -9,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::collections::HashMap;
 use std::sync::Arc;
 use termwiz::cell::{unicode_column_width, Blink, CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
@@ -74,7 +75,11 @@ pub fn render(
     render_tabs(frame, view);
     render_status(frame, model, ui, view, viewport_status);
 
-    if let Some((title, hint)) = handoff_message {
+    if view.terminal_obscured {
+        // The sidebar was drawn first and owns the whole narrow screen. Pane
+        // geometry still exists for viewport negotiation, but terminal output
+        // must not paint back over the overlay.
+    } else if let Some((title, hint)) = handoff_message {
         render_handoff(frame, view.content, title, hint, handoff_animation);
     } else if let Some(tab) = local_tab {
         result.active_pane = tab.get_active_pane().map(|pane| pane.pane_id());
@@ -268,6 +273,20 @@ fn render_tabs(frame: &mut Frame<'_>, view: &ViewLayout) {
     for (rect, control) in &view.tab_controls {
         draw_text(frame, *rect, control.glyph(), chrome_dim());
     }
+    for button in &view.tab_overflow {
+        let style = if button.hidden > 0 {
+            chrome_accent_text()
+        } else {
+            chrome_dim()
+        };
+        let label = if button.direction < 0 {
+            format!("< …{}", button.hidden)
+        } else {
+            format!("{}… >", button.hidden)
+        };
+        fill(frame, button.rect, " ", chrome());
+        draw_text(frame, button.rect, &label, style);
+    }
     if view.tabs.is_empty() {
         draw_text(frame, view.tab_bar, " Opening terminal…", chrome_dim());
         return;
@@ -287,10 +306,18 @@ fn render_tabs(frame: &mut Frame<'_>, view: &ViewLayout) {
         }
     }
     let used = view
-        .tabs
+        .tab_overflow
         .last()
-        .map_or(view.tab_bar.x, |tab| tab.rect.right());
-    if used < view.tab_bar.right() {
+        .map(|button| button.rect.right())
+        .or_else(|| view.tabs.last().map(|tab| tab.rect.right()))
+        .unwrap_or(view.tab_bar.x);
+    let controls_left = view
+        .tab_controls
+        .iter()
+        .map(|(rect, _)| rect.x)
+        .min()
+        .unwrap_or(view.tab_bar.right());
+    if used < controls_left {
         let separator = Rect::new(used, view.tab_bar.y, 1, view.tab_bar.height);
         fill(frame, separator, "│", chrome_border());
     }
@@ -316,20 +343,6 @@ fn render_panes(frame: &mut Frame<'_>, tab: &Arc<Tab>, ui: &UiState, view: &View
             );
             continue;
         }
-        if let Some(border) = pane_view.border {
-            let focused = tab
-                .get_active_pane()
-                .is_some_and(|active| active.pane_id() == pane_view.pane_id);
-            let style = if focused {
-                chrome_accent_text()
-            } else {
-                chrome_border()
-            };
-            frame.render_widget(
-                Block::default().borders(Borders::ALL).border_style(style),
-                border,
-            );
-        }
         if let Some(nav) = &pane_view.nav {
             let focused = tab
                 .get_active_pane()
@@ -342,26 +355,11 @@ fn render_panes(frame: &mut Frame<'_>, tab: &Arc<Tab>, ui: &UiState, view: &View
         }
     }
 
-    // Framed panes already show where each one ends, and a divider between two
-    // frames is a third line of chrome in a row that has two. When the frames
-    // were not drawn — too small, or turned off — the divider is the only thing
-    // separating them.
-    for split in &view.splits {
-        let symbol = match split.direction {
-            SplitDirection::Horizontal => "│",
-            SplitDirection::Vertical => "─",
-        };
-        for y in split.rect.y..split.rect.bottom() {
-            for x in split.rect.x..split.rect.right() {
-                if !split_cell_needs_divider(view, split, x, y) {
-                    continue;
-                }
-                frame.buffer_mut()[(x, y)]
-                    .set_symbol(symbol)
-                    .set_style(chrome_border());
-            }
-        }
-    }
+    paint_pane_chrome(
+        frame,
+        tab.get_active_pane().map(|pane| pane.pane_id()),
+        view,
+    );
 
     if let Some(active) = tab.get_active_pane() {
         if let Some(pane_view) = view
@@ -388,36 +386,305 @@ fn render_panes(frame: &mut Frame<'_>, tab: &Arc<Tab>, ui: &UiState, view: &View
     }
 }
 
+const LINE_NORTH: u8 = 1 << 0;
+const LINE_EAST: u8 = 1 << 1;
+const LINE_SOUTH: u8 = 1 << 2;
+const LINE_WEST: u8 = 1 << 3;
+const LINE_NS: u8 = LINE_NORTH | LINE_SOUTH;
+const LINE_EW: u8 = LINE_EAST | LINE_WEST;
+const LINE_ES: u8 = LINE_EAST | LINE_SOUTH;
+const LINE_SW: u8 = LINE_SOUTH | LINE_WEST;
+const LINE_NE: u8 = LINE_NORTH | LINE_EAST;
+const LINE_NW: u8 = LINE_NORTH | LINE_WEST;
+const LINE_NES: u8 = LINE_NORTH | LINE_EAST | LINE_SOUTH;
+const LINE_NSW: u8 = LINE_NORTH | LINE_SOUTH | LINE_WEST;
+const LINE_ESW: u8 = LINE_EAST | LINE_SOUTH | LINE_WEST;
+const LINE_NEW: u8 = LINE_NORTH | LINE_EAST | LINE_WEST;
+const LINE_NESW: u8 = LINE_NORTH | LINE_EAST | LINE_SOUTH | LINE_WEST;
+
+#[derive(Clone, Copy)]
+struct PaneChromeCell {
+    connections: u8,
+    style: Style,
+    style_priority: u8,
+}
+
+#[derive(Default)]
+struct PaneChromeLines {
+    cells: HashMap<(u16, u16), PaneChromeCell>,
+}
+
+impl PaneChromeLines {
+    fn add(&mut self, x: u16, y: u16, connections: u8, style: Style, style_priority: u8) {
+        self.cells
+            .entry((x, y))
+            .and_modify(|cell| {
+                cell.connections |= connections;
+                if style_priority > cell.style_priority {
+                    cell.style = style;
+                    cell.style_priority = style_priority;
+                }
+            })
+            .or_insert(PaneChromeCell {
+                connections,
+                style,
+                style_priority,
+            });
+    }
+
+    fn horizontal(&mut self, y: u16, start: u16, end: u16, style: Style, priority: u8) {
+        if start >= end {
+            return;
+        }
+        for x in start..end {
+            let connections = if end - start == 1 {
+                LINE_EW
+            } else {
+                let mut connections = 0;
+                if x > start {
+                    connections |= LINE_WEST;
+                }
+                if x + 1 < end {
+                    connections |= LINE_EAST;
+                }
+                connections
+            };
+            self.add(x, y, connections, style, priority);
+        }
+    }
+
+    fn vertical(&mut self, x: u16, start: u16, end: u16, style: Style, priority: u8) {
+        if start >= end {
+            return;
+        }
+        for y in start..end {
+            let connections = if end - start == 1 {
+                LINE_NS
+            } else {
+                let mut connections = 0;
+                if y > start {
+                    connections |= LINE_NORTH;
+                }
+                if y + 1 < end {
+                    connections |= LINE_SOUTH;
+                }
+                connections
+            };
+            self.add(x, y, connections, style, priority);
+        }
+    }
+
+    fn border(&mut self, rect: Rect, style: Style, priority: u8) {
+        if rect.is_empty() {
+            return;
+        }
+        if rect.width == 1 {
+            self.vertical(rect.x, rect.y, rect.bottom(), style, priority);
+            return;
+        }
+        if rect.height == 1 {
+            self.horizontal(rect.y, rect.x, rect.right(), style, priority);
+            return;
+        }
+        self.horizontal(rect.y, rect.x, rect.right(), style, priority);
+        self.horizontal(rect.bottom() - 1, rect.x, rect.right(), style, priority);
+        self.vertical(rect.x, rect.y, rect.bottom(), style, priority);
+        self.vertical(rect.right() - 1, rect.y, rect.bottom(), style, priority);
+    }
+
+    fn paint(self, frame: &mut Frame<'_>) {
+        for ((x, y), cell) in self.cells {
+            frame.buffer_mut()[(x, y)]
+                .set_symbol(pane_chrome_symbol(cell.connections))
+                .set_style(cell.style);
+        }
+    }
+}
+
+fn pane_chrome_symbol(connections: u8) -> &'static str {
+    match connections {
+        LINE_ES => "┌",
+        LINE_SW => "┐",
+        LINE_NE => "└",
+        LINE_NW => "┘",
+        LINE_NES => "├",
+        LINE_NSW => "┤",
+        LINE_ESW => "┬",
+        LINE_NEW => "┴",
+        LINE_NESW => "┼",
+        LINE_NS => "│",
+        LINE_EW => "─",
+        mask if mask & (LINE_NORTH | LINE_SOUTH) != 0 => "│",
+        _ => "─",
+    }
+}
+
+fn paint_pane_chrome(frame: &mut Frame<'_>, active_pane_id: Option<PaneId>, view: &ViewLayout) {
+    let mut lines = PaneChromeLines::default();
+    for pane in &view.panes {
+        let Some(border) = painted_pane_border_rect(view, pane) else {
+            continue;
+        };
+        let focused = active_pane_id == Some(pane.pane_id);
+        lines.border(
+            border,
+            if focused {
+                chrome_accent_text()
+            } else {
+                chrome_border()
+            },
+            if focused { 2 } else { 1 },
+        );
+    }
+
+    // Frames and split dividers feed one connection map. Crossings therefore
+    // become real junction glyphs rather than whichever independent draw ran
+    // last, while a divider between two complete frames remains suppressed to
+    // avoid a third parallel rule.
+    for split in &view.splits {
+        for y in split.rect.y..split.rect.bottom() {
+            for x in split.rect.x..split.rect.right() {
+                if !split_cell_needs_divider(view, split, x, y) {
+                    continue;
+                }
+                let connections = match split.direction {
+                    SplitDirection::Horizontal => {
+                        let mut connections = 0;
+                        if y > split.rect.y && split_cell_needs_divider(view, split, x, y - 1) {
+                            connections |= LINE_NORTH;
+                        }
+                        if y + 1 < split.rect.bottom()
+                            && split_cell_needs_divider(view, split, x, y + 1)
+                        {
+                            connections |= LINE_SOUTH;
+                        }
+                        if connections == 0 {
+                            LINE_NS
+                        } else {
+                            connections
+                        }
+                    }
+                    SplitDirection::Vertical => {
+                        let mut connections = 0;
+                        if x > split.rect.x && split_cell_needs_divider(view, split, x - 1, y) {
+                            connections |= LINE_WEST;
+                        }
+                        if x + 1 < split.rect.right()
+                            && split_cell_needs_divider(view, split, x + 1, y)
+                        {
+                            connections |= LINE_EAST;
+                        }
+                        if connections == 0 {
+                            LINE_EW
+                        } else {
+                            connections
+                        }
+                    }
+                };
+                lines.add(x, y, connections, chrome_border(), 0);
+            }
+        }
+    }
+    lines.paint(frame);
+}
+
 fn split_cell_needs_divider(view: &ViewLayout, split: &SplitView, x: u16, y: u16) -> bool {
+    // A pane nav is part of the pane's outer chrome even though its frame
+    // deliberately starts one row lower. Looking only at `border` resurrects
+    // the split divider for exactly that nav row, leaving a short, detached
+    // line beside a level-2 tab bar. Compare against the complete framed pane
+    // instead, so a divider is either replaced by the two pane frames for its
+    // whole span or remains available where one side is genuinely unframed.
     let framed_on_both_sides = match split.direction {
         SplitDirection::Horizontal => {
             let left = view.panes.iter().any(|pane| {
-                pane.border.is_some_and(|border| {
-                    border.right() == x && y >= border.y && y < border.bottom()
+                framed_pane_outer_rect(pane).is_some_and(|outer| {
+                    outer.right() == x && rect_vertical_span_covers_or_touches(outer, y)
                 })
             });
             let right = view.panes.iter().any(|pane| {
-                pane.border.is_some_and(|border| {
-                    border.x == x.saturating_add(1) && y >= border.y && y < border.bottom()
+                framed_pane_outer_rect(pane).is_some_and(|outer| {
+                    outer.x == x.saturating_add(1) && rect_vertical_span_covers_or_touches(outer, y)
                 })
             });
             left && right
         }
         SplitDirection::Vertical => {
             let above = view.panes.iter().any(|pane| {
-                pane.border.is_some_and(|border| {
-                    border.bottom() == y && x >= border.x && x < border.right()
+                framed_pane_outer_rect(pane).is_some_and(|outer| {
+                    outer.bottom() == y && rect_horizontal_span_covers_or_touches(outer, x)
                 })
             });
             let below = view.panes.iter().any(|pane| {
-                pane.border.is_some_and(|border| {
-                    border.y == y.saturating_add(1) && x >= border.x && x < border.right()
+                framed_pane_outer_rect(pane).is_some_and(|outer| {
+                    outer.y == y.saturating_add(1)
+                        && rect_horizontal_span_covers_or_touches(outer, x)
                 })
             });
             above && below
         }
     };
     !framed_on_both_sides
+}
+
+fn rect_vertical_span_covers_or_touches(rect: Rect, y: u16) -> bool {
+    (y >= rect.y && y < rect.bottom()) || y.saturating_add(1) == rect.y || y == rect.bottom()
+}
+
+fn rect_horizontal_span_covers_or_touches(rect: Rect, x: u16) -> bool {
+    (x >= rect.x && x < rect.right()) || x.saturating_add(1) == rect.x || x == rect.right()
+}
+
+fn framed_pane_outer_rect(pane: &PaneView) -> Option<Rect> {
+    let border = pane.border?;
+    let Some(nav) = pane.nav.as_ref() else {
+        return Some(border);
+    };
+    let x = border.x.min(nav.rect.x);
+    let y = border.y.min(nav.rect.y);
+    let right = border.right().max(nav.rect.right());
+    let bottom = border.bottom().max(nav.rect.bottom());
+    Some(Rect::new(
+        x,
+        y,
+        right.saturating_sub(x),
+        bottom.saturating_sub(y),
+    ))
+}
+
+fn painted_pane_border_rect(view: &ViewLayout, pane: &PaneView) -> Option<Rect> {
+    let border = pane.border?;
+    let bottom = view
+        .splits
+        .iter()
+        .filter(|split| {
+            split.direction == SplitDirection::Vertical
+                && split.rect.y == border.bottom()
+                && split.rect.x <= border.x
+                && split.rect.right() >= border.right()
+                && view.panes.iter().any(|below| {
+                    below.border.is_some()
+                        && below.nav.as_ref().is_some_and(|nav| {
+                            nav.rect.y == split.rect.bottom()
+                                && nav.rect.x <= border.x
+                                && nav.rect.right() >= border.right()
+                        })
+                })
+        })
+        .map(|split| split.rect.bottom())
+        .max()
+        .unwrap_or_else(|| border.bottom());
+
+    // The split gutter immediately above a lower pane's nav is visual chrome,
+    // not terminal space. Use it as the upper frame's bottom edge: the upper
+    // pane keeps a complete box, the lower nav remains its own layer, and no
+    // third detached divider is painted between them.
+    Some(Rect::new(
+        border.x,
+        border.y,
+        border.width,
+        bottom.saturating_sub(border.y),
+    ))
 }
 
 fn paint_collapsed_pane(
@@ -454,34 +721,32 @@ fn paint_collapsed_pane(
 /// Draw one pane's own strip: what is stacked behind it, and what can be done
 /// to it.
 ///
-/// The focused pane's bar is the only one drawn in the accent, which is what
-/// says where typing goes — a job the frame used to do alone, and only when the
-/// pane was wide enough to afford one.
+/// The bar is a layer of its own between the window tabs and terminal content.
+/// The active stack tab opens back onto the content background; accent text on
+/// that tab says which pane owns keyboard focus.
 fn paint_pane_nav(frame: &mut Frame<'_>, nav: &PaneNav, focused: bool) {
     if nav.rect.is_empty() {
         return;
     }
-    // No fill. A band of surface behind every pane turned the screen into
-    // stacked grey slabs — and because every style below sets its own
-    // background, the glyphs punched the plain background back through it in
-    // streaks. The bar sits on the background like everything else; which pane
-    // has the focus is said by the colour of its name, which is where the eye
-    // already is.
-    let base = chrome();
-    // No fill. On a framed pane this row *is* the frame's top edge, and filling
-    // it with spaces rubs the line out between the corners, leaving `┌` and `┐`
-    // floating either side of a gap. Leaving it alone lets the line run behind
-    // the names and buttons, which is what a titled box looks like.
-    for entry in &nav.tabs {
-        // Each item clears its own cells. Filling the whole row would rub out
-        // the frame's top edge; filling none of it lets the line run through
-        // the gaps inside a name and between the buttons.
-        fill(frame, entry.rect, " ", base);
-        let style = match (entry.active, focused) {
-            (true, true) => chrome_accent_text().add_modifier(Modifier::BOLD),
-            (true, false) => chrome_bold(),
-            (false, _) => chrome_dim(),
+    let surface = pane_nav_surface_style();
+    fill(frame, nav.rect, " ", surface);
+    for button in &nav.overflow {
+        let style = if button.hidden > 0 {
+            pane_nav_tool_style(focused)
+        } else {
+            surface.add_modifier(Modifier::DIM)
         };
+        let label = if button.direction < 0 {
+            format!("< …{}", button.hidden)
+        } else {
+            format!("{}… >", button.hidden)
+        };
+        fill(frame, button.rect, " ", surface);
+        draw_text(frame, button.rect, &label, style);
+    }
+    for entry in &nav.tabs {
+        let style = pane_nav_tab_style(entry.active, focused);
+        fill(frame, entry.rect, " ", style);
         // Clipped to where the close button starts, so a long title is
         // shortened rather than drawn underneath it.
         // One column short of the close button, so a title long enough to be
@@ -499,10 +764,65 @@ fn paint_pane_nav(frame: &mut Frame<'_>, nav: &PaneNav, focused: bool) {
             draw_text(frame, close, "✕", style);
         }
     }
-    let tool_style = if focused { chrome_bold() } else { chrome_dim() };
+    let tool_style = pane_nav_tool_style(focused);
     for (rect, tool) in &nav.tools {
-        fill(frame, *rect, " ", base);
+        fill(frame, *rect, " ", tool_style);
         draw_text(frame, *rect, tool.glyph(), tool_style);
+    }
+}
+
+fn pane_nav_surface_style() -> Style {
+    let palette = crate::settings::palette();
+    if palette.reset_chrome {
+        Style::reset().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::reset().fg(palette.foreground).bg(palette.surface)
+    }
+}
+
+fn pane_nav_tab_style(active: bool, focused: bool) -> Style {
+    let palette = crate::settings::palette();
+    if palette.reset_chrome {
+        return if active {
+            let selected = Style::reset().add_modifier(Modifier::UNDERLINED);
+            if focused {
+                selected.add_modifier(Modifier::BOLD)
+            } else {
+                selected
+            }
+        } else {
+            pane_nav_surface_style().add_modifier(Modifier::DIM)
+        };
+    }
+    if active {
+        Style::reset()
+            .fg(if focused {
+                palette.accent
+            } else {
+                palette.foreground
+            })
+            .bg(palette.background)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::reset().fg(palette.border).bg(palette.surface)
+    }
+}
+
+fn pane_nav_tool_style(focused: bool) -> Style {
+    let palette = crate::settings::palette();
+    let style = pane_nav_surface_style();
+    if palette.reset_chrome {
+        style.add_modifier(if focused {
+            Modifier::BOLD
+        } else {
+            Modifier::DIM
+        })
+    } else {
+        style.fg(if focused {
+            palette.foreground
+        } else {
+            palette.border
+        })
     }
 }
 
@@ -510,36 +830,66 @@ fn paint_pane_nav(frame: &mut Frame<'_>, nav: &PaneNav, focused: bool) {
 ///
 /// The thumb is sized by how much of the scrollback is on screen and placed by
 /// how far back the view has been pulled, so its length says how much there is
-/// and its position says where you are. A pane with nothing to scroll gets a
-/// plain track rather than a full-height thumb, which would otherwise read as
-/// "there is more here" on a screen that has none.
+/// and its position says where you are. The gutter remains reserved to avoid a
+/// PTY resize when scrollback first appears, but stays visually empty until it
+/// has real scroll position to communicate.
 fn paint_scrollbar(frame: &mut Frame<'_>, pane: &Arc<dyn Pane>, area: Rect, ui: &UiState) {
     if area.is_empty() {
         return;
     }
-    fill(frame, area, "│", chrome_border());
+    fill(frame, area, " ", Style::reset());
     let dims = pane.get_dimensions();
-    let scrollable = dims.scrollback_rows.saturating_sub(dims.viewport_rows);
-    if scrollable == 0 {
+    let Some((from_top, thumb)) = scrollbar_thumb(
+        dims.viewport_rows,
+        dims.scrollback_rows,
+        area.height as usize,
+        ui.scroll_offset(pane.pane_id()),
+    ) else {
         return;
-    }
-    let height = area.height as usize;
-    let thumb = ((dims.viewport_rows * height) / dims.scrollback_rows.max(1)).clamp(1, height);
-    let offset = ui.scroll_offset(pane.pane_id()).min(scrollable);
-    // Offset counts backwards from the live screen, and the bar runs forwards.
-    let travel = height - thumb;
-    let from_top = travel - (offset * travel) / scrollable.max(1);
+    };
+    fill(frame, area, "│", chrome_border());
     fill(
         frame,
-        Rect::new(
-            area.x,
-            area.y + from_top as u16,
-            area.width,
-            thumb.min(height) as u16,
-        ),
+        Rect::new(area.x, area.y + from_top as u16, area.width, thumb as u16),
         "█",
         chrome_accent_text(),
     );
+}
+
+fn scrollbar_thumb(
+    viewport_rows: usize,
+    scrollback_rows: usize,
+    height: usize,
+    offset: usize,
+) -> Option<(usize, usize)> {
+    let scrollable = scrollback_rows.saturating_sub(viewport_rows);
+    if scrollable == 0 || height == 0 {
+        return None;
+    }
+    let thumb = ((viewport_rows * height) / scrollback_rows.max(1)).clamp(1, height);
+    let offset = offset.min(scrollable);
+    // Offset counts backwards from the live screen, and the bar runs forwards.
+    let travel = height - thumb;
+    let from_top = travel - (offset * travel) / scrollable;
+    Some((from_top, thumb))
+}
+
+fn painted_viewport_top(
+    physical_top: StableRowIndex,
+    viewport_rows: usize,
+    height: usize,
+    offset: usize,
+    scrollback_rows: usize,
+    earliest: StableRowIndex,
+) -> StableRowIndex {
+    let live_top = physical_top.saturating_add(
+        viewport_rows
+            .saturating_sub(height)
+            .min(StableRowIndex::MAX as usize) as StableRowIndex,
+    );
+    live_top
+        .saturating_sub(offset.min(scrollback_rows) as StableRowIndex)
+        .max(earliest)
 }
 
 fn paint_pane(frame: &mut Frame<'_>, pane: &Arc<dyn Pane>, area: Rect, ui: &UiState) {
@@ -556,10 +906,18 @@ fn paint_pane(frame: &mut Frame<'_>, pane: &Arc<dyn Pane>, area: Rect, ui: &UiSt
     let height = (area.height as usize).min(dims.scrollback_rows.max(dims.viewport_rows));
     let offset = ui.scroll_offset(pane.pane_id());
     let earliest = dims.scrollback_top;
-    let top = dims
-        .physical_top
-        .saturating_sub(offset.min(dims.scrollback_rows) as StableRowIndex)
-        .max(earliest);
+    // If chrome or an in-flight geometry update temporarily gives this pane a
+    // shorter rectangle than its PTY viewport, keep the live bottom anchored.
+    // Losing an old row at the top is harmless; losing the prompt, cursor or a
+    // full-screen application's status line is not.
+    let top = painted_viewport_top(
+        dims.physical_top,
+        dims.viewport_rows,
+        height,
+        offset,
+        dims.scrollback_rows,
+        earliest,
+    );
     let (resolved_top, lines) = pane.get_lines(top..top + height as StableRowIndex);
     // Named and indexed colors are forwarded as themselves rather than looked
     // up in the pane's palette, so the host terminal resolves them the way it
@@ -697,17 +1055,7 @@ fn render_status(
     // heaviest thing on it, and it is spending that weight on a hint. The bar
     // keeps the background; only a mode worth noticing gets picked out.
     fill(frame, view.status, " ", chrome());
-    let left = match ui.mode {
-        AppMode::Prefix => " PREFIX  ? help  b sidebar  g go  c tab  v/- split  x close ",
-        AppMode::Navigate => " NAVIGATE  ↑↓ thread  hjkl pane  Enter open  Esc back ",
-        AppMode::Resize => " RESIZE  hjkl/arrows resize  Enter/Esc finish ",
-        AppMode::Copy => " COPY  hjkl move  Space select  / search  y copy  Esc back ",
-        AppMode::Search => " SEARCH  Enter apply  Esc cancel ",
-        AppMode::Connections => " CONNECTIONS  ↑↓ select  Enter connect  Esc back ",
-        AppMode::Settings => " SETTINGS  ↑↓ select  ←→ change  Esc close ",
-        AppMode::Help => " HELP  Esc close ",
-        _ => " Ctrl-b commands ",
-    };
+    let left = mode_hint(ui.mode);
     let mode_style = if ui.mode == AppMode::Terminal {
         chrome_dim()
     } else {
@@ -775,6 +1123,20 @@ fn render_status(
     if view.status.width >= 8 {
         let rect = Rect::new(view.status.right() - 7, view.status.y, 7, 1);
         draw_text(frame, rect, " Detach", chrome_dim());
+    }
+}
+
+fn mode_hint(mode: AppMode) -> &'static str {
+    match mode {
+        AppMode::Prefix => " PREFIX  ? help  b sidebar  g go  c tab  v/- split  x close ",
+        AppMode::Navigate => " NAVIGATE  ↑↓ thread  hjkl pane  Enter open  Esc back ",
+        AppMode::Resize => " RESIZE  hjkl/arrows resize  Enter/Esc finish ",
+        AppMode::Copy => " COPY  hjkl move  Space select  / search  y copy  Esc back ",
+        AppMode::Search => " SEARCH  Enter apply  Esc cancel ",
+        AppMode::Connections => " CONNECTIONS  ↑↓ select  Enter connect  Esc back ",
+        AppMode::Settings => " SETTINGS  ↑↓ select  ←→ change  Esc close ",
+        AppMode::Help => " HELP  Esc close ",
+        _ => " Ctrl-b commands ",
     }
 }
 
@@ -880,8 +1242,34 @@ fn render_overlays(frame: &mut Frame<'_>, ui: &UiState, view: &ViewLayout, setti
         }
     }
 
-    if let Some(toast) = &ui.toast {
-        let width = (unicode_column_width(&toast.message, None) as u16 + 4)
+    let floating_message = if !settings.show_status_bar {
+        ui.toast
+            .as_ref()
+            .map(|toast| (toast.message.as_str(), true))
+            .or_else(|| {
+                ui.pending.as_ref().map(|pending| {
+                    // The allocation only lives for this draw, so keep pending
+                    // rendering below where it can own the String.
+                    (pending.label.as_str(), false)
+                })
+            })
+            .or_else(|| (!ui.status.is_empty()).then_some((ui.status.as_str(), false)))
+    } else {
+        ui.toast
+            .as_ref()
+            .map(|toast| (toast.message.as_str(), true))
+    };
+    if let Some((message, success)) = floating_message {
+        let pending_message = ui
+            .pending
+            .as_ref()
+            .map(|pending| format!("{} on {}…", pending.label, pending.domain_name));
+        let message = if !settings.show_status_bar && ui.toast.is_none() {
+            pending_message.as_deref().unwrap_or(message)
+        } else {
+            message
+        };
+        let width = (unicode_column_width(message, None) as u16 + 4)
             .min(view.screen.width)
             .max(4);
         let rect = Rect::new(
@@ -894,8 +1282,15 @@ fn render_overlays(frame: &mut Frame<'_>, ui: &UiState, view: &ViewLayout, setti
         fill(frame, rect, " ", chrome());
         frame.render_widget(
             Paragraph::new(TextLine::from(vec![
-                Span::styled(" + ", chrome_success().add_modifier(Modifier::BOLD)),
-                Span::raw(toast.message.as_str()),
+                Span::styled(
+                    if success { " + " } else { " · " },
+                    if success {
+                        chrome_success().add_modifier(Modifier::BOLD)
+                    } else {
+                        chrome_accent_text().add_modifier(Modifier::BOLD)
+                    },
+                ),
+                Span::raw(message),
             ]))
             .style(chrome())
             .block(
@@ -905,6 +1300,31 @@ fn render_overlays(frame: &mut Frame<'_>, ui: &UiState, view: &ViewLayout, setti
                     .style(chrome()),
             ),
             rect,
+        );
+    }
+
+    if !settings.show_status_bar
+        && matches!(
+            ui.mode,
+            AppMode::Prefix | AppMode::Navigate | AppMode::Resize | AppMode::Copy | AppMode::Search
+        )
+        && view.screen.height > 0
+    {
+        let hint = mode_hint(ui.mode);
+        let width = unicode_column_width(hint, None).min(view.screen.width as usize) as u16;
+        let rect = Rect::new(
+            view.screen.x,
+            view.screen.bottom().saturating_sub(1),
+            width,
+            1,
+        );
+        frame.render_widget(Clear, rect);
+        fill(frame, rect, " ", chrome());
+        draw_text(
+            frame,
+            rect,
+            hint,
+            chrome_accent_text().add_modifier(Modifier::BOLD),
         );
     }
 }
@@ -1318,9 +1738,118 @@ mod tests {
     }
 
     #[test]
+    fn pane_nav_rows_do_not_resurrect_detached_split_lines() {
+        let nav = |rect| PaneNav {
+            rect,
+            scroll_start: 0,
+            tabs: vec![],
+            overflow: vec![],
+            tools: vec![],
+        };
+
+        let side_split = SplitView {
+            index: 0,
+            rect: Rect::new(5, 0, 1, 4),
+            direction: SplitDirection::Horizontal,
+        };
+        let mut side_view = ViewLayout::default();
+        side_view.panes = vec![
+            PaneView {
+                nav: Some(nav(Rect::new(0, 0, 5, 1))),
+                ..divider_test_pane(1, Some(Rect::new(0, 1, 5, 3)))
+            },
+            PaneView {
+                nav: Some(nav(Rect::new(6, 0, 5, 1))),
+                ..divider_test_pane(2, Some(Rect::new(6, 1, 5, 3)))
+            },
+        ];
+        assert!(
+            !split_cell_needs_divider(&side_view, &side_split, 5, 0),
+            "the nav row is still covered by both framed pane outers"
+        );
+
+        side_view.panes = vec![
+            divider_test_pane(1, Some(Rect::new(0, 0, 5, 2))),
+            divider_test_pane(2, Some(Rect::new(0, 3, 5, 1))),
+            divider_test_pane(3, Some(Rect::new(6, 0, 5, 4))),
+        ];
+        assert!(
+            !split_cell_needs_divider(&side_view, &side_split, 5, 2),
+            "an orthogonal split gap must not leave a detached divider cell"
+        );
+
+        let row_split = SplitView {
+            index: 1,
+            rect: Rect::new(0, 4, 5, 1),
+            direction: SplitDirection::Vertical,
+        };
+        let mut row_view = ViewLayout::default();
+        row_view.splits = vec![row_split.clone()];
+        row_view.panes = vec![
+            divider_test_pane(1, Some(Rect::new(0, 0, 5, 4))),
+            PaneView {
+                nav: Some(nav(Rect::new(0, 5, 5, 1))),
+                ..divider_test_pane(2, Some(Rect::new(0, 6, 5, 3)))
+            },
+        ];
+        assert!(
+            !split_cell_needs_divider(&row_view, &row_split, 2, 4),
+            "a lower pane nav is the beginning of that framed pane"
+        );
+        assert_eq!(
+            painted_pane_border_rect(&row_view, &row_view.panes[0]),
+            Some(Rect::new(0, 0, 5, 5)),
+            "the upper frame uses the split gutter as its bottom edge"
+        );
+    }
+
+    #[test]
+    fn pane_chrome_composes_a_complete_box_and_real_junctions() {
+        let mut lines = PaneChromeLines::default();
+        lines.border(Rect::new(2, 1, 5, 4), Style::default(), 1);
+
+        let symbol = |x, y| {
+            pane_chrome_symbol(
+                lines
+                    .cells
+                    .get(&(x, y))
+                    .expect("expected a chrome cell")
+                    .connections,
+            )
+        };
+        assert_eq!(symbol(2, 1), "┌");
+        assert_eq!(symbol(6, 1), "┐");
+        assert_eq!(symbol(2, 4), "└");
+        assert_eq!(symbol(6, 4), "┘");
+        assert_eq!(symbol(4, 1), "─");
+        assert_eq!(symbol(2, 2), "│");
+
+        lines.add(4, 1, LINE_SOUTH, Style::default(), 0);
+        assert_eq!(
+            pane_chrome_symbol(lines.cells[&(4, 1)].connections),
+            "┬",
+            "a divider and frame edge must join instead of overwriting"
+        );
+    }
+
+    #[test]
     fn fit_text_respects_cell_width() {
         assert_eq!(fit_text("abc", 2), "ab");
         assert_eq!(fit_text("你好x", 4), "你好");
+    }
+
+    #[test]
+    fn a_shorter_pane_rectangle_keeps_the_live_bottom_visible() {
+        assert_eq!(painted_viewport_top(100, 24, 20, 0, 200, 0), 104);
+        assert_eq!(painted_viewport_top(100, 24, 20, 3, 200, 0), 101);
+        assert_eq!(painted_viewport_top(2, 24, 20, 20, 24, 0), 0);
+    }
+
+    #[test]
+    fn scrollbar_has_no_visual_track_without_scrollback() {
+        assert_eq!(scrollbar_thumb(20, 20, 20, 0), None);
+        assert_eq!(scrollbar_thumb(20, 100, 20, 0), Some((16, 4)));
+        assert_eq!(scrollbar_thumb(20, 100, 20, 80), Some((0, 4)));
     }
 
     #[test]
@@ -1349,6 +1878,79 @@ mod tests {
         // panes beside it.
         assert_eq!(chrome().bg, Some(Color::Reset));
         assert_eq!(chrome_selected().bg, Some(Color::Rgb(137, 180, 250)));
+    }
+
+    #[test]
+    fn level_two_tabs_separate_stack_selection_from_pane_focus() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        crate::settings::set_active_theme(crate::settings::ThemeName::Dracula);
+
+        let surface = pane_nav_surface_style();
+        assert_eq!(surface.bg, Some(Color::Rgb(68, 71, 90)));
+
+        let focused = pane_nav_tab_style(true, true);
+        assert_eq!(focused.bg, Some(Color::Reset));
+        assert_eq!(focused.fg, Some(Color::Rgb(189, 147, 249)));
+        assert!(focused.add_modifier.contains(Modifier::BOLD));
+
+        let unfocused = pane_nav_tab_style(true, false);
+        assert_eq!(unfocused.bg, Some(Color::Reset));
+        assert_eq!(unfocused.fg, Some(Color::Rgb(248, 248, 242)));
+        assert!(unfocused.add_modifier.contains(Modifier::BOLD));
+
+        let inactive = pane_nav_tab_style(false, true);
+        assert_eq!(inactive.bg, Some(Color::Rgb(68, 71, 90)));
+        assert_eq!(inactive.fg, Some(Color::Rgb(98, 114, 164)));
+
+        crate::settings::set_active_theme(crate::settings::ThemeName::Terminal);
+        let surface = pane_nav_surface_style();
+        assert!(surface.add_modifier.contains(Modifier::REVERSED));
+        let terminal = pane_nav_tab_style(true, true);
+        assert!(terminal.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!terminal.add_modifier.contains(Modifier::REVERSED));
+        let inactive = pane_nav_tab_style(false, true);
+        assert!(inactive.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn level_two_bar_paints_a_full_width_layer() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        use crate::view::{PaneNavTab, PaneTool};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        crate::settings::set_active_theme(crate::settings::ThemeName::Dracula);
+        let nav = PaneNav {
+            rect: Rect::new(0, 0, 12, 1),
+            scroll_start: 0,
+            tabs: vec![PaneNavTab {
+                rect: Rect::new(0, 0, 5, 1),
+                pane_id: 1,
+                label: " zsh ".to_string(),
+                active: true,
+                close: None,
+            }],
+            overflow: vec![],
+            tools: vec![(Rect::new(10, 0, 2, 1), PaneTool::NewTab)],
+        };
+        let backend = TestBackend::new(12, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| paint_pane_nav(frame, &nav, true))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 0)].bg, Color::Reset, "active tab opens below");
+        assert_eq!(
+            buffer[(7, 0)].bg,
+            Color::Rgb(68, 71, 90),
+            "unused space belongs to the nav layer"
+        );
+        assert_eq!(
+            buffer[(11, 0)].bg,
+            Color::Rgb(68, 71, 90),
+            "tools stay on the nav layer"
+        );
     }
 
     #[test]

@@ -165,9 +165,16 @@ pub struct UiState {
     pub pane_scrollbars: bool,
     /// Mirrors `TuiConfig::pane_borders`.
     pub pane_borders: bool,
+    /// Mirrors `TuiConfig::show_status_bar`.
+    pub show_status_bar: bool,
     /// Mirrors `TuiConfig::pane_nav_bar`.
     pub pane_nav_bar: bool,
     pub sidebar_scroll: usize,
+    /// First preferred level-1 tab. Layout adjusts it as needed to keep the
+    /// active tab visible.
+    pub tab_scroll: usize,
+    /// First preferred level-2 tab for each pane stack.
+    pub pane_nav_scroll: HashMap<PaneId, usize>,
     pub tree_collapsed: BTreeSet<TreeNodeKey>,
     /// Lines above the physical screen for each pane. Zero follows output.
     pub scroll_offsets: HashMap<PaneId, usize>,
@@ -181,6 +188,9 @@ pub struct UiState {
     pub connection_index: usize,
     pub settings_index: usize,
     pub status: String,
+    status_observed: String,
+    status_expires_at: Option<Instant>,
+    status_persistent: bool,
     pub toast: Option<Toast>,
     pub exit: bool,
     pub frame_number: u64,
@@ -188,6 +198,8 @@ pub struct UiState {
 
 impl UiState {
     pub fn new(status: String) -> Self {
+        let status_expires_at =
+            (!status.is_empty()).then(|| Instant::now() + Duration::from_secs(8));
         Self {
             sidebar_visible: true,
             sidebar_width: 26,
@@ -195,7 +207,10 @@ impl UiState {
             touch_targets: None,
             pane_scrollbars: false,
             pane_borders: true,
+            show_status_bar: false,
             pane_nav_bar: true,
+            status_observed: status.clone(),
+            status_expires_at,
             status,
             ..Default::default()
         }
@@ -229,6 +244,46 @@ impl UiState {
         self.toast
             .as_ref()
             .map(|toast| toast.expires_at.saturating_duration_since(now))
+    }
+
+    fn synchronize_status_deadline(&mut self, now: Instant) {
+        if self.status_observed == self.status {
+            return;
+        }
+        self.status_observed.clone_from(&self.status);
+        self.status_persistent = false;
+        self.status_expires_at = (!self.status.is_empty()).then(|| now + Duration::from_secs(8));
+    }
+
+    pub fn set_persistent_status(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+        self.status_observed.clone_from(&self.status);
+        self.status_persistent = true;
+        self.status_expires_at = None;
+    }
+
+    pub fn expire_status(&mut self, now: Instant) -> bool {
+        self.synchronize_status_deadline(now);
+        if !self.status_persistent
+            && self
+                .status_expires_at
+                .is_some_and(|expires_at| expires_at <= now)
+        {
+            self.status.clear();
+            self.status_observed.clear();
+            self.status_expires_at = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn status_timeout(&mut self, now: Instant) -> Option<Duration> {
+        self.synchronize_status_deadline(now);
+        (!self.status_persistent)
+            .then_some(self.status_expires_at)
+            .flatten()
+            .map(|expires_at| expires_at.saturating_duration_since(now))
     }
 
     pub fn scroll_offset(&self, pane_id: PaneId) -> usize {
@@ -275,5 +330,20 @@ mod tests {
         assert!(!ui.expire_toast(now + Duration::from_secs(2)));
         assert!(ui.expire_toast(now + Duration::from_secs(3)));
         assert!(ui.toast.is_none());
+    }
+
+    #[test]
+    fn ordinary_status_expires_but_progress_waits_for_explicit_completion() {
+        let now = Instant::now();
+        let mut ui = UiState::new(String::new());
+        ui.status = "something failed".into();
+        assert_eq!(ui.status_timeout(now), Some(Duration::from_secs(8)));
+        assert!(!ui.expire_status(now + Duration::from_secs(7)));
+        assert!(ui.expire_status(now + Duration::from_secs(8)));
+
+        ui.set_persistent_status("resyncing");
+        assert_eq!(ui.status_timeout(now), None);
+        assert!(!ui.expire_status(now + Duration::from_secs(60)));
+        assert_eq!(ui.status, "resyncing");
     }
 }

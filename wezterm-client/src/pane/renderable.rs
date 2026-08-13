@@ -37,6 +37,17 @@ struct FetchToken {
 struct FrontendPreviewGeometry {
     epoch: u64,
     size: wezterm_term::TerminalSize,
+    policy: FrontendPreviewPolicy,
+}
+
+/// How an optimistic frontend geometry should treat rows that were fetched for
+/// the preceding grid.  Takeover previews are hidden by an opaque frontend
+/// surface, while a live divider resize is visible and must never expose a row
+/// whose cell storage still has the old width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrontendPreviewPolicy {
+    PreserveRows,
+    LiveResize,
 }
 
 #[derive(Debug)]
@@ -85,6 +96,28 @@ fn invalidate_line_entries(lines: &mut LruCache<StableRowIndex, LineEntry>, pres
     *lines = stale;
 }
 
+/// Keep a stable visual fallback while a visible divider is moving, but make
+/// every retained row structurally valid for the new grid before it can be
+/// painted.  Cropping/padding a prior complete row is preferable to either a
+/// blank flash or mixing old-width storage with newly fetched cells.
+fn resize_stale_line_entries(lines: &mut LruCache<StableRowIndex, LineEntry>, cols: usize) {
+    let mut stale = LruCache::unbounded();
+    while let Some((stable_row, entry)) = lines.pop_lru() {
+        let line = match entry {
+            LineEntry::Stale(line)
+            | LineEntry::Line(line)
+            | LineEntry::LineAndFetching(line, _) => line,
+            LineEntry::Fetching(_) => continue,
+        };
+        let seqno = line.current_seqno();
+        let mut line = line;
+        line.resize(cols, seqno);
+        line.set_last_cell_was_wrapped(false, seqno);
+        stale.put(stable_row, LineEntry::Stale(line));
+    }
+    *lines = stale;
+}
+
 fn render_geometry_changed(current: RenderableDimensions, next: RenderableDimensions) -> bool {
     current.cols != next.cols
         || current.viewport_rows != next.viewport_rows
@@ -102,6 +135,42 @@ fn render_dimensions_match_terminal_size(
         && dimensions.pixel_width == size.pixel_width
         && dimensions.pixel_height == size.pixel_height
         && dimensions.dpi == size.dpi
+}
+
+fn confirmed_frontend_visible_range(
+    dimensions: RenderableDimensions,
+    size: wezterm_term::TerminalSize,
+) -> Option<Range<StableRowIndex>> {
+    if !render_dimensions_match_terminal_size(dimensions, size) {
+        return None;
+    }
+    let top = dimensions.physical_top;
+    Some(top..top.saturating_add(size.rows as StableRowIndex))
+}
+
+fn release_unreturned_fetches(
+    lines: &mut LruCache<StableRowIndex, LineEntry>,
+    requested: &RangeSet<StableRowIndex>,
+    returned: &RangeSet<StableRowIndex>,
+    fetch_token: FetchToken,
+) {
+    for range in requested.iter() {
+        for row in range.clone() {
+            if returned.contains(row) {
+                continue;
+            }
+            match lines.pop(&row) {
+                Some(LineEntry::Fetching(token)) if token == fetch_token => {}
+                Some(LineEntry::LineAndFetching(line, token)) if token == fetch_token => {
+                    lines.put(row, LineEntry::Stale(line));
+                }
+                Some(entry) => {
+                    lines.put(row, entry);
+                }
+                None => {}
+            }
+        }
+    }
 }
 
 fn resolve_server_geometry(
@@ -401,6 +470,11 @@ impl RenderableInner {
         self.poll_interval = BASE_POLL_INTERVAL;
         self.last_recv_time = now;
 
+        let live_preview_accepts_snapshot = self.frontend_preview.is_none_or(|preview| {
+            preview.policy != FrontendPreviewPolicy::LiveResize
+                || render_dimensions_match_terminal_size(delta.dimensions, preview.size)
+        });
+
         let mut dirty = RangeSet::new();
         for r in delta.dirty_lines {
             dirty.add_range(r.clone());
@@ -429,8 +503,9 @@ impl RenderableInner {
         // finally right one in quick succession.
         // If the delta was not from an input event then we trust it; this is most
         // like due to a unilateral movement by the application on the other end.
-        if delta.input_serial.is_none()
-            || delta.input_serial.unwrap_or(InputSerial::empty()) >= self.input_serial
+        if live_preview_accepts_snapshot
+            && (delta.input_serial.is_none()
+                || delta.input_serial.unwrap_or(InputSerial::empty()) >= self.input_serial)
         {
             self.cursor_position = delta.cursor_position;
         }
@@ -460,6 +535,14 @@ impl RenderableInner {
 
         let config = configuration();
         for (stable_row, line) in bonus_lines {
+            // A live preview can have several acknowledged server grids in
+            // flight over its lifetime. Rows bundled with an intermediate
+            // grid are authoritative for that grid only; accepting them into
+            // the final-width cache is exactly how old-width fragments survive
+            // after the divider stops.
+            if !live_preview_accepts_snapshot {
+                continue;
+            }
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
             self.put_line(stable_row, line, &config, None);
             dirty.remove(stable_row);
@@ -565,6 +648,7 @@ impl RenderableInner {
         &mut self,
         epoch: u64,
         size: wezterm_term::TerminalSize,
+        policy: FrontendPreviewPolicy,
     ) -> bool {
         if self
             .frontend_preview
@@ -572,15 +656,28 @@ impl RenderableInner {
         {
             return false;
         }
-        self.frontend_preview = Some(FrontendPreviewGeometry { epoch, size });
+        self.frontend_preview = Some(FrontendPreviewGeometry {
+            epoch,
+            size,
+            policy,
+        });
         if render_dimensions_match_terminal_size(self.dimensions, size) {
             return false;
         }
+        let width_changed = self.dimensions.cols != size.cols;
         self.dimensions.cols = size.cols;
         self.dimensions.viewport_rows = size.rows;
         self.dimensions.pixel_width = size.pixel_width;
         self.dimensions.pixel_height = size.pixel_height;
         self.dimensions.dpi = size.dpi;
+        if policy == FrontendPreviewPolicy::LiveResize {
+            self.line_cache_epoch = self.line_cache_epoch.wrapping_add(1);
+            if width_changed {
+                resize_stale_line_entries(&mut self.lines, size.cols);
+            } else {
+                invalidate_line_entries(&mut self.lines, true);
+            }
+        }
         true
     }
 
@@ -735,11 +832,20 @@ impl RenderableInner {
             match result {
                 Ok(lines) => {
                     let config = configuration();
+                    let mut returned = RangeSet::new();
 
                     log::trace!("fetch complete for {:?} with {:?}", to_fetch, fetch_token);
                     for (stable_row, line) in lines.into_iter() {
+                        returned.add(stable_row);
                         inner.put_line(stable_row, line, &config, Some(fetch_token));
                     }
+                    // The terminal can scroll or resize while GetLines is in
+                    // flight, so a successful response is allowed to omit a
+                    // row that no longer exists in its stable range. Leaving
+                    // that row tagged Fetching would suppress every future
+                    // request for it and can hold an opaque takeover mask up
+                    // forever.
+                    release_unreturned_fetches(&mut inner.lines, &to_fetch, &returned, fetch_token);
                 }
                 Err(err) => {
                     log::error!("get_lines failed: {}", err);
@@ -1049,40 +1155,59 @@ impl RenderableState {
         self.inner.borrow().dimensions
     }
 
-    /// What the server last advertised.  This, not `get_dimensions`, is what
-    /// `prime_frontend_geometry` compares a takeover against, and the two can
-    /// disagree — so a takeover that never completes is only explainable from
-    /// this value.
-    pub(crate) fn server_dimensions(&self) -> RenderableDimensions {
-        self.inner.borrow().server_dimensions
-    }
-
-    /// Which fields block a takeover from settling on `size`, for zoomtrace.
+    /// Which fields or render rows block a takeover from settling on `size`.
     pub(crate) fn frontend_geometry_mismatch(
         &self,
         size: wezterm_term::TerminalSize,
     ) -> Option<String> {
-        let dims = self.inner.borrow().server_dimensions;
-        if render_dimensions_match_terminal_size(dims, size) {
-            return None;
+        let mut inner = self.inner.borrow_mut();
+        let dims = inner.server_dimensions;
+        if !render_dimensions_match_terminal_size(dims, size) {
+            let mut fields = Vec::new();
+            if dims.cols != size.cols {
+                fields.push(format!("cols {}!={}", dims.cols, size.cols));
+            }
+            if dims.viewport_rows != size.rows {
+                fields.push(format!("rows {}!={}", dims.viewport_rows, size.rows));
+            }
+            if dims.pixel_width != size.pixel_width {
+                fields.push(format!("px_w {}!={}", dims.pixel_width, size.pixel_width));
+            }
+            if dims.pixel_height != size.pixel_height {
+                fields.push(format!("px_h {}!={}", dims.pixel_height, size.pixel_height));
+            }
+            if dims.dpi != size.dpi {
+                fields.push(format!("dpi {}!={}", dims.dpi, size.dpi));
+            }
+            return Some(fields.join(","));
         }
-        let mut fields = Vec::new();
-        if dims.cols != size.cols {
-            fields.push(format!("cols {}!={}", dims.cols, size.cols));
+
+        let top = inner.server_dimensions.physical_top;
+        let end = top.saturating_add(size.rows as StableRowIndex);
+        let mut total = 0usize;
+        let mut sample = Vec::new();
+        for row in top..end {
+            let kind = match inner.lines.get(&row) {
+                Some(LineEntry::Line(_)) => continue,
+                Some(LineEntry::Fetching(token)) => format!("Fetching/e{}", token.epoch),
+                Some(LineEntry::LineAndFetching(_, token)) => {
+                    format!("LineAndFetching/e{}", token.epoch)
+                }
+                Some(LineEntry::Stale(_)) => "Stale".to_string(),
+                None => "Missing".to_string(),
+            };
+            total += 1;
+            if sample.len() < 8 {
+                sample.push(format!("{row}:{kind}"));
+            }
         }
-        if dims.viewport_rows != size.rows {
-            fields.push(format!("rows {}!={}", dims.viewport_rows, size.rows));
-        }
-        if dims.pixel_width != size.pixel_width {
-            fields.push(format!("px_w {}!={}", dims.pixel_width, size.pixel_width));
-        }
-        if dims.pixel_height != size.pixel_height {
-            fields.push(format!("px_h {}!={}", dims.pixel_height, size.pixel_height));
-        }
-        if dims.dpi != size.dpi {
-            fields.push(format!("dpi {}!={}", dims.dpi, size.dpi));
-        }
-        Some(fields.join(","))
+        (total > 0).then(|| {
+            format!(
+                "render rows {top}..{end} pending {total} [{}], cache_epoch={}",
+                sample.join(" "),
+                inner.line_cache_epoch
+            )
+        })
     }
 
     /// Drive a render poll and populate every currently visible line while a
@@ -1102,8 +1227,11 @@ impl RenderableState {
             if let Err(err) = inner.poll() {
                 log::trace!("polling takeover geometry: {err:#}");
             }
-            let top = inner.dimensions.physical_top;
-            top..top.saturating_add(size.rows as StableRowIndex)
+            let Some(visible) = confirmed_frontend_visible_range(inner.server_dimensions, size)
+            else {
+                return false;
+            };
+            visible
         };
 
         // This both returns any retained rows and schedules missing/stale
@@ -1112,7 +1240,9 @@ impl RenderableState {
         let _ = self.get_lines(visible.clone());
 
         let mut inner = self.inner.borrow_mut();
-        if !render_dimensions_match_terminal_size(inner.server_dimensions, size) {
+        if confirmed_frontend_visible_range(inner.server_dimensions, size).as_ref()
+            != Some(&visible)
+        {
             return false;
         }
         visible.all(|row| matches!(inner.lines.get(&row), Some(LineEntry::Line(_))))
@@ -1172,6 +1302,25 @@ mod test {
     }
 
     #[test]
+    fn live_resize_normalizes_retained_rows_to_the_preview_width() {
+        let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
+        let mut wrapped = line(80);
+        wrapped.set_last_cell_was_wrapped(true, SEQ_ZERO);
+        lines.put(1, LineEntry::Line(wrapped));
+        lines.put(2, LineEntry::Stale(line(80)));
+
+        resize_stale_line_entries(&mut lines, 37);
+
+        for row in [1, 2] {
+            let Some(LineEntry::Stale(line)) = lines.get(&row) else {
+                panic!("row {} was not retained as stale", row);
+            };
+            assert_eq!(line.len(), 37);
+            assert!(!line.last_cell_was_wrapped());
+        }
+    }
+
+    #[test]
     fn geometry_epoch_ignores_scrollback_motion_but_detects_render_size() {
         let current = dimensions(80, 24, 96);
         let mut scrollback_only = current;
@@ -1225,6 +1374,46 @@ mod test {
             stale_pixels,
             expected
         ));
+    }
+
+    #[test]
+    fn takeover_fetches_the_authoritative_server_rows_after_bottom_anchored_resize() {
+        let size = wezterm_term::TerminalSize {
+            rows: 27,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 540,
+            dpi: 96,
+        };
+        let mut server = dimensions(120, 27, 96);
+        server.pixel_width = size.pixel_width;
+        server.pixel_height = size.pixel_height;
+        server.physical_top = 69;
+
+        assert_eq!(
+            confirmed_frontend_visible_range(server, size),
+            Some(69..96),
+            "a preview's stale top row must not shift the request to 70..97"
+        );
+    }
+
+    #[test]
+    fn a_partial_fetch_response_does_not_leave_an_unreturned_row_in_flight_forever() {
+        let token = FetchToken {
+            epoch: 9,
+            started_at: Instant::now(),
+        };
+        let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
+        lines.put(70, LineEntry::Fetching(token));
+        lines.put(71, LineEntry::LineAndFetching(line(80), token));
+        let mut requested = RangeSet::new();
+        requested.add_range(70..72);
+        let returned = RangeSet::new();
+
+        release_unreturned_fetches(&mut lines, &requested, &returned, token);
+
+        assert!(lines.get(&70).is_none());
+        assert!(matches!(lines.get(&71), Some(LineEntry::Stale(_))));
     }
 
     #[test]

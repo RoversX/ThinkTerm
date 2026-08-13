@@ -73,6 +73,7 @@ pub enum Action {
         split_index: usize,
         delta: isize,
     },
+    FinishSplitResize,
     EnterCopyMode,
     LeaveCopyMode,
     ScrollPane {

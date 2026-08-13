@@ -88,14 +88,17 @@ pub struct TuiConfig {
     /// the server. Until the two agree, the bar is worth having only where the
     /// last column can be spared.
     pub pane_scrollbars: bool,
-    /// Draw a frame around each pane, with the focused one picked out.
+    /// Draw a frame around each pane.
     ///
-    /// On, and cheaper than it sounds: the pane's nav bar is drawn on the
-    /// frame's top edge rather than under it, so the frame costs one row and
-    /// two columns beyond what the bar already spends. What it buys is the
-    /// thing a split screen most needs — an unambiguous edge, and somewhere for
-    /// "this is the pane you are typing into" to live.
+    /// On by default for split layouts. The pane nav remains a separate layer
+    /// above the frame, so the terminal surface has one unambiguous, complete
+    /// outline rather than borrowing disconnected pieces of split dividers.
     pub pane_borders: bool,
+    /// Keep the command/status strip at the bottom of the screen.
+    ///
+    /// Off by default: transient messages and non-terminal mode hints are
+    /// overlays, so showing or expiring one never changes the PTY grid.
+    pub show_status_bar: bool,
     /// Give each pane a strip of its own carrying the panes stacked behind it
     /// and what can be done to it.
     ///
@@ -119,6 +122,7 @@ impl Default for TuiConfig {
             touch_targets: None,
             pane_scrollbars: false,
             pane_borders: true,
+            show_status_bar: false,
             pane_nav_bar: true,
         }
     }
@@ -473,6 +477,7 @@ mod tests {
         assert_eq!(config.sidebar_width, 18);
         assert_eq!(config.scroll_lines, 20);
         assert_eq!(config.theme, ThemeName::MonochromeDark);
+        assert!(config.pane_borders);
     }
 
     #[test]
