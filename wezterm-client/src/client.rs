@@ -266,6 +266,30 @@ pub struct IncompatibleVersionError {
     pub codec_vers: usize,
 }
 
+/// Describe a server whose build differs from ours, or `None` when they match.
+///
+/// [`CODEC_VERSION`] guards the wire format, not behaviour: two builds that
+/// differ only by a behaviour change still carry the same codec version and
+/// handshake without complaint. That is how a mux server left running from a
+/// days-old build goes on serving live shells while looking healthy to a
+/// freshly built client -- the failure this reports is invisible otherwise.
+///
+/// Reported through the log rather than the connection UI on purpose. A
+/// *remote* server legitimately runs its own build, and nagging on every
+/// connect would train the warning away before it ever caught the local case
+/// it exists for.
+pub(crate) fn describe_server_build_mismatch(local: &str, remote: &str) -> Option<String> {
+    if local == remote {
+        return None;
+    }
+    Some(format!(
+        "mux server is running {remote}, this client is {local}. \
+         Codec version {CODEC_VERSION} matches, so they interoperate, but the \
+         server may be serving behaviour from an older build; restart it if \
+         that is not deliberate."
+    ))
+}
+
 macro_rules! rpc {
     ($method_name:ident, $request_type:ident, $response_type:ident) => {
         pub async fn $method_name(&self, pdu: $request_type) -> anyhow::Result<$response_type> {
@@ -1843,6 +1867,12 @@ impl Client {
                     info.version_string,
                     info.codec_vers
                 );
+                if let Some(mismatch) = describe_server_build_mismatch(
+                    config::wezterm_version(),
+                    &info.version_string,
+                ) {
+                    log::warn!("{mismatch}");
+                }
                 match self
                     .send_bootstrap_pdu(Pdu::SetClientId(SetClientId {
                         client_id: self.client_id.clone(),
@@ -2140,7 +2170,32 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{Reconnectable, RegistrationBarrier};
+    use super::{describe_server_build_mismatch, Reconnectable, RegistrationBarrier};
+
+    #[test]
+    fn an_identical_build_is_not_worth_warning_about() {
+        assert_eq!(
+            describe_server_build_mismatch(
+                "20260814-011230-aaef9bfb",
+                "20260814-011230-aaef9bfb"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_server_from_another_build_names_both_sides() {
+        let mismatch = describe_server_build_mismatch(
+            "20260815-150100-eab2bf7c",
+            "20260813-012155-816da4db",
+        )
+        .expect("differing builds are reported");
+        // Which side is which is the whole point of the message: the same two
+        // version strings in the wrong order sends the user to restart the
+        // wrong process.
+        assert!(mismatch.contains("server is running 20260813-012155-816da4db"));
+        assert!(mismatch.contains("client is 20260815-150100-eab2bf7c"));
+    }
 
     #[test]
     fn registration_barrier_sends_bootstrap_before_deferred_rpcs() {

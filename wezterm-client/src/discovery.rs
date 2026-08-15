@@ -177,9 +177,14 @@ mod windows {
         /// Computes the names of the objects; they use Local scoped
         /// names so that we have one per desktop, rather than one
         /// system wide.
+        /// Scoped to the build profile as well as the desktop, so that a debug
+        /// GUI and the release one do not publish to a single pair of objects
+        /// and leave `thinkterm cli` addressing whichever started last. See
+        /// [`config::runtime_file_name`].
         fn compute_names(class_name: &str) -> (String, String) {
-            let mutex_name = format!("Local\\wezterm-sock-mutex-{}", class_name);
-            let map_name = format!("Local\\wezterm-sock-{}", class_name);
+            let scoped = config::runtime_file_name(class_name);
+            let mutex_name = format!("Local\\wezterm-sock-mutex-{}", scoped);
+            let map_name = format!("Local\\wezterm-sock-{}", scoped);
             (mutex_name, map_name)
         }
 
@@ -269,7 +274,18 @@ mod unix {
     }
 
     impl NameHolder {
+        /// Name the symlink that points `thinkterm cli` at the running GUI.
+        ///
+        /// Scoped to the build profile for the same reason the mux socket is
+        /// (see [`config::runtime_file_name`]): a debug GUI and the release
+        /// one otherwise publish to a single name, last writer wins, and CLI
+        /// commands silently address whichever process started most recently
+        /// rather than the one the user meant.
         fn compute_name(class_name: &str) -> String {
+            config::runtime_file_name(&Self::compute_display_name(class_name))
+        }
+
+        fn compute_display_name(class_name: &str) -> String {
             #[cfg(not(target_os = "macos"))]
             {
                 let config = config::configuration();
@@ -313,6 +329,25 @@ mod unix {
         pub fn resolve(class_name: &str) -> anyhow::Result<PathBuf> {
             let name = Self::compute_path(class_name);
             std::fs::read_link(&name).with_context(|| format!("reading symlink {}", name.display()))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::NameHolder;
+
+        #[test]
+        fn the_published_name_is_scoped_to_the_build_profile() {
+            let class = "com.example.thinkterm";
+            let name = NameHolder::compute_name(class);
+            assert!(
+                name.contains(class),
+                "{} no longer identifies the class it publishes for",
+                name
+            );
+            // Tests are built with debug_assertions, which is precisely the
+            // profile that must not land on the release GUI's name.
+            assert_ne!(name, NameHolder::compute_display_name(class));
         }
     }
 }

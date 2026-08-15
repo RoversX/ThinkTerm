@@ -93,7 +93,7 @@ impl UnixDomain {
         self.socket_path
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| RUNTIME_DIR.join("sock"))
+            .unwrap_or_else(|| RUNTIME_DIR.join(runtime_file_name("sock")))
     }
 
     pub fn target(&self) -> UnixTarget {

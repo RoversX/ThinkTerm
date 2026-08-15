@@ -85,6 +85,31 @@ thread_local! {
     static LUA_CONFIG: RefCell<Option<LuaConfigState>> = RefCell::new(None);
 }
 
+/// Name a file under [`RUNTIME_DIR`], scoped to the build profile.
+///
+/// A debug build gets its own socket, pid file and log, so that a binary
+/// built while developing can never adopt -- or be adopted by -- the
+/// release mux server that serves the user's real work. Both ends of the
+/// protocol derive their paths from here, so a debug client reaches the
+/// debug server and nothing else.
+///
+/// The protocol's own guard is not enough on its own: `CODEC_VERSION`
+/// advances only when the wire format changes, so two builds that differ
+/// by a behaviour change alone still handshake happily. A development
+/// server left running days ago therefore goes on serving live shells
+/// while looking perfectly healthy to a freshly built client.
+pub fn runtime_file_name(base: &str) -> String {
+    scoped_runtime_file_name(base, cfg!(debug_assertions))
+}
+
+fn scoped_runtime_file_name(base: &str, debug_build: bool) -> String {
+    if debug_build {
+        format!("{base}-debug")
+    } else {
+        base.to_string()
+    }
+}
+
 fn toml_table_has_numeric_keys(t: &toml::value::Table) -> bool {
     t.keys().all(|k| k.parse::<isize>().is_ok())
 }
@@ -854,4 +879,25 @@ fn default_one_point_oh() -> f32 {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod runtime_file_name_tests {
+    use super::scoped_runtime_file_name;
+
+    #[test]
+    fn a_release_build_keeps_the_documented_runtime_file_names() {
+        assert_eq!(scoped_runtime_file_name("sock", false), "sock");
+        assert_eq!(scoped_runtime_file_name("pid", false), "pid");
+        assert_eq!(scoped_runtime_file_name("log", false), "log");
+    }
+
+    #[test]
+    fn a_debug_build_never_shares_a_runtime_file_with_the_release_one() {
+        for base in ["sock", "pid", "log"] {
+            let debug = scoped_runtime_file_name(base, true);
+            assert_ne!(debug, scoped_runtime_file_name(base, false));
+            assert_eq!(debug, format!("{base}-debug"));
+        }
+    }
 }

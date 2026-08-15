@@ -50,21 +50,21 @@ impl DaemonOptions {
         self.pid_file
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| RUNTIME_DIR.join("pid"))
+            .unwrap_or_else(|| RUNTIME_DIR.join(runtime_file_name("pid")))
     }
 
     pub fn stdout(&self) -> PathBuf {
         self.stdout
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| RUNTIME_DIR.join("log"))
+            .unwrap_or_else(|| RUNTIME_DIR.join(runtime_file_name("log")))
     }
 
     pub fn stderr(&self) -> PathBuf {
         self.stderr
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| RUNTIME_DIR.join("log"))
+            .unwrap_or_else(|| RUNTIME_DIR.join(runtime_file_name("log")))
     }
 
     pub fn open_stdout(&self) -> anyhow::Result<File> {
