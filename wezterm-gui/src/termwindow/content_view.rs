@@ -8,17 +8,269 @@ use crate::termwindow::TermWindow;
 use crate::ui::{DrawContext, UiPalette};
 use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::PositionedSplit;
+use mux::tab::{PositionedSplit, TabId};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wezterm_font::LoadedFont;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex, TerminalSize};
-use window::{MouseEventKind as WMEK, RectF};
+use window::{MouseEvent, MouseEventKind as WMEK, RectF};
 
 pub(crate) type ContentViewId = u64;
+
+/// A full-window ContentView arriving or leaving, composited over the terminal
+/// while it travels.
+///
+/// The terminal keeps being painted for the duration -- normally a foreground
+/// ContentView suppresses it entirely -- so the two are on screen together and
+/// the view can be faded against something rather than against nothing.
+pub(crate) struct ContentViewFade {
+    /// How present the view is: rising as it arrives, falling as it leaves.
+    pub(crate) opacity: crate::ui::anim::Timeline,
+    /// How far the terminal has travelled towards the place the view keeps for
+    /// it: 0 is the whole window, 1 is that place. Separate from `opacity`
+    /// because movement decelerates into its target while opacity does not.
+    pub(crate) travel: crate::ui::anim::Timeline,
+    /// The outgoing view's last painted frame.
+    ///
+    /// A closing view is torn down immediately: deferring that would mean
+    /// keeping something alive that still answers to input and to the mux
+    /// while it is on its way out. Keeping its final quads instead lets the
+    /// picture leave without the view having to.
+    pub(crate) ghost: Option<crate::quad::HeapQuadAllocator>,
+    /// The terminal, recorded once, and where it is going.
+    pub(crate) flight: Option<ContentViewFlight>,
+    /// How far the window frame has moved off its own edges: 0 in place, 1
+    /// fully gone. Separate from the terminal's travel so the two can be
+    /// staggered -- the frame is meant to be seen leaving before the terminal
+    /// starts crossing, and to come back after it has landed.
+    pub(crate) chrome_travel: crate::ui::anim::Timeline,
+    /// The window frame, recorded once, in the three pieces that leave in
+    /// three different directions.
+    pub(crate) chrome: Option<ContentViewChrome>,
+    /// Destination captured before the view was torn down.
+    ///
+    /// A closing view cannot be asked where the terminal belongs -- it is
+    /// already gone by the time the flight is resolved -- so a close records
+    /// the answer while it still can.
+    pub(crate) pending_destination: Option<RectF>,
+    /// The travelling terminal dissolving into the card's own thumbnail of it,
+    /// started once the two are close enough in size to overlap. `None` until
+    /// then, and for the whole of a closing transition -- growing back out of
+    /// a card, there is nothing on the far side to dissolve into.
+    pub(crate) landing: Option<crate::ui::anim::Timeline>,
+    /// When this transition began, in wall-clock time.
+    ///
+    /// Only used to bound how long input may be held; the animation itself is
+    /// paced by the timelines above, which run on a deferred clock.
+    pub(crate) started_at: Instant,
+}
+
+/// How long a running transition may hold input before it is assumed stuck.
+///
+/// The longest piece of the animation is 260ms, and its clock does not start
+/// until a frame has been presented. This ceiling is well clear of that while
+/// still bounded, because the fade is only ever cleared by painting: a window
+/// that stops painting mid-transition -- occluded, or on a display that has
+/// gone to sleep -- would otherwise hold input forever.
+const TRANSITION_INPUT_HOLD: Duration = Duration::from_millis(1000);
+
+/// Whether a transition that began `elapsed` ago still owns the keyboard and
+/// the pointer.
+///
+/// While a transition runs, what is on screen is a recording: the terminal on
+/// its way behind an arriving view, or a view's last frame on its way out.
+/// Both look interactive and neither is.
+pub(crate) fn transition_holds_input(elapsed: Duration) -> bool {
+    elapsed < TRANSITION_INPUT_HOLD
+}
+
+#[cfg(test)]
+mod flight_rect_tests {
+    use super::*;
+
+    fn source() -> RectF {
+        euclid::rect(0.0, 40.0, 1600.0, 900.0)
+    }
+
+    fn destination() -> RectF {
+        euclid::rect(300.0, 600.0, 400.0, 225.0)
+    }
+
+    #[test]
+    fn the_journey_starts_where_the_terminal_was_recorded() {
+        assert_eq!(flight_rect_at(source(), destination(), 0.0), source());
+    }
+
+    #[test]
+    fn the_journey_ends_in_the_card() {
+        assert_eq!(flight_rect_at(source(), destination(), 1.0), destination());
+    }
+
+    #[test]
+    fn travel_is_clamped_at_both_ends() {
+        assert_eq!(flight_rect_at(source(), destination(), -0.5), source());
+        assert_eq!(flight_rect_at(source(), destination(), 4.0), destination());
+    }
+
+    #[test]
+    fn halfway_is_halfway_on_every_edge() {
+        let mid = flight_rect_at(source(), destination(), 0.5);
+        assert_eq!(mid.min_x(), 150.0);
+        assert_eq!(mid.min_y(), 320.0);
+        assert_eq!(mid.size.width, 1000.0);
+        assert_eq!(mid.size.height, 562.5);
+    }
+
+    #[test]
+    fn the_dissolve_waits_until_the_sizes_nearly_match() {
+        // Shrinking 1600 wide into a 400 wide card: every 1% of journey left
+        // is 3% of oversize, so the bound is reached at travel 0.96.
+        let (src, dst) = (source(), destination());
+        assert!(!flight_is_landing(src, dst, 0.0));
+        assert!(!flight_is_landing(src, dst, 0.95));
+        assert!(flight_is_landing(src, dst, 0.96));
+        assert!(flight_is_landing(src, dst, 1.0));
+    }
+
+    #[test]
+    fn a_smaller_card_has_to_be_approached_more_closely() {
+        // Same journey into a card half the size: the journey left that was
+        // 12% of oversize is 28% of this one, so 0.96 is no longer close
+        // enough. The window stays roughly the same length in time because
+        // the travel eases out.
+        let src = source();
+        let small = euclid::rect(300.0, 600.0, 200.0, 112.5);
+        assert!(!flight_is_landing(src, small, 0.96));
+        assert!(flight_is_landing(src, small, 0.99));
+    }
+
+    #[test]
+    fn a_card_that_moved_mid_flight_retargets_from_the_same_source() {
+        // The overview reflowed underneath the terminal: same recording, new
+        // landing rectangle. The arriving picture has to follow it rather than
+        // finish at the old one and jump.
+        let moved = euclid::rect(900.0, 100.0, 400.0, 225.0);
+        assert_eq!(flight_rect_at(source(), moved, 1.0), moved);
+        assert_eq!(flight_rect_at(source(), moved, 0.0), source());
+    }
+}
+
+#[cfg(test)]
+mod transition_input_tests {
+    use super::*;
+
+    #[test]
+    fn input_is_held_for_the_length_of_the_animation() {
+        // The travel is 260ms and its clock waits for a presented frame.
+        assert!(transition_holds_input(Duration::ZERO));
+        assert!(transition_holds_input(Duration::from_millis(260)));
+        assert!(transition_holds_input(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn a_transition_that_stopped_painting_gives_input_back() {
+        assert!(!transition_holds_input(TRANSITION_INPUT_HOLD));
+        assert!(!transition_holds_input(Duration::from_secs(30)));
+    }
+}
+
+/// The window frame recorded per edge, because each piece leaves towards the
+/// edge it is anchored to rather than all of them fading in place.
+#[derive(Default)]
+pub(crate) struct ContentViewChrome {
+    pub(crate) left: crate::quad::HeapQuadAllocator,
+    pub(crate) right: crate::quad::HeapQuadAllocator,
+    pub(crate) top: crate::quad::HeapQuadAllocator,
+}
+
+/// The terminal as it looked when a transition began, travelling to the place
+/// the arriving view keeps for it.
+///
+/// Recorded once rather than repainted per frame: the terminal is not
+/// interactive during the transition, so there is nothing for a live repaint
+/// to show that a still frame cannot. The cost is that its glyphs are sampled
+/// below the size they were rasterised at, so the text softens as it shrinks
+/// -- which is what a window pulling away from you looks like anyway.
+pub(crate) struct ContentViewFlight {
+    pub(crate) surface: crate::quad::HeapQuadAllocator,
+    /// Where the terminal was when `surface` was recorded.
+    ///
+    /// Frozen rather than re-read each frame. These quads carry the positions
+    /// they were authored at, so remapping them from anywhere but the geometry
+    /// they were authored under scales and offsets them wrongly -- a window
+    /// resized, or a sidebar toggled, mid-flight used to stretch the picture.
+    pub(crate) source: RectF,
+    /// Destination in window pixels. Equal to the whole window when the view
+    /// has no place for this terminal, which turns the flight into a plain
+    /// hold and leaves the transition to the fade alone.
+    ///
+    /// A fallback rather than the answer: an arriving view is asked again on
+    /// every frame, because its layout keeps moving while the terminal is on
+    /// its way there. This value is what a *departing* view left behind, and
+    /// there is nobody left to ask.
+    pub(crate) destination: RectF,
+    /// Which terminal is travelling, so the arriving view can be re-asked
+    /// where it now keeps a place for it.
+    pub(crate) tab_id: Option<TabId>,
+}
+
+/// How much larger than its card the travelling terminal may still be when the
+/// two are first allowed to overlap.
+///
+/// Loose, because the overlap itself is cheap: the eased opacity is still flat
+/// at 1.0 for the first quarter of the dissolve, and by the time the recording
+/// is visibly translucent the mismatch is already under 1%. What made the
+/// earlier attempt read as two pictures was not the mismatch on its own but
+/// the flat panel colour showing between them -- the card drew no thumbnail
+/// while its terminal was in flight, so there was nothing to dissolve into.
+/// With an aligned copy of the same picture underneath, a few percent of size
+/// difference is not what the eye is looking at.
+///
+/// Tightening this is what made the first version invisible: 3% left about two
+/// usable frames, which is a cut with extra steps.
+const FLIGHT_LANDING_OVERSIZE: f32 = 0.12;
+
+/// Whether the travelling terminal has closed to within touching distance of
+/// the card it is landing in.
+///
+/// Measured in size, not in time and not in distance already covered. The
+/// travel eases out, so a window written in either of those spends most of
+/// itself at a size that does not match the card -- a threshold at "the last
+/// tenth of the distance" is nearly half of the duration, which is exactly how
+/// the previous attempt ended up translucent for seven frames at a size 3-18%
+/// off. Bounding the mismatch instead makes the window short as a
+/// *consequence*: 40-65ms across the range of card sizes, and self-correcting,
+/// because a smaller card has to be approached more closely to reach the same
+/// proportional error.
+pub(crate) fn flight_is_landing(source: RectF, destination: RectF, travel: f32) -> bool {
+    let rect = flight_rect_at(source, destination, travel);
+    let mismatch = |reached: f32, target: f32| {
+        if target <= 0.0 {
+            f32::INFINITY
+        } else {
+            (reached - target).abs() / target
+        }
+    };
+    mismatch(rect.size.width, destination.size.width)
+        .max(mismatch(rect.size.height, destination.size.height))
+        <= FLIGHT_LANDING_OVERSIZE
+}
+
+/// Where the travelling terminal sits at `travel`, between the rectangle it
+/// was recorded in and the one it is heading for.
+pub(crate) fn flight_rect_at(source: RectF, destination: RectF, travel: f32) -> RectF {
+    let travel = travel.clamp(0.0, 1.0);
+    let lerp = |from: f32, to: f32| from + (to - from) * travel;
+    euclid::rect(
+        lerp(source.min_x(), destination.min_x()),
+        lerp(source.min_y(), destination.min_y()),
+        lerp(source.size.width, destination.size.width),
+        lerp(source.size.height, destination.size.height),
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ContentViewPresentation {
@@ -57,6 +309,11 @@ pub(crate) struct TerminalPreviewPaneSnapshot {
     pub rows: usize,
     pub resolved_top: StableRowIndex,
     pub lines: Vec<Line>,
+    /// Height of the pane's whole box, nav bar included. `dimensions` covers
+    /// the grid alone, so the difference is what the real terminal reserves
+    /// above the first row -- which a thumbnail has to reserve too, or it
+    /// draws the same rows into a taller space.
+    pub box_pixel_height: usize,
     pub dimensions: RenderableDimensions,
     pub palette: ColorPalette,
     pub cursor: StableCursorPosition,
@@ -67,6 +324,13 @@ pub(crate) struct TerminalPreviewRequest {
     pub snapshot: Arc<TerminalPreviewSnapshot>,
     pub area: RectF,
     pub clip: RectF,
+    /// The card is being resized right now, so hold whatever font scale was
+    /// already chosen rather than picking one for this exact size. Scales are
+    /// bucketed to bound how many `FontConfiguration`s exist, but a drag sweeps
+    /// the card through a bucket every few pixels, and each new bucket builds a
+    /// font and rasterises a glyph set. Holding still for the duration costs a
+    /// thumbnail that is briefly a little small.
+    pub hold_scale: bool,
 }
 
 /// Progress of an SSH connection that a content view kicked off, pushed by the
@@ -167,11 +431,39 @@ pub(crate) trait ContentView {
         false
     }
 
+    /// Tell the view the shape of the terminal area it is standing in front
+    /// of, so a thumbnail can hold the same proportions as the thing it is a
+    /// picture of. Pushed every frame rather than fixed at construction: the
+    /// window can be resized, a sidebar opened or the tab bar toggled while
+    /// the view is up, and a card frozen at the shape the terminal happened to
+    /// have when it opened stops matching the terminal it came from.
+    fn set_host_preview_aspect(&mut self, _aspect: f32) {}
+
     /// Terminal tabs to paint as read-only live thumbnails after the view's
     /// regular UI layers have been prepared.
     fn terminal_previews(&self) -> Vec<TerminalPreviewRequest> {
         Vec::new()
     }
+
+    /// Where this view shows `tab_id`'s terminal, if it shows it at all.
+    ///
+    /// A view that gives a terminal a place of its own can have that terminal
+    /// travel to it rather than being replaced by it. `None` means there is no
+    /// destination and the view should simply arrive.
+    ///
+    /// Only meaningful after a paint: the answer comes from a layout, and the
+    /// layout is computed while drawing.
+    fn terminal_landing_rect(&self, _tab_id: TabId) -> Option<RectF> {
+        None
+    }
+
+    /// A terminal that is currently travelling to or from its place here, and
+    /// so must not also be drawn in it.
+    ///
+    /// Without this the view shows its own copy of the terminal underneath the
+    /// one flying towards it, and the transition reads as two pictures of the
+    /// same thing rather than one thing moving.
+    fn set_terminal_in_flight(&mut self, _tab_id: Option<TabId>) {}
 
     /// Paint masks and chrome that must sit above terminal preview glyphs.
     /// Most ContentViews do not embed terminal snapshots and need no second
@@ -212,6 +504,21 @@ pub(crate) trait ContentView {
     ) -> anyhow::Result<()>;
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse;
+
+    /// Wheel events, with the parts of the event that [`WMEK`] cannot carry.
+    ///
+    /// A trackpad reports pixels: macOS sends `VertWheel(0)` alongside a
+    /// precise delta whenever the gesture has not yet accumulated a whole
+    /// line, so a view that reads only the kind either stands still or moves
+    /// in whole notches. The momentum phase matters for the same reason --
+    /// the system is already supplying the glide, and a view that adds its
+    /// own would be integrating it twice.
+    ///
+    /// Views that do not scroll by pixels can ignore this and keep handling
+    /// the coarse event.
+    fn on_wheel(&mut self, x: f32, y: f32, event: &MouseEvent) -> ContentViewResponse {
+        self.on_mouse(x, y, event.kind.clone())
+    }
 
     fn on_key(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse;
 

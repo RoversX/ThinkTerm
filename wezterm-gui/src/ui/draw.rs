@@ -310,7 +310,7 @@ impl<'a> DrawContext<'a> {
             clip.max_y(),
             &self.dimensions,
         );
-        heap.apply_to_clipped(layers, clip)
+        heap.apply_to_clipped(layers, clip, 1.0)
     }
 
     pub(crate) fn draw_rounded_rect(

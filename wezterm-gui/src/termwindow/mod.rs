@@ -249,6 +249,72 @@ use prevcursor::PrevCursorPos;
 
 const ATLAS_SIZE: usize = 128;
 
+/// Ceiling on growing the glyph atlas to fit a working set, in texels per side.
+///
+/// [`ATLAS_SIZE`] is only a seed: startup grows it until the utility sprites
+/// fit and then stops, which lands at 512 and has nothing to do with how many
+/// glyphs are actually in use. The overview pushed the working set well past
+/// that -- a terminal's glyphs, the window chrome, and every card's thumbnail
+/// at its own font size -- and the overflow path answered by clearing the
+/// atlas at the same size. Any single frame fits after a clear, so it never
+/// grew and cleared again on the next transition instead: every glyph on
+/// screen re-rasterised, several times a minute.
+///
+/// The atlas is BGRA32, so this is 16MB. Growth stays demand-driven -- nothing
+/// is allocated until a frame actually overflows -- and at the ceiling the old
+/// clear-in-place behaviour takes over again, which is also what reclaims the
+/// one-off glyphs a closed overview leaves behind.
+const MAX_GROWN_ATLAS_SIZE: usize = 2048;
+
+/// How long a full-window view takes to arrive or leave.
+///
+/// Shorter than the Space swipe settle: that one continues a gesture the hand
+/// is still invested in, while this is the cost of a glance. The overview is
+/// opened to survey what is running, several times an hour, and every
+/// millisecond here is charged to that glance.
+const CONTENT_VIEW_FADE: Duration = Duration::from_millis(140);
+
+/// How long the terminal takes to travel into the card it becomes.
+///
+/// Longer than the fade it happens under: the eye is following something
+/// across most of the window, and a distance that large read at fade speed
+/// registers as a jump rather than as travel.
+const CONTENT_VIEW_TRAVEL: Duration = Duration::from_millis(260);
+
+/// How long the travelling terminal takes to dissolve into the card's own
+/// thumbnail of it, once the two are close enough in size to overlap.
+///
+/// Long enough to be seen, which is a lower bound with real teeth: a timeline
+/// does not start its clock until the frame after it is armed, so a dissolve
+/// budgeted at 45ms spent one frame arming and left two usable ones. That is a
+/// cut with extra steps, and it is what the first version of this shipped as.
+///
+/// Deliberately outlasts the travel. The last stretch of it therefore runs
+/// after the terminal has settled into the card, where the two pictures are
+/// aligned exactly and the dissolve costs nothing at all.
+const CONTENT_VIEW_LANDING_FADE: Duration = Duration::from_millis(140);
+
+/// How long the window frame takes to clear its own edges. Shorter than the
+/// terminal's journey: it only has to get out of the way, and the eye should
+/// be on the terminal by the time it is halfway across.
+const CONTENT_VIEW_CHROME_TRAVEL: Duration = Duration::from_millis(180);
+
+/// How long the frame waits, on the way back, for the terminal to land first.
+/// Arriving together would leave the frame sitting around an empty middle.
+const CHROME_RETURN_DELAY: Duration = Duration::from_millis(90);
+
+/// Z-index the travelling terminal is composited into: above the arriving
+/// view, because it is shrinking *into* the card and has to be seen crossing
+/// the grid that is arriving underneath it.
+pub(crate) const CONTENT_VIEW_FLIGHT_ZINDEX: i8 = 9;
+
+/// Z-index a transitioning full-window view is composited into.
+///
+/// Everything else in the window draws at zero. The quad layers within a
+/// z-index are a global order rather than per-surface depth, so a view sharing
+/// them with the terminal would have the terminal's text drawn through it.
+pub(crate) const CONTENT_VIEW_FADE_ZINDEX: i8 = 8;
+
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
     static ref POSITION: Mutex<Option<GuiPosition>> = Mutex::new(None);
@@ -1427,6 +1493,12 @@ pub struct TermWindow {
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
     pane_font_cache: RefCell<HashMap<PaneFontKey, PaneFontEntry>>,
+    /// Scratch space for recording terminal thumbnails, kept across frames so
+    /// its pool of quad boxes is not rebuilt for every card.
+    preview_quad_heap: RefCell<crate::quad::HeapQuadAllocator>,
+    /// Font scale last chosen for a thumbnail of a grid this size, so a drag
+    /// can hold it steady instead of rebucketing every few pixels.
+    preview_scale_hold: RefCell<HashMap<(usize, usize), f64>>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
     window_background: Vec<LoadedBackgroundLayer>,
@@ -1495,6 +1567,12 @@ pub struct TermWindow {
     /// foreground.  It is flushed once when terminal content becomes visible
     /// again; merely opening and closing a view must not resize mux tabs.
     content_view_deferred_mux_resize: bool,
+    /// A full-window view arriving or leaving. `None` outside a transition,
+    /// which is the state the paint pass treats as "one world or the other".
+    content_view_fade: Option<crate::termwindow::content_view::ContentViewFade>,
+    /// The most recent full-window view frame, recorded so that closing one
+    /// has a picture to take away after the view itself is gone.
+    content_view_last_frame: Option<crate::quad::HeapQuadAllocator>,
     next_content_view_id: ContentViewId,
     registered_content_view_surfaces: HashMap<ContentViewId, MuxWindowId>,
     /// Tracks SSH connections kicked off by `RemoteThreadView`s.
@@ -1977,6 +2055,56 @@ impl TermWindow {
         }
     }
 
+    /// Drop what a running full-window transition had recorded, keeping the
+    /// transition itself.
+    ///
+    /// Same reason as the space swipe above: captured quads hold atlas UV
+    /// coordinates rather than pixels, so a repack moves every glyph out from
+    /// under them and replaying them afterwards draws whatever now sits at
+    /// those coordinates. A transition is a likely moment for a repack -- it
+    /// is generating thumbnails at font sizes nothing has used before.
+    ///
+    /// Most of it can simply be recorded again. Clearing `flight` is what asks
+    /// for that: the next frame sees no recording, paints the terminal world
+    /// into a fresh one, and re-resolves where it is going -- the timelines
+    /// keep running throughout, so the animation continues from where it had
+    /// reached rather than restarting. The window frame comes along on the
+    /// same frame.
+    ///
+    /// `ghost` is kept, stale coordinates and all. It is a closing view's last
+    /// frame and that view has already been torn down, so nothing can record
+    /// it again -- and on the frame this runs on, the terminal world is going
+    /// into a recording rather than onto the screen. Dropping the ghost there
+    /// leaves nothing at all to draw: the whole window goes black for a frame,
+    /// with the shrunken terminal alone in the middle of it. Wrong glyphs in a
+    /// picture that is already fading out are much cheaper than that.
+    ///
+    /// This deliberately does *not* cancel the fade either. That was the first
+    /// version, and it traded the same frame of wrong glyphs for an animation
+    /// that silently stopped partway.
+    fn discard_content_view_captures_after_atlas_recreation(&mut self) {
+        // Repopulated by the paint pass the retry loop is about to run.
+        self.content_view_last_frame = None;
+        let Some(fade) = self.content_view_fade.as_mut() else {
+            return;
+        };
+        // Logged, not silent. This fires far more often than "the atlas
+        // occasionally repacks" suggests -- three times in thirteen seconds of
+        // opening and closing the overview -- and every symptom it produces
+        // looks like a rendering bug rather than like recovery.
+        log::info!(
+            "atlas recreated mid-transition; re-recording flight and chrome (ghost kept: {})",
+            fade.ghost.is_some()
+        );
+        fade.flight = None;
+        fade.chrome = None;
+        // The card hides its own thumbnail while its terminal is in flight.
+        // There is no flight for the moment, so let it draw one.
+        if let Some(view) = self.active_content_view_mut() {
+            view.set_terminal_in_flight(None);
+        }
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
@@ -2300,6 +2428,8 @@ impl TermWindow {
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             pane_font_cache: RefCell::new(HashMap::new()),
+            preview_quad_heap: RefCell::new(Default::default()),
+            preview_scale_hold: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
             last_mouse_click: None,
@@ -2375,6 +2505,8 @@ impl TermWindow {
             active_content_view_id: None,
             content_view_response_tab_id: None,
             content_view_deferred_mux_resize: false,
+            content_view_fade: None,
+            content_view_last_frame: None,
             next_content_view_id: 1,
             registered_content_view_surfaces: HashMap::new(),
             remote_connects: HashMap::new(),
@@ -4263,6 +4395,9 @@ impl TermWindow {
             .borrow_mut()
             .update_config(&config);
         self.pane_font_cache.borrow_mut().clear();
+        // The held scales name entries in the cache just emptied, and a config
+        // change can move the font size out from under them anyway.
+        self.preview_scale_hold.borrow_mut().clear();
         self.fancy_tab_bar.take();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
@@ -4329,6 +4464,23 @@ impl TermWindow {
         self.active_content_view_index().is_some()
     }
 
+    /// Whether a full-window view is arriving or leaving right now, and so
+    /// owns the keyboard and the pointer.
+    ///
+    /// Every other input gate asks [`Self::content_view_foreground`], which is
+    /// false for the whole of a *closing* transition: the view is removed from
+    /// `content_views` before the fade is started. Without this the terminal
+    /// was reachable for the length of that animation, while what the user was
+    /// looking at was a recording of it on its way into a card.
+    pub(crate) fn content_view_transition_running(&self) -> bool {
+        let now = Instant::now();
+        self.content_view_fade.as_ref().is_some_and(|fade| {
+            crate::termwindow::content_view::transition_holds_input(
+                now.saturating_duration_since(fade.started_at),
+            )
+        })
+    }
+
     pub(crate) fn active_content_view_presentation(&self) -> ContentViewPresentation {
         self.active_content_view()
             .map(|view| view.presentation())
@@ -4385,6 +4537,37 @@ impl TermWindow {
         // area. Applying it only added a left/top gap (the right/bottom edges
         // never subtracted it) that nothing painted, so the window background
         // showed through as an L-shaped border.
+        let left = self.workspace_sidebar_width() as f32 + border.left.get() as f32;
+        let top = border.top.get() as f32 + top_tab_h;
+        let right = self
+            .dimensions
+            .pixel_width
+            .saturating_sub(border.right.get() as usize)
+            .saturating_sub(self.right_sidebar_width()) as f32;
+        let bottom =
+            (self.dimensions.pixel_height as f32 - border.bottom.get() as f32 - bottom_tab_h)
+                .max(top);
+        euclid::rect(left, top, (right - left).max(0.0), (bottom - top).max(0.0))
+    }
+
+    /// Where the terminal grid itself lives: the window minus the sidebars,
+    /// the tab bar and the borders.
+    ///
+    /// Unlike [`Self::content_view_area`] this ignores whether a full-window
+    /// view is currently open, because it answers a question about the
+    /// terminal rather than about the view sitting on top of it.
+    pub(crate) fn terminal_content_rect(&self) -> RectF {
+        let border = self.get_os_border();
+        let top_tab_h = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let bottom_tab_h = if self.show_tab_bar && self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
         let left = self.workspace_sidebar_width() as f32 + border.left.get() as f32;
         let top = border.top.get() as f32 + top_tab_h;
         let right = self
@@ -4581,6 +4764,7 @@ impl TermWindow {
 
         let id = self.next_content_view_id;
         self.next_content_view_id = self.next_content_view_id.saturating_add(1).max(1);
+        let full_window = matches!(view.presentation(), ContentViewPresentation::FullWindow);
         self.content_views.push(ContentViewTab {
             id,
             key,
@@ -4588,7 +4772,88 @@ impl TermWindow {
             view,
         });
         self.set_active_content_view_id(Some(id));
+        if full_window {
+            self.begin_content_view_fade(false);
+        }
         id
+    }
+
+    /// Start a full-window view's arrival or departure.
+    ///
+    /// The clock is deliberately left unstarted: the first frame of an
+    /// arriving view rasterises every glyph it contains and grows the atlas
+    /// for them, and charging that to the transition would spend most of it
+    /// on a picture nobody has seen yet.
+    fn begin_content_view_fade(&mut self, closing: bool) {
+        self.begin_content_view_fade_to(closing, None);
+    }
+
+    fn begin_content_view_fade_to(&mut self, closing: bool, destination: Option<RectF>) {
+        let now = Instant::now();
+        let ghost = closing.then(|| self.content_view_last_frame.take()).flatten();
+        if closing && ghost.is_none() {
+            // Nothing was ever composited for this view -- it opened and
+            // closed inside a single frame. There is no picture to take away.
+            self.content_view_fade = None;
+            return;
+        }
+        let (from, to) = if closing { (1.0, 0.0) } else { (0.0, 1.0) };
+        // A toggle can land while the previous one is still running. Departing
+        // from where each value currently is, rather than from the far end, is
+        // the difference between a reversal and a jump followed by a reversal.
+        let (opacity_from, travel_from, chrome_from) = self
+            .content_view_fade
+            .as_ref()
+            .map(|fade| {
+                (
+                    fade.opacity.value(now),
+                    fade.travel.value(now),
+                    fade.chrome_travel.value(now),
+                )
+            })
+            .unwrap_or((from, from, from));
+        // Time the reversal by how far it actually has to go. Replaying the
+        // full duration to cover the last tenth of a journey reads as the
+        // animation having stalled; the floor keeps a near-complete one from
+        // snapping.
+        let span = |start: f32| ((to - start).abs()).clamp(0.25, 1.0);
+        self.content_view_fade = Some(crate::termwindow::content_view::ContentViewFade {
+            opacity: crate::ui::anim::Timeline::new(
+                now,
+                opacity_from,
+                to,
+                CONTENT_VIEW_FADE.mul_f32(span(opacity_from)),
+                crate::ui::anim::Easing::Smooth,
+            ),
+            travel: crate::ui::anim::Timeline::new(
+                now,
+                travel_from,
+                to,
+                CONTENT_VIEW_TRAVEL.mul_f32(span(travel_from)),
+                crate::ui::anim::Easing::OutCubic,
+            ),
+            // Opening, the frame is seen leaving before the terminal starts
+            // crossing; closing, it comes back only once the terminal has
+            // landed. Same two events, opposite order, so the delay swaps ends.
+            chrome_travel: crate::ui::anim::Timeline::delayed(
+                now,
+                chrome_from,
+                to,
+                if closing { CHROME_RETURN_DELAY } else { Duration::ZERO },
+                CONTENT_VIEW_CHROME_TRAVEL.mul_f32(span(chrome_from)),
+                crate::ui::anim::Easing::OutCubic,
+            ),
+            chrome: None,
+            ghost,
+            flight: None,
+            landing: None,
+            pending_destination: destination,
+            started_at: now,
+        });
+        // Input is held for the duration, so a press that is still waiting for
+        // its release must not be left half-finished: the release would be
+        // swallowed and the drag would resume against the next stray motion.
+        self.dragging = None;
     }
 
     pub(crate) fn close_content_view(&mut self) {
@@ -4605,7 +4870,26 @@ impl TermWindow {
         let Some(idx) = self.content_views.iter().position(|tab| tab.id == id) else {
             return;
         };
+        let was_full_window = matches!(
+            self.content_views[idx].view.presentation(),
+            ContentViewPresentation::FullWindow
+        );
+        // Ask, while the view still exists, where the terminal it is giving
+        // the window back to was sitting. After the removal there is nobody
+        // left to answer.
+        let departing_destination = Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .map(|tab| tab.tab_id())
+            .and_then(|tab_id| self.content_views[idx].view.terminal_landing_rect(tab_id));
+        // Deliberately not gated on `was_foreground`: some close paths clear
+        // the active id before removing the view, and a view that had been
+        // painting is on screen whether or not it still holds that id. Having
+        // a recorded frame is the evidence that matters.
+        let was_on_screen = was_full_window && self.content_view_last_frame.is_some();
         self.content_views.remove(idx);
+        if was_on_screen {
+            self.begin_content_view_fade_to(true, departing_destination);
+        }
 
         if was_foreground {
             self.active_content_view_id = self
@@ -4737,7 +5021,19 @@ impl TermWindow {
             let active_workspace = self
                 .current_mux_workspace()
                 .unwrap_or_else(|| Mux::get().active_workspace());
-            let host_preview_aspect = if self.terminal_size.pixel_height > 0 {
+            // A card is a picture of the space the terminal occupies on
+            // screen, and that is also what the opening transition flies from:
+            // `terminal_content_rect`, grid plus padding. Sizing the card from
+            // the bare grid instead left the two ends measuring different
+            // rectangles of the same terminal -- the flight arrived stretched
+            // by whatever share the padding held, non-uniformly, because the
+            // card it landed in had never accounted for it.
+            let content = self.terminal_content_rect();
+            let host_preview_aspect = if content.size.height > 0.0
+                && content.size.width > 0.0
+            {
+                content.size.width / content.size.height
+            } else if self.terminal_size.pixel_height > 0 {
                 self.terminal_size.pixel_width as f32 / self.terminal_size.pixel_height as f32
             } else {
                 let width = self.terminal_size.cols as f32

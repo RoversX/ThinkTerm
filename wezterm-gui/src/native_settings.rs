@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use window::{Appearance, Connection, ConnectionOps};
 
 // One point is one logical pixel on macOS but 4/3 px at 96dpi, so the
@@ -456,10 +456,10 @@ pub(crate) fn settings_path() -> PathBuf {
         .join("settings.json")
 }
 
-static SETTINGS_CACHE: OnceLock<Mutex<ThinkTermNativeSettings>> = OnceLock::new();
+static SETTINGS_CACHE: OnceLock<Mutex<Arc<ThinkTermNativeSettings>>> = OnceLock::new();
 
-fn settings_cache() -> &'static Mutex<ThinkTermNativeSettings> {
-    SETTINGS_CACHE.get_or_init(|| Mutex::new(load_from_disk()))
+fn settings_cache() -> &'static Mutex<Arc<ThinkTermNativeSettings>> {
+    SETTINGS_CACHE.get_or_init(|| Mutex::new(Arc::new(load_from_disk())))
 }
 
 fn load_from_disk() -> ThinkTermNativeSettings {
@@ -487,7 +487,17 @@ fn load_from_disk() -> ThinkTermNativeSettings {
 }
 
 pub(crate) fn load() -> ThinkTermNativeSettings {
-    settings_cache().lock().clone()
+    (**settings_cache().lock()).clone()
+}
+
+/// A shared handle to the settings, for callers that only read them.
+///
+/// [`load`] hands out a private copy, which is what a caller wanting to edit
+/// and `save` needs. The paint path wants nothing of the sort and was taking
+/// several copies a frame -- a lock and a deep clone each time, of a value
+/// nobody was going to touch.
+pub(crate) fn load_shared() -> Arc<ThinkTermNativeSettings> {
+    Arc::clone(&settings_cache().lock())
 }
 
 pub(crate) fn should_show_onboarding(settings: &ThinkTermNativeSettings) -> bool {
@@ -496,7 +506,7 @@ pub(crate) fn should_show_onboarding(settings: &ThinkTermNativeSettings) -> bool
 
 pub(crate) fn reload_from_disk() -> ThinkTermNativeSettings {
     let settings = load_from_disk();
-    *settings_cache().lock() = settings.clone();
+    *settings_cache().lock() = Arc::new(settings.clone());
     settings
 }
 
@@ -509,7 +519,7 @@ pub(crate) fn save(settings: &ThinkTermNativeSettings) -> anyhow::Result<()> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, data)?;
     fs::rename(tmp, path)?;
-    *settings_cache().lock() = settings.clone();
+    *settings_cache().lock() = Arc::new(settings.clone());
     Ok(())
 }
 

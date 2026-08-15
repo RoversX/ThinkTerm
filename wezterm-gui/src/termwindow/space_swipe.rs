@@ -1,3 +1,4 @@
+use crate::ui::anim::{Easing, Timeline};
 use std::time::{Duration, Instant};
 
 const HORIZONTAL_LOCK_DISTANCE: f32 = 8.0;
@@ -184,15 +185,11 @@ struct Settle {
     source_space_id: String,
     target_space_id: Option<String>,
     source_scroll_offset: f32,
-    from: f32,
-    to: f32,
-    started_at: Instant,
-    /// The frame that first shows `from` is also the frame that adopts the
-    /// destination Space, so it pays for its glyph rasterisation and atlas
-    /// growth -- routinely 100ms+, roughly half the transition. Holding the
-    /// clock until the *next* frame starts keeps that cost out of the
-    /// animation instead of letting it swallow the opening frames.
-    started: bool,
+    /// The sidebar offset travelling to its resting place. A committed switch
+    /// leaves its opening frame uncharged, because that frame also adopts the
+    /// destination Space and pays for its glyph rasterisation and atlas
+    /// growth -- routinely 100ms+, roughly half the transition.
+    travel: Timeline,
     committed: bool,
 }
 
@@ -305,10 +302,15 @@ impl SidebarSpaceSwipeState {
                     source_space_id: gesture.source_space_id,
                     target_space_id,
                     source_scroll_offset: gesture.source_scroll_offset,
-                    from,
-                    to: 0.0,
-                    started_at: now,
-                    started: true,
+                    // The pages are already where the finger left them, so
+                    // there is nothing new to draw before travelling back.
+                    travel: Timeline::running(
+                        now,
+                        from,
+                        0.0,
+                        SETTLE_DURATION,
+                        Easing::OutCubic,
+                    ),
                     committed: false,
                 });
                 SidebarSpaceSwipeFinish::AnimateBack
@@ -360,12 +362,16 @@ impl SidebarSpaceSwipeState {
                     source_space_id: gesture.source_space_id,
                     target_space_id,
                     source_scroll_offset: gesture.source_scroll_offset,
-                    from,
-                    to: if switched { target_offset } else { 0.0 },
-                    started_at: now,
                     // A committed switch defers its clock to the next frame;
                     // a rejected one has nothing expensive to wait for.
-                    started: !switched,
+                    travel: {
+                        let to = if switched { target_offset } else { 0.0 };
+                        if switched {
+                            Timeline::new(now, from, to, SETTLE_DURATION, Easing::OutCubic)
+                        } else {
+                            Timeline::running(now, from, to, SETTLE_DURATION, Easing::OutCubic)
+                        }
+                    },
                     committed: switched,
                 });
             }
@@ -385,16 +391,7 @@ impl SidebarSpaceSwipeState {
             return false;
         };
 
-        if !settle.started {
-            // The opening frame has been presented; start timing from here.
-            settle.started = true;
-            settle.started_at = now;
-            self.phase = Phase::Settling(settle);
-            return true;
-        }
-
-        let elapsed = now.saturating_duration_since(settle.started_at);
-        if elapsed >= SETTLE_DURATION {
+        if !settle.travel.advance(now) {
             self.phase = Phase::Idle;
             return false;
         }
@@ -417,24 +414,12 @@ impl SidebarSpaceSwipeState {
                     offset: gesture.display_offset(sidebar_width),
                 })
             }
-            Phase::Settling(settle) => {
-                let raw_t = if settle.started {
-                    now.saturating_duration_since(settle.started_at)
-                        .as_secs_f32()
-                        / SETTLE_DURATION.as_secs_f32()
-                } else {
-                    // Clock not running yet: hold the opening position.
-                    0.0
-                };
-                let t = raw_t.clamp(0.0, 1.0);
-                let eased = 1.0 - (1.0 - t).powi(3);
-                Some(SidebarSpaceSwipeVisual {
-                    source_space_id: settle.source_space_id.clone(),
-                    target_space_id: settle.target_space_id.clone(),
-                    source_scroll_offset: settle.source_scroll_offset,
-                    offset: settle.from + (settle.to - settle.from) * eased,
-                })
-            }
+            Phase::Settling(settle) => Some(SidebarSpaceSwipeVisual {
+                source_space_id: settle.source_space_id.clone(),
+                target_space_id: settle.target_space_id.clone(),
+                source_scroll_offset: settle.source_scroll_offset,
+                offset: settle.travel.value(now),
+            }),
             _ => None,
         }
     }
@@ -784,12 +769,17 @@ mod tests {
         );
 
         assert!(swipe.is_committing_or_committed());
-        // First paint after the commit: starts the clock, nothing elapsed yet.
-        assert!(swipe.advance(at(start, 120)));
+        // The opening frame: painted at rest, and not charged to the
+        // transition -- it is the frame that adopts the destination Space.
+        assert!(swipe.advance(at(start, 30)));
+        assert_eq!(swipe.visual(at(start, 30), 300.0).unwrap().offset, -120.0);
         assert!(swipe.is_committing_or_committed());
-        assert!(swipe.advance(at(start, 250)));
+
+        // Timing runs from the frame after that one.
+        assert!(swipe.advance(at(start, 46)));
+        assert!(swipe.advance(at(start, 200)));
         assert!(swipe.is_committing_or_committed());
-        assert!(!swipe.advance(at(start, 350)));
+        assert!(!swipe.advance(at(start, 280)));
         assert!(!swipe.is_committing_or_committed());
     }
 
@@ -841,8 +831,11 @@ mod tests {
             swipe.visual(adoption_finished, 300.0).unwrap().offset,
             -120.0
         );
+        // The full transition is still ahead: the second of adoption before it
+        // has been spent on work, not on the animation.
         assert!(swipe.advance(at(start, 1_100)));
-        assert!(!swipe.advance(at(start, 1_250)));
+        assert!(swipe.advance(at(start, 1_250)));
+        assert!(!swipe.advance(at(start, 1_330)));
     }
 
     #[test]

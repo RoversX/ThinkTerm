@@ -5,9 +5,10 @@ use crate::termwindow::{RenderFrame, TermWindowNotif};
 use crate::ui::{DrawContext, UiPalette};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::color::LinearRgba;
+use ::window::RectF;
 use ::window::WindowOps;
 use anyhow::Context;
-use mux::renderable::StableCursorPosition;
+use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::SplitDirection;
 use smol::Timer;
 use std::collections::hash_map::DefaultHasher;
@@ -15,9 +16,26 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 use wezterm_font::ClearShapeCache;
 use wezterm_term::color::ColorAttribute;
+use wezterm_term::TerminalSize;
 
 const TERMINAL_PREVIEW_EXTENT_BUCKET_DESIGN_PX: f32 = 8.0;
 const TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT: f64 = 128.0;
+/// How far the preview may walk down from its estimated font scale looking for
+/// one that fits. Each step costs a `FontConfiguration`, and the estimate is
+/// close enough that one is usually all it takes.
+const MAX_PREVIEW_SCALE_STEPS: usize = 12;
+/// How far a thumbnail may be stretched on one axis to undo the proportions
+/// lost when a cell is rounded to whole pixels. Enough to cover that rounding
+/// at the sizes cards use; far short of reshaping a terminal that is honestly
+/// a different shape.
+const MAX_PREVIEW_ASPECT_TRIM: f32 = 1.15;
+/// Ceiling on enlarging a thumbnail to fill its card. Only ever closes the gap
+/// left by whole-pixel cells, which is under one cell's worth.
+const MAX_PREVIEW_FILL: f32 = 1.5;
+
+/// Height of the pane layer divider the tab bar draws below itself, in the same
+/// device pixels the divider quad uses. Kept in step with `fancy_tab_bar`.
+const TAB_BAR_SEAM_HEIGHT: f32 = 1.0;
 
 fn quantized_terminal_preview_extent(extent: f32, dpi: usize) -> f32 {
     let bucket = crate::ui::scale_ui_f32(TERMINAL_PREVIEW_EXTENT_BUCKET_DESIGN_PX, dpi).max(1.0);
@@ -26,6 +44,43 @@ fn quantized_terminal_preview_extent(extent: f32, dpi: usize) -> f32 {
     } else {
         (extent / bucket).floor() * bucket
     }
+}
+
+/// How much to stretch a laid-out grid, per axis, so it fills its card.
+///
+/// The font scale a thumbnail settles on lands on whole pixels -- a cell is
+/// 6px or 7px and nothing between -- so the grid it builds routinely stops
+/// short of the card, by up to a whole cell across the full width. Worse,
+/// rounding does not preserve a cell's proportions: a real 19x41 cell becomes
+/// 6x14, which is 8% narrow for its height, and a grid of narrow cells is the
+/// wrong *shape* for its card however uniformly it is scaled. It fills the
+/// height and leaves a bare strip down the side.
+///
+/// So: enlarge uniformly as far as both axes allow, then let the short axis
+/// catch up by a bounded amount. That second step undoes the rounding rather
+/// than inventing a distortion. The bound is what keeps it honest -- a card
+/// can be showing a terminal from another window whose grid is a genuinely
+/// different shape, and that difference is not ours to erase.
+fn preview_fill_factors(
+    grid_width: f32,
+    grid_height: f32,
+    area_width: f32,
+    area_height: f32,
+) -> (f32, f32) {
+    if !(grid_width > 0.0 && grid_height > 0.0 && area_width > 0.0 && area_height > 0.0) {
+        return (1.0, 1.0);
+    }
+    let want_x = area_width / grid_width;
+    let want_y = area_height / grid_height;
+    let smaller = want_x.min(want_y);
+    let uniform = smaller.clamp(1.0, MAX_PREVIEW_FILL);
+    // Measured against what both axes wanted, not against the capped uniform:
+    // dividing by the cap makes the ratio enormous whenever the card is much
+    // larger than the grid, and then both axes take the full trim -- turning a
+    // bounded uniform fill into an unbounded one, for a grid that was already
+    // the right shape.
+    let trim = |want: f32| (want / smaller).clamp(1.0, MAX_PREVIEW_ASPECT_TRIM);
+    (uniform * trim(want_x), uniform * trim(want_y))
 }
 
 fn minimum_terminal_preview_scale(font_size: f64, dpi: usize, global_scale: f64) -> f64 {
@@ -47,12 +102,63 @@ fn quantize_terminal_preview_scale_down(scale: f64, minimum: f64) -> f64 {
         .max(minimum)
 }
 
+/// Recover a pane's font-size ratio from the terminal geometry captured in
+/// the snapshot. `Tab::get_size` is expressed using the root grid's cell
+/// metrics, while each pane's pixel dimensions use that pane's own metrics.
+/// Comparing their effective cell sizes preserves pane-local font scaling
+/// without reaching back into another GUI window's mutable pane state.
+fn terminal_preview_pane_scale_ratio(
+    tab_size: TerminalSize,
+    pane_dims: RenderableDimensions,
+) -> f64 {
+    fn ratio(
+        pane_pixels: usize,
+        pane_cells: usize,
+        root_pixels: usize,
+        root_cells: usize,
+    ) -> Option<f64> {
+        if pane_pixels == 0 || pane_cells == 0 || root_pixels == 0 || root_cells == 0 {
+            return None;
+        }
+        let pane_cell = pane_pixels as f64 / pane_cells as f64;
+        let root_cell = root_pixels as f64 / root_cells as f64;
+        let ratio = pane_cell / root_cell;
+        ratio.is_finite().then_some(ratio)
+    }
+
+    let width_ratio = ratio(
+        pane_dims.pixel_width,
+        pane_dims.cols,
+        tab_size.pixel_width,
+        tab_size.cols,
+    );
+    let height_ratio = ratio(
+        pane_dims.pixel_height,
+        pane_dims.viewport_rows,
+        tab_size.pixel_height,
+        tab_size.rows,
+    );
+
+    // Start from the larger axis. The raster-metric correction in the paint
+    // path then scales down to the largest font that fits both axes, avoiding
+    // a permanently under-filled pane due to integer font metrics.
+    match (width_ratio, height_ratio) {
+        (Some(width), Some(height)) => width.max(height),
+        (Some(width), None) => width,
+        (None, Some(height)) => height,
+        (None, None) => 1.0,
+    }
+    .clamp(0.25, 4.0)
+}
+
 #[cfg(test)]
 mod terminal_preview_tests {
     use super::{
         minimum_terminal_preview_scale, quantize_terminal_preview_scale_down,
-        quantized_terminal_preview_extent,
+        quantized_terminal_preview_extent, terminal_preview_pane_scale_ratio,
     };
+    use mux::renderable::RenderableDimensions;
+    use wezterm_term::TerminalSize;
 
     #[test]
     fn preview_extent_uses_four_logical_pixel_buckets() {
@@ -74,6 +180,37 @@ mod terminal_preview_tests {
         assert_eq!(
             quantize_terminal_preview_scale_down(0.001, minimum),
             minimum
+        );
+    }
+
+    #[test]
+    fn preview_recovers_a_pane_local_font_scale_from_its_cell_geometry() {
+        let tab_size = TerminalSize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 1_000,
+            pixel_height: 800,
+            dpi: 144,
+        };
+        let pane_dims = RenderableDimensions {
+            cols: 40,
+            viewport_rows: 12,
+            pixel_width: 600,
+            pixel_height: 360,
+            ..RenderableDimensions::default()
+        };
+
+        assert_eq!(terminal_preview_pane_scale_ratio(tab_size, pane_dims), 1.5);
+    }
+
+    #[test]
+    fn preview_uses_the_default_scale_when_cell_geometry_is_unavailable() {
+        assert_eq!(
+            terminal_preview_pane_scale_ratio(
+                TerminalSize::default(),
+                RenderableDimensions::default()
+            ),
+            1.0
         );
     }
 }
@@ -106,7 +243,7 @@ impl crate::TermWindow {
         self.filled_rectangle(layers, 0, area, palette.window_bg)
             .context("frontend handoff opaque background")?;
 
-        let font_size = crate::native_settings::home_font_size(&crate::native_settings::load());
+        let font_size = crate::native_settings::home_font_size(&crate::native_settings::load_shared());
         let title_font = self.fonts.title_font_with_size(font_size + 2.0)?;
         let hint_font = self.fonts.title_font_with_size(font_size)?;
         let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&title_font.metrics());
@@ -323,10 +460,31 @@ impl crate::TermWindow {
                     }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
                     {
                         let result = if pass == 0 {
-                            // Let's try clearing out the atlas and trying again
-                            // self.clear_texture_atlas()
-                            log::trace!("recreate_texture_atlas");
-                            self.recreate_texture_atlas(Some(current_size))
+                            // Grow while there is headroom, rather than
+                            // clearing in place.
+                            //
+                            // Clearing answers "the atlas is full of glyphs we
+                            // no longer need". It is the wrong answer to "the
+                            // working set does not fit": the frame that
+                            // overflowed fits once the atlas is empty, so this
+                            // never reached the growth branch below, and the
+                            // next frame that wants the same glyphs overflows
+                            // again. Toggling the overview cleared the atlas
+                            // every single time, re-rasterising every glyph on
+                            // screen -- and taking the recorded transition
+                            // frames, whose texture coordinates the rebuild
+                            // invalidates, with it.
+                            let grown = size.min(crate::termwindow::MAX_GROWN_ATLAS_SIZE);
+                            if grown > current_size {
+                                log::trace!("grow texture atlas {current_size} -> {grown}");
+                                self.recreate_texture_atlas(Some(grown))
+                            } else {
+                                // At the ceiling: clearing is all that is left,
+                                // and it is also what reclaims the one-off
+                                // glyphs a closed overview leaves behind.
+                                log::trace!("recreate_texture_atlas at {current_size}");
+                                self.recreate_texture_atlas(Some(current_size))
+                            }
                         } else {
                             log::trace!("grow texture atlas to {}", size);
                             self.recreate_texture_atlas(Some(size))
@@ -339,6 +497,7 @@ impl crate::TermWindow {
                         // waiting for its first source capture; the retry can
                         // repaint that source and complete the pending switch.
                         self.recover_workspace_space_swipe_after_atlas_recreation();
+                        self.discard_content_view_captures_after_atlas_recreation();
 
                         if let Err(err) = result {
                             self.allow_images = match self.allow_images {
@@ -421,11 +580,360 @@ impl crate::TermWindow {
 
     /// Paint the active content view into the content area (right of the
     /// sidebar, below the tab bar).
+    /// Advance a full-window view's arrival or departure.
+    fn advance_content_view_fade(&mut self, now: Instant) {
+        let Some(fade) = self.content_view_fade.as_mut() else {
+            return;
+        };
+        // Once the travelling terminal has closed to within touching distance
+        // of its card, hand the card back its own thumbnail and dissolve the
+        // recording into it. Both pictures are then on screen at the same
+        // rectangle, which is the only arrangement in which a dissolve reads as
+        // one thing settling rather than as two things overlapping.
+        let mut landed = false;
+        if fade.landing.is_none() && fade.travel.target() >= 0.5 {
+            if let Some(flight) = fade.flight.as_ref() {
+                if crate::termwindow::content_view::flight_is_landing(
+                    flight.source,
+                    flight.destination,
+                    fade.travel.value(now),
+                ) {
+                    fade.landing = Some(crate::ui::anim::Timeline::new(
+                        now,
+                        1.0,
+                        0.0,
+                        crate::termwindow::CONTENT_VIEW_LANDING_FADE,
+                        crate::ui::anim::Easing::Smooth,
+                    ));
+                    landed = true;
+                }
+            }
+        }
+        let travelling = fade.travel.advance(now)
+            | fade.chrome_travel.advance(now)
+            | fade.landing.as_mut().is_some_and(|fade| fade.advance(now));
+        if landed {
+            // Painted after this runs, so the thumbnail appears underneath the
+            // dissolve on this very frame rather than one frame late.
+            if let Some(view) = self.active_content_view_mut() {
+                view.set_terminal_in_flight(None);
+            }
+        }
+        let Some(fade) = self.content_view_fade.as_mut() else {
+            return;
+        };
+        if fade.opacity.advance(now) || travelling {
+            // Unnamed interval, as with the Space swipe: the backend paces
+            // repaints to this display's refresh rate.
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        } else {
+            self.content_view_fade = None;
+            // The departing picture has finished leaving; nothing else refers
+            // to it, and an arriving one is now simply the foreground.
+            self.content_view_last_frame = None;
+            if let Some(view) = self.active_content_view_mut() {
+                view.set_terminal_in_flight(None);
+            }
+            self.invalidate_window();
+        }
+    }
+
+    fn content_view_fade_opacity(&self, now: Instant) -> Option<f32> {
+        self.content_view_fade
+            .as_ref()
+            .map(|fade| fade.opacity.value(now))
+    }
+
+    fn window_rect(&self) -> RectF {
+        euclid::rect(
+            0.0,
+            0.0,
+            self.dimensions.pixel_width as f32,
+            self.dimensions.pixel_height as f32,
+        )
+    }
+
+    fn clip_of(&self, rect: RectF) -> QuadClipRect {
+        QuadClipRect::from_top_left_pixels(
+            rect.min_x(),
+            rect.min_y(),
+            rect.max_x(),
+            rect.max_y(),
+            &self.dimensions,
+        )
+    }
+
+    /// Replay the recorded terminal at the size its travel has reached.
+    ///
+    /// It rides above the view: the terminal is shrinking *into* the card, so
+    /// it has to be seen crossing the grid that is arriving underneath it. The
+    /// last stretch is spent fading, because what it lands on is the card's
+    /// own thumbnail of the same terminal drawn from the same snapshot -- near
+    /// enough to blend into, not near enough to cut to.
+    fn paint_content_view_flight(&self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let Some(fade) = self.content_view_fade.as_ref() else {
+            return Ok(());
+        };
+        let Some(flight) = fade.flight.as_ref() else {
+            return Ok(());
+        };
+        // The terminal grid is what travels, and the card's own thumbnail is
+        // what it lands on, so both ends of the journey are the same picture.
+        //
+        // The source is the one recorded with the surface, not the terminal's
+        // rectangle now: these quads hold the positions they were authored at.
+        let source = flight.source;
+        // The destination, on the other hand, is re-asked every frame. An
+        // arriving overview keeps laying itself out while the terminal crosses
+        // the window -- closing a card reflows the grid underneath it -- and a
+        // rectangle sampled once meant landing on where the card used to be
+        // and then jumping to where it is.
+        let destination = flight
+            .tab_id
+            .and_then(|tab_id| {
+                self.active_content_view()
+                    .and_then(|view| view.terminal_landing_rect(tab_id))
+            })
+            .unwrap_or(flight.destination);
+        let travel = fade.travel.value(now);
+        let target = crate::termwindow::content_view::flight_rect_at(source, destination, travel);
+        // Opaque for all of the journey but the landing.
+        //
+        // An earlier version faded over the last tenth of the *distance*, and
+        // ease-out spends its time unevenly: that tenth is nearly half of the
+        // duration, so the fade ran translucent for seven frames at a size
+        // 3-18% off the card it was landing on. Worse, the card drew no
+        // thumbnail while its terminal was in flight, so there was nothing on
+        // the far side to dissolve into -- only the flat panel colour. Two
+        // misaligned pictures with a panel showing between them is exactly
+        // what "it looks like two layers" meant.
+        //
+        // Both of those are now addressed rather than avoided: the window is
+        // bounded by size instead of by distance, and the card is handed its
+        // thumbnail back as the window opens. See `flight_is_landing`.
+        let opacity = fade.landing.as_ref().map_or(1.0, |fade| fade.value(now));
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::CONTENT_VIEW_FLIGHT_ZINDEX)
+            .context("content view flight layer")?;
+        let mut layers = layer.quad_allocator();
+        flight.surface.apply_to_scaled(
+            &mut layers,
+            self.clip_of(source),
+            self.clip_of(target),
+            self.clip_of(target),
+            opacity,
+        )
+    }
+
+    /// Record the window frame in three pieces, one per edge it can leave by.
+    fn record_content_view_chrome(&mut self) -> anyhow::Result<()> {
+        let mut chrome = crate::termwindow::content_view::ContentViewChrome::default();
+        {
+            let mut left = TripleLayerQuadAllocator::Heap(&mut chrome.left);
+            self.paint_workspace_sidebar(&mut left)
+                .context("record workspace sidebar")?;
+        }
+        {
+            let mut right = TripleLayerQuadAllocator::Heap(&mut chrome.right);
+            self.paint_right_sidebar(&mut right)
+                .context("record right sidebar")?;
+        }
+        if self.show_tab_bar {
+            let mut top = TripleLayerQuadAllocator::Heap(&mut chrome.top);
+            self.paint_tab_bar(&mut top).context("record tab bar")?;
+        }
+        if let Some(fade) = self.content_view_fade.as_mut() {
+            fade.chrome = Some(chrome);
+        }
+        Ok(())
+    }
+
+    /// Slide each piece of the frame off the edge it belongs to.
+    ///
+    /// Anchored motion rather than a fade: a panel that lives against the left
+    /// edge reads as leaving when it goes left, and as merely disappearing
+    /// when it dissolves in place.
+    fn paint_content_view_chrome(&self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let Some(fade) = self.content_view_fade.as_ref() else {
+            return Ok(());
+        };
+        let Some(chrome) = fade.chrome.as_ref() else {
+            return Ok(());
+        };
+        let gone = fade.chrome_travel.value(now).clamp(0.0, 1.0);
+        let window = self.window_rect();
+        let terminal = self.terminal_content_rect();
+        let left_width = terminal.min_x() - window.min_x();
+        let right_width = window.max_x() - terminal.max_x();
+        // The tab bar paints one row past its own band. The pane layer divider
+        // in `fancy_tab_bar` sits at the seam -- `row_y + row_height`, which is
+        // the terminal's first row, not the tab bar's last -- so sliding by the
+        // terminal's top inset alone parks exactly that row against the top of
+        // the window and leaves it there. Windowed, the rounded corner mask
+        // hides most of it; fullscreen has no corners and it reads as a
+        // hairline that never leaves.
+        let top_height = terminal.min_y() - window.min_y() + TAB_BAR_SEAM_HEIGHT;
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::CONTENT_VIEW_FLIGHT_ZINDEX)
+            .context("content view chrome layer")?;
+        let mut layers = layer.quad_allocator();
+        let full = self.clip_of(window);
+        for (surface, dx, dy) in [
+            (&chrome.left, -left_width * gone, 0.0),
+            (&chrome.right, right_width * gone, 0.0),
+            (&chrome.top, 0.0, -top_height * gone),
+        ] {
+            let shifted = window.translate(euclid::vec2(dx, dy));
+            surface.apply_to_scaled(&mut layers, full, self.clip_of(shifted), full, 1.0)?;
+        }
+        Ok(())
+    }
+
+    /// Work out where the terminal is heading and hand it the recorded frame.
+    ///
+    /// Called after the view has painted, because the destination comes from
+    /// the view's layout and the layout is produced by painting. This lands on
+    /// the transition's first frame, which the timelines have deliberately not
+    /// started counting yet.
+    fn resolve_content_view_flight(&mut self, surface: HeapQuadAllocator) {
+        let tab_id = mux::Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .map(|tab| tab.tab_id());
+        // A closing transition recorded its destination before the view was
+        // torn down; an opening one asks the view that has just laid itself
+        // out.
+        let recorded = self
+            .content_view_fade
+            .as_ref()
+            .and_then(|fade| fade.pending_destination);
+        let destination = recorded
+            .or_else(|| {
+                tab_id.and_then(|tab_id| {
+                    self.active_content_view()
+                        .and_then(|view| view.terminal_landing_rect(tab_id))
+                })
+            })
+            .unwrap_or_else(|| self.window_rect());
+        // The view must not draw its own copy of a terminal that is currently
+        // crossing the window towards it.
+        if destination != self.window_rect() {
+            if let Some(view) = self.active_content_view_mut() {
+                view.set_terminal_in_flight(tab_id);
+            }
+        }
+        let source = self.terminal_content_rect();
+        if let Some(fade) = self.content_view_fade.as_mut() {
+            fade.flight = Some(crate::termwindow::content_view::ContentViewFlight {
+                surface,
+                source,
+                destination,
+                tab_id,
+            });
+        }
+    }
+
+    fn surface_clip(&self) -> QuadClipRect {
+        QuadClipRect::from_top_left_pixels(
+            0.0,
+            0.0,
+            self.dimensions.pixel_width as f32,
+            self.dimensions.pixel_height as f32,
+            &self.dimensions,
+        )
+    }
+
+    /// Composite a recorded surface above everything the terminal drew.
+    ///
+    /// The three quad layers are a global z-order, not per-surface depth:
+    /// every layer-0 quad in the window is drawn, then every layer-1 quad,
+    /// then every layer-2 quad. Appending a second surface into the same
+    /// layers therefore interleaves the two -- terminal text, which lives in
+    /// layer 1, lands on top of a view's card backgrounds in layer 0. A
+    /// separate z-index is a separate set of passes, so the whole surface
+    /// arrives above the whole terminal.
+    fn composite_above_terminal(
+        &self,
+        surface: &HeapQuadAllocator,
+        opacity: f32,
+    ) -> anyhow::Result<()> {
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::CONTENT_VIEW_FADE_ZINDEX)
+            .context("content view transition layer")?;
+        let mut layers = layer.quad_allocator();
+        surface.apply_to_clipped(&mut layers, self.surface_clip(), opacity)
+    }
+
+    /// Paint the foreground view, recording the frame so that closing it later
+    /// has a picture to take away, and compositing it at the transition's
+    /// opacity while one is running.
+    fn paint_content_view_composited(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+    ) -> anyhow::Result<()> {
+        if !self.content_view_is_full_window() {
+            // Only full-window views transition, and only they are worth the
+            // extra copy through a heap.
+            return self.paint_content_view(layers);
+        }
+
+        // One surface, recorded in one pass: the view, its thumbnails and the
+        // window chrome it owns. Fading them separately -- or holding some of
+        // them back -- is what makes an arrival look like several things
+        // happening near each other rather than one thing happening.
+        let mut heap = HeapQuadAllocator::default();
+        {
+            let mut recorded = TripleLayerQuadAllocator::Heap(&mut heap);
+            self.paint_content_view(&mut recorded)?;
+            let mut chrome_items = self
+                .paint_full_window_chrome(&mut recorded)
+                .context("paint full-window client chrome")?;
+            self.ui_items.append(&mut chrome_items);
+        }
+        match self.content_view_fade_opacity(Instant::now()) {
+            // Arriving: the terminal is underneath this frame, so the view has
+            // to be lifted clear of it.
+            Some(opacity) => self.composite_above_terminal(&heap, opacity)?,
+            // Settled: nothing else is on screen to be ordered against.
+            None => heap.apply_to_clipped(layers, self.surface_clip(), 1.0)?,
+        }
+        self.content_view_last_frame = Some(heap);
+        Ok(())
+    }
+
+    /// Composite the recorded frame of a view that has already been closed.
+    fn paint_departing_content_view(&mut self) -> anyhow::Result<()> {
+        let opacity = self
+            .content_view_fade_opacity(Instant::now())
+            .unwrap_or(0.0);
+        let Some(ghost) = self
+            .content_view_fade
+            .as_ref()
+            .and_then(|fade| fade.ghost.as_ref())
+        else {
+            return Ok(());
+        };
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::CONTENT_VIEW_FADE_ZINDEX)
+            .context("departing content view layer")?;
+        let mut layers = layer.quad_allocator();
+        ghost.apply_to_clipped(&mut layers, self.surface_clip(), opacity)
+    }
+
     pub fn paint_content_view(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
     ) -> anyhow::Result<()> {
-        let settings = crate::native_settings::load();
+        let settings = crate::native_settings::load_shared();
         let font_weight = crate::native_settings::settings_font_weight(&settings);
         let active_content_view_idx = self.active_content_view_index();
         let typography = active_content_view_idx
@@ -486,11 +994,24 @@ impl crate::TermWindow {
             self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(blink_ms)));
         }
 
+        // Measured before the view is borrowed, and re-measured every frame:
+        // the terminal area behind a full-window view keeps changing shape
+        // while the view is up.
+        let host_preview_aspect = {
+            let content = self.terminal_content_rect();
+            if content.size.width > 0.0 && content.size.height > 0.0 {
+                content.size.width / content.size.height
+            } else {
+                0.0
+            }
+        };
+
         let (next_frame, previews) = {
             let gl_state = self.render_state.as_ref().unwrap();
             let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
             if let Some(idx) = active_content_view_idx {
                 let view = self.content_views[idx].view.as_mut();
+                view.set_host_preview_aspect(host_preview_aspect);
                 view.paint_surface_background(&ctx, layers, surface, palette)?;
                 view.paint(
                     &ctx,
@@ -535,20 +1056,33 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator<'_>,
         previews: &[TerminalPreviewRequest],
     ) -> anyhow::Result<()> {
-        for preview in previews {
-            self.paint_terminal_preview(layers, preview)?;
-        }
-        Ok(())
+        // One allocator for every card, borrowed out of the window and put
+        // back, so its pool of quad boxes outlives both the loop and the frame.
+        // Each card's thumbnail is thousands of quads and there are as many
+        // cards as fit the viewport; building and dropping that from scratch
+        // per card per frame is millions of allocations a second, spent on
+        // memory that was about to be asked for again.
+        let mut heap = std::mem::take(&mut *self.preview_quad_heap.borrow_mut());
+        let result = (|| {
+            for preview in previews {
+                self.paint_terminal_preview(layers, preview, &mut heap)?;
+            }
+            Ok(())
+        })();
+        heap.recycle();
+        *self.preview_quad_heap.borrow_mut() = heap;
+        result
     }
 
     fn paint_terminal_preview(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         preview: &TerminalPreviewRequest,
+        heap: &mut HeapQuadAllocator,
     ) -> anyhow::Result<()> {
-        let mut heap = HeapQuadAllocator::default();
+        heap.recycle();
         {
-            let mut clipped_layers = TripleLayerQuadAllocator::Heap(&mut heap);
+            let mut clipped_layers = TripleLayerQuadAllocator::Heap(heap);
             self.paint_terminal_preview_unclipped(&mut clipped_layers, preview)?;
         }
         let clip = QuadClipRect::from_top_left_pixels(
@@ -558,7 +1092,7 @@ impl crate::TermWindow {
             preview.clip.max_y(),
             &self.dimensions,
         );
-        heap.apply_to_clipped(layers, clip)
+        heap.apply_to_clipped(layers, clip, 1.0)
     }
 
     fn paint_terminal_preview_unclipped(
@@ -609,6 +1143,16 @@ impl crate::TermWindow {
             .clamp(minimum_scale, maximum_scale);
         let mut quantized_scale =
             quantize_terminal_preview_scale_down(desired_scale, minimum_scale);
+        // Mid-drag, keep the scale this grid was last drawn at. The search
+        // below would otherwise walk a new bucket every few pixels of card
+        // width, and every bucket is a `FontConfiguration` that builds a font,
+        // rasterises glyphs and grows the atlas -- and is never evicted.
+        let scale_key = (tab_size.cols, tab_size.rows);
+        if preview.hold_scale {
+            if let Some(held) = self.preview_scale_hold.borrow().get(&scale_key) {
+                quantized_scale = *held;
+            }
+        }
         let (mut font_config, mut metrics) = self.pane_font_resources(quantized_scale)?;
 
         // Font raster metrics are integer pixels and therefore do not scale
@@ -631,21 +1175,78 @@ impl crate::TermWindow {
             }
         }
 
-        let still_too_wide =
-            tab_size.cols as f32 * metrics.cell_size.width.max(1) as f32 > bucketed_width;
-        let still_too_tall =
-            tab_size.rows as f32 * metrics.cell_size.height.max(1) as f32 > bucketed_height;
-        if (still_too_wide || still_too_tall) && quantized_scale > minimum_scale {
-            quantized_scale = minimum_scale;
+        // Step down a bucket at a time until the grid fits.
+        //
+        // This used to answer any remaining overflow by dropping straight to
+        // `minimum_scale`, which is a cliff rather than a correction: being one
+        // pixel too tall after the analytical estimate is a rounding artefact
+        // of integer raster metrics, and paying for it with the smallest font
+        // the preview allows collapsed the whole thumbnail to 1x3px cells --
+        // a thumb-sized smear of text in the corner of an otherwise empty card.
+        // Reachable as soon as a card is tall enough relative to its terminal,
+        // which is what opening a sidebar does.
+        //
+        // The step is bounded: each iteration builds a FontConfiguration, and
+        // the estimate is close enough that this normally settles in one.
+        for _ in 0..MAX_PREVIEW_SCALE_STEPS {
+            if quantized_scale <= minimum_scale {
+                break;
+            }
+            let too_wide =
+                tab_size.cols as f32 * metrics.cell_size.width.max(1) as f32 > bucketed_width;
+            let too_tall =
+                tab_size.rows as f32 * metrics.cell_size.height.max(1) as f32 > bucketed_height;
+            if !too_wide && !too_tall {
+                break;
+            }
+            let next = quantize_terminal_preview_scale_down(
+                quantized_scale - 1.0 / TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT,
+                minimum_scale,
+            );
+            if next >= quantized_scale {
+                break;
+            }
+            quantized_scale = next;
             (font_config, metrics) = self.pane_font_resources(quantized_scale)?;
         }
+        // Whatever the search settled on is what a drag will hold to. Recorded
+        // even mid-drag, because the stepping loop above may still have had to
+        // come down to make the grid fit a card that has since shrunk.
+        self.preview_scale_hold
+            .borrow_mut()
+            .insert(scale_key, quantized_scale);
+
         let cell_width = metrics.cell_size.width.max(1) as f32;
         let cell_height = metrics.cell_size.height.max(1) as f32;
+
+        // Close the gap left by whole-pixel cells.
+        //
+        // A thumbnail cell is 6px or 7px and nothing in between, and the scale
+        // search can only round down, so the grid routinely stops a whole cell
+        // short across its full width -- 87 columns at 6px is 522px inside a
+        // 610px card, a bare strip down the right-hand side. The per-pane
+        // position transform below already maps rendered text into whatever
+        // rect the layout asks for; it simply had nothing to do, because the
+        // layout asked for exactly the size the text already was. Stretching
+        // the layout is what gives it something to do. One factor for both
+        // axes, so this enlarges the picture rather than distorting it.
+        let (fill_x, fill_y) = preview_fill_factors(
+            tab_size.cols as f32 * cell_width,
+            tab_size.rows as f32 * cell_height,
+            preview.area.size.width,
+            preview.area.size.height,
+        );
+        let cell_width = cell_width * fill_x;
+        let cell_height = cell_height * fill_y;
         // Terminal content begins at the same top-left origin as the real
         // terminal. Any remainder stays on the right/bottom and is visually
         // continuous with the background painted above.
         let origin_x = preview.area.origin.x;
         let origin_y = preview.area.origin.y;
+
+        // One nav bar height for every pane in the tab, because that is how the
+        // terminal draws it.
+        let nav_bar_height = self.pane_nav_bar_height() as f32;
 
         let gl_state = self.render_state.as_ref().unwrap();
         let white_space = gl_state.util_sprites.white_space.texture_coords();
@@ -660,14 +1261,15 @@ impl crate::TermWindow {
             let pane_width = pane.width as f32 * cell_width;
             let pane_height = pane.height as f32 * cell_height;
             let pane_rect = euclid::rect(pane_x, pane_y, pane_width, pane_height);
-            if let Some(visible) = pane_rect.intersection(&preview.clip) {
-                self.filled_rectangle(
-                    layers,
-                    0,
-                    visible,
-                    palette.resolve_bg(ColorAttribute::Default).to_linear(),
-                )?;
-            }
+            let Some(pane_clip) = pane_rect.intersection(&preview.clip) else {
+                continue;
+            };
+            self.filled_rectangle(
+                layers,
+                0,
+                pane_clip,
+                palette.resolve_bg(ColorAttribute::Default).to_linear(),
+            )?;
 
             let source_dims = pane.dimensions;
             let rows = pane.rows;
@@ -676,12 +1278,59 @@ impl crate::TermWindow {
                 continue;
             }
 
+            // The real terminal reserves the top of a pane's box for its nav
+            // bar and starts the grid below it: `terminal_size_for_positioned_pane`
+            // subtracts that height before dividing into rows. `pane.height`
+            // is the whole box, so laying the grid out against the box's top
+            // edge both lifts the text by the height of a nav bar and stretches
+            // it vertically, mapping the same rows onto a taller target. The
+            // strip left behind is the picture the terminal shows once its
+            // chrome is taken away, which is what a card is.
+            // Take the nav bar's real height rather than inferring it from
+            // what the grid left over. That leftover is the nav bar *plus* the
+            // remainder of dividing the box by a cell, and the remainder
+            // depends on each pane's own cell height -- so two panes sharing
+            // one nav bar derived strips 22px apart and their text no longer
+            // lined up across the split, which it does in the terminal.
+            let reserved = pane
+                .box_pixel_height
+                .saturating_sub(source_dims.pixel_height);
+            let nav_fraction = if reserved > 0 && pane.box_pixel_height > 0 {
+                (nav_bar_height / pane.box_pixel_height as f32).clamp(0.0, 0.5)
+            } else {
+                0.0
+            };
+            let grid_top = pane_rect.min_y() + pane_height * nav_fraction;
+            let grid_height = pane_height * (1.0 - nav_fraction);
+
+            // Pane placement remains in the root grid so every split keeps
+            // the same outer frame. Content inside that frame uses the pane's
+            // own effective cell size, reconstructed from the immutable
+            // snapshot. This is the preview equivalent of the normal pane
+            // renderer's `pane_font_resources` path.
+            let pane_scale_ratio = terminal_preview_pane_scale_ratio(tab_size, source_dims);
+            let pane_scale = quantize_terminal_preview_scale_down(
+                quantized_scale * pane_scale_ratio,
+                minimum_scale,
+            );
+            let (pane_font_config, pane_metrics) =
+                if pane_scale.to_bits() == quantized_scale.to_bits() {
+                    (font_config.clone(), metrics)
+                } else {
+                    self.pane_font_resources(pane_scale)?
+                };
+
+            let pane_cell_width = pane_metrics.cell_size.width.max(1) as f32;
+            let pane_cell_height = pane_metrics.cell_size.height.max(1) as f32;
+            let rendered_width = cols as f32 * pane_cell_width;
+            let rendered_height = rows as f32 * pane_cell_height;
+
             let mut render_dims = source_dims;
             render_dims.cols = cols;
             render_dims.viewport_rows = rows;
-            render_dims.pixel_width = (cols as f32 * cell_width).round() as usize;
-            render_dims.pixel_height = (rows as f32 * cell_height).round() as usize;
-            let rendered_y = pane_y + pane.height.saturating_sub(rows) as f32 * cell_height;
+            render_dims.pixel_width = rendered_width.round() as usize;
+            render_dims.pixel_height = rendered_height.round() as usize;
+            let rendered_y = grid_top;
             let foreground = palette.foreground.to_linear();
             let default_bg = palette.background.to_linear();
             // LineToElementShape caches resolved colors as well as glyph
@@ -698,13 +1347,45 @@ impl crate::TermWindow {
             palette.selection_fg.hash(&mut palette_hasher);
             palette.selection_bg.hash(&mut palette_hasher);
             let palette_identity = palette_hasher.finish();
-            let font_identity = quantized_scale.to_bits()
-                ^ palette_identity.rotate_left(17)
-                ^ 0x4c49_5645_5052_4556;
+            let font_identity =
+                pane_scale.to_bits() ^ palette_identity.rotate_left(17) ^ 0x4c49_5645_5052_4556;
 
-            for (line_idx, line) in pane.lines.iter().enumerate() {
-                let y = rendered_y + line_idx as f32 * cell_height;
-                if y + cell_height <= preview.clip.min_y() || y >= preview.clip.max_y() {
+            // Map positions as the pane is authored. At thumbnail sizes a
+            // cell can only jump from (for example) 3 px to 4 px, so no font
+            // scale can fill both axes exactly. Applying this tiny correction
+            // during allocation keeps exact pane geometry without a second
+            // CPU walk over every htop glyph each frame.
+            let source_rect = QuadClipRect::from_top_left_pixels(
+                pane_x,
+                rendered_y,
+                pane_x + rendered_width,
+                rendered_y + rendered_height,
+                &self.dimensions,
+            );
+            let target_rect = QuadClipRect::from_top_left_pixels(
+                pane_rect.min_x(),
+                grid_top,
+                pane_rect.max_x(),
+                grid_top + grid_height,
+                &self.dimensions,
+            );
+            // Bind the call before asserting on it. `debug_assert!` does not
+            // evaluate its argument in release, and this workspace ships
+            // release without debug assertions, so writing the call inside the
+            // macro meant the transform was never applied in the build users
+            // run -- panes were drawn at their authored size and whatever did
+            // not fit was clipped away.
+            let transformed =
+                layers.set_heap_position_transform(Some((source_rect, target_rect)));
+            debug_assert!(transformed);
+            let source_visible_top = rendered_y
+                + (pane_clip.min_y() - grid_top) * rendered_height / grid_height.max(1.0);
+            let source_visible_bottom = rendered_y
+                + (pane_clip.max_y() - grid_top) * rendered_height / grid_height.max(1.0);
+
+            for (line_idx, line) in pane.lines.iter().take(rows).enumerate() {
+                let y = rendered_y + line_idx as f32 * pane_cell_height;
+                if y + pane_cell_height <= source_visible_top || y >= source_visible_bottom {
                     continue;
                 }
                 let shape_hash = self.shape_hash_for_line(line);
@@ -712,7 +1393,7 @@ impl crate::TermWindow {
                     RenderScreenLineParams {
                         top_pixel_y: y,
                         left_pixel_x: pane_x,
-                        pixel_width: cols as f32 * cell_width,
+                        pixel_width: rendered_width,
                         stable_line_idx: Some(pane.resolved_top + line_idx as isize),
                         line,
                         selection: 0..0,
@@ -736,8 +1417,8 @@ impl crate::TermWindow {
                         font: None,
                         style: None,
                         use_pixel_positioning: false,
-                        render_metrics: metrics,
-                        font_config: Some(font_config.clone()),
+                        render_metrics: pane_metrics,
+                        font_config: Some(pane_font_config.clone()),
                         font_identity,
                         shape_key: Some(LineToEleShapeCacheKey {
                             shape_hash,
@@ -763,40 +1444,40 @@ impl crate::TermWindow {
                     && (cursor_row as usize) < rows
                     && cursor.x < cols
                 {
-                    let cursor_rect = euclid::rect(
-                        pane_x + cursor.x as f32 * cell_width,
-                        rendered_y + cursor_row as f32 * cell_height,
-                        cell_width,
-                        cell_height,
+                    let cursor_rect: ::window::RectF = euclid::rect(
+                        pane_x + cursor.x as f32 * pane_cell_width,
+                        rendered_y + cursor_row as f32 * pane_cell_height,
+                        pane_cell_width,
+                        pane_cell_height,
                     );
-                    if let Some(cursor_rect) = cursor_rect.intersection(&preview.clip) {
-                        let color = palette.cursor_border.to_linear().mul_alpha(0.72);
-                        let stroke = 1.0_f32.min(cursor_rect.size.width / 2.0);
-                        self.filled_rectangle(
-                            layers,
-                            2,
-                            euclid::rect(
-                                cursor_rect.origin.x,
-                                cursor_rect.origin.y,
-                                cursor_rect.size.width,
-                                stroke,
-                            ),
-                            color,
-                        )?;
-                        self.filled_rectangle(
-                            layers,
-                            2,
-                            euclid::rect(
-                                cursor_rect.origin.x,
-                                cursor_rect.max_y() - stroke,
-                                cursor_rect.size.width,
-                                stroke,
-                            ),
-                            color,
-                        )?;
-                    }
+                    let color = palette.cursor_border.to_linear().mul_alpha(0.72);
+                    let stroke = 1.0_f32.min(cursor_rect.size.width / 2.0);
+                    self.filled_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(
+                            cursor_rect.origin.x,
+                            cursor_rect.origin.y,
+                            cursor_rect.size.width,
+                            stroke,
+                        ),
+                        color,
+                    )?;
+                    self.filled_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(
+                            cursor_rect.origin.x,
+                            cursor_rect.max_y() - stroke,
+                            cursor_rect.size.width,
+                            stroke,
+                        ),
+                        color,
+                    )?;
                 }
             }
+            let cleared = layers.set_heap_position_transform(None);
+            debug_assert!(cleared);
         }
 
         // Preserve split topology in the thumbnail.  PositionedSplit is part
@@ -851,7 +1532,7 @@ impl crate::TermWindow {
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
     ) -> anyhow::Result<()> {
-        let settings = crate::native_settings::load();
+        let settings = crate::native_settings::load_shared();
         if !settings.terminal.bottom_quote_enabled {
             return Ok(());
         }
@@ -918,12 +1599,18 @@ impl crate::TermWindow {
             .min(max_width);
         let x = (grid_left + self.terminal_size.pixel_width as f32 - inset - text_width).max(0.0);
         let y = (grid_bottom + ((gutter_height - quote_height) / 2.0).max(0.0)).max(0.0);
+        // Opaque, and deliberately so. These carried `.mul_alpha(0.46)` and
+        // `.mul_alpha(0.38)`, but the glyph shader discarded a vertex alpha
+        // until it was fixed to honour one, so the quote has always rendered
+        // solid and was tuned by eye against that. Keeping the multiplier now
+        // that it works would darken shipped output to settle an intent nobody
+        // ever saw. The muting lives in the colour itself.
         let color = match crate::native_settings::effective_appearance() {
             window::Appearance::Light | window::Appearance::LightHighContrast => {
-                LinearRgba::with_srgba(80, 80, 90, 255).mul_alpha(0.46)
+                LinearRgba::with_srgba(80, 80, 90, 255)
             }
             window::Appearance::Dark | window::Appearance::DarkHighContrast => {
-                LinearRgba::with_srgba(210, 210, 220, 255).mul_alpha(0.38)
+                LinearRgba::with_srgba(210, 210, 220, 255)
             }
         };
 
@@ -1118,7 +1805,7 @@ impl crate::TermWindow {
         if label.is_empty() {
             return Ok(());
         }
-        let settings = crate::native_settings::load();
+        let settings = crate::native_settings::load_shared();
         let font_size = crate::native_settings::home_font_size(&settings);
         let ui_font = self
             .fonts
@@ -1318,6 +2005,7 @@ impl crate::TermWindow {
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
         let frame_now = Instant::now();
         self.advance_workspace_space_swipe_push(frame_now);
+        self.advance_content_view_fade(frame_now);
         {
             let gl_state = self.render_state.as_ref().unwrap();
             for layer in gl_state.layers.borrow().iter() {
@@ -1344,7 +2032,21 @@ impl crate::TermWindow {
         let layer = gl_state
             .layer_for_zindex(0)
             .context("layer_for_zindex(0)")?;
-        let mut layers = layer.quad_allocator();
+        // The first frame of a transition records the terminal instead of
+        // drawing it, and every frame after replays that recording at the size
+        // its travel has reached. Redirecting the allocator here catches the
+        // whole world -- panes, splits, sidebars, tab bar -- without each of
+        // them having to know a transition is running.
+        let recording_flight = self
+            .content_view_fade
+            .as_ref()
+            .is_some_and(|fade| fade.flight.is_none());
+        let mut flight_capture = HeapQuadAllocator::default();
+        let mut layers = if recording_flight {
+            TripleLayerQuadAllocator::Heap(&mut flight_capture)
+        } else {
+            layer.quad_allocator()
+        };
         log::trace!("quad map elapsed {:?}", start.elapsed());
         metrics::histogram!("quad.map").record(start.elapsed());
 
@@ -1438,8 +2140,29 @@ impl crate::TermWindow {
         }
 
         // When a content view is the foreground it takes over the content area,
-        // so skip painting the terminal panes / splits.
+        // so skip painting the terminal panes / splits -- except while one is
+        // arriving or leaving, when both have to be on screen at once for the
+        // view to have anything to fade against.
         let content_view_active = self.content_view_foreground();
+        // A transition puts both worlds on screen: the terminal is painted as
+        // usual and the view is composited over it at a partial opacity. A
+        // closing view is already gone by now, so its side of the transition
+        // is a recorded frame rather than a live paint.
+        let fading_content_view = self.content_view_fade.is_some();
+        // While a transition runs the terminal is a recording: drawn once into
+        // `flight_capture` on the opening frame, replayed thereafter.
+        //
+        // `content_view_active` is false for the whole of a *closing*
+        // transition -- the view is removed from `content_views` before the
+        // fade is started, so there is no longer an active one to find. Left to
+        // `!content_view_active` alone this put the live terminal on screen at
+        // full size from the transition's second frame, underneath the
+        // recording that was still growing back out of the card. Two terminals,
+        // two scales, and anything the terminal world draws once per frame --
+        // the bottom quote most visibly, at 38% alpha over itself -- drawn
+        // twice. It also made the return look like a dissolve rather than a
+        // move, because the picture being travelled towards was already there.
+        let paint_terminal_world = (!content_view_active && !fading_content_view) || recording_flight;
 
         if !content_view_active {
             // Takeover remains opaque while this actively polls and hydrates
@@ -1450,7 +2173,13 @@ impl crate::TermWindow {
 
         let frontend_blocked = !content_view_active && self.frontend_surface_blocked();
 
-        if !content_view_active && !frontend_blocked {
+        // Everything the terminal registers during a transition sits under a
+        // view that is on its way in or out. Leaving those targets live would
+        // let a click land on a pane the user is looking at through a
+        // half-drawn overview.
+        let ui_items_before_terminal = self.ui_items.len();
+
+        if paint_terminal_world && !frontend_blocked {
             for pos in panes {
                 if pos.is_active {
                     self.update_text_cursor(&pos);
@@ -1473,7 +2202,7 @@ impl crate::TermWindow {
                 .context("paint shared unused grid")?;
         }
 
-        if !content_view_active && !frontend_blocked {
+        if paint_terminal_world && !frontend_blocked {
             self.paint_bottom_quote(&mut layers)
                 .context("paint_bottom_quote")?;
         }
@@ -1483,20 +2212,42 @@ impl crate::TermWindow {
                 .context("paint frontend handoff overlay")?;
         }
 
-        if content_view_active {
-            self.paint_content_view(&mut layers)
-                .context("paint_content_view")?;
+        if fading_content_view {
+            self.ui_items.truncate(ui_items_before_terminal);
         }
+
+        if content_view_active {
+            self.paint_content_view_composited(&mut layers)
+                .context("paint_content_view")?;
+        } else if fading_content_view {
+            self.paint_departing_content_view()
+                .context("paint departing content view")?;
+        }
+        // Only the arriving view answers to the pointer while a transition
+        // runs. The chrome painted below belongs to the terminal, which is on
+        // screen but on its way behind something, and a click landing there
+        // would go somewhere the user is no longer looking.
+        let ui_items_after_view = self.ui_items.len();
 
         // A full-window ContentView owns all ThinkTerm chrome below the native
         // title bar. This is presentation-only: sidebar widths/collapse state
         // and terminal geometry stay unchanged behind the view.
-        if self.content_view_is_full_window() {
-            let mut chrome_items = self
-                .paint_full_window_chrome(&mut layers)
-                .context("paint full-window client chrome")?;
-            self.ui_items.append(&mut chrome_items);
+        //
+        // The window frame stays where it is while the terminal inside it
+        // travels, so a transition keeps painting it. Only the terminal grid
+        // flies, because the card it is flying into shows a terminal and
+        // nothing else -- carrying the sidebar along made the picture that
+        // landed and the picture already in the card visibly different things.
+        if self.content_view_is_full_window() && !fading_content_view {
+            // Recorded into the view's own surface, so the two arrive and
+            // leave together.
             drop(layers);
+        } else if fading_content_view {
+            drop(layers);
+            if recording_flight {
+                self.record_content_view_chrome()
+                    .context("record window frame")?;
+            }
         } else {
             // Space switching is a left-sidebar interaction. Keep the terminal,
             // tab bar, right sidebar and window chrome on the live GPU path, then
@@ -1714,6 +2465,23 @@ impl crate::TermWindow {
             drop(chrome_layers);
         }
 
+        if fading_content_view {
+            self.ui_items.truncate(ui_items_after_view);
+        }
+
+        if recording_flight {
+            // Every allocator borrowing the recording has been dropped, and
+            // the view has laid itself out, so it can now say where this
+            // terminal is going.
+            self.resolve_content_view_flight(flight_capture);
+        }
+        if fading_content_view {
+            self.paint_content_view_chrome()
+                .context("paint content view chrome")?;
+            self.paint_content_view_flight()
+                .context("paint content view flight")?;
+        }
+
         let mut layers = layer.quad_allocator();
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
@@ -1729,5 +2497,88 @@ impl crate::TermWindow {
             .context("paint_file_drag_ghost")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A card exactly the size of the grid it holds is left alone. This is the
+    /// case the fill exists to *not* disturb.
+    #[test]
+    fn a_grid_that_already_fits_its_card_is_not_touched() {
+        let (x, y) = preview_fill_factors(522.0, 504.0, 522.0, 504.0);
+        assert_eq!((x, y), (1.0, 1.0));
+    }
+
+    /// Whole-pixel cells leave the grid short on both axes; closing that gap is
+    /// a uniform enlargement, so the picture grows without changing shape.
+    #[test]
+    fn a_grid_short_on_both_axes_is_enlarged_without_reshaping() {
+        let (x, y) = preview_fill_factors(500.0, 400.0, 550.0, 440.0);
+        assert!((x - 1.1).abs() < 1e-4, "{x}");
+        assert!((y - x).abs() < 1e-4, "axes diverged: {x} vs {y}");
+    }
+
+    /// The case that left a bare strip down the side of every card: rounding
+    /// made the cells narrow, so the grid filled the height with room to spare
+    /// across. The short axis is allowed to catch up.
+    #[test]
+    fn the_axis_left_short_by_cell_rounding_catches_up() {
+        // Height binds at 1.0; width has 8% of slack, the amount a 19x41 cell
+        // loses becoming 6x14.
+        let (x, y) = preview_fill_factors(500.0, 400.0, 540.0, 400.0);
+        assert!((y - 1.0).abs() < 1e-4, "bound axis moved: {y}");
+        assert!((x - 1.08).abs() < 1e-4, "{x}");
+    }
+
+    /// A card can be showing a terminal from another window, genuinely a
+    /// different shape. Filling the card must not turn it into a different
+    /// terminal.
+    #[test]
+    fn a_terminal_of_a_different_shape_is_not_reshaped_to_fit() {
+        // Twice as wide as the card wants: far past anything rounding explains.
+        let (x, y) = preview_fill_factors(500.0, 400.0, 1000.0, 400.0);
+        assert!((y - 1.0).abs() < 1e-4);
+        assert!(
+            (x - MAX_PREVIEW_ASPECT_TRIM).abs() < 1e-4,
+            "stretched to {x}, past the bound"
+        );
+    }
+
+    #[test]
+    fn enlargement_has_a_ceiling() {
+        let (x, y) = preview_fill_factors(100.0, 100.0, 10_000.0, 10_000.0);
+        assert!((x - MAX_PREVIEW_FILL).abs() < 1e-4, "{x}");
+        assert!((y - MAX_PREVIEW_FILL).abs() < 1e-4, "{y}");
+    }
+
+    #[test]
+    fn a_degenerate_card_or_grid_asks_for_no_stretch() {
+        assert_eq!(preview_fill_factors(0.0, 400.0, 500.0, 400.0), (1.0, 1.0));
+        assert_eq!(preview_fill_factors(500.0, 400.0, 0.0, 400.0), (1.0, 1.0));
+        assert_eq!(preview_fill_factors(500.0, 0.0, 500.0, 400.0), (1.0, 1.0));
+    }
+
+    /// Quantization only ever rounds down, so a grid laid out at the quantized
+    /// scale cannot overflow the extent it was measured against.
+    #[test]
+    fn quantizing_a_scale_never_rounds_up() {
+        let minimum = 1.0 / TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT;
+        for raw in [0.9999_f64, 0.5, 0.33, 0.0417, 0.001] {
+            let quantized = quantize_terminal_preview_scale_down(raw, minimum);
+            assert!(quantized <= raw.max(minimum) + 1e-9, "{raw} -> {quantized}");
+            assert!(quantized >= minimum);
+        }
+    }
+
+    #[test]
+    fn a_scale_that_is_not_a_number_falls_back_to_the_minimum() {
+        let minimum = 0.25;
+        assert_eq!(
+            quantize_terminal_preview_scale_down(f64::NAN, minimum),
+            minimum
+        );
     }
 }

@@ -5,6 +5,7 @@ use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::content_view::{ContentView, ContentViewResponse};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::TermWindow;
+use crate::ui::anim::Easing;
 use crate::ui::{
     draw_scrollbar, draw_toggle, rect, wheel_delta_pixels, ControlState, DrawContext,
     InteractionState, ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
@@ -544,11 +545,6 @@ impl OnboardingView {
 
     fn transition_duration() -> Duration {
         Duration::from_millis(TRANSITION_MS)
-    }
-
-    fn ease_in_out(t: f32) -> f32 {
-        let t = t.clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
     }
 
     fn transition_t(&self) -> Option<f32> {
@@ -1156,7 +1152,7 @@ impl OnboardingView {
             if let (Some(transition), Some(raw_t)) = (self.transition, self.transition_t()) {
                 let from = transition.from.index() as f32;
                 let to = transition.to.index() as f32;
-                from + (to - from) * Self::ease_in_out(raw_t)
+                from + (to - from) * Easing::Smooth.apply(raw_t)
             } else {
                 self.step.index() as f32
             };

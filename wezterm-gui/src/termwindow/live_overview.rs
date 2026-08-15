@@ -5,15 +5,16 @@ use crate::termwindow::content_view::{
 };
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::{TermWindow, TermWindowNotif};
+use crate::ui::anim::{self, Easing, Timeline};
 use crate::ui::{
     draw_button_on_layer, draw_icon_button, draw_icon_button_on_layer, draw_scrollbar_on_layer,
-    wheel_delta_pixels, ButtonSpec, ControlState, DrawContext, InteractionState, ScrollState,
-    UiContext, UiPalette, UiTokens, WidgetKind,
+    precise_wheel_delta_pixels, wheel_delta_pixels, ButtonSpec, ControlState, DrawContext,
+    InteractionState, ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads;
 use fluent_bundle::FluentArgs;
 use mux::domain::DomainState;
-use mux::pane::{CloseReason, PaneId};
+use mux::pane::{CachePolicy, CloseReason, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{PositionedSplit, TabId};
 use mux::Mux;
@@ -50,6 +51,11 @@ const CARD_INSET: f32 = 8.0;
 const CARD_CLOSE_BUTTON_SIZE: f32 = 32.0;
 const CARD_CLOSE_RIGHT_PAD: f32 = 8.0;
 const CARD_TITLE_CLOSE_GAP: f32 = 8.0;
+/// Space between the thread name and the command it is running.
+const RUNNING_LABEL_GAP: f32 = 14.0;
+/// Below this there is no room to say anything useful, so say nothing rather
+/// than showing two or three clipped letters.
+const RUNNING_LABEL_MIN_WIDTH: f32 = 56.0;
 const PREVIEW_RADIUS: f32 = 12.0;
 const CLOSE_BUTTON_SIZE: f32 = 44.0;
 const CONFIRM_MIN_WIDTH: f32 = 640.0;
@@ -59,11 +65,31 @@ const CONFIRM_PADDING: f32 = 36.0;
 const CONFIRM_RADIUS: f32 = 24.0;
 const CONFIRM_TEXT_GAP: f32 = 18.0;
 const CONFIRM_BUTTON_GAP: f32 = 12.0;
+/// Bounds on the shape a card may take. A card is a picture of the terminal,
+/// so the terminal's own proportions decide this and the clamp only guards
+/// against a degenerate window. The lower bound used to sit at 1.2, which is
+/// wider than a terminal gets as soon as a sidebar is open -- at 2704px wide
+/// with both sidebars out the terminal is 1699x1622, or 1.05, and every card
+/// was being stretched 15% wider than the thing it was a picture of.
+const HOST_PREVIEW_ASPECT_MIN: f32 = 0.55;
+const HOST_PREVIEW_ASPECT_MAX: f32 = 3.4;
 const MAX_COLUMNS: usize = 5;
 const MAX_COLUMNS_BELOW_WIDE_BREAKPOINT: usize = 4;
 const FIVE_COLUMN_WINDOW_WIDTH: f32 = 3000.0;
 const LIVE_RESIZE_PREVIEW_INTERVAL: Duration = Duration::from_millis(33);
+/// How often a card re-asks what its terminal is running.
+///
+/// `CachePolicy::AllowStale` is not the cheap read its name suggests: it takes
+/// a lock, clones a `CachedLeaderInfo` with its paths, and spawns a thread when
+/// the entry has expired. Asking once per card per frame put that on the render
+/// thread sixty times a second, for cards scrolled out of sight as much as
+/// visible ones. A label naming the program at the prompt does not need to be
+/// fresher than this.
+const RUNNING_LABEL_REFRESH: Duration = Duration::from_millis(1000);
 const SCROLLBAR_VISIBLE_INTERVAL: Duration = Duration::from_millis(900);
+/// The tail of that interval is spent fading rather than shown at full
+/// strength and then cut.
+const SCROLLBAR_FADE: Duration = anim::SHORT;
 const SCROLL_MASK_FADE_HEIGHT: f32 = 32.0;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -107,6 +133,11 @@ struct CachedPreview<T> {
 struct LiveCard {
     key: LiveThreadKey,
     title: String,
+    /// What this terminal is running right now, if it is running anything.
+    /// The thumbnail below says what the screen looks like; at card size that
+    /// is texture rather than information, and this is the line that actually
+    /// answers "what is happening here".
+    running: Option<String>,
     tab_id: TabId,
     active: bool,
 }
@@ -148,6 +179,53 @@ struct GroupLayout {
     grid: GroupGrid,
 }
 
+/// Where a card is travelling from and to, so that a change of layout is
+/// covered rather than jumped.
+///
+/// The rectangles are in content space -- the scroll offset and the viewport
+/// origin are applied afterwards. Scrolling moves every card on every frame,
+/// and diffing in screen space would read that as the whole grid reflowing.
+#[derive(Clone, Debug)]
+struct CardMotion {
+    from: RectF,
+    to: RectF,
+    travel: Timeline,
+}
+
+impl CardMotion {
+    fn settled(now: Instant, rect: RectF) -> Self {
+        Self {
+            from: rect,
+            to: rect,
+            travel: Timeline::settled(now, 1.0),
+        }
+    }
+
+    fn current(&self, now: Instant) -> RectF {
+        lerp_rect(self.from, self.to, self.travel.value(now))
+    }
+}
+
+fn lerp_rect(from: RectF, to: RectF, t: f32) -> RectF {
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    euclid::rect(
+        lerp(from.origin.x, to.origin.x),
+        lerp(from.origin.y, to.origin.y),
+        lerp(from.size.width, to.size.width),
+        lerp(from.size.height, to.size.height),
+    )
+}
+
+/// Sub-pixel drift is not a reflow. Without a threshold, rounding in the grid
+/// arithmetic would restart the travel on frames where nothing moved.
+fn rect_moved(from: RectF, to: RectF) -> bool {
+    let moved = |a: f32, b: f32| (a - b).abs() > 0.5;
+    moved(from.origin.x, to.origin.x)
+        || moved(from.origin.y, to.origin.y)
+        || moved(from.size.width, to.size.width)
+        || moved(from.size.height, to.size.height)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CardChrome {
     preview: RectF,
@@ -177,6 +255,9 @@ pub(crate) struct LiveOverviewView {
     active: Option<LiveThreadKey>,
     host_preview_aspect: f32,
     scroll: ScrollState,
+    /// Whether the active thread's card has been brought into view. Done once,
+    /// on the first frame that has a layout to measure against.
+    revealed_active: bool,
     last_ui_scale: f32,
     viewport: RectF,
     widgets: UiContext<OverviewAction>,
@@ -184,11 +265,24 @@ pub(crate) struct LiveOverviewView {
     card_keys: HashMap<TabId, LiveThreadKey>,
     card_titles: HashMap<TabId, String>,
     pending_close: Option<PendingClose>,
+    running_labels: HashMap<TabId, (Instant, Option<String>)>,
     snapshot_cache: HashMap<LiveThreadKey, CachedPreview<TerminalPreviewSnapshot>>,
     previews: Vec<TerminalPreviewRequest>,
     preview_chrome: Vec<CardChrome>,
+    /// Where each visible card shows its terminal, so an opening overview can
+    /// be told what a given terminal is about to become. Only cards that were
+    /// actually laid out this frame appear here.
+    card_preview_rects: HashMap<TabId, RectF>,
+    /// Terminal currently travelling to or from its card. Its card is laid out
+    /// and drawn as usual, but left empty: the travelling copy is the one the
+    /// eye is following, and a second copy waiting in the slot is what made
+    /// the transition look like two layers.
+    terminal_in_flight: Option<TabId>,
     visible_panes: HashSet<PaneId>,
     live_resizing: bool,
+    card_motion: HashMap<LiveThreadKey, CardMotion>,
+    card_motion_running: bool,
+    scroll_animating: bool,
     next_preview_refresh: Option<Instant>,
     scrollbar_visible_until: Option<Instant>,
 }
@@ -210,8 +304,9 @@ impl LiveOverviewView {
             // Extremely narrow/tall terminals still need a useful overview;
             // within this safety range every card keeps the exact same host
             // aspect instead of inheriting a source mux tab's split geometry.
-            host_preview_aspect: host_preview_aspect.clamp(1.2, 3.4),
+            host_preview_aspect: host_preview_aspect.clamp(HOST_PREVIEW_ASPECT_MIN, HOST_PREVIEW_ASPECT_MAX),
             scroll: ScrollState::new(),
+            revealed_active: false,
             last_ui_scale: 1.0,
             viewport: euclid::rect(0.0, 0.0, 0.0, 0.0),
             widgets: UiContext::default(),
@@ -219,17 +314,68 @@ impl LiveOverviewView {
             card_keys: HashMap::new(),
             card_titles: HashMap::new(),
             pending_close: None,
+            running_labels: HashMap::new(),
             snapshot_cache: HashMap::new(),
             previews: Vec::new(),
             preview_chrome: Vec::new(),
+            card_preview_rects: HashMap::new(),
+            terminal_in_flight: None,
             visible_panes: HashSet::new(),
             live_resizing: false,
+            card_motion: HashMap::new(),
+            card_motion_running: false,
+            scroll_animating: false,
             next_preview_refresh: None,
             scrollbar_visible_until: None,
         }
     }
 
-    fn collect_groups(&self) -> Vec<LiveGroup> {
+    /// Where to draw a card this frame, given where the grid says it belongs.
+    ///
+    /// A card that has moved travels to its new home instead of appearing
+    /// there. Cards seen for the first time -- and every card while the window
+    /// is being dragged, where an animation would only ever lag behind the
+    /// window edge -- are placed directly.
+    fn settle_card_rect(&mut self, key: &LiveThreadKey, target: RectF, now: Instant) -> RectF {
+        let snap = self.live_resizing;
+        match self.card_motion.get_mut(key) {
+            None => {
+                self.card_motion
+                    .insert(key.clone(), CardMotion::settled(now, target));
+                target
+            }
+            Some(motion) => {
+                if snap {
+                    *motion = CardMotion::settled(now, target);
+                    return target;
+                }
+                if rect_moved(motion.to, target) {
+                    // Depart from where the card is right now, not from where
+                    // the previous travel was headed: closing a second card
+                    // while the first reflow is still moving must not send
+                    // everything backwards before it sets off again.
+                    motion.from = motion.current(now);
+                    motion.to = target;
+                    motion.travel = Timeline::progress(now, anim::SHORT, Easing::OutCubic);
+                }
+                motion.current(now)
+            }
+        }
+    }
+
+    /// What `tab_id` is running, from cache unless it has gone stale.
+    fn running_label(&mut self, tab_id: TabId, now: Instant) -> Option<String> {
+        if let Some((asked_at, label)) = self.running_labels.get(&tab_id) {
+            if now.saturating_duration_since(*asked_at) < RUNNING_LABEL_REFRESH {
+                return label.clone();
+            }
+        }
+        let label = foreground_process_name(tab_id);
+        self.running_labels.insert(tab_id, (now, label.clone()));
+        label
+    }
+
+    fn collect_groups(&mut self, now: Instant) -> Vec<LiveGroup> {
         let mux = Mux::get();
         let live_workspaces = mux.iter_workspaces();
         let mut groups = Vec::new();
@@ -266,6 +412,7 @@ impl LiveOverviewView {
                             active: self.active.as_ref() == Some(&key),
                             key,
                             title: card_title(&state.project_name, &state.thread_name),
+                            running: self.running_label(tab_id, now),
                             tab_id,
                         });
                     }
@@ -284,7 +431,67 @@ impl LiveOverviewView {
             }
         }
 
+        retain_running_labels(&mut self.running_labels, &groups);
+
         groups
+    }
+
+    /// Where the list has to sit for the active thread's card to be on screen,
+    /// or `None` if it already is -- or if there is no active card to find.
+    ///
+    /// This is not only about orientation. A card outside the viewport is
+    /// skipped before it registers a landing rectangle, and a terminal with no
+    /// landing rectangle has nowhere to go: `terminal_landing_rect` returns
+    /// `None`, the flight falls back to the whole window, and the shrink
+    /// degenerates into a fade in place. Revealing the card is what gives the
+    /// transition a destination.
+    ///
+    /// Centres the card rather than scrolling the least possible distance. This
+    /// runs before the first row is drawn, so there is no motion to keep small
+    /// -- only the question of where the eye should land.
+    fn offset_revealing_active(
+        &self,
+        groups: &[LiveGroup],
+        layouts: &[GroupLayout],
+        content_x: f32,
+        content_width: f32,
+        gap: f32,
+    ) -> Option<f32> {
+        let viewport_height = self.viewport.size.height;
+        let max_offset = self.scroll.max_offset();
+        if viewport_height <= 0.0 || max_offset <= 0.0 {
+            return None;
+        }
+        let (layout, index, count) = groups.iter().zip(layouts).find_map(|(group, layout)| {
+            group
+                .cards
+                .iter()
+                .position(|card| card.active)
+                .map(|index| (layout, index, group.cards.len()))
+        })?;
+        let rect = card_rect(
+            index,
+            count,
+            layout.grid,
+            content_x,
+            content_width,
+            layout.cards_y,
+            gap,
+        );
+        // Card rectangles are in content space, so the band on screen right now
+        // is `[offset, offset + viewport_height]`.
+        let offset = self.scroll.offset;
+        if rect.min_y() >= offset && rect.max_y() <= offset + viewport_height {
+            return None;
+        }
+        let desired = if rect.size.height >= viewport_height {
+            // Taller than the viewport: showing its top beats centring a card
+            // whose header would then be cut off.
+            rect.min_y()
+        } else {
+            rect.min_y() - (viewport_height - rect.size.height) / 2.0
+        };
+        Some(desired.clamp(0.0, max_offset))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -304,6 +511,7 @@ impl LiveOverviewView {
         self.card_titles.clear();
         self.previews.clear();
         self.preview_chrome.clear();
+        self.card_preview_rects.clear();
         self.visible_panes.clear();
         self.next_preview_refresh = None;
 
@@ -349,10 +557,21 @@ impl LiveOverviewView {
             ctx.px(FIVE_COLUMN_WINDOW_WIDTH),
         );
 
-        let groups = self.collect_groups();
         let now = Instant::now();
+        let groups = self.collect_groups(now);
         let refresh_interval = self.live_resizing.then_some(LIVE_RESIZE_PREVIEW_INTERVAL);
+        // Advance every card's travel once, before anything samples it.
+        for motion in self.card_motion.values_mut() {
+            motion.travel.advance(now);
+        }
+        // The glide a notched wheel was given, and any smoothing towards a
+        // programmatic target, both live in the scroll state.
+        self.scroll_animating = self.scroll.advance_animation(now);
+        if self.scroll_animating {
+            self.reveal_scrollbar(now);
+        }
         let mut warm_keys = HashSet::new();
+        let mut seen_keys = HashSet::new();
         if groups.is_empty() {
             self.scroll.set_extents(self.viewport.size.height, 0.0);
             self.paint_empty(ctx, layers, palette, settings_font)?;
@@ -378,6 +597,20 @@ impl LiveOverviewView {
             );
             self.scroll
                 .set_extents(self.viewport.size.height, content_height);
+            // A brand-new overview starts at the top of the list, which leaves
+            // the active thread's card off screen as soon as the grid is taller
+            // than the viewport. Reveal it here, before the first row is drawn,
+            // so that this frame's `card_preview_rects` already carries its
+            // landing rectangle and the arriving terminal has somewhere to
+            // shrink into.
+            if !self.revealed_active {
+                self.revealed_active = true;
+                if let Some(offset) =
+                    self.offset_revealing_active(&groups, &layouts, content_x, content_width, gap)
+                {
+                    self.scroll.scroll_by(offset - self.scroll.offset);
+                }
+            }
 
             for (group, layout) in groups.iter().zip(layouts) {
                 let heading_y = self.viewport.origin.y + layout.header_y - self.scroll.offset;
@@ -419,15 +652,25 @@ impl LiveOverviewView {
                 }
 
                 for (index, card) in group.cards.iter().enumerate() {
-                    let rect = card_rect(
+                    // Content space: `cards_y` is measured from the top of the
+                    // scrollable content, so the same card keeps the same
+                    // rectangle no matter where the list is scrolled to.
+                    let target = card_rect(
                         index,
                         group.cards.len(),
                         layout.grid,
                         content_x,
                         content_width,
-                        self.viewport.origin.y + layout.cards_y - self.scroll.offset,
+                        layout.cards_y,
                         gap,
                     );
+                    seen_keys.insert(card.key.clone());
+                    let rect = self
+                        .settle_card_rect(&card.key, target, now)
+                        .translate(euclid::vec2(
+                            0.0,
+                            self.viewport.origin.y - self.scroll.offset,
+                        ));
 
                     // Keep one complete row warm above and below the viewport
                     // so a scroll does not reveal an uncaptured thumbnail. All
@@ -517,6 +760,7 @@ impl LiveOverviewView {
                             palette.secondary_text,
                         )?;
                         let text_x = icon_x + icon_size + ctx.px(10.0);
+                        let text_limit = (close_x - ctx.px(CARD_TITLE_CLOSE_GAP) - text_x).max(1.0);
                         ctx.draw_text(
                             layers,
                             card_font,
@@ -524,8 +768,28 @@ impl LiveOverviewView {
                             title_y,
                             &card.title,
                             palette.text,
-                            (close_x - ctx.px(CARD_TITLE_CLOSE_GAP) - text_x).max(1.0),
+                            text_limit,
                         )?;
+                        if let Some(running) = card.running.as_ref() {
+                            // Only once the name of the thread has been given
+                            // its space: which terminal this is comes first,
+                            // what it is doing second.
+                            let title_width =
+                                ctx.measure_text_width(card_font, &card.title).min(text_limit);
+                            let running_x = text_x + title_width + ctx.px(RUNNING_LABEL_GAP);
+                            let running_limit = text_x + text_limit - running_x;
+                            if running_limit >= ctx.px(RUNNING_LABEL_MIN_WIDTH) {
+                                ctx.draw_text(
+                                    layers,
+                                    card_font,
+                                    running_x,
+                                    title_y,
+                                    running,
+                                    palette.muted_text,
+                                    running_limit,
+                                )?;
+                            }
+                        }
                     }
 
                     let preview_width = (rect.size.width - card_inset * 2.0).max(1.0);
@@ -535,6 +799,22 @@ impl LiveOverviewView {
                         preview_width,
                         preview_width / self.host_preview_aspect,
                     );
+                    let in_flight = self.terminal_in_flight == Some(tab_id);
+                    // A card whose terminal is currently flying to it is left
+                    // empty, but not neutral: the panel takes that terminal's
+                    // own background so the arriving picture settles onto the
+                    // same colour it is already showing. Filling it with the
+                    // generic preview grey put a step in the handover, and the
+                    // step read as a flash.
+                    let preview_fill = if in_flight {
+                        snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.panes.first())
+                            .map(|pane| pane.palette.background.to_linear())
+                            .unwrap_or(colors.preview)
+                    } else {
+                        colors.preview
+                    };
                     if let Some(clip) = preview.intersection(&self.viewport) {
                         if clip.size.width > 1.0 && clip.size.height > 1.0 {
                             ctx.draw_rounded_rect(
@@ -544,14 +824,15 @@ impl LiveOverviewView {
                                 preview.origin.y,
                                 preview.size.width,
                                 preview.size.height,
-                                colors.preview,
+                                preview_fill,
                                 ctx.px(PREVIEW_RADIUS),
                             )?;
-                            if let Some(snapshot) = snapshot.as_ref() {
+                            if let Some(snapshot) = snapshot.as_ref().filter(|_| !in_flight) {
                                 self.previews.push(TerminalPreviewRequest {
                                     snapshot: Arc::clone(snapshot),
                                     area: preview,
                                     clip,
+                                    hold_scale: self.live_resizing,
                                 });
                                 self.visible_panes
                                     .extend(snapshot.panes.iter().map(|pane| pane.pane_id));
@@ -562,6 +843,7 @@ impl LiveOverviewView {
                                 fill,
                                 border: colors.preview_border,
                             });
+                            self.card_preview_rects.insert(tab_id, preview);
                         }
                     }
 
@@ -600,6 +882,16 @@ impl LiveOverviewView {
             self.scrollbar_visible_until = None;
         }
         self.snapshot_cache.retain(|key, _| warm_keys.contains(key));
+        // The running-label cache is pruned in `collect_groups`, against every
+        // live tab rather than against the cards that happened to be drawn.
+        // A card that is gone has nowhere left to travel to; keeping its
+        // motion would also mean a reopened thread animating in from wherever
+        // it happened to sit last time.
+        self.card_motion.retain(|key, _| seen_keys.contains(key));
+        self.card_motion_running = self
+            .card_motion
+            .values()
+            .any(|motion| motion.travel.is_running());
 
         Ok(())
     }
@@ -689,13 +981,16 @@ impl LiveOverviewView {
         area: RectF,
         palette: UiPalette,
     ) -> anyhow::Result<()> {
-        if self.scrollbar_visible_at(Instant::now()) {
+        let scrollbar_opacity = self.scrollbar_opacity_at(Instant::now());
+        if scrollbar_opacity > 0.0 {
             let scrollbar_area = euclid::rect(
                 self.viewport.origin.x,
                 self.viewport.origin.y,
                 self.viewport.size.width,
                 self.viewport.size.height,
             );
+            let mut palette = palette;
+            palette.scrollbar_thumb = palette.scrollbar_thumb.mul_alpha(scrollbar_opacity);
             draw_scrollbar_on_layer(
                 ctx,
                 layers,
@@ -733,21 +1028,53 @@ impl LiveOverviewView {
         }
     }
 
-    fn scrollbar_visible_at(&self, now: Instant) -> bool {
-        self.scroll.max_offset() > 0.0
-            && self
-                .scrollbar_visible_until
-                .is_some_and(|until| until > now)
+    /// The scrollbar is transient, and used to vanish between one frame and
+    /// the next. Spend the tail of its visible interval fading instead, so
+    /// what the eye catches is something leaving rather than something
+    /// disappearing.
+    fn scrollbar_opacity_at(&self, now: Instant) -> f32 {
+        if self.scroll.max_offset() <= 0.0 {
+            return 0.0;
+        }
+        let Some(until) = self.scrollbar_visible_until else {
+            return 0.0;
+        };
+        let Some(remaining) = until.checked_duration_since(now) else {
+            return 0.0;
+        };
+        if remaining >= SCROLLBAR_FADE {
+            return 1.0;
+        }
+        Easing::Smooth.apply(remaining.as_secs_f32() / SCROLLBAR_FADE.as_secs_f32())
     }
 
     fn next_frame_deadline(&self, now: Instant) -> Option<Instant> {
-        let scrollbar_deadline = self.scrollbar_visible_until.filter(|until| *until > now);
-        match (self.next_preview_refresh, scrollbar_deadline) {
-            (Some(preview), Some(scrollbar)) => Some(preview.min(scrollbar)),
-            (Some(preview), None) => Some(preview),
-            (None, Some(scrollbar)) => Some(scrollbar),
-            (None, None) => None,
-        }
+        // A travelling card wants the next frame the display will give it.
+        // Asking for `now` rather than naming an interval leaves the pacing to
+        // the repaint scheduler and the backend, which already throttle to
+        // this panel's refresh rate.
+        let motion_deadline = (self.card_motion_running || self.scroll_animating).then_some(now);
+        // Before the fade begins one frame is enough -- the one that starts
+        // it. Inside the fade every frame counts.
+        let scrollbar_deadline = self.scrollbar_visible_until.and_then(|until| {
+            let fade_from = until.checked_sub(SCROLLBAR_FADE).unwrap_or(until);
+            if now < fade_from {
+                Some(fade_from)
+            } else if now < until {
+                Some(now)
+            } else {
+                None
+            }
+        });
+        [
+            motion_deadline,
+            self.next_preview_refresh,
+            scrollbar_deadline,
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .min()
     }
 
     fn paint_empty(
@@ -1021,6 +1348,9 @@ impl LiveOverviewView {
         match kind {
             WMEK::VertWheel(_) if modal_active => ContentViewResponse::Ignored,
             WMEK::VertWheel(amount) => {
+                // Reached only when the wheel arrives without its full event,
+                // which is every backend that has no pixel deltas to report.
+                // See `on_wheel` for the trackpad path.
                 let old = self.scroll.offset;
                 self.scroll
                     .scroll_by(wheel_delta_pixels(amount, self.last_ui_scale));
@@ -1127,6 +1457,20 @@ impl ContentView for LiveOverviewView {
         }
     }
 
+    fn terminal_landing_rect(&self, tab_id: TabId) -> Option<RectF> {
+        self.card_preview_rects.get(&tab_id).copied()
+    }
+
+    fn set_terminal_in_flight(&mut self, tab_id: Option<TabId>) {
+        self.terminal_in_flight = tab_id;
+    }
+
+    fn set_host_preview_aspect(&mut self, aspect: f32) {
+        if aspect.is_finite() && aspect > 0.0 {
+            self.host_preview_aspect = aspect.clamp(HOST_PREVIEW_ASPECT_MIN, HOST_PREVIEW_ASPECT_MAX);
+        }
+    }
+
     fn terminal_previews(&self) -> Vec<TerminalPreviewRequest> {
         self.previews.clone()
     }
@@ -1185,6 +1529,37 @@ impl ContentView for LiveOverviewView {
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         self.on_mouse_impl(x, y, kind)
+    }
+
+    fn on_wheel(&mut self, _x: f32, _y: f32, event: &window::MouseEvent) -> ContentViewResponse {
+        if self.pending_close.is_some() {
+            return ContentViewResponse::Ignored;
+        }
+        self.scroll
+            .set_phase(event.momentum_phase.or(event.scroll_phase));
+
+        let before = (self.scroll.offset, self.scroll.velocity);
+        if let Some(delta) = precise_wheel_delta_pixels(event) {
+            // A trackpad is already carrying its own momentum; take the
+            // pixels it reports and add nothing.
+            self.scroll.scroll_by(delta);
+        } else if let WMEK::VertWheel(amount) = event.kind {
+            // A notched wheel has no glide of its own, so give it one rather
+            // than teleporting the list a fixed distance per click.
+            self.scroll
+                .scroll_by_smooth(wheel_delta_pixels(amount, self.last_ui_scale));
+        } else {
+            return ContentViewResponse::Ignored;
+        }
+
+        if (before.0 - self.scroll.offset).abs() > 0.01
+            || (before.1 - self.scroll.velocity).abs() > 0.5
+        {
+            self.reveal_scrollbar(Instant::now());
+            ContentViewResponse::Redraw
+        } else {
+            ContentViewResponse::Ignored
+        }
     }
 
     fn on_key(&mut self, key: KeyCode, _mods: KeyModifiers) -> ContentViewResponse {
@@ -1359,6 +1734,26 @@ fn terminal_preview_fingerprint(tab_id: TabId) -> Option<TerminalPreviewFingerpr
     }
 }
 
+/// Prune the running-label cache to the tabs that are still live.
+///
+/// Keyed on every card `collect_groups` walked, not on the cards that were
+/// drawn. Retaining against the drawn set -- which is what `card_keys` holds --
+/// discarded every offscreen card's entry on each frame as soon as there were
+/// more cards than fit in the viewport, so the next frame asked the system
+/// again for all of them and [`RUNNING_LABEL_REFRESH`] never held anything.
+/// The cost lands on the render thread, in a lookup that spawns a thread when
+/// its own cache has gone stale.
+fn retain_running_labels(
+    labels: &mut HashMap<TabId, (Instant, Option<String>)>,
+    groups: &[LiveGroup],
+) {
+    let live_tabs: HashSet<TabId> = groups
+        .iter()
+        .flat_map(|group| group.cards.iter().map(|card| card.tab_id))
+        .collect();
+    labels.retain(|tab_id, _| live_tabs.contains(tab_id));
+}
+
 fn palette_identity(palette: &wezterm_term::color::ColorPalette) -> u64 {
     let mut hasher = DefaultHasher::new();
     palette.colors.0.hash(&mut hasher);
@@ -1386,11 +1781,14 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
     for positioned in tab.iter_panes() {
         let pane = positioned.pane;
         let dimensions = pane.get_dimensions();
-        let rows = positioned.height.min(dimensions.viewport_rows);
-        let cols = positioned.width.min(dimensions.cols);
-        let first_row = dimensions
-            .physical_top
-            .saturating_add(dimensions.viewport_rows.saturating_sub(rows) as isize);
+        // A positioned pane is measured in the tab's root-cell grid, while
+        // its terminal dimensions are measured in that pane's own cells.
+        // Those differ when a pane has a local font scale. Clamping the latter
+        // to the former discards the extra rows/columns of a smaller-font pane
+        // and makes a larger-font pane look artificially short in a preview.
+        let rows = dimensions.viewport_rows;
+        let cols = dimensions.cols;
+        let first_row = dimensions.physical_top;
         let (resolved_top, lines) = if rows == 0 || cols == 0 {
             (first_row, Vec::new())
         } else {
@@ -1407,6 +1805,7 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
             rows,
             resolved_top,
             lines,
+            box_pixel_height: positioned.pixel_height,
             dimensions,
             palette: pane.palette_override().unwrap_or_else(|| pane.palette()),
             cursor: pane.get_cursor_position(),
@@ -1467,6 +1866,25 @@ where
         cache.get(key).map(|cached| Arc::clone(&cached.snapshot)),
         None,
     )
+}
+
+/// The command in the foreground of a tab's active pane, basename only, or
+/// `None` when the pane is a shell waiting at its prompt.
+///
+/// `AllowStale` keeps this to a cache read: it runs for every card on every
+/// frame, and a name that is one refresh out of date is not worth walking the
+/// process table for.
+fn foreground_process_name(tab_id: TabId) -> Option<String> {
+    let pane = Mux::get().get_tab(tab_id)?.get_active_pane()?;
+    let path = pane.get_foreground_process_name(CachePolicy::AllowStale)?;
+    let name = std::path::Path::new(&path)
+        .file_name()?
+        .to_string_lossy()
+        .to_string();
+    if crate::termwindow::ui::is_default_shell_title(&name) {
+        return None;
+    }
+    Some(name)
 }
 
 fn card_title(project_name: &str, thread_name: &str) -> String {
@@ -1989,18 +2407,255 @@ mod tests {
         assert!(view.pending_close.is_none());
     }
 
+    fn live_group_with_active(count: usize, active: usize) -> LiveGroup {
+        LiveGroup {
+            name: "space".to_string(),
+            offline: false,
+            cards: (0..count)
+                .map(|index| LiveCard {
+                    key: LiveThreadKey {
+                        space_id: "space".to_string(),
+                        thread_id: format!("thread-{index}"),
+                    },
+                    title: format!("thread {index}"),
+                    running: None,
+                    tab_id: index as TabId,
+                    active: index == active,
+                })
+                .collect(),
+        }
+    }
+
+    fn reveal_layout(columns: usize, rows: usize, card_height: f32) -> Vec<GroupLayout> {
+        vec![GroupLayout {
+            header_y: 0.0,
+            cards_y: 40.0,
+            grid: GroupGrid {
+                columns,
+                rows,
+                card_width: 480.0,
+                card_height,
+            },
+        }]
+    }
+
+    #[test]
+    fn opening_scrolls_an_active_card_below_the_fold_into_view() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        view.viewport = euclid::rect(0.0, 0.0, 1000.0, 400.0);
+        let layouts = reveal_layout(2, 3, 300.0);
+        let groups = vec![live_group_with_active(6, 5)];
+        // Three rows of 300 separated by a 16 gap, below a 40px heading.
+        view.scroll.set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
+
+        let offset = view
+            .offset_revealing_active(&groups, &layouts, 0.0, 1000.0, 16.0)
+            .expect("the last row starts below the fold");
+        // The last row wants to be centred at 622; the list bottoms out at 572.
+        assert!((offset - 572.0).abs() < 0.01, "offset was {offset}");
+    }
+
+    #[test]
+    fn a_revealed_card_is_centred_when_the_list_is_long_enough() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        view.viewport = euclid::rect(0.0, 0.0, 1000.0, 400.0);
+        let layouts = reveal_layout(1, 10, 100.0);
+        let groups = vec![live_group_with_active(10, 4)];
+        view.scroll.set_extents(400.0, 40.0 + 10.0 * 100.0 + 9.0 * 16.0);
+
+        let offset = view
+            .offset_revealing_active(&groups, &layouts, 0.0, 1000.0, 16.0)
+            .expect("the fifth row is below the fold");
+        // Row 4 sits at 40 + 4 * 116 = 504; centring a 100 tall card in 400
+        // lifts it by 150.
+        assert!((offset - 354.0).abs() < 0.01, "offset was {offset}");
+    }
+
+    #[test]
+    fn opening_leaves_an_already_visible_active_card_alone() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        view.viewport = euclid::rect(0.0, 0.0, 1000.0, 400.0);
+        let layouts = reveal_layout(2, 3, 300.0);
+        let groups = vec![live_group_with_active(6, 0)];
+        view.scroll.set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
+
+        assert!(view
+            .offset_revealing_active(&groups, &layouts, 0.0, 1000.0, 16.0)
+            .is_none());
+    }
+
+    #[test]
+    fn a_list_with_no_active_card_is_left_where_it_is() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        view.viewport = euclid::rect(0.0, 0.0, 1000.0, 400.0);
+        let layouts = reveal_layout(2, 3, 300.0);
+        let mut groups = vec![live_group_with_active(6, 0)];
+        groups[0].cards[0].active = false;
+        view.scroll.set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
+
+        assert!(view
+            .offset_revealing_active(&groups, &layouts, 0.0, 1000.0, 16.0)
+            .is_none());
+    }
+
+    #[test]
+    fn offscreen_cards_keep_their_running_label_between_frames() {
+        // Six cards; a viewport that fits two. Whether a card was drawn is not
+        // this function's business -- every live tab keeps its entry, or the
+        // one-second cache never survives a frame.
+        let groups = vec![live_group_with_active(6, 0)];
+        let now = Instant::now();
+        let mut labels: HashMap<TabId, (Instant, Option<String>)> = (0..6)
+            .map(|index| (index as TabId, (now, Some(format!("cmd-{index}")))))
+            .collect();
+
+        retain_running_labels(&mut labels, &groups);
+
+        assert_eq!(labels.len(), 6, "every live tab keeps its label");
+        assert_eq!(
+            labels[&5].1.as_deref(),
+            Some("cmd-5"),
+            "the last row is offscreen but still live"
+        );
+    }
+
+    #[test]
+    fn a_closed_tab_loses_its_running_label() {
+        let groups = vec![live_group_with_active(2, 0)];
+        let now = Instant::now();
+        let mut labels: HashMap<TabId, (Instant, Option<String>)> = (0..4)
+            .map(|index| (index as TabId, (now, Some("cmd".to_string()))))
+            .collect();
+
+        retain_running_labels(&mut labels, &groups);
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains_key(&0) && labels.contains_key(&1));
+    }
+
+    fn card_key() -> LiveThreadKey {
+        LiveThreadKey {
+            space_id: "space".to_string(),
+            thread_id: "thread".to_string(),
+        }
+    }
+
+    /// One frame of `paint_impl`: every travel is advanced once, then each
+    /// card asks where it should be drawn.
+    fn card_frame(
+        view: &mut LiveOverviewView,
+        key: &LiveThreadKey,
+        target: RectF,
+        now: Instant,
+    ) -> RectF {
+        for motion in view.card_motion.values_mut() {
+            motion.travel.advance(now);
+        }
+        view.settle_card_rect(key, target, now)
+    }
+
+    #[test]
+    fn a_card_appears_where_the_grid_puts_it_and_stays_there() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let key = card_key();
+        let now = Instant::now();
+        let slot = euclid::rect(0.0, 0.0, 100.0, 80.0);
+
+        assert_eq!(card_frame(&mut view, &key, slot, now), slot);
+        let later = now + Duration::from_millis(500);
+        assert_eq!(card_frame(&mut view, &key, slot, later), slot);
+        assert!(!view.card_motion[&key].travel.is_running());
+    }
+
+    #[test]
+    fn a_card_whose_neighbour_closed_travels_into_the_gap() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let key = card_key();
+        let start = Instant::now();
+        let was = euclid::rect(0.0, 200.0, 100.0, 80.0);
+        let now_at = euclid::rect(0.0, 0.0, 100.0, 80.0);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+
+        card_frame(&mut view, &key, was, at(0));
+
+        // The frame that discovers the new layout is also the frame that pays
+        // for redrawing it, so the card has not set off yet.
+        assert_eq!(card_frame(&mut view, &key, now_at, at(10)), was);
+        assert_eq!(card_frame(&mut view, &key, now_at, at(20)), was);
+
+        // Halfway through, ease-out has it well past the midpoint.
+        let midway = card_frame(&mut view, &key, now_at, at(110));
+        assert!(midway.origin.y < 100.0 && midway.origin.y > 0.0);
+
+        assert_eq!(card_frame(&mut view, &key, now_at, at(400)), now_at);
+        assert!(!view.card_motion[&key].travel.is_running());
+    }
+
+    #[test]
+    fn closing_a_second_card_mid_travel_does_not_send_the_first_backwards() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let key = card_key();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let bottom = euclid::rect(0.0, 200.0, 100.0, 80.0);
+        let middle = euclid::rect(0.0, 100.0, 100.0, 80.0);
+        let top = euclid::rect(0.0, 0.0, 100.0, 80.0);
+
+        card_frame(&mut view, &key, bottom, at(0));
+        card_frame(&mut view, &key, middle, at(10));
+        card_frame(&mut view, &key, middle, at(20));
+        let mid_travel = card_frame(&mut view, &key, middle, at(110));
+        assert!(mid_travel.origin.y < 200.0 && mid_travel.origin.y > 100.0);
+
+        // A second card closes while this one is still moving.
+        let redirected = card_frame(&mut view, &key, top, at(110));
+        assert_eq!(redirected.origin.y, mid_travel.origin.y);
+
+        card_frame(&mut view, &key, top, at(126));
+        assert_eq!(card_frame(&mut view, &key, top, at(500)), top);
+    }
+
+    #[test]
+    fn dragging_the_window_relays_out_the_grid_without_animating_it() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let key = card_key();
+        let start = Instant::now();
+        let narrow = euclid::rect(0.0, 0.0, 100.0, 80.0);
+        let wide = euclid::rect(0.0, 0.0, 260.0, 80.0);
+
+        card_frame(&mut view, &key, narrow, start);
+        view.live_resizing = true;
+        // Chasing the window edge one frame behind reads as lag, not motion.
+        assert_eq!(
+            card_frame(&mut view, &key, wide, start + Duration::from_millis(8)),
+            wide
+        );
+        assert!(!view.card_motion[&key].travel.is_running());
+    }
+
     #[test]
     fn scrollbar_is_transient_and_schedules_its_hide_frame() {
         let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
         view.scroll.set_extents(100.0, 300.0);
         let now = Instant::now();
-        assert!(!view.scrollbar_visible_at(now));
+        assert_eq!(view.scrollbar_opacity_at(now), 0.0);
 
         view.reveal_scrollbar(now);
         let deadline = now + SCROLLBAR_VISIBLE_INTERVAL;
-        assert!(view.scrollbar_visible_at(deadline - Duration::from_millis(1)));
-        assert!(!view.scrollbar_visible_at(deadline));
-        assert_eq!(view.next_frame_deadline(now), Some(deadline));
+        assert!(view.scrollbar_opacity_at(deadline - Duration::from_millis(1)) > 0.0);
+
+        // Full strength until the fade starts, then on its way out.
+        let fade_from = deadline - SCROLLBAR_FADE;
+        assert_eq!(view.scrollbar_opacity_at(fade_from), 1.0);
+        let half_faded = view.scrollbar_opacity_at(fade_from + SCROLLBAR_FADE / 2);
+        assert!(half_faded > 0.0 && half_faded < 1.0);
+        assert_eq!(view.scrollbar_opacity_at(deadline), 0.0);
+
+        // One frame to begin the fade; once inside it, every frame.
+        assert_eq!(view.next_frame_deadline(now), Some(fade_from));
+        let mid_fade = fade_from + Duration::from_millis(20);
+        assert_eq!(view.next_frame_deadline(mid_fade), Some(mid_fade));
+        assert_eq!(view.next_frame_deadline(deadline), None);
     }
 
     #[test]

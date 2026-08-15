@@ -140,6 +140,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   var linear_tex: vec4<f32> = textureSample(atlas_linear_tex, atlas_linear_sampler, in.tex);
   var nearest_tex: vec4<f32> = textureSample(atlas_nearest_tex, atlas_nearest_sampler, in.tex);
 
+  // How far this quad is minified, in atlas texels per screen pixel.
+  //
+  // Glyphs are rasterised at the size they are meant to be drawn and sampled
+  // nearest, which is correct at 1:1 and is what keeps terminal text crisp.
+  // A quad that is being shrunk -- a terminal travelling into an overview
+  // card -- breaks that assumption: nearest minification samples one texel in
+  // every N, so strokes drop out entirely and the text shimmers as the scale
+  // passes through. Both samples are taken anyway and the two bind groups are
+  // the same atlas texture, so blending toward the linear one costs a mix and
+  // leaves everything drawn at its rasterised size untouched.
+  //
+  // Derivatives must be taken in uniform control flow, hence up here rather
+  // than inside the branches below.
+  let atlas_size = vec2<f32>(textureDimensions(atlas_nearest_tex));
+  let footprint = max(
+    length(dpdx(in.tex) * atlas_size),
+    length(dpdy(in.tex) * atlas_size),
+  );
+  // Nearest until the quad is unambiguously being shrunk, then ramp to linear.
+  //
+  // The dead zone matters more than the ramp. A glyph drawn at the size it was
+  // rasterised does not land on exactly one texel per pixel -- cell metrics are
+  // integer device pixels and the projection carries float error -- so a
+  // threshold at 1.0 leaks a few percent of linear into every character on
+  // screen and softens the whole terminal. Nothing below 1.25 is minified
+  // enough to be worth filtering.
+  let minified = smoothstep(1.25, 2.0, footprint);
+
   var hsv = in.hsv;
 
   if in.has_color == IS_SOLID_COLOR {
@@ -152,16 +180,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     color.a *= in.fg_color.a;
   } else if in.has_color == IS_COLOR_EMOJI {
     // the texture is full color info (eg: color emoji glyph)
-    color = nearest_tex;
+    color = mix(nearest_tex, linear_tex, minified);
+    // The vertex alpha still applies, so that a surface being composited at
+    // partial opacity carries its emoji with it.
+    color.a *= in.fg_color.a;
   } else if in.has_color == IS_GRAY_SCALE {
     // Grayscale poly quad for non-aa text render layers
     color = in.fg_color;
-    color.a *= nearest_tex.a;
+    color.a *= mix(nearest_tex.a, linear_tex.a, minified);
   } else if in.has_color == IS_GLYPH {
     // the texture is the alpha channel/color mask
     // and we need to tint with the fg_color
     color = in.fg_color;
-    color.a = nearest_tex.a;
+    // Multiply rather than replace: the glyph mask decides the shape, the
+    // vertex colour decides how present the whole thing is. Replacing it
+    // discarded any opacity the caller asked for, which meant terminal text
+    // could not take part in a surface being composited at partial opacity --
+    // it stayed solid over everything else as it faded.
+    color.a = mix(nearest_tex.a, linear_tex.a, minified) * in.fg_color.a;
     hsv *= uniforms.foreground_text_hsb;
   }
 

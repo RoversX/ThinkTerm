@@ -126,14 +126,73 @@ pub trait QuadTrait {
 pub enum QuadImpl<'a> {
     Vert(Quad<'a>),
     Boxed(&'a mut BoxedQuad),
+    TransformedBoxed(&'a mut BoxedQuad, QuadPositionTransform),
     Tee(Quad<'a>, &'a mut BoxedQuad),
+}
+
+/// Maps quad positions from a naturally rendered source rect into an exact
+/// destination rect while the quad is being authored. Live thumbnails use
+/// this instead of walking every glyph a second time after paint.
+#[derive(Clone, Copy, Debug)]
+pub struct QuadPositionTransform {
+    scale_x: f32,
+    scale_y: f32,
+    offset_x: f32,
+    offset_y: f32,
+}
+
+impl QuadPositionTransform {
+    fn new(source: QuadClipRect, target: QuadClipRect) -> Option<Self> {
+        let source_width = source.width();
+        let source_height = source.bottom() - source.top();
+        let target_width = target.width();
+        let target_height = target.bottom() - target.top();
+        if !(source_width > 0.0
+            && source_height > 0.0
+            && target_width > 0.0
+            && target_height > 0.0)
+        {
+            return None;
+        }
+        let scale_x = target_width / source_width;
+        let scale_y = target_height / source_height;
+        let offset_x = target.left() - source.left() * scale_x;
+        let offset_y = target.top() - source.top() * scale_y;
+        (scale_x.is_finite()
+            && scale_y.is_finite()
+            && offset_x.is_finite()
+            && offset_y.is_finite())
+            .then_some(Self {
+                scale_x,
+                scale_y,
+                offset_x,
+                offset_y,
+            })
+    }
+
+    fn map_position(
+        self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    ) -> (f32, f32, f32, f32) {
+        (
+            left * self.scale_x + self.offset_x,
+            top * self.scale_y + self.offset_y,
+            right * self.scale_x + self.offset_x,
+            bottom * self.scale_y + self.offset_y,
+        )
+    }
 }
 
 impl<'a> QuadTrait for QuadImpl<'a> {
     fn set_texture_discrete(&mut self, x1: f32, x2: f32, y1: f32, y2: f32) {
         match self {
             Self::Vert(q) => q.set_texture_discrete(x1, x2, y1, y2),
-            Self::Boxed(q) => q.set_texture_discrete(x1, x2, y1, y2),
+            Self::Boxed(q) | Self::TransformedBoxed(q, _) => {
+                q.set_texture_discrete(x1, x2, y1, y2)
+            }
             Self::Tee(gpu, heap) => {
                 gpu.set_texture_discrete(x1, x2, y1, y2);
                 heap.set_texture_discrete(x1, x2, y1, y2);
@@ -144,7 +203,7 @@ impl<'a> QuadTrait for QuadImpl<'a> {
     fn set_has_color_impl(&mut self, has_color: f32) {
         match self {
             Self::Vert(q) => q.set_has_color_impl(has_color),
-            Self::Boxed(q) => q.set_has_color_impl(has_color),
+            Self::Boxed(q) | Self::TransformedBoxed(q, _) => q.set_has_color_impl(has_color),
             Self::Tee(gpu, heap) => {
                 gpu.set_has_color_impl(has_color);
                 heap.set_has_color_impl(has_color);
@@ -155,7 +214,7 @@ impl<'a> QuadTrait for QuadImpl<'a> {
     fn set_fg_color(&mut self, color: LinearRgba) {
         match self {
             Self::Vert(q) => q.set_fg_color(color),
-            Self::Boxed(q) => q.set_fg_color(color),
+            Self::Boxed(q) | Self::TransformedBoxed(q, _) => q.set_fg_color(color),
             Self::Tee(gpu, heap) => {
                 gpu.set_fg_color(color);
                 heap.set_fg_color(color);
@@ -172,7 +231,9 @@ impl<'a> QuadTrait for QuadImpl<'a> {
     ) {
         match self {
             Self::Vert(q) => q.set_corner_gradient(top_left, top_right, bottom_left, bottom_right),
-            Self::Boxed(q) => q.set_corner_gradient(top_left, top_right, bottom_left, bottom_right),
+            Self::Boxed(q) | Self::TransformedBoxed(q, _) => {
+                q.set_corner_gradient(top_left, top_right, bottom_left, bottom_right)
+            }
             Self::Tee(gpu, heap) => {
                 gpu.set_corner_gradient(top_left, top_right, bottom_left, bottom_right);
                 heap.set_corner_gradient(top_left, top_right, bottom_left, bottom_right);
@@ -183,7 +244,7 @@ impl<'a> QuadTrait for QuadImpl<'a> {
     fn set_vertical_gradient(&mut self, top: LinearRgba, bottom: LinearRgba) {
         match self {
             Self::Vert(q) => q.set_vertical_gradient(top, bottom),
-            Self::Boxed(q) => q.set_vertical_gradient(top, bottom),
+            Self::Boxed(q) | Self::TransformedBoxed(q, _) => q.set_vertical_gradient(top, bottom),
             Self::Tee(gpu, heap) => {
                 gpu.set_vertical_gradient(top, bottom);
                 heap.set_vertical_gradient(top, bottom);
@@ -194,7 +255,9 @@ impl<'a> QuadTrait for QuadImpl<'a> {
     fn set_alt_color_and_mix_value(&mut self, color: LinearRgba, mix_value: f32) {
         match self {
             Self::Vert(q) => q.set_alt_color_and_mix_value(color, mix_value),
-            Self::Boxed(q) => q.set_alt_color_and_mix_value(color, mix_value),
+            Self::Boxed(q) | Self::TransformedBoxed(q, _) => {
+                q.set_alt_color_and_mix_value(color, mix_value)
+            }
             Self::Tee(gpu, heap) => {
                 gpu.set_alt_color_and_mix_value(color, mix_value);
                 heap.set_alt_color_and_mix_value(color, mix_value);
@@ -205,7 +268,7 @@ impl<'a> QuadTrait for QuadImpl<'a> {
     fn set_hsv(&mut self, hsv: Option<HsbTransform>) {
         match self {
             Self::Vert(q) => q.set_hsv(hsv),
-            Self::Boxed(q) => q.set_hsv(hsv),
+            Self::Boxed(q) | Self::TransformedBoxed(q, _) => q.set_hsv(hsv),
             Self::Tee(gpu, heap) => {
                 gpu.set_hsv(hsv);
                 heap.set_hsv(hsv);
@@ -217,6 +280,11 @@ impl<'a> QuadTrait for QuadImpl<'a> {
         match self {
             Self::Vert(q) => q.set_position(left, top, right, bottom),
             Self::Boxed(q) => q.set_position(left, top, right, bottom),
+            Self::TransformedBoxed(q, transform) => {
+                let (left, top, right, bottom) =
+                    transform.map_position(left, top, right, bottom);
+                q.set_position(left, top, right, bottom);
+            }
             Self::Tee(gpu, heap) => {
                 gpu.set_position(left, top, right, bottom);
                 heap.set_position(left, top, right, bottom);
@@ -434,6 +502,25 @@ impl BoxedQuad {
         vert
     }
 
+    /// Scale every colour's alpha, for compositing a recorded surface at
+    /// partial opacity.
+    ///
+    /// Every shader branch multiplies by this, so a whole recorded surface --
+    /// fills, gradients, UI text, terminal glyphs, colour emoji -- fades as
+    /// one picture. `IS_GLYPH` and `IS_COLOR_EMOJI` used to take their alpha
+    /// from the glyph texture alone and drop the vertex colour's, which left
+    /// terminal text standing solid over everything else as it faded.
+    fn with_opacity(mut self, opacity: f32) -> Self {
+        self.fg_color[3] *= opacity;
+        self.alt_color[3] *= opacity;
+        if let Some(corners) = self.fg_color_corners.as_deref_mut() {
+            for corner in corners.iter_mut() {
+                corner[3] *= opacity;
+            }
+        }
+        self
+    }
+
     /// Translate this quad and crop it to `clip`, preserving texture
     /// coordinates and per-corner colors for the visible portion.
     fn translated_clipped(&self, offset_x: f32, offset_y: f32, clip: QuadClipRect) -> Option<Self> {
@@ -442,26 +529,65 @@ impl BoxedQuad {
         let translated_top = top + offset_y;
         let translated_right = right + offset_x;
         let translated_bottom = bottom + offset_y;
-        if !(translated_right > translated_left
-            && translated_bottom > translated_top
+        self.positioned_clipped(
+            translated_left,
+            translated_top,
+            translated_right,
+            translated_bottom,
+            clip,
+        )
+    }
+
+    /// Scale and offset this quad into a destination rect, then crop it.
+    ///
+    /// Unlike [`TripleLayerQuadAllocator::set_heap_position_transform`], which
+    /// maps positions as a surface is being authored, this remaps a surface
+    /// that was already recorded. That is what lets one captured frame be
+    /// replayed at a different size on every frame of a transition instead of
+    /// the whole window being painted again each time -- at the cost of the
+    /// glyph textures being sampled below their rasterised size, so the text
+    /// softens as it shrinks.
+    fn transformed_clipped(
+        &self,
+        transform: QuadPositionTransform,
+        clip: QuadClipRect,
+    ) -> Option<Self> {
+        let (left, top, right, bottom) = self.position;
+        let (left, top, right, bottom) = transform.map_position(left, top, right, bottom);
+        self.positioned_clipped(left, top, right, bottom, clip)
+    }
+
+    /// Crop this quad after its four position edges have already been mapped.
+    /// Keeping the mapping outside avoids cloning an intermediate quad for the
+    /// scaled-preview path, which touches thousands of tiny glyph quads.
+    fn positioned_clipped(
+        &self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        clip: QuadClipRect,
+    ) -> Option<Self> {
+        if !(right > left
+            && bottom > top
             && clip.right() > clip.left()
             && clip.bottom() > clip.top())
         {
             return None;
         }
 
-        let visible_left = translated_left.max(clip.left());
-        let visible_top = translated_top.max(clip.top());
-        let visible_right = translated_right.min(clip.right());
-        let visible_bottom = translated_bottom.min(clip.bottom());
+        let visible_left = left.max(clip.left());
+        let visible_top = top.max(clip.top());
+        let visible_right = right.min(clip.right());
+        let visible_bottom = bottom.min(clip.bottom());
         if visible_right <= visible_left || visible_bottom <= visible_top {
             return None;
         }
 
-        let x0 = (visible_left - translated_left) / (translated_right - translated_left);
-        let x1 = (visible_right - translated_left) / (translated_right - translated_left);
-        let y0 = (visible_top - translated_top) / (translated_bottom - translated_top);
-        let y1 = (visible_bottom - translated_top) / (translated_bottom - translated_top);
+        let x0 = (visible_left - left) / (right - left);
+        let x1 = (visible_right - left) / (right - left);
+        let y0 = (visible_top - top) / (bottom - top);
+        let y1 = (visible_bottom - top) / (bottom - top);
         let (u0, u1, v0, v1) = self.tex;
         let source_colors = self
             .fg_color_corners
@@ -508,6 +634,7 @@ impl BoxedQuad {
         }
         Some(clipped)
     }
+
 }
 
 fn lerp(start: f32, end: f32, amount: f32) -> f32 {
@@ -529,7 +656,19 @@ pub struct HeapQuadAllocator {
     layer0: Vec<Box<BoxedQuad>>,
     layer1: Vec<Box<BoxedQuad>>,
     layer2: Vec<Box<BoxedQuad>>,
+    /// Boxes handed back by [`HeapQuadAllocator::recycle`], waiting to be
+    /// filled again. Quads are boxed so their addresses survive the vector
+    /// growing, which means one allocation each -- fine for a surface recorded
+    /// once, ruinous for the overview, which builds a fresh allocator per card
+    /// per frame and drops every box at the end of it.
+    spare: Vec<Box<BoxedQuad>>,
+    position_transform: Option<QuadPositionTransform>,
 }
+
+/// Ceiling on the recycling pool. A pool the size of the largest single
+/// surface is the whole point; one the size of the largest surface ever
+/// painted, held forever, is a leak wearing a cache's clothes.
+const MAX_SPARE_QUADS: usize = 65_536;
 
 impl std::fmt::Debug for HeapQuadAllocator {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -640,6 +779,23 @@ pub struct HeapQuadMark {
 }
 
 impl HeapQuadAllocator {
+    /// Empty the allocator but keep its boxes for whatever is recorded next.
+    ///
+    /// For a caller that records many surfaces in a row -- the overview draws
+    /// one per visible card, every frame -- this turns a quad's allocation into
+    /// a `Vec::pop`. Dropping the allocator instead frees every box, and the
+    /// next card immediately allocates them all back.
+    pub fn recycle(&mut self) {
+        for layer in [&mut self.layer0, &mut self.layer1, &mut self.layer2] {
+            if self.spare.len() + layer.len() <= MAX_SPARE_QUADS {
+                self.spare.append(layer);
+            } else {
+                layer.clear();
+            }
+        }
+        self.position_transform = None;
+    }
+
     /// Where the next quad will land, for later use with [`Self::apply_before`],
     /// [`Self::apply_between`] and [`Self::apply_after`].
     pub fn mark(&self) -> HeapQuadMark {
@@ -674,13 +830,18 @@ impl HeapQuadAllocator {
         Ok(())
     }
 
-    /// Copy every recorded quad into `other`, cropped to `clip`.
+    /// Copy every recorded quad into `other`, cropped to `clip` and scaled to
+    /// `opacity`.
     /// Position, texture coordinates and per-corner colors are transformed
     /// together by the same primitive used by Space swipe composition.
+    ///
+    /// See [`BoxedQuad::with_opacity`] for which quads an opacity below 1
+    /// actually reaches.
     pub fn apply_to_clipped(
         &self,
         other: &mut TripleLayerQuadAllocator,
         clip: QuadClipRect,
+        opacity: f32,
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         for (layer_num, quads) in self.layers() {
@@ -688,10 +849,50 @@ impl HeapQuadAllocator {
                 let Some(clipped) = quad.translated_clipped(0.0, 0.0, clip) else {
                     continue;
                 };
+                let clipped = if opacity < 1.0 {
+                    clipped.with_opacity(opacity)
+                } else {
+                    clipped
+                };
                 other.extend_with(layer_num, &clipped.to_vertices());
             }
         }
         metrics::histogram!("quad_buffer_apply_clipped").record(started.elapsed());
+        Ok(())
+    }
+
+    /// Replay this whole surface scaled into `target`, cropped to `clip` and
+    /// composited at `opacity`.
+    ///
+    /// `source` is the rect the surface was recorded in; the two together give
+    /// the scale and offset. Used to fly a captured window into the card it
+    /// becomes.
+    pub fn apply_to_scaled(
+        &self,
+        other: &mut TripleLayerQuadAllocator,
+        source: QuadClipRect,
+        target: QuadClipRect,
+        clip: QuadClipRect,
+        opacity: f32,
+    ) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let Some(transform) = QuadPositionTransform::new(source, target) else {
+            return Ok(());
+        };
+        for (layer_num, quads) in self.layers() {
+            for quad in quads {
+                let Some(mapped) = quad.transformed_clipped(transform, clip) else {
+                    continue;
+                };
+                let mapped = if opacity < 1.0 {
+                    mapped.with_opacity(opacity)
+                } else {
+                    mapped
+                };
+                other.extend_with(layer_num, &mapped.to_vertices());
+            }
+        }
+        metrics::histogram!("quad_buffer_apply_scaled").record(started.elapsed());
         Ok(())
     }
 
@@ -754,10 +955,22 @@ impl HeapQuadAllocator {
         metrics::histogram!("quad_buffer_translated_rect_clip_apply").record(started.elapsed());
         Ok(())
     }
+
+    fn set_position_transform(&mut self, transform: Option<QuadPositionTransform>) {
+        self.position_transform = transform;
+    }
 }
 
 impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
     fn allocate(&mut self, layer_num: usize) -> anyhow::Result<QuadImpl<'_>> {
+        let position_transform = self.position_transform;
+        let fresh = match self.spare.pop() {
+            Some(mut quad) => {
+                *quad = BoxedQuad::default();
+                quad
+            }
+            None => Box::new(BoxedQuad::default()),
+        };
         let quads = match layer_num {
             0 => &mut self.layer0,
             1 => &mut self.layer1,
@@ -765,10 +978,13 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
             _ => unreachable!(),
         };
 
-        quads.push(Box::new(BoxedQuad::default()));
+        quads.push(fresh);
 
         let quad = quads.last_mut().unwrap();
-        Ok(QuadImpl::Boxed(quad))
+        Ok(match position_transform {
+            Some(transform) => QuadImpl::TransformedBoxed(quad, transform),
+            None => QuadImpl::Boxed(quad),
+        })
     }
 
     fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]) {
@@ -776,6 +992,7 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
             return;
         }
 
+        let position_transform = self.position_transform;
         let dest_quads = match layer_num {
             0 => &mut self.layer0,
             1 => &mut self.layer1,
@@ -791,7 +1008,12 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
             unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast(), vertices.len() / 4) };
 
         for quad in src_quads {
-            dest_quads.push(Box::new(BoxedQuad::from_vertices(quad)));
+            let mut quad = BoxedQuad::from_vertices(quad);
+            if let Some(transform) = position_transform {
+                let (left, top, right, bottom) = quad.position;
+                quad.position = transform.map_position(left, top, right, bottom);
+            }
+            dest_quads.push(Box::new(quad));
         }
     }
 }
@@ -815,6 +1037,29 @@ impl<'a> TripleLayerQuadAllocator<'a> {
             Self::Heap(heap) => Some(heap.mark()),
             Self::Tee { heap, .. } => Some(heap.mark()),
         }
+    }
+
+    /// Map subsequently recorded quad positions while backed by a heap. GPU
+    /// vertices are immutable once allocated, so preview callers deliberately
+    /// record their complete surface before the final upload.
+    pub fn set_heap_position_transform(
+        &mut self,
+        transform: Option<(QuadClipRect, QuadClipRect)>,
+    ) -> bool {
+        let Self::Heap(heap) = self else {
+            return false;
+        };
+        let transform = match transform {
+            Some((source, target)) => {
+                let Some(transform) = QuadPositionTransform::new(source, target) else {
+                    return false;
+                };
+                Some(transform)
+            }
+            None => None,
+        };
+        heap.set_position_transform(transform);
+        true
     }
 }
 
@@ -935,6 +1180,30 @@ fn boxed_quad_translation_and_clip_crop_position_texture_and_gradient_together()
     assert_eq!(colors[V_TOP_RIGHT], [0.75, 0.25, 0.0, 1.0]);
     assert_eq!(colors[V_BOT_LEFT], [0.25, 0.75, 0.0, 1.0]);
     assert_eq!(colors[V_BOT_RIGHT], [0.75, 0.75, 0.0, 1.0]);
+}
+
+#[cfg(test)]
+#[test]
+fn heap_position_transform_maps_new_and_cached_quads_in_one_pass() {
+    let source = QuadClipRect::from_top_left_pixels(0.0, 0.0, 100.0, 100.0, &TEST_ORIGIN);
+    let target = QuadClipRect::from_top_left_pixels(10.0, 20.0, 210.0, 70.0, &TEST_ORIGIN);
+    let mut heap = HeapQuadAllocator::default();
+    {
+        let mut layers = TripleLayerQuadAllocator::Heap(&mut heap);
+        assert!(layers.set_heap_position_transform(Some((source, target))));
+
+        let mut authored = layers.allocate(0).unwrap();
+        authored.set_position(20.0, 10.0, 40.0, 50.0);
+        drop(authored);
+
+        let mut cached = BoxedQuad::default();
+        cached.set_position(20.0, 10.0, 40.0, 50.0);
+        layers.extend_with(1, &cached.to_vertices());
+        assert!(layers.set_heap_position_transform(None));
+    }
+
+    assert_eq!(heap.layer0[0].position, (50.0, 25.0, 90.0, 45.0));
+    assert_eq!(heap.layer1[0].position, (50.0, 25.0, 90.0, 45.0));
 }
 
 #[cfg(test)]

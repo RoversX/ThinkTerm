@@ -1500,10 +1500,11 @@ impl super::TermWindow {
     /// Release the pointer-ownership bookkeeping for a `Release` that is
     /// about to be consumed by an early return.
     ///
-    /// `mouse_event_impl` normally clears these in its `Release` arm, but two
-    /// context-menu paths return before reaching it: the suppressed release
-    /// that follows a menu choice, and any release delivered while a menu is
-    /// open. Suppressing the *action* is intended; forgetting that the button
+    /// `mouse_event_impl` normally clears these in its `Release` arm, but
+    /// three paths return before reaching it: the suppressed release that
+    /// follows a menu choice, any release delivered while a menu is open, and
+    /// any release that lands while a full-window view is transitioning.
+    /// Suppressing the *action* is intended; forgetting that the button
     /// physically came up is not. Left armed, `current_mouse_capture` and
     /// `current_mouse_buttons` stay set for the rest of the session and
     /// silently veto every guard that tests them -- which disabled the
@@ -1525,6 +1526,18 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        // See `key_event_impl`: nothing on screen during a transition is live,
+        // including the card layout a click would be aiming at, which is still
+        // moving.
+        if self.content_view_transition_running() {
+            // Suppressing the action is the point; forgetting that the button
+            // physically came up is not. A press held across the start of a
+            // transition -- holding a card and hitting Escape, say -- would
+            // otherwise leave the pointer bookkeeping armed, and every guard
+            // that tests it reads as if the button were still down.
+            self.release_pointer_ownership(&event);
+            return;
+        }
         let pane = self.get_active_pane_or_overlay();
 
         if self.frontend_handoff_consumed_press && matches!(event.kind, WMEK::Release(_)) {
@@ -1961,9 +1974,16 @@ impl super::TermWindow {
             let py = event.coords.y as f32;
             let area = self.content_view_area();
             if px >= area.min_x() && px < area.max_x() && py >= area.min_y() && py < area.max_y() {
-                let resp = self
-                    .active_content_view_mut()
-                    .map(|v| v.on_mouse(px, py, event.kind));
+                let resp = self.active_content_view_mut().map(|v| {
+                    if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)) {
+                        // Pixel deltas and scroll phases do not survive the
+                        // trip through `MouseEventKind`; hand the view the
+                        // whole event so it can scroll like a trackpad.
+                        v.on_wheel(px, py, &event)
+                    } else {
+                        v.on_mouse(px, py, event.kind)
+                    }
+                });
                 if let Some(resp) = resp {
                     self.handle_content_response(resp);
                 }

@@ -9,6 +9,7 @@ use crate::ssh_hosts::{self, SshHostEntry, SshHostSource, SshHostSpec};
 use crate::termwindow::content_view::{ContentView, ContentViewResponse};
 use crate::termwindow::ui::icons::{distro_to_icon, SvgIcon};
 use crate::termwindow::TermWindow;
+use crate::ui::anim::Easing;
 use crate::ui::{
     char_index_for_x, contains, draw_button, draw_icon_button, draw_scrollbar, draw_text_input,
     draw_toggle, rect, text_width_to_char, wheel_delta_pixels, ButtonSpec, ControlState,
@@ -1457,7 +1458,7 @@ impl SshHostsView {
         if self.scroll.offset > 0.5 {
             for step in 0..fade_height {
                 let progress = step as f32 / fade_height as f32;
-                let alpha = 1.0 - Self::smoothstep(progress);
+                let alpha = 1.0 - Easing::Smooth.apply(progress);
                 ctx.draw_rect(
                     layers,
                     2,
@@ -1474,7 +1475,7 @@ impl SshHostsView {
             let start_y = area.origin.y + area.size.height - fade_height as f32;
             for step in 0..fade_height {
                 let progress = (step + 1) as f32 / fade_height as f32;
-                let alpha = Self::smoothstep(progress);
+                let alpha = Easing::Smooth.apply(progress);
                 ctx.draw_rect(
                     layers,
                     2,
@@ -1488,11 +1489,6 @@ impl SshHostsView {
         }
 
         Ok(())
-    }
-
-    fn smoothstep(t: f32) -> f32 {
-        let t = t.clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
     }
 
     fn paint_list_mask(

@@ -985,6 +985,13 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
+        // A transition owns the window: what is on screen is a recording, not
+        // anything that can answer. Swallowing here rather than routing to the
+        // terminal is the difference between a keystroke landing in a pane the
+        // user can no longer see and it landing nowhere.
+        if self.content_view_transition_running() {
+            return;
+        }
         // Esc aborts an in-flight file-row drag without reaching the pane
         if window_key.key_is_down
             && matches!(window_key.key, KeyCode::Char('\u{1b}'))
