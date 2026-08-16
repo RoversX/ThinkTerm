@@ -146,6 +146,20 @@ impl PaneStack {
             if pane.is_remote_mirror() {
                 continue;
             }
+            // Local panes get the same treatment through the frontend's
+            // registered cell metrics: convert the tree's pixel rect with
+            // the pane's own font scale and chrome so this write agrees
+            // with the GUI's, instead of fighting it (no entry = raw size).
+            let size = crate::pane::apply_frontend_cell_metrics(pane.pane_id(), size);
+            log::debug!(
+                target: "sizetrace",
+                "stack resize pane {} -> {}x{} ({}x{}px)",
+                pane.pane_id(),
+                size.cols,
+                size.rows,
+                size.pixel_width,
+                size.pixel_height,
+            );
             pane.resize(size)?;
         }
         Ok(())

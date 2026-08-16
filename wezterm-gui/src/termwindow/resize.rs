@@ -1959,6 +1959,22 @@ impl super::TermWindow {
         let target_size = self.terminal_size_for_positioned_pane(pos, render_metrics);
         let dims = pos.pane.get_dimensions();
 
+        // Register the metrics behind target_size so mux-side split-tree
+        // resizes (cascade during divider drags) compute this same size for
+        // the pane instead of the raw root-cell size — the two writers must
+        // agree or the PTY ping-pongs between their answers every frame.
+        if pos.pane.downcast_ref::<ClientPane>().is_none() {
+            mux::pane::set_frontend_cell_metrics(
+                pane_id,
+                Some(mux::pane::FrontendCellMetrics {
+                    cell_width: render_metrics.cell_size.width.max(1) as usize,
+                    cell_height: render_metrics.cell_size.height.max(1) as usize,
+                    chrome_height: self.pane_nav_bar_height(),
+                    dpi: self.dimensions.dpi as u32,
+                }),
+            );
+        }
+
         if dims.cols != target_size.cols
             || dims.viewport_rows != target_size.rows
             || dims.pixel_width != target_size.pixel_width
@@ -1968,6 +1984,19 @@ impl super::TermWindow {
             if let Some(client) = pos.pane.downcast_ref::<ClientPane>() {
                 client.adopt_frontend_geometry(target_size);
             } else {
+                log::debug!(
+                    target: "sizetrace",
+                    "gui sync pane {} {}x{} -> {}x{} (scale {} pos {}x{}px nav {})",
+                    pane_id,
+                    dims.cols,
+                    dims.viewport_rows,
+                    target_size.cols,
+                    target_size.rows,
+                    font_scale,
+                    pos.pixel_width,
+                    pos.pixel_height,
+                    self.pane_nav_bar_height(),
+                );
                 pos.pane.resize(target_size)?;
             }
         }

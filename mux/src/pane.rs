@@ -28,6 +28,73 @@ pub fn alloc_pane_id() -> PaneId {
     PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The cell geometry a frontend sizes this pane's PTY with.
+///
+/// The split tree thinks in root-font cells and knows nothing of per-pane
+/// font scale or per-pane chrome (the pane nav bar), while the GUI sizes
+/// PTYs through both. With two writers using different arithmetic, every
+/// split-tree resize and every GUI sync would set a *different* size on the
+/// same PTY — during a divider drag that alternates the TUI between two
+/// widths at frame rate. A GUI therefore registers, per pane, the metrics
+/// it sizes with, and `PaneStack::resize` converts the tree's pixel rect
+/// through them so both writers land on the identical size. Headless mux
+/// has no entries and keeps the raw cell behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontendCellMetrics {
+    pub cell_width: usize,
+    pub cell_height: usize,
+    /// Vertical chrome drawn inside the pane's rect (the pane nav bar), px.
+    pub chrome_height: usize,
+    pub dpi: u32,
+}
+
+lazy_static::lazy_static! {
+    static ref FRONTEND_CELL_METRICS: parking_lot::RwLock<HashMap<PaneId, FrontendCellMetrics>> =
+        parking_lot::RwLock::new(HashMap::new());
+}
+
+pub fn set_frontend_cell_metrics(pane_id: PaneId, metrics: Option<FrontendCellMetrics>) {
+    let mut map = FRONTEND_CELL_METRICS.write();
+    match metrics {
+        Some(m) => {
+            map.insert(pane_id, m);
+        }
+        None => {
+            map.remove(&pane_id);
+        }
+    }
+}
+
+pub fn frontend_cell_metrics(pane_id: PaneId) -> Option<FrontendCellMetrics> {
+    FRONTEND_CELL_METRICS.read().get(&pane_id).copied()
+}
+
+/// Convert a split-tree pixel rect into the size the registered frontend
+/// would compute for it. Mirrors the GUI's `terminal_size_for_positioned_pane`
+/// exactly: chrome is clamped so one terminal row always survives, and the
+/// pixel size is re-derived from whole cells.
+pub fn apply_frontend_cell_metrics(pane_id: PaneId, size: TerminalSize) -> TerminalSize {
+    let Some(m) = frontend_cell_metrics(pane_id) else {
+        return size;
+    };
+    let cell_width = m.cell_width.max(1);
+    let cell_height = m.cell_height.max(1);
+    let chrome = m
+        .chrome_height
+        .min(size.pixel_height.saturating_sub(cell_height));
+    let pixel_width = size.pixel_width.max(cell_width);
+    let pixel_height = size.pixel_height.saturating_sub(chrome).max(cell_height);
+    let cols = (pixel_width / cell_width).max(1);
+    let rows = (pixel_height / cell_height).max(1);
+    TerminalSize {
+        rows,
+        cols,
+        pixel_width: cols * cell_width,
+        pixel_height: rows * cell_height,
+        dpi: m.dpi,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PerformAssignmentResult {
     /// Continue search for handler

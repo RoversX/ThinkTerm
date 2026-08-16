@@ -2058,6 +2058,7 @@ impl Mux {
     fn remove_pane_internal(&self, pane_id: PaneId) {
         log::debug!("removing pane {}", pane_id);
         self.palette_advisories.lock().remove_pane(pane_id);
+        crate::pane::set_frontend_cell_metrics(pane_id, None);
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);
