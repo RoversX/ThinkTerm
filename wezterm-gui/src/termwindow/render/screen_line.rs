@@ -132,6 +132,7 @@ impl crate::TermWindow {
                 if !expired && !hover_changed {
                     self.update_next_frame_time(entry.expires);
                     shaped.replace(Rc::clone(&entry.shaped));
+                    crate::perf::accum_count("line_shape_hit");
                 }
 
                 invalidate_on_hover_change = entry.invalidate_on_hover_change;
@@ -153,12 +154,16 @@ impl crate::TermWindow {
                 font_config: params.font_config.as_ref(),
                 render_metrics: params.render_metrics,
                 font_identity: params.font_identity,
+                simple_shaping: params.simple_shaping,
             };
 
+            let build_started = crate::perf::now();
             let (shaped, invalidate_on_hover) = self.build_line_element_shape(params)?;
+            crate::perf::accum("line_shape_build", build_started);
             invalidate_on_hover_change = invalidate_on_hover;
             shaped
         };
+        let emit_started = crate::perf::now();
 
         let bounding_rect = euclid::rect(
             params.left_pixel_x,
@@ -717,6 +722,7 @@ impl crate::TermWindow {
         }
 
         metrics::histogram!("render_screen_line").record(start.elapsed());
+        crate::perf::accum("line_quad_emit", emit_started);
 
         Ok(RenderScreenLineResult {
             invalidate_on_hover_change,
@@ -866,15 +872,27 @@ impl crate::TermWindow {
 
             let style_params = last_style.as_ref().expect("we just set it up").clone();
 
-            let glyph_info = self.cached_cluster_shape(
-                style_params.style,
-                &cluster,
-                &gl_state,
-                params.font,
-                params.font_config,
-                &params.render_metrics,
-                params.font_identity,
-            )?;
+            let glyph_info = if params.simple_shaping {
+                self.cached_cluster_shape_by_cell(
+                    style_params.style,
+                    &cluster,
+                    &gl_state,
+                    params.font,
+                    params.font_config,
+                    &params.render_metrics,
+                    params.font_identity,
+                )?
+            } else {
+                self.cached_cluster_shape(
+                    style_params.style,
+                    &cluster,
+                    &gl_state,
+                    params.font,
+                    params.font_config,
+                    &params.render_metrics,
+                    params.font_identity,
+                )?
+            };
             let pixel_width = glyph_info
                 .iter()
                 .map(|info| info.glyph.x_advance.get() as f32)

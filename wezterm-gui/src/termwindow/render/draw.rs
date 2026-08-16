@@ -86,6 +86,7 @@ pub(crate) fn draw_webgpu_layers(
     clear_color: wgpu::Color,
     corner_radius: f32,
     window_border: WindowBorder,
+    window_label: usize,
 ) -> anyhow::Result<()> {
     let acquire_start = crate::perf::now();
     let output = webgpu.surface.get_current_texture()?;
@@ -196,7 +197,14 @@ pub(crate) fn draw_webgpu_layers(
                 render_pass.set_bind_group(0, &uniforms, &[]);
                 render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
                 render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
+                // Timed on its own because it is not the small bookkeeping step
+                // it reads as: `recreate` allocates a whole new vertex buffer
+                // with `mapped_at_creation`, which wgpu zero-fills. At overview
+                // sizes that is megabytes per layer per frame.
+                let recreate_start = crate::perf::now();
                 vertex_buffer = vertices.webgpu_mut().recreate();
+                crate::perf::log_duration("webgpu_vb_recreate", recreate_start);
+                crate::perf::log_counter("webgpu_vb_bytes", vertices.webgpu().capacity_bytes());
                 vertex_buffer.unmap();
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass
@@ -215,6 +223,16 @@ pub(crate) fn draw_webgpu_layers(
     crate::perf::log_counter("webgpu_vertices", vertices_total);
     let submit_start = crate::perf::now();
     webgpu.queue.submit(std::iter::once(encoder.finish()));
+    if crate::framedump::should_dump(window_label) {
+        if let Err(err) = crate::framedump::dump_texture(
+            &webgpu.device,
+            &webgpu.queue,
+            &output.texture,
+            window_label,
+        ) {
+            log::error!("framedump failed: {err:#}");
+        }
+    }
     output.present();
     crate::perf::log_duration("webgpu_submit_present", submit_start);
 
@@ -265,6 +283,7 @@ impl crate::TermWindow {
             },
             corner_radius,
             window_border,
+            self.mux_window_id as usize,
         )
     }
 

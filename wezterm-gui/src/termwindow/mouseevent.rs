@@ -2058,12 +2058,22 @@ impl super::TermWindow {
         };
 
         if delta != 0 {
+            // Split of the per-event drag cost: the pre-c9e3300 path was
+            // resize_split_by alone; preview_active_tab_geometry_now is the
+            // frontend-geometry machinery added since. Which of the two the
+            // time goes to decides where the fast-path cut lands.
+            let event_started = crate::perf::now();
+            let split_started = crate::perf::now();
             tab.resize_split_by(split.index, delta);
+            crate::perf::log_duration("drag_resize_split_by", split_started);
+            let preview_started = crate::perf::now();
             self.preview_active_tab_geometry_now();
+            crate::perf::log_duration("drag_preview_geometry", preview_started);
             if let Some(split) = tab.iter_splits().into_iter().nth(split.index) {
                 item.item_type = UIItemType::Split(split);
                 context.invalidate();
             }
+            crate::perf::log_duration("drag_split_event", event_started);
         }
         self.dragging.replace((item, start_event));
     }

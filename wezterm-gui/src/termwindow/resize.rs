@@ -1977,6 +1977,11 @@ impl super::TermWindow {
 
     fn sync_active_mux_tab_pane_sizes(&self) {
         if !self.owns_frontend_viewport() {
+            // Another frontend holds this tab's lease; resizing its PTYs from
+            // here would fight it. Logged because a *wrongly* closed gate is
+            // invisible otherwise: it silently strands every pane at its old
+            // size during divider drags.
+            log::debug!("skipping pane size sync: frontend viewport not owned");
             return;
         }
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {

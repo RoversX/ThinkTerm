@@ -39,6 +39,7 @@ mod colorease;
 mod commands;
 mod customglyph;
 mod download;
+mod framedump;
 mod frontend;
 mod glyphcache;
 mod i18n;

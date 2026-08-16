@@ -3593,6 +3593,7 @@ impl SettingsWindow {
             clear_color,
             corner_radius,
             window_border,
+            usize::MAX, // settings window; no mux window behind it
         )?;
         Ok(true)
     }

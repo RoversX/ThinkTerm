@@ -148,6 +148,7 @@ impl crate::TermWindow {
                 shape_key: None,
                 password_input: false,
                 allow_images: true,
+                simple_shaping: false,
             },
             layers,
         )?;

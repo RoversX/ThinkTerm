@@ -404,7 +404,11 @@ impl WebGpuState {
         };
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if crate::framedump::enabled() {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format,
             width: dimensions.pixel_width as u32,
             height: dimensions.pixel_height as u32,

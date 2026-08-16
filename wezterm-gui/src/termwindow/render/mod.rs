@@ -103,6 +103,7 @@ pub struct LineToElementParams<'a> {
     pub font_config: Option<&'a Rc<FontConfiguration>>,
     pub render_metrics: RenderMetrics,
     pub font_identity: u64,
+    pub simple_shaping: bool,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -189,6 +190,14 @@ pub struct RenderScreenLineParams<'a> {
     /// Live Overview keeps the source line untouched and suppresses only the
     /// image quads; regular terminal painting enables them.
     pub allow_images: bool,
+
+    /// Shape one cell at a time through the per-grapheme shape cache instead
+    /// of handing whole same-attribute runs to the shaper. Ligatures and
+    /// kerning are given up, which is invisible at thumbnail cell sizes; what
+    /// is bought is a cache that actually hits on content like btop, whose
+    /// full-run strings never repeat but whose individual characters always
+    /// do. Live Overview previews only.
+    pub simple_shaping: bool,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -862,7 +871,10 @@ impl crate::TermWindow {
             text: &cluster.text,
         };
         let glyph_info = match self.lookup_cached_shape(&key) {
-            Some(Ok(info)) => info,
+            Some(Ok(info)) => {
+                crate::perf::accum_count("cluster_shape_hit");
+                info
+            }
             Some(Err(err)) => return Err(err),
             None => {
                 let font = match font {
@@ -873,6 +885,7 @@ impl crate::TermWindow {
 
                 let presentation_width = PresentationWidth::with_cluster(&cluster);
 
+                let hb_started = crate::perf::now();
                 match font.shape(
                     &cluster.text,
                     move || window.notify(TermWindowNotif::InvalidateShapeCache),
@@ -883,6 +896,8 @@ impl crate::TermWindow {
                     Some(&presentation_width),
                 ) {
                     Ok(info) => {
+                        crate::perf::accum("cluster_hb_shape", hb_started);
+                        let raster_started = crate::perf::now();
                         let glyphs = self.glyph_infos_to_glyphs(
                             &style,
                             &mut gl_state.glyph_cache.borrow_mut(),
@@ -890,6 +905,7 @@ impl crate::TermWindow {
                             &font,
                             metrics,
                         )?;
+                        crate::perf::accum("glyph_raster", raster_started);
                         let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
 
                         self.shape_cache
@@ -916,6 +932,135 @@ impl crate::TermWindow {
             shape_resolve_start.elapsed()
         );
         Ok(glyph_info)
+    }
+
+    /// Shape a cluster one cell at a time, each cell's grapheme going through
+    /// the shape cache on its own.
+    ///
+    /// The whole-run `cached_cluster_shape` above keys its cache on the entire
+    /// same-attribute string, and against content like btop -- whose braille
+    /// graphs mint a new string every refresh -- that cache can never hit:
+    /// measured on a Live Overview rebuild, 85% of the cost was HarfBuzz
+    /// re-shaping runs it had shaped 100ms earlier. The individual characters,
+    /// though, repeat endlessly (braille is 256 codepoints), so per-cell
+    /// entries converge on a hit rate of ~1 after the first screen.
+    ///
+    /// The price is shaping without cross-cell context: no ligatures, no
+    /// kerning, and ambiguous-width characters resolved without the cluster's
+    /// `PresentationWidth`. At the 2-6px cell sizes previews render at, none
+    /// of that is visible, which is why only they take this path.
+    fn cached_cluster_shape_by_cell(
+        &self,
+        style: &TextStyle,
+        cluster: &CellCluster,
+        gl_state: &RenderState,
+        font: Option<&Rc<LoadedFont>>,
+        font_config: Option<&Rc<FontConfiguration>>,
+        metrics: &RenderMetrics,
+        font_identity: u64,
+    ) -> anyhow::Result<Rc<Vec<ShapedInfo>>> {
+        let text = &cluster.text;
+        if text.is_empty() {
+            return Ok(Rc::new(vec![]));
+        }
+
+        // Cell boundaries in byte offsets. A cell holds one grapheme, so
+        // splitting where the byte->cell mapping steps keeps combining
+        // sequences intact without a segmentation pass.
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut seg_start = 0usize;
+        let mut seg_cell = cluster.byte_to_cell_idx(0);
+        for (byte_idx, _) in text.char_indices().skip(1) {
+            let cell = cluster.byte_to_cell_idx(byte_idx);
+            if cell != seg_cell {
+                segments.push((seg_start, byte_idx));
+                seg_start = byte_idx;
+                seg_cell = cell;
+            }
+        }
+        segments.push((seg_start, text.len()));
+
+        let mut resolved_font: Option<Rc<LoadedFont>> = font.cloned();
+        let mut merged: Vec<ShapedInfo> = Vec::with_capacity(segments.len());
+        for (start, end) in segments {
+            let seg = &text[start..end];
+            let key = BorrowedShapeCacheKey {
+                font_identity,
+                style,
+                text: seg,
+            };
+            let infos = match self.lookup_cached_shape(&key) {
+                Some(Ok(info)) => {
+                    crate::perf::accum_count("cluster_shape_hit");
+                    info
+                }
+                Some(Err(err)) => return Err(err),
+                None => {
+                    let font = match &resolved_font {
+                        Some(font) => Rc::clone(font),
+                        None => {
+                            let font = font_config.unwrap_or(&self.fonts).resolve_font(style)?;
+                            resolved_font = Some(Rc::clone(&font));
+                            font
+                        }
+                    };
+                    let window = self.window.as_ref().unwrap().clone();
+                    let hb_started = crate::perf::now();
+                    match font.shape(
+                        seg,
+                        move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                        BlockKey::filter_out_synthetic,
+                        Some(cluster.presentation),
+                        cluster.direction,
+                        None,
+                        None,
+                    ) {
+                        Ok(info) => {
+                            crate::perf::accum("cluster_hb_shape", hb_started);
+                            let raster_started = crate::perf::now();
+                            let glyphs = self.glyph_infos_to_glyphs(
+                                &style,
+                                &mut gl_state.glyph_cache.borrow_mut(),
+                                &info,
+                                &font,
+                                metrics,
+                            )?;
+                            crate::perf::accum("glyph_raster", raster_started);
+                            let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
+                            self.shape_cache
+                                .borrow_mut()
+                                .put(key.to_owned(), Ok(Rc::clone(&shaped)));
+                            shaped
+                        }
+                        Err(err) => {
+                            if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
+                                return Err(err);
+                            }
+                            let res = anyhow!("shaper error: {}", err);
+                            self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
+                            return Err(res);
+                        }
+                    }
+                }
+            };
+            for info in infos.iter() {
+                merged.push(ShapedInfo {
+                    glyph: Rc::clone(&info.glyph),
+                    pos: GlyphPosition {
+                        glyph_idx: info.pos.glyph_idx,
+                        num_cells: info.pos.num_cells,
+                        x_offset: info.pos.x_offset,
+                        bearing_x: info.pos.bearing_x,
+                        bitmap_pixel_width: info.pos.bitmap_pixel_width,
+                    },
+                    // Re-anchor from segment-relative to cluster-relative so
+                    // the consumer's byte->cell mapping still lands.
+                    cluster: start + info.cluster,
+                    block_key: info.block_key,
+                });
+            }
+        }
+        Ok(Rc::new(merged))
     }
 
     fn lookup_cached_shape(

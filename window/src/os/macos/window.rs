@@ -158,6 +158,30 @@ fn target_frame_fps(configured_max_fps: u64) -> f64 {
     configured.min(screen).max(1.0)
 }
 
+/// How long to hold the next frame back, or `None` to let the display decide.
+///
+/// The throttle exists to honour a `max_fps` set *below* the panel's rate. When
+/// it is not below it -- and the default 120 is not below a 120Hz panel -- there
+/// is nothing left to enforce, because CoreAnimation already delivers `drawRect`
+/// once per refresh. Running the timer anyway is not merely redundant, it costs
+/// a refresh: the delay was measured from the *end* of the paint, so a 7ms frame
+/// was followed by a full 8.3ms of enforced idleness and only then by the wait
+/// for the next vsync, and every `drawRect` AppKit delivered in between was
+/// dropped by the throttle check. Measured: delivered frames every 33ms on a
+/// 120Hz panel while painting took 7ms.
+fn frame_throttle_delay(
+    configured_max_fps: u64,
+    spent: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let screen = macos_current_screen_max_fps().unwrap_or(60).max(1) as f64;
+    if configured_max_fps.max(1) as f64 >= screen {
+        return None;
+    }
+    let period = std::time::Duration::from_secs_f64(1.0 / target_frame_fps(configured_max_fps));
+    let remaining = period.saturating_sub(spent);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
 fn ns_event_phase_to_scroll_phase(phase: NSEventPhase) -> Option<ScrollPhase> {
     if phase.contains(NSEventPhase::NSEventPhaseBegan) {
         Some(ScrollPhase::Began)
@@ -1668,10 +1692,24 @@ impl WindowInner {
             // Avoid borrowing the view's `Inner` here: `set_cursor` can be
             // reached synchronously from inside an event dispatch that already
             // holds that borrow, so we stash the value in an ivar instead.
-            (**self.view).set_ivar::<i64>(CURSOR_IVAR, cursor_to_code(cursor));
-            // Ask AppKit to rebuild the cursor rects so the change above takes
-            // effect for its own cursor management on the next event.
-            let () = msg_send![*self.window, invalidateCursorRectsForView: *self.view];
+            // Only rebuild the cursor rects when the cursor actually changes.
+            // `set_cursor` runs on every mouse move, and
+            // `invalidateCursorRectsForView:` makes AppKit re-route the rects
+            // through the window server (`routeCursorRect` ->
+            // `_NSFindWindowUnderMouse` -> SLS* IPC) synchronously on the main
+            // thread. Sampled during a divider drag, that routing ate 30-45%
+            // of the drag's wall time and serialized mouse-event delivery --
+            // the whole app felt like a remote session. The registered rect
+            // stays valid while the cursor kind is unchanged, so skipping the
+            // invalidation loses nothing.
+            let code = cursor_to_code(cursor);
+            let prev: i64 = *(**self.view).get_ivar::<i64>(CURSOR_IVAR);
+            if prev != code {
+                (**self.view).set_ivar::<i64>(CURSOR_IVAR, code);
+                // Ask AppKit to rebuild the cursor rects so the change above
+                // takes effect for its own cursor management on the next event.
+                let () = msg_send![*self.window, invalidateCursorRectsForView: *self.view];
+            }
 
             if let Some(cursor) = cursor {
                 // Unconditionally apply the requested cursor, as there are
@@ -2725,6 +2763,14 @@ struct WindowView {
     // the frame throttle timer, invalidate()), and losing an update here is
     // what makes the window stop refreshing until the next user interaction.
     paint_throttled: Cell<bool>,
+    // When the throttle was engaged. The async timer that clears the flag is
+    // a single point of failure -- display sleep coalesces timers hard enough
+    // to lose it outright, and once it is gone every drawRect short-circuits
+    // on the flag forever (observed: a window frozen from the 50th minute of
+    // a display-off stretch until relaunch). This timestamp is what lets
+    // drawRect notice that the throttle has outlived any legal frame period
+    // and break the latch itself.
+    paint_throttled_since: Cell<Option<Instant>>,
     invalidated: Cell<bool>,
 }
 
@@ -4338,29 +4384,64 @@ impl WindowView {
                 return;
             }
 
-            if this.paint_throttled.get() {
+            // The throttle is only honored while its clearing timer can still
+            // plausibly be pending. No legal frame period reaches anywhere
+            // near this bound, so blowing past it means the timer is lost and
+            // waiting on it would freeze the window permanently.
+            const PAINT_THROTTLE_WATCHDOG: std::time::Duration =
+                std::time::Duration::from_millis(250);
+            let throttle_holds = this.paint_throttled.get()
+                && this
+                    .paint_throttled_since
+                    .get()
+                    .is_some_and(|since| since.elapsed() < PAINT_THROTTLE_WATCHDOG);
+            if this.paint_throttled.get() && !throttle_holds {
+                log::warn!("paint throttle outlived its clearing timer; breaking the latch");
+            }
+            if throttle_holds {
                 this.invalidated.set(true);
             } else {
                 let now = Instant::now();
                 if let Some(last) = inner.last_repaint_time.replace(now) {
                     if thinkterm_perf_enabled() {
                         log::info!(
-                            "thinkterm_perf macos_frame_interval_ms={:.2}",
-                            now.saturating_duration_since(last).as_secs_f64() * 1000.0
+                            "thinkterm_perf macos_frame_interval_ms={:.2} win={}",
+                            now.saturating_duration_since(last).as_secs_f64() * 1000.0,
+                            inner.window_id,
                         );
                     }
                 }
                 inner.events.dispatch(WindowEvent::NeedRepaint);
                 this.invalidated.set(false);
                 this.paint_throttled.set(true);
+                this.paint_throttled_since.set(Some(now));
 
                 let window_id = inner.window_id;
                 let max_fps = target_frame_fps(inner.config.max_fps);
                 if thinkterm_perf_enabled() {
                     log::info!("thinkterm_perf macos_target_fps={max_fps:.0}");
                 }
+                let Some(remaining) = frame_throttle_delay(inner.config.max_fps, now.elapsed())
+                else {
+                    // Nothing left to enforce; hand the pacing back to the
+                    // display, which is the only clock that matters here.
+                    this.paint_throttled.set(false);
+                    if this.invalidated.get() {
+                        // Through `performSelector` rather than setting the flag
+                        // inline: AppKit clears `needsDisplay` around this pass,
+                        // so a request made from inside it can be lost.
+                        if let Some(view_id) = inner.view_id.as_ref().map(|view| view.load()) {
+                            unsafe {
+                                let () = msg_send![*view_id, performSelector: sel!(thinktermRearmNeedsDisplay)
+                                                   withObject: nil
+                                                   afterDelay: 0.0];
+                            }
+                        }
+                    }
+                    return;
+                };
                 promise::spawn::spawn(async move {
-                    async_io::Timer::after(std::time::Duration::from_secs_f64(1.0 / max_fps)).await;
+                    async_io::Timer::after(remaining).await;
                     Connection::with_window_inner(window_id, move |inner| {
                         if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
                             window_view.paint_throttled.set(false);
@@ -4496,6 +4577,7 @@ impl WindowView {
         let view = Box::into_raw(Box::new(Self {
             inner: Rc::clone(&inner),
             paint_throttled: Cell::new(false),
+            paint_throttled_since: Cell::new(None),
             invalidated: Cell::new(true),
         }));
 

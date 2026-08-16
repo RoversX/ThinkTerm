@@ -1623,6 +1623,7 @@ impl crate::TermWindow {
                                 shape_key: Some(shape_key),
                                 password_input,
                                 allow_images: true,
+                                simple_shaping: false,
                             },
                             &mut TripleLayerQuadAllocator::Heap(&mut buf),
                         )

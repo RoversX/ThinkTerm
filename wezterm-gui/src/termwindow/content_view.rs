@@ -321,6 +321,9 @@ pub(crate) struct TerminalPreviewPaneSnapshot {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TerminalPreviewRequest {
+    /// Which card this thumbnail belongs to. The renderer keeps one cached
+    /// quad heap per card and needs a stable identity to find it again.
+    pub tab_id: TabId,
     pub snapshot: Arc<TerminalPreviewSnapshot>,
     pub area: RectF,
     pub clip: RectF,
@@ -464,6 +467,11 @@ pub(crate) trait ContentView {
     /// one flying towards it, and the transition reads as two pictures of the
     /// same thing rather than one thing moving.
     fn set_terminal_in_flight(&mut self, _tab_id: Option<TabId>) {}
+
+    /// The opening frame of a full-window transition records the terminal and
+    /// grows the atlas; defer thumbnail capture until the next frame so that
+    /// work is not stacked onto the click that triggered the transition.
+    fn set_defer_preview_captures(&mut self, _defer: bool) {}
 
     /// Paint masks and chrome that must sit above terminal preview glyphs.
     /// Most ContentViews do not embed terminal snapshots and need no second

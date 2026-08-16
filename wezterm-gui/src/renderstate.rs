@@ -326,6 +326,12 @@ impl WebGpuVertexBuffer {
         }
     }
 
+    /// Size of the buffer this recreates, which is the capacity high-water
+    /// mark rather than what the frame actually uses.
+    pub fn capacity_bytes(&self) -> usize {
+        self.num_vertices * std::mem::size_of::<Vertex>()
+    }
+
     pub fn recreate(&mut self) -> wgpu::Buffer {
         let mut new_buf = self.state.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Vertex Buffer"),

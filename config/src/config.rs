@@ -849,6 +849,20 @@ pub struct Config {
     #[dynamic(default = "default_max_fps")]
     pub max_fps: u64,
 
+    /// How often, in milliseconds, a live overview card re-reads the terminal
+    /// it is showing.
+    ///
+    /// A card that re-reads has to rebuild its thumbnail, and that is by far
+    /// the most expensive thing the overview does: with several cards visible,
+    /// a frame that rebuilds one takes around 12ms against a 8.3ms budget while
+    /// a frame that rebuilds none takes 5ms. This number decides how many
+    /// frames land in which group, so it is the main handle on how smooth the
+    /// overview feels against how live the thumbnails look.
+    ///
+    /// Dynamic, so it can be tuned without a restart.
+    #[dynamic(default = "default_live_overview_preview_refresh_ms")]
+    pub live_overview_preview_refresh_ms: u64,
+
     #[dynamic(default = "default_shape_cache_size")]
     pub shape_cache_size: usize,
     #[dynamic(default = "default_line_state_cache_size")]
@@ -2302,20 +2316,33 @@ fn default_note_reading_max_width() -> usize {
     820
 }
 
+fn default_live_overview_preview_refresh_ms() -> u64 {
+    300
+}
+
+/// These four sizes were set when a window showed one terminal. ThinkTerm's
+/// live overview draws six at once, each at its own font size -- and the caches
+/// are keyed by size, so six thumbnails of the same text are six sets of
+/// entries. At 1024 that thrashed: a profile of the overview over busy
+/// terminals put 87% of a thumbnail's cost in HarfBuzz, re-shaping text the
+/// cache had just evicted.
+///
+/// An entry is a shaped cluster -- glyph indices and offsets, no pixels -- so
+/// the memory is small next to the atlas it saves work against.
 fn default_shape_cache_size() -> usize {
-    1024
+    16384
 }
 
 fn default_line_state_cache_size() -> usize {
-    1024
+    4096
 }
 
 fn default_line_quad_cache_size() -> usize {
-    1024
+    4096
 }
 
 fn default_line_to_ele_shape_cache_size() -> usize {
-    1024
+    8192
 }
 
 #[derive(Debug, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]

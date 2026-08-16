@@ -77,6 +77,57 @@ const MAX_COLUMNS: usize = 5;
 const MAX_COLUMNS_BELOW_WIDE_BREAKPOINT: usize = 4;
 const FIVE_COLUMN_WINDOW_WIDTH: f32 = 3000.0;
 const LIVE_RESIZE_PREVIEW_INTERVAL: Duration = Duration::from_millis(33);
+/// How long a card holds its picture while the list is being scrolled.
+///
+/// Long enough that no single flick contains a refresh, which is the point:
+/// the cost of a refresh lands as dropped frames in the scroll itself. It is
+/// an interval rather than a flag so a card that has never been captured still
+/// gets its first picture while the list is moving.
+const SCROLLING_PREVIEW_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a card re-reads the terminal it is showing, when nothing is being
+/// dragged.
+///
+/// Capturing had no interval at all outside a resize: any frame whose
+/// fingerprint had moved re-read the screen and, downstream, rebuilt every quad
+/// in the thumbnail. Against terminals that are genuinely busy -- agents
+/// printing continuously, which is what this overview is for -- that meant
+/// rebuilding all of them at the display's refresh rate, and no cache below
+/// could ever hit. This is the gate that bounds that work; the quad cache is
+/// what collects on it.
+///
+/// A thumbnail is a few pixels per cell, so it does not need to be as current
+/// as the terminal it depicts. The value lives in the config
+/// (`live_overview_preview_refresh_ms`) because it is the one number that
+/// trades the overview's smoothness against how live the cards look, and
+/// finding the right point takes trying it -- which a constant would make cost
+/// a rebuild each time.
+fn preview_refresh_interval() -> Duration {
+    Duration::from_millis(
+        config::configuration()
+            .live_overview_preview_refresh_ms
+            .max(1),
+    )
+}
+/// How many cards may re-read their terminal in any one frame.
+///
+/// Every visible card is first captured in the same frame, so their refresh
+/// deadlines start life aligned and stay that way: without a cap, each interval
+/// would land one frame in which every card rebuilds -- a periodic hitch ten
+/// times a second, which reads worse than being uniformly slow. Spending the
+/// budget staggers the phases apart on the first collision and keeps them apart.
+///
+/// One, because a rebuild is not cheap enough to fit two in a frame. Measured
+/// against six cards of continuously redrawing terminals: a frame that rebuilds
+/// one card takes 11.4ms, two takes 17.5ms, and six -- which is what opening the
+/// overview used to do in a single frame -- takes 397ms. The budget covers a
+/// card's *first* capture as well as its refreshes for that last reason.
+const MAX_PREVIEW_CAPTURES_PER_FRAME: usize = 1;
+/// How long after the last observed stale preview the repaint chain stays
+/// armed. A little longer than the default refresh interval, so that with a
+/// continuously updating terminal the next staleness lands before the hold
+/// expires and the chain never flaps; once output stops, the overview
+/// settles back to event-driven repaints within one interval.
+const PREVIEW_STALE_CHAIN_HOLD: Duration = Duration::from_millis(400);
 /// How often a card re-asks what its terminal is running.
 ///
 /// `CachePolicy::AllowStale` is not the cheap read its name suggests: it takes
@@ -285,6 +336,17 @@ pub(crate) struct LiveOverviewView {
     scroll_animating: bool,
     next_preview_refresh: Option<Instant>,
     scrollbar_visible_until: Option<Instant>,
+    /// The last time a warm card reported content newer than what is on
+    /// screen (a changed fingerprint that the refresh throttle has not
+    /// let us capture yet, or a capture we owe). Drives the repaint
+    /// chain: while previews are live, every frame asks for the next one
+    /// and the display paces us; when they go quiet we stop asking and
+    /// the overview costs nothing.
+    last_preview_stale: Option<Instant>,
+    /// Opening a full-window view records the terminal on the same frame as
+    /// the overview's first layout. Skip thumbnail capture that frame so the
+    /// click is not charged for both at once.
+    defer_preview_captures: bool,
 }
 
 impl LiveOverviewView {
@@ -327,6 +389,8 @@ impl LiveOverviewView {
             scroll_animating: false,
             next_preview_refresh: None,
             scrollbar_visible_until: None,
+            last_preview_stale: None,
+            defer_preview_captures: false,
         }
     }
 
@@ -559,7 +623,6 @@ impl LiveOverviewView {
 
         let now = Instant::now();
         let groups = self.collect_groups(now);
-        let refresh_interval = self.live_resizing.then_some(LIVE_RESIZE_PREVIEW_INTERVAL);
         // Advance every card's travel once, before anything samples it.
         for motion in self.card_motion.values_mut() {
             motion.travel.advance(now);
@@ -570,6 +633,23 @@ impl LiveOverviewView {
         if self.scroll_animating {
             self.reveal_scrollbar(now);
         }
+        // The list is moving if a finger is down on it or a flick is still
+        // gliding. A card that recaptures has to rebuild its thumbnail, and
+        // that is ~10ms against a 8.3ms frame -- so a refresh landing mid-flick
+        // drops frames out of the one animation the eye is following. Held for
+        // the length of the gesture, no thumbnail can be read anyway; released
+        // the moment it ends, so the cards are current by the time the list
+        // settles. The interval is a hold rather than a skip so that a card
+        // being seen for the first time still gets its picture.
+        let scrolling = self.scroll.active_phase.is_some() || self.scroll_animating;
+        let refresh_interval = Some(if self.live_resizing {
+            LIVE_RESIZE_PREVIEW_INTERVAL
+        } else if scrolling {
+            SCROLLING_PREVIEW_INTERVAL
+        } else {
+            preview_refresh_interval()
+        });
+        let mut capture_budget = MAX_PREVIEW_CAPTURES_PER_FRAME;
         let mut warm_keys = HashSet::new();
         let mut seen_keys = HashSet::new();
         if groups.is_empty() {
@@ -678,22 +758,37 @@ impl LiveOverviewView {
                     let overscan = layout.grid.card_height + gap;
                     let snapshot = if card_is_warm(rect, self.viewport, overscan) {
                         warm_keys.insert(card.key.clone());
-                        let fingerprint = terminal_preview_fingerprint(card.tab_id);
-                        let (snapshot, refresh_due) = resolve_snapshot(
-                            &mut self.snapshot_cache,
-                            &card.key,
-                            fingerprint,
-                            now,
-                            refresh_interval,
-                            || capture_terminal_snapshot(card.tab_id),
-                        );
-                        if let Some(refresh_due) = refresh_due {
-                            self.next_preview_refresh = Some(
-                                self.next_preview_refresh
-                                    .map_or(refresh_due, |current| current.min(refresh_due)),
+                        if self.defer_preview_captures {
+                            self.snapshot_cache
+                                .get(&card.key)
+                                .map(|cached| Arc::clone(&cached.snapshot))
+                        } else {
+                            let fingerprint = terminal_preview_fingerprint(card.tab_id);
+                            let (snapshot, refresh_due) = resolve_snapshot(
+                                &mut self.snapshot_cache,
+                                &card.key,
+                                fingerprint,
+                                now,
+                                refresh_interval,
+                                &mut capture_budget,
+                                || capture_terminal_snapshot(card.tab_id),
                             );
+                            if let Some(refresh_due) = refresh_due {
+                                // A `Some` here means the card's fingerprint no
+                                // longer matches what was captured: there is newer
+                                // content than what is on screen (or no capture
+                                // yet). That -- not the refresh timer on its own
+                                // -- is what justifies asking for a steady stream
+                                // of frames. Cursor blink does not move the
+                                // fingerprint, so idle cursors stay idle.
+                                self.last_preview_stale = Some(now);
+                                self.next_preview_refresh = Some(
+                                    self.next_preview_refresh
+                                        .map_or(refresh_due, |current| current.min(refresh_due)),
+                                );
+                            }
+                            snapshot
                         }
-                        snapshot
                     } else {
                         None
                     };
@@ -829,6 +924,7 @@ impl LiveOverviewView {
                             )?;
                             if let Some(snapshot) = snapshot.as_ref().filter(|_| !in_flight) {
                                 self.previews.push(TerminalPreviewRequest {
+                                    tab_id,
                                     snapshot: Arc::clone(snapshot),
                                     area: preview,
                                     clip,
@@ -1054,6 +1150,15 @@ impl LiveOverviewView {
         // the repaint scheduler and the backend, which already throttle to
         // this panel's refresh rate.
         let motion_deadline = (self.card_motion_running || self.scroll_animating).then_some(now);
+        // While any card is showing stale content, chain frames at the
+        // display's pace instead of waking once per refresh timer: six cards
+        // on a 300ms throttle wake 20 times a second otherwise, which paints
+        // a busy overview at a juddery ~20fps. The hold-out spans a little
+        // more than one refresh interval so the chain does not flap in the
+        // gap between a capture and the next burst of output.
+        let stale_deadline = self.last_preview_stale.and_then(|stale| {
+            (now.duration_since(stale) < PREVIEW_STALE_CHAIN_HOLD).then_some(now)
+        });
         // Before the fade begins one frame is enough -- the one that starts
         // it. Inside the fade every frame counts.
         let scrollbar_deadline = self.scrollbar_visible_until.and_then(|until| {
@@ -1068,6 +1173,7 @@ impl LiveOverviewView {
         });
         [
             motion_deadline,
+            stale_deadline,
             self.next_preview_refresh,
             scrollbar_deadline,
         ]
@@ -1465,6 +1571,10 @@ impl ContentView for LiveOverviewView {
         self.terminal_in_flight = tab_id;
     }
 
+    fn set_defer_preview_captures(&mut self, defer: bool) {
+        self.defer_preview_captures = defer;
+    }
+
     fn set_host_preview_aspect(&mut self, aspect: f32) {
         if aspect.is_finite() && aspect > 0.0 {
             self.host_preview_aspect = aspect.clamp(HOST_PREVIEW_ASPECT_MIN, HOST_PREVIEW_ASPECT_MAX);
@@ -1828,6 +1938,7 @@ fn resolve_snapshot<T, F>(
     fingerprint: Option<TerminalPreviewFingerprint>,
     now: Instant,
     refresh_interval: Option<Duration>,
+    capture_budget: &mut usize,
     capture: F,
 ) -> (Option<Arc<T>>, Option<Instant>)
 where
@@ -1850,7 +1961,25 @@ where
                 return (Some(Arc::clone(&cached.snapshot)), Some(refresh_due));
             }
         }
+        // Due, but this frame has already paid for as many cards as it will.
+        // Ask for another frame immediately rather than naming a time: this
+        // card is owed a capture and should get it as soon as there is room.
+        if *capture_budget == 0 {
+            return (Some(Arc::clone(&cached.snapshot)), Some(now));
+        }
+    } else if *capture_budget == 0 {
+        // Nothing to show for this card yet, and it will have to wait a frame
+        // for its first picture.
+        //
+        // This used to be exempt, on the theory that an empty panel is a more
+        // visible defect than a stale one. Measurement said otherwise: opening
+        // an overview of six cards captured all six in one frame and cost
+        // 397ms -- a fifth of a second of frozen window, at the exact moment
+        // the user is looking at it. Spread one per frame the same six take
+        // 25ms and no card is empty for longer than a frame or two.
+        return (None, Some(now));
     }
+    *capture_budget -= 1;
 
     if let Some(snapshot) = capture() {
         cache.insert(
@@ -2659,6 +2788,27 @@ mod tests {
     }
 
     #[test]
+    fn stale_previews_chain_frames_at_display_pace_then_settle() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let now = Instant::now();
+
+        // Nothing has ever been stale: no chain, no deadline, zero cost.
+        assert_eq!(view.next_frame_deadline(now), None);
+
+        // A card just reported newer content than what is on screen: ask for
+        // the next frame immediately and let the display pace us.
+        view.last_preview_stale = Some(now);
+        assert_eq!(view.next_frame_deadline(now), Some(now));
+        // The hold spans the gap between a capture and the next output burst.
+        let within_hold = now + PREVIEW_STALE_CHAIN_HOLD - Duration::from_millis(1);
+        assert_eq!(view.next_frame_deadline(within_hold), Some(within_hold));
+
+        // Once previews have stayed quiet past the hold, the chain lets go.
+        let past_hold = now + PREVIEW_STALE_CHAIN_HOLD;
+        assert_eq!(view.next_frame_deadline(past_hold), None);
+    }
+
+    #[test]
     fn snapshot_cache_reuses_unchanged_content_and_throttles_live_resize() {
         let key = LiveThreadKey {
             space_id: "local".to_string(),
@@ -2666,6 +2816,7 @@ mod tests {
         };
         let mut cache = HashMap::new();
         let now = Instant::now();
+        let mut budget = usize::MAX;
         let first_fingerprint = test_fingerprint(1);
         let (snapshot, due) = resolve_snapshot(
             &mut cache,
@@ -2673,6 +2824,7 @@ mod tests {
             Some(first_fingerprint.clone()),
             now,
             None,
+            &mut budget,
             || Some(7_u8),
         );
         assert_eq!(*snapshot.unwrap(), 7);
@@ -2684,6 +2836,7 @@ mod tests {
             Some(first_fingerprint),
             now + Duration::from_millis(1),
             None,
+            &mut budget,
             || panic!("unchanged fingerprint must not recapture"),
         );
         assert_eq!(*snapshot.unwrap(), 7);
@@ -2696,6 +2849,7 @@ mod tests {
             Some(changed_fingerprint.clone()),
             now + Duration::from_millis(10),
             Some(LIVE_RESIZE_PREVIEW_INTERVAL),
+            &mut budget,
             || panic!("live resize must reuse until the refresh deadline"),
         );
         assert_eq!(*snapshot.unwrap(), 7);
@@ -2707,6 +2861,7 @@ mod tests {
             Some(changed_fingerprint),
             now + Duration::from_millis(34),
             Some(LIVE_RESIZE_PREVIEW_INTERVAL),
+            &mut budget,
             || Some(8_u8),
         );
         assert_eq!(*snapshot.unwrap(), 8);
@@ -2718,12 +2873,173 @@ mod tests {
             None,
             now + Duration::from_millis(35),
             None,
+            &mut budget,
             || panic!("missing live tab keeps the last successful snapshot"),
         );
         assert_eq!(*snapshot.unwrap(), 8);
         let live = HashSet::<LiveThreadKey>::new();
         cache.retain(|cached, _| live.contains(cached));
         assert!(cache.is_empty());
+    }
+
+    /// A busy terminal changes its fingerprint on every frame. Without an
+    /// interval outside a resize, that recaptured -- and rebuilt every quad in
+    /// the thumbnail -- at the display's refresh rate.
+    #[test]
+    fn a_busy_terminal_is_recaptured_at_the_steady_state_interval() {
+        let key = LiveThreadKey {
+            space_id: "local".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+        let mut budget = usize::MAX;
+        let mut captures = 0;
+        let mut capture = |cache: &mut HashMap<_, _>, at: Instant, seq: usize, budget: &mut usize| {
+            resolve_snapshot(
+                cache,
+                &key,
+                Some(test_fingerprint(seq)),
+                at,
+                Some(preview_refresh_interval()),
+                budget,
+                || {
+                    captures += 1;
+                    Some(seq as u8)
+                },
+            )
+        };
+
+        // A frame every 8ms for a second, with the content different every
+        // time. What comes out is one capture per refresh interval, not the
+        // 121 the fingerprints alone would ask for.
+        const FRAMES: u64 = 120;
+        const FRAME_MS: u64 = 8;
+        capture(&mut cache, now, 1, &mut budget);
+        for frame in 1..=FRAMES {
+            capture(
+                &mut cache,
+                now + Duration::from_millis(FRAME_MS * frame),
+                1 + frame as usize,
+                &mut budget,
+            );
+        }
+        let interval_ms = preview_refresh_interval().as_millis() as u64;
+        assert_eq!(captures, 1 + (FRAMES * FRAME_MS / interval_ms) as usize);
+        assert!(captures < 12, "{captures} captures in a second is not a throttle");
+    }
+
+    /// Opening the overview used to capture every card in the frame that
+    /// revealed them -- 397ms with six cards, all of it inside the gesture the
+    /// user is watching.
+    #[test]
+    fn opening_does_not_capture_every_card_in_one_frame() {
+        let keys: Vec<LiveThreadKey> = (0..6)
+            .map(|index| LiveThreadKey {
+                space_id: "local".to_string(),
+                thread_id: format!("thread-{index}"),
+            })
+            .collect();
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+        let mut budget = MAX_PREVIEW_CAPTURES_PER_FRAME;
+        let mut captured = 0;
+        let mut empty = 0;
+        for key in &keys {
+            let (snapshot, due) = resolve_snapshot(
+                &mut cache,
+                key,
+                Some(test_fingerprint(1)),
+                now,
+                Some(preview_refresh_interval()),
+                &mut budget,
+                || {
+                    captured += 1;
+                    Some(1_u8)
+                },
+            );
+            if snapshot.is_none() {
+                // Nothing to draw yet, and owed the very next frame for it.
+                assert_eq!(due, Some(now));
+                empty += 1;
+            }
+        }
+        assert_eq!(captured, MAX_PREVIEW_CAPTURES_PER_FRAME);
+        assert_eq!(empty, keys.len() - MAX_PREVIEW_CAPTURES_PER_FRAME);
+
+        // The next frame picks up where this one stopped.
+        let mut budget = MAX_PREVIEW_CAPTURES_PER_FRAME;
+        resolve_snapshot(
+            &mut cache,
+            &keys[1],
+            Some(test_fingerprint(1)),
+            now,
+            Some(preview_refresh_interval()),
+            &mut budget,
+            || {
+                captured += 1;
+                Some(1_u8)
+            },
+        );
+        assert_eq!(captured, 2 * MAX_PREVIEW_CAPTURES_PER_FRAME);
+    }
+
+    /// Cards are all first captured in the same frame, so their deadlines start
+    /// aligned. Rationing captures is what stops one frame in every interval
+    /// from rebuilding all of them at once.
+    #[test]
+    fn only_a_couple_of_cards_may_recapture_in_one_frame() {
+        let keys: Vec<LiveThreadKey> = (0..5)
+            .map(|index| LiveThreadKey {
+                space_id: "local".to_string(),
+                thread_id: format!("thread-{index}"),
+            })
+            .collect();
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+
+        let mut budget = usize::MAX;
+        for key in &keys {
+            resolve_snapshot(
+                &mut cache,
+                key,
+                Some(test_fingerprint(1)),
+                now,
+                Some(preview_refresh_interval()),
+                &mut budget,
+                || Some(1_u8),
+            );
+        }
+
+        // Every card is now due at the same instant, and every one has changed.
+        let due_at = now + preview_refresh_interval();
+        let mut budget = MAX_PREVIEW_CAPTURES_PER_FRAME;
+        let mut captured = 0;
+        let mut asked_for_another_frame = 0;
+        for key in &keys {
+            let (snapshot, due) = resolve_snapshot(
+                &mut cache,
+                key,
+                Some(test_fingerprint(2)),
+                due_at,
+                Some(preview_refresh_interval()),
+                &mut budget,
+                || {
+                    captured += 1;
+                    Some(2_u8)
+                },
+            );
+            if *snapshot.unwrap() == 1 {
+                // Still on the old picture, and owed a frame to fix that.
+                assert_eq!(due, Some(due_at));
+                asked_for_another_frame += 1;
+            }
+        }
+        assert_eq!(captured, MAX_PREVIEW_CAPTURES_PER_FRAME);
+        assert_eq!(
+            asked_for_another_frame,
+            keys.len() - MAX_PREVIEW_CAPTURES_PER_FRAME
+        );
     }
 
     #[test]

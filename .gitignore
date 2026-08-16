@@ -77,3 +77,6 @@ ThinkTerm-macos-v0.1.0.zip
 /docs/*
 !/docs/thinkterm/
 !/docs/thinkterm/*.md
+
+# well...
+/.claude

@@ -9,11 +9,14 @@ use ::window::RectF;
 use ::window::WindowOps;
 use anyhow::Context;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::SplitDirection;
+use mux::tab::{SplitDirection, TabId};
 use smol::Timer;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use window::Dimensions;
 use wezterm_font::ClearShapeCache;
 use wezterm_term::color::ColorAttribute;
 use wezterm_term::TerminalSize;
@@ -36,6 +39,119 @@ const MAX_PREVIEW_FILL: f32 = 1.5;
 /// Height of the pane layer divider the tab bar draws below itself, in the same
 /// device pixels the divider quad uses. Kept in step with `fancy_tab_bar`.
 const TAB_BAR_SEAM_HEIGHT: f32 = 1.0;
+
+/// How many cards may rebuild their recorded quads in one frame.
+///
+/// Measured with five cards open: replaying a card costs ~0.3ms and rebuilding
+/// one costs ~10ms, so this is the difference between a frame that fits a
+/// 120Hz deadline and one that misses two. Five at once -- which is what
+/// reopening the overview used to do -- froze the window for 100-170ms.
+///
+/// One, because two already overruns. Cards over the budget replay their last
+/// picture and ask for another frame, so no card goes blank and the queue
+/// drains at one per frame.
+const MAX_PREVIEW_QUAD_REBUILDS_PER_FRAME: usize = 1;
+
+/// Everything a card's recorded quads depend on.
+///
+/// Equal keys mean the recorded heap still draws the right picture and can be
+/// replayed instead of rebuilt. Note what is *not* here: where the card is.
+/// Position is recovered at replay time, so scrolling the overview costs a
+/// remap rather than a rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreviewQuadKey {
+    /// Address of the snapshot these quads were built from.
+    ///
+    /// `resolve_snapshot` hands back the very same `Arc` while a terminal's
+    /// content is unchanged and a freshly allocated one when it is not, so
+    /// pointer equality answers "is this the same picture?" exactly, for free.
+    /// [`CachedPreviewQuads`] keeps the `Arc` alive so a dead snapshot's
+    /// address cannot be reissued to a different one.
+    snapshot: usize,
+    /// Bumped when a font finishes loading and every shape cache is thrown
+    /// away. That makes the recorded quads *out of date* -- a character the
+    /// shaper had no glyph for may now have one -- but not wrong: the atlas is
+    /// untouched, so every texel they address still holds the glyph they were
+    /// built with. It belongs on this side of the split for that reason.
+    ///
+    /// It matters that it is here and not in the geometry. A font fallback
+    /// landed roughly once a second against busy terminals, and while this was
+    /// geometry every one of them forced all five cards to rebuild inside the
+    /// frame that noticed -- a ~100ms freeze, once a second, for a difference
+    /// nobody could see. The atlas repack that *does* invalidate these quads
+    /// clears the cache outright, in the same breath as the rest of the
+    /// captures (`discard_content_view_captures_after_atlas_recreation`), so
+    /// nothing here has to stand in for it.
+    shape_generation: usize,
+    geometry: PreviewGeometryKey,
+}
+
+/// Everything a card's quads depend on *except* what the terminal was showing.
+///
+/// The split is the difference between two kinds of staleness. Quads whose
+/// geometry still matches but whose snapshot has moved on draw the right
+/// pixels in the right places, just a refresh behind -- safe to put on screen
+/// for a frame while the rebuild waits its turn. Quads whose geometry has moved
+/// on are not stale, they are *wrong*: the quads carry positions relative to
+/// the centre of the window and a font scale chosen from the card's size, so
+/// showing them under a different window or a different card draws the picture
+/// somewhere it does not belong. Replaying across that is what made the
+/// overview flicker while opening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreviewGeometryKey {
+    area_width: u32,
+    area_height: u32,
+    hold_scale: bool,
+    pixel_width: usize,
+    pixel_height: usize,
+    dpi: usize,
+}
+
+/// One card's thumbnail, kept between frames.
+pub(crate) struct CachedPreviewQuads {
+    key: PreviewQuadKey,
+    /// Never read. Held so that the address recorded in `key.snapshot` belongs
+    /// to a live allocation for as long as this entry does, which is what makes
+    /// comparing addresses a sound test for "same snapshot".
+    #[allow(dead_code)]
+    snapshot: Arc<crate::termwindow::content_view::TerminalPreviewSnapshot>,
+    /// The card rectangle these quads were laid out in.
+    area: RectF,
+    heap: HeapQuadAllocator,
+}
+
+fn preview_quad_key(
+    preview: &TerminalPreviewRequest,
+    dimensions: &Dimensions,
+    shape_generation: usize,
+) -> PreviewQuadKey {
+    PreviewQuadKey {
+        snapshot: Arc::as_ptr(&preview.snapshot) as usize,
+        shape_generation,
+        geometry: PreviewGeometryKey {
+            // The font scale is chosen from the card's size, so a resized card
+            // is a different picture even from the same snapshot. Position is
+            // deliberately absent: a moved card is replayed, not rebuilt.
+            area_width: preview.area.size.width.to_bits(),
+            area_height: preview.area.size.height.to_bits(),
+            hold_scale: preview.hold_scale,
+            // Quad positions are relative to the centre of the window.
+            pixel_width: dimensions.pixel_width,
+            pixel_height: dimensions.pixel_height,
+            dpi: dimensions.dpi,
+        },
+    }
+}
+
+fn quad_clip_rect(rect: RectF, dimensions: &Dimensions) -> QuadClipRect {
+    QuadClipRect::from_top_left_pixels(
+        rect.min_x(),
+        rect.min_y(),
+        rect.max_x(),
+        rect.max_y(),
+        dimensions,
+    )
+}
 
 fn quantized_terminal_preview_extent(extent: f32, dpi: usize) -> f32 {
     let bucket = crate::ui::scale_ui_f32(TERMINAL_PREVIEW_EXTENT_BUCKET_DESIGN_PX, dpi).max(1.0);
@@ -438,13 +554,42 @@ impl crate::TermWindow {
             }
         }
 
+        // How many times one frame may be thrown away and started again because
+        // a font finished loading underneath it.
+        //
+        // `ClearShapeCache` means "a font you asked for has only just arrived;
+        // the shapes you cached are stale". The handler answers by clearing
+        // every shape cache and repainting the whole window -- and each repaint
+        // can pull in the next not-yet-loaded font and ask for the same thing
+        // again. Opening the live overview introduces a font size per card at
+        // once, so the frame that opens it was chaining eight and nine of these
+        // rounds, re-shaping five thumbnails from scratch in every one: 680ms
+        // of frozen window, measured.
+        //
+        // One retry is enough to present a correct frame in the common case.
+        // Past that, stop chasing the fonts inside this frame and ask for
+        // another one: the caches have been cleared either way, so the next
+        // frame starts warm and the cost lands as one more frame rather than as
+        // half a second of nothing.
+        const MAX_SHAPE_CACHE_RETRIES: usize = 1;
+        let mut shape_retries = 0usize;
+
         'pass: for pass in 0.. {
             match self.paint_pass() {
                 Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
                     Ok(allocated) => {
                         if !allocated {
+                            // Recorded even for the ordinary single-pass frame,
+                            // so the counter can be read as a distribution
+                            // rather than as "something went wrong once".
+                            crate::perf::log_counter("paint_passes", pass + 1);
                             break 'pass;
                         }
+                        // Each retry repaints the *whole* window, thumbnails
+                        // included. Opening the overview was costing five of
+                        // them inside one frame -- 580ms -- so which resource
+                        // ran out, and how often, decides where the fix goes.
+                        crate::perf::log_counter("paint_retry_quads", pass);
                         self.invalidate_fancy_tab_bar();
                         self.invalidate_modal();
                     }
@@ -459,6 +604,10 @@ impl crate::TermWindow {
                         current_size,
                     }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
                     {
+                        crate::perf::log_counter(
+                            "paint_retry_atlas",
+                            format!("pass={pass} have={current_size} want={size}"),
+                        );
                         let result = if pass == 0 {
                             // Grow while there is headroom, rather than
                             // clearing in place.
@@ -523,6 +672,11 @@ impl crate::TermWindow {
                             );
                         }
                     } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
+                        // The shaper asked for the frame to be redone because a
+                        // font it needed had only just finished loading. Each
+                        // one of these throws away every shape cache and starts
+                        // the whole window again, thumbnails included.
+                        crate::perf::log_counter("paint_retry_shape", pass);
                         self.invalidate_fancy_tab_bar();
                         self.invalidate_modal();
                         self.shape_generation += 1;
@@ -530,6 +684,14 @@ impl crate::TermWindow {
                         self.ui_shape_caches.borrow_mut().clear_all();
                         self.publish_ui_shape_cache_diagnostics();
                         self.line_to_ele_shape_cache.borrow_mut().clear();
+                        shape_retries += 1;
+                        if shape_retries > MAX_SHAPE_CACHE_RETRIES {
+                            crate::perf::log_counter("paint_shape_retry_capped", shape_retries);
+                            if let Some(window) = self.window.as_ref() {
+                                window.invalidate();
+                            }
+                            break 'pass;
+                        }
                     } else {
                         log::error!("paint_pass failed: {:#}", err);
                         break 'pass;
@@ -553,12 +715,56 @@ impl crate::TermWindow {
         // If self.has_animation is some, then the last render detected
         // image attachments with multiple frames, so we also need to
         // invalidate the viewport when the next frame is due
-        if self.focused.is_some() {
+        //
+        // The focus gate exists so an unfocused terminal does not burn frames
+        // animating gifs nobody is looking at. But a content-view transition
+        // or an open overview owes frames regardless of focus: toggling the
+        // overview can switch macOS Spaces, and during that switch the window
+        // is briefly unfocused -- dropping the schedule right there strands
+        // the animation, which then only advances when some terminal happens
+        // to emit output. Measured: 150-210ms between transition frames, with
+        // the main thread idle the whole time.
+        let owes_frames_regardless_of_focus =
+            self.content_view_fade.is_some() || self.active_content_view_index().is_some();
+        if self.focused.is_some() || owes_frames_regardless_of_focus {
             if let Some(next_due) = *self.has_animation.borrow() {
+                // "The next frame the display will give me" is the common
+                // request: every frame of a scroll, of a card travelling, of a
+                // transition, and of a preview that is owed a capture asks for
+                // it.
+                //
+                // Answering it through the timer answers it the slowest way
+                // available -- spawn a task, await a `Timer` that is already
+                // due, notify the window across a channel, spend a turn of the
+                // run loop applying that notification, invalidate, and only
+                // then wait for the display refresh that was the entire point.
+                // Those hops cost more than the frame does: measured with the
+                // overview open, 14.7ms of painting delivered a frame every
+                // 33.6ms, the difference spent idle in the run loop waiting for
+                // the app's own message to come back.
+                //
+                // So ask the window directly and let the backend pace it; it
+                // already throttles to min(max_fps, the display's rate).
+                if next_due <= Instant::now() {
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                    return;
+                }
                 let prior = self.scheduled_animation.borrow_mut().take();
                 match prior {
-                    Some(prior) if prior <= next_due => {
-                        // Already due before that time
+                    // A timer for an earlier-or-equal deadline is already in
+                    // flight -- but only trust it while the deadline is
+                    // current. Display sleep can swallow the spawned task
+                    // whole, and a swallowed timer whose deadline is trusted
+                    // forever strands the animation. Put the deadline back so
+                    // the next frame doesn't spawn a duplicate timer for it.
+                    Some(prior)
+                        if prior <= next_due
+                            && Instant::now().saturating_duration_since(prior)
+                                < Duration::from_millis(250) =>
+                    {
+                        self.scheduled_animation.borrow_mut().replace(prior);
                     }
                     _ => {
                         self.scheduled_animation.borrow_mut().replace(next_due);
@@ -1006,11 +1212,15 @@ impl crate::TermWindow {
             }
         };
 
+        let defer_preview_captures = self.content_view_fade.as_ref().is_some_and(|fade| {
+            fade.flight.is_none()
+        });
         let (next_frame, previews) = {
             let gl_state = self.render_state.as_ref().unwrap();
             let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
             if let Some(idx) = active_content_view_idx {
                 let view = self.content_views[idx].view.as_mut();
+                view.set_defer_preview_captures(defer_preview_captures);
                 view.set_host_preview_aspect(host_preview_aspect);
                 view.paint_surface_background(&ctx, layers, surface, palette)?;
                 view.paint(
@@ -1056,45 +1266,175 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator<'_>,
         previews: &[TerminalPreviewRequest],
     ) -> anyhow::Result<()> {
-        // One allocator for every card, borrowed out of the window and put
-        // back, so its pool of quad boxes outlives both the loop and the frame.
-        // Each card's thumbnail is thousands of quads and there are as many
-        // cards as fit the viewport; building and dropping that from scratch
-        // per card per frame is millions of allocations a second, spent on
-        // memory that was about to be asked for again.
-        let mut heap = std::mem::take(&mut *self.preview_quad_heap.borrow_mut());
-        let result = (|| {
-            for preview in previews {
-                self.paint_terminal_preview(layers, preview, &mut heap)?;
+        // Drop the cards that are no longer asked for -- but only while there
+        // are cards to compare against. Closing the overview asks for none, and
+        // pruning on that frame threw away every recorded thumbnail; reopening
+        // then rebuilt all of them in the single frame that revealed them,
+        // which is the 100-170ms freeze the gesture was landing in. Nothing
+        // about a closed overview says the cards are gone, and a stale entry
+        // costs one key comparison to reject.
+        if !previews.is_empty() {
+            let live: HashSet<TabId> = previews.iter().map(|preview| preview.tab_id).collect();
+            self.preview_quad_cache
+                .borrow_mut()
+                .retain(|tab_id, _| live.contains(tab_id));
+        }
+        let started = crate::perf::now();
+        crate::perf::reset_accums();
+        let mut rebuilt = 0usize;
+        // How many cards may rebuild their quads in this frame.
+        //
+        // A rebuild is ~10ms and a replay is ~0.3ms, so a frame that rebuilds
+        // two cards has already missed a 120Hz deadline and a frame that
+        // rebuilds five has frozen the window for a fifth of a second. Cards
+        // over the budget replay what they last showed and ask for another
+        // frame, so the picture is at worst one frame out of date and the cost
+        // is spread instead of spiked.
+        let mut budget = MAX_PREVIEW_QUAD_REBUILDS_PER_FRAME;
+        for preview in previews {
+            if self.paint_terminal_preview(layers, preview, &mut budget)? {
+                rebuilt += 1;
             }
-            Ok(())
-        })();
-        heap.recycle();
-        *self.preview_quad_heap.borrow_mut() = heap;
-        result
+        }
+        // What a frame spent on thumbnails, and how much of that was a card
+        // whose quads could not be replayed. Without the split, a slow frame
+        // says nothing about whether the cache missed or whether the cost is
+        // somewhere else entirely.
+        crate::perf::log_duration("preview_paint", started);
+        crate::perf::log_counter("preview_cards", previews.len());
+        crate::perf::log_counter("preview_rebuilds", rebuilt);
+        if rebuilt > 0 {
+            crate::perf::log_accums("pv_");
+        } else {
+            crate::perf::reset_accums();
+        }
+        // A shaping cache sitting at its capacity is a cache that is evicting
+        // entries it is about to be asked for again. Reading the occupancy is
+        // the difference between knowing that and inferring it from timings.
+        if crate::perf::enabled() {
+            crate::perf::log_counter("shape_cache_len", self.shape_cache.borrow().len());
+            crate::perf::log_counter(
+                "line_shape_cache_len",
+                self.line_to_ele_shape_cache.borrow().len(),
+            );
+            crate::perf::log_counter("line_quad_cache_len", self.line_quad_cache.borrow().len());
+        }
+        Ok(())
     }
 
+    /// Draw one card's thumbnail, building its quads only when they cannot be
+    /// replayed.
+    ///
+    /// A thumbnail is thousands of quads and rebuilding one means re-shaping
+    /// every line of the terminal it depicts. Doing that per card per frame
+    /// was the whole cost of the overview: measured over 4621 frames it put
+    /// the median frame at 14.8ms against a 8.3ms budget, and the snapshots
+    /// feeding it were mostly *unchanged* -- the work was being redone to
+    /// arrive at the same picture. Keeping the quads is what turns a repaint
+    /// into a copy.
+    ///
+    /// Returns whether the quads had to be rebuilt.
     fn paint_terminal_preview(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         preview: &TerminalPreviewRequest,
-        heap: &mut HeapQuadAllocator,
-    ) -> anyhow::Result<()> {
+        budget: &mut usize,
+    ) -> anyhow::Result<bool> {
+        let key = preview_quad_key(preview, &self.dimensions, self.shape_generation);
+        let clip = quad_clip_rect(preview.clip, &self.dimensions);
+
+        // A hit replays. A miss replays too -- but only when the miss is the
+        // snapshot alone and the budget is spent, because then the recorded
+        // quads are merely a refresh out of date, which at thumbnail size is
+        // not a difference anyone can see. A geometry miss is never replayed:
+        // those quads are wrong, not old.
+        let mut deferred = false;
+        let recorded_area = self
+            .preview_quad_cache
+            .borrow()
+            .get(&preview.tab_id)
+            .filter(|cached| {
+                if cached.key == key {
+                    return true;
+                }
+                if cached.key.geometry == key.geometry && *budget == 0 {
+                    deferred = true;
+                    return true;
+                }
+                false
+            })
+            .map(|cached| cached.area);
+        if deferred {
+            // Come straight back rather than naming a time: this card owes a
+            // rebuild and should get it as soon as a frame has room.
+            self.update_next_frame_time(Some(Instant::now()));
+        }
+        if let Some(recorded_area) = recorded_area {
+            let cache = self.preview_quad_cache.borrow();
+            let cached = cache
+                .get(&preview.tab_id)
+                .expect("entry was present a statement ago and nothing removes it");
+            // Scrolling moves a card without changing what it shows. The quads
+            // carry the position they were recorded at, so a card that has
+            // moved is replayed through the same source->target mapping the
+            // flight animation uses. The key carries the card's *size*, so a
+            // matching key guarantees the two rects are the same shape and the
+            // mapping degenerates to a translation -- none of the softening
+            // that a genuinely rescaled replay costs. A card that has not moved
+            // takes the plain path, which is bit-for-bit what this drew before
+            // the cache existed.
+            if recorded_area == preview.area {
+                cached.heap.apply_to_clipped(layers, clip, 1.0)?;
+            } else {
+                let source = quad_clip_rect(recorded_area, &self.dimensions);
+                let target = quad_clip_rect(preview.area, &self.dimensions);
+                cached
+                    .heap
+                    .apply_to_scaled(layers, source, target, clip, 1.0)?;
+            }
+            return Ok(false);
+        }
+
+        *budget = budget.saturating_sub(1);
+        // Reuse the stale entry's boxes rather than freeing thousands of them
+        // and asking for the same number back on the next line of this
+        // function. `recycle` empties the layers into the spare pool.
+        let mut heap = self
+            .preview_quad_cache
+            .borrow_mut()
+            .remove(&preview.tab_id)
+            .map(|cached| cached.heap)
+            .unwrap_or_default();
         heap.recycle();
         {
-            let mut clipped_layers = TripleLayerQuadAllocator::Heap(heap);
-            self.paint_terminal_preview_unclipped(&mut clipped_layers, preview)?;
+            let card_started = crate::perf::now();
+            let mut heap_layers = TripleLayerQuadAllocator::Heap(&mut heap);
+            self.paint_terminal_preview_unclipped(&mut heap_layers, preview)?;
+            crate::perf::log_duration("preview_rebuild_card", card_started);
         }
-        let clip = QuadClipRect::from_top_left_pixels(
-            preview.clip.min_x(),
-            preview.clip.min_y(),
-            preview.clip.max_x(),
-            preview.clip.max_y(),
-            &self.dimensions,
+        let result = heap.apply_to_clipped(layers, clip, 1.0).map(|()| true);
+        self.preview_quad_cache.borrow_mut().insert(
+            preview.tab_id,
+            CachedPreviewQuads {
+                key,
+                // Held so the address in `key` cannot be handed to a different
+                // snapshot while this entry is alive.
+                snapshot: Arc::clone(&preview.snapshot),
+                area: preview.area,
+                heap,
+            },
         );
-        heap.apply_to_clipped(layers, clip, 1.0)
+        result
     }
 
+    /// Build one card's thumbnail into `layers`, whole.
+    ///
+    /// Everything here is laid out against `preview.area` -- the card's full
+    /// rectangle -- and nothing against `preview.clip`. That is what lets the
+    /// result be kept: a heap built against the visible slice would hold only
+    /// the rows that happened to be on screen when it was recorded, and the
+    /// first scroll would reveal the gap. Cropping is the replaying caller's
+    /// job, and it already does it.
     fn paint_terminal_preview_unclipped(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -1119,7 +1459,7 @@ impl crate::TermWindow {
             .or_else(|| snapshot.panes.first())
             .map(|pane| pane.palette.resolve_bg(ColorAttribute::Default).to_linear())
             .expect("checked that the tab has panes");
-        self.filled_rectangle(layers, 0, preview.clip, preview_background)?;
+        self.filled_rectangle(layers, 0, preview.area, preview_background)?;
 
         // Quantization bounds the number of cached FontConfigurations even
         // when cards continuously resize. Flooring guarantees the terminal
@@ -1261,13 +1601,13 @@ impl crate::TermWindow {
             let pane_width = pane.width as f32 * cell_width;
             let pane_height = pane.height as f32 * cell_height;
             let pane_rect = euclid::rect(pane_x, pane_y, pane_width, pane_height);
-            let Some(pane_clip) = pane_rect.intersection(&preview.clip) else {
+            let Some(pane_bounds) = pane_rect.intersection(&preview.area) else {
                 continue;
             };
             self.filled_rectangle(
                 layers,
                 0,
-                pane_clip,
+                pane_bounds,
                 palette.resolve_bg(ColorAttribute::Default).to_linear(),
             )?;
 
@@ -1330,7 +1670,6 @@ impl crate::TermWindow {
             render_dims.viewport_rows = rows;
             render_dims.pixel_width = rendered_width.round() as usize;
             render_dims.pixel_height = rendered_height.round() as usize;
-            let rendered_y = grid_top;
             let foreground = palette.foreground.to_linear();
             let default_bg = palette.background.to_linear();
             // LineToElementShape caches resolved colors as well as glyph
@@ -1355,11 +1694,23 @@ impl crate::TermWindow {
             // scale can fill both axes exactly. Applying this tiny correction
             // during allocation keeps exact pane geometry without a second
             // CPU walk over every htop glyph each frame.
+            //
+            // The source space starts at the origin rather than at the card's
+            // corner, so everything drawn through this transform is expressed
+            // relative to the pane itself. That is what makes the line quads
+            // below cacheable: `LineQuadCacheKey` carries `top_pixel_y` and
+            // `left_pixel_x`, and while those were the card's position on
+            // screen, scrolling the overview minted a fresh key for every line
+            // at every scroll offset -- thousands of entries that would never
+            // be asked for again, evicting the ones that would. Measured with
+            // four cards open, the cache sat pegged at its 4096 capacity and a
+            // card that had to rebuild cost 7.9ms against 1.7ms for one that
+            // did not.
             let source_rect = QuadClipRect::from_top_left_pixels(
-                pane_x,
-                rendered_y,
-                pane_x + rendered_width,
-                rendered_y + rendered_height,
+                0.0,
+                0.0,
+                rendered_width,
+                rendered_height,
                 &self.dimensions,
             );
             let target_rect = QuadClipRect::from_top_left_pixels(
@@ -1378,21 +1729,62 @@ impl crate::TermWindow {
             let transformed =
                 layers.set_heap_position_transform(Some((source_rect, target_rect)));
             debug_assert!(transformed);
-            let source_visible_top = rendered_y
-                + (pane_clip.min_y() - grid_top) * rendered_height / grid_height.max(1.0);
-            let source_visible_bottom = rendered_y
-                + (pane_clip.max_y() - grid_top) * rendered_height / grid_height.max(1.0);
+            // In the same pane-relative space as `source_rect`.
+            let source_visible_top =
+                (pane_bounds.min_y() - grid_top) * rendered_height / grid_height.max(1.0);
+            let source_visible_bottom =
+                (pane_bounds.max_y() - grid_top) * rendered_height / grid_height.max(1.0);
 
             for (line_idx, line) in pane.lines.iter().take(rows).enumerate() {
-                let y = rendered_y + line_idx as f32 * pane_cell_height;
+                let y = line_idx as f32 * pane_cell_height;
                 if y + pane_cell_height <= source_visible_top || y >= source_visible_bottom {
                     continue;
                 }
+                let hash_started = crate::perf::now();
                 let shape_hash = self.shape_hash_for_line(line);
+                crate::perf::accum("line_hash", hash_started);
+
+                // Deliberately *not* going through `line_quad_cache` here, the
+                // way the real pane renderer does.
+                //
+                // It was tried, on the theory that a card whose snapshot moved
+                // should only pay for the rows that actually changed. Measured,
+                // it made a card rebuild 4.5x more expensive: 2.3ms per card
+                // without it, 9.96ms with. Two reasons, both structural.
+                //
+                // The cache cannot hold a thumbnail's working set. Its key
+                // carries the row a line was drawn at, so a terminal that
+                // scrolls mints a fresh entry for every row it shifts text
+                // through -- five cards of scrolling output filled all 4096
+                // slots and stayed there, evicting entries as fast as they were
+                // put in. Growing it is not the answer either: an entry is the
+                // line's quads, so the capacity that would hold the working set
+                // is measured in hundreds of megabytes.
+                //
+                // And a miss is not free. It allocates a heap, renders into it,
+                // copies every quad a second time into `layers`, then evicts
+                // someone else's entry to store it. At the hit rate a full
+                // cache gives, that is pure overhead on top of the work it was
+                // supposed to avoid -- and the work it was supposed to avoid is
+                // already cheap, because `shape_cache` and
+                // `line_to_ele_shape_cache` catch the re-shaping. Those two sit
+                // at a few hundred entries of their thousands while this one is
+                // pegged, which is the whole argument in two numbers.
+                //
+                // What does pay is the layer above: `preview_quad_cache` keeps
+                // the finished card, so an unchanged terminal costs a replay
+                // (1.41ms for four cards) and never reaches this loop at all.
+                // Whatever else changes here, keep this path a straight render.
+                //
+                // Whatever the terminal itself was waiting to redraw for, put
+                // back afterwards: a thumbnail must not claim the window's
+                // animation deadline, and must not silently inherit one.
+                let next_due = self.has_animation.borrow_mut().take();
+                let line_started = crate::perf::now();
                 self.render_screen_line(
                     RenderScreenLineParams {
                         top_pixel_y: y,
-                        left_pixel_x: pane_x,
+                        left_pixel_x: 0.0,
                         pixel_width: rendered_width,
                         stable_line_idx: Some(pane.resolved_top + line_idx as isize),
                         line,
@@ -1428,9 +1820,15 @@ impl crate::TermWindow {
                         }),
                         password_input: false,
                         allow_images: false,
+                        simple_shaping: true,
                     },
                     layers,
                 )?;
+                crate::perf::accum("line_render", line_started);
+                // Restore by assignment, not min-merge: the line render above
+                // may have claimed a blink/expiry deadline of its own, and a
+                // merge would let the thumbnail keep it.
+                *self.has_animation.borrow_mut() = next_due;
             }
 
             // Draw a non-blinking cursor for the active split. The regular
@@ -1444,9 +1842,11 @@ impl crate::TermWindow {
                     && (cursor_row as usize) < rows
                     && cursor.x < cols
                 {
+                    // Still inside the position transform, so pane-relative
+                    // like everything else drawn through it.
                     let cursor_rect: ::window::RectF = euclid::rect(
-                        pane_x + cursor.x as f32 * pane_cell_width,
-                        rendered_y + cursor_row as f32 * pane_cell_height,
+                        cursor.x as f32 * pane_cell_width,
+                        cursor_row as f32 * pane_cell_height,
                         pane_cell_width,
                         pane_cell_height,
                     );
@@ -1506,7 +1906,7 @@ impl crate::TermWindow {
                     split_stroke,
                 )
             };
-            if let Some(visible) = rect.intersection(&preview.clip) {
+            if let Some(visible) = rect.intersection(&preview.area) {
                 self.filled_rectangle(layers, 2, visible, split_color)?;
             }
         }
@@ -2503,6 +2903,147 @@ impl crate::TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_preview(area: RectF) -> TerminalPreviewRequest {
+        TerminalPreviewRequest {
+            tab_id: 1,
+            snapshot: Arc::new(crate::termwindow::content_view::TerminalPreviewSnapshot {
+                tab_size: TerminalSize::default(),
+                panes: vec![],
+                splits: vec![],
+            }),
+            area,
+            clip: area,
+            hold_scale: false,
+        }
+    }
+
+    fn test_dimensions() -> Dimensions {
+        Dimensions {
+            pixel_width: 1600,
+            pixel_height: 1000,
+            dpi: 144,
+        }
+    }
+
+    /// The whole point of the cache: an unchanged snapshot in an unchanged card
+    /// replays instead of being rebuilt.
+    #[test]
+    fn the_same_snapshot_in_the_same_card_keeps_its_quads() {
+        let preview = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
+        assert_eq!(
+            preview_quad_key(&preview, &test_dimensions(), 3),
+            preview_quad_key(&preview, &test_dimensions(), 3)
+        );
+    }
+
+    /// A card that has only scrolled shows the same picture somewhere else, so
+    /// it stays a cache hit and is replayed through a translation.
+    #[test]
+    fn a_card_that_only_moved_keeps_its_quads() {
+        let mut moved = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
+        let key = preview_quad_key(&moved, &test_dimensions(), 3);
+        moved.area = moved.area.translate(euclid::vec2(0.0, -140.0));
+        assert_eq!(preview_quad_key(&moved, &test_dimensions(), 3), key);
+    }
+
+    /// Resizing a card rebuckets the font scale, so the recorded quads are the
+    /// wrong picture even though the terminal has not changed.
+    #[test]
+    fn a_resized_card_rebuilds() {
+        let small = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
+        let mut large = small.clone();
+        large.area.size.width = 480.0;
+        assert_ne!(
+            preview_quad_key(&large, &test_dimensions(), 3),
+            preview_quad_key(&small, &test_dimensions(), 3)
+        );
+    }
+
+    /// A font finishing its load means the card should be re-shaped, so the
+    /// key stops matching and the card rebuilds.
+    #[test]
+    fn a_newly_loaded_font_rebuilds() {
+        let preview = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
+        assert_ne!(
+            preview_quad_key(&preview, &test_dimensions(), 4),
+            preview_quad_key(&preview, &test_dimensions(), 3)
+        );
+    }
+
+    /// The distinction the rebuild budget rests on: which misses may be shown
+    /// one frame late, and which may not be shown at all.
+    ///
+    /// New content and a newly loaded font both leave quads that draw valid
+    /// pixels in the right places -- only what they depict is behind. A card
+    /// that has changed size or moved to another window does not: its quads
+    /// carry positions relative to the window's centre and glyphs sized for the
+    /// old card, so replaying them puts the picture in the wrong place. That is
+    /// the flicker.
+    #[test]
+    fn only_a_stale_picture_may_be_shown_late() {
+        let first = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
+        let mut recaptured = first.clone();
+        recaptured.snapshot = Arc::new((*first.snapshot).clone());
+
+        let old = preview_quad_key(&first, &test_dimensions(), 3);
+
+        let new_content = preview_quad_key(&recaptured, &test_dimensions(), 3);
+        assert_ne!(new_content, old, "a recapture must eventually be rebuilt");
+        assert_eq!(
+            new_content.geometry, old.geometry,
+            "but the recorded quads still draw the right pixels meanwhile"
+        );
+
+        let new_font = preview_quad_key(&first, &test_dimensions(), 4);
+        assert_ne!(new_font, old, "a loaded font must eventually be rebuilt");
+        assert_eq!(
+            new_font.geometry, old.geometry,
+            "shaping does not move the atlas, so the quads stay showable"
+        );
+
+        let mut resized = first.clone();
+        resized.area.size.width = 480.0;
+        assert_ne!(
+            preview_quad_key(&resized, &test_dimensions(), 3).geometry,
+            old.geometry,
+            "a resized card must not be replayed, at any budget"
+        );
+
+        let mut wider = test_dimensions();
+        wider.pixel_width += 200;
+        assert_ne!(
+            preview_quad_key(&first, &wider, 3).geometry,
+            old.geometry,
+            "a resized window must not be replayed, at any budget"
+        );
+    }
+
+    /// Quad positions are relative to the centre of the window, so every
+    /// recorded position moves when the window does.
+    #[test]
+    fn a_resized_window_rebuilds() {
+        let preview = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
+        let mut wider = test_dimensions();
+        wider.pixel_width += 200;
+        assert_ne!(
+            preview_quad_key(&preview, &wider, 3),
+            preview_quad_key(&preview, &test_dimensions(), 3)
+        );
+    }
+
+    /// Two cards holding equal-looking snapshots are still two pictures: the
+    /// key is the snapshot's identity, not its value.
+    #[test]
+    fn a_fresh_capture_rebuilds_even_when_it_looks_the_same() {
+        let first = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
+        let mut recaptured = first.clone();
+        recaptured.snapshot = Arc::new((*first.snapshot).clone());
+        assert_ne!(
+            preview_quad_key(&recaptured, &test_dimensions(), 3),
+            preview_quad_key(&first, &test_dimensions(), 3)
+        );
+    }
 
     /// A card exactly the size of the grid it holds is left alone. This is the
     /// case the fill exists to *not* disturb.

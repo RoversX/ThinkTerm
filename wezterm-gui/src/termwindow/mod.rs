@@ -1493,9 +1493,12 @@ pub struct TermWindow {
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
     pane_font_cache: RefCell<HashMap<PaneFontKey, PaneFontEntry>>,
-    /// Scratch space for recording terminal thumbnails, kept across frames so
-    /// its pool of quad boxes is not rebuilt for every card.
-    preview_quad_heap: RefCell<crate::quad::HeapQuadAllocator>,
+    /// One recorded thumbnail per card, kept across frames so an unchanged
+    /// terminal is replayed rather than re-shaped and re-quadded. Entries are
+    /// dropped for cards that stop asking for a preview, and invalidated
+    /// wholesale when the glyph atlas is repacked -- the quads hold atlas
+    /// coordinates.
+    preview_quad_cache: RefCell<HashMap<TabId, crate::termwindow::render::paint::CachedPreviewQuads>>,
     /// Font scale last chosen for a thumbnail of a grid this size, so a drag
     /// can hold it steady instead of rebucketing every few pixels.
     preview_scale_hold: RefCell<HashMap<(usize, usize), f64>>,
@@ -2085,6 +2088,13 @@ impl TermWindow {
     fn discard_content_view_captures_after_atlas_recreation(&mut self) {
         // Repopulated by the paint pass the retry loop is about to run.
         self.content_view_last_frame = None;
+        // Same reason, one level down: a card's recorded thumbnail is quads
+        // carrying atlas coordinates, and a repack moves every glyph. Keeping
+        // them would draw the overview in whatever now occupies those texels.
+        // `PreviewQuadKey` also carries `shape_generation`, so this is belt and
+        // braces -- but the two live in different files and the invariant
+        // belongs with the rest of the captures.
+        self.preview_quad_cache.borrow_mut().clear();
         let Some(fade) = self.content_view_fade.as_mut() else {
             return;
         };
@@ -2428,7 +2438,7 @@ impl TermWindow {
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             pane_font_cache: RefCell::new(HashMap::new()),
-            preview_quad_heap: RefCell::new(Default::default()),
+            preview_quad_cache: RefCell::new(HashMap::new()),
             preview_scale_hold: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
@@ -7345,14 +7355,57 @@ impl TermWindow {
     /// converged. Background tabs retain the server's canonical split tree
     /// until they are activated or explicitly claimed.
     pub(crate) fn reapply_collapsed_panes_for_tab(&mut self, tab_id: TabId) {
-        if self.collapsed_pane_layouts.is_empty() {
-            return;
-        }
-
         let Some(tab) = Mux::get().get_tab(tab_id) else {
             return;
         };
         let min_cells = self.collapsed_pane_min_cells();
+
+        // Adopt orphans first. `collapsed_pane_layouts` keys on stack ids
+        // that are allocated per process and lives only in this window's
+        // memory, so a pane that *arrives* at collapsed width -- session
+        // restore, window adoption, workspace reconcile -- has no record
+        // here. Without one it is painted as an ordinary terminal squeezed
+        // to a few columns: the "strip of vertically wrapped prompt text on
+        // the right edge" bug. A pane this narrow is not something anyone
+        // can read or use, so claiming it as collapsed is strictly better
+        // than drawing it raw.
+        //
+        // The threshold is deliberately looser than `min_cells` (2-3): the
+        // orphan was squeezed by proportional resizes, not by the collapse
+        // code, so it drifts -- observed at 6 cells. Ten columns is still
+        // far below anything a terminal is usable at, and legitimate narrow
+        // threads (~20 cells) stay untouched.
+        let threshold = (min_cells * 3).max(10);
+        let orphans: Vec<usize> = tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .filter(|pos| {
+                // No direction test: side-by-side panes report their split as
+                // Horizontal and collapse into a vertical strip. Whether a
+                // given pane can collapse at all is `collapse_pane_by_index`'s
+                // call -- it returns None when it cannot.
+                !pos.is_active
+                    && pos.width <= threshold
+                    && !self
+                        .collapsed_pane_layouts
+                        .contains_key(&pos.pane_stack_id)
+            })
+            .map(|pos| pos.index)
+            .collect();
+        for index in orphans {
+            if let Some(layout) = tab.collapse_pane_by_index(index, min_cells) {
+                log::info!(
+                    "adopted orphan collapsed pane stack {:?} (index {index})",
+                    layout.pane_stack_id
+                );
+                self.collapsed_pane_layouts
+                    .insert(layout.pane_stack_id, layout);
+            }
+        }
+
+        if self.collapsed_pane_layouts.is_empty() {
+            return;
+        }
         let layouts: Vec<_> = self.collapsed_pane_layouts.values().copied().collect();
         for layout in layouts {
             let contains_stack = tab
@@ -7518,6 +7571,7 @@ impl TermWindow {
             return Ok((Rc::clone(&entry.fonts), entry.render_metrics));
         }
 
+        let build_started = crate::perf::now();
         let fonts = Rc::new(FontConfiguration::new(
             Some(self.config.clone()),
             self.dimensions.dpi,
@@ -7532,6 +7586,7 @@ impl TermWindow {
                 render_metrics,
             },
         );
+        crate::perf::accum("font_config_build", build_started);
 
         Ok((fonts, render_metrics))
     }

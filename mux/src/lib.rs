@@ -1094,19 +1094,33 @@ impl Mux {
     }
 
     pub fn current_identity_owns_frontend_lease(&self, tab_id: TabId) -> bool {
+        // An UNCLAIMED lease belongs to whoever is asking. The lease exists to
+        // stop two frontends fighting over one tab's geometry; when nobody
+        // holds it there is nothing to protect, and answering "not yours"
+        // paralyzes the only frontend present: the GUI's local viewport
+        // publish can fail its compose validation ("frontend frames do not
+        // compose"), the lease then never gets claimed, and every pane-size
+        // sync behind `owns_frontend_viewport` is silently skipped -- measured
+        // as split-divider drags leaving TUIs at their old PTY size until the
+        // drag ends. The identity-less arm below already treated unclaimed as
+        // permitted; this makes the identified arm consistent.
+        let unclaimed = {
+            let lease = self.frontend_lease.lock();
+            match lease.access_mode {
+                FrontendAccessMode::Handoff => lease.handoff_owner.is_none(),
+                FrontendAccessMode::TmuxLatest => lease
+                    .tabs
+                    .get(&tab_id)
+                    .and_then(|state| state.owner.as_ref())
+                    .is_none(),
+            }
+        };
+        if unclaimed {
+            return true;
+        }
         match self.active_identity() {
             Some(identity) => self.client_owns_frontend_lease(&identity, tab_id),
-            None => {
-                let lease = self.frontend_lease.lock();
-                match lease.access_mode {
-                    FrontendAccessMode::Handoff => lease.handoff_owner.is_none(),
-                    FrontendAccessMode::TmuxLatest => lease
-                        .tabs
-                        .get(&tab_id)
-                        .and_then(|state| state.owner.as_ref())
-                        .is_none(),
-                }
-            }
+            None => false,
         }
     }
 
