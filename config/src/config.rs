@@ -2320,29 +2320,38 @@ fn default_live_overview_preview_refresh_ms() -> u64 {
     300
 }
 
-/// These four sizes were set when a window showed one terminal. ThinkTerm's
-/// live overview draws six at once, each at its own font size -- and the caches
-/// are keyed by size, so six thumbnails of the same text are six sets of
-/// entries. At 1024 that thrashed: a profile of the overview over busy
-/// terminals put 87% of a thumbnail's cost in HarfBuzz, re-shaping text the
-/// cache had just evicted.
+/// Sizing note for the four render caches. They are LFU with an entry-count
+/// cap and no byte budget, per TermWindow, and never shrink below the cap
+/// once warm -- so a cap is best read as resident memory multiplied by the
+/// number of windows. Keep each near its working set, not comfortably above
+/// it: hit rate is set by the working set, and capacity beyond it holds only
+/// entries that will never be asked for again.
 ///
-/// An entry is a shaped cluster -- glyph indices and offsets, no pixels -- so
-/// the memory is small next to the atlas it saves work against.
+/// shape_cache: keyed by text+font, shared across every pane and thumbnail,
+/// and a miss costs a HarfBuzz run (a profile of the overview over busy
+/// terminals put 87% of a thumbnail's cost there at the old 1024 cap). The
+/// overview's per-cell shaping keeps entries single-grapheme and small, so
+/// the population is bounded by the distinct glyphs on screen; 8192 covers
+/// six busy thumbnails plus the main view with headroom.
 fn default_shape_cache_size() -> usize {
-    16384
+    8192
 }
 
+/// ~200 bytes per entry; sized to the visible-line working set.
 fn default_line_state_cache_size() -> usize {
-    4096
+    1024
 }
 
+/// The heavy one: an entry is a line's finished GPU quads, tens of KB, and
+/// the key pins pane id, exact pixel position and width -- scrolling one row
+/// or moving a divider orphans the lot. Only lines being painted right now
+/// can hit, so anything past the visible set is dead weight.
 fn default_line_quad_cache_size() -> usize {
-    4096
+    1024
 }
 
 fn default_line_to_ele_shape_cache_size() -> usize {
-    8192
+    4096
 }
 
 #[derive(Debug, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
