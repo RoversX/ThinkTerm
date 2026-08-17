@@ -15,6 +15,129 @@ use config::FreeTypeLoadTarget;
 const LINUX_WINDOW_CORNER_RADIUS: f32 = 16.0;
 const LINUX_WINDOW_BORDER_WIDTH: f32 = 1.0;
 
+/// Grow-only scratch GPU buffers shared by every card render and composite
+/// draw of a frame: one vertex upload, sliced per draw with `base_vertex`.
+pub(crate) struct CardScratch {
+    vb: wgpu::Buffer,
+    vb_capacity_verts: usize,
+    index: wgpu::Buffer,
+    index_capacity_quads: usize,
+}
+
+impl CardScratch {
+    fn ensure(
+        scratch: &mut Option<CardScratch>,
+        state: &WebGpuState,
+        verts_needed: usize,
+        quads_needed: usize,
+    ) {
+        use crate::quad::{VERTICES_PER_CELL, V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT};
+        const INDICES_PER_CELL: usize = 6;
+        let need_vb = scratch
+            .as_ref()
+            .map_or(true, |s| s.vb_capacity_verts < verts_needed);
+        let need_index = scratch
+            .as_ref()
+            .map_or(true, |s| s.index_capacity_quads < quads_needed);
+        if !need_vb && !need_index {
+            return;
+        }
+        let vb_capacity_verts = scratch
+            .as_ref()
+            .map(|s| s.vb_capacity_verts)
+            .unwrap_or(0)
+            .max(verts_needed)
+            .next_power_of_two()
+            .max(1024);
+        let index_capacity_quads = scratch
+            .as_ref()
+            .map(|s| s.index_capacity_quads)
+            .unwrap_or(0)
+            .max(quads_needed)
+            .next_power_of_two()
+            .max(256);
+        let vb = state.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Card Scratch Vertices"),
+            size: (vb_capacity_verts * std::mem::size_of::<crate::quad::Vertex>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut indices: Vec<u32> = Vec::with_capacity(index_capacity_quads * INDICES_PER_CELL);
+        for q in 0..index_capacity_quads {
+            let idx = (q * VERTICES_PER_CELL) as u32;
+            indices.push(idx + V_TOP_LEFT as u32);
+            indices.push(idx + V_TOP_RIGHT as u32);
+            indices.push(idx + V_BOT_LEFT as u32);
+            indices.push(idx + V_TOP_RIGHT as u32);
+            indices.push(idx + V_BOT_LEFT as u32);
+            indices.push(idx + V_BOT_RIGHT as u32);
+        }
+        let index = wgpu::util::DeviceExt::create_buffer_init(
+            &state.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Card Scratch Indices"),
+                usage: wgpu::BufferUsages::INDEX,
+                contents: bytemuck::cast_slice(&indices),
+            },
+        );
+        *scratch = Some(CardScratch {
+            vb,
+            vb_capacity_verts,
+            index,
+            index_capacity_quads,
+        });
+    }
+}
+
+/// The card texture work of one frame, handed from the paint pass to the
+/// draw: heaps to render into card textures, and the textured quads that
+/// stand in for the cards in the main pass.
+pub(crate) struct CardDrawData {
+    pub pending: Vec<crate::termwindow::render::paint::PendingCardRender>,
+    pub composites: Vec<crate::termwindow::render::paint::CardComposite>,
+}
+
+/// Build the 4 vertices of one composite quad: `dest` cropped to `clip`,
+/// UVs following the crop, positions converted to the window-centre-origin
+/// space the shared projection expects.
+fn composite_quad_verts(
+    composite: &crate::termwindow::render::paint::CardComposite,
+    dimensions: &Dimensions,
+) -> Option<[crate::quad::Vertex; 4]> {
+    use crate::quad::Vertex;
+    let dest = composite.dest;
+    let vis = dest.intersection(&composite.clip)?;
+    if vis.size.width <= 0.0 || vis.size.height <= 0.0 {
+        return None;
+    }
+    let half_w = dimensions.pixel_width as f32 / 2.0;
+    let half_h = dimensions.pixel_height as f32 / 2.0;
+    let u0 = (vis.min_x() - dest.min_x()) / dest.size.width;
+    let u1 = (vis.max_x() - dest.min_x()) / dest.size.width;
+    let v0 = (vis.min_y() - dest.min_y()) / dest.size.height;
+    let v1 = (vis.max_y() - dest.min_y()) / dest.size.height;
+    let (x0, x1) = (vis.min_x() - half_w, vis.max_x() - half_w);
+    let (y0, y1) = (vis.min_y() - half_h, vis.max_y() - half_h);
+    const IS_BG_IMAGE: f32 = 2.0;
+    let vert = |x: f32, y: f32, u: f32, v: f32| Vertex {
+        position: [x, y],
+        tex: [u, v],
+        fg_color: [1.0, 1.0, 1.0, composite.opacity],
+        alt_color: [1.0, 1.0, 1.0, composite.opacity],
+        hsv: [1.0, 1.0, 1.0],
+        has_color: IS_BG_IMAGE,
+        mix_value: 0.0,
+    };
+    // Corner order matches the shared index pattern: TL, TR, BL, BR.
+    Some([
+        vert(x0, y0, u0, v0),
+        vert(x1, y0, u1, v0),
+        vert(x0, y1, u0, v1),
+        vert(x1, y1, u1, v1),
+    ])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WindowBorder {
     pub width: f32,
@@ -87,6 +210,8 @@ pub(crate) fn draw_webgpu_layers(
     corner_radius: f32,
     window_border: WindowBorder,
     window_label: usize,
+    cards: CardDrawData,
+    card_scratch: &mut Option<CardScratch>,
 ) -> anyhow::Result<()> {
     let acquire_start = crate::perf::now();
     let output = webgpu.surface.get_current_texture()?;
@@ -143,6 +268,109 @@ pub(crate) fn draw_webgpu_layers(
     )
     .to_arrays_transposed();
 
+    // ---- Card texture work -------------------------------------------------
+    // One combined vertex upload covers every card render pass and every
+    // composite quad; each draw slices it with `base_vertex`. The uploads
+    // must all happen before any pass is encoded because queued buffer
+    // writes run at the head of the submit.
+    let card_pass_start = crate::perf::now();
+    let mut card_verts: Vec<crate::quad::Vertex> = Vec::new();
+    let mut pending_ranges = Vec::with_capacity(cards.pending.len());
+    for pending in &cards.pending {
+        let base = card_verts.len();
+        card_verts.extend_from_slice(&pending.verts);
+        pending_ranges.push((base, pending.verts.len() / 4));
+    }
+    let mut composite_draws: Vec<(i8, i32, &crate::termwindow::render::paint::CardComposite)> =
+        Vec::with_capacity(cards.composites.len());
+    for composite in &cards.composites {
+        if let Some(verts) = composite_quad_verts(composite, &dimensions) {
+            let base = card_verts.len();
+            card_verts.extend_from_slice(&verts);
+            composite_draws.push((composite.zindex, base as i32, composite));
+        }
+    }
+    if !card_verts.is_empty() {
+        let max_quads = pending_ranges
+            .iter()
+            .map(|(_, quads)| *quads)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        CardScratch::ensure(card_scratch, webgpu, card_verts.len(), max_quads);
+        let scratch = card_scratch.as_ref().expect("just ensured");
+        webgpu
+            .queue
+            .write_buffer(&scratch.vb, 0, bytemuck::cast_slice(&card_verts));
+
+        // Render each dirty card's quads into its texture. These passes are
+        // encoded before the main pass, so the composites below sample the
+        // fresh picture.
+        for (pending, (base, quads)) in cards.pending.iter().zip(&pending_ranges) {
+            if *quads == 0 {
+                continue;
+            }
+            let half_w = dimensions.pixel_width as f32 / 2.0;
+            let half_h = dimensions.pixel_height as f32 / 2.0;
+            let area = pending.area;
+            // `to_arrays()`, NOT `to_arrays_transposed()`: euclid's ortho
+            // keeps its translation in the fourth row, and the shader
+            // multiplies matrix * column-vector, so the plain row arrays are
+            // already the WGSL column layout. The main pass gets away with
+            // the transposed form only because its ortho is symmetric --
+            // translation is zero there, and a transposed diagonal is
+            // itself. This ortho is off-centre; transposing it puts the
+            // translation into the w row and every card collapses into a
+            // perspective wedge.
+            let card_projection = euclid::Transform3D::<f32, f32, f32>::ortho(
+                area.min_x() - half_w,
+                area.max_x() - half_w,
+                area.max_y() - half_h,
+                area.min_y() - half_h,
+                -1.0,
+                1.0,
+            )
+            .to_arrays();
+            let card_uniforms = webgpu.create_uniform(ShaderUniform {
+                foreground_text_hsb,
+                milliseconds,
+                viewport_and_corner: [
+                    pending.texture.width as f32,
+                    pending.texture.height as f32,
+                    0.0,
+                    0.0,
+                ],
+                window_border: [0.0; 4],
+                projection: card_projection,
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Card Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &pending.texture.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&webgpu.render_pipeline);
+            pass.set_bind_group(0, &card_uniforms, &[]);
+            pass.set_bind_group(1, &texture_linear_bind_group, &[]);
+            pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
+            pass.set_vertex_buffer(0, scratch.vb.slice(..));
+            pass.set_index_buffer(scratch.index.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..(*quads * 6) as u32, *base as i32, 0..1);
+        }
+    }
+    crate::perf::log_duration("card_texture_passes", card_pass_start);
+    crate::perf::log_counter("card_texture_renders", cards.pending.len());
+    crate::perf::log_counter("card_composites", composite_draws.len());
+    // -----------------------------------------------------------------------
+
     let mut cleared = false;
     let mut draw_calls = 0usize;
     let mut vertices_total = 0usize;
@@ -151,10 +379,9 @@ pub(crate) fn draw_webgpu_layers(
         for idx in 0..3 {
             let vb = &layer.vb.borrow()[idx];
             let (vertex_count, index_count) = vb.vertex_index_count();
-            let vertex_buffer;
             let uniforms;
             if vertex_count > 0 {
-                let mut vertices = vb.current_vb_mut();
+                let vertices = vb.current_vb_mut();
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Render Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -197,21 +424,83 @@ pub(crate) fn draw_webgpu_layers(
                 render_pass.set_bind_group(0, &uniforms, &[]);
                 render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
                 render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
-                // Timed on its own because it is not the small bookkeeping step
-                // it reads as: `recreate` allocates a whole new vertex buffer
-                // with `mapped_at_creation`, which wgpu zero-fills. At overview
-                // sizes that is megabytes per layer per frame.
-                let recreate_start = crate::perf::now();
-                vertex_buffer = vertices.webgpu_mut().recreate();
-                crate::perf::log_duration("webgpu_vb_recreate", recreate_start);
+                // Upload only the quads this frame actually wrote into the
+                // persistent vertex buffer. The old scheme allocated a fresh
+                // `mapped_at_creation` buffer every frame, which wgpu
+                // zero-fills -- megabytes of allocation and memset per layer
+                // per frame, measured at ~10% of the main thread.
+                let upload_start = crate::perf::now();
+                vertices.webgpu().upload(vertex_count);
+                crate::perf::log_duration("webgpu_vb_upload", upload_start);
                 crate::perf::log_counter("webgpu_vb_bytes", vertices.webgpu().capacity_bytes());
-                vertex_buffer.unmap();
-                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(0, vertices.webgpu().slice(..));
                 render_pass
                     .set_index_buffer(vb.indices.webgpu().slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..index_count as _, 0, 0..1);
                 draw_calls += 1;
                 vertices_total += vertex_count;
+            }
+
+            // Card pictures composite between this layer's base fills and
+            // its glyph sub-buffers: above their own card background, below
+            // every label drawn on top.
+            if idx == 0
+                && composite_draws
+                    .iter()
+                    .any(|(zindex, _, _)| *zindex == layer.zindex())
+            {
+                let scratch = card_scratch
+                    .as_ref()
+                    .expect("composite draws imply the scratch exists");
+                let comp_uniforms = webgpu.create_uniform(ShaderUniform {
+                    foreground_text_hsb,
+                    milliseconds,
+                    viewport_and_corner: [
+                        dimensions.pixel_width as f32,
+                        dimensions.pixel_height as f32,
+                        corner_radius,
+                        0.0,
+                    ],
+                    window_border: [
+                        window_border.color[0],
+                        window_border.color[1],
+                        window_border.color[2],
+                        window_border.width,
+                    ],
+                    projection,
+                });
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Card Composite Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if cleared {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(clear_color)
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                cleared = true;
+                pass.set_pipeline(&webgpu.render_pipeline);
+                pass.set_bind_group(0, &comp_uniforms, &[]);
+                pass.set_vertex_buffer(0, scratch.vb.slice(..));
+                pass.set_index_buffer(scratch.index.slice(..), wgpu::IndexFormat::Uint32);
+                for (zindex, base, composite) in &composite_draws {
+                    if *zindex != layer.zindex() {
+                        continue;
+                    }
+                    pass.set_bind_group(1, &composite.texture.bind_group, &[]);
+                    pass.set_bind_group(2, &composite.texture.bind_group, &[]);
+                    pass.draw_indexed(0..6, *base, 0..1);
+                    draw_calls += 1;
+                }
             }
 
             vb.next_index();
@@ -231,6 +520,18 @@ pub(crate) fn draw_webgpu_layers(
             window_label,
         ) {
             log::error!("framedump failed: {err:#}");
+        }
+        // Ground truth for the card texture path: dump each card texture
+        // rendered this frame under a distinctive label.
+        for (i, pending) in cards.pending.iter().enumerate() {
+            if let Err(err) = crate::framedump::dump_texture(
+                &webgpu.device,
+                &webgpu.queue,
+                &pending.texture.texture,
+                90000 + i,
+            ) {
+                log::error!("card framedump failed: {err:#}");
+            }
         }
     }
     output.present();
@@ -269,6 +570,11 @@ impl crate::TermWindow {
             self.dimensions.dpi,
             crate::native_settings::effective_appearance(),
         );
+        let cards = CardDrawData {
+            pending: std::mem::take(&mut *self.pending_card_renders.borrow_mut()),
+            composites: std::mem::take(&mut *self.card_composites.borrow_mut()),
+        };
+        let mut card_scratch = self.card_scratch.borrow_mut();
         draw_webgpu_layers(
             webgpu,
             render_state,
@@ -284,6 +590,8 @@ impl crate::TermWindow {
             corner_radius,
             window_border,
             self.mux_window_id as usize,
+            cards,
+            &mut card_scratch,
         )
     }
 

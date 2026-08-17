@@ -3594,6 +3594,11 @@ impl SettingsWindow {
             corner_radius,
             window_border,
             usize::MAX, // settings window; no mux window behind it
+            crate::termwindow::render::draw::CardDrawData {
+                pending: Vec::new(),
+                composites: Vec::new(),
+            },
+            &mut None,
         )?;
         Ok(true)
     }

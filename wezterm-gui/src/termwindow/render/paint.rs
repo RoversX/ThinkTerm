@@ -14,6 +14,7 @@ use smol::Timer;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use window::Dimensions;
@@ -22,7 +23,12 @@ use wezterm_term::color::ColorAttribute;
 use wezterm_term::TerminalSize;
 
 const TERMINAL_PREVIEW_EXTENT_BUCKET_DESIGN_PX: f32 = 8.0;
-const TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT: f64 = 128.0;
+/// Coarse on purpose: every distinct bucket becomes a `FontConfiguration`
+/// (a 4-8ms main-thread build plus its own glyph-atlas population and a new
+/// shape-cache identity). At 128 buckets/unit a session of scrolling and
+/// resizing built 96 of them in two minutes; at 16 the cell-size difference
+/// between adjacent buckets is sub-pixel at thumbnail sizes.
+const TERMINAL_PREVIEW_SCALE_BUCKETS_PER_UNIT: f64 = 16.0;
 /// How far the preview may walk down from its estimated font scale looking for
 /// one that fits. Each step costs a `FontConfiguration`, and the estimate is
 /// close enough that one is usually all it takes.
@@ -101,7 +107,11 @@ pub(crate) struct PreviewQuadKey {
 pub(crate) struct PreviewGeometryKey {
     area_width: u32,
     area_height: u32,
-    hold_scale: bool,
+    /// The *resolved* render scale (`preview_scale_estimate`), not the
+    /// drag-time hold flag it replaced: the flag flipped at every gesture
+    /// start and end, and each flip re-keyed all cards at once -- a full
+    /// same-frame rebuild of the overview to draw the identical picture.
+    scale_bits: u64,
     pixel_width: usize,
     pixel_height: usize,
     dpi: usize,
@@ -118,12 +128,45 @@ pub(crate) struct CachedPreviewQuads {
     /// The card rectangle these quads were laid out in.
     area: RectF,
     heap: HeapQuadAllocator,
+    /// The card's picture as a texture (WebGpu only). Rendered from `heap`
+    /// when content changes; composited as a single quad on every other
+    /// frame, which is what makes an unchanged card nearly free.
+    texture: Option<Rc<crate::termwindow::webgpu::CardRenderTexture>>,
+}
+
+/// A card whose heap must be rendered into its texture this frame, queued by
+/// the paint pass and encoded by `draw_webgpu_layers` before the main pass.
+pub(crate) struct PendingCardRender {
+    pub texture: Rc<crate::termwindow::webgpu::CardRenderTexture>,
+    /// The card's quads, flattened; positions are window-centre-relative and
+    /// the pass's projection maps `area` onto the texture.
+    pub verts: Vec<crate::quad::Vertex>,
+    /// The rect (top-left window pixels) the verts were recorded against.
+    pub area: RectF,
+}
+
+/// One textured quad standing in for a card's thousands of glyph quads,
+/// drawn between the base fills and the glyph sub-layers of the main pass.
+#[derive(Clone)]
+pub(crate) struct CardComposite {
+    pub texture: Rc<crate::termwindow::webgpu::CardRenderTexture>,
+    /// Where the card is being drawn this frame (top-left window pixels).
+    pub dest: RectF,
+    /// Visible region; the quad is shrunk to this and its UVs follow.
+    pub clip: RectF,
+    pub opacity: f32,
+    /// Which render layer to composite after: drawn between that layer's
+    /// base-fill sub-buffer and its glyph sub-buffers, so card pictures sit
+    /// above their card's background and below every label. Settled frames
+    /// use layer 0; a closing ghost's fading pictures use the fade layer.
+    pub zindex: i8,
 }
 
 fn preview_quad_key(
     preview: &TerminalPreviewRequest,
     dimensions: &Dimensions,
     shape_generation: usize,
+    scale: f64,
 ) -> PreviewQuadKey {
     PreviewQuadKey {
         snapshot: Arc::as_ptr(&preview.snapshot) as usize,
@@ -134,7 +177,7 @@ fn preview_quad_key(
             // deliberately absent: a moved card is replayed, not rebuilt.
             area_width: preview.area.size.width.to_bits(),
             area_height: preview.area.size.height.to_bits(),
-            hold_scale: preview.hold_scale,
+            scale_bits: scale.to_bits(),
             // Quad positions are relative to the centre of the window.
             pixel_width: dimensions.pixel_width,
             pixel_height: dimensions.pixel_height,
@@ -289,10 +332,8 @@ mod terminal_preview_tests {
     fn preview_scale_can_shrink_below_the_old_twelve_percent_floor() {
         let minimum = minimum_terminal_preview_scale(14.0, 144, 1.0);
         assert!(minimum < 0.12);
-        assert_eq!(
-            quantize_terminal_preview_scale_down(0.08, minimum),
-            0.078125
-        );
+        // 0.08 rounds down to the next 1/16 bucket, still below the old floor.
+        assert_eq!(quantize_terminal_preview_scale_down(0.08, minimum), 0.0625);
         assert_eq!(
             quantize_terminal_preview_scale_down(0.001, minimum),
             minimum
@@ -839,6 +880,7 @@ impl crate::TermWindow {
             // The departing picture has finished leaving; nothing else refers
             // to it, and an arriving one is now simply the foreground.
             self.content_view_last_frame = None;
+            self.content_view_last_composites.borrow_mut().clear();
             if let Some(view) = self.active_content_view_mut() {
                 view.set_terminal_in_flight(None);
             }
@@ -1095,6 +1137,7 @@ impl crate::TermWindow {
         // window chrome it owns. Fading them separately -- or holding some of
         // them back -- is what makes an arrival look like several things
         // happening near each other rather than one thing happening.
+        let composites_before = self.card_composites.borrow().len();
         let mut heap = HeapQuadAllocator::default();
         {
             let mut recorded = TripleLayerQuadAllocator::Heap(&mut heap);
@@ -1106,12 +1149,27 @@ impl crate::TermWindow {
         }
         match self.content_view_fade_opacity(Instant::now()) {
             // Arriving: the terminal is underneath this frame, so the view has
-            // to be lifted clear of it.
-            Some(opacity) => self.composite_above_terminal(&heap, opacity)?,
+            // to be lifted clear of it. Card textures are not in the heap;
+            // lift their composites to the fade layer at the fade's opacity
+            // so the pictures arrive as part of the view.
+            Some(opacity) => {
+                {
+                    let mut composites = self.card_composites.borrow_mut();
+                    for composite in composites[composites_before..].iter_mut() {
+                        composite.zindex = crate::termwindow::CONTENT_VIEW_FADE_ZINDEX;
+                        composite.opacity *= opacity;
+                    }
+                }
+                self.composite_above_terminal(&heap, opacity)?
+            }
             // Settled: nothing else is on screen to be ordered against.
             None => heap.apply_to_clipped(layers, self.surface_clip(), 1.0)?,
         }
         self.content_view_last_frame = Some(heap);
+        // The heap holds no thumbnail quads on the texture path, so a closing
+        // ghost needs this frame's composites to fade the pictures out.
+        *self.content_view_last_composites.borrow_mut() =
+            self.card_composites.borrow()[composites_before..].to_vec();
         Ok(())
     }
 
@@ -1132,7 +1190,19 @@ impl crate::TermWindow {
             .layer_for_zindex(crate::termwindow::CONTENT_VIEW_FADE_ZINDEX)
             .context("departing content view layer")?;
         let mut layers = layer.quad_allocator();
-        ghost.apply_to_clipped(&mut layers, self.surface_clip(), opacity)
+        ghost.apply_to_clipped(&mut layers, self.surface_clip(), opacity)?;
+        // Card pictures live in textures, not in the ghost heap: fade them
+        // with it. NOTE: these draw after the base fills of the main layer,
+        // i.e. underneath the travelling ghost chrome above them.
+        let mut composites = self.card_composites.borrow_mut();
+        for saved in self.content_view_last_composites.borrow().iter() {
+            composites.push(CardComposite {
+                opacity,
+                zindex: crate::termwindow::CONTENT_VIEW_FADE_ZINDEX,
+                ..saved.clone()
+            });
+        }
+        Ok(())
     }
 
     pub fn paint_content_view(
@@ -1340,7 +1410,12 @@ impl crate::TermWindow {
         preview: &TerminalPreviewRequest,
         budget: &mut usize,
     ) -> anyhow::Result<bool> {
-        let key = preview_quad_key(preview, &self.dimensions, self.shape_generation);
+        let key = preview_quad_key(
+            preview,
+            &self.dimensions,
+            self.shape_generation,
+            self.preview_scale_estimate(preview),
+        );
         let clip = quad_clip_rect(preview.clip, &self.dimensions);
 
         // A hit replays. A miss replays too -- but only when the miss is the
@@ -1370,6 +1445,11 @@ impl crate::TermWindow {
             self.update_next_frame_time(Some(Instant::now()));
         }
         if let Some(recorded_area) = recorded_area {
+            // Texture path: the card's picture already lives in its own
+            // texture; a single textured quad replaces the whole replay.
+            if self.card_texture_path_active() && self.composite_cached_card(preview)? {
+                return Ok(false);
+            }
             let cache = self.preview_quad_cache.borrow();
             let cached = cache
                 .get(&preview.tab_id)
@@ -1399,12 +1479,14 @@ impl crate::TermWindow {
         // Reuse the stale entry's boxes rather than freeing thousands of them
         // and asking for the same number back on the next line of this
         // function. `recycle` empties the layers into the spare pool.
-        let mut heap = self
+        let (mut heap, prior_texture) = match self
             .preview_quad_cache
             .borrow_mut()
             .remove(&preview.tab_id)
-            .map(|cached| cached.heap)
-            .unwrap_or_default();
+        {
+            Some(cached) => (cached.heap, cached.texture),
+            None => (HeapQuadAllocator::default(), None),
+        };
         heap.recycle();
         {
             let card_started = crate::perf::now();
@@ -1412,7 +1494,46 @@ impl crate::TermWindow {
             self.paint_terminal_preview_unclipped(&mut heap_layers, preview)?;
             crate::perf::log_duration("preview_rebuild_card", card_started);
         }
-        let result = heap.apply_to_clipped(layers, clip, 1.0).map(|()| true);
+        let mut texture = None;
+        let result = if self.card_texture_path_active() {
+            // Reuse the previous texture when the card size is unchanged --
+            // content changes every refresh interval and reallocating a
+            // texture for each one would churn.
+            let wanted_w = (preview.area.size.width.ceil() as u32).max(1);
+            let wanted_h = (preview.area.size.height.ceil() as u32).max(1);
+            let tex = match prior_texture
+                .filter(|t| t.width == wanted_w && t.height == wanted_h)
+            {
+                Some(prior) => Ok(prior),
+                None => self.create_card_texture(preview.area),
+            };
+            match tex {
+                Ok(tex) => {
+                    let mut verts = Vec::new();
+                    heap.extract_vertices(&mut verts);
+                    self.pending_card_renders.borrow_mut().push(PendingCardRender {
+                        texture: Rc::clone(&tex),
+                        verts,
+                        area: preview.area,
+                    });
+                    self.card_composites.borrow_mut().push(CardComposite {
+                        texture: Rc::clone(&tex),
+                        dest: preview.area,
+                        clip: preview.clip,
+                        opacity: 1.0,
+                        zindex: 0,
+                    });
+                    texture = Some(tex);
+                    Ok(true)
+                }
+                Err(err) => {
+                    log::warn!("card texture unavailable, replaying quads: {err:#}");
+                    heap.apply_to_clipped(layers, clip, 1.0).map(|()| true)
+                }
+            }
+        } else {
+            heap.apply_to_clipped(layers, clip, 1.0).map(|()| true)
+        };
         self.preview_quad_cache.borrow_mut().insert(
             preview.tab_id,
             CachedPreviewQuads {
@@ -1422,9 +1543,87 @@ impl crate::TermWindow {
                 snapshot: Arc::clone(&preview.snapshot),
                 area: preview.area,
                 heap,
+                texture,
             },
         );
         result
+    }
+
+    /// True while cards may draw as textures (WebGpu only). Transition
+    /// frames also qualify: the card quads are not recorded into the fade
+    /// heap; instead `paint_content_view_composited` lifts the composites to
+    /// the fade layer and gives them the fade's opacity, so the pictures
+    /// arrive and leave with the view while transition frames stay cheap.
+    fn card_texture_path_active(&self) -> bool {
+        self.webgpu.is_some()
+    }
+
+    fn create_card_texture(
+        &self,
+        area: RectF,
+    ) -> anyhow::Result<Rc<crate::termwindow::webgpu::CardRenderTexture>> {
+        let webgpu = self
+            .webgpu
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no webgpu state"))?;
+        let width = (area.size.width.ceil() as u32).max(1);
+        let height = (area.size.height.ceil() as u32).max(1);
+        Ok(Rc::new(crate::termwindow::webgpu::CardRenderTexture::new(
+            width, height, webgpu,
+        )?))
+    }
+
+    /// Composite a cached card as one textured quad, first rendering the
+    /// cached heap into a fresh texture if the entry does not have one yet
+    /// (recorded during a transition, when the texture path is off). Returns
+    /// false when there is nothing usable and the caller must replay quads.
+    fn composite_cached_card(&self, preview: &TerminalPreviewRequest) -> anyhow::Result<bool> {
+        let (needs_texture, recorded_area) = {
+            let cache = self.preview_quad_cache.borrow();
+            let Some(cached) = cache.get(&preview.tab_id) else {
+                return Ok(false);
+            };
+            (cached.texture.is_none(), cached.area)
+        };
+        if needs_texture {
+            let texture = match self.create_card_texture(recorded_area) {
+                Ok(texture) => texture,
+                Err(err) => {
+                    log::warn!("card texture unavailable, replaying quads: {err:#}");
+                    return Ok(false);
+                }
+            };
+            let mut verts = Vec::new();
+            {
+                let mut cache = self.preview_quad_cache.borrow_mut();
+                let Some(cached) = cache.get_mut(&preview.tab_id) else {
+                    return Ok(false);
+                };
+                cached.heap.extract_vertices(&mut verts);
+                cached.texture = Some(Rc::clone(&texture));
+            }
+            self.pending_card_renders.borrow_mut().push(PendingCardRender {
+                texture,
+                verts,
+                area: recorded_area,
+            });
+        }
+        let Some(texture) = self
+            .preview_quad_cache
+            .borrow()
+            .get(&preview.tab_id)
+            .and_then(|cached| cached.texture.clone())
+        else {
+            return Ok(false);
+        };
+        self.card_composites.borrow_mut().push(CardComposite {
+            texture,
+            dest: preview.area,
+            clip: preview.clip,
+            opacity: 1.0,
+            zindex: 0,
+        });
+        Ok(true)
     }
 
     /// Build one card's thumbnail into `layers`, whole.
@@ -1435,6 +1634,51 @@ impl crate::TermWindow {
     /// the rows that happened to be on screen when it was recorded, and the
     /// first scroll would reveal the gap. Cropping is the replaying caller's
     /// job, and it already does it.
+    /// The scale a card's grid will be rendered at, before raster-metric
+    /// correction: a pure function of the card's bucketed size, the
+    /// terminal's shape and the drag-time hold. Cheap -- no font metrics --
+    /// so the quad-cache key can carry the resolved value instead of the
+    /// hold *flag*: a drag whose hold resolves to the scale already on
+    /// screen then reads as the same geometry, where the flag flipping used
+    /// to rebuild every card at gesture start and end.
+    fn preview_scale_estimate(&self, preview: &TerminalPreviewRequest) -> f64 {
+        let tab_size = preview.snapshot.tab_size;
+        if tab_size.cols == 0 || tab_size.rows == 0 {
+            return 1.0;
+        }
+        let bucketed_width =
+            quantized_terminal_preview_extent(preview.area.size.width, self.dimensions.dpi);
+        let bucketed_height =
+            quantized_terminal_preview_extent(preview.area.size.height, self.dimensions.dpi);
+        let width_ratio = bucketed_width
+            / (tab_size.cols as f32 * self.render_metrics.cell_size.width.max(1) as f32);
+        let height_ratio = bucketed_height
+            / (tab_size.rows as f32 * self.render_metrics.cell_size.height.max(1) as f32);
+        let global_scale = self.fonts.get_font_scale();
+        let minimum_scale = minimum_terminal_preview_scale(
+            self.config.font_size,
+            self.dimensions.dpi,
+            global_scale,
+        );
+        let maximum_scale = (global_scale * 0.84).max(minimum_scale);
+        let desired_scale = (global_scale * f64::from(width_ratio.min(height_ratio)))
+            .clamp(minimum_scale, maximum_scale);
+        let mut quantized_scale = quantize_terminal_preview_scale_down(desired_scale, minimum_scale);
+        // Mid-drag, keep the scale this grid was last drawn at. The search
+        // in the render path would otherwise walk a new bucket every few
+        // pixels of card width, and every bucket is a `FontConfiguration`.
+        if preview.hold_scale {
+            if let Some(held) = self
+                .preview_scale_hold
+                .borrow()
+                .get(&(tab_size.cols, tab_size.rows))
+            {
+                quantized_scale = *held;
+            }
+        }
+        quantized_scale
+    }
+
     fn paint_terminal_preview_unclipped(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -1468,31 +1712,17 @@ impl crate::TermWindow {
             quantized_terminal_preview_extent(preview.area.size.width, self.dimensions.dpi);
         let bucketed_height =
             quantized_terminal_preview_extent(preview.area.size.height, self.dimensions.dpi);
-        let width_ratio = bucketed_width
-            / (tab_size.cols as f32 * self.render_metrics.cell_size.width.max(1) as f32);
-        let height_ratio = bucketed_height
-            / (tab_size.rows as f32 * self.render_metrics.cell_size.height.max(1) as f32);
         let global_scale = self.fonts.get_font_scale();
         let minimum_scale = minimum_terminal_preview_scale(
             self.config.font_size,
             self.dimensions.dpi,
             global_scale,
         );
-        let maximum_scale = (global_scale * 0.84).max(minimum_scale);
-        let desired_scale = (global_scale * f64::from(width_ratio.min(height_ratio)))
-            .clamp(minimum_scale, maximum_scale);
-        let mut quantized_scale =
-            quantize_terminal_preview_scale_down(desired_scale, minimum_scale);
-        // Mid-drag, keep the scale this grid was last drawn at. The search
-        // below would otherwise walk a new bucket every few pixels of card
-        // width, and every bucket is a `FontConfiguration` that builds a font,
-        // rasterises glyphs and grows the atlas -- and is never evicted.
+        // Shared with the quad-cache key: both must resolve the drag-time
+        // hold the same way, or a gesture's start and end read as geometry
+        // changes and rebuild every card in one frame.
+        let mut quantized_scale = self.preview_scale_estimate(preview);
         let scale_key = (tab_size.cols, tab_size.rows);
-        if preview.hold_scale {
-            if let Some(held) = self.preview_scale_hold.borrow().get(&scale_key) {
-                quantized_scale = *held;
-            }
-        }
         let (mut font_config, mut metrics) = self.pane_font_resources(quantized_scale)?;
 
         // Font raster metrics are integer pixels and therefore do not scale
@@ -2406,6 +2636,9 @@ impl crate::TermWindow {
         let frame_now = Instant::now();
         self.advance_workspace_space_swipe_push(frame_now);
         self.advance_content_view_fade(frame_now);
+        // Card texture work is queued per pass; a retried pass re-queues it.
+        self.pending_card_renders.borrow_mut().clear();
+        self.card_composites.borrow_mut().clear();
         {
             let gl_state = self.render_state.as_ref().unwrap();
             for layer in gl_state.layers.borrow().iter() {
@@ -2932,8 +3165,8 @@ mod tests {
     fn the_same_snapshot_in_the_same_card_keeps_its_quads() {
         let preview = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
         assert_eq!(
-            preview_quad_key(&preview, &test_dimensions(), 3),
-            preview_quad_key(&preview, &test_dimensions(), 3)
+            preview_quad_key(&preview, &test_dimensions(), 3, 1.0),
+            preview_quad_key(&preview, &test_dimensions(), 3, 1.0)
         );
     }
 
@@ -2942,9 +3175,9 @@ mod tests {
     #[test]
     fn a_card_that_only_moved_keeps_its_quads() {
         let mut moved = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
-        let key = preview_quad_key(&moved, &test_dimensions(), 3);
+        let key = preview_quad_key(&moved, &test_dimensions(), 3, 1.0);
         moved.area = moved.area.translate(euclid::vec2(0.0, -140.0));
-        assert_eq!(preview_quad_key(&moved, &test_dimensions(), 3), key);
+        assert_eq!(preview_quad_key(&moved, &test_dimensions(), 3, 1.0), key);
     }
 
     /// Resizing a card rebuckets the font scale, so the recorded quads are the
@@ -2955,8 +3188,8 @@ mod tests {
         let mut large = small.clone();
         large.area.size.width = 480.0;
         assert_ne!(
-            preview_quad_key(&large, &test_dimensions(), 3),
-            preview_quad_key(&small, &test_dimensions(), 3)
+            preview_quad_key(&large, &test_dimensions(), 3, 1.0),
+            preview_quad_key(&small, &test_dimensions(), 3, 1.0)
         );
     }
 
@@ -2966,8 +3199,8 @@ mod tests {
     fn a_newly_loaded_font_rebuilds() {
         let preview = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
         assert_ne!(
-            preview_quad_key(&preview, &test_dimensions(), 4),
-            preview_quad_key(&preview, &test_dimensions(), 3)
+            preview_quad_key(&preview, &test_dimensions(), 4, 1.0),
+            preview_quad_key(&preview, &test_dimensions(), 3, 1.0)
         );
     }
 
@@ -2986,16 +3219,16 @@ mod tests {
         let mut recaptured = first.clone();
         recaptured.snapshot = Arc::new((*first.snapshot).clone());
 
-        let old = preview_quad_key(&first, &test_dimensions(), 3);
+        let old = preview_quad_key(&first, &test_dimensions(), 3, 1.0);
 
-        let new_content = preview_quad_key(&recaptured, &test_dimensions(), 3);
+        let new_content = preview_quad_key(&recaptured, &test_dimensions(), 3, 1.0);
         assert_ne!(new_content, old, "a recapture must eventually be rebuilt");
         assert_eq!(
             new_content.geometry, old.geometry,
             "but the recorded quads still draw the right pixels meanwhile"
         );
 
-        let new_font = preview_quad_key(&first, &test_dimensions(), 4);
+        let new_font = preview_quad_key(&first, &test_dimensions(), 4, 1.0);
         assert_ne!(new_font, old, "a loaded font must eventually be rebuilt");
         assert_eq!(
             new_font.geometry, old.geometry,
@@ -3005,7 +3238,7 @@ mod tests {
         let mut resized = first.clone();
         resized.area.size.width = 480.0;
         assert_ne!(
-            preview_quad_key(&resized, &test_dimensions(), 3).geometry,
+            preview_quad_key(&resized, &test_dimensions(), 3, 1.0).geometry,
             old.geometry,
             "a resized card must not be replayed, at any budget"
         );
@@ -3013,7 +3246,7 @@ mod tests {
         let mut wider = test_dimensions();
         wider.pixel_width += 200;
         assert_ne!(
-            preview_quad_key(&first, &wider, 3).geometry,
+            preview_quad_key(&first, &wider, 3, 1.0).geometry,
             old.geometry,
             "a resized window must not be replayed, at any budget"
         );
@@ -3027,8 +3260,8 @@ mod tests {
         let mut wider = test_dimensions();
         wider.pixel_width += 200;
         assert_ne!(
-            preview_quad_key(&preview, &wider, 3),
-            preview_quad_key(&preview, &test_dimensions(), 3)
+            preview_quad_key(&preview, &wider, 3, 1.0),
+            preview_quad_key(&preview, &test_dimensions(), 3, 1.0)
         );
     }
 
@@ -3040,8 +3273,8 @@ mod tests {
         let mut recaptured = first.clone();
         recaptured.snapshot = Arc::new((*first.snapshot).clone());
         assert_ne!(
-            preview_quad_key(&recaptured, &test_dimensions(), 3),
-            preview_quad_key(&first, &test_dimensions(), 3)
+            preview_quad_key(&recaptured, &test_dimensions(), 3, 1.0),
+            preview_quad_key(&first, &test_dimensions(), 3, 1.0)
         );
     }
 

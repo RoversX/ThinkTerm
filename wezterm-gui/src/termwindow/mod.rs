@@ -58,7 +58,7 @@ use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::ops::{Add, Range};
 use std::path::{Path, PathBuf};
@@ -1176,6 +1176,9 @@ pub struct PaneState {
 pub struct PaneFontEntry {
     pub fonts: Rc<FontConfiguration>,
     pub render_metrics: RenderMetrics,
+    /// LRU stamp from `pane_font_cache_tick`; the cache holds whole
+    /// FontConfigurations and would otherwise only ever grow.
+    last_used: Cell<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1493,12 +1496,24 @@ pub struct TermWindow {
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
     pane_font_cache: RefCell<HashMap<PaneFontKey, PaneFontEntry>>,
+    pane_font_cache_tick: Cell<u64>,
     /// One recorded thumbnail per card, kept across frames so an unchanged
     /// terminal is replayed rather than re-shaped and re-quadded. Entries are
     /// dropped for cards that stop asking for a preview, and invalidated
     /// wholesale when the glyph atlas is repacked -- the quads hold atlas
     /// coordinates.
     preview_quad_cache: RefCell<HashMap<TabId, crate::termwindow::render::paint::CachedPreviewQuads>>,
+    /// Cards whose heap must be rendered into their texture this frame;
+    /// queued by the paint pass, encoded by draw before the main pass.
+    pending_card_renders: RefCell<Vec<crate::termwindow::render::paint::PendingCardRender>>,
+    /// One textured quad per card standing in for its glyph quads.
+    card_composites: RefCell<Vec<crate::termwindow::render::paint::CardComposite>>,
+    /// The settled frame's composites, kept so a closing overview's ghost
+    /// can fade the card pictures out with it (the ghost heap itself holds
+    /// no thumbnail quads on the texture path).
+    content_view_last_composites: RefCell<Vec<crate::termwindow::render::paint::CardComposite>>,
+    /// Grow-only scratch GPU buffers for card render passes.
+    card_scratch: RefCell<Option<crate::termwindow::render::draw::CardScratch>>,
     /// Font scale last chosen for a thumbnail of a grid this size, so a drag
     /// can hold it steady instead of rebucketing every few pixels.
     preview_scale_hold: RefCell<HashMap<(usize, usize), f64>>,
@@ -2438,7 +2453,12 @@ impl TermWindow {
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             pane_font_cache: RefCell::new(HashMap::new()),
+            pane_font_cache_tick: Cell::new(0),
             preview_quad_cache: RefCell::new(HashMap::new()),
+            pending_card_renders: RefCell::new(Vec::new()),
+            card_composites: RefCell::new(Vec::new()),
+            content_view_last_composites: RefCell::new(Vec::new()),
+            card_scratch: RefCell::new(None),
             preview_scale_hold: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
@@ -7567,7 +7587,11 @@ impl TermWindow {
             config_generation: self.config.generation(),
         };
 
+        let tick = self.pane_font_cache_tick.get().wrapping_add(1);
+        self.pane_font_cache_tick.set(tick);
+
         if let Some(entry) = self.pane_font_cache.borrow().get(&key) {
+            entry.last_used.set(tick);
             return Ok((Rc::clone(&entry.fonts), entry.render_metrics));
         }
 
@@ -7579,13 +7603,31 @@ impl TermWindow {
         fonts.change_scaling(font_scale, self.dimensions.dpi);
         let render_metrics = RenderMetrics::new(&fonts)?;
 
-        self.pane_font_cache.borrow_mut().insert(
-            key,
-            PaneFontEntry {
-                fonts: Rc::clone(&fonts),
-                render_metrics,
-            },
-        );
+        {
+            let mut cache = self.pane_font_cache.borrow_mut();
+            // Each entry is a whole FontConfiguration (fonts, shaper state,
+            // atlas-resident glyphs); unbounded, the map only ever grows as
+            // scrolling and resizing walk new scale buckets.
+            const PANE_FONT_CACHE_CAP: usize = 16;
+            while cache.len() >= PANE_FONT_CACHE_CAP {
+                let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used.get())
+                    .map(|(key, _)| *key)
+                else {
+                    break;
+                };
+                cache.remove(&oldest);
+            }
+            cache.insert(
+                key,
+                PaneFontEntry {
+                    fonts: Rc::clone(&fonts),
+                    render_metrics,
+                    last_used: Cell::new(tick),
+                },
+            );
+        }
         crate::perf::accum("font_config_build", build_started);
 
         Ok((fonts, render_metrics))

@@ -212,6 +212,77 @@ impl Drop for WebGpuTexture {
     }
 }
 
+/// An overview card's private render target. The card's quads are rendered
+/// into this once per content change; every other frame composites it as a
+/// single textured quad, instead of re-emitting and re-uploading the card's
+/// thousands of glyph quads.
+pub struct CardRenderTexture {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    /// Card texture + linear sampler, bindable in either of the pipeline's
+    /// two texture slots (their layouts are identical).
+    pub bind_group: wgpu::BindGroup,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl CardRenderTexture {
+    pub fn new(width: u32, height: u32, state: &WebGpuState) -> anyhow::Result<Self> {
+        let limit = state.device.limits().max_texture_dimension_2d;
+        if width > limit || height > limit {
+            anyhow::bail!(
+                "card texture dimensions {width}x{height} exceed the \
+                 max dimension {limit} supported by your GPU"
+            );
+        }
+        // Same format as the surface so the shared render pipeline can
+        // target it.
+        let format = state.config.borrow().format;
+        let texture = state.device.create_texture(&wgpu::TextureDescriptor {
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: if crate::framedump::enabled() {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+            },
+            label: Some("Card Texture"),
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &state.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&state.texture_linear_sampler),
+                },
+            ],
+            label: Some("card texture bind group"),
+        });
+        Ok(Self {
+            texture,
+            view,
+            bind_group,
+            width,
+            height,
+        })
+    }
+}
+
 pub fn adapter_info_to_gpu_info(info: wgpu::AdapterInfo) -> GpuInfo {
     GpuInfo {
         name: info.name,

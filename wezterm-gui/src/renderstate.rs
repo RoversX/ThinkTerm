@@ -267,10 +267,7 @@ impl MappedVertexBuffer {
     fn slice_mut(&mut self, range: std::ops::Range<usize>) -> &mut [Vertex] {
         match self {
             Self::Glium(g) => &mut g.mapping[range],
-            Self::WebGpu(g) => {
-                let mapping: &mut [Vertex] = bytemuck::cast_slice_mut(&mut g.mapping);
-                &mut mapping[range]
-            }
+            Self::WebGpu(g) => &mut g.mapping[range],
         }
     }
 }
@@ -282,13 +279,17 @@ pub struct MappedQuads<'a> {
 }
 
 pub struct WebGpuMappedVertexBuffer {
-    mapping: wgpu::BufferViewMut<'static>,
-    // Owner mapping, must be dropped after mapping
-    _slice: wgpu::BufferSlice<'static>,
+    mapping: RefMut<'static, Vec<Vertex>>,
 }
 
 pub struct WebGpuVertexBuffer {
     buf: wgpu::Buffer,
+    /// CPU-side quad staging. Quads are written here during layout and the
+    /// used range is uploaded with `queue.write_buffer` at draw time. The
+    /// GPU buffer is persistent: the old scheme allocated a fresh
+    /// `mapped_at_creation` buffer every frame, and wgpu zero-fills those --
+    /// megabytes of allocation and memset per layer per frame.
+    staging: Vec<Vertex>,
     num_vertices: usize,
     state: Rc<WebGpuState>,
 }
@@ -306,41 +307,30 @@ impl WebGpuVertexBuffer {
             buf: state.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Vertex Buffer"),
                 size: (num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::VERTEX,
-                mapped_at_creation: true,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             }),
+            staging: vec![Vertex::default(); num_vertices],
             num_vertices,
             state: Rc::clone(state),
         }
     }
 
-    pub fn map(&self) -> WebGpuMappedVertexBuffer {
-        unsafe {
-            let slice = self.buf.slice(..).extend_lifetime();
-            let mapping = slice.get_mapped_range_mut();
-
-            WebGpuMappedVertexBuffer {
-                mapping,
-                _slice: slice,
-            }
-        }
-    }
-
-    /// Size of the buffer this recreates, which is the capacity high-water
+    /// Size of the persistent buffer, which is the capacity high-water
     /// mark rather than what the frame actually uses.
     pub fn capacity_bytes(&self) -> usize {
         self.num_vertices * std::mem::size_of::<Vertex>()
     }
 
-    pub fn recreate(&mut self) -> wgpu::Buffer {
-        let mut new_buf = self.state.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Vertex Buffer"),
-            size: (self.num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        std::mem::swap(&mut new_buf, &mut self.buf);
-        new_buf
+    /// Upload the used prefix of the staging quads into the persistent
+    /// GPU buffer.
+    pub fn upload(&self, vertex_count: usize) {
+        let count = vertex_count.min(self.staging.len());
+        if count > 0 {
+            self.state
+                .queue
+                .write_buffer(&self.buf, 0, bytemuck::cast_slice(&self.staging[..count]));
+        }
     }
 }
 
@@ -509,21 +499,32 @@ impl TripleVertexBuffer {
         // we can then store in the same struct.
         // This is "safe" because we carry them around together and ensure
         // that the owner is dropped after the derived data.
-        let mapping = match &mut *bufs {
-            VertexBuffer::Glium(vb) => {
-                let buf_slice = unsafe {
+        let mapping = if matches!(&*bufs, VertexBuffer::Glium(_)) {
+            let buf_slice = {
+                let vb = match &mut *bufs {
+                    VertexBuffer::Glium(vb) => vb,
+                    _ => unreachable!(),
+                };
+                unsafe {
                     vb.slice_mut(..)
                         .expect("to map vertex buffer")
                         .extend_lifetime()
-                };
-                let mapping = buf_slice.map();
+                }
+            };
+            let mapping = buf_slice.map();
 
-                MappedVertexBuffer::Glium(GliumMappedVertexBuffer {
-                    _owner: bufs,
-                    mapping,
-                })
-            }
-            VertexBuffer::WebGpu(vb) => MappedVertexBuffer::WebGpu(vb.map()),
+            MappedVertexBuffer::Glium(GliumMappedVertexBuffer {
+                _owner: bufs,
+                mapping,
+            })
+        } else {
+            // The WebGpu "mapping" is the CPU staging Vec; the RefMut keeps
+            // the owning VertexBuffer borrowed for the mapping's lifetime.
+            let staging = RefMut::map(bufs, |vb| match vb {
+                VertexBuffer::WebGpu(vb) => &mut vb.staging,
+                _ => unreachable!(),
+            });
+            MappedVertexBuffer::WebGpu(WebGpuMappedVertexBuffer { mapping: staging })
         };
 
         MappedQuads {
@@ -555,6 +556,10 @@ pub struct RenderLayer {
 }
 
 impl RenderLayer {
+    pub fn zindex(&self) -> i8 {
+        self.zindex
+    }
+
     pub fn new(context: &RenderContext, num_quads: usize, zindex: i8) -> anyhow::Result<Self> {
         let vb = [
             Self::compute_vertices(context, 32)?,

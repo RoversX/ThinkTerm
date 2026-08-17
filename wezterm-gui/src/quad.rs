@@ -832,6 +832,26 @@ impl HeapQuadAllocator {
 
     /// Copy every recorded quad into `other`, cropped to `clip` and scaled to
     /// `opacity`.
+    /// Flatten the recorded quads into a plain vertex stream: sub-layer 0,
+    /// then 1, then 2, in recorded order -- the order a replay would draw
+    /// them. Used to render a card's picture into its own texture, where
+    /// the render pass's projection does the placement and cropping, so the
+    /// vertices go out untransformed and unclipped.
+    pub fn extract_vertices(&self, out: &mut Vec<Vertex>) {
+        for (_layer_num, quads) in self.layers() {
+            for quad in quads {
+                out.extend_from_slice(&quad.to_vertices());
+            }
+        }
+    }
+
+    pub fn quad_count(&self) -> usize {
+        self.layers()
+            .iter()
+            .map(|(_, quads)| quads.len())
+            .sum()
+    }
+
     /// Position, texture coordinates and per-corner colors are transformed
     /// together by the same primitive used by Space swipe composition.
     ///
