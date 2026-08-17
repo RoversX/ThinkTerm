@@ -81,6 +81,7 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "thinkterm-gui",
     about = "ThinkTerm - a workspace-first terminal\nhttps://github.com/RoversX/thinkterm",
     version = config::wezterm_version()
 )]
@@ -1658,7 +1659,7 @@ fn run() -> anyhow::Result<()> {
         Some(sub) => sub,
         None => {
             // Need to fake an argv0
-            let mut argv = vec!["wezterm-gui".to_string()];
+            let mut argv = vec!["thinkterm-gui".to_string()];
             for a in &config.default_gui_startup_args {
                 argv.push(a.clone());
             }

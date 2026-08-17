@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>wezterm-gui</string>
+	<string>thinkterm-gui</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.roversx.thinkterm</string>
 	<key>CFBundleInfoDictionaryVersion</key>

@@ -5,6 +5,13 @@ authors = ["Wez Furlong <wez@wezfurlong.org>"]
 edition = "2018"
 resolver = "2"
 publish = false
+autobins = false
+
+# The crate keeps its upstream name so patches still merge; only the produced
+# executable is branded.
+[[bin]]
+name = "thinkterm-mux-server"
+path = "src/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

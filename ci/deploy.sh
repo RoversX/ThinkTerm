@@ -38,7 +38,7 @@ case $OSTYPE in
     cp -r assets/shell-completion $zipdir/ThinkTerm.app/Contents/Resources
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
 
-    for bin in wezterm thinkterm wezterm-mux-server wezterm-gui strip-ansi-escapes ; do
+    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes ; do
       # If the user ran a simple `cargo build --release`, then we want to allow
       # a single-arch package to be built
       if [[ -f $TARGET_DIR/release/$bin ]] ; then
@@ -121,8 +121,8 @@ case $OSTYPE in
     mkdir $zipdir
     cp $TARGET_DIR/release/thinkterm.exe \
       $TARGET_DIR/release/wezterm.exe \
-      $TARGET_DIR/release/wezterm-mux-server.exe \
-      $TARGET_DIR/release/wezterm-gui.exe \
+      $TARGET_DIR/release/thinkterm-mux-server.exe \
+      $TARGET_DIR/release/thinkterm-gui.exe \
       $TARGET_DIR/release/strip-ansi-escapes.exe \
       $TARGET_DIR/release/thinkterm.pdb \
       $TARGET_DIR/release/wezterm.pdb \
@@ -252,8 +252,8 @@ mkdir -p %{buildroot}/usr/bin %{buildroot}/etc/profile.d %{buildroot}/usr/share/
 install -Dm755 assets/open-thinkterm-here assets/open-wezterm-here -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/release/thinkterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/release/wezterm -t %{buildroot}/usr/bin
-install -Dsm755 $TARGET_DIR/release/wezterm-gui -t %{buildroot}/usr/bin
-install -Dsm755 $TARGET_DIR/release/wezterm-mux-server -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/release/thinkterm-gui -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/release/thinkterm-mux-server -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/release/strip-ansi-escapes -t %{buildroot}/usr/bin
 install -Dm644 assets/shell-integration/* -t %{buildroot}/etc/profile.d
 install -Dm644 assets/shell-completion/zsh %{buildroot}/usr/share/zsh/site-functions/_thinkterm
@@ -283,14 +283,14 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 %files -n wezterm-gui
 /usr/bin/open-thinkterm-here
 /usr/bin/open-wezterm-here
-/usr/bin/wezterm-gui
+/usr/bin/thinkterm-gui
 /usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
 /usr/share/applications/com.roversx.thinkterm.desktop
 /usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 /usr/share/nautilus-python/extensions/wezterm-nautilus.py*
 
 %files -n wezterm-mux-server
-/usr/bin/wezterm-mux-server
+/usr/bin/thinkterm-mux-server
 
 %changelog
 * Mon Oct 2 2023 Wez Furlong
@@ -352,8 +352,8 @@ if [ "\$1" = "remove" ]; then
 fi
 EOF
 
-        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/wezterm-mux-server
-        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/wezterm-gui
+        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/thinkterm-mux-server
+        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/thinkterm-gui
         install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/thinkterm
         install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/wezterm
         install -Dm755 -t pkg/debian/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
@@ -427,8 +427,8 @@ makedepends="cmd:tic"
 source="
   $TARGET_DIR/release/thinkterm
   $TARGET_DIR/release/wezterm
-  $TARGET_DIR/release/wezterm-gui
-  $TARGET_DIR/release/wezterm-mux-server
+  $TARGET_DIR/release/thinkterm-gui
+  $TARGET_DIR/release/thinkterm-mux-server
   assets/open-thinkterm-here
   assets/open-wezterm-here
   assets/wezterm.desktop
@@ -448,8 +448,8 @@ package() {
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/open-wezterm-here
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm
-  install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm-gui
-  install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm-mux-server
+  install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-gui
+  install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-mux-server
 
   install -Dm644 "\$srcdir"/wezterm.desktop "\$pkgdir"/usr/share/applications/com.roversx.thinkterm.desktop
   install -Dm644 "\$srcdir"/wezterm.appdata.xml "\$pkgdir"/usr/share/metainfo/com.roversx.thinkterm.appdata.xml

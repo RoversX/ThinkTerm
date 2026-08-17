@@ -24,8 +24,8 @@ cask "thinkterm" do
   [
     "thinkterm",
     "wezterm",
-    "wezterm-gui",
-    "wezterm-mux-server",
+    "thinkterm-gui",
+    "thinkterm-mux-server",
     "strip-ansi-escapes"
   ].each do |tool|
     binary "#{appdir}/ThinkTerm.app/Contents/MacOS/#{tool}"
@@ -46,7 +46,7 @@ cask "thinkterm" do
 
   def caveats; <<~EOS
     Cask #{token} related executables like 'thinkterm', 'wezterm',
-    'wezterm-gui', and 'wezterm-mux-server' are linked into
+    'thinkterm-gui', and 'thinkterm-mux-server' are linked into
       /usr/local/bin/    for x86 Mac,
       /opt/homebrew/bin/ for M1 Mac.
 

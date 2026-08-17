@@ -6,7 +6,7 @@
 ;#define MyAppVersion "1.5"
 #define MyAppPublisher "RoversX"
 #define MyAppURL "https://github.com/RoversX/thinkterm"
-#define MyAppExeName "wezterm-gui.exe"
+#define MyAppExeName "thinkterm-gui.exe"
 
 [Setup]
 AppId={{56CBA99B-8F65-4EC0-8CE4-F13BFCB70274}
@@ -45,8 +45,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\target\release\thinkterm.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\wezterm.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\wezterm-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\wezterm-mux-server.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\thinkterm-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\thinkterm-mux-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\mesa\opengl32.dll"; DestDir: "{app}\mesa"; Flags: ignoreversion
 Source: "..\target\release\libEGL.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\libGLESv2.dll"; DestDir: "{app}"; Flags: ignoreversion
