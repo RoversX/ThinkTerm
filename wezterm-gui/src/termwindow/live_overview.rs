@@ -122,12 +122,11 @@ fn preview_refresh_interval() -> Duration {
 /// overview used to do in a single frame -- takes 397ms. The budget covers a
 /// card's *first* capture as well as its refreshes for that last reason.
 const MAX_PREVIEW_CAPTURES_PER_FRAME: usize = 1;
-/// How long after the last observed stale preview the repaint chain stays
-/// armed. A little longer than the default refresh interval, so that with a
-/// continuously updating terminal the next staleness lands before the hold
-/// expires and the chain never flaps; once output stops, the overview
-/// settles back to event-driven repaints within one interval.
-const PREVIEW_STALE_CHAIN_HOLD: Duration = Duration::from_millis(400);
+/// The first capturing frame after opening may seed this many cards at once:
+/// a one-frame cost spike at the exact moment a spike is least visible (the
+/// open transition is still running) in exchange for the overview arriving
+/// mostly populated instead of popping thumbnails in one per frame.
+const FIRST_FRAME_CAPTURE_BUDGET: usize = 4;
 /// How often a card re-asks what its terminal is running.
 ///
 /// `CachePolicy::AllowStale` is not the cheap read its name suggests: it takes
@@ -336,17 +335,21 @@ pub(crate) struct LiveOverviewView {
     scroll_animating: bool,
     next_preview_refresh: Option<Instant>,
     scrollbar_visible_until: Option<Instant>,
-    /// The last time a warm card reported content newer than what is on
-    /// screen (a changed fingerprint that the refresh throttle has not
-    /// let us capture yet, or a capture we owe). Drives the repaint
-    /// chain: while previews are live, every frame asks for the next one
-    /// and the display paces us; when they go quiet we stop asking and
-    /// the overview costs nothing.
-    last_preview_stale: Option<Instant>,
+    /// Set during a layout pass when the capture budget ran out with cards
+    /// still owed a capture. Only this — queued work — justifies chaining
+    /// another frame immediately; a card that is merely throttled names its
+    /// time via `next_preview_refresh` and costs nothing until then. The
+    /// old scheme chained at display rate for as long as any card was live,
+    /// which replayed every card's quads at 120fps to show no change.
+    capture_backlog: bool,
     /// Opening a full-window view records the terminal on the same frame as
     /// the overview's first layout. Skip thumbnail capture that frame so the
     /// click is not charged for both at once.
     defer_preview_captures: bool,
+    /// One-shot budget boost for the first capturing frame after the defer
+    /// lifts: with many cards, filling in strictly one per frame reads as
+    /// thumbnails popping in one at a time.
+    boost_next_capture_budget: bool,
 }
 
 impl LiveOverviewView {
@@ -389,8 +392,9 @@ impl LiveOverviewView {
             scroll_animating: false,
             next_preview_refresh: None,
             scrollbar_visible_until: None,
-            last_preview_stale: None,
+            capture_backlog: false,
             defer_preview_captures: false,
+            boost_next_capture_budget: true,
         }
     }
 
@@ -649,7 +653,12 @@ impl LiveOverviewView {
         } else {
             preview_refresh_interval()
         });
-        let mut capture_budget = MAX_PREVIEW_CAPTURES_PER_FRAME;
+        let mut capture_budget = if std::mem::take(&mut self.boost_next_capture_budget) {
+            FIRST_FRAME_CAPTURE_BUDGET
+        } else {
+            MAX_PREVIEW_CAPTURES_PER_FRAME
+        };
+        self.capture_backlog = false;
         let mut warm_keys = HashSet::new();
         let mut seen_keys = HashSet::new();
         if groups.is_empty() {
@@ -775,13 +784,16 @@ impl LiveOverviewView {
                             );
                             if let Some(refresh_due) = refresh_due {
                                 // A `Some` here means the card's fingerprint no
-                                // longer matches what was captured: there is newer
-                                // content than what is on screen (or no capture
-                                // yet). That -- not the refresh timer on its own
-                                // -- is what justifies asking for a steady stream
-                                // of frames. Cursor blink does not move the
+                                // longer matches what was captured. A future
+                                // instant is a throttled card naming its time; a
+                                // due-now one is a card the exhausted budget
+                                // turned away -- queued work, and the only thing
+                                // that justifies chaining another frame
+                                // immediately. Cursor blink does not move the
                                 // fingerprint, so idle cursors stay idle.
-                                self.last_preview_stale = Some(now);
+                                if refresh_due <= now {
+                                    self.capture_backlog = true;
+                                }
                                 self.next_preview_refresh = Some(
                                     self.next_preview_refresh
                                         .map_or(refresh_due, |current| current.min(refresh_due)),
@@ -1150,15 +1162,13 @@ impl LiveOverviewView {
         // the repaint scheduler and the backend, which already throttle to
         // this panel's refresh rate.
         let motion_deadline = (self.card_motion_running || self.scroll_animating).then_some(now);
-        // While any card is showing stale content, chain frames at the
-        // display's pace instead of waking once per refresh timer: six cards
-        // on a 300ms throttle wake 20 times a second otherwise, which paints
-        // a busy overview at a juddery ~20fps. The hold-out spans a little
-        // more than one refresh interval so the chain does not flap in the
-        // gap between a capture and the next burst of output.
-        let stale_deadline = self.last_preview_stale.and_then(|stale| {
-            (now.duration_since(stale) < PREVIEW_STALE_CHAIN_HOLD).then_some(now)
-        });
+        // Chain an immediate frame only while the last layout pass turned
+        // cards away for lack of capture budget -- queued work being drained
+        // one card per frame. Cards that are merely throttled name their
+        // moment through `next_preview_refresh`; painting between those
+        // moments would replay every card's quads to show no change, which
+        // at ten busy cards was measured as ~21% of the main thread.
+        let backlog_deadline = self.capture_backlog.then_some(now);
         // Before the fade begins one frame is enough -- the one that starts
         // it. Inside the fade every frame counts.
         let scrollbar_deadline = self.scrollbar_visible_until.and_then(|until| {
@@ -1173,7 +1183,7 @@ impl LiveOverviewView {
         });
         [
             motion_deadline,
-            stale_deadline,
+            backlog_deadline,
             self.next_preview_refresh,
             scrollbar_deadline,
         ]
@@ -1572,6 +1582,11 @@ impl ContentView for LiveOverviewView {
     }
 
     fn set_defer_preview_captures(&mut self, defer: bool) {
+        if self.defer_preview_captures && !defer {
+            // The defer just lifted: the next layout pass is the first one
+            // allowed to capture. Let it seed several cards at once.
+            self.boost_next_capture_budget = true;
+        }
         self.defer_preview_captures = defer;
     }
 
@@ -2788,24 +2803,24 @@ mod tests {
     }
 
     #[test]
-    fn stale_previews_chain_frames_at_display_pace_then_settle() {
+    fn capture_backlog_chains_frames_and_throttled_cards_use_the_timer() {
         let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
         let now = Instant::now();
 
-        // Nothing has ever been stale: no chain, no deadline, zero cost.
+        // Nothing pending: no chain, no deadline, zero cost.
         assert_eq!(view.next_frame_deadline(now), None);
 
-        // A card just reported newer content than what is on screen: ask for
-        // the next frame immediately and let the display pace us.
-        view.last_preview_stale = Some(now);
+        // The last layout pass turned cards away for lack of budget: chain
+        // the next frame immediately so the queue drains one card per frame.
+        view.capture_backlog = true;
         assert_eq!(view.next_frame_deadline(now), Some(now));
-        // The hold spans the gap between a capture and the next output burst.
-        let within_hold = now + PREVIEW_STALE_CHAIN_HOLD - Duration::from_millis(1);
-        assert_eq!(view.next_frame_deadline(within_hold), Some(within_hold));
 
-        // Once previews have stayed quiet past the hold, the chain lets go.
-        let past_hold = now + PREVIEW_STALE_CHAIN_HOLD;
-        assert_eq!(view.next_frame_deadline(past_hold), None);
+        // Backlog drained; a merely throttled card names its own moment and
+        // nothing paints in between.
+        view.capture_backlog = false;
+        let refresh_at = now + Duration::from_millis(300);
+        view.next_preview_refresh = Some(refresh_at);
+        assert_eq!(view.next_frame_deadline(now), Some(refresh_at));
     }
 
     #[test]
