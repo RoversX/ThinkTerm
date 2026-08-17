@@ -50,6 +50,16 @@ pub fn alloc_font_id() -> LoadedFontId {
 
 lazy_static::lazy_static! {
     static ref LAST_WARNING: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
+    /// Fallback resolution results, process-wide, keyed by config generation
+    /// and the sorted missing codepoints. Resolution depends on neither font
+    /// size nor scale, but every LoadedFont (one per preview scale bucket in
+    /// the GUI) used to re-run the async resolve for the same codepoints and
+    /// answer its arrival by throwing away every shape cache. A memo hit is
+    /// a synchronous insert with nothing to clear. An empty entry records
+    /// "nothing provides these", which also stops unresolvable glyphs from
+    /// re-scheduling the resolver once per font forever.
+    static ref FALLBACK_RESOLVE_MEMO: Mutex<HashMap<(usize, Vec<char>), Vec<ParsedFont>>> =
+        Mutex::new(HashMap::new());
 }
 
 pub struct LoadedFont {
@@ -156,7 +166,7 @@ impl LoadedFont {
         }
     }
 
-    pub fn shape<F: FnOnce() + Send + 'static, FS: FnOnce(&mut Vec<char>)>(
+    pub fn shape<F: FnOnce() + Send + 'static, FS: FnMut(&mut Vec<char>)>(
         &self,
         text: &str,
         completion: F,
@@ -178,68 +188,110 @@ impl LoadedFont {
         Ok(res)
     }
 
-    fn shape_impl<F: FnOnce() + Send + 'static, FS: FnOnce(&mut Vec<char>)>(
+    fn shape_impl<F: FnOnce() + Send + 'static, FS: FnMut(&mut Vec<char>)>(
         &self,
         text: &str,
         completion: F,
-        filter_out_synthetic: FS,
+        mut filter_out_synthetic: FS,
         presentation: Option<Presentation>,
         direction: Direction,
         range: Option<Range<usize>>,
         presentation_width: Option<&PresentationWidth>,
     ) -> anyhow::Result<(bool, Vec<GlyphInfo>)> {
-        let mut no_glyphs = vec![];
-
-        {
-            let mut pending = self.pending_fallback.lock().unwrap();
-            if !pending.is_empty() {
-                match self.insert_fallback_handles(pending.split_off(0)) {
-                    Ok(true) => return Err(ClearShapeCache {})?,
-                    Ok(false) => {}
-                    Err(err) => {
-                        log::error!("Error adding fallback: {:#}", err);
+        let mut completion = Some(completion);
+        let mut consulted_memo = false;
+        loop {
+            {
+                let mut pending = self.pending_fallback.lock().unwrap();
+                if !pending.is_empty() {
+                    match self.insert_fallback_handles(pending.split_off(0)) {
+                        Ok(true) => return Err(ClearShapeCache {})?,
+                        Ok(false) => {}
+                        Err(err) => {
+                            log::error!("Error adding fallback: {:#}", err);
+                        }
                     }
                 }
             }
-        }
 
-        let result = self.shaper.borrow().shape(
-            text,
-            self.font_size,
-            self.dpi,
-            &mut no_glyphs,
-            presentation,
-            direction,
-            range,
-            presentation_width,
-        );
+            let mut no_glyphs = vec![];
+            let result = self.shaper.borrow().shape(
+                text,
+                self.font_size,
+                self.dpi,
+                &mut no_glyphs,
+                presentation,
+                direction,
+                range.clone(),
+                presentation_width,
+            );
 
-        no_glyphs.retain(|&c| c != '\u{FE0F}' && c != '\u{FE0E}');
-        filter_out_synthetic(&mut no_glyphs);
+            no_glyphs.retain(|&c| c != '\u{FE0F}' && c != '\u{FE0E}');
+            filter_out_synthetic(&mut no_glyphs);
+            no_glyphs
+                .retain(|c| !self.tried_glyphs.borrow().contains(c));
+            no_glyphs.sort();
+            no_glyphs.dedup();
 
-        let mut tried_glyphs = self.tried_glyphs.borrow_mut();
-        no_glyphs.retain(|c| !tried_glyphs.contains(c));
-        for c in &no_glyphs {
-            tried_glyphs.insert(*c);
-        }
-
-        no_glyphs.sort();
-        no_glyphs.dedup();
-
-        let mut async_resolve = false;
-
-        if !no_glyphs.is_empty() {
-            if let Some(font_config) = self.font_config.upgrade() {
-                font_config.schedule_fallback_resolve(
-                    no_glyphs,
-                    &self.pending_fallback,
-                    completion,
-                );
-                async_resolve = true;
+            // A previously resolved answer for exactly these codepoints can be
+            // installed synchronously and the shape simply redone: nothing
+            // upstream has cached this attempt, so there is nothing to clear
+            // -- where the async path answers with ClearShapeCache and throws
+            // away every shape cache in the window.
+            if !no_glyphs.is_empty() && !consulted_memo {
+                if let Some(font_config) = self.font_config.upgrade() {
+                    let generation = font_config.config.borrow().generation();
+                    let memo = FALLBACK_RESOLVE_MEMO
+                        .lock()
+                        .unwrap()
+                        .get(&(generation, no_glyphs.clone()))
+                        .cloned();
+                    if let Some(handles) = memo {
+                        consulted_memo = true;
+                        let inserted = if handles.is_empty() {
+                            false
+                        } else {
+                            self.insert_fallback_handles(handles).unwrap_or_else(|err| {
+                                log::error!("Error adding memoized fallback: {:#}", err);
+                                false
+                            })
+                        };
+                        if inserted {
+                            continue;
+                        }
+                        // The memo says nothing (new) provides these: record
+                        // them as tried and settle for placeholder glyphs
+                        // without waking the resolver.
+                        let mut tried_glyphs = self.tried_glyphs.borrow_mut();
+                        for c in &no_glyphs {
+                            tried_glyphs.insert(*c);
+                        }
+                        return result.map(|r| (false, r));
+                    }
+                }
             }
-        }
 
-        result.map(|r| (async_resolve, r))
+            let mut async_resolve = false;
+
+            if !no_glyphs.is_empty() {
+                {
+                    let mut tried_glyphs = self.tried_glyphs.borrow_mut();
+                    for c in &no_glyphs {
+                        tried_glyphs.insert(*c);
+                    }
+                }
+                if let Some(font_config) = self.font_config.upgrade() {
+                    font_config.schedule_fallback_resolve(
+                        no_glyphs,
+                        &self.pending_fallback,
+                        completion.take().expect("fallback scheduled at most once"),
+                    );
+                    async_resolve = true;
+                }
+            }
+
+            return result.map(|r| (async_resolve, r));
+        }
     }
 
     pub fn metrics_for_idx(&self, font_idx: usize) -> anyhow::Result<FontMetrics> {
@@ -306,6 +358,9 @@ struct FallbackResolveInfo {
 impl FallbackResolveInfo {
     fn process(self) {
         let fallback_str = self.no_glyphs.iter().collect::<String>();
+        // The codepoints arrive sorted and deduped from shape_impl; keep a
+        // copy as the memo key before `wanted` consumes the list below.
+        let memo_glyphs = self.no_glyphs.clone();
         let mut extra_handles = vec![];
 
         log::trace!(
@@ -385,6 +440,14 @@ impl FallbackResolveInfo {
             }
             Err(_) => false,
         });
+
+        // Remember the outcome -- including an empty one -- so the next
+        // LoadedFont missing these same codepoints resolves synchronously
+        // instead of repeating this search and clearing every shape cache.
+        FALLBACK_RESOLVE_MEMO.lock().unwrap().insert(
+            (self.config.generation(), memo_glyphs),
+            extra_handles.clone(),
+        );
 
         if !extra_handles.is_empty() {
             let mut pending = self.pending.lock().unwrap();
