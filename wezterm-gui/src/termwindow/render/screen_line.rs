@@ -872,7 +872,9 @@ impl crate::TermWindow {
 
             let style_params = last_style.as_ref().expect("we just set it up").clone();
 
-            let glyph_info = if params.simple_shaping {
+            let glyph_info = if params.simple_shaping
+                || cluster_is_tui_graphics(&cluster.text)
+            {
                 self.cached_cluster_shape_by_cell(
                     style_params.style,
                     &cluster,
@@ -932,4 +934,25 @@ impl crate::TermWindow {
 
         Ok((shaped, invalidate_on_hover_change))
     }
+}
+
+/// True when the cluster is TUI graphics: every char is a box-drawing,
+/// block, geometric, braille or powerline/private-use codepoint (spaces
+/// allowed, at least one graphic required). These never ligate or
+/// context-shape, so per-cell shaping is lossless -- and busy TUIs
+/// regenerate such runs with fresh text every frame, which makes the
+/// whole-run shape-cache key a permanent miss no matter the cache size.
+/// Routing them through the per-cell path caches each glyph once.
+fn cluster_is_tui_graphics(text: &str) -> bool {
+    let mut saw_graphic = false;
+    for c in text.chars() {
+        match c {
+            ' ' => {}
+            '\u{2500}'..='\u{25FF}' | '\u{2800}'..='\u{28FF}' | '\u{E000}'..='\u{F8FF}' => {
+                saw_graphic = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_graphic
 }
