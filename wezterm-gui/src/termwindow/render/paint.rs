@@ -58,6 +58,16 @@ const TAB_BAR_SEAM_HEIGHT: f32 = 1.0;
 /// drains at one per frame.
 const MAX_PREVIEW_QUAD_REBUILDS_PER_FRAME: usize = 1;
 
+/// How long one frame may spend rebuilding a card before the rest of the work
+/// is carried over to the next frame.
+///
+/// The one-card budget above bounds *how many* cards rebuild per frame, but
+/// not how big that card is: a full-window card of braille TUI output measured
+/// 29ms at p99 and 71ms at worst -- two to four missed frames for one card.
+/// Slicing inside the card caps the per-frame cost; the partially built card
+/// keeps showing its previous texture until the new picture is complete.
+const PREVIEW_REBUILD_SLICE: Duration = Duration::from_millis(3);
+
 /// Everything a card's recorded quads depend on.
 ///
 /// Equal keys mean the recorded heap still draws the right picture and can be
@@ -134,13 +144,35 @@ pub(crate) struct CachedPreviewQuads {
     texture: Option<Rc<crate::termwindow::webgpu::CardRenderTexture>>,
 }
 
+/// A card rebuild in flight, sliced across frames.
+///
+/// A single slot rather than a map: the per-frame rebuild budget is one card,
+/// so at most one card is ever mid-rebuild. A different card claiming the
+/// budget simply drops the slot and the interrupted card starts over when its
+/// turn comes back.
+pub(crate) struct PreviewRebuildPartial {
+    tab_id: TabId,
+    key: PreviewQuadKey,
+    /// Keeps `key.snapshot`'s address alive, same as the cache entry.
+    #[allow(dead_code)]
+    snapshot: Arc<crate::termwindow::content_view::TerminalPreviewSnapshot>,
+    heap: HeapQuadAllocator,
+    /// Resume point: the next pane and the next line within it.
+    pane_idx: usize,
+    line_idx: usize,
+}
+
 /// A card whose heap must be rendered into its texture this frame, queued by
 /// the paint pass and encoded by `draw_webgpu_layers` before the main pass.
 pub(crate) struct PendingCardRender {
     pub texture: Rc<crate::termwindow::webgpu::CardRenderTexture>,
-    /// The card's quads, flattened; positions are window-centre-relative and
-    /// the pass's projection maps `area` onto the texture.
-    pub verts: Vec<crate::quad::Vertex>,
+    /// Where this card's flattened quads live inside the window's shared
+    /// `card_frame_verts` buffer. A range instead of an owned Vec: extracting
+    /// a large card is a multi-megabyte allocation, and doing that per rebuild
+    /// (plus a per-frame combined copy in draw) was the biggest source of
+    /// malloc large-block churn.
+    pub first_vertex: usize,
+    pub quad_count: usize,
     /// The rect (top-left window pixels) the verts were recorded against.
     pub area: RectF,
 }
@@ -1348,6 +1380,14 @@ impl crate::TermWindow {
             self.preview_quad_cache
                 .borrow_mut()
                 .retain(|tab_id, _| live.contains(tab_id));
+            // Same policy for a rebuild sliced across frames: its card is gone.
+            let mut partial = self.preview_rebuild_partial.borrow_mut();
+            if partial
+                .as_ref()
+                .is_some_and(|partial| !live.contains(&partial.tab_id))
+            {
+                *partial = None;
+            }
         }
         let started = crate::perf::now();
         crate::perf::reset_accums();
@@ -1476,24 +1516,83 @@ impl crate::TermWindow {
         }
 
         *budget = budget.saturating_sub(1);
-        // Reuse the stale entry's boxes rather than freeing thousands of them
-        // and asking for the same number back on the next line of this
-        // function. `recycle` empties the layers into the spare pool.
-        let (mut heap, prior_texture) = match self
+
+        // Continue the sliced rebuild when the slot holds this card and the
+        // key still describes the same picture; anything else in the slot is
+        // stale and a fresh build starts. The old cache entry stays in place
+        // meanwhile -- it is what keeps the card showing its previous picture
+        // until the new one is complete.
+        let mut partial = match self.preview_rebuild_partial.borrow_mut().take() {
+            Some(partial) if partial.tab_id == preview.tab_id && partial.key == key => partial,
+            _ => {
+                // When the old entry's texture can carry the display duty by
+                // itself, take its quad storage: recycling keeps the rebuild
+                // allocation-free instead of freeing thousands of quads and
+                // asking for the same memory back a moment later.
+                let mut heap = HeapQuadAllocator::default();
+                if let Some(cached) = self
+                    .preview_quad_cache
+                    .borrow_mut()
+                    .get_mut(&preview.tab_id)
+                    .filter(|cached| cached.texture.is_some())
+                {
+                    heap = std::mem::take(&mut cached.heap);
+                    heap.recycle();
+                }
+                PreviewRebuildPartial {
+                    tab_id: preview.tab_id,
+                    key,
+                    snapshot: Arc::clone(&preview.snapshot),
+                    heap,
+                    pane_idx: 0,
+                    line_idx: 0,
+                }
+            }
+        };
+        let finished = {
+            let card_started = crate::perf::now();
+            let deadline = Instant::now() + PREVIEW_REBUILD_SLICE;
+            let mut heap_layers = TripleLayerQuadAllocator::Heap(&mut partial.heap);
+            let finished = self.paint_terminal_preview_unclipped(
+                &mut heap_layers,
+                preview,
+                &mut partial.pane_idx,
+                &mut partial.line_idx,
+                deadline,
+            )?;
+            crate::perf::log_duration("preview_rebuild_card", card_started);
+            finished
+        };
+        if !finished {
+            // Keep the card's previous picture on screen: its texture
+            // stretches to the current rect even across a geometry change,
+            // and a card that never had one simply stays background until
+            // the first build lands.
+            if !(self.card_texture_path_active() && self.composite_cached_card(preview)?) {
+                let cache = self.preview_quad_cache.borrow();
+                if let Some(cached) = cache.get(&preview.tab_id) {
+                    if cached.area == preview.area {
+                        cached.heap.apply_to_clipped(layers, clip, 1.0)?;
+                    } else {
+                        let source = quad_clip_rect(cached.area, &self.dimensions);
+                        let target = quad_clip_rect(preview.area, &self.dimensions);
+                        cached
+                            .heap
+                            .apply_to_scaled(layers, source, target, clip, 1.0)?;
+                    }
+                }
+            }
+            *self.preview_rebuild_partial.borrow_mut() = Some(partial);
+            // The rest of this card's build should get the very next frame.
+            self.update_next_frame_time(Some(Instant::now()));
+            return Ok(true);
+        }
+        let PreviewRebuildPartial { heap, .. } = partial;
+        let prior_texture = self
             .preview_quad_cache
             .borrow_mut()
             .remove(&preview.tab_id)
-        {
-            Some(cached) => (cached.heap, cached.texture),
-            None => (HeapQuadAllocator::default(), None),
-        };
-        heap.recycle();
-        {
-            let card_started = crate::perf::now();
-            let mut heap_layers = TripleLayerQuadAllocator::Heap(&mut heap);
-            self.paint_terminal_preview_unclipped(&mut heap_layers, preview)?;
-            crate::perf::log_duration("preview_rebuild_card", card_started);
-        }
+            .and_then(|cached| cached.texture);
         let mut texture = None;
         let result = if self.card_texture_path_active() {
             // Reuse the previous texture when the card size is unchanged --
@@ -1509,11 +1608,16 @@ impl crate::TermWindow {
             };
             match tex {
                 Ok(tex) => {
-                    let mut verts = Vec::new();
-                    heap.extract_vertices(&mut verts);
+                    let (first_vertex, quad_count) = {
+                        let mut frame_verts = self.card_frame_verts.borrow_mut();
+                        let base = frame_verts.len();
+                        heap.extract_vertices(&mut frame_verts);
+                        (base, (frame_verts.len() - base) / 4)
+                    };
                     self.pending_card_renders.borrow_mut().push(PendingCardRender {
                         texture: Rc::clone(&tex),
-                        verts,
+                        first_vertex,
+                        quad_count,
                         area: preview.area,
                     });
                     self.card_composites.borrow_mut().push(CardComposite {
@@ -1593,18 +1697,21 @@ impl crate::TermWindow {
                     return Ok(false);
                 }
             };
-            let mut verts = Vec::new();
-            {
+            let (first_vertex, quad_count) = {
                 let mut cache = self.preview_quad_cache.borrow_mut();
                 let Some(cached) = cache.get_mut(&preview.tab_id) else {
                     return Ok(false);
                 };
-                cached.heap.extract_vertices(&mut verts);
+                let mut frame_verts = self.card_frame_verts.borrow_mut();
+                let base = frame_verts.len();
+                cached.heap.extract_vertices(&mut frame_verts);
                 cached.texture = Some(Rc::clone(&texture));
-            }
+                (base, (frame_verts.len() - base) / 4)
+            };
             self.pending_card_renders.borrow_mut().push(PendingCardRender {
                 texture,
-                verts,
+                first_vertex,
+                quad_count,
                 area: recorded_area,
             });
         }
@@ -1679,18 +1786,27 @@ impl crate::TermWindow {
         quantized_scale
     }
 
+    /// Returns whether the card is complete. `false` means the slice deadline
+    /// arrived first: the resume indices point at the next line to render and
+    /// the caller re-enters with the same heap on a later frame. Everything
+    /// outside the line loop is either recomputed idempotently on re-entry
+    /// (scale search, font lookups) or guarded by the resume indices (the
+    /// background fills, which would otherwise be recorded twice).
     fn paint_terminal_preview_unclipped(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         preview: &TerminalPreviewRequest,
-    ) -> anyhow::Result<()> {
+        resume_pane: &mut usize,
+        resume_line: &mut usize,
+        deadline: Instant,
+    ) -> anyhow::Result<bool> {
         let snapshot = &preview.snapshot;
         let tab_size = snapshot.tab_size;
         if tab_size.cols == 0 || tab_size.rows == 0 {
-            return Ok(());
+            return Ok(true);
         }
         if snapshot.panes.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
 
         // A thumbnail represents the whole terminal surface, not just the
@@ -1703,7 +1819,9 @@ impl crate::TermWindow {
             .or_else(|| snapshot.panes.first())
             .map(|pane| pane.palette.resolve_bg(ColorAttribute::Default).to_linear())
             .expect("checked that the tab has panes");
-        self.filled_rectangle(layers, 0, preview.area, preview_background)?;
+        if *resume_pane == 0 && *resume_line == 0 {
+            self.filled_rectangle(layers, 0, preview.area, preview_background)?;
+        }
 
         // Quantization bounds the number of cached FontConfigurations even
         // when cards continuously resize. Flooring guarantees the terminal
@@ -1824,7 +1942,14 @@ impl crate::TermWindow {
         let mut hidden_cursor = StableCursorPosition::default();
         hidden_cursor.y = isize::MIN;
 
-        for pane in &snapshot.panes {
+        let mut rendered_this_slice = 0usize;
+        for (pane_idx, pane) in snapshot.panes.iter().enumerate().skip(*resume_pane) {
+            // Lines already recorded in an earlier slice of this same build.
+            let start_line = if pane_idx == *resume_pane {
+                *resume_line
+            } else {
+                0
+            };
             let palette = &pane.palette;
             let pane_x = origin_x + pane.left as f32 * cell_width;
             let pane_y = origin_y + pane.top as f32 * cell_height;
@@ -1834,12 +1959,14 @@ impl crate::TermWindow {
             let Some(pane_bounds) = pane_rect.intersection(&preview.area) else {
                 continue;
             };
-            self.filled_rectangle(
-                layers,
-                0,
-                pane_bounds,
-                palette.resolve_bg(ColorAttribute::Default).to_linear(),
-            )?;
+            if start_line == 0 {
+                self.filled_rectangle(
+                    layers,
+                    0,
+                    pane_bounds,
+                    palette.resolve_bg(ColorAttribute::Default).to_linear(),
+                )?;
+            }
 
             let source_dims = pane.dimensions;
             let rows = pane.rows;
@@ -1965,10 +2092,20 @@ impl crate::TermWindow {
             let source_visible_bottom =
                 (pane_bounds.max_y() - grid_top) * rendered_height / grid_height.max(1.0);
 
-            for (line_idx, line) in pane.lines.iter().take(rows).enumerate() {
+            for (line_idx, line) in pane.lines.iter().take(rows).enumerate().skip(start_line) {
                 let y = line_idx as f32 * pane_cell_height;
                 if y + pane_cell_height <= source_visible_top || y >= source_visible_bottom {
                     continue;
+                }
+                // Out of time: park the resume point at this line. Requiring
+                // one rendered line first guarantees forward progress even
+                // when a single line overruns the whole slice.
+                if rendered_this_slice > 0 && Instant::now() >= deadline {
+                    *resume_pane = pane_idx;
+                    *resume_line = line_idx;
+                    let cleared = layers.set_heap_position_transform(None);
+                    debug_assert!(cleared);
+                    return Ok(false);
                 }
                 let hash_started = crate::perf::now();
                 let shape_hash = self.shape_hash_for_line(line);
@@ -2059,6 +2196,7 @@ impl crate::TermWindow {
                 // may have claimed a blink/expiry deadline of its own, and a
                 // merge would let the thumbnail keep it.
                 *self.has_animation.borrow_mut() = next_due;
+                rendered_this_slice += 1;
             }
 
             // Draw a non-blinking cursor for the active split. The regular
@@ -2140,7 +2278,7 @@ impl crate::TermWindow {
                 self.filled_rectangle(layers, 2, visible, split_color)?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     pub fn paint_modal(&mut self) -> anyhow::Result<()> {
@@ -2639,6 +2777,8 @@ impl crate::TermWindow {
         // Card texture work is queued per pass; a retried pass re-queues it.
         self.pending_card_renders.borrow_mut().clear();
         self.card_composites.borrow_mut().clear();
+        // Truncate, not drop: the buffer's capacity is the whole point.
+        self.card_frame_verts.borrow_mut().clear();
         {
             let gl_state = self.render_state.as_ref().unwrap();
             for layer in gl_state.layers.borrow().iter() {

@@ -1503,9 +1503,16 @@ pub struct TermWindow {
     /// wholesale when the glyph atlas is repacked -- the quads hold atlas
     /// coordinates.
     preview_quad_cache: RefCell<HashMap<TabId, crate::termwindow::render::paint::CachedPreviewQuads>>,
+    /// The one card rebuild currently sliced across frames, if any.
+    preview_rebuild_partial:
+        RefCell<Option<crate::termwindow::render::paint::PreviewRebuildPartial>>,
     /// Cards whose heap must be rendered into their texture this frame;
     /// queued by the paint pass, encoded by draw before the main pass.
     pending_card_renders: RefCell<Vec<crate::termwindow::render::paint::PendingCardRender>>,
+    /// Flattened vertices for every pending card render and composite quad of
+    /// the current frame, in one persistent grow-only buffer. Cleared (not
+    /// dropped) each pass so rebuilds stop allocating megabytes per card.
+    card_frame_verts: RefCell<Vec<crate::quad::Vertex>>,
     /// One textured quad per card standing in for its glyph quads.
     card_composites: RefCell<Vec<crate::termwindow::render::paint::CardComposite>>,
     /// The settled frame's composites, kept so a closing overview's ghost
@@ -2110,6 +2117,8 @@ impl TermWindow {
         // braces -- but the two live in different files and the invariant
         // belongs with the rest of the captures.
         self.preview_quad_cache.borrow_mut().clear();
+        // The half-built card holds the same kind of atlas-addressed quads.
+        *self.preview_rebuild_partial.borrow_mut() = None;
         let Some(fade) = self.content_view_fade.as_mut() else {
             return;
         };
@@ -2455,7 +2464,9 @@ impl TermWindow {
             pane_font_cache: RefCell::new(HashMap::new()),
             pane_font_cache_tick: Cell::new(0),
             preview_quad_cache: RefCell::new(HashMap::new()),
+            preview_rebuild_partial: RefCell::new(None),
             pending_card_renders: RefCell::new(Vec::new()),
+            card_frame_verts: RefCell::new(Vec::new()),
             card_composites: RefCell::new(Vec::new()),
             content_view_last_composites: RefCell::new(Vec::new()),
             card_scratch: RefCell::new(None),

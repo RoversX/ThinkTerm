@@ -12,7 +12,7 @@ use ::window::glium::{
 };
 use ::window::*;
 use anyhow::Context;
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::convert::TryInto;
 use std::rc::Rc;
 use wezterm_font::FontConfiguration;
@@ -414,10 +414,19 @@ impl<'a> QuadAllocator for MappedQuads<'a> {
 
 pub struct TripleVertexBuffer {
     pub index: RefCell<usize>,
-    pub bufs: RefCell<[VertexBuffer; 3]>,
+    /// One buffer for WebGPU, three rotating buffers for Glium. Glium maps
+    /// buffer memory directly, so it rotates to avoid writing into a buffer
+    /// the GPU is still reading; WebGPU uploads go through
+    /// `queue.write_buffer`, which is ordered on the queue timeline, so a
+    /// single buffer is safe and costs a third of the memory.
+    pub bufs: RefCell<Vec<VertexBuffer>>,
     pub indices: IndexBuffer,
     pub capacity: usize,
     pub next_quad: RefCell<usize>,
+    /// Peak quad usage seen in the current shrink observation window.
+    high_water: Cell<usize>,
+    /// Frames observed so far in the current shrink window.
+    frames_observed: Cell<u32>,
 }
 
 /// A trait to avoid broadly-scoped transmutes; we only want to
@@ -537,7 +546,13 @@ impl TripleVertexBuffer {
     pub fn current_vb_mut(&self) -> RefMut<'static, VertexBuffer> {
         let index = *self.index.borrow();
         let bufs = self.bufs.borrow_mut();
-        unsafe { RefMut::map(bufs, |bufs| &mut bufs[index]).extend_lifetime() }
+        unsafe {
+            RefMut::map(bufs, |bufs| {
+                let len = bufs.len();
+                &mut bufs[index % len]
+            })
+            .extend_lifetime()
+        }
     }
 
     pub fn next_index(&self) {
@@ -546,6 +561,28 @@ impl TripleVertexBuffer {
         if *index >= 3 {
             *index = 0;
         }
+    }
+
+    /// Record this frame's quad usage; once usage has stayed well below
+    /// capacity for a whole observation window, return the capacity to
+    /// shrink to. Vertex buffers only ever grew before this, so a single
+    /// spike (opening the overview on a wall of busy panes) pinned tens of
+    /// megabytes of staging + GPU memory forever.
+    fn shrink_target(&self) -> Option<usize> {
+        const OBSERVE_FRAMES: u32 = 120;
+        const MIN_QUADS: usize = 32;
+        let used = *self.next_quad.borrow();
+        self.high_water.set(self.high_water.get().max(used));
+        let frames = self.frames_observed.get() + 1;
+        self.frames_observed.set(frames);
+        if frames < OBSERVE_FRAMES {
+            return None;
+        }
+        let high_water = self.high_water.get();
+        self.frames_observed.set(0);
+        self.high_water.set(0);
+        let target = (high_water.max(MIN_QUADS) * 5 / 4).next_power_of_two();
+        (self.capacity > target * 2).then_some(target)
     }
 }
 
@@ -658,16 +695,23 @@ impl RenderLayer {
             indices.push(idx + V_BOT_RIGHT as u32);
         }
 
+        let copies = match context {
+            RenderContext::Glium(_) => 3,
+            RenderContext::WebGpu(_) => 1,
+        };
+        let mut bufs = Vec::with_capacity(copies);
+        for _ in 0..copies {
+            bufs.push(context.allocate_vertex_buffer(num_quads, &verts)?);
+        }
+
         let buffer = TripleVertexBuffer {
             index: RefCell::new(0),
-            bufs: RefCell::new([
-                context.allocate_vertex_buffer(num_quads, &verts)?,
-                context.allocate_vertex_buffer(num_quads, &verts)?,
-                context.allocate_vertex_buffer(num_quads, &verts)?,
-            ]),
+            bufs: RefCell::new(bufs),
             capacity: num_quads,
             indices: context.allocate_index_buffer(&indices)?,
             next_quad: RefCell::new(0),
+            high_water: Cell::new(0),
+            frames_observed: Cell::new(0),
         };
 
         Ok(buffer)
@@ -806,6 +850,27 @@ impl RenderState {
         }
 
         Ok(allocated)
+    }
+
+    /// Give back vertex buffer memory once a usage spike has passed. Called
+    /// after the frame's draw has been submitted, while `next_quad` still
+    /// holds this frame's usage. WebGPU only: dropping the old wgpu buffer is
+    /// deferred until the GPU is done with it, whereas glium's rotating
+    /// buffers are persistently mapped and are left alone.
+    pub fn maybe_shrink_quads(&self) {
+        if matches!(self.context, RenderContext::Glium(_)) {
+            return;
+        }
+        for layer in self.layers.borrow().iter() {
+            for vb_idx in 0..3 {
+                let target = layer.vb.borrow()[vb_idx].shrink_target();
+                if let Some(target) = target {
+                    if let Err(err) = layer.reallocate_quads(vb_idx, target) {
+                        log::error!("failed to shrink vertex buffer: {err:#}");
+                    }
+                }
+            }
+        }
     }
 
     fn compile_prog(

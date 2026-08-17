@@ -454,6 +454,12 @@ impl Drop for TabGeometryTransaction<'_> {
 
 const BUFSIZE: usize = 1024 * 1024;
 
+/// Size of the per-pane pty read buffer. This lives for the lifetime of the
+/// pane's reader thread, so it is sized for what a single read() can actually
+/// return (the kernel tty buffer is far smaller than this) rather than
+/// BUFSIZE, which would pin 1MB per pane.
+const PTY_READ_BUFSIZE: usize = 64 * 1024;
+
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
 fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: Vec<Action>) {
@@ -618,7 +624,7 @@ fn read_from_pane_pty(
     banner: Option<String>,
     mut reader: Box<dyn std::io::Read>,
 ) {
-    let mut buf = vec![0; BUFSIZE];
+    let mut buf = vec![0; PTY_READ_BUFSIZE];
 
     // This is used to signal that an error occurred either in this thread,
     // or in the main mux thread.  If `true`, this thread will terminate.

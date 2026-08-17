@@ -653,22 +653,16 @@ fn bilerp_color(corners: [[f32; 4]; 4], x: f32, y: f32) -> [f32; 4] {
 
 #[derive(Default)]
 pub struct HeapQuadAllocator {
-    layer0: Vec<Box<BoxedQuad>>,
-    layer1: Vec<Box<BoxedQuad>>,
-    layer2: Vec<Box<BoxedQuad>>,
-    /// Boxes handed back by [`HeapQuadAllocator::recycle`], waiting to be
-    /// filled again. Quads are boxed so their addresses survive the vector
-    /// growing, which means one allocation each -- fine for a surface recorded
-    /// once, ruinous for the overview, which builds a fresh allocator per card
-    /// per frame and drops every box at the end of it.
-    spare: Vec<Box<BoxedQuad>>,
+    // Quads are stored inline: a cached surface with hundreds of thousands of
+    // quads would otherwise be that many separate 96-byte allocations, which
+    // both fragments the heap and makes every replay a pointer chase. Callers
+    // only ever hold the `QuadImpl` borrow from `allocate` until the next
+    // allocation, so element addresses do not need to survive vector growth.
+    layer0: Vec<BoxedQuad>,
+    layer1: Vec<BoxedQuad>,
+    layer2: Vec<BoxedQuad>,
     position_transform: Option<QuadPositionTransform>,
 }
-
-/// Ceiling on the recycling pool. A pool the size of the largest single
-/// surface is the whole point; one the size of the largest surface ever
-/// painted, held forever, is a leak wearing a cache's clothes.
-const MAX_SPARE_QUADS: usize = 65_536;
 
 impl std::fmt::Debug for HeapQuadAllocator {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -779,20 +773,14 @@ pub struct HeapQuadMark {
 }
 
 impl HeapQuadAllocator {
-    /// Empty the allocator but keep its boxes for whatever is recorded next.
-    ///
-    /// For a caller that records many surfaces in a row -- the overview draws
-    /// one per visible card, every frame -- this turns a quad's allocation into
-    /// a `Vec::pop`. Dropping the allocator instead frees every box, and the
-    /// next card immediately allocates them all back.
+    /// Empty the allocator but keep its capacity for whatever is recorded
+    /// next. For a caller that records many surfaces in a row -- the overview
+    /// draws one per visible card, every frame -- this makes re-recording
+    /// allocation-free.
     pub fn recycle(&mut self) {
-        for layer in [&mut self.layer0, &mut self.layer1, &mut self.layer2] {
-            if self.spare.len() + layer.len() <= MAX_SPARE_QUADS {
-                self.spare.append(layer);
-            } else {
-                layer.clear();
-            }
-        }
+        self.layer0.clear();
+        self.layer1.clear();
+        self.layer2.clear();
         self.position_transform = None;
     }
 
@@ -806,7 +794,7 @@ impl HeapQuadAllocator {
         }
     }
 
-    fn layers(&self) -> [(usize, &Vec<Box<BoxedQuad>>); 3] {
+    fn layers(&self) -> [(usize, &Vec<BoxedQuad>); 3] {
         [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)]
     }
 
@@ -984,13 +972,6 @@ impl HeapQuadAllocator {
 impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
     fn allocate(&mut self, layer_num: usize) -> anyhow::Result<QuadImpl<'_>> {
         let position_transform = self.position_transform;
-        let fresh = match self.spare.pop() {
-            Some(mut quad) => {
-                *quad = BoxedQuad::default();
-                quad
-            }
-            None => Box::new(BoxedQuad::default()),
-        };
         let quads = match layer_num {
             0 => &mut self.layer0,
             1 => &mut self.layer1,
@@ -998,7 +979,7 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
             _ => unreachable!(),
         };
 
-        quads.push(fresh);
+        quads.push(BoxedQuad::default());
 
         let quad = quads.last_mut().unwrap();
         Ok(match position_transform {
@@ -1033,7 +1014,7 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
                 let (left, top, right, bottom) = quad.position;
                 quad.position = transform.map_position(left, top, right, bottom);
             }
-            dest_quads.push(Box::new(quad));
+            dest_quads.push(quad);
         }
     }
 }
@@ -1331,12 +1312,12 @@ mod translated_clip_tests {
             pixel_height: 800,
             dpi: 96,
         };
-        fn quad_at(left: f32, top: f32, right: f32, bottom: f32) -> Box<BoxedQuad> {
+        fn quad_at(left: f32, top: f32, right: f32, bottom: f32) -> BoxedQuad {
             let rect = QuadClipRect::from_top_left_pixels(left, top, right, bottom, &WINDOW);
-            Box::new(BoxedQuad {
+            BoxedQuad {
                 position: (rect.left(), rect.top(), rect.right(), rect.bottom()),
                 ..Default::default()
-            })
+            }
         }
         // Left edge of a top-left `x`, in the centre-relative space quads use.
         let at = |x: f32| x - WINDOW.pixel_width as f32 / 2.0;

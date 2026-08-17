@@ -190,6 +190,7 @@ impl GuiFrontEnd {
         let connection = Connection::init()?;
         connection.set_event_handler(Self::app_event_handler);
         crate::native_settings::apply_to_app(&crate::native_settings::load());
+        spawn_malloc_pressure_relief_thread();
 
         let mux = Mux::get();
         let client_id = mux.active_identity().expect("to have set my own id");
@@ -967,6 +968,32 @@ impl Drop for WorkspaceSwitcher {
 pub fn shutdown() {
     FRONT_END.with(|f| drop(f.borrow_mut().take()));
 }
+
+/// Hand the allocator's empty-but-dirty pages back to the kernel on a slow
+/// cadence. Rendering churns multi-megabyte buffers (vertex staging growth,
+/// card extraction), and macOS malloc holds the freed pages dirty instead of
+/// returning them -- measured at 300MB of phys footprint that no live object
+/// accounts for. Runs on its own thread so the walk over the zones (a few ms
+/// on a large heap) never lands inside a frame.
+#[cfg(target_os = "macos")]
+fn spawn_malloc_pressure_relief_thread() {
+    extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    std::thread::Builder::new()
+        .name("malloc-relief".to_string())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let freed = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+            if freed > 0 {
+                log::debug!("malloc_zone_pressure_relief returned {freed} bytes to the kernel");
+            }
+        })
+        .expect("spawn malloc-relief thread");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_malloc_pressure_relief_thread() {}
 
 pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
     let front_end = GuiFrontEnd::try_new()?;

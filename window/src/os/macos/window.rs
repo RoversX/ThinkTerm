@@ -284,6 +284,15 @@ unsafe fn set_standard_window_buttons_visible(window: &StrongPtr, visible: bool)
 }
 
 pub fn set_application_icon_from_file(path: &Path) -> anyhow::Result<()> {
+    // Loading the icon decodes several MB of NSImage, and every copy handed to
+    // setApplicationIconImage_ stays alive. Every new window applies the icon,
+    // so reloading per call leaks one decoded image per window.
+    static LAST_ICON_PATH: std::sync::Mutex<Option<std::path::PathBuf>> =
+        std::sync::Mutex::new(None);
+    if LAST_ICON_PATH.lock().unwrap().as_deref() == Some(path) {
+        return Ok(());
+    }
+
     let path_string = path.to_string_lossy();
 
     unsafe {
@@ -298,6 +307,7 @@ pub fn set_application_icon_from_file(path: &Path) -> anyhow::Result<()> {
         app.setApplicationIconImage_(*ns_image);
     }
 
+    *LAST_ICON_PATH.lock().unwrap() = Some(path.to_path_buf());
     Ok(())
 }
 

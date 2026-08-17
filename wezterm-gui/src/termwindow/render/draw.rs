@@ -212,6 +212,7 @@ pub(crate) fn draw_webgpu_layers(
     window_label: usize,
     cards: CardDrawData,
     card_scratch: &mut Option<CardScratch>,
+    frame_verts: &mut Vec<crate::quad::Vertex>,
 ) -> anyhow::Result<()> {
     let acquire_start = crate::perf::now();
     let output = webgpu.surface.get_current_texture()?;
@@ -272,42 +273,39 @@ pub(crate) fn draw_webgpu_layers(
     // One combined vertex upload covers every card render pass and every
     // composite quad; each draw slices it with `base_vertex`. The uploads
     // must all happen before any pass is encoded because queued buffer
-    // writes run at the head of the submit.
+    // writes run at the head of the submit. The pending cards' vertices were
+    // already extracted into `frame_verts` by the paint pass; only the
+    // composite quads are appended here.
     let card_pass_start = crate::perf::now();
-    let mut card_verts: Vec<crate::quad::Vertex> = Vec::new();
-    let mut pending_ranges = Vec::with_capacity(cards.pending.len());
-    for pending in &cards.pending {
-        let base = card_verts.len();
-        card_verts.extend_from_slice(&pending.verts);
-        pending_ranges.push((base, pending.verts.len() / 4));
-    }
     let mut composite_draws: Vec<(i8, i32, &crate::termwindow::render::paint::CardComposite)> =
         Vec::with_capacity(cards.composites.len());
     for composite in &cards.composites {
         if let Some(verts) = composite_quad_verts(composite, &dimensions) {
-            let base = card_verts.len();
-            card_verts.extend_from_slice(&verts);
+            let base = frame_verts.len();
+            frame_verts.extend_from_slice(&verts);
             composite_draws.push((composite.zindex, base as i32, composite));
         }
     }
-    if !card_verts.is_empty() {
-        let max_quads = pending_ranges
+    if !frame_verts.is_empty() {
+        let max_quads = cards
+            .pending
             .iter()
-            .map(|(_, quads)| *quads)
+            .map(|pending| pending.quad_count)
             .max()
             .unwrap_or(0)
             .max(1);
-        CardScratch::ensure(card_scratch, webgpu, card_verts.len(), max_quads);
+        CardScratch::ensure(card_scratch, webgpu, frame_verts.len(), max_quads);
         let scratch = card_scratch.as_ref().expect("just ensured");
         webgpu
             .queue
-            .write_buffer(&scratch.vb, 0, bytemuck::cast_slice(&card_verts));
+            .write_buffer(&scratch.vb, 0, bytemuck::cast_slice(frame_verts));
 
         // Render each dirty card's quads into its texture. These passes are
         // encoded before the main pass, so the composites below sample the
         // fresh picture.
-        for (pending, (base, quads)) in cards.pending.iter().zip(&pending_ranges) {
-            if *quads == 0 {
+        for pending in cards.pending.iter() {
+            let (base, quads) = (pending.first_vertex, pending.quad_count);
+            if quads == 0 {
                 continue;
             }
             let half_w = dimensions.pixel_width as f32 / 2.0;
@@ -363,7 +361,7 @@ pub(crate) fn draw_webgpu_layers(
             pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
             pass.set_vertex_buffer(0, scratch.vb.slice(..));
             pass.set_index_buffer(scratch.index.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..(*quads * 6) as u32, *base as i32, 0..1);
+            pass.draw_indexed(0..(quads * 6) as u32, base as i32, 0..1);
         }
     }
     crate::perf::log_duration("card_texture_passes", card_pass_start);
@@ -575,6 +573,7 @@ impl crate::TermWindow {
             composites: std::mem::take(&mut *self.card_composites.borrow_mut()),
         };
         let mut card_scratch = self.card_scratch.borrow_mut();
+        let mut frame_verts = self.card_frame_verts.borrow_mut();
         draw_webgpu_layers(
             webgpu,
             render_state,
@@ -592,7 +591,10 @@ impl crate::TermWindow {
             self.mux_window_id as usize,
             cards,
             &mut card_scratch,
-        )
+            &mut frame_verts,
+        )?;
+        render_state.maybe_shrink_quads();
+        Ok(())
     }
 
     fn call_draw_glium(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {

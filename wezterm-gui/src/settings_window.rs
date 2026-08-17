@@ -3599,6 +3599,7 @@ impl SettingsWindow {
                 composites: Vec::new(),
             },
             &mut None,
+            &mut Vec::new(),
         )?;
         Ok(true)
     }
