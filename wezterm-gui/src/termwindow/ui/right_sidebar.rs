@@ -34,7 +34,8 @@ use crate::termwindow::ui::tokens::{
 };
 use crate::termwindow::{
     NoteEditorCommand, PendingLocalCopy, PendingRemoteConfirm, RightSidebarFileCharBag,
-    RightSidebarFileField, RightSidebarFileIndex, RightSidebarFileIndexEntry,
+    RightSidebarFileDirCache, RightSidebarFileDirEntry, RightSidebarFileField,
+    RightSidebarFileIndex, RightSidebarFileIndexEntry,
     RightSidebarFileIndexStatus, RightSidebarFilePreviewImage, RightSidebarFilePreviewLine,
     RightSidebarFilePreviewSelection, RightSidebarFilePreviewSelectionPoint,
     RightSidebarFilePreviewSliceCacheKey, RightSidebarFilePreviewSliceCacheValue,
@@ -67,7 +68,7 @@ use termwiz::image::{ImageData, ImageDataType};
 use termwiz::input::{KeyCode as TermKeyCode, Modifiers as TermModifiers};
 use thinkterm_syntax::{HighlightKind, HighlightResult, HighlightSpan, LanguageId};
 use unicode_segmentation::UnicodeSegmentation;
-use walkdir::{DirEntry as WalkDirEntry, WalkDir};
+use ignore::{DirEntry as IgnoreDirEntry, WalkBuilder};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{
@@ -437,6 +438,29 @@ fn file_release_action(token_matches: bool, visible: bool, indexing: bool) -> Fi
         FileReleaseAction::RescheduleWhileIndexing
     } else {
         FileReleaseAction::Release
+    }
+}
+
+/// What a re-scan should actually do, now that browsing and search no longer
+/// share one walk of the project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RescanPlan {
+    /// Re-read the directories the tree is currently showing.
+    reread_loaded_dirs: bool,
+    /// Rebuild the search index. Only ever a *refresh* of one that exists.
+    refresh_search_index: bool,
+}
+
+/// Split out so the two rules that are easy to regress stay pinned by tests:
+///
+/// * the tree half never depends on the index state — a user who never searches
+///   sits at "no index" forever, and gating on it would freeze their tree;
+/// * the index half never *creates* an index — doing so would reinstate the
+///   eager whole-project walk, on a 90-second timer no less.
+fn rescan_plan(view_active: bool, index_ready: bool, index_refreshing: bool) -> RescanPlan {
+    RescanPlan {
+        reread_loaded_dirs: view_active,
+        refresh_search_index: view_active && index_ready && !index_refreshing,
     }
 }
 
@@ -1412,6 +1436,10 @@ impl crate::TermWindow {
         self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Empty;
         self.right_sidebar_file_browse_rows = Vec::new();
         self.right_sidebar_file_browse_cache_key = None;
+        self.reset_right_sidebar_file_dir_cache();
+        // Reopening must restore the view this teardown dropped; the index
+        // status can no longer signal that, since it may never leave `Empty`.
+        self.right_sidebar_file_view_needs_restore = true;
         // Remote trees survive a panel toggle so switching back is instant, but
         // a panel left hidden this long should give them back too.
         self.right_sidebar_remote_files.release_cached_trees();
@@ -1548,6 +1576,17 @@ impl crate::TermWindow {
             .set_text_end(state.filter.clone());
         self.right_sidebar_file_applied_filter = state.filter;
         self.right_sidebar_file_filter_debounce_until = None;
+
+        // Read every restored folder in one batch. Left to the paint-time
+        // "missing" pass this would discover one level per frame, so a deep
+        // restored tree would visibly unfold instead of appearing at once.
+        let restored: Vec<PathBuf> = self
+            .right_sidebar_file_expanded
+            .iter()
+            .map(PathBuf::from)
+            .filter(|dir| !self.right_sidebar_file_dir_cache.is_loaded(dir))
+            .collect();
+        self.spawn_right_sidebar_dir_reads(restored);
 
         match (state.view, state.selected) {
             (RightSidebarFileView::Preview, Some(path)) if path.is_file() => {
@@ -1764,6 +1803,9 @@ impl crate::TermWindow {
                 self.right_sidebar_file_expanded.remove(&key);
             } else {
                 self.right_sidebar_file_expanded.insert(key);
+                // Start reading now rather than waiting for the next paint to
+                // notice the folder is missing; saves a frame on expand.
+                self.spawn_right_sidebar_dir_reads(vec![path.clone()]);
             }
             self.right_sidebar_file_expanded_version =
                 self.right_sidebar_file_expanded_version.wrapping_add(1);
@@ -2712,22 +2754,25 @@ impl crate::TermWindow {
         })));
     }
 
-    fn start_right_sidebar_file_index_if_needed(&mut self, root: &RightSidebarFileRoot) {
+    /// Point the Files panel at `root`, restoring that root's remembered view.
+    ///
+    /// Deliberately does *not* build a search index: the tree is served lazily
+    /// per directory, and the whole-project walk only happens if the user
+    /// actually searches. The old version keyed its "already handled" check off
+    /// the index status, which no longer works — a user who never searches sits
+    /// at `Empty` forever, and this runs on every paint.
+    fn track_right_sidebar_file_root(&mut self, root: &RightSidebarFileRoot) {
         let same_root = self
             .right_sidebar_file_index_root
             .as_ref()
             .is_some_and(|path| path == &root.path)
             && self.right_sidebar_file_index_project_name == root.project_name;
-        if same_root
-            && matches!(
-                self.right_sidebar_file_index_status,
-                RightSidebarFileIndexStatus::Indexing | RightSidebarFileIndexStatus::Ready
-            )
-        {
+        if same_root && !self.right_sidebar_file_view_needs_restore {
             return;
         }
 
         let new_key = (root.path.clone(), root.project_name.clone());
+        self.right_sidebar_file_view_needs_restore = false;
 
         if !same_root {
             let previous_width = self.right_sidebar_width();
@@ -2737,6 +2782,13 @@ impl crate::TermWindow {
             self.close_right_sidebar_file_preview();
             self.right_sidebar_file_browse_rows.clear();
             self.right_sidebar_file_browse_cache_key = None;
+            // Must precede the restore below: the reset bumps the generation, so
+            // reads spawned by the restore are tagged for the incoming root and
+            // any read still in flight for the outgoing one is discarded.
+            self.reset_right_sidebar_file_dir_cache();
+            // The previous root's search index describes a project we are no
+            // longer showing; drop it rather than search the wrong tree.
+            self.discard_right_sidebar_file_index();
             self.right_sidebar_file_index_root = Some(root.path.clone());
             self.right_sidebar_file_index_project_name = root.project_name.clone();
             self.restore_right_sidebar_file_view_state(&new_key);
@@ -2744,17 +2796,53 @@ impl crate::TermWindow {
                 self.schedule_right_sidebar_reflow();
             }
         } else {
-            // Same root, status Empty/Failed (e.g. after idle-release): restore
-            // the view the release tore down before rebuilding.
+            // Same root, coming back from an idle release: restore the view the
+            // release tore down (in particular, reload the preview).
             self.restore_right_sidebar_file_view_state(&new_key);
         }
+    }
 
-        self.spawn_right_sidebar_file_index_build(
-            root.path.clone(),
-            root.project_name.clone(),
-            false,
-            false,
-        );
+    /// Drop the search index and any search in flight. Used when the root
+    /// changes; the browse tree is untouched and keeps rendering.
+    fn discard_right_sidebar_file_index(&mut self) {
+        if let Some(cancel) = self.right_sidebar_file_index_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        self.right_sidebar_file_index_generation =
+            self.right_sidebar_file_index_generation.wrapping_add(1);
+        self.right_sidebar_file_index = None;
+        self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Empty;
+        self.right_sidebar_file_refreshing = false;
+        self.clear_right_sidebar_file_search();
+    }
+
+    /// Build the whole-project search index unless it already exists or is on
+    /// its way.
+    ///
+    /// Called when the filter box takes focus — the same moment VS Code primes
+    /// its file-search cache — so the walk overlaps with the user typing their
+    /// first query instead of delaying the panel opening. A session that never
+    /// touches the filter box never walks the project at all.
+    pub(crate) fn prime_right_sidebar_file_index(&mut self) {
+        if matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
+            return;
+        }
+        if matches!(
+            self.right_sidebar_file_index_status,
+            RightSidebarFileIndexStatus::Indexing
+                | RightSidebarFileIndexStatus::Ready
+                // A failed build must not be retried from here: this runs once
+                // per paint while a query is showing, so retrying would spawn a
+                // walk every frame. The re-scan cycle clears `Failed` back to
+                // `Empty`, which paces retries at the re-scan interval.
+                | RightSidebarFileIndexStatus::Failed(_)
+        ) {
+            return;
+        }
+        let Ok(root) = self.active_local_project_for_files() else {
+            return;
+        };
+        self.spawn_right_sidebar_file_index_build(root.path, root.project_name, false, false);
     }
 
     fn clear_right_sidebar_file_root_for_unavailable_project(&mut self) {
@@ -2776,6 +2864,7 @@ impl crate::TermWindow {
         self.right_sidebar_file_index = None;
         self.right_sidebar_file_browse_rows.clear();
         self.right_sidebar_file_browse_cache_key = None;
+        self.reset_right_sidebar_file_dir_cache();
         self.right_sidebar_file_refreshing = false;
         if self.right_sidebar_width() != previous_width {
             self.schedule_right_sidebar_reflow();
@@ -2792,7 +2881,7 @@ impl crate::TermWindow {
                 return Err(err);
             }
         };
-        self.start_right_sidebar_file_index_if_needed(&root);
+        self.track_right_sidebar_file_root(&root);
         Ok(root)
     }
 
@@ -2847,6 +2936,7 @@ impl crate::TermWindow {
         let index_root_path = root_path.clone();
         let index_project_name = project_name.clone();
         let worker_cancel = index_cancel.clone();
+        let respect_gitignore = self.config.right_sidebar_search_respects_gitignore;
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
                 Ok(if fresh {
@@ -2854,12 +2944,14 @@ impl crate::TermWindow {
                         &index_root_path,
                         &index_project_name,
                         &worker_cancel,
+                        respect_gitignore,
                     )
                 } else {
                     build_or_reuse_shared_file_index(
                         &index_root_path,
                         &index_project_name,
                         &worker_cancel,
+                        respect_gitignore,
                     )
                 })
             })
@@ -2877,14 +2969,113 @@ impl crate::TermWindow {
         .detach();
     }
 
-    /// Force a real (registry-bypassing) re-scan of the current root while
-    /// keeping the tree + view state on screen. Used by the periodic timer,
-    /// window/panel focus, and the manual Refresh button.
-    pub(crate) fn force_right_sidebar_file_rescan(&mut self) {
-        if matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
+    /// Drop every lazily-read directory and invalidate loads still in flight.
+    ///
+    /// The generation bump is what makes in-flight reads safe to ignore: a read
+    /// started for the previous root lands with a stale generation and is
+    /// discarded instead of poisoning the new tree.
+    fn reset_right_sidebar_file_dir_cache(&mut self) {
+        self.right_sidebar_file_dir_cache.clear();
+        self.right_sidebar_file_dir_loads_in_flight.clear();
+        self.right_sidebar_file_dir_cache_generation =
+            self.right_sidebar_file_dir_cache_generation.wrapping_add(1);
+        self.right_sidebar_file_browse_cache_key = None;
+    }
+
+    /// Read `dirs` into the browse cache on a worker thread.
+    ///
+    /// The tree only ever needs the directories it is actually showing, so this
+    /// replaces the old walk-the-whole-project index for browsing: opening the
+    /// panel reads the root, and expanding a folder reads exactly that folder.
+    /// Reads are off the UI thread so a stalled network mount cannot freeze the
+    /// window, and the in-flight set keeps a folder that stays expanded across
+    /// frames from being re-read on every paint.
+    fn spawn_right_sidebar_dir_reads(&mut self, dirs: Vec<PathBuf>) {
+        let dirs: Vec<PathBuf> = dirs
+            .into_iter()
+            .filter(|dir| self.right_sidebar_file_dir_loads_in_flight.insert(dir.clone()))
+            .collect();
+        if dirs.is_empty() {
             return;
         }
-        if !self.right_sidebar_file_view_active() || self.right_sidebar_file_refreshing {
+        let Some(window) = self.window.as_ref().cloned() else {
+            for dir in &dirs {
+                self.right_sidebar_file_dir_loads_in_flight.remove(dir);
+            }
+            return;
+        };
+        let generation = self.right_sidebar_file_dir_cache_generation;
+
+        // Kept so `apply` can clear the in-flight marks even if the worker dies;
+        // otherwise those directories would never be retried.
+        let requested = dirs.clone();
+        promise::spawn::spawn(async move {
+            let loaded = promise::spawn::spawn_into_new_thread(move || {
+                Ok(dirs
+                    .into_iter()
+                    .map(|dir| {
+                        let children = read_right_sidebar_dir(&dir);
+                        (dir, children)
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await
+            .unwrap_or_else(|err| {
+                log::warn!("Unable to read sidebar directories: {err:#}");
+                Vec::new()
+            });
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_right_sidebar_dir_load_result(generation, requested, loaded);
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_right_sidebar_dir_load_result(
+        &mut self,
+        generation: u64,
+        requested: Vec<PathBuf>,
+        loaded: Vec<(PathBuf, Vec<RightSidebarFileDirEntry>)>,
+    ) {
+        if generation != self.right_sidebar_file_dir_cache_generation {
+            // Root changed while we were reading; the in-flight set was already
+            // cleared by the reset, so there is nothing to release here.
+            return;
+        }
+        for dir in &requested {
+            self.right_sidebar_file_dir_loads_in_flight.remove(dir);
+        }
+        // Only bump the generation for directories that actually changed: the
+        // periodic re-scan re-reads everything on screen, and an unconditional
+        // insert would rebuild rows and repaint every tick for nothing.
+        let mut changed = false;
+        for (dir, children) in loaded {
+            if self.right_sidebar_file_dir_cache.children(&dir) != Some(children.as_slice()) {
+                self.right_sidebar_file_dir_cache.insert(dir, children);
+                changed = true;
+            }
+        }
+        if changed {
+            self.invalidate_window();
+        }
+    }
+
+    /// Re-read what is on screen, and refresh the search index only if one
+    /// already exists. Used by the periodic timer, window/panel focus, the
+    /// manual Refresh button, and after we ourselves rename/delete/copy a file.
+    ///
+    /// Two rules matter here now that browsing and search no longer share a
+    /// scan:
+    ///
+    /// * The tree re-read must not depend on the index status. The index is
+    ///   built lazily on first search, so a user who never searches sits at
+    ///   `Empty` forever — gating on `Ready` (as this used to) would mean their
+    ///   tree never picked up a rename, a delete, or an external change again.
+    /// * A re-scan may refresh an existing index but must never create one.
+    ///   Building here would quietly restore the eager whole-project walk that
+    ///   the lazy tree exists to avoid, and on the 90-second timer at that.
+    pub(crate) fn force_right_sidebar_file_rescan(&mut self) {
+        if matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
             return;
         }
         if self
@@ -2893,33 +3084,52 @@ impl crate::TermWindow {
         {
             return;
         }
-        if !matches!(
-            self.right_sidebar_file_index_status,
-            RightSidebarFileIndexStatus::Ready
-        ) {
-            return;
+
+        let plan = rescan_plan(
+            self.right_sidebar_file_view_active(),
+            matches!(
+                self.right_sidebar_file_index_status,
+                RightSidebarFileIndexStatus::Ready
+            ),
+            self.right_sidebar_file_refreshing,
+        );
+
+        if plan.reread_loaded_dirs {
+            // `spawn` skips directories with a read already in flight, so this
+            // is safe to call as often as the timer fires.
+            let loaded = self.right_sidebar_file_dir_cache.loaded_dirs();
+            self.spawn_right_sidebar_dir_reads(loaded);
+
+            // Clear a failed index so the next query can try again. Priming
+            // deliberately refuses to retry a failure itself, so this is what
+            // paces retries at the re-scan interval instead of per frame.
+            if matches!(
+                self.right_sidebar_file_index_status,
+                RightSidebarFileIndexStatus::Failed(_)
+            ) {
+                self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Empty;
+            }
         }
-        let Some((root, project)) = self.right_sidebar_file_view_state_key() else {
-            return;
-        };
-        self.spawn_right_sidebar_file_index_build(root, project, true, true);
+
+        if plan.refresh_search_index {
+            if let Some((root, project)) = self.right_sidebar_file_view_state_key() {
+                self.spawn_right_sidebar_file_index_build(root, project, true, true);
+            }
+        }
     }
 
     /// Re-scan after we ourselves changed the tree.
     ///
-    /// [`Self::force_right_sidebar_file_rescan`] gives up when a scan is
-    /// already running or the index is not `Ready` — fine for a timer, wrong
-    /// here: the files we just wrote would then stay invisible until the next
-    /// 90-second tick. Re-arm the periodic cycle so the scan happens either
-    /// way.
+    /// [`Self::force_right_sidebar_file_rescan`] can still decline to refresh
+    /// the search index (one is already in flight) — fine for a timer, wrong
+    /// here: re-arm the periodic cycle so a refresh happens either way.
     pub(crate) fn force_right_sidebar_file_rescan_soon(&mut self) {
         self.force_right_sidebar_file_rescan();
         self.schedule_right_sidebar_file_rescan();
     }
 
-    /// Refresh now (if a tree is already loaded) and (re)start the 90s periodic
-    /// re-scan cycle. Called on window focus and when entering the file view; a
-    /// fresh open builds via the normal index path, so we only force when Ready.
+    /// Re-read the visible tree and (re)start the 90s periodic re-scan cycle.
+    /// Called on window focus and when entering the file view.
     pub(crate) fn kick_right_sidebar_file_rescan_cycle(&mut self) {
         if matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
             return;
@@ -2933,12 +3143,9 @@ impl crate::TermWindow {
         {
             return;
         }
-        if matches!(
-            self.right_sidebar_file_index_status,
-            RightSidebarFileIndexStatus::Ready
-        ) {
-            self.force_right_sidebar_file_rescan();
-        }
+        // Unconditional: `force` decides for itself what needs refreshing, and
+        // the tree half must run even when no search index has ever been built.
+        self.force_right_sidebar_file_rescan();
         self.schedule_right_sidebar_file_rescan();
     }
 
@@ -3032,6 +3239,11 @@ impl crate::TermWindow {
         }
 
         let Some(index) = self.right_sidebar_file_index.clone() else {
+            // No index yet — this is the choke point that covers every way a
+            // query can appear (focus-primed, restored from saved view state,
+            // typed while a previous build was discarded). Kick the build; the
+            // panel shows "Indexing files…" and this runs again once it lands.
+            self.prime_right_sidebar_file_index();
             return;
         };
         let Some(window) = self.window.as_ref().cloned() else {
@@ -8682,17 +8894,36 @@ impl crate::TermWindow {
     /// expanded folders has changed; otherwise reuse the cached rows. This runs
     /// on every paint, so it avoids re-cloning up to `FILE_TREE_ROW_LIMIT` rows
     /// (each holding a `PathBuf` + `String`) on frames where nothing changed.
-    fn refresh_right_sidebar_file_browse_rows(&mut self, index: &RightSidebarFileIndex) {
+    /// Rebuild the visible rows from the lazily-read directory cache.
+    ///
+    /// Takes no index: the browse tree is independent of the search index, which
+    /// may legitimately never be built. Rows are cached against the directory
+    /// cache generation, so a landing read or an expand/collapse rebuilds them
+    /// and nothing else does.
+    fn refresh_right_sidebar_file_browse_rows(&mut self) {
+        let Some((root, project_name)) = self.right_sidebar_file_view_state_key() else {
+            self.right_sidebar_file_browse_rows.clear();
+            self.right_sidebar_file_browse_cache_key = None;
+            return;
+        };
         let key = (
-            self.right_sidebar_file_index_generation,
+            self.right_sidebar_file_dir_cache.generation,
             self.right_sidebar_file_expanded_version,
         );
         if self.right_sidebar_file_browse_cache_key == Some(key) {
             return;
         }
-        self.right_sidebar_file_browse_rows =
-            right_sidebar_file_browse_rows_from_index(index, &self.right_sidebar_file_expanded);
+        let (rows, missing) = right_sidebar_file_browse_rows_from_dir_cache(
+            &self.right_sidebar_file_dir_cache,
+            &root,
+            &project_name,
+            &self.right_sidebar_file_expanded,
+        );
+        self.right_sidebar_file_browse_rows = rows;
         self.right_sidebar_file_browse_cache_key = Some(key);
+        if !missing.is_empty() {
+            self.spawn_right_sidebar_dir_reads(missing);
+        }
     }
 
     fn paint_files_sidebar(
@@ -13014,26 +13245,26 @@ impl crate::TermWindow {
         }
 
         let applied_filter = self.right_sidebar_file_filter_for_tree();
-        let index = match self.right_sidebar_file_index_status.clone() {
-            RightSidebarFileIndexStatus::Ready => match self.right_sidebar_file_index.clone() {
-                Some(index) => index,
-                None => {
-                    return self.paint_files_message(
-                        layers,
-                        ui_font,
-                        ui_metrics,
-                        chrome,
-                        muted_fg,
-                        content_x,
-                        tree_top,
-                        content_width,
-                        content_bottom,
-                        icon_size,
-                        &crate::i18n::tr("right-indexing-files"),
-                    );
-                }
-            },
-            RightSidebarFileIndexStatus::Failed(message) => {
+        let query = applied_filter.trim().to_string();
+        self.start_right_sidebar_file_search_if_needed(&query);
+        let row_count = if query.is_empty() {
+            // Browsing is served entirely by the lazily-read directory cache and
+            // deliberately does not consult the index status: the whole-project
+            // index exists only for search and may never be built, so gating the
+            // tree on it would leave the tree permanently blank.
+            self.refresh_right_sidebar_file_browse_rows();
+            self.right_sidebar_file_browse_rows.len()
+        } else {
+            // Search is the one consumer that needs the whole project walked.
+            let index_ready = matches!(
+                self.right_sidebar_file_index_status,
+                RightSidebarFileIndexStatus::Ready
+            ) && self.right_sidebar_file_index.is_some();
+            if !index_ready {
+                let message = match self.right_sidebar_file_index_status.clone() {
+                    RightSidebarFileIndexStatus::Failed(message) => message,
+                    _ => crate::i18n::tr("right-indexing-files"),
+                };
                 return self.paint_files_message(
                     layers,
                     ui_font,
@@ -13048,29 +13279,6 @@ impl crate::TermWindow {
                     &message,
                 );
             }
-            RightSidebarFileIndexStatus::Empty | RightSidebarFileIndexStatus::Indexing => {
-                return self.paint_files_message(
-                    layers,
-                    ui_font,
-                    ui_metrics,
-                    chrome,
-                    muted_fg,
-                    content_x,
-                    tree_top,
-                    content_width,
-                    content_bottom,
-                    icon_size,
-                    &crate::i18n::tr("right-indexing-files"),
-                );
-            }
-        };
-
-        let query = applied_filter.trim().to_string();
-        self.start_right_sidebar_file_search_if_needed(&query);
-        let row_count = if query.is_empty() {
-            self.refresh_right_sidebar_file_browse_rows(&index);
-            self.right_sidebar_file_browse_rows.len()
-        } else {
             self.right_sidebar_file_search_rows.len()
         };
 
@@ -17293,14 +17501,20 @@ impl RightSidebarFileCharBag {
     }
 }
 
-/// Process-wide registry of weak references to file indexes, keyed by
-/// (root, project). Lets multiple windows on the same workspace share a single
-/// `Arc<RightSidebarFileIndex>` instead of each scanning and holding its own
-/// copy. Only weak refs live here, so an index is freed the moment the last
-/// window drops its strong ref (e.g. via the idle-release path).
+/// Key for the shared index registry.
+///
+/// The gitignore flag is part of the key: two windows configured differently
+/// must not hand each other an index built under the other policy.
+type SharedFileIndexKey = (PathBuf, String, bool);
+
+/// Process-wide registry of weak references to file indexes. Lets multiple
+/// windows on the same workspace share a single `Arc<RightSidebarFileIndex>`
+/// instead of each scanning and holding its own copy. Only weak refs live here,
+/// so an index is freed the moment the last window drops its strong ref (e.g.
+/// via the idle-release path).
 fn shared_file_index_registry(
-) -> &'static Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<(PathBuf, String), Weak<RightSidebarFileIndex>>>> =
+) -> &'static Mutex<HashMap<SharedFileIndexKey, Weak<RightSidebarFileIndex>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<SharedFileIndexKey, Weak<RightSidebarFileIndex>>>> =
         OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -17314,8 +17528,13 @@ fn build_or_reuse_shared_file_index(
     root: &Path,
     project_name: &str,
     cancel: &AtomicBool,
+    respect_gitignore: bool,
 ) -> Result<Arc<RightSidebarFileIndex>, String> {
-    let key = (root.to_path_buf(), project_name.to_string());
+    let key = (
+        root.to_path_buf(),
+        project_name.to_string(),
+        respect_gitignore,
+    );
     if let Some(existing) = shared_file_index_registry()
         .lock()
         .ok()
@@ -17328,6 +17547,7 @@ fn build_or_reuse_shared_file_index(
         root,
         project_name,
         cancel,
+        respect_gitignore,
     )?);
 
     if let Ok(mut registry) = shared_file_index_registry().lock() {
@@ -17344,15 +17564,21 @@ fn build_fresh_shared_file_index(
     root: &Path,
     project_name: &str,
     cancel: &AtomicBool,
+    respect_gitignore: bool,
 ) -> Result<Arc<RightSidebarFileIndex>, String> {
     let index = Arc::new(build_right_sidebar_file_index_with_cancel(
         root,
         project_name,
         cancel,
+        respect_gitignore,
     )?);
     if let Ok(mut registry) = shared_file_index_registry().lock() {
         registry.insert(
-            (root.to_path_buf(), project_name.to_string()),
+            (
+                root.to_path_buf(),
+                project_name.to_string(),
+                respect_gitignore,
+            ),
             Arc::downgrade(&index),
         );
         registry.retain(|_, weak| weak.strong_count() > 0);
@@ -17364,15 +17590,37 @@ fn build_fresh_shared_file_index(
 fn build_right_sidebar_file_index(
     root: &Path,
     project_name: &str,
+    respect_gitignore: bool,
 ) -> Result<RightSidebarFileIndex, String> {
     let cancel = AtomicBool::new(false);
-    build_right_sidebar_file_index_with_cancel(root, project_name, &cancel)
+    build_right_sidebar_file_index_with_cancel(root, project_name, &cancel, respect_gitignore)
+}
+
+/// Drive the lazy loader to a fixed point, the way successive paints would:
+/// build rows, read whatever they reported missing, repeat. Returns the cache so
+/// tests can assert on *which* directories were touched, not just the rows.
+#[cfg(test)]
+fn load_dir_cache_for_test(root: &Path, expanded: &HashSet<String>) -> RightSidebarFileDirCache {
+    let mut cache = RightSidebarFileDirCache::default();
+    loop {
+        let (_, missing) =
+            right_sidebar_file_browse_rows_from_dir_cache(&cache, root, "Project", expanded);
+        if missing.is_empty() {
+            break;
+        }
+        for dir in missing {
+            let children = read_right_sidebar_dir(&dir);
+            cache.insert(dir, children);
+        }
+    }
+    cache
 }
 
 fn build_right_sidebar_file_index_with_cancel(
     root: &Path,
     project_name: &str,
     cancel: &AtomicBool,
+    respect_gitignore: bool,
 ) -> Result<RightSidebarFileIndex, String> {
     if !root.is_dir() {
         return Err("Project folder is unavailable".to_string());
@@ -17384,19 +17632,37 @@ fn build_right_sidebar_file_index_with_cancel(
         name: project_name.to_string(),
         display_path: project_name.to_string(),
         is_dir: true,
-        depth: 0,
         name_char_bag: RightSidebarFileCharBag::from_str(project_name),
         char_bag: RightSidebarFileCharBag::from_str(project_name),
     }];
-    let mut children_by_parent: HashMap<PathBuf, Vec<usize>> = HashMap::new();
 
-    let walker = WalkDir::new(root)
+    // `ignore` is ripgrep's walker: it prunes ignored directories as it goes
+    // rather than listing then discarding them, which is what keeps a project
+    // with a large vendored subtree from costing hundreds of milliseconds.
+    let mut builder = WalkBuilder::new(root);
+    builder
+        // Dotfiles stay visible — `.github`, `.cargo` and friends are part of
+        // the project. Only .gitignore decides what is hidden.
+        .hidden(false)
         .follow_links(false)
-        .min_depth(1)
-        .into_iter()
-        .filter_entry(should_index_file_entry);
-    for entry in walker {
+        .git_ignore(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        // Only this project's own ignore rules: no global core.excludesFile and
+        // no walking up into parent repositories.
+        .git_global(false)
+        .parents(false)
+        // Honour .gitignore even in a directory that is not a git repo yet.
+        .require_git(false)
+        .filter_entry(should_index_walk_entry);
+
+    for entry in builder.build().skip(1) {
         if entries.len() >= FILE_INDEX_ENTRY_LIMIT {
+            log::warn!(
+                "File search index for {} hit the {} entry limit; \
+                 some files will not be findable by name",
+                root.display(),
+                FILE_INDEX_ENTRY_LIMIT
+            );
             break;
         }
         if cancel.load(AtomicOrdering::Relaxed) {
@@ -17405,80 +17671,119 @@ fn build_right_sidebar_file_index_with_cancel(
         let Ok(entry) = entry else {
             continue;
         };
-        let is_dir = entry.file_type().is_dir();
+        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
         let path = entry.path().to_path_buf();
-        let parent = path.parent().unwrap_or(root).to_path_buf();
         let name = entry.file_name().to_string_lossy().to_string();
         let display_path = path
             .strip_prefix(root)
             .map(path_to_display_string)
             .unwrap_or_else(|_| name.clone());
         let name_char_bag = RightSidebarFileCharBag::from_str(&name);
-        let index = entries.len();
         entries.push(RightSidebarFileIndexEntry {
-            path: path.clone(),
+            path,
             name,
             display_path: display_path.clone(),
             is_dir,
-            depth: entry.depth(),
             name_char_bag,
             char_bag: RightSidebarFileCharBag::from_str(&display_path),
         });
-        children_by_parent.entry(parent).or_default().push(index);
     }
 
     if cancel.load(AtomicOrdering::Relaxed) {
         return Err("File indexing canceled".to_string());
     }
-    for children in children_by_parent.values_mut() {
-        children.sort_by(|left, right| file_index_entry_cmp(&entries[*left], &entries[*right]));
+
+    Ok(RightSidebarFileIndex { entries })
+}
+
+/// Read one directory's children, applying the same skip list and ordering the
+/// full-project index used, so a lazily-built tree renders identically to the
+/// eagerly-walked one.
+fn read_right_sidebar_dir(dir: &Path) -> Vec<RightSidebarFileDirEntry> {
+    let Ok(reader) = fs::read_dir(dir) else {
+        // Unreadable (permissions, raced deletion): cache it as empty rather
+        // than retrying on every paint. The periodic re-scan picks it up later.
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for entry in reader.flatten() {
+        // `file_type` here is `lstat`-like, matching the old walker's
+        // `follow_links(false)`: a symlink to a directory stays a leaf.
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_dir && should_skip_file_index_dir(&name) {
+            continue;
+        }
+        children.push(RightSidebarFileDirEntry {
+            path: entry.path(),
+            name,
+            is_dir,
+        });
     }
-
-    Ok(RightSidebarFileIndex {
-        entries,
-        children_by_parent,
-    })
+    children.sort_by(right_sidebar_dir_entry_cmp);
+    children
 }
 
-fn right_sidebar_file_browse_rows_from_index(
-    index: &RightSidebarFileIndex,
+fn right_sidebar_dir_entry_cmp(
+    a: &RightSidebarFileDirEntry,
+    b: &RightSidebarFileDirEntry,
+) -> Ordering {
+    match (a.is_dir, b.is_dir) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => naturalish_cmp(&a.name, &b.name),
+    }
+}
+
+/// Build the visible rows from whatever directories have been read so far.
+///
+/// Returns the rows plus the directories that are expanded but not yet loaded,
+/// which the caller turns into read requests. An unloaded folder simply renders
+/// with no children for a frame; nothing blocks on disk.
+fn right_sidebar_file_browse_rows_from_dir_cache(
+    cache: &RightSidebarFileDirCache,
+    root: &Path,
+    project_name: &str,
     expanded: &HashSet<String>,
-) -> Vec<RightSidebarFileTreeRow> {
-    let mut rows = Vec::new();
-    collect_file_index_rows(index, 0, expanded, &mut rows);
-    rows
+) -> (Vec<RightSidebarFileTreeRow>, Vec<PathBuf>) {
+    let mut rows = vec![RightSidebarFileTreeRow {
+        path: root.to_path_buf(),
+        name: project_name.to_string(),
+        depth: 0,
+        is_dir: true,
+        is_expanded: true,
+    }];
+    let mut missing = Vec::new();
+    collect_dir_cache_rows(cache, root, 1, expanded, &mut rows, &mut missing);
+    (rows, missing)
 }
 
-fn collect_file_index_rows(
-    index: &RightSidebarFileIndex,
-    entry_index: usize,
+fn collect_dir_cache_rows(
+    cache: &RightSidebarFileDirCache,
+    dir: &Path,
+    depth: usize,
     expanded: &HashSet<String>,
     rows: &mut Vec<RightSidebarFileTreeRow>,
+    missing: &mut Vec<PathBuf>,
 ) {
-    if rows.len() >= FILE_TREE_ROW_LIMIT {
-        return;
-    }
-    let Some(entry) = index.entries.get(entry_index) else {
+    let Some(children) = cache.children(dir) else {
+        missing.push(dir.to_path_buf());
         return;
     };
-    let is_expanded = entry.depth == 0 || expanded.contains(&path_key(&entry.path));
-    rows.push(RightSidebarFileTreeRow {
-        path: entry.path.clone(),
-        name: entry.name.clone(),
-        depth: entry.depth,
-        is_dir: entry.is_dir,
-        is_expanded,
-    });
-
-    if !entry.is_dir || !is_expanded {
-        return;
-    }
-    if let Some(children) = index.children_by_parent.get(&entry.path) {
-        for child in children {
-            collect_file_index_rows(index, *child, expanded, rows);
-            if rows.len() >= FILE_TREE_ROW_LIMIT {
-                break;
-            }
+    for child in children {
+        if rows.len() >= FILE_TREE_ROW_LIMIT {
+            return;
+        }
+        let is_expanded = expanded.contains(&path_key(&child.path));
+        rows.push(RightSidebarFileTreeRow {
+            path: child.path.clone(),
+            name: child.name.clone(),
+            depth,
+            is_dir: child.is_dir,
+            is_expanded,
+        });
+        if child.is_dir && is_expanded {
+            collect_dir_cache_rows(cache, &child.path, depth + 1, expanded, rows, missing);
         }
     }
 }
@@ -17547,8 +17852,8 @@ fn search_right_sidebar_file_index(
         .collect()
 }
 
-fn should_index_file_entry(entry: &WalkDirEntry) -> bool {
-    if entry.depth() == 0 || !entry.file_type().is_dir() {
+fn should_index_walk_entry(entry: &IgnoreDirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
         return true;
     }
     let name = entry.file_name().to_string_lossy();
@@ -17953,8 +18258,8 @@ mod tests {
         preflight_local_copy, preview_line_count, preview_lines_from_text,
         preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
         preview_visible_line_range, remote_lease_failure_disposition, resolve_drop_destination,
-        resolve_local_drop_target, resolve_remote_drop_target,
-        right_sidebar_file_browse_rows_from_index, right_sidebar_file_row_metrics,
+        load_dir_cache_for_test, rescan_plan, resolve_local_drop_target, resolve_remote_drop_target,
+        right_sidebar_file_browse_rows_from_dir_cache, right_sidebar_file_row_metrics,
         right_sidebar_open_with_cache_key, sanitize_preview_text, scrollable_note_table_columns,
         search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
         sorted_open_with_candidates, spawn_pasted_image_staging, stage_pasted_image,
@@ -18986,15 +19291,17 @@ mod tests {
     }
 
     #[test]
-    fn file_index_sorts_dirs_first_and_natural() {
+    fn file_tree_sorts_dirs_first_and_natural() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("dir10")).unwrap();
         fs::create_dir(dir.path().join("dir2")).unwrap();
         fs::write(dir.path().join("file10.txt"), "").unwrap();
         fs::write(dir.path().join("file2.txt"), "").unwrap();
 
-        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
-        let rows = right_sidebar_file_browse_rows_from_index(&index, &HashSet::new());
+        let expanded = HashSet::new();
+        let cache = load_dir_cache_for_test(dir.path(), &expanded);
+        let (rows, _) =
+            right_sidebar_file_browse_rows_from_dir_cache(&cache, dir.path(), "Project", &expanded);
         let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
         assert_eq!(
             names,
@@ -19019,7 +19326,7 @@ mod tests {
         fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
         fs::write(docs.join("readme.md"), "# docs\n").unwrap();
 
-        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let index = build_right_sidebar_file_index(dir.path(), "Project", true).unwrap();
         let cancel = AtomicBool::new(false);
         let rows = search_right_sidebar_file_index(&index, "main", &cancel);
         let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
@@ -19038,7 +19345,7 @@ mod tests {
         fs::write(elio.join("lib.rs"), "").unwrap();
         fs::write(elio.parent().unwrap().join("build.rs"), "").unwrap();
 
-        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let index = build_right_sidebar_file_index(dir.path(), "Project", true).unwrap();
         let cancel = AtomicBool::new(false);
         let rows = search_right_sidebar_file_index(&index, "main.rs", &cancel);
         let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
@@ -19060,7 +19367,7 @@ mod tests {
         fs::write(docs.join("mermaid-init.js"), "").unwrap();
         fs::write(src.join("main.js"), "").unwrap();
 
-        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let index = build_right_sidebar_file_index(dir.path(), "Project", true).unwrap();
         let cancel = AtomicBool::new(false);
         let rows = search_right_sidebar_file_index(&index, "main.js", &cancel);
         let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
@@ -19075,7 +19382,7 @@ mod tests {
         fs::create_dir(&src).unwrap();
         fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
 
-        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let index = build_right_sidebar_file_index(dir.path(), "Project", true).unwrap();
         let cancel = AtomicBool::new(false);
         let rows = search_right_sidebar_file_index(&index, "src/main", &cancel);
         let names: Vec<_> = rows.into_iter().map(|row| row.name).collect();
@@ -19090,36 +19397,149 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::write(target.join("generated-artifact.rs"), "fn generated() {}\n").unwrap();
 
-        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let index = build_right_sidebar_file_index(dir.path(), "Project", true).unwrap();
         let cancel = AtomicBool::new(false);
         let rows = search_right_sidebar_file_index(&index, "generated", &cancel);
         assert!(rows.is_empty());
     }
 
     #[test]
-    fn file_index_browse_only_descends_expanded_dirs() {
+    fn file_tree_only_reads_expanded_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         fs::create_dir(&src).unwrap();
         fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
 
-        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
-        let rows = right_sidebar_file_browse_rows_from_index(&index, &HashSet::new());
+        let collapsed = HashSet::new();
+        let cache = load_dir_cache_for_test(dir.path(), &collapsed);
+        let (rows, _) = right_sidebar_file_browse_rows_from_dir_cache(
+            &cache,
+            dir.path(),
+            "Project",
+            &collapsed,
+        );
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, vec!["Project", "src"]);
+        // The point of the lazy tree: a collapsed folder is never even read.
+        assert!(!cache.is_loaded(&src));
 
         let mut expanded = HashSet::new();
         expanded.insert(path_key(&src));
-        let rows = right_sidebar_file_browse_rows_from_index(&index, &expanded);
+        let cache = load_dir_cache_for_test(dir.path(), &expanded);
+        let (rows, _) =
+            right_sidebar_file_browse_rows_from_dir_cache(&cache, dir.path(), "Project", &expanded);
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, vec!["Project", "src", "main.rs"]);
+        assert!(cache.is_loaded(&src));
+    }
+
+    /// Regression test for the bug this lazy tree exists to make impossible: a
+    /// project whose first directory dwarfs everything else used to swallow the
+    /// whole entry budget of the up-front walk, leaving its siblings out of the
+    /// tree entirely. Reading only what is expanded means the size of a
+    /// collapsed subtree cannot influence its siblings at all.
+    #[test]
+    fn a_huge_collapsed_subtree_cannot_starve_its_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let heavy = dir.path().join("aaa_research");
+        fs::create_dir(&heavy).unwrap();
+        for index in 0..200 {
+            let nested = heavy.join(format!("repo{index}")).join("src");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join("lib.rs"), "").unwrap();
+        }
+        for sibling in ["crates", "docs", "scripts", "ui"] {
+            fs::create_dir(dir.path().join(sibling)).unwrap();
+        }
+        fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+
+        let expanded = HashSet::new();
+        let cache = load_dir_cache_for_test(dir.path(), &expanded);
+        let (rows, _) =
+            right_sidebar_file_browse_rows_from_dir_cache(&cache, dir.path(), "Project", &expanded);
+        let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Project",
+                "aaa_research",
+                "crates",
+                "docs",
+                "scripts",
+                "ui",
+                "Cargo.toml"
+            ]
+        );
+        // One directory read in total — the heavy subtree is never descended.
+        assert_eq!(cache.loaded_dirs().len(), 1);
+    }
+
+    #[test]
+    fn search_index_respects_gitignore_only_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "secret/\n").unwrap();
+        let secret = dir.path().join("secret");
+        fs::create_dir(&secret).unwrap();
+        fs::write(secret.join("token.txt"), "").unwrap();
+        fs::write(dir.path().join("visible.txt"), "").unwrap();
+
+        // No `.git` here, so this also pins `require_git(false)`.
+        let index = build_right_sidebar_file_index(dir.path(), "Project", true).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(search_right_sidebar_file_index(&index, "token", &cancel).is_empty());
+        assert!(!search_right_sidebar_file_index(&index, "visible", &cancel).is_empty());
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project", false).unwrap();
+        assert!(!search_right_sidebar_file_index(&index, "token", &cancel).is_empty());
+    }
+
+    /// The tree half of a re-scan must not be gated on the search index. A user
+    /// who never opens the filter box has no index and never will, and gating
+    /// would mean their tree stopped picking up renames, deletes and external
+    /// changes entirely.
+    #[test]
+    fn rescan_rereads_the_tree_even_with_no_search_index() {
+        let plan = rescan_plan(true, false, false);
+        assert!(plan.reread_loaded_dirs);
+        assert!(!plan.refresh_search_index);
+    }
+
+    /// A re-scan may refresh an existing index but must never build one, or the
+    /// eager whole-project walk comes back through the 90-second timer.
+    #[test]
+    fn rescan_never_creates_a_search_index() {
+        for refreshing in [false, true] {
+            assert!(!rescan_plan(true, false, refreshing).refresh_search_index);
+        }
+        assert!(rescan_plan(true, true, false).refresh_search_index);
+        // ...and defers to a rebuild already in flight.
+        assert!(!rescan_plan(true, true, true).refresh_search_index);
+    }
+
+    #[test]
+    fn rescan_does_nothing_while_the_file_view_is_hidden() {
+        let plan = rescan_plan(false, true, false);
+        assert!(!plan.reread_loaded_dirs);
+        assert!(!plan.refresh_search_index);
+    }
+
+    #[test]
+    fn search_index_keeps_dotfiles_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflows = dir.path().join(".github").join("workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(workflows.join("ci.yml"), "").unwrap();
+
+        let index = build_right_sidebar_file_index(dir.path(), "Project", true).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(!search_right_sidebar_file_index(&index, "ci.yml", &cancel).is_empty());
     }
 
     #[test]
     fn file_index_search_respects_cancel() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let index = build_right_sidebar_file_index(dir.path(), "Project").unwrap();
+        let index = build_right_sidebar_file_index(dir.path(), "Project", true).unwrap();
         let cancel = AtomicBool::new(true);
 
         let rows = search_right_sidebar_file_index(&index, "main", &cancel);

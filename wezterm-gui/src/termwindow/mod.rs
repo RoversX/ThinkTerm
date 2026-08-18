@@ -638,15 +638,69 @@ pub(crate) struct RightSidebarFileIndexEntry {
     pub name: String,
     pub display_path: String,
     pub is_dir: bool,
-    pub depth: usize,
     pub name_char_bag: RightSidebarFileCharBag,
     pub char_bag: RightSidebarFileCharBag,
 }
 
+/// Flat list of every file in the project, built only to serve fuzzy search.
+///
+/// Browsing is served by [`RightSidebarFileDirCache`] instead, so this carries
+/// no parent/child structure and no per-entry depth: search scans `entries`
+/// linearly and ranks the matches itself.
 #[derive(Clone, Debug)]
 pub(crate) struct RightSidebarFileIndex {
     pub entries: Vec<RightSidebarFileIndexEntry>,
-    pub children_by_parent: HashMap<PathBuf, Vec<usize>>,
+}
+
+/// One child of a directory we actually read. Deliberately smaller than
+/// [`RightSidebarFileIndexEntry`]: the browse tree never needs the char bags or
+/// display paths that only fuzzy search consumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RightSidebarFileDirEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Directories the Files tree has actually read, filled on demand as folders are
+/// expanded.
+///
+/// This replaces the old "walk the entire project up front" index for the browse
+/// tree. Only the root plus expanded folders are ever read, so opening the panel
+/// costs one `read_dir` instead of a full-tree walk, and a project with a huge
+/// vendored subtree can no longer starve its own siblings out of the tree.
+///
+/// `generation` bumps whenever a directory lands or is dropped, and feeds the
+/// browse-row cache key so rows rebuild exactly when the contents change.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RightSidebarFileDirCache {
+    pub dirs: HashMap<PathBuf, Vec<RightSidebarFileDirEntry>>,
+    pub generation: u64,
+}
+
+impl RightSidebarFileDirCache {
+    pub fn children(&self, dir: &Path) -> Option<&[RightSidebarFileDirEntry]> {
+        self.dirs.get(dir).map(|children| children.as_slice())
+    }
+
+    pub fn is_loaded(&self, dir: &Path) -> bool {
+        self.dirs.contains_key(dir)
+    }
+
+    pub fn insert(&mut self, dir: PathBuf, children: Vec<RightSidebarFileDirEntry>) {
+        self.dirs.insert(dir, children);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Every directory currently held, for the re-scan path.
+    pub fn loaded_dirs(&self) -> Vec<PathBuf> {
+        self.dirs.keys().cloned().collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.dirs.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1513,6 +1567,11 @@ pub struct TermWindow {
     /// The one card rebuild currently sliced across frames, if any.
     preview_rebuild_partial:
         RefCell<Option<crate::termwindow::render::paint::PreviewRebuildPartial>>,
+    /// When each card's terminal first showed visible content, keyed like
+    /// `preview_quad_cache`. Drives the blank->content fade-in; survives
+    /// overview closes and atlas repacks so neither replays the fade.
+    preview_content_fade:
+        RefCell<HashMap<TabId, crate::termwindow::render::paint::PreviewContentFade>>,
     /// Cards whose heap must be rendered into their texture this frame;
     /// queued by the paint pass, encoded by draw before the main pass.
     pending_card_renders: RefCell<Vec<crate::termwindow::render::paint::PendingCardRender>>,
@@ -1724,6 +1783,19 @@ pub struct TermWindow {
     right_sidebar_file_index_status: RightSidebarFileIndexStatus,
     right_sidebar_file_index: Option<Arc<RightSidebarFileIndex>>,
     right_sidebar_file_index_cancel: Option<Arc<AtomicBool>>,
+    /// Lazily-read directories backing the browse tree. Independent of the
+    /// search index above, which is only built once the user actually searches.
+    right_sidebar_file_dir_cache: RightSidebarFileDirCache,
+    /// Directories with a `read_dir` in flight, so a folder that stays expanded
+    /// across several frames is not re-read on every paint.
+    right_sidebar_file_dir_loads_in_flight: HashSet<PathBuf>,
+    /// Invalidates in-flight directory loads whose root/project no longer match.
+    right_sidebar_file_dir_cache_generation: u64,
+    /// Set when the idle release tears the panel down, so the next paint knows
+    /// to restore the saved view (notably the preview it dropped). The index
+    /// status used to stand in for this, which stops working once the index is
+    /// only built on demand and legitimately stays `Empty`.
+    right_sidebar_file_view_needs_restore: bool,
     // Bumped each time the file panel goes idle; a delayed release task only
     // frees the index/buffers if its captured token still matches (i.e. the
     // panel was not reopened or re-toggled in the meantime).
@@ -2483,6 +2555,7 @@ impl TermWindow {
             pane_font_cache_tick: Cell::new(0),
             preview_quad_cache: RefCell::new(HashMap::new()),
             preview_rebuild_partial: RefCell::new(None),
+            preview_content_fade: RefCell::new(HashMap::new()),
             pending_card_renders: RefCell::new(Vec::new()),
             card_frame_verts: RefCell::new(Vec::new()),
             card_composites: RefCell::new(Vec::new()),
@@ -2645,6 +2718,10 @@ impl TermWindow {
             right_sidebar_file_memory_release_token: 0,
             right_sidebar_file_index: None,
             right_sidebar_file_index_cancel: None,
+            right_sidebar_file_dir_cache: RightSidebarFileDirCache::default(),
+            right_sidebar_file_dir_loads_in_flight: HashSet::new(),
+            right_sidebar_file_dir_cache_generation: 0,
+            right_sidebar_file_view_needs_restore: false,
             right_sidebar_file_search_generation: 0,
             right_sidebar_file_search_cancel: None,
             right_sidebar_file_search_query: String::new(),

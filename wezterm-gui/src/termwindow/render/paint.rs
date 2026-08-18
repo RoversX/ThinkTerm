@@ -70,6 +70,37 @@ const MAX_PREVIEW_QUAD_REBUILDS_PER_FRAME: usize = 1;
 /// keeps showing its previous texture until the new picture is complete.
 const PREVIEW_REBUILD_SLICE: Duration = Duration::from_millis(3);
 
+/// How long a card's picture takes to fade in once its terminal first shows
+/// visible content.
+///
+/// A card whose pane has nothing cached locally -- a remote pane, a
+/// background tab -- opens as an empty frame and fills in whenever its fetch
+/// completes, one card at a time, with no transition: a hard blank-to-full
+/// pop that reads as flicker. The fade turns that pop into an appearance.
+/// It only runs on the blank->content edge, so settled cards, refreshes of a
+/// card that already has content, and atlas rebuilds never re-fade.
+const PREVIEW_CONTENT_FADE: Duration = Duration::from_millis(120);
+
+/// Whether a card has ever shown visible content, and when it first did.
+/// Keyed per card alongside `preview_quad_cache`, and kept across overview
+/// closes for the same reason that cache is: reopening should not replay
+/// the fade.
+pub(crate) enum PreviewContentFade {
+    /// Still blank. `snapshot` is the address of the snapshot last scanned,
+    /// so each snapshot is scanned for content at most once.
+    Blank { snapshot: usize },
+    ContentSince(Instant),
+}
+
+fn snapshot_has_content(
+    snapshot: &crate::termwindow::content_view::TerminalPreviewSnapshot,
+) -> bool {
+    snapshot
+        .panes
+        .iter()
+        .any(|pane| pane.lines.iter().any(|line| !line.is_whitespace()))
+}
+
 /// Everything a card's recorded quads depend on.
 ///
 /// Equal keys mean the recorded heap still draws the right picture and can be
@@ -649,6 +680,16 @@ impl crate::TermWindow {
         // half a second of nothing.
         const MAX_SHAPE_CACHE_RETRIES: usize = 1;
         let mut shape_retries = 0usize;
+        // Cleared when the retry cap gives up on this frame: the quad buffers
+        // then hold however much of the window the aborted pass got through,
+        // and presenting that paints the terminal without its chrome for the
+        // couple of frames until the requested repaint lands -- a visible
+        // black flash on every font-size change. Skipping the present keeps
+        // the previous complete frame on screen instead, which nobody can
+        // see. Only WebGpu can skip: the glium frame was created by do_paint
+        // and will be swapped regardless, so an unpainted frame there would
+        // present undefined content, which is worse than a partial one.
+        let mut present_frame = true;
 
         'pass: for pass in 0.. {
             match self.paint_pass() {
@@ -766,6 +807,7 @@ impl crate::TermWindow {
                             if let Some(window) = self.window.as_ref() {
                                 window.invalidate();
                             }
+                            present_frame = false;
                             break 'pass;
                         }
                     } else {
@@ -777,7 +819,9 @@ impl crate::TermWindow {
         }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
-        self.call_draw(frame).ok();
+        if present_frame || !matches!(frame, RenderFrame::WebGpu) {
+            self.call_draw(frame).ok();
+        }
         self.publish_ui_shape_cache_diagnostics_throttled();
         self.last_frame_duration = start.elapsed();
         log::debug!(
@@ -1388,6 +1432,9 @@ impl crate::TermWindow {
             self.preview_quad_cache
                 .borrow_mut()
                 .retain(|tab_id, _| live.contains(tab_id));
+            self.preview_content_fade
+                .borrow_mut()
+                .retain(|tab_id, _| live.contains(tab_id));
             // Same policy for a rebuild sliced across frames: its card is gone.
             let mut partial = self.preview_rebuild_partial.borrow_mut();
             if partial
@@ -1440,6 +1487,51 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// The opacity a card's picture should draw at this frame: 1.0 for a
+    /// settled card, ramping 0->1 across [`PREVIEW_CONTENT_FADE`] from the
+    /// moment its terminal first shows visible content. Requests further
+    /// frames itself while a ramp is running.
+    fn preview_content_alpha(&self, preview: &TerminalPreviewRequest) -> f32 {
+        let now = Instant::now();
+        let snapshot_ptr = Arc::as_ptr(&preview.snapshot) as usize;
+        let mut fades = self.preview_content_fade.borrow_mut();
+        let entry = fades.entry(preview.tab_id).or_insert_with(|| {
+            if snapshot_has_content(&preview.snapshot) {
+                PreviewContentFade::ContentSince(now)
+            } else {
+                PreviewContentFade::Blank {
+                    snapshot: snapshot_ptr,
+                }
+            }
+        });
+        if let PreviewContentFade::Blank { snapshot } = entry {
+            if *snapshot != snapshot_ptr {
+                if snapshot_has_content(&preview.snapshot) {
+                    *entry = PreviewContentFade::ContentSince(now);
+                } else {
+                    *snapshot = snapshot_ptr;
+                }
+            }
+        }
+        match entry {
+            // A blank picture looks the same at any opacity; full keeps the
+            // card's (invisible) quads out of the blending special cases.
+            PreviewContentFade::Blank { .. } => 1.0,
+            PreviewContentFade::ContentSince(since) => {
+                let t = now.duration_since(*since).as_secs_f32()
+                    / PREVIEW_CONTENT_FADE.as_secs_f32();
+                if t >= 1.0 {
+                    1.0
+                } else {
+                    self.update_next_frame_time(Some(Instant::now()));
+                    // Ease out: fast early rise reveals the content sooner.
+                    let t = t.max(0.0);
+                    t * (2.0 - t)
+                }
+            }
+        }
+    }
+
     /// Draw one card's thumbnail, building its quads only when they cannot be
     /// replayed.
     ///
@@ -1465,6 +1557,7 @@ impl crate::TermWindow {
             self.preview_scale_estimate(preview),
         );
         let clip = quad_clip_rect(preview.clip, &self.dimensions);
+        let content_alpha = self.preview_content_alpha(preview);
 
         // A hit replays. A miss replays too -- but only when the miss is the
         // snapshot alone and the budget is spent, because then the recorded
@@ -1495,7 +1588,9 @@ impl crate::TermWindow {
         if let Some(recorded_area) = recorded_area {
             // Texture path: the card's picture already lives in its own
             // texture; a single textured quad replaces the whole replay.
-            if self.card_texture_path_active() && self.composite_cached_card(preview)? {
+            if self.card_texture_path_active()
+                && self.composite_cached_card(preview, content_alpha)?
+            {
                 return Ok(false);
             }
             let cache = self.preview_quad_cache.borrow();
@@ -1512,13 +1607,13 @@ impl crate::TermWindow {
             // takes the plain path, which is bit-for-bit what this drew before
             // the cache existed.
             if recorded_area == preview.area {
-                cached.heap.apply_to_clipped(layers, clip, 1.0)?;
+                cached.heap.apply_to_clipped(layers, clip, content_alpha)?;
             } else {
                 let source = quad_clip_rect(recorded_area, &self.dimensions);
                 let target = quad_clip_rect(preview.area, &self.dimensions);
                 cached
                     .heap
-                    .apply_to_scaled(layers, source, target, clip, 1.0)?;
+                    .apply_to_scaled(layers, source, target, clip, content_alpha)?;
             }
             return Ok(false);
         }
@@ -1576,17 +1671,19 @@ impl crate::TermWindow {
             // stretches to the current rect even across a geometry change,
             // and a card that never had one simply stays background until
             // the first build lands.
-            if !(self.card_texture_path_active() && self.composite_cached_card(preview)?) {
+            if !(self.card_texture_path_active()
+                && self.composite_cached_card(preview, content_alpha)?)
+            {
                 let cache = self.preview_quad_cache.borrow();
                 if let Some(cached) = cache.get(&preview.tab_id) {
                     if cached.area == preview.area {
-                        cached.heap.apply_to_clipped(layers, clip, 1.0)?;
+                        cached.heap.apply_to_clipped(layers, clip, content_alpha)?;
                     } else {
                         let source = quad_clip_rect(cached.area, &self.dimensions);
                         let target = quad_clip_rect(preview.area, &self.dimensions);
                         cached
                             .heap
-                            .apply_to_scaled(layers, source, target, clip, 1.0)?;
+                            .apply_to_scaled(layers, source, target, clip, content_alpha)?;
                     }
                 }
             }
@@ -1632,7 +1729,7 @@ impl crate::TermWindow {
                         texture: Rc::clone(&tex),
                         dest: preview.area,
                         clip: preview.clip,
-                        opacity: 1.0,
+                        opacity: content_alpha,
                         zindex: 0,
                     });
                     texture = Some(tex);
@@ -1640,11 +1737,13 @@ impl crate::TermWindow {
                 }
                 Err(err) => {
                     log::warn!("card texture unavailable, replaying quads: {err:#}");
-                    heap.apply_to_clipped(layers, clip, 1.0).map(|()| true)
+                    heap.apply_to_clipped(layers, clip, content_alpha)
+                        .map(|()| true)
                 }
             }
         } else {
-            heap.apply_to_clipped(layers, clip, 1.0).map(|()| true)
+            heap.apply_to_clipped(layers, clip, content_alpha)
+                .map(|()| true)
         };
         self.preview_quad_cache.borrow_mut().insert(
             preview.tab_id,
@@ -1689,7 +1788,11 @@ impl crate::TermWindow {
     /// cached heap into a fresh texture if the entry does not have one yet
     /// (recorded during a transition, when the texture path is off). Returns
     /// false when there is nothing usable and the caller must replay quads.
-    fn composite_cached_card(&self, preview: &TerminalPreviewRequest) -> anyhow::Result<bool> {
+    fn composite_cached_card(
+        &self,
+        preview: &TerminalPreviewRequest,
+        opacity: f32,
+    ) -> anyhow::Result<bool> {
         let (needs_texture, recorded_area) = {
             let cache = self.preview_quad_cache.borrow();
             let Some(cached) = cache.get(&preview.tab_id) else {
@@ -1737,7 +1840,7 @@ impl crate::TermWindow {
             texture,
             dest: preview.area,
             clip: preview.clip,
-            opacity: 1.0,
+            opacity,
             zindex: 0,
         });
         Ok(true)

@@ -248,6 +248,15 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub detect_password_input: bool,
 
+    /// Whether the right sidebar's file filter honours `.gitignore` (and
+    /// `.git/info/exclude`) when searching for files by name.
+    ///
+    /// Only the filter is affected; the file tree always shows everything.
+    /// Mirrors VS Code's `search.useIgnoreFiles`, which likewise defaults to
+    /// true while its explorer keeps ignored files visible.
+    #[dynamic(default = "default_true")]
+    pub right_sidebar_search_respects_gitignore: bool,
+
     /// Specifies a map of environment variables that should be set
     /// when spawning commands in the local domain.
     /// This is not used when working with remote domains.

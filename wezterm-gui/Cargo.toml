@@ -68,6 +68,7 @@ frecency.workspace = true
 futures.workspace = true
 hdrhistogram.workspace = true
 http_req.workspace = true
+ignore.workspace = true
 image.workspace = true
 lazy_static.workspace = true
 lfucache.workspace = true

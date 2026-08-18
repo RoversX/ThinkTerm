@@ -4393,6 +4393,9 @@ impl super::TermWindow {
         match (item_type, event.kind.clone()) {
             (UIItemType::RightSidebarFileFilter, WMEK::Press(MousePress::Left)) => {
                 self.right_sidebar_file_focus = Some(super::RightSidebarFileField::Filter);
+                // Start walking the project the moment the box takes focus, so
+                // the index is ready by the time a query is typed.
+                self.prime_right_sidebar_file_index();
                 let double_click = self
                     .last_mouse_click
                     .as_ref()

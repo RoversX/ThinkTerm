@@ -7948,6 +7948,7 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "http_req",
+ "ignore",
  "image",
  "k9",
  "lazy_static",
