@@ -1,8 +1,8 @@
 use crate::PKI;
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use codec::*;
-use config::TermConfig;
 use config::keyassignment::SpawnTabDomain;
+use config::TermConfig;
 use mux::client::ClientId;
 use mux::domain::SplitSource;
 use mux::pane::{CachePolicy, Pane, PaneId};
@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use termwiz::surface::SequenceNo;
 use url::Url;
-use wezterm_term::StableRowIndex;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::terminal::Alert;
+use wezterm_term::StableRowIndex;
 
 lazy_static::lazy_static! {
     /// Serializes the authoritative tree decision with the live-workspace
@@ -1108,25 +1108,22 @@ impl SessionHandler {
             }
 
             Pdu::SpawnV2(spawn) => {
-                let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_domain_spawn_v2(spawn, send_response, client_id);
+                    schedule_domain_spawn_v2(spawn, send_response);
                 })
                 .detach();
             }
 
             Pdu::SplitPane(split) => {
-                let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_split_pane(split, send_response, client_id);
+                    schedule_split_pane(split, send_response);
                 })
                 .detach();
             }
 
             Pdu::SpawnPaneInStack(request) => {
-                let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_spawn_pane_in_stack(request, send_response, client_id);
+                    schedule_spawn_pane_in_stack(request, send_response);
                 })
                 .detach();
             }
@@ -1169,9 +1166,8 @@ impl SessionHandler {
             }
 
             Pdu::MovePaneToStack(request) => {
-                let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_move_pane_to_stack(request, send_response, client_id);
+                    schedule_move_pane_to_stack(request, send_response);
                 })
                 .detach();
             }
@@ -1187,9 +1183,8 @@ impl SessionHandler {
             }
 
             Pdu::EnsureThinkTermThread(request) => {
-                let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_ensure_thinkterm_thread(request, send_response, client_id);
+                    schedule_ensure_thinkterm_thread(request, send_response);
                 })
                 .detach();
             }
@@ -1630,37 +1625,28 @@ impl SessionHandler {
 // function below because the compiler thinks that all of its locals then need to be Send.
 // We need to shimmy through this helper to break that aspect of the compiler flow
 // analysis and allow things to compile.
-fn schedule_domain_spawn_v2<SND>(
-    spawn: SpawnV2,
-    send_response: SND,
-    client_id: Option<Arc<ClientId>>,
-) where
+fn schedule_domain_spawn_v2<SND>(spawn: SpawnV2, send_response: SND)
+where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(domain_spawn_v2(spawn, client_id).await) })
+    promise::spawn::spawn(async move { send_response(domain_spawn_v2(spawn).await) }).detach();
+}
+
+fn schedule_ensure_thinkterm_thread<SND>(request: EnsureThinkTermThread, send_response: SND)
+where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+{
+    promise::spawn::spawn(async move { send_response(ensure_thinkterm_thread(request).await) })
         .detach();
 }
 
-fn schedule_ensure_thinkterm_thread<SND>(
-    request: EnsureThinkTermThread,
-    send_response: SND,
-    client_id: Option<Arc<ClientId>>,
-) where
-    SND: Fn(anyhow::Result<Pdu>) + 'static,
-{
-    promise::spawn::spawn(async move {
-        send_response(ensure_thinkterm_thread(request, client_id).await)
-    })
-    .detach();
-}
-
-async fn ensure_thinkterm_thread(
-    request: EnsureThinkTermThread,
-    client_id: Option<Arc<ClientId>>,
-) -> anyhow::Result<Pdu> {
+async fn ensure_thinkterm_thread(request: EnsureThinkTermThread) -> anyhow::Result<Pdu> {
     let _materialize = THINKTERM_MATERIALIZE.lock().await;
     let mux = Mux::get();
-    let _identity = mux.with_identity(client_id);
+    // No identity is installed here on purpose: every workspace name on this
+    // path is explicit (`landing.workspace`), and a guard held across the
+    // awaits below would leak the requesting identity to unrelated
+    // main-thread work. See `Mux::with_identity`.
     let landing = crate::thinkterm_tree::ensure_landing(request.preferred_thread_id.as_deref())?;
 
     let has_live_pane = mux
@@ -1724,6 +1710,12 @@ async fn ensure_thinkterm_thread(
     ))
 }
 
+/// NOTE: this runs with *no* identity installed (see `ensure_thinkterm_thread`).
+/// If layout restore or this fallback ever gains a "send a command to the new
+/// shell" step, that write would reach `record_input_for_current_identity`
+/// and, in `TmuxLatest`, claim the tab's viewport for the ambient identity
+/// (the GUI's, in a GUI-hosted mux) — resolve the requesting identity
+/// explicitly at that point instead of re-adding a `with_identity` guard.
 async fn spawn_default_thinkterm_thread(
     mux: &Mux,
     landing: &crate::thinkterm_tree::LandingRecord,
@@ -1748,37 +1740,29 @@ async fn spawn_default_thinkterm_thread(
     Ok(())
 }
 
-fn schedule_split_pane<SND>(split: SplitPane, send_response: SND, client_id: Option<Arc<ClientId>>)
+fn schedule_split_pane<SND>(split: SplitPane, send_response: SND)
 where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(split_pane(split, client_id).await) })
+    promise::spawn::spawn(async move { send_response(split_pane(split).await) }).detach();
+}
+
+fn schedule_spawn_pane_in_stack<SND>(request: SpawnPaneInStack, send_response: SND)
+where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+{
+    promise::spawn::spawn(async move { send_response(spawn_pane_in_stack(request).await) })
         .detach();
 }
 
-fn schedule_spawn_pane_in_stack<SND>(
-    request: SpawnPaneInStack,
-    send_response: SND,
-    client_id: Option<Arc<ClientId>>,
-) where
-    SND: Fn(anyhow::Result<Pdu>) + 'static,
-{
-    promise::spawn::spawn(
-        async move { send_response(spawn_pane_in_stack(request, client_id).await) },
-    )
-    .detach();
-}
-
-fn schedule_move_pane_to_stack<SND>(
-    request: MovePaneToStack,
-    send_response: SND,
-    client_id: Option<Arc<ClientId>>,
-) where
+fn schedule_move_pane_to_stack<SND>(request: MovePaneToStack, send_response: SND)
+where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
     promise::spawn::spawn(async move {
         let mux = Mux::get();
-        let _identity = mux.with_identity(client_id);
+        // No identity: `move_pane_to_stack` reads none, and a guard held
+        // across the await would leak the identity to unrelated work.
         send_response(
             mux.move_pane_to_stack(request.source_pane_id, request.target_pane_id)
                 .await
@@ -1788,12 +1772,10 @@ fn schedule_move_pane_to_stack<SND>(
     .detach();
 }
 
-async fn spawn_pane_in_stack(
-    request: SpawnPaneInStack,
-    client_id: Option<Arc<ClientId>>,
-) -> anyhow::Result<Pdu> {
+async fn spawn_pane_in_stack(request: SpawnPaneInStack) -> anyhow::Result<Pdu> {
     let mux = Mux::get();
-    let _identity = mux.with_identity(client_id);
+    // No identity: `spawn_pane_in_stack` reads none, and a guard held across
+    // the await would leak the identity to unrelated main-thread work.
 
     let (_pane_domain_id, window_id, tab_id) = mux
         .resolve_pane_id(request.pane_id)
@@ -1831,9 +1813,10 @@ async fn spawn_pane_in_stack(
     }))
 }
 
-async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {
+async fn split_pane(split: SplitPane) -> anyhow::Result<Pdu> {
     let mux = Mux::get();
-    let _identity = mux.with_identity(client_id);
+    // No identity: `Mux::split_pane` reads none, and a guard held across the
+    // await would leak the identity to unrelated main-thread work.
 
     let (_pane_domain_id, window_id, tab_id) = mux
         .resolve_pane_id(split.pane_id)
@@ -1860,9 +1843,12 @@ async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyho
     }))
 }
 
-async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {
+async fn domain_spawn_v2(spawn: SpawnV2) -> anyhow::Result<Pdu> {
     let mux = Mux::get();
-    let _identity = mux.with_identity(client_id);
+    // No identity: `spawn.workspace` is an explicit non-optional string on
+    // the wire, so `spawn_tab_or_window` never falls back to the ambient
+    // identity's workspace. A guard held across the await would leak the
+    // identity to unrelated main-thread work.
 
     let (tab, pane, window_id) = mux
         .spawn_tab_or_window(
@@ -1896,19 +1882,44 @@ fn schedule_move_pane<SND>(
         .detach();
 }
 
+/// `Mux::move_pane_to_new_tab` falls back to the *global identity's*
+/// workspace when it has to create a window and nobody named one. Resolve
+/// that name here, synchronously and per-client, so no identity has to
+/// survive the await.
+///
+/// Only the new-window case is filled in: with a `window_id` the workspace
+/// is unused locally, and leaving it `None` keeps the PDU forwarded to a
+/// nested mux byte-identical to before.
+fn workspace_for_moved_pane(
+    mux: &Mux,
+    requested: Option<String>,
+    window_id: Option<mux::window::WindowId>,
+    client_id: Option<&Arc<ClientId>>,
+) -> Option<String> {
+    if requested.is_some() || window_id.is_some() {
+        return requested;
+    }
+    Some(mux.active_workspace_for_optional_client(client_id))
+}
+
 async fn move_pane(
     request: MovePaneToNewTab,
     client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
     let mux = Mux::get();
-    let _identity = mux.with_identity(client_id);
+    // No identity is installed here: the one identity-derived value on this
+    // path (the fallback workspace for a new window) is resolved explicitly
+    // below. A guard held across the await would leak the identity to
+    // unrelated main-thread work.
+    let workspace = workspace_for_moved_pane(
+        &mux,
+        request.workspace_for_new_window,
+        request.window_id,
+        client_id.as_ref(),
+    );
 
     let (tab, window_id) = mux
-        .move_pane_to_new_tab(
-            request.pane_id,
-            request.window_id,
-            request.workspace_for_new_window,
-        )
+        .move_pane_to_new_tab(request.pane_id, request.window_id, workspace)
         .await?;
 
     Ok::<Pdu, anyhow::Error>(Pdu::MovePaneToNewTabResponse(MovePaneToNewTabResponse {
@@ -1919,13 +1930,16 @@ async fn move_pane(
 
 #[cfg(test)]
 mod tests {
-    use super::{PerPane, claim_viewport_for_pane, requires_existing_frontend_access};
+    use super::{
+        claim_viewport_for_pane, requires_existing_frontend_access, workspace_for_moved_pane,
+        PerPane,
+    };
     use codec::{EnsureThinkTermThread, Pdu};
-    use mux::Mux;
     use mux::client::ClientId;
+    use mux::Mux;
     use std::sync::Arc;
-    use wezterm_term::TerminalSize;
     use wezterm_term::color::ColorPalette;
+    use wezterm_term::TerminalSize;
 
     #[test]
     fn cold_thread_materialization_does_not_require_an_existing_owner() {
@@ -1958,6 +1972,38 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(superseded.contains("superseded client connection"));
+    }
+
+    #[test]
+    fn moved_pane_workspace_is_resolved_from_the_requesting_client() {
+        config::use_test_configuration();
+        let mux = Mux::new(None);
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        mux.set_active_workspace_for_client(&client, "space-2");
+
+        // An explicitly requested workspace passes through untouched.
+        assert_eq!(
+            workspace_for_moved_pane(&mux, Some("named".to_string()), None, Some(&client)),
+            Some("named".to_string())
+        );
+        // An existing-window move keeps the field empty: it is unused locally
+        // and the forwarded nested-mux PDU stays byte-identical.
+        assert_eq!(
+            workspace_for_moved_pane(&mux, None, Some(7), Some(&client)),
+            None
+        );
+        // A new window with no name lands in the requesting client's
+        // workspace...
+        assert_eq!(
+            workspace_for_moved_pane(&mux, None, None, Some(&client)),
+            Some("space-2".to_string())
+        );
+        // ...and in the default workspace when the request is anonymous.
+        assert_eq!(
+            workspace_for_moved_pane(&mux, None, None, None),
+            Some("default".to_string())
+        );
     }
 
     #[test]

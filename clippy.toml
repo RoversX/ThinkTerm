@@ -1,0 +1,4 @@
+# `Mux.identity` is a process-global slot; holding its RAII guard across an
+# `.await` publishes the wrong identity to every other main-thread task and
+# breaks the guard's LIFO restore. See `Mux::with_identity` for the full story.
+await-holding-invalid-types = ["mux::IdentityHolder"]

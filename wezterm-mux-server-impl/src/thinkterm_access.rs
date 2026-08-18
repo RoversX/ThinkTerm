@@ -4,6 +4,19 @@
 //! and must be rebuilt after each mux-server restart. A malformed existing file
 //! is never silently overwritten: the server starts safely in Handoff mode but
 //! refuses mode mutations until the operator repairs or removes that file.
+//!
+//! # Single writer per file
+//!
+//! `STORE` is a per-process cache read once at startup. Both wezterm-gui
+//! (which also calls `persist_mode` in-process from its own frontend-mode UI)
+//! and wezterm-mux-server cache independently, and neither re-reads on a
+//! schedule: mux mode is initialized exactly once per process
+//! (`initialize_mux`, `Mux::initialize_frontend_access_mode`). Concurrent
+//! writers are therefore last-writer-wins; `persist_mode` re-reads the file
+//! before each write so a concurrent change is *reported* (and the write is
+//! based on the on-disk truth), but modes are not reconciled across live
+//! processes — that would need owner-validated runtime handoff and is out of
+//! scope here.
 
 use anyhow::{Context, Result};
 use mux::{FrontendAccessMode, Mux};
@@ -129,17 +142,42 @@ pub fn initialize_mux(mux: &Mux) {
 /// Persist before the caller commits the mux state. `StoreState` changes only
 /// after the atomic replace succeeds.
 pub fn persist_mode(mode: FrontendAccessMode) -> Result<()> {
-    let mut store = STORE.lock().unwrap();
+    persist_mode_at(&access_path(), &mut STORE.lock().unwrap(), mode)
+}
+
+fn persist_mode_at(path: &Path, store: &mut StoreState, mode: FrontendAccessMode) -> Result<()> {
     if let Some(err) = &store.load_error {
-        anyhow::bail!(
-            "refusing to overwrite unreadable {}: {err}",
-            access_path().display()
-        );
+        anyhow::bail!("refusing to overwrite unreadable {}: {err}", path.display());
+    }
+    // Another process (GUI-embedded server vs standalone mux-server) may have
+    // written the file since this process cached it. Decide against the
+    // on-disk truth, not the cache: the stale-cache early return below used
+    // to skip a write the file actually needed.
+    match load_from_path(path) {
+        Ok(on_disk) => {
+            if on_disk != store.mode {
+                log::warn!(
+                    "{} was changed out from under this process (on disk {on_disk:?}, \
+                     this process last knew {:?}); writing {mode:?} anyway — last \
+                     writer wins",
+                    path.display(),
+                    store.mode
+                );
+                store.mode = on_disk;
+            }
+        }
+        Err(err) => {
+            log::warn!(
+                "refusing to overwrite {}: it became unreadable since startup: {err:#}",
+                path.display()
+            );
+            return Err(err);
+        }
     }
     if store.mode == mode {
         return Ok(());
     }
-    save_to_path(&access_path(), mode)?;
+    save_to_path(path, mode)?;
     store.mode = mode;
     Ok(())
 }
@@ -170,5 +208,40 @@ mod tests {
         std::fs::write(&path, b"not json").unwrap();
         assert!(load_from_path(&path).is_err());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn a_concurrent_mode_change_is_reported_and_the_last_writer_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thinkterm_access.json");
+        // Another process wrote TmuxLatest while this process still believes
+        // its own last write of Handoff is current.
+        save_to_path(&path, FrontendAccessMode::TmuxLatest).unwrap();
+        let mut store = StoreState {
+            mode: FrontendAccessMode::Handoff,
+            load_error: None,
+        };
+
+        // The stale-cache early return used to skip this write entirely,
+        // leaving the file saying TmuxLatest while this process believed
+        // Handoff. Deciding against the on-disk truth fixes that.
+        persist_mode_at(&path, &mut store, FrontendAccessMode::Handoff).unwrap();
+        assert_eq!(load_from_path(&path).unwrap(), FrontendAccessMode::Handoff);
+        assert_eq!(store.mode, FrontendAccessMode::Handoff);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_not_overwritten_even_when_the_cache_looks_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thinkterm_access.json");
+        std::fs::write(&path, b"not json").unwrap();
+        let mut store = StoreState {
+            mode: FrontendAccessMode::Handoff,
+            load_error: None,
+        };
+
+        assert!(persist_mode_at(&path, &mut store, FrontendAccessMode::TmuxLatest).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not json");
+        assert_eq!(store.mode, FrontendAccessMode::Handoff);
     }
 }

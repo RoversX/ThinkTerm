@@ -3,13 +3,13 @@ use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::{Window, WindowId, WindowUiSurfaceId};
-use anyhow::{Context, Error, anyhow};
+use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
-use config::{ExitBehavior, GuiPosition, configuration};
+use config::{configuration, ExitBehavior, GuiPosition};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
+use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 #[cfg(unix)]
-use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
+use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -34,7 +34,7 @@ use wezterm_term::{
     Clipboard, ClipboardSelection, DownloadHandler, TerminalConfiguration, TerminalSize,
 };
 #[cfg(windows)]
-use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
+use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
 pub mod activity;
 pub mod client;
@@ -235,6 +235,29 @@ struct TabFrontendLease {
     /// it can never describe a renderer that is no longer driving.
     view: Option<FrontendView>,
     generation: u64,
+}
+
+/// True when `me` is the only *live* client that has advertised geometry for
+/// any tab. A sole renderer cannot be fighting anyone over the lease, so an
+/// unclaimed lease is effectively its own. Two or more renderers must take it
+/// explicitly — see `unregister_client`, which deliberately elects no
+/// successor.
+///
+/// Handoff's owner is global, so the scan is global: a phone rendering tab B
+/// must still stop the desktop from silently assuming tab A. Filtering by
+/// `live` registrations guards against a viewport left behind by a client
+/// whose transport died without an orderly unregister.
+fn is_sole_live_renderer(
+    tabs: &HashMap<TabId, TabFrontendLease>,
+    live: &HashSet<ClientId>,
+    me: &ClientId,
+) -> bool {
+    !tabs.values().any(|state| {
+        state
+            .viewports
+            .keys()
+            .any(|client| client != me && live.contains(client))
+    })
 }
 
 struct FrontendLeaseState {
@@ -1100,33 +1123,43 @@ impl Mux {
     }
 
     pub fn current_identity_owns_frontend_lease(&self, tab_id: TabId) -> bool {
-        // An UNCLAIMED lease belongs to whoever is asking. The lease exists to
-        // stop two frontends fighting over one tab's geometry; when nobody
-        // holds it there is nothing to protect, and answering "not yours"
-        // paralyzes the only frontend present: the GUI's local viewport
-        // publish can fail its compose validation ("frontend frames do not
-        // compose"), the lease then never gets claimed, and every pane-size
-        // sync behind `owns_frontend_viewport` is silently skipped -- measured
-        // as split-divider drags leaving TUIs at their old PTY size until the
-        // drag ends. The identity-less arm below already treated unclaimed as
-        // permitted; this makes the identified arm consistent.
-        let unclaimed = {
-            let lease = self.frontend_lease.lock();
-            match lease.access_mode {
-                FrontendAccessMode::Handoff => lease.handoff_owner.is_none(),
-                FrontendAccessMode::TmuxLatest => lease
+        // Lock order: registrations first, dropped before the lease lock is
+        // taken — the same order `set_registered_client_viewport` uses.
+        let identity = self.active_identity();
+        let live: HashSet<ClientId> = self.client_registrations.read().keys().cloned().collect();
+        let lease = self.frontend_lease.lock();
+        match lease.access_mode {
+            // Per-tab ownership is cheap to re-take and is re-seeded by the
+            // very next passive report (`set_client_viewport` seeds an
+            // ownerless tab unconditionally), so an unclaimed tab belongs to
+            // whoever asks — symmetric with the wire path.
+            FrontendAccessMode::TmuxLatest => {
+                match lease
                     .tabs
                     .get(&tab_id)
                     .and_then(|state| state.owner.as_ref())
-                    .is_none(),
+                {
+                    None => true,
+                    Some(owner) => identity.as_deref() == Some(owner),
+                }
             }
-        };
-        if unclaimed {
-            return true;
-        }
-        match self.active_identity() {
-            Some(identity) => self.client_owns_frontend_lease(&identity, tab_id),
-            None => false,
+            FrontendAccessMode::Handoff => match lease.handoff_owner.as_ref() {
+                Some(owner) => identity.as_deref() == Some(owner),
+                // Bootstrap: nobody has ever rendered, nothing to protect.
+                None if !lease.handoff_ever_owned => true,
+                // Post-revocation. Symmetric with wire clients
+                // (`set_client_viewport` seeds only while
+                // `!handoff_ever_owned`): survivors must claim explicitly.
+                // The one exception is a sole renderer, which recovers on its
+                // own instead of sitting behind a takeover surface with
+                // nobody to take the terminal from — this preserves the fix
+                // for the measured paralysis (split-divider drags leaving
+                // TUIs at their old PTY size) without letting two surviving
+                // frontends fight over the geometry.
+                None => identity
+                    .as_deref()
+                    .is_some_and(|me| is_sole_live_renderer(&lease.tabs, &live, me)),
+            },
         }
     }
 
@@ -1769,6 +1802,24 @@ impl Mux {
             .unwrap_or_else(|| self.get_default_workspace())
     }
 
+    /// The workspace a request from `client_id` should file new windows under.
+    ///
+    /// Exactly equivalent to `active_workspace()` evaluated with `client_id`
+    /// installed as the global identity, but without touching that global.
+    /// Server handlers must resolve workspace attribution with this *before*
+    /// they await: an `IdentityHolder` held across a suspension point
+    /// publishes the wrong identity to every other main-thread task, and its
+    /// restore is not LIFO-safe.
+    pub fn active_workspace_for_optional_client(
+        &self,
+        client_id: Option<&Arc<ClientId>>,
+    ) -> String {
+        match client_id {
+            Some(client_id) => self.active_workspace_for_client(client_id),
+            None => self.get_default_workspace(),
+        }
+    }
+
     pub fn set_active_workspace_for_client(&self, ident: &Arc<ClientId>, workspace: &str) {
         let mut clients = self.clients.write();
         if let Some(info) = clients.get_mut(&ident) {
@@ -1813,6 +1864,18 @@ impl Mux {
     /// Returns `IdentityHolder` which will restore the prior identity
     /// when it is dropped.
     /// This can be used to change the identity for the duration of a block.
+    ///
+    /// # This guard must not be held across an `.await`
+    ///
+    /// The identity is a single process-global slot and `IdentityHolder`'s
+    /// restore is not LIFO-safe across interleaved tasks. Suspending with one
+    /// installed publishes the wrong identity to every other main-thread
+    /// task, including GUI mux subscribers (which run synchronously from
+    /// `notify`) and `record_input_for_current_identity`, which in
+    /// `TmuxLatest` mode will *claim* a tab's viewport for whoever happens to
+    /// be installed. Resolve what you need synchronously (e.g.
+    /// [`Mux::active_workspace_for_optional_client`]) and pass it as data.
+    /// `clippy.toml` arms `await_holding_invalid_type` for `IdentityHolder`.
     pub fn with_identity(&self, id: Option<Arc<ClientId>>) -> IdentityHolder {
         let prior = self.replace_identity(id);
         IdentityHolder { prior }
@@ -3100,6 +3163,196 @@ mod tests {
     }
 
     #[test]
+    fn sole_live_renderer_ignores_itself_and_dead_clients() {
+        let me = client_id(150);
+        let other = client_id(151);
+        let mut live = HashSet::new();
+        live.insert(me.clone());
+        let mut tabs: HashMap<TabId, TabFrontendLease> = HashMap::new();
+
+        // No viewports anywhere: sole.
+        assert!(is_sole_live_renderer(&tabs, &live, &me));
+
+        // Only my own viewport: still sole.
+        tabs.entry(1)
+            .or_default()
+            .viewports
+            .insert(me.clone(), frontend_test_viewport(80, 24));
+        assert!(is_sole_live_renderer(&tabs, &live, &me));
+
+        // Another client's viewport, but that client is dead: still sole.
+        tabs.entry(2)
+            .or_default()
+            .viewports
+            .insert(other.clone(), frontend_test_viewport(60, 20));
+        assert!(is_sole_live_renderer(&tabs, &live, &me));
+
+        // Same viewport once the client is live: no longer sole.
+        live.insert(other.clone());
+        assert!(!is_sole_live_renderer(&tabs, &live, &me));
+
+        // A live client with no viewport anywhere (a `wezterm cli` style
+        // non-rendering client) does not count as a renderer.
+        tabs.get_mut(&2).unwrap().viewports.remove(&other);
+        assert!(is_sole_live_renderer(&tabs, &live, &me));
+    }
+
+    #[test]
+    fn unclaimed_handoff_lease_belongs_to_the_first_renderer() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
+        let tab_id = frontend_test_tab(&mux);
+
+        // Bootstrap: nobody has ever rendered.
+        assert!(mux.current_identity_owns_frontend_lease(tab_id));
+        mux.replace_identity(Some(Arc::new(client_id(160))));
+        assert!(mux.current_identity_owns_frontend_lease(tab_id));
+    }
+
+    #[test]
+    fn revoked_handoff_lease_stays_unowned_while_two_renderers_are_present() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
+        let tab_id = frontend_test_tab(&mux);
+        let gui = Arc::new(client_id(161));
+        let tui = Arc::new(client_id(162));
+        mux.register_client(Arc::clone(&gui));
+        mux.register_client(Arc::clone(&tui));
+        {
+            let mut lease = mux.frontend_lease.lock();
+            lease.handoff_owner = None;
+            lease.handoff_ever_owned = true;
+            let state = lease.tabs.entry(tab_id).or_default();
+            state
+                .viewports
+                .insert((*gui).clone(), frontend_test_viewport(120, 40));
+            state
+                .viewports
+                .insert((*tui).clone(), frontend_test_viewport(60, 20));
+        }
+
+        // Symmetry is the point: neither survivor silently owns the lease.
+        mux.replace_identity(Some(Arc::clone(&gui)));
+        assert!(!mux.current_identity_owns_frontend_lease(tab_id));
+        mux.replace_identity(Some(Arc::clone(&tui)));
+        assert!(!mux.current_identity_owns_frontend_lease(tab_id));
+    }
+
+    #[test]
+    fn revoked_handoff_lease_returns_to_the_sole_surviving_renderer() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
+        let tab_id = frontend_test_tab(&mux);
+        let gui = Arc::new(client_id(163));
+        let tui = Arc::new(client_id(164));
+        mux.register_client(Arc::clone(&gui));
+        let tui_registration = mux.register_client(Arc::clone(&tui));
+        {
+            let mut lease = mux.frontend_lease.lock();
+            lease.handoff_owner = None;
+            lease.handoff_ever_owned = true;
+            let state = lease.tabs.entry(tab_id).or_default();
+            state
+                .viewports
+                .insert((*gui).clone(), frontend_test_viewport(120, 40));
+            state
+                .viewports
+                .insert((*tui).clone(), frontend_test_viewport(60, 20));
+        }
+        mux.replace_identity(Some(Arc::clone(&gui)));
+        assert!(!mux.current_identity_owns_frontend_lease(tab_id));
+
+        mux.unregister_client(&tui, tui_registration);
+        assert!(mux.current_identity_owns_frontend_lease(tab_id));
+
+        // A viewport left behind by a dead client must not block recovery.
+        mux.frontend_lease
+            .lock()
+            .tabs
+            .get_mut(&tab_id)
+            .unwrap()
+            .viewports
+            .insert((*tui).clone(), frontend_test_viewport(60, 20));
+        assert!(mux.current_identity_owns_frontend_lease(tab_id));
+    }
+
+    #[test]
+    fn claimed_handoff_lease_is_not_owned_by_a_non_owner() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
+        let tab_id = frontend_test_tab(&mux);
+        let owner = Arc::new(client_id(165));
+        let bystander = Arc::new(client_id(166));
+        {
+            let mut lease = mux.frontend_lease.lock();
+            lease.handoff_owner = Some((*owner).clone());
+            lease.handoff_ever_owned = true;
+        }
+
+        mux.replace_identity(Some(Arc::clone(&bystander)));
+        assert!(!mux.current_identity_owns_frontend_lease(tab_id));
+        mux.replace_identity(Some(Arc::clone(&owner)));
+        assert!(mux.current_identity_owns_frontend_lease(tab_id));
+        mux.replace_identity(None);
+        assert!(!mux.current_identity_owns_frontend_lease(tab_id));
+    }
+
+    #[test]
+    fn unclaimed_tmux_latest_tab_is_owned_by_the_asking_renderer() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::TmuxLatest);
+        let tab_id = frontend_test_tab(&mux);
+        let me = Arc::new(client_id(167));
+        let other = Arc::new(client_id(168));
+        mux.register_client(Arc::clone(&me));
+        mux.register_client(Arc::clone(&other));
+        {
+            let mut lease = mux.frontend_lease.lock();
+            let state = lease.tabs.entry(tab_id).or_default();
+            state
+                .viewports
+                .insert((*me).clone(), frontend_test_viewport(120, 40));
+            state
+                .viewports
+                .insert((*other).clone(), frontend_test_viewport(60, 20));
+        }
+
+        // Per-tab claims are cheap and symmetric: an ownerless tab belongs to
+        // whoever asks, even with another renderer present.
+        mux.replace_identity(Some(Arc::clone(&me)));
+        assert!(mux.current_identity_owns_frontend_lease(tab_id));
+
+        mux.frontend_lease
+            .lock()
+            .tabs
+            .get_mut(&tab_id)
+            .unwrap()
+            .owner = Some((*other).clone());
+        assert!(!mux.current_identity_owns_frontend_lease(tab_id));
+    }
+
+    #[test]
+    fn optional_client_workspace_matches_the_identified_fallback() {
+        config::use_test_configuration();
+        let mux = Mux::new(None);
+        let client = Arc::new(client_id(190));
+        mux.register_client(Arc::clone(&client));
+        mux.set_active_workspace_for_client(&client, "space-2");
+
+        assert_eq!(
+            mux.active_workspace_for_optional_client(Some(&client)),
+            "space-2"
+        );
+        // The None case must resolve to the default workspace — exactly what
+        // `active_workspace()` produced with no identity installed.
+        assert_eq!(
+            mux.active_workspace_for_optional_client(None),
+            mux.active_workspace()
+        );
+        assert_eq!(mux.active_workspace_for_optional_client(None), "default");
+    }
+
+    #[test]
     fn failed_first_handoff_geometry_revokes_the_automatic_owner() {
         let mux = Mux::new(None);
         mux.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
@@ -3107,10 +3360,9 @@ mod tests {
         let client = client_id(201);
         mux.frontend_geometry_failures.lock().push_back(true);
 
-        assert!(
-            mux.set_client_viewport(&client, tab_id, frontend_test_viewport(120, 40))
-                .is_err()
-        );
+        assert!(mux
+            .set_client_viewport(&client, tab_id, frontend_test_viewport(120, 40))
+            .is_err());
         let lease = mux.frontend_lease.lock();
         assert_eq!(lease.handoff_owner, None);
         assert!(lease.handoff_ever_owned);
@@ -3132,10 +3384,9 @@ mod tests {
         }
         mux.frontend_geometry_failures.lock().push_back(true);
 
-        assert!(
-            mux.claim_frontend_viewport(&second, tab_id, frontend_test_viewport(120, 40))
-                .is_err()
-        );
+        assert!(mux
+            .claim_frontend_viewport(&second, tab_id, frontend_test_viewport(120, 40))
+            .is_err());
         let lease = mux.frontend_lease.lock();
         assert_eq!(lease.handoff_owner, None);
         assert_eq!(lease.tabs[&tab_id].owner, None);
@@ -3155,15 +3406,14 @@ mod tests {
         }
         mux.frontend_geometry_failures.lock().push_back(true);
 
-        assert!(
-            mux.set_frontend_access_mode(
+        assert!(mux
+            .set_frontend_access_mode(
                 &owner,
                 FrontendAccessMode::TmuxLatest,
                 tab_id,
                 frontend_test_viewport(120, 40),
             )
-            .is_err()
-        );
+            .is_err());
         let access = mux.frontend_access_state();
         assert_eq!(access.mode, FrontendAccessMode::Handoff);
         assert_eq!(access.owner, None);
@@ -3567,16 +3817,15 @@ mod tests {
         mux.set_registered_client_viewport(&second, second_registration, tab_id, grid.clone())
             .unwrap();
 
-        assert!(
-            mux.set_registered_frontend_access_mode(
+        assert!(mux
+            .set_registered_frontend_access_mode(
                 &second,
                 second_registration,
                 FrontendAccessMode::TmuxLatest,
                 tab_id,
                 grid.clone(),
             )
-            .is_err()
-        );
+            .is_err());
         mux.set_registered_frontend_access_mode(
             &first,
             first_registration,
@@ -3590,16 +3839,15 @@ mod tests {
         // the one allowed to make itself B's global owner.
         mux.claim_registered_client_viewport(&second, second_registration, tab_id, grid.clone())
             .unwrap();
-        assert!(
-            mux.set_registered_frontend_access_mode(
+        assert!(mux
+            .set_registered_frontend_access_mode(
                 &first,
                 first_registration,
                 FrontendAccessMode::Handoff,
                 tab_id,
                 grid.clone(),
             )
-            .is_err()
-        );
+            .is_err());
         let access = mux
             .set_registered_frontend_access_mode(
                 &second,
