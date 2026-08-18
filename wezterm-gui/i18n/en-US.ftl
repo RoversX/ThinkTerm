@@ -443,3 +443,15 @@ settings-status-import-field-disabled = { $field } removed from the import selec
 settings-status-import-selection-error = Unable to save the import selection: { $error }
 settings-status-import-all-selected = Selected all { $count } supported settings.
 settings-status-import-all-cleared = Cleared the import selection.
+# -- First-run setup ---------------------------------------------------------
+onboarding-window-title = ThinkTerm Setup
+onboarding-title = Welcome to ThinkTerm
+onboarding-subtitle = A terminal that keeps your work together
+onboarding-language = Language
+onboarding-appearance = Appearance
+onboarding-theme-system = Follow System
+onboarding-theme-light = Light
+onboarding-theme-dark = Dark
+onboarding-privacy = Nothing you open leaves this machine.
+onboarding-skip = Skip
+onboarding-start = Get Started

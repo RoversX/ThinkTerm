@@ -1,331 +1,220 @@
-use crate::native_settings::{
-    mark_onboarding_seen, NativeLanguagePreference, NativeThemeMode, ThinkTermNativeSettings,
-};
+//! First-run setup: one page, no wizard.
+//!
+//! It asks two things — what language, and light or dark — and gets out of the
+//! way.
+//!
+//! Every surface here is a `draw_rounded_frame` and every glyph a `SvgIcon`,
+//! which is the combination the rest of this crate already draws with. An
+//! earlier cut invented its own ornament — a bevelled slab with a phosphor-dot
+//! grid for the mark — by transcribing a CSS mock. Those primitives have no
+//! equivalent here (no blend modes, no clipping, no box-shadow) and the result
+//! did not render as designed. Prefer a plainer thing that is certainly right.
+//!
+//! The palette is deliberately neutral. The user is choosing a theme on this
+//! screen, so an accent hue would compete with the very thing being judged;
+//! selection is carried by fill and border weight instead.
+
+use crate::i18n::{language_option_label, LANGUAGE_OPTIONS};
+use crate::native_settings::{mark_onboarding_seen, NativeThemeMode, ThinkTermNativeSettings};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::content_view::{ContentView, ContentViewResponse};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::TermWindow;
-use crate::ui::anim::Easing;
 use crate::ui::{
-    draw_scrollbar, draw_toggle, rect, wheel_delta_pixels, ControlState, DrawContext,
-    InteractionState, ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
+    rect, ControlState, DrawContext, InteractionState, UiContext, UiPalette, WidgetKind,
 };
-use std::path::{Path, PathBuf};
+use crate::utilsprites::RenderMetrics;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
 use window::color::LinearRgba;
 use window::{MouseEventKind as WMEK, MousePress, RectF, WindowOps};
 
-const OUTER_PAD: f32 = 56.0;
-const CARD_RADIUS: f32 = 20.0;
-const ACTION_H: f32 = 66.0;
-const CONTENT_MAX_W: f32 = 1240.0;
-const HEADER_H: f32 = 160.0;
-const FOOTER_H: f32 = 150.0;
-const PROJECT_ROW_H: f32 = 118.0;
-const PROJECT_ROW_GAP: f32 = 10.0;
-const TRANSITION_MS: u64 = 280;
+// Design pixels, which `ctx.px()` maps onto this surface's backing grid.
+//
+// A design pixel is *half* a CSS/logical pixel: the design dpi is 144, i.e. a
+// 2x macOS surface (see `ui::tokens::ui_scale_for_dpi`). So a control that
+// should look 32pt tall is 64 here. Getting this wrong halves the whole layout
+// while leaving the text at full size, which reads as everything crushed
+// together and wrapping early.
+const COL_W: f32 = 1120.0;
+/// Floor for the content column, so text never gets a zero width budget.
+const MIN_COL_W: f32 = 320.0;
+const SIDE_PAD: f32 = 64.0;
+const SECTION_GAP: f32 = 60.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Step {
-    Welcome,
-    ImportSources,
-    ReviewProjects,
-    Preferences,
-    Ready,
-}
+const MARK_SIZE: f32 = 128.0;
+const MARK_TO_TITLE: f32 = 52.0;
+const TITLE_TO_SUB: f32 = 12.0;
+const LABEL_GAP: f32 = 24.0;
 
-impl Step {
-    fn all() -> &'static [Step] {
-        &[
-            Self::Welcome,
-            Self::ImportSources,
-            Self::ReviewProjects,
-            Self::Preferences,
-            Self::Ready,
-        ]
-    }
+const CHIP_PAD_X: f32 = 28.0;
+const CHIP_PAD_Y: f32 = 18.0;
+const CHIP_GAP: f32 = 16.0;
+const CHIP_RADIUS: f32 = 18.0;
 
-    fn index(self) -> usize {
-        Self::all()
-            .iter()
-            .position(|step| *step == self)
-            .unwrap_or(0)
-    }
+/// Appearance previews. Big enough to actually depict a light and a dark
+/// surface, because that is the one thing on this page that communicates
+/// without being read — the user may not have picked their language yet.
+const TILE_W: f32 = 224.0;
+const TILE_H: f32 = 144.0;
+const TILE_GAP: f32 = 24.0;
+const TILE_RADIUS: f32 = 20.0;
+const TILE_INSET: f32 = 16.0;
+const TILE_LABEL_GAP: f32 = 16.0;
+/// Slack around a preview's caption, so a long translation widens the tile
+/// instead of being ellipsised inside it.
+const TILE_CAPTION_PAD: f32 = 24.0;
+const FACE_RADIUS: f32 = 10.0;
+const FACE_SPLIT_GAP: f32 = 8.0;
+const BAR_H: f32 = 6.0;
+const BAR_GAP: f32 = 10.0;
+const BAR_INSET: f32 = 12.0;
 
-    fn title(self) -> &'static str {
-        match self {
-            Self::Welcome => "Welcome",
-            Self::ImportSources => "Import Sources",
-            Self::ReviewProjects => "Review Projects",
-            Self::Preferences => "Preferences",
-            Self::Ready => "Ready",
-        }
-    }
+/// Ring weights. `draw_rounded_frame`'s own border is always exactly one
+/// physical pixel, so anything heavier has to be a filled rounded rect drawn
+/// *behind* the control, with the margin showing as the ring.
+/// Floor for the shrink factor; below this the page is unreadable regardless.
+const FIT_MIN: f32 = 0.42;
 
-    fn eyebrow(self) -> &'static str {
-        match self {
-            Self::Welcome => "Set up your native terminal workspace",
-            Self::ImportSources => "Choose where projects come from",
-            Self::ReviewProjects => "Confirm before importing",
-            Self::Preferences => "Tune the native workspace",
-            Self::Ready => "Start clean",
-        }
-    }
+const RING_SELECTED: f32 = 4.0;
+const RING_FOCUS: f32 = 6.0;
 
-    fn next(self) -> Self {
-        match self {
-            Self::Welcome => Self::ImportSources,
-            Self::ImportSources => Self::ReviewProjects,
-            Self::ReviewProjects => Self::Preferences,
-            Self::Preferences => Self::Ready,
-            Self::Ready => Self::Ready,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Welcome => Self::Welcome,
-            Self::ImportSources => Self::Welcome,
-            Self::ReviewProjects => Self::ImportSources,
-            Self::Preferences => Self::ReviewProjects,
-            Self::Ready => Self::Preferences,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ImportProvider {
-    VsCode,
-    Cursor,
-    Antigravity,
-    Cmux,
-    Manual,
-}
-
-impl ImportProvider {
-    fn all() -> &'static [Self] {
-        &[
-            Self::VsCode,
-            Self::Cursor,
-            Self::Antigravity,
-            Self::Cmux,
-            Self::Manual,
-        ]
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::VsCode => "VS Code",
-            Self::Cursor => "Cursor",
-            Self::Antigravity => "Antigravity",
-            Self::Cmux => "cmux",
-            Self::Manual => "Choose Folder Manually",
-        }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::VsCode => "Workspace scan is not available in v1.",
-            Self::Cursor => "Cursor project history import is coming soon.",
-            Self::Antigravity => "Local Antigravity scan is not yet supported.",
-            Self::Cmux => "cmux session discovery is not wired yet.",
-            Self::Manual => "Pick a folder and review it before import.",
-        }
-    }
-
-    fn icon(self) -> SvgIcon {
-        match self {
-            Self::VsCode | Self::Cursor => SvgIcon::SquareTerminal,
-            Self::Antigravity => SvgIcon::Layers,
-            Self::Cmux => SvgIcon::Terminal,
-            Self::Manual => SvgIcon::FolderPlus,
-        }
-    }
-
-    fn is_available(self) -> bool {
-        matches!(self, Self::Manual)
-    }
-}
+const BTN_PAD_X: f32 = 40.0;
+const BTN_PAD_Y: f32 = 22.0;
+const BTN_GAP: f32 = 20.0;
+const BTN_RADIUS: f32 = 18.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum OnboardingAction {
-    Primary,
-    Back,
+    Start,
     Skip,
-    Provider(ImportProvider),
-    ToggleProject(usize),
-    RemoveProject(usize),
-    Language(NativeLanguagePreference),
+    /// Carries the stable preference string from [`LANGUAGE_OPTIONS`], which is
+    /// what `localization.language` persists, rather than the legacy
+    /// `NativeLanguagePreference` enum that cannot name every shipped locale.
+    Language(&'static str),
     Appearance(NativeThemeMode),
-    ToggleSidebar,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct StepTransition {
-    from: Step,
-    to: Step,
-    started_at: Instant,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProjectSource {
-    Manual,
-}
-
-impl ProjectSource {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Manual => "Manual",
-        }
+/// How far the discretionary space must shrink for the page to fit.
+///
+/// Text height is fixed, so total height is `rigid + factor * flex` — linear,
+/// and solvable in one step. Floored rather than allowed to go to zero: past
+/// some point the page is unreadable anyway, and overflowing slightly beats
+/// collapsing every gap to nothing.
+fn fit_factor(available: f32, rigid: f32, flex: f32) -> f32 {
+    if flex <= 0.0 {
+        return 1.0;
     }
+    ((available - rigid) / flex).clamp(FIT_MIN, 1.0)
 }
 
-#[derive(Debug, Clone)]
-struct PendingProject {
-    name: String,
-    path: PathBuf,
-    source: ProjectSource,
-    selected: bool,
+/// The appearance choices with their labels already localized.
+///
+/// Extracted so a test can assert the labels really are translations: an
+/// earlier cut left a second `modes` binding holding the raw key strings, which
+/// shadowed the translated one at the draw site, and the previews rendered
+/// "onboarding-theme-…" truncated to fit.
+fn appearance_choices() -> Vec<(NativeThemeMode, String)> {
+    vec![
+        (
+            NativeThemeMode::System,
+            crate::i18n::tr("onboarding-theme-system"),
+        ),
+        (
+            NativeThemeMode::Light,
+            crate::i18n::tr("onboarding-theme-light"),
+        ),
+        (
+            NativeThemeMode::Dark,
+            crate::i18n::tr("onboarding-theme-dark"),
+        ),
+    ]
 }
 
-impl PendingProject {
-    fn from_path(path: PathBuf, source: ProjectSource) -> Self {
-        let name = project_name_for_path(&path);
-        Self {
-            name,
-            path,
-            source,
-            selected: true,
-        }
-    }
+/// Tab order. Keyboard users get the same reach as the mouse, which the
+/// multi-step version never offered — there, Tab switched steps and no control
+/// was reachable without pointing at it.
+fn focus_order() -> Vec<OnboardingAction> {
+    let mut order: Vec<OnboardingAction> = LANGUAGE_OPTIONS
+        .iter()
+        .map(|option| OnboardingAction::Language(option.preference))
+        .collect();
+    order.extend(
+        [
+            NativeThemeMode::System,
+            NativeThemeMode::Light,
+            NativeThemeMode::Dark,
+        ]
+        .map(OnboardingAction::Appearance),
+    );
+    order.push(OnboardingAction::Skip);
+    order.push(OnboardingAction::Start);
+    order
 }
 
 pub(crate) struct OnboardingView {
-    /// UI scale captured at paint time; mouse handlers get no `DrawContext`.
-    last_ui_scale: f32,
-    step: Step,
     widgets: UiContext<OnboardingAction>,
     interaction: InteractionState<OnboardingAction>,
-    review_scroll: ScrollState,
     initial_space_id: String,
     initial_space_name: String,
-    pending_projects: Vec<PendingProject>,
-    target_space_id: Option<String>,
-    imported_project_count: usize,
-    selected_language: NativeLanguagePreference,
+    /// Preference string from [`LANGUAGE_OPTIONS`], not the legacy enum.
+    selected_language: &'static str,
     selected_appearance: NativeThemeMode,
-    show_left_sidebar: bool,
-    status: Option<String>,
-    transition: Option<StepTransition>,
+    /// What the app was using when this opened. Choices apply the instant they
+    /// are clicked, so without these Skip would have nothing to undo and would
+    /// be indistinguishable from Get Started — while still promising otherwise.
+    opened_with: (&'static str, NativeThemeMode),
 }
 
 impl OnboardingView {
     pub(crate) fn new(initial_space_id: String, initial_space_name: String) -> Self {
         let settings = crate::native_settings::load();
         Self {
-            step: Step::Welcome,
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
-            review_scroll: ScrollState::new(),
             initial_space_id,
             initial_space_name,
-            pending_projects: Vec::new(),
-            target_space_id: None,
-            imported_project_count: 0,
-            selected_language: settings.onboarding.language,
+            // Seeded from the effective preference, which already prefers
+            // `localization.language` and falls back to the legacy field, so a
+            // language set in Settings shows up preselected here.
+            selected_language: language_preference_for(&settings),
             selected_appearance: settings.appearance.theme_mode,
-            show_left_sidebar: settings.onboarding.show_left_sidebar_by_default,
-            status: None,
-            transition: None,
-            last_ui_scale: 1.0,
+            opened_with: (
+                language_preference_for(&settings),
+                settings.appearance.theme_mode,
+            ),
         }
     }
 
-    fn normalized_space_name(&self) -> String {
-        self.fallback_space_name()
-    }
-
-    fn fallback_space_name(&self) -> String {
+    fn space_name(&self) -> String {
         let initial_name = self.initial_space_name.trim();
         if !initial_name.is_empty() {
-            initial_name.to_string()
+            return initial_name.to_string();
+        }
+        let initial_id = self.initial_space_id.trim();
+        if initial_id.is_empty() {
+            "Default".to_string()
         } else {
-            let initial_id = self.initial_space_id.trim();
-            if initial_id.is_empty() {
-                "Default".to_string()
-            } else {
-                initial_id.to_string()
-            }
+            initial_id.to_string()
         }
-    }
-
-    fn selected_project_count(&self) -> usize {
-        self.pending_projects
-            .iter()
-            .filter(|project| project.selected)
-            .count()
-    }
-
-    fn start_step_transition(&mut self, next: Step, _direction: f32) {
-        let from = self.step;
-        if from == next {
-            return;
-        }
-        self.step = next;
-        if next == Step::ReviewProjects {
-            self.review_scroll.reset();
-        }
-        self.interaction.pressed = None;
-        self.transition = Some(StepTransition {
-            from,
-            to: next,
-            started_at: Instant::now(),
-        });
     }
 
     fn target_space_id_for_choice(&self) -> String {
         let initial_id = self.initial_space_id.trim();
         if initial_id.is_empty() {
-            crate::workspace_threads::ensure_space_named(&self.normalized_space_name())
+            crate::workspace_threads::ensure_space_named(&self.space_name())
         } else {
             self.initial_space_id.clone()
         }
     }
 
-    fn primary_label(&self) -> &'static str {
-        match self.step {
-            Step::Welcome | Step::ImportSources | Step::Preferences => "Continue",
-            Step::ReviewProjects => {
-                if self.selected_project_count() == 0 {
-                    "Continue Without Import"
-                } else {
-                    "Import Selected"
-                }
-            }
-            Step::Ready => "Start ThinkTerm",
-        }
-    }
-
-    fn primary_enabled(&self) -> bool {
-        true
-    }
+    // ---------------------------------------------------------------- input
 
     fn on_mouse_impl(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         let hit = self.widgets.hit_test(x, y).map(|target| target.action);
         match kind {
-            WMEK::VertWheel(amount) if self.step == Step::ReviewProjects => {
-                let old = self.review_scroll.offset;
-                self.review_scroll
-                    .scroll_by(wheel_delta_pixels(amount, self.last_ui_scale));
-                if (self.review_scroll.offset - old).abs() > 0.01 {
-                    ContentViewResponse::Redraw
-                } else {
-                    ContentViewResponse::Ignored
-                }
-            }
             WMEK::Move => {
                 if self.interaction.hovered != hit {
                     self.interaction.hovered = hit;
@@ -336,6 +225,11 @@ impl OnboardingView {
             }
             WMEK::Press(MousePress::Left) => {
                 self.interaction.pressed = hit;
+                // Clicking also takes focus, so Tab continues from where the
+                // pointer left off rather than jumping back to the start.
+                if hit.is_some() {
+                    self.interaction.focused = hit;
+                }
                 ContentViewResponse::Redraw
             }
             WMEK::Release(MousePress::Left) => {
@@ -351,256 +245,181 @@ impl OnboardingView {
         }
     }
 
+    /// Both choices apply the moment they are picked, exactly as the Settings
+    /// window applies them — the page redraws in the new language and the whole
+    /// app switches theme. Deferring them to "Get Started" made the controls
+    /// look inert: you click 简体中文 and nothing happens.
     fn apply(&mut self, action: OnboardingAction) -> ContentViewResponse {
-        self.status = None;
         match action {
-            OnboardingAction::Primary => self.apply_primary(),
-            OnboardingAction::Back => {
-                self.start_step_transition(self.step.previous(), -1.0);
-                ContentViewResponse::Redraw
-            }
+            OnboardingAction::Start => self.finish_response(),
             OnboardingAction::Skip => self.skip_response(),
-            OnboardingAction::Provider(provider) => {
-                if provider.is_available() {
-                    ContentViewResponse::Run(Box::new(|tw: &mut TermWindow| {
-                        tw.pick_content_view_folder();
-                    }))
-                } else {
-                    self.status = Some(format!("{} import is coming soon.", provider.label()));
-                    ContentViewResponse::Redraw
-                }
-            }
-            OnboardingAction::ToggleProject(index) => {
-                if let Some(project) = self.pending_projects.get_mut(index) {
-                    project.selected = !project.selected;
-                }
-                ContentViewResponse::Redraw
-            }
-            OnboardingAction::RemoveProject(index) => {
-                if index < self.pending_projects.len() {
-                    self.pending_projects.remove(index);
-                }
-                ContentViewResponse::Redraw
-            }
             OnboardingAction::Language(language) => {
+                // Redraw, not Ignored: the press fill is derived from
+                // `state_of`, so skipping the repaint leaves the control stuck
+                // looking pressed after the button comes back up.
+                if self.selected_language == language {
+                    return ContentViewResponse::Redraw;
+                }
                 self.selected_language = language;
-                ContentViewResponse::Redraw
+                ContentViewResponse::Run(Box::new(move |_tw: &mut TermWindow| {
+                    let mut settings = crate::native_settings::load();
+                    settings.localization.language = Some(language.to_string());
+                    if let Err(err) = crate::native_settings::save(&settings) {
+                        log::error!("failed to save onboarding language: {err:#}");
+                        return;
+                    }
+                    crate::i18n::activate_preference(language);
+                    if let Some(front_end) = crate::frontend::try_front_end() {
+                        front_end.invalidate_all_windows();
+                    }
+                }))
             }
             OnboardingAction::Appearance(mode) => {
-                self.selected_appearance = mode;
-                ContentViewResponse::Redraw
-            }
-            OnboardingAction::ToggleSidebar => {
-                self.show_left_sidebar = !self.show_left_sidebar;
-                ContentViewResponse::Redraw
-            }
-        }
-    }
-
-    fn apply_primary(&mut self) -> ContentViewResponse {
-        if !self.primary_enabled() {
-            return ContentViewResponse::Redraw;
-        }
-        match self.step {
-            Step::Welcome | Step::ImportSources => {
-                self.start_step_transition(self.step.next(), 1.0);
-                ContentViewResponse::Redraw
-            }
-            Step::ReviewProjects => {
-                self.import_selected_projects();
-                self.start_step_transition(Step::Preferences, 1.0);
-                ContentViewResponse::Redraw
-            }
-            Step::Preferences => {
-                self.start_step_transition(Step::Ready, 1.0);
-                ContentViewResponse::Redraw
-            }
-            Step::Ready => self.finish_response(),
-        }
-    }
-
-    fn import_selected_projects(&mut self) {
-        let space_id = self
-            .target_space_id
-            .clone()
-            .unwrap_or_else(|| self.target_space_id_for_choice());
-        let mut imported = 0usize;
-        for project in self
-            .pending_projects
-            .iter()
-            .filter(|project| project.selected)
-        {
-            let path = project.path.to_string_lossy();
-            match crate::workspace_threads::create_project_from_path(&space_id, path.as_ref()) {
-                Ok(_) => imported += 1,
-                Err(err) => {
-                    log::error!(
-                        "failed to import onboarding project {}: {err:#}",
-                        project.path.display()
-                    );
+                if self.selected_appearance == mode {
+                    return ContentViewResponse::Redraw;
                 }
+                self.selected_appearance = mode;
+                ContentViewResponse::Run(Box::new(move |_tw: &mut TermWindow| {
+                    let mut settings = crate::native_settings::load();
+                    settings.appearance.theme_mode = mode;
+                    if let Err(err) = crate::native_settings::save(&settings) {
+                        log::error!("failed to save onboarding appearance: {err:#}");
+                        return;
+                    }
+                    crate::native_settings::apply_to_app(&settings);
+                    if let Some(front_end) = crate::frontend::try_front_end() {
+                        front_end.invalidate_all_windows();
+                    }
+                }))
             }
         }
-        self.target_space_id = Some(space_id);
-        self.imported_project_count = imported;
+    }
+
+    fn move_focus(&mut self, forward: bool) -> ContentViewResponse {
+        let order = focus_order();
+        if order.is_empty() {
+            return ContentViewResponse::Ignored;
+        }
+        let next = match self
+            .interaction
+            .focused
+            .and_then(|current| order.iter().position(|item| *item == current))
+        {
+            Some(index) if forward => (index + 1) % order.len(),
+            Some(index) => (index + order.len() - 1) % order.len(),
+            // No focus yet: Tab enters at the top, Shift+Tab at the bottom.
+            None if forward => 0,
+            None => order.len() - 1,
+        };
+        self.interaction.focused = Some(order[next]);
+        ContentViewResponse::Redraw
+    }
+
+    fn on_key_impl(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse {
+        match (key, mods) {
+            (KeyCode::Escape, _) => self.skip_response(),
+            (KeyCode::Tab, KeyModifiers::NONE) => self.move_focus(true),
+            (KeyCode::Tab, KeyModifiers::SHIFT) => self.move_focus(false),
+            // Space activates whatever is focused. Enter is the default
+            // action — it starts — except on Skip, which it honours. Focus on a
+            // chip does not change that: the chip is already applied the moment
+            // it is picked, so there is nothing left for Enter to confirm.
+            (KeyCode::Char(' '), _) => match self.interaction.focused {
+                Some(action) => self.apply(action),
+                None => ContentViewResponse::Ignored,
+            },
+            (KeyCode::Enter, _) => match self.interaction.focused {
+                Some(OnboardingAction::Skip) => self.skip_response(),
+                _ => self.finish_response(),
+            },
+            _ => ContentViewResponse::Ignored,
+        }
     }
 
     fn finish_response(&self) -> ContentViewResponse {
         let prefs = OnboardingPrefs {
-            space_name: self.normalized_space_name(),
-            target_space_id: Some(
-                self.target_space_id
-                    .clone()
-                    .unwrap_or_else(|| self.target_space_id_for_choice()),
-            ),
-            imported_project_count: self.imported_project_count,
+            space_name: self.space_name(),
+            target_space_id: Some(self.target_space_id_for_choice()),
             language: self.selected_language,
             appearance: self.selected_appearance,
-            show_left_sidebar: self.show_left_sidebar,
         };
         ContentViewResponse::Run(Box::new(move |tw: &mut TermWindow| {
             finish_onboarding(tw, prefs);
         }))
     }
 
+    /// Skip puts back whatever the app was using when this opened, then marks
+    /// setup seen. Anything picked here has already been applied, so without
+    /// the restore "Skip" would silently keep the very choices it offers to
+    /// discard.
     fn skip_response(&self) -> ContentViewResponse {
-        ContentViewResponse::Run(Box::new(|tw: &mut TermWindow| {
+        let (language, appearance) = self.opened_with;
+        let changed = (self.selected_language, self.selected_appearance) != self.opened_with;
+        ContentViewResponse::Run(Box::new(move |tw: &mut TermWindow| {
             let mut settings = crate::native_settings::load();
+            if changed {
+                settings.localization.language = Some(language.to_string());
+                settings.appearance.theme_mode = appearance;
+            }
             mark_onboarding_seen(&mut settings);
             if let Err(err) = crate::native_settings::save(&settings) {
                 log::error!("failed to save onboarding skip state: {err:#}");
+            }
+            if changed {
+                crate::native_settings::apply_to_app(&settings);
+                crate::i18n::activate_preference(language);
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
             }
             tw.close_content_view();
         }))
     }
 
-    fn on_key_impl(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse {
-        match (key, mods) {
-            (KeyCode::Escape, _) => self.skip_response(),
-            (KeyCode::Enter, _) => self.apply_primary(),
-            (KeyCode::Tab, KeyModifiers::NONE) => {
-                self.start_step_transition(self.step.next(), 1.0);
-                ContentViewResponse::Redraw
-            }
-            (KeyCode::Tab, KeyModifiers::SHIFT) => {
-                self.start_step_transition(self.step.previous(), -1.0);
-                ContentViewResponse::Redraw
-            }
-            _ => ContentViewResponse::Ignored,
-        }
-    }
+    // ---------------------------------------------------------------- paint
 
-    fn on_paste_impl(&mut self, _text: &str) -> ContentViewResponse {
-        ContentViewResponse::Ignored
-    }
-
-    fn add_manual_project(&mut self, path: PathBuf) {
-        if self
-            .pending_projects
-            .iter()
-            .any(|project| project.path == path)
-        {
-            self.status = Some("That folder is already in the review list.".to_string());
+    fn state_of(&self, action: OnboardingAction) -> ControlState {
+        if self.interaction.pressed == Some(action) {
+            ControlState::Pressed
+        } else if self.interaction.hovered == Some(action) {
+            ControlState::Hovered
         } else {
-            self.pending_projects
-                .push(PendingProject::from_path(path, ProjectSource::Manual));
-            self.status = Some("Folder added. Review it before importing.".to_string());
+            ControlState::Normal
         }
-        self.start_step_transition(Step::ReviewProjects, 1.0);
-        self.review_scroll.reset();
     }
 
-    fn line_h(ctx: &DrawContext) -> f32 {
-        (ctx.metrics.cell_size.height as f32 + ctx.px(14.0)).max(ctx.px(34.0))
+    fn text_h(font: &Rc<LoadedFont>) -> f32 {
+        RenderMetrics::with_font_metrics(&font.metrics())
+            .cell_size
+            .height as f32
     }
 
-    fn compact_line_h(ctx: &DrawContext) -> f32 {
-        (ctx.metrics.cell_size.height as f32 + ctx.px(8.0)).max(ctx.px(28.0))
+    /// One chip's width: its label plus symmetric padding.
+    fn chip_w(ctx: &DrawContext, font: &Rc<LoadedFont>, label: &str) -> f32 {
+        ctx.measure_text_width(font, label) + ctx.px(CHIP_PAD_X) * 2.0
     }
 
-    fn control_h(ctx: &DrawContext) -> f32 {
-        (ctx.metrics.cell_size.height as f32 + ctx.px(30.0)).max(ctx.px(60.0))
-    }
-
-    fn preference_choice_h(ctx: &DrawContext) -> f32 {
-        (Self::control_h(ctx) + ctx.px(10.0)).clamp(ctx.px(68.0), ctx.px(80.0))
-    }
-
-    fn preference_group_height(ctx: &DrawContext, choice_count: usize) -> f32 {
-        let rows = choice_count.div_ceil(2).max(1) as f32;
-        Self::line_h(ctx)
-            + ctx.px(26.0)
-            + rows * Self::preference_choice_h(ctx)
-            + (rows - 1.0) * ctx.px(18.0)
-    }
-
-    fn action_h(ctx: &DrawContext) -> f32 {
-        Self::control_h(ctx).min(ctx.px(68.0)).max(ctx.px(ACTION_H))
-    }
-
-    fn centered_text_y(ctx: &DrawContext, area: RectF) -> f32 {
-        let text_h = ctx.metrics.cell_size.height as f32;
-        area.origin.y + ((area.size.height - text_h) / 2.0).max(ctx.px(4.0))
-    }
-
-    fn transition_duration() -> Duration {
-        Duration::from_millis(TRANSITION_MS)
-    }
-
-    fn transition_t(&self) -> Option<f32> {
-        self.transition.map(|transition| {
-            let elapsed = transition.started_at.elapsed();
-            (elapsed.as_secs_f32() / Self::transition_duration().as_secs_f32()).clamp(0.0, 1.0)
-        })
-    }
-
-    fn paint_body_for_step(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        step: Step,
-        body: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        tokens: UiTokens,
-        section_font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        match step {
-            Step::Welcome => self.paint_welcome(ctx, layers, body, palette, font)?,
-            Step::ImportSources => self.paint_import_sources(ctx, layers, body, palette, font)?,
-            Step::ReviewProjects => self.paint_review(ctx, layers, body, palette, font, tokens)?,
-            Step::Preferences => {
-                self.paint_preferences(ctx, layers, body, palette, font, section_font)?
+    /// Wrap chips into rows that fit `max_w`. Returns one vector of indices per
+    /// row. Five languages fit on one row at 560px, but a narrow window (or a
+    /// locale with longer names) has to wrap rather than overflow.
+    fn chip_rows(widths: &[f32], gap: f32, max_w: f32) -> Vec<Vec<usize>> {
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        let mut row: Vec<usize> = Vec::new();
+        let mut used = 0.0f32;
+        for (index, width) in widths.iter().enumerate() {
+            let advance = if row.is_empty() { *width } else { gap + *width };
+            if !row.is_empty() && used + advance > max_w {
+                rows.push(std::mem::take(&mut row));
+                used = *width;
+            } else {
+                used += advance;
             }
-            Step::Ready => self.paint_ready(ctx, layers, body, palette, font)?,
+            row.push(index);
         }
-        Ok(())
-    }
-
-    fn paint_body(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        body: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        tokens: UiTokens,
-        section_font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        if self.transition_t().is_some_and(|raw_t| raw_t >= 1.0) {
-            self.transition = None;
+        if !row.is_empty() {
+            rows.push(row);
         }
-
-        self.paint_body_for_step(
-            ctx,
-            layers,
-            self.step,
-            body,
-            palette,
-            font,
-            tokens,
-            section_font,
-        )
+        rows
     }
 
     fn paint_impl(
@@ -612,11 +431,10 @@ impl OnboardingView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
-        _cursor_on: bool,
     ) -> anyhow::Result<()> {
         self.widgets.clear();
-        self.last_ui_scale = ctx.scale();
-        let tokens = UiTokens::for_dpi(ctx.dimensions.dpi);
+        let skin = Skin::new(palette);
+
         ctx.draw_rect(
             layers,
             0,
@@ -627,1020 +445,534 @@ impl OnboardingView {
             palette.window_bg,
         )?;
 
-        let shell = inset_rect(area, ctx.px(OUTER_PAD));
-        let content_w = shell.size.width.min(ctx.px(CONTENT_MAX_W)).max(0.0);
-        let content_x = shell.origin.x + ((shell.size.width - content_w) / 2.0).max(0.0);
-        let content = rect(content_x, shell.origin.y, content_w, shell.size.height);
+        let body_h = Self::text_h(font);
+        let title_h = Self::text_h(title_font);
+        let label_h = Self::text_h(section_font);
 
-        self.paint_header(ctx, layers, content, palette, font, title_font)?;
-        let body = rect(
-            content.origin.x,
-            content.origin.y + ctx.px(HEADER_H),
-            content.size.width,
-            (content.size.height - ctx.px(HEADER_H + FOOTER_H)).max(0.0),
-        );
-        self.paint_body(ctx, layers, body, palette, font, tokens, section_font)?;
-        self.paint_status(ctx, layers, content, palette, font)?;
-        self.paint_footer(ctx, layers, content, palette, font)?;
-        Ok(())
-    }
+        // Floored, not clamped to zero: `draw_text` early-returns on a
+        // non-positive max width, so a window narrower than the side padding
+        // would drop every label while the chips and previews kept painting.
+        // Better to overflow the edge than to render a page of blank shapes.
+        let col_w = ctx
+            .px(COL_W)
+            .min((area.size.width - ctx.px(SIDE_PAD) * 2.0).max(ctx.px(MIN_COL_W)));
+        let col_x = area.origin.x + ((area.size.width - col_w) / 2.0).max(0.0);
 
-    fn paint_header(
-        &self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        content: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        title_font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        ctx.draw_text(
-            layers,
-            title_font,
-            content.origin.x,
-            content.origin.y + ctx.px(6.0),
-            self.step.title(),
-            palette.text,
-            content.size.width,
-        )?;
-        self.draw_wrapped_text(
-            ctx,
-            layers,
-            font,
-            content.origin.x,
-            content.origin.y + ctx.px(64.0),
-            content.size.width.min(ctx.px(900.0)),
-            self.step.eyebrow(),
-            palette.muted_text,
-            2,
-        )?;
-        ctx.draw_rect(
-            layers,
-            0,
-            content.origin.x,
-            content.origin.y + ctx.px(HEADER_H - 24.0),
-            content.size.width,
-            1.0,
-            palette.separator,
-        )
-    }
+        // --- measure everything first so the column can be centred vertically
+        let languages: Vec<(String, &'static str)> = LANGUAGE_OPTIONS
+            .iter()
+            .map(|option| (language_option_label(*option), option.preference))
+            .collect();
+        let chip_widths: Vec<f32> = languages
+            .iter()
+            .map(|(label, _)| Self::chip_w(ctx, font, label))
+            .collect();
+        // Wrapping is settled at full scale: shrinking only ever buys room, so
+        // this is the conservative row count.
+        let rows = Self::chip_rows(&chip_widths, ctx.px(CHIP_GAP), col_w);
 
-    fn paint_welcome(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        self.draw_wrapped_text(
-            ctx,
-            layers,
-            font,
-            area.origin.x,
-            area.origin.y,
-            area.size.width.min(ctx.px(960.0)),
-            "Open folders, review imports, and keep terminal sessions tied to the work they belong to.",
-            palette.secondary_text,
-            2,
-        )?;
-        let line_h = Self::line_h(ctx);
-        let card_h = (line_h * 3.2 + ctx.px(58.0)).max(ctx.px(156.0));
-        let cards = [
-            (
-                SvgIcon::Layers,
-                "Workspaces",
-                "Keep related folders and sessions together.",
-            ),
-            (
-                SvgIcon::FolderOpen,
-                "Projects",
-                "Review each folder before ThinkTerm creates it.",
-            ),
-            (
-                SvgIcon::SquareTerminal,
-                "Sessions",
-                "Return to long-running terminal work quickly.",
-            ),
-        ];
-        let card_gap = ctx.px(22.0);
-        let card_w = ((area.size.width - card_gap * 2.0) / 3.0).max(ctx.px(240.0));
-        let mut x = area.origin.x;
-        let y = area.origin.y + line_h * 2.0 + ctx.px(46.0);
-        for (icon, title, description) in cards {
-            self.paint_info_card(
-                ctx,
-                layers,
-                rect(x, y, card_w, card_h),
-                palette,
-                font,
-                icon,
-                title,
-                description,
-            )?;
-            x += card_w + card_gap;
-        }
-        self.paint_info_card(
+        let modes = appearance_choices();
+        // A preview is at least as wide as the widest caption. At the design
+        // width the French "Suivre le système" was ellipsised to "Suivre le
+        // syst…", which is the one label a user who cannot yet read the UI
+        // most needs whole.
+        let widest_caption = modes
+            .iter()
+            .map(|(_, label)| ctx.measure_text_width(font, label))
+            .fold(0.0f32, f32::max);
+        let tile_w_base = ctx
+            .px(TILE_W)
+            .max(widest_caption + ctx.px(TILE_CAPTION_PAD));
+        let tile_row_w = tile_w_base * modes.len() as f32
+            + ctx.px(TILE_GAP) * (modes.len().saturating_sub(1)) as f32;
+        let tiles_fit = tile_row_w <= col_w;
+
+        // Text cannot shrink; spacing and decoration can. Page height is
+        // therefore linear in a single factor, so solve it rather than guess:
+        // at the default 24-row window the content area is only ~700px tall and
+        // the full-size layout runs ~340px past it — with no scrolling and no
+        // wheel handler, that put "Get Started" off screen and out of reach.
+        let rows_n = rows.len() as f32;
+        let tile_rows = if tiles_fit { 1.0 } else { modes.len() as f32 };
+        let rigid = title_h
+            + body_h
+            + label_h
+            + rows_n * body_h
+            + label_h
+            + tile_rows * body_h
+            + body_h
+            + body_h;
+        let flex = ctx.px(MARK_SIZE
+            + MARK_TO_TITLE
+            + TITLE_TO_SUB
+            + LABEL_GAP * 2.0
+            + rows_n * CHIP_PAD_Y * 2.0
+            + (rows_n - 1.0).max(0.0) * CHIP_GAP
+            + tile_rows * (TILE_H + TILE_LABEL_GAP)
+            + (tile_rows - 1.0).max(0.0) * TILE_GAP
+            + BTN_PAD_Y * 2.0
+            + SECTION_GAP * 4.0);
+        let fit = fit_factor(area.size.height - ctx.px(SIDE_PAD) * 2.0, rigid, flex);
+        // Every discretionary dimension goes through this from here on.
+        let fx = |value: f32| ctx.px(value) * fit;
+
+        let chip_h = body_h + fx(CHIP_PAD_Y) * 2.0;
+        let chips_h = rows_n * chip_h + (rows_n - 1.0).max(0.0) * fx(CHIP_GAP);
+        let tile_w = tile_w_base * fit;
+        let tile_h = fx(TILE_H);
+        let modes_h = tile_rows * (tile_h + fx(TILE_LABEL_GAP) + body_h)
+            + (tile_rows - 1.0).max(0.0) * fx(TILE_GAP);
+        let brand_h = fx(MARK_SIZE) + fx(MARK_TO_TITLE) + title_h + fx(TITLE_TO_SUB) + body_h;
+        let group_h = |controls: f32| label_h + fx(LABEL_GAP) + controls;
+        let actions_h = body_h + fx(BTN_PAD_Y) * 2.0;
+
+        let gap = fx(SECTION_GAP);
+        let total_h = brand_h
+            + gap
+            + group_h(chips_h)
+            + gap
+            + group_h(modes_h)
+            + gap
+            + body_h
+            + gap
+            + actions_h;
+
+        let mut y = area.origin.y + ((area.size.height - total_h) / 2.0).max(0.0);
+
+        // --- brand
+        self.paint_mark(
             ctx,
             layers,
             rect(
-                area.origin.x,
-                y + card_h + ctx.px(24.0),
-                area.size.width,
-                (line_h * 2.6 + ctx.px(54.0)).max(ctx.px(136.0)),
+                col_x + (col_w - fx(MARK_SIZE)) / 2.0,
+                y,
+                fx(MARK_SIZE),
+                fx(MARK_SIZE),
             ),
-            palette,
-            font,
-            SvgIcon::Info,
-            "Private by default",
-            "No project paths, terminal content, or local folders are collected. Manual imports stay local until you confirm.",
+            skin,
         )?;
-        Ok(())
-    }
+        y += fx(MARK_SIZE) + fx(MARK_TO_TITLE);
 
-    fn paint_import_sources(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        self.draw_wrapped_text(
+        let title = crate::i18n::tr("onboarding-title");
+        Self::draw_centered(
+            ctx,
+            layers,
+            title_font,
+            col_x,
+            y,
+            col_w,
+            &title,
+            palette.text,
+        )?;
+        y += title_h + fx(TITLE_TO_SUB);
+
+        let subtitle = crate::i18n::tr("onboarding-subtitle");
+        Self::draw_centered(
             ctx,
             layers,
             font,
-            area.origin.x,
-            area.origin.y,
-            area.size.width.min(ctx.px(960.0)),
-            "Choose a source to scan. v1 imports manual folders only, and nothing is created until review.",
-            palette.secondary_text,
-            2,
+            col_x,
+            y,
+            col_w,
+            &subtitle,
+            palette.muted_text,
         )?;
-        let line_h = Self::line_h(ctx);
-        let grid_w = area.size.width;
-        let gap = 20.0;
-        let card_w = ((grid_w - gap) / 2.0).max(ctx.px(280.0));
-        let card_h = (line_h * 3.0 + ctx.px(64.0)).max(ctx.px(164.0));
-        let start_y = area.origin.y + line_h * 2.0 + ctx.px(42.0);
-        for (idx, provider) in ImportProvider::all().iter().enumerate() {
-            let is_manual = *provider == ImportProvider::Manual;
-            let row = idx / 2;
-            let col = idx % 2;
-            let x = area.origin.x + col as f32 * (card_w + gap);
-            let y = start_y + row as f32 * (card_h + gap);
-            self.paint_provider_card(
+        y += body_h + gap;
+
+        // --- language
+        ctx.draw_text(
+            layers,
+            section_font,
+            col_x,
+            y,
+            &crate::i18n::tr("onboarding-language"),
+            skin.label,
+            col_w,
+        )?;
+        y += label_h + fx(LABEL_GAP);
+
+        for row in &rows {
+            let mut x = col_x;
+            for index in row {
+                let (label, preference) = &languages[*index];
+                let action = OnboardingAction::Language(preference);
+                self.paint_chip(
+                    ctx,
+                    layers,
+                    rect(x, y, chip_widths[*index], chip_h),
+                    skin,
+                    font,
+                    label,
+                    action,
+                    self.selected_language == *preference,
+                )?;
+                x += chip_widths[*index] + fx(CHIP_GAP);
+            }
+            y += chip_h + fx(CHIP_GAP);
+        }
+        y -= fx(CHIP_GAP);
+        y += gap;
+
+        // --- appearance
+        ctx.draw_text(
+            layers,
+            section_font,
+            col_x,
+            y,
+            &crate::i18n::tr("onboarding-appearance"),
+            skin.label,
+            col_w,
+        )?;
+        y += label_h + fx(LABEL_GAP);
+
+        let tile_step = tile_h + fx(TILE_LABEL_GAP) + body_h + fx(TILE_GAP);
+        for (index, (mode, label)) in modes.iter().enumerate() {
+            let (tx, ty) = if tiles_fit {
+                (col_x + index as f32 * (tile_w + fx(TILE_GAP)), y)
+            } else {
+                (col_x, y + index as f32 * tile_step)
+            };
+            self.paint_theme_tile(
                 ctx,
                 layers,
-                rect(
-                    if is_manual { area.origin.x } else { x },
-                    y,
-                    if is_manual { grid_w } else { card_w },
-                    card_h,
-                ),
-                palette,
+                rect(tx, ty, tile_w, tile_h),
+                skin,
                 font,
-                *provider,
+                *mode,
+                label,
+                fit,
             )?;
         }
-        Ok(())
-    }
+        y += modes_h + gap;
 
-    fn paint_review(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        tokens: UiTokens,
-    ) -> anyhow::Result<()> {
-        let count = self.pending_projects.len();
-        let selected = self.selected_project_count();
-        let summary = format!("{selected} of {count} projects selected");
-        let line_h = Self::line_h(ctx);
+        // --- privacy footnote
         ctx.draw_text(
             layers,
             font,
-            area.origin.x,
-            area.origin.y,
-            &summary,
-            palette.secondary_text,
-            area.size.width,
+            col_x,
+            y,
+            &crate::i18n::tr("onboarding-privacy"),
+            palette.muted_text,
+            col_w,
         )?;
-        let list = rect(
-            area.origin.x,
-            area.origin.y + line_h + 20.0,
-            area.size.width.min(ctx.px(820.0)),
-            (area.size.height - line_h - 28.0).max(0.0),
-        );
-        if self.pending_projects.is_empty() {
-            self.paint_empty_state(ctx, layers, list, palette, font)?;
-            return Ok(());
-        }
-        let content_h = self.pending_projects.len() as f32 * ctx.px(PROJECT_ROW_H)
-            + self.pending_projects.len().saturating_sub(1) as f32 * ctx.px(PROJECT_ROW_GAP);
-        self.review_scroll.set_extents(list.size.height, content_h);
-        let mut y = list.origin.y - self.review_scroll.offset;
-        let projects = self.pending_projects.clone();
-        for (idx, project) in projects.iter().enumerate() {
-            if y + ctx.px(PROJECT_ROW_H) >= list.origin.y && y <= list.origin.y + list.size.height {
-                self.paint_project_row(
-                    ctx,
-                    layers,
-                    rect(list.origin.x, y, list.size.width, ctx.px(PROJECT_ROW_H)),
-                    list,
-                    palette,
-                    font,
-                    idx,
-                    project,
-                )?;
-            }
-            y += ctx.px(PROJECT_ROW_H + PROJECT_ROW_GAP);
-        }
-        if self.review_scroll.has_overflow() {
-            draw_scrollbar(ctx, layers, palette, tokens, list, self.review_scroll)?;
-        }
+        y += body_h + gap;
+
+        // --- actions, right aligned
+        let start_label = crate::i18n::tr("onboarding-start");
+        let skip_label = crate::i18n::tr("onboarding-skip");
+        let start_w = ctx.measure_text_width(font, &start_label) + ctx.px(BTN_PAD_X) * 2.0;
+        let skip_w = ctx.measure_text_width(font, &skip_label) + ctx.px(BTN_PAD_X) * 2.0;
+
+        let start_x = col_x + col_w - start_w;
+        self.paint_button(
+            ctx,
+            layers,
+            rect(start_x, y, start_w, actions_h),
+            skin,
+            font,
+            &start_label,
+            OnboardingAction::Start,
+            true,
+        )?;
+        self.paint_button(
+            ctx,
+            layers,
+            rect(start_x - ctx.px(BTN_GAP) - skip_w, y, skip_w, actions_h),
+            skin,
+            font,
+            &skip_label,
+            OnboardingAction::Skip,
+            false,
+        )?;
+
         Ok(())
     }
 
-    fn paint_preferences(
+    /// The ThinkTerm mark: a disc carrying the prompt chevron, and nothing
+    /// else. The app icon's gloss and phosphor grid are deliberately not
+    /// reproduced; there is no primitive here that gets them right, and an
+    /// approximation of them looks like a defect.
+    fn paint_mark(
+        &self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        card: RectF,
+        skin: Skin,
+    ) -> anyhow::Result<()> {
+        // A radius of half the side is clamped to exactly that, giving a
+        // circle — the mark is square, so this is a disc rather than a stadium.
+        ctx.draw_rounded_frame(
+            layers,
+            0,
+            card.origin.x,
+            card.origin.y,
+            card.size.width,
+            card.size.height,
+            skin.mark_bg,
+            skin.mark_border,
+            card.size.width / 2.0,
+        )?;
+        let glyph = card.size.width * 0.5;
+        ctx.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronRight,
+            card.origin.x + (card.size.width - glyph) / 2.0,
+            card.origin.y + (card.size.height - glyph) / 2.0,
+            glyph,
+            skin.text,
+        )
+    }
+
+    /// An appearance preview: a framed card holding one light face, one dark
+    /// face, or both side by side. Each face is its own rounded rect, so the
+    /// split needs no clipping — which this renderer does not have.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_theme_tile(
         &mut self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        palette: UiPalette,
+        tile: RectF,
+        skin: Skin,
         font: &Rc<LoadedFont>,
-        section_font: &Rc<LoadedFont>,
+        mode: NativeThemeMode,
+        label: &str,
+        fit: f32,
     ) -> anyhow::Result<()> {
-        let group_w = area.size.width.min(ctx.px(1120.0));
-        let language_h = Self::preference_group_height(ctx, 4);
-        self.paint_preference_group(
-            ctx,
-            layers,
-            rect(area.origin.x, area.origin.y, group_w, language_h),
-            palette,
-            font,
-            section_font,
-            "Language",
-            &[
-                (
-                    NativeLanguagePreference::System.label(),
-                    OnboardingAction::Language(NativeLanguagePreference::System),
-                    self.selected_language == NativeLanguagePreference::System,
-                ),
-                (
-                    NativeLanguagePreference::English.label(),
-                    OnboardingAction::Language(NativeLanguagePreference::English),
-                    self.selected_language == NativeLanguagePreference::English,
-                ),
-                (
-                    NativeLanguagePreference::Chinese.label(),
-                    OnboardingAction::Language(NativeLanguagePreference::Chinese),
-                    self.selected_language == NativeLanguagePreference::Chinese,
-                ),
-                (
-                    NativeLanguagePreference::Japanese.label(),
-                    OnboardingAction::Language(NativeLanguagePreference::Japanese),
-                    self.selected_language == NativeLanguagePreference::Japanese,
-                ),
-            ],
-        )?;
-        let appearance_y = area.origin.y + language_h + ctx.px(54.0);
-        let appearance_h = Self::preference_group_height(ctx, 3);
-        self.paint_preference_group(
-            ctx,
-            layers,
-            rect(area.origin.x, appearance_y, group_w, appearance_h),
-            palette,
-            font,
-            section_font,
-            "Appearance",
-            &[
-                (
-                    "Follow System",
-                    OnboardingAction::Appearance(NativeThemeMode::System),
-                    self.selected_appearance == NativeThemeMode::System,
-                ),
-                (
-                    "Light",
-                    OnboardingAction::Appearance(NativeThemeMode::Light),
-                    self.selected_appearance == NativeThemeMode::Light,
-                ),
-                (
-                    "Dark",
-                    OnboardingAction::Appearance(NativeThemeMode::Dark),
-                    self.selected_appearance == NativeThemeMode::Dark,
-                ),
-            ],
-        )?;
-        let toggle_y = appearance_y + appearance_h + ctx.px(58.0);
-        let toggle_row = rect(area.origin.x, toggle_y, group_w, ctx.px(124.0));
+        // The tile box is scaled by the page's fit factor, so everything drawn
+        // inside it has to scale too — otherwise a short window shrinks the
+        // frame while its insets and text bars stay full size and spill out.
+        let fx = |value: f32| ctx.px(value) * fit;
+        let caption_h = fx(TILE_LABEL_GAP) + Self::text_h(font);
+        let action = OnboardingAction::Appearance(mode);
+        let selected = self.selected_appearance == mode;
+        // The hit target covers the caption too. It is drawn below the card and
+        // is the only text naming each theme — the obvious thing to click,
+        // especially before the language is chosen.
         self.widgets.push(
-            toggle_row,
+            rect(
+                tile.origin.x,
+                tile.origin.y,
+                tile.size.width,
+                tile.size.height + caption_h,
+            ),
             WidgetKind::Button,
-            OnboardingAction::ToggleSidebar,
+            action,
         );
-        let hovered = self.interaction.hovered == Some(OnboardingAction::ToggleSidebar);
-        let pressed = self.interaction.pressed == Some(OnboardingAction::ToggleSidebar);
-        let toggle_bg = if pressed {
-            palette.control_pressed_bg
-        } else if hovered {
-            palette.control_hover_bg
-        } else {
-            palette.control_bg
+
+        // Rings first: they are filled rounded rects showing through as a
+        // margin, so they have to be under the card.
+        self.paint_ring(ctx, layers, tile, skin, action, fx(TILE_RADIUS), selected)?;
+
+        let card_bg = match self.state_of(action) {
+            ControlState::Pressed => skin.chip_pressed_bg,
+            ControlState::Hovered => skin.chip_hover_bg,
+            _ => skin.chip_bg,
         };
         ctx.draw_rounded_frame(
             layers,
             0,
-            toggle_row.origin.x,
-            toggle_row.origin.y,
-            toggle_row.size.width,
-            toggle_row.size.height,
-            toggle_bg,
-            palette.control_border,
-            ctx.px(CARD_RADIUS),
+            tile.origin.x,
+            tile.origin.y,
+            tile.size.width,
+            tile.size.height,
+            card_bg,
+            if selected {
+                skin.chip_selected_border
+            } else {
+                skin.chip_border
+            },
+            fx(TILE_RADIUS),
         )?;
-        let toggle_rect = rect(
-            toggle_row.origin.x + ctx.px(24.0),
-            toggle_row.origin.y + ctx.px(47.0),
-            ctx.px(54.0),
-            ctx.px(30.0),
+
+        let inset = fx(TILE_INSET);
+        let inner = rect(
+            tile.origin.x + inset,
+            tile.origin.y + inset,
+            (tile.size.width - inset * 2.0).max(0.0),
+            (tile.size.height - inset * 2.0).max(0.0),
         );
-        draw_toggle(
-            ctx,
-            layers,
-            &mut self.widgets,
-            palette,
-            toggle_rect,
-            self.show_left_sidebar,
-            OnboardingAction::ToggleSidebar,
-        )?;
-        ctx.draw_text(
-            layers,
-            section_font,
-            toggle_row.origin.x + 100.0,
-            toggle_row.origin.y + ctx.px(26.0),
-            "Show left sidebar by default",
-            palette.text,
-            toggle_row.size.width - ctx.px(124.0),
-        )?;
+        match mode {
+            NativeThemeMode::System => {
+                let gap = fx(FACE_SPLIT_GAP);
+                let half = ((inner.size.width - gap) / 2.0).max(0.0);
+                self.paint_face(
+                    ctx,
+                    layers,
+                    rect(inner.origin.x, inner.origin.y, half, inner.size.height),
+                    skin,
+                    true,
+                    fit,
+                )?;
+                self.paint_face(
+                    ctx,
+                    layers,
+                    rect(
+                        inner.origin.x + half + gap,
+                        inner.origin.y,
+                        half,
+                        inner.size.height,
+                    ),
+                    skin,
+                    false,
+                    fit,
+                )?;
+            }
+            NativeThemeMode::Light => self.paint_face(ctx, layers, inner, skin, true, fit)?,
+            NativeThemeMode::Dark => self.paint_face(ctx, layers, inner, skin, false, fit)?,
+        }
+
+        let text_w = ctx.measure_text_width(font, label).min(tile.size.width);
         ctx.draw_text(
             layers,
             font,
-            toggle_row.origin.x + 100.0,
-            toggle_row.origin.y + ctx.px(72.0),
-            "Applies to newly opened main windows and this setup finish.",
-            palette.muted_text,
-            toggle_row.size.width - ctx.px(124.0),
-        )?;
-        Ok(())
+            tile.origin.x + ((tile.size.width - text_w) / 2.0).max(0.0),
+            tile.origin.y + tile.size.height + fx(TILE_LABEL_GAP),
+            label,
+            if selected {
+                skin.text
+            } else {
+                skin.secondary_text
+            },
+            tile.size.width,
+        )
     }
 
-    fn paint_ready(
-        &mut self,
+    /// One face of a preview: a light or dark surface with a couple of bars
+    /// standing in for text. Fixed colours — it depicts a theme, so it must not
+    /// follow the current one.
+    fn paint_face(
+        &self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
+        face: RectF,
+        skin: Skin,
+        light: bool,
+        fit: f32,
     ) -> anyhow::Result<()> {
-        let rows = [
-            ("Space", self.normalized_space_name()),
-            ("Projects imported", self.imported_project_count.to_string()),
+        let fx = |value: f32| ctx.px(value) * fit;
+        let (bg, bar, bar_hi) = if light {
             (
-                "Sidebar",
-                if self.show_left_sidebar {
-                    "Shown by default".to_string()
-                } else {
-                    "Hidden by default".to_string()
-                },
-            ),
-            ("Language", self.selected_language.label().to_string()),
-            ("Appearance", self.selected_appearance.label().to_string()),
-        ];
-        let mut y = area.origin.y;
-        let row_h = (Self::line_h(ctx) + ctx.px(34.0)).max(ctx.px(64.0));
-        for (label, value) in rows {
-            self.paint_summary_row(
-                ctx,
-                layers,
-                rect(area.origin.x, y, area.size.width.min(ctx.px(760.0)), row_h),
-                palette,
-                font,
-                label,
-                &value,
-            )?;
-            y += row_h + ctx.px(12.0);
-        }
-        Ok(())
-    }
-
-    fn paint_footer(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        content: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        let footer_y = content.origin.y + content.size.height - ctx.px(FOOTER_H);
-        ctx.draw_rect(
-            layers,
-            0,
-            content.origin.x,
-            footer_y,
-            content.size.width,
-            1.0,
-            palette.separator,
-        )?;
-        self.paint_step_progress(
-            ctx,
-            layers,
-            rect(content.origin.x, footer_y + 18.0, content.size.width, 40.0),
-            palette,
-            font,
-        )?;
-
-        let action_h = Self::action_h(ctx);
-        let y = footer_y + ctx.px(76.0);
-        let primary_w = if self.step == Step::ReviewProjects {
-            ctx.px(330.0)
-        } else if self.step == Step::Ready {
-            ctx.px(290.0)
+                LinearRgba::with_srgba(0xF2, 0xF2, 0xF6, 255),
+                LinearRgba::with_srgba(0xC2, 0xC3, 0xCE, 255),
+                LinearRgba::with_srgba(0x7C, 0x7E, 0x92, 255),
+            )
         } else {
-            ctx.px(230.0)
+            (
+                LinearRgba::with_srgba(0x1B, 0x1B, 0x21, 255),
+                LinearRgba::with_srgba(0x45, 0x47, 0x59, 255),
+                LinearRgba::with_srgba(0x8E, 0x90, 0xA6, 255),
+            )
         };
-        let primary = rect(
-            content.origin.x + content.size.width - primary_w,
-            y,
-            primary_w,
-            action_h,
-        );
-        self.paint_button(
-            ctx,
-            layers,
-            primary,
-            palette,
-            font,
-            self.primary_label(),
-            OnboardingAction::Primary,
-            true,
-            self.primary_enabled(),
-        )?;
-        if self.step != Step::Welcome {
-            self.paint_button(
-                ctx,
-                layers,
-                rect(primary.origin.x - 194.0, y, 170.0, action_h),
-                palette,
-                font,
-                "Back",
-                OnboardingAction::Back,
-                false,
-                true,
-            )?;
-        }
-        self.paint_button(
-            ctx,
-            layers,
-            rect(content.origin.x, y, ctx.px(154.0), action_h),
-            palette,
-            font,
-            "Skip",
-            OnboardingAction::Skip,
-            false,
-            true,
-        )
-    }
-
-    fn paint_status(
-        &self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        content: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        let Some(status) = &self.status else {
-            return Ok(());
-        };
-        ctx.draw_text(
-            layers,
-            font,
-            content.origin.x,
-            content.origin.y + content.size.height
-                - ctx.px(FOOTER_H)
-                - Self::compact_line_h(ctx)
-                - ctx.px(16.0),
-            status,
-            palette.muted_text,
-            content.size.width,
-        )
-    }
-
-    fn paint_step_progress(
-        &self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        let steps = Step::all();
-        let progress_index =
-            if let (Some(transition), Some(raw_t)) = (self.transition, self.transition_t()) {
-                let from = transition.from.index() as f32;
-                let to = transition.to.index() as f32;
-                from + (to - from) * Easing::Smooth.apply(raw_t)
-            } else {
-                self.step.index() as f32
-            };
-        let label = format!(
-            "Step {} of {} · {}",
-            self.step.index() + 1,
-            steps.len(),
-            self.step.title()
-        );
-        ctx.draw_text(
-            layers,
-            font,
-            area.origin.x,
-            Self::centered_text_y(ctx, area),
-            &label,
-            palette.secondary_text,
-            area.size.width * 0.42,
-        )?;
-
-        let track_w = (area.size.width * 0.46)
-            .min(ctx.px(520.0))
-            .max(ctx.px(280.0));
-        let track_x = area.origin.x + area.size.width - track_w;
-        let center_y = area.origin.y + area.size.height / 2.0;
-        let segment_w = track_w / steps.len().max(1) as f32;
-        let active_progress = palette.secondary_text;
-        ctx.draw_rounded_rect(
+        ctx.draw_rounded_frame(
             layers,
             0,
-            track_x,
-            center_y - ctx.px(2.0),
-            track_w,
-            ctx.px(4.0),
-            palette.control_border,
-            ctx.px(2.0),
+            face.origin.x,
+            face.origin.y,
+            face.size.width,
+            face.size.height,
+            bg,
+            skin.face_border,
+            fx(FACE_RADIUS),
         )?;
-        let fill_w = segment_w * (progress_index + 1.0);
-        ctx.draw_rounded_rect(
-            layers,
-            1,
-            track_x,
-            center_y - ctx.px(2.0),
-            fill_w.min(track_w),
-            ctx.px(4.0),
-            active_progress,
-            ctx.px(2.0),
-        )?;
-        for (idx, step) in steps.iter().enumerate() {
-            let active = *step == self.step;
-            let idx_f = idx as f32;
-            let complete = idx_f < progress_index.floor();
-            let active_strength = (1.0 - (idx_f - progress_index).abs()).clamp(0.0, 1.0);
-            let cx = track_x + segment_w * idx as f32 + segment_w / 2.0;
-            let size = ctx.px(14.0) + ctx.px(4.0) * active_strength;
-            let color = if complete || active || active_strength > 0.01 {
-                active_progress
-            } else {
-                palette.control_border
-            };
+
+        let bar_h = fx(BAR_H);
+        let inset = fx(BAR_INSET);
+        let usable = (face.size.width - inset * 2.0).max(0.0);
+        let mut y = face.origin.y + inset;
+        for (index, ratio) in [0.52f32, 0.78, 0.64].iter().enumerate() {
+            if y + bar_h > face.origin.y + face.size.height - inset {
+                break;
+            }
             ctx.draw_rounded_rect(
                 layers,
-                1,
-                cx - size / 2.0,
-                center_y - size / 2.0,
-                size,
-                size,
-                color,
-                size / 2.0,
+                0,
+                face.origin.x + inset,
+                y,
+                usable * ratio,
+                bar_h,
+                if index == 0 { bar_hi } else { bar },
+                bar_h / 2.0,
             )?;
+            y += bar_h + fx(BAR_GAP);
         }
         Ok(())
+    }
+
+    fn draw_centered(
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        x: f32,
+        y: f32,
+        width: f32,
+        text: &str,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let text_w = ctx.measure_text_width(font, text).min(width);
+        ctx.draw_text(
+            layers,
+            font,
+            x + ((width - text_w) / 2.0).max(0.0),
+            y,
+            text,
+            color,
+            width,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_info_card(
-        &self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        card: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        icon: SvgIcon,
-        title: &str,
-        description: &str,
-    ) -> anyhow::Result<()> {
-        ctx.draw_rounded_frame(
-            layers,
-            0,
-            card.origin.x,
-            card.origin.y,
-            card.size.width,
-            card.size.height,
-            palette.control_bg,
-            palette.control_border,
-            ctx.px(CARD_RADIUS),
-        )?;
-        let line_h = Self::line_h(ctx);
-        let icon_y = card.origin.y + ctx.px(24.0);
-        ctx.draw_svg_icon(
-            layers,
-            icon,
-            card.origin.x + ctx.px(24.0),
-            icon_y,
-            ctx.px(28.0),
-            palette.secondary_text,
-        )?;
-        ctx.draw_text(
-            layers,
-            font,
-            card.origin.x + ctx.px(68.0),
-            card.origin.y + ctx.px(22.0),
-            title,
-            palette.text,
-            card.size.width - ctx.px(92.0),
-        )?;
-        self.draw_wrapped_text(
-            ctx,
-            layers,
-            font,
-            card.origin.x + ctx.px(24.0),
-            card.origin.y + ctx.px(26.0) + line_h,
-            card.size.width - ctx.px(48.0),
-            description,
-            palette.secondary_text,
-            2,
-        )
-    }
-
-    fn paint_provider_card(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        card: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        provider: ImportProvider,
-    ) -> anyhow::Result<()> {
-        self.widgets.push(
-            card,
-            WidgetKind::Button,
-            OnboardingAction::Provider(provider),
-        );
-        let hovered = self.interaction.hovered == Some(OnboardingAction::Provider(provider));
-        let pressed = self.interaction.pressed == Some(OnboardingAction::Provider(provider));
-        let available = provider.is_available();
-        let bg = if pressed {
-            palette.control_pressed_bg
-        } else if hovered {
-            palette.control_hover_bg
-        } else {
-            palette.control_bg
-        };
-        let border = if hovered {
-            palette.separator
-        } else {
-            palette.control_border
-        };
-        let line_h = Self::line_h(ctx);
-        ctx.draw_rounded_frame(
-            layers,
-            0,
-            card.origin.x,
-            card.origin.y,
-            card.size.width,
-            card.size.height,
-            bg,
-            border,
-            ctx.px(CARD_RADIUS),
-        )?;
-        let icon_color = if available {
-            palette.secondary_text
-        } else {
-            palette.muted_text
-        };
-        ctx.draw_svg_icon(
-            layers,
-            provider.icon(),
-            card.origin.x + ctx.px(18.0),
-            card.origin.y + ctx.px(22.0),
-            ctx.px(28.0),
-            icon_color,
-        )?;
-        ctx.draw_text(
-            layers,
-            font,
-            card.origin.x + 60.0,
-            card.origin.y + ctx.px(16.0),
-            provider.label(),
-            palette.text,
-            card.size.width - ctx.px(78.0),
-        )?;
-        self.draw_wrapped_text(
-            ctx,
-            layers,
-            font,
-            card.origin.x + 60.0,
-            card.origin.y + ctx.px(16.0) + line_h,
-            card.size.width - ctx.px(78.0),
-            provider.description(),
-            palette.muted_text,
-            2,
-        )?;
-        let badge = if available {
-            "Available"
-        } else {
-            "Coming soon"
-        };
-        ctx.draw_text(
-            layers,
-            font,
-            card.origin.x + 60.0,
-            card.origin.y + card.size.height - line_h - ctx.px(12.0),
-            badge,
-            if available {
-                palette.secondary_text
-            } else {
-                palette.muted_text
-            },
-            card.size.width - ctx.px(78.0),
-        )
-    }
-
-    fn paint_project_row(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        row: RectF,
-        clip: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        index: usize,
-        project: &PendingProject,
-    ) -> anyhow::Result<()> {
-        let hit_y = row.origin.y.max(clip.origin.y);
-        let hit_h = (row.origin.y + row.size.height).min(clip.origin.y + clip.size.height) - hit_y;
-        if hit_h <= 0.0 {
-            return Ok(());
-        }
-        self.widgets.push(
-            rect(row.origin.x, hit_y, row.size.width, hit_h),
-            WidgetKind::SidebarRow,
-            OnboardingAction::ToggleProject(index),
-        );
-        let hovered = self.interaction.hovered == Some(OnboardingAction::ToggleProject(index));
-        let bg = if project.selected {
-            palette.sidebar_row_active_bg
-        } else if hovered {
-            palette.sidebar_row_hover_bg
-        } else {
-            palette.control_bg
-        };
-        ctx.draw_rounded_frame(
-            layers,
-            0,
-            row.origin.x,
-            row.origin.y,
-            row.size.width,
-            row.size.height,
-            bg,
-            palette.control_border,
-            ctx.px(CARD_RADIUS),
-        )?;
-        let checkbox = rect(
-            row.origin.x + ctx.px(16.0),
-            row.origin.y + ctx.px(24.0),
-            ctx.px(28.0),
-            ctx.px(28.0),
-        );
-        ctx.draw_rounded_frame(
-            layers,
-            1,
-            checkbox.origin.x,
-            checkbox.origin.y,
-            checkbox.size.width,
-            checkbox.size.height,
-            if project.selected {
-                palette.selected_bg
-            } else {
-                palette.control_bg
-            },
-            if project.selected {
-                palette.selected_bg
-            } else {
-                palette.control_border
-            },
-            ctx.px(6.0),
-        )?;
-        if project.selected {
-            ctx.draw_svg_icon(
-                layers,
-                SvgIcon::CircleCheck,
-                checkbox.origin.x + ctx.px(3.0),
-                checkbox.origin.y + ctx.px(3.0),
-                ctx.px(22.0),
-                palette.selected_text,
-            )?;
-        }
-        ctx.draw_text(
-            layers,
-            font,
-            row.origin.x + ctx.px(62.0),
-            row.origin.y + ctx.px(16.0),
-            &project.name,
-            palette.text,
-            row.size.width - ctx.px(154.0),
-        )?;
-        let line_h = Self::line_h(ctx);
-        ctx.draw_text(
-            layers,
-            font,
-            row.origin.x + ctx.px(62.0),
-            row.origin.y + ctx.px(16.0) + line_h,
-            &project.path.display().to_string(),
-            palette.secondary_text,
-            row.size.width - ctx.px(154.0),
-        )?;
-        ctx.draw_text(
-            layers,
-            font,
-            row.origin.x + row.size.width - ctx.px(132.0),
-            row.origin.y + ctx.px(16.0),
-            project.source.label(),
-            palette.muted_text,
-            ctx.px(76.0),
-        )?;
-        let remove = rect(
-            row.origin.x + row.size.width - ctx.px(46.0),
-            row.origin.y + ctx.px(22.0),
-            ctx.px(32.0),
-            ctx.px(32.0),
-        );
-        self.widgets.push(
-            remove,
-            WidgetKind::Button,
-            OnboardingAction::RemoveProject(index),
-        );
-        let remove_hover = self.interaction.hovered == Some(OnboardingAction::RemoveProject(index));
-        if remove_hover {
-            ctx.draw_rounded_rect(
-                layers,
-                1,
-                remove.origin.x,
-                remove.origin.y,
-                remove.size.width,
-                remove.size.height,
-                palette.control_hover_bg,
-                ctx.px(8.0),
-            )?;
-        }
-        ctx.draw_svg_icon(
-            layers,
-            SvgIcon::X,
-            remove.origin.x + ctx.px(8.0),
-            remove.origin.y + ctx.px(8.0),
-            ctx.px(16.0),
-            palette.muted_text,
-        )
-    }
-
-    fn paint_empty_state(
+    fn paint_chip(
         &mut self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
         area: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-    ) -> anyhow::Result<()> {
-        let line_h = Self::line_h(ctx);
-        let card = rect(
-            area.origin.x,
-            area.origin.y,
-            area.size.width.min(ctx.px(720.0)),
-            line_h * 3.4,
-        );
-        ctx.draw_rounded_frame(
-            layers,
-            0,
-            card.origin.x,
-            card.origin.y,
-            card.size.width,
-            card.size.height,
-            palette.control_bg,
-            palette.control_border,
-            ctx.px(CARD_RADIUS),
-        )?;
-        ctx.draw_svg_icon(
-            layers,
-            SvgIcon::FolderOpen,
-            card.origin.x + ctx.px(22.0),
-            card.origin.y + ctx.px(26.0),
-            ctx.px(34.0),
-            palette.muted_text,
-        )?;
-        ctx.draw_text(
-            layers,
-            font,
-            card.origin.x + ctx.px(76.0),
-            card.origin.y + ctx.px(24.0),
-            "No projects queued",
-            palette.text,
-            card.size.width - ctx.px(98.0),
-        )?;
-        self.draw_wrapped_text(
-            ctx,
-            layers,
-            font,
-            card.origin.x + ctx.px(76.0),
-            card.origin.y + ctx.px(24.0) + line_h,
-            card.size.width - ctx.px(98.0),
-            "Go back to choose a folder manually, continue with an empty workspace, or Skip setup.",
-            palette.secondary_text,
-            2,
-        )
-    }
-
-    fn paint_preference_group(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        section_font: &Rc<LoadedFont>,
-        title: &str,
-        choices: &[(&str, OnboardingAction, bool)],
-    ) -> anyhow::Result<()> {
-        let line_h = Self::line_h(ctx);
-        ctx.draw_text(
-            layers,
-            section_font,
-            area.origin.x,
-            area.origin.y,
-            title,
-            palette.text,
-            area.size.width,
-        )?;
-        let columns = 2usize;
-        let gap = ctx.px(18.0);
-        let control_h = Self::preference_choice_h(ctx);
-        let width = ((area.size.width - gap) / columns as f32).max(ctx.px(180.0));
-        let start_y = area.origin.y + line_h + ctx.px(26.0);
-        for (idx, (label, action, selected)) in choices.iter().enumerate() {
-            let col = idx % columns;
-            let row = idx / columns;
-            let x = area.origin.x + col as f32 * (width + gap);
-            let y = start_y + row as f32 * (control_h + ctx.px(18.0));
-            self.paint_choice_pill(
-                ctx,
-                layers,
-                rect(x, y, width, control_h),
-                palette,
-                font,
-                label,
-                *selected,
-                *action,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn paint_choice_pill(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        palette: UiPalette,
+        skin: Skin,
         font: &Rc<LoadedFont>,
         label: &str,
-        selected: bool,
         action: OnboardingAction,
+        selected: bool,
     ) -> anyhow::Result<()> {
+        let text = self.paint_chip_frame(ctx, layers, area, skin, action, selected)?;
+        ctx.draw_text(
+            layers,
+            font,
+            area.origin.x + ctx.px(CHIP_PAD_X),
+            area.origin.y + ctx.px(CHIP_PAD_Y),
+            label,
+            text,
+            area.size.width - ctx.px(CHIP_PAD_X) * 2.0,
+        )
+    }
+
+    /// The shared chip surface: hit target, fill, border and focus ring.
+    /// Returns the label colour so the two kinds of chip stay in step.
+    fn paint_chip_frame(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        area: RectF,
+        skin: Skin,
+        action: OnboardingAction,
+        selected: bool,
+    ) -> anyhow::Result<LinearRgba> {
         self.widgets.push(area, WidgetKind::Button, action);
-        let hovered = self.interaction.hovered == Some(action);
-        let pressed = self.interaction.pressed == Some(action);
-        let bg = if selected {
-            palette.selected_bg.mul_alpha(0.22)
-        } else if pressed {
-            palette.control_pressed_bg
-        } else if hovered {
-            palette.control_hover_bg
+        let (bg, border, text) = if selected {
+            // Selected still needs to answer the pointer, or the control the
+            // user is already on is the one that looks dead.
+            let bg = match self.state_of(action) {
+                ControlState::Pressed => mix(skin.chip_selected_bg, skin.text, 0.10),
+                ControlState::Hovered => mix(skin.chip_selected_bg, skin.text, 0.05),
+                _ => skin.chip_selected_bg,
+            };
+            (bg, skin.chip_selected_border, skin.chip_selected_text)
         } else {
-            palette.control_bg
+            match self.state_of(action) {
+                ControlState::Pressed => (skin.chip_pressed_bg, skin.chip_border, skin.text),
+                ControlState::Hovered => (skin.chip_hover_bg, skin.chip_border, skin.text),
+                _ => (skin.chip_bg, skin.chip_border, skin.secondary_text),
+            }
         };
-        let border = if selected {
-            palette.selected_bg
-        } else {
-            palette.control_border
-        };
+        self.paint_ring(ctx, layers, area, skin, action, ctx.px(CHIP_RADIUS), false)?;
         ctx.draw_rounded_frame(
             layers,
             0,
@@ -1650,59 +982,41 @@ impl OnboardingView {
             area.size.height,
             bg,
             border,
-            ctx.px(CARD_RADIUS),
+            ctx.px(CHIP_RADIUS),
         )?;
-        ctx.draw_text(
-            layers,
-            font,
-            area.origin.x + ctx.px(22.0),
-            Self::centered_text_y(ctx, area),
-            label,
-            if selected {
-                palette.text
-            } else {
-                palette.secondary_text
-            },
-            area.size.width - ctx.px(44.0),
-        )
+        Ok(text)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_button(
         &mut self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
         area: RectF,
-        palette: UiPalette,
+        skin: Skin,
         font: &Rc<LoadedFont>,
         label: &str,
         action: OnboardingAction,
         primary: bool,
-        enabled: bool,
     ) -> anyhow::Result<()> {
         self.widgets.push(area, WidgetKind::Button, action);
-        let state = if !enabled {
-            ControlState::Disabled
-        } else if self.interaction.pressed == Some(action) {
-            ControlState::Pressed
-        } else if self.interaction.hovered == Some(action) {
-            ControlState::Hovered
-        } else {
-            ControlState::Normal
-        };
-        let (mut bg, mut border) = state.colors(palette);
-        let mut text = palette.text;
-        if primary && enabled {
-            bg = if state == ControlState::Pressed {
-                palette.selected_bg.mul_alpha(0.78)
-            } else {
-                palette.selected_bg
+        let state = self.state_of(action);
+        let (bg, border, text) = if primary {
+            let bg = match state {
+                ControlState::Pressed => mix(skin.primary_bg, skin.ground, 0.22),
+                ControlState::Hovered => mix(skin.primary_bg, skin.ground, 0.10),
+                _ => skin.primary_bg,
             };
-            border = palette.selected_bg;
-            text = palette.selected_text;
-        } else if !enabled {
-            bg = bg.mul_alpha(0.50);
-            text = palette.muted_text;
-        }
+            (bg, bg, skin.primary_text)
+        } else {
+            let bg = match state {
+                ControlState::Pressed => skin.chip_pressed_bg,
+                ControlState::Hovered => skin.chip_hover_bg,
+                _ => skin.ground,
+            };
+            (bg, skin.chip_border, skin.secondary_text)
+        };
+        self.paint_ring(ctx, layers, area, skin, action, ctx.px(BTN_RADIUS), false)?;
         ctx.draw_rounded_frame(
             layers,
             0,
@@ -1712,117 +1026,163 @@ impl OnboardingView {
             area.size.height,
             bg,
             border,
-            ctx.px(CARD_RADIUS),
+            ctx.px(BTN_RADIUS),
         )?;
-        let text_w = ctx.measure_text_width(font, label);
-        let max_text_w = (area.size.width - 24.0).max(0.0);
-        let x =
-            area.origin.x + ((area.size.width - text_w.min(max_text_w)) / 2.0).max(ctx.px(12.0));
+        let text_w = ctx.measure_text_width(font, label).min(area.size.width);
         ctx.draw_text(
             layers,
             font,
-            x,
-            Self::centered_text_y(ctx, area),
+            area.origin.x + ((area.size.width - text_w) / 2.0).max(0.0),
+            area.origin.y + ctx.px(BTN_PAD_Y),
             label,
             text,
-            max_text_w,
+            area.size.width,
         )
     }
 
-    fn paint_summary_row(
-        &self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        row: RectF,
-        palette: UiPalette,
-        font: &Rc<LoadedFont>,
-        label: &str,
-        value: &str,
-    ) -> anyhow::Result<()> {
-        ctx.draw_rounded_frame(
-            layers,
-            0,
-            row.origin.x,
-            row.origin.y,
-            row.size.width,
-            row.size.height,
-            palette.control_bg,
-            palette.control_border,
-            ctx.px(CARD_RADIUS),
-        )?;
-        ctx.draw_text(
-            layers,
-            font,
-            row.origin.x + ctx.px(18.0),
-            Self::centered_text_y(ctx, row),
-            label,
-            palette.secondary_text,
-            row.size.width * 0.42,
-        )?;
-        ctx.draw_text(
-            layers,
-            font,
-            row.origin.x + row.size.width * 0.45,
-            Self::centered_text_y(ctx, row),
-            value,
-            palette.text,
-            row.size.width * 0.52,
-        )
-    }
-
+    /// Rings around a control, as filled rounded rects drawn *underneath* it —
+    /// the exposed margin is the ring.
+    ///
+    /// There is no stroke primitive here, and the obvious substitute (a frame
+    /// with a transparent fill) does the opposite of what it looks like: it
+    /// paints the whole rect in the border colour. The selected preview came
+    /// out as a solid white block that way.
     #[allow(clippy::too_many_arguments)]
-    fn draw_wrapped_text(
+    fn paint_ring(
         &self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
-        font: &Rc<LoadedFont>,
-        x: f32,
-        mut y: f32,
-        width: f32,
-        text: &str,
-        color: LinearRgba,
-        max_lines: usize,
+        area: RectF,
+        skin: Skin,
+        action: OnboardingAction,
+        radius: f32,
+        selected: bool,
     ) -> anyhow::Result<()> {
-        if max_lines == 0 || width <= 0.0 || text.is_empty() {
-            return Ok(());
+        // Outermost first: focus sits outside selection so the two can show at
+        // once without either being hidden.
+        let focused = self.interaction.focused == Some(action);
+        let mut layers_to_draw: Vec<(f32, LinearRgba)> = Vec::new();
+        if focused {
+            let out = ctx.px(RING_FOCUS) + if selected { ctx.px(RING_SELECTED) } else { 0.0 };
+            layers_to_draw.push((out, skin.focus));
         }
-        let mut lines = Vec::new();
-        let mut current = String::new();
-        let mut consumed_words = 0usize;
-        let words = text.split_whitespace().collect::<Vec<_>>();
-        for word in &words {
-            let candidate = if current.is_empty() {
-                (*word).to_string()
-            } else {
-                format!("{current} {word}")
-            };
-            if current.is_empty() || ctx.measure_text_width(font, &candidate) <= width {
-                current = candidate;
-                consumed_words += 1;
-            } else {
-                lines.push(current);
-                current = (*word).to_string();
-                consumed_words += 1;
-                if lines.len() == max_lines {
-                    break;
-                }
-            }
+        if selected {
+            layers_to_draw.push((ctx.px(RING_SELECTED), skin.text));
         }
-        if !current.is_empty() && lines.len() < max_lines {
-            lines.push(current);
-        }
-        let truncated = consumed_words < words.len();
-        if truncated {
-            if let Some(last) = lines.last_mut() {
-                *last = ctx.text_with_ellipsis(font, last, width);
-            }
-        }
-        let line_h = Self::compact_line_h(ctx);
-        for line in lines.into_iter().take(max_lines) {
-            ctx.draw_text(layers, font, x, y, &line, color, width)?;
-            y += line_h;
+        for (out, color) in layers_to_draw {
+            ctx.draw_rounded_rect(
+                layers,
+                0,
+                area.origin.x - out,
+                area.origin.y - out,
+                area.size.width + out * 2.0,
+                area.size.height + out * 2.0,
+                color,
+                radius + out,
+            )?;
         }
         Ok(())
+    }
+}
+
+/// The neutral skin. Everything is derived from [`UiPalette`] so both themes
+/// stay correct, except the mark and the theme tiles, which depict physical
+/// things and look the same either way.
+#[derive(Debug, Clone, Copy)]
+struct Skin {
+    text: LinearRgba,
+    secondary_text: LinearRgba,
+    label: LinearRgba,
+    chip_bg: LinearRgba,
+    chip_hover_bg: LinearRgba,
+    chip_pressed_bg: LinearRgba,
+    chip_border: LinearRgba,
+    chip_selected_bg: LinearRgba,
+    chip_selected_text: LinearRgba,
+    chip_selected_border: LinearRgba,
+    /// Opaque page colour, for controls that should read as outline-only.
+    ground: LinearRgba,
+    face_border: LinearRgba,
+    mark_bg: LinearRgba,
+    mark_border: LinearRgba,
+    primary_bg: LinearRgba,
+    primary_text: LinearRgba,
+    focus: LinearRgba,
+}
+
+impl Skin {
+    fn new(palette: UiPalette) -> Self {
+        let ground = palette.window_bg;
+        // Every fill below is opaque — see `mix`. The selected chip in
+        // particular sits only a little way from the ground, so the ordinary
+        // text colour still reads on it; pushing it towards the text colour
+        // instead would leave a near-white label on a near-white pill.
+        Self {
+            text: palette.text,
+            secondary_text: palette.secondary_text,
+            label: palette.muted_text,
+            chip_bg: mix(ground, palette.text, 0.08),
+            chip_hover_bg: mix(ground, palette.text, 0.13),
+            chip_pressed_bg: mix(ground, palette.text, 0.20),
+            chip_border: mix(ground, palette.text, 0.18),
+            chip_selected_bg: mix(ground, palette.text, 0.17),
+            chip_selected_text: palette.text,
+            chip_selected_border: mix(ground, palette.text, 0.62),
+            ground,
+            face_border: mix(ground, palette.text, 0.24),
+            mark_bg: mix(ground, palette.text, 0.10),
+            mark_border: mix(ground, palette.text, 0.20),
+            // The mono inversion: the primary action is the highest-contrast
+            // thing on the page without introducing a hue.
+            primary_bg: palette.text,
+            primary_text: palette.window_bg,
+            focus: mix(ground, palette.text, 0.65),
+        }
+    }
+}
+
+/// Opaque blend from `from` towards `to`, **in sRGB space**.
+///
+/// Two things this has to get right:
+///
+/// Fills passed to [`DrawContext::draw_rounded_frame`] must be opaque. That
+/// helper paints the *whole* rect in the border colour and then draws the fill
+/// inset by one pixel on top, so a translucent fill lets the border colour
+/// flood the control: a chip whose fill was white at 24% over a border of white
+/// at 55% came out pale enough that its own white label vanished into it.
+///
+/// And the blend must happen in sRGB, not in the linear values these colours
+/// are stored as. Lerping 10% of the way from near-black to near-white in
+/// *linear* space lands around 34% in sRGB — so greys meant to sit just off the
+/// page came out as mid-greys.
+fn mix(from: LinearRgba, to: LinearRgba, t: f32) -> LinearRgba {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32| srgb_decode(srgb_encode(a) + (srgb_encode(b) - srgb_encode(a)) * t);
+    LinearRgba::with_components(
+        lerp(from.0, to.0),
+        lerp(from.1, to.1),
+        lerp(from.2, to.2),
+        1.0,
+    )
+}
+
+// The standard sRGB transfer function, written out rather than reached for on
+// `LinearRgba`/`SrgbaTuple`: those two use different curves (one exact, one a
+// gamma-2.2 approximation) and so do not round-trip. These are exact inverses,
+// which is what a blend needs.
+fn srgb_encode(c: f32) -> f32 {
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn srgb_decode(c: f32) -> f32 {
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -1830,10 +1190,9 @@ impl OnboardingView {
 struct OnboardingPrefs {
     space_name: String,
     target_space_id: Option<String>,
-    imported_project_count: usize,
-    language: NativeLanguagePreference,
+    /// Preference string from [`LANGUAGE_OPTIONS`].
+    language: &'static str,
     appearance: NativeThemeMode,
-    show_left_sidebar: bool,
 }
 
 fn finish_onboarding(tw: &mut TermWindow, prefs: OnboardingPrefs) {
@@ -1858,46 +1217,37 @@ fn finish_onboarding(tw: &mut TermWindow, prefs: OnboardingPrefs) {
         } else {
             window.invalidate();
         }
-        if tw.workspace_sidebar_collapsed == prefs.show_left_sidebar {
-            tw.workspace_sidebar_collapsed = !prefs.show_left_sidebar;
-            let dimensions = tw.dimensions;
-            tw.apply_dimensions(&dimensions, None, &window);
-        }
     }
-    log::debug!(
-        "onboarding completed: imported_project_count={}",
-        prefs.imported_project_count
-    );
     tw.close_content_view();
 }
 
 fn apply_onboarding_preferences(settings: &mut ThinkTermNativeSettings, prefs: &OnboardingPrefs) {
     settings.appearance.theme_mode = prefs.appearance;
-    settings.onboarding.language = prefs.language;
-    settings.onboarding.show_left_sidebar_by_default = prefs.show_left_sidebar;
+    // `localization.language`, not the legacy `onboarding.language`:
+    // `i18n::configured_preference` reads the former first and only falls back
+    // to the latter for a settings file written before localization existed.
+    // Writing only the legacy field made this picker a silent no-op for anyone
+    // who had ever chosen a language in the Settings window.
+    settings.localization.language = Some(prefs.language.to_string());
     mark_onboarding_seen(settings);
 }
 
-fn project_name_for_path(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Project")
-        .to_string()
-}
-
-fn inset_rect(rect: RectF, amount: f32) -> RectF {
-    euclid::rect(
-        rect.origin.x + amount,
-        rect.origin.y + amount,
-        (rect.size.width - amount * 2.0).max(0.0),
-        (rect.size.height - amount * 2.0).max(0.0),
-    )
+/// The [`LANGUAGE_OPTIONS`] entry matching the language the app is currently
+/// using, so the picker opens on the real answer rather than the legacy field.
+/// Falls back to System for a preference we do not offer (a hand-edited
+/// settings file, or a locale added to settings but not to the option list).
+fn language_preference_for(settings: &ThinkTermNativeSettings) -> &'static str {
+    let configured = crate::i18n::configured_preference(settings);
+    LANGUAGE_OPTIONS
+        .iter()
+        .map(|option| option.preference)
+        .find(|preference| preference.eq_ignore_ascii_case(configured))
+        .unwrap_or(crate::i18n::SYSTEM_PREFERENCE)
 }
 
 impl ContentView for OnboardingView {
     fn title(&self) -> String {
-        "ThinkTerm Setup".to_string()
+        crate::i18n::tr("onboarding-window-title")
     }
 
     fn tab_key(&self) -> Option<String> {
@@ -1913,9 +1263,7 @@ impl ContentView for OnboardingView {
     }
 
     fn next_frame_time(&self) -> Option<Instant> {
-        self.transition
-            .filter(|transition| transition.started_at.elapsed() < Self::transition_duration())
-            .map(|_| Instant::now() + Duration::from_millis(16))
+        None
     }
 
     fn paint(
@@ -1927,18 +1275,9 @@ impl ContentView for OnboardingView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
-        cursor_on: bool,
+        _cursor_on: bool,
     ) -> anyhow::Result<()> {
-        self.paint_impl(
-            ctx,
-            layers,
-            area,
-            palette,
-            font,
-            title_font,
-            section_font,
-            cursor_on,
-        )
+        self.paint_impl(ctx, layers, area, palette, font, title_font, section_font)
     }
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
@@ -1949,17 +1288,12 @@ impl ContentView for OnboardingView {
         self.on_key_impl(key, mods)
     }
 
-    fn on_paste(&mut self, text: &str) -> ContentViewResponse {
-        self.on_paste_impl(text)
+    fn on_paste(&mut self, _text: &str) -> ContentViewResponse {
+        ContentViewResponse::Ignored
     }
 
     fn on_close_requested(&mut self) -> ContentViewResponse {
         self.skip_response()
-    }
-
-    fn on_folder_picked(&mut self, path: PathBuf) -> ContentViewResponse {
-        self.add_manual_project(path);
-        ContentViewResponse::Redraw
     }
 
     fn copy_text(&self) -> Option<String> {
@@ -1974,56 +1308,277 @@ impl ContentView for OnboardingView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use window::Appearance;
 
-    #[test]
-    fn manual_project_uses_folder_name_and_starts_selected() {
-        let project = PendingProject::from_path(
-            PathBuf::from("/tmp/thinkterm-onboarding-demo"),
-            ProjectSource::Manual,
-        );
-
-        assert_eq!(project.name, "thinkterm-onboarding-demo");
-        assert!(project.selected);
-        assert_eq!(project.source.label(), "Manual");
-    }
-
-    #[test]
-    fn selected_project_count_tracks_toggles() {
-        let mut view = OnboardingView::new("space-default".to_string(), "Default".to_string());
-        view.pending_projects.push(PendingProject::from_path(
-            PathBuf::from("/tmp/one"),
-            ProjectSource::Manual,
-        ));
-        view.pending_projects.push(PendingProject::from_path(
-            PathBuf::from("/tmp/two"),
-            ProjectSource::Manual,
-        ));
-
-        assert_eq!(view.selected_project_count(), 2);
-        view.pending_projects[1].selected = false;
-        assert_eq!(view.selected_project_count(), 1);
-    }
-
-    #[test]
-    fn flow_skips_space_step() {
-        assert_eq!(Step::all().len(), 5);
-        assert_eq!(Step::Welcome.next(), Step::ImportSources);
-        assert_eq!(Step::ImportSources.previous(), Step::Welcome);
+    fn prefs_with_language(language: &'static str) -> OnboardingPrefs {
+        OnboardingPrefs {
+            space_name: "Default".to_string(),
+            target_space_id: Some("space-default".to_string()),
+            language,
+            appearance: NativeThemeMode::System,
+        }
     }
 
     #[test]
     fn target_space_uses_initial_space() {
         let view = OnboardingView::new("space-default".to_string(), "Default".to_string());
-        assert_eq!(view.normalized_space_name(), "Default");
+        assert_eq!(view.space_name(), "Default");
         assert_eq!(view.target_space_id_for_choice(), "space-default");
     }
 
+    /// The picker used to write only the legacy `onboarding.language`, which
+    /// `configured_preference` consults *after* `localization.language` — so
+    /// choosing a language here did nothing once Settings had ever set one.
     #[test]
-    fn unavailable_providers_are_not_reported_available() {
-        assert!(ImportProvider::Manual.is_available());
-        assert!(!ImportProvider::VsCode.is_available());
-        assert!(!ImportProvider::Cursor.is_available());
-        assert!(!ImportProvider::Antigravity.is_available());
-        assert!(!ImportProvider::Cmux.is_available());
+    fn language_choice_wins_over_a_previously_configured_language() {
+        let mut settings = ThinkTermNativeSettings::default();
+        settings.localization.language = Some("en-US".to_string());
+
+        apply_onboarding_preferences(&mut settings, &prefs_with_language("zh-CN"));
+
+        assert_eq!(crate::i18n::configured_preference(&settings), "zh-CN");
+    }
+
+    #[test]
+    fn language_choice_applies_to_a_fresh_settings_file() {
+        let mut settings = ThinkTermNativeSettings::default();
+        assert_eq!(settings.localization.language, None);
+
+        apply_onboarding_preferences(&mut settings, &prefs_with_language("ja-JP"));
+
+        assert_eq!(crate::i18n::configured_preference(&settings), "ja-JP");
+    }
+
+    /// Every shipped locale must be offered. The hand-written list this
+    /// replaced omitted French even though `fr-FR.ftl` ships.
+    #[test]
+    fn every_shipped_language_is_selectable() {
+        let offered: Vec<&str> = LANGUAGE_OPTIONS
+            .iter()
+            .map(|option| option.preference)
+            .collect();
+        assert!(offered.contains(&"fr-FR"));
+
+        for preference in offered {
+            let mut settings = ThinkTermNativeSettings::default();
+            apply_onboarding_preferences(&mut settings, &prefs_with_language(preference));
+            assert_eq!(
+                crate::i18n::configured_preference(&settings),
+                preference,
+                "{preference} did not survive the round trip"
+            );
+            assert_eq!(language_preference_for(&settings), preference);
+        }
+    }
+
+    #[test]
+    fn an_unknown_configured_language_falls_back_to_system() {
+        let mut settings = ThinkTermNativeSettings::default();
+        settings.localization.language = Some("kl-GL".to_string());
+
+        assert_eq!(
+            language_preference_for(&settings),
+            crate::i18n::SYSTEM_PREFERENCE
+        );
+    }
+
+    /// Every control must be reachable by keyboard. The multi-step version had
+    /// none: Tab switched steps, so the pills and the toggle were mouse-only.
+    #[test]
+    fn focus_order_covers_every_control() {
+        let order = focus_order();
+        assert_eq!(order.len(), LANGUAGE_OPTIONS.len() + 3 + 2);
+        assert!(order.contains(&OnboardingAction::Start));
+        assert!(order.contains(&OnboardingAction::Skip));
+        for option in LANGUAGE_OPTIONS {
+            assert!(order.contains(&OnboardingAction::Language(option.preference)));
+        }
+        for mode in [
+            NativeThemeMode::System,
+            NativeThemeMode::Light,
+            NativeThemeMode::Dark,
+        ] {
+            assert!(order.contains(&OnboardingAction::Appearance(mode)));
+        }
+    }
+
+    /// Five chips fit one row at the design width but must wrap rather than
+    /// overflow when the column is narrow or a locale has long names.
+    #[test]
+    fn chips_wrap_instead_of_overflowing() {
+        let widths = [100.0f32, 100.0, 100.0, 100.0, 100.0];
+
+        let one_row = OnboardingView::chip_rows(&widths, 8.0, 560.0);
+        assert_eq!(one_row.len(), 1);
+
+        let narrow = OnboardingView::chip_rows(&widths, 8.0, 220.0);
+        assert!(narrow.len() > 1, "expected wrapping, got {:?}", narrow);
+        assert_eq!(narrow.iter().map(Vec::len).sum::<usize>(), widths.len());
+        for row in &narrow {
+            let used: f32 = row.iter().map(|index| widths[*index]).sum::<f32>()
+                + (row.len().saturating_sub(1)) as f32 * 8.0;
+            assert!(used <= 220.0, "row overflows: {}", used);
+        }
+    }
+
+    /// The constants above are design pixels, which are *half* a logical
+    /// pixel. Reading them as CSS pixels halves the entire layout while the
+    /// text — sized by the font, not by `px()` — stays put, so the page renders
+    /// crushed together and the language chips wrap a row early. That is
+    /// exactly how the first cut of this screen shipped, hence the pin.
+    #[test]
+    fn constants_are_design_pixels_not_logical_pixels() {
+        let design_dpi = if cfg!(target_os = "macos") { 144 } else { 192 };
+        assert_eq!(
+            crate::ui::ui_scale_for_dpi(design_dpi),
+            1.0,
+            "px() is 1:1 at the design dpi, so these constants are backing pixels there"
+        );
+
+        // The design surface is 2x, so halving gives the intended point size.
+        assert_eq!(MARK_SIZE / 2.0, 64.0, "mark should read as 64pt");
+        assert_eq!(COL_W / 2.0, 560.0, "column should read as 560pt");
+        assert_eq!(TILE_W / 2.0, 112.0);
+        assert_eq!(TILE_H / 2.0, 72.0);
+        assert_eq!(SECTION_GAP / 2.0, 30.0);
+    }
+
+    /// The page must fit the area it is given. At the default 24-row window the
+    /// content region is only ~700 backing px tall while the full-size layout
+    /// wants ~1040 — and with no scrolling, no wheel handler, and dispatch
+    /// gated on `py < area.max_y()`, everything past the fold was not merely
+    /// clipped but unclickable. "Get Started" was off screen on first run.
+    #[test]
+    fn the_layout_shrinks_to_fit_a_short_window() {
+        let rigid = 420.0;
+        let flex = 620.0;
+        let full = rigid + flex;
+
+        // Room to spare: nothing shrinks.
+        assert_eq!(fit_factor(full + 200.0, rigid, flex), 1.0);
+        assert_eq!(fit_factor(full, rigid, flex), 1.0);
+
+        // The default window: solve exactly, and check it really fits.
+        let short = 700.0;
+        let fit = fit_factor(short, rigid, flex);
+        assert!(fit < 1.0, "should have shrunk, got {}", fit);
+        assert!(
+            rigid + fit * flex <= short + 0.01,
+            "still overflows: {} into {}",
+            rigid + fit * flex,
+            short
+        );
+
+        // Absurdly short: floored rather than collapsed to nothing.
+        assert_eq!(fit_factor(10.0, rigid, flex), FIT_MIN);
+        // Degenerate input must not divide by zero.
+        assert_eq!(fit_factor(100.0, rigid, 0.0), 1.0);
+    }
+
+    /// The theme previews once rendered "onboa…" — a second `modes` binding
+    /// holding the raw key strings shadowed the translated one at the draw
+    /// site. Nothing about that needs a GPU to catch.
+    #[test]
+    fn appearance_labels_are_translated_not_raw_keys() {
+        let choices = appearance_choices();
+        assert_eq!(choices.len(), 3);
+        for (mode, label) in choices {
+            assert!(
+                !label.starts_with("onboarding-"),
+                "{:?} shows a raw i18n key: {}",
+                mode,
+                label
+            );
+            assert!(!label.trim().is_empty(), "{:?} has an empty label", mode);
+        }
+    }
+
+    /// `draw_rounded_frame` paints the whole rect in the border colour and then
+    /// insets the fill by one pixel, so a translucent fill lets the border
+    /// flood through. That is how the selected chip ended up a pale pill
+    /// wearing a near-white label. Every fill the skin hands out must be
+    /// opaque, and the selected fill must stay far enough from the text colour
+    /// to carry it.
+    #[test]
+    fn skin_fills_are_opaque_and_keep_their_labels_legible() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let palette = UiPalette::for_appearance(appearance);
+            let skin = Skin::new(palette);
+            let fills = [
+                ("chip_bg", skin.chip_bg),
+                ("chip_hover_bg", skin.chip_hover_bg),
+                ("chip_pressed_bg", skin.chip_pressed_bg),
+                ("chip_selected_bg", skin.chip_selected_bg),
+                ("ground", skin.ground),
+                ("mark_bg", skin.mark_bg),
+            ];
+            for (name, fill) in fills {
+                assert_eq!(fill.3, 1.0, "{} is translucent on {:?}", name, appearance);
+            }
+
+            // The selected label is drawn in `chip_selected_text`. The fill has
+            // to stay nearer the page than the label, or the two collapse —
+            // which is what happened when the border colour flooded through a
+            // translucent fill and left white text on a pale pill. Phrased
+            // against the page rather than as a fraction of the gap, which was
+            // slack enough to hold for any sane value.
+            let luma =
+                |c: LinearRgba| (srgb_encode(c.0) + srgb_encode(c.1) + srgb_encode(c.2)) / 3.0;
+            let to_label = (luma(skin.chip_selected_bg) - luma(skin.chip_selected_text)).abs();
+            let to_ground = (luma(skin.chip_selected_bg) - luma(skin.ground)).abs();
+            assert!(
+                to_label > to_ground,
+                "selected fill on {:?} sits nearer its own label ({:.3}) than the page ({:.3})",
+                appearance,
+                to_label,
+                to_ground,
+            );
+        }
+    }
+
+    /// `mix` blends in sRGB. Doing it on the stored linear values instead
+    /// makes every "just off the page" grey land far lighter than asked for —
+    /// a nominal 10% came out near 34%, which is why the mark and the buttons
+    /// read as mid-grey on a near-black page.
+    #[test]
+    fn mix_blends_perceptually_not_in_linear_space() {
+        let black = LinearRgba::with_srgba(0, 0, 0, 255);
+        let white = LinearRgba::with_srgba(255, 255, 255, 255);
+
+        let tenth = srgb_encode(mix(black, white, 0.10).0);
+        assert!(
+            (tenth - 0.10).abs() < 0.02,
+            "10% of the way to white should be ~10% in sRGB, got {}",
+            tenth
+        );
+
+        // Halfway is mid-grey to the eye, not the much lighter linear midpoint.
+        let half = srgb_encode(mix(black, white, 0.5).0);
+        assert!((half - 0.5).abs() < 0.02, "midpoint drifted to {}", half);
+
+        // And the skin's own greys must stay nearer the ground than the text.
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let palette = UiPalette::for_appearance(appearance);
+            let skin = Skin::new(palette);
+            let luma =
+                |c: LinearRgba| (srgb_encode(c.0) + srgb_encode(c.1) + srgb_encode(c.2)) / 3.0;
+            let to_ground = (luma(skin.mark_bg) - luma(skin.ground)).abs();
+            let to_text = (luma(skin.mark_bg) - luma(skin.text)).abs();
+            assert!(
+                to_ground < to_text,
+                "mark on {:?} sits closer to the text than to the page",
+                appearance
+            );
+        }
+    }
+
+    /// A chip wider than the column still gets its own row rather than being
+    /// dropped.
+    #[test]
+    fn an_overlong_chip_still_gets_a_row() {
+        let rows = OnboardingView::chip_rows(&[900.0, 40.0], 8.0, 200.0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![0]);
+        assert_eq!(rows[1], vec![1]);
     }
 }

@@ -213,18 +213,44 @@ impl crate::TermWindow {
         }
     }
 
+    /// Toggle the panel, and remember the result so new windows inherit it.
+    ///
+    /// Reads [`Self::workspace_sidebar_is_presented`] rather than the collapsed
+    /// flag, because during a hover reveal the two disagree: the panel is on
+    /// screen while `workspace_sidebar_collapsed` is still true. The tab bar's
+    /// button is labelled from the presented state
+    /// ([`Self::workspace_sidebar_toggle_icon`]), so it reads "close" during a
+    /// reveal — and toggling the flag from there *docked* the panel instead of
+    /// closing it. Harmless while nothing persisted; once this writes the
+    /// setting, brushing the left edge and clicking "close" would re-dock the
+    /// sidebar for every window from then on.
     pub fn toggle_workspace_sidebar(&mut self) {
+        let shown = workspace_sidebar_toggle_target(
+            self.workspace_sidebar_collapsed,
+            self.workspace_sidebar_hover.is_presented(),
+        );
         self.workspace_sidebar_swipe.cancel_immediately();
         self.clear_workspace_space_swipe_frame_transition();
-        self.workspace_sidebar_collapsed = !self.workspace_sidebar_collapsed;
-        // Whichever way this went, the hover machine must not act on the
-        // pointer still sitting where it was: collapsing must not instantly
-        // re-reveal, and expanding makes the reveal moot.
-        self.workspace_sidebar_hover.suppress_until_pointer_leaves();
+        self.set_workspace_sidebar_shown(shown);
     }
 
     pub fn expand_workspace_sidebar(&mut self) {
-        self.workspace_sidebar_collapsed = false;
+        self.set_workspace_sidebar_shown(true);
+    }
+
+    /// Dock or collapse the panel and persist that choice.
+    ///
+    /// The write is skipped when nothing changed, which matters because the
+    /// resize drag calls this on every pointer move.
+    pub(crate) fn set_workspace_sidebar_shown(&mut self, shown: bool) {
+        let collapsed = !shown;
+        if self.workspace_sidebar_collapsed != collapsed {
+            self.workspace_sidebar_collapsed = collapsed;
+            crate::native_settings::save_workspace_sidebar_shown(shown);
+        }
+        // Either way the hover machine must not act on the pointer still
+        // sitting where it was: collapsing must not instantly re-reveal, and
+        // docking makes the reveal moot.
         self.workspace_sidebar_hover.suppress_until_pointer_leaves();
     }
 
@@ -3097,15 +3123,54 @@ fn notification_badge_pulse_phase(elapsed: Duration) -> Option<f32> {
     Some((total_progress * NOTIFICATION_BADGE_PULSE_COUNT).fract())
 }
 
+/// The `shown` state a sidebar toggle should move to.
+///
+/// Split out from [`TermWindow::toggle_workspace_sidebar`] because its two
+/// inputs disagree during a hover reveal — the panel is on screen while
+/// `collapsed` is still true — and that disagreement is exactly where this went
+/// wrong: reading `collapsed` alone turned a click on a button labelled "close"
+/// into a dock.
+fn workspace_sidebar_toggle_target(collapsed: bool, hover_presented: bool) -> bool {
+    let presented = !collapsed || hover_presented;
+    !presented
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ellipsize_cut_byte, notification_badge_pulse_phase, notification_snapshot_has_new_entry,
-        snapped_rounded_corner_radius, NOTIFICATION_BADGE_PULSE_DURATION,
+        snapped_rounded_corner_radius, workspace_sidebar_toggle_target,
+        NOTIFICATION_BADGE_PULSE_DURATION,
     };
     use crate::workspace_threads::WorkspaceThreadWorkStatus;
     use std::collections::HashMap;
     use std::time::Duration;
+
+    /// Clicking the tab bar's toggle acts on what the user sees. During a hover
+    /// reveal the panel is presented while `collapsed` is still true, and the
+    /// button reads "close" — so it must collapse, not dock. Docking there also
+    /// persisted `show_left_sidebar_by_default`, permanently re-docking the
+    /// panel for every future window.
+    #[test]
+    fn toggling_a_hover_revealed_sidebar_collapses_it() {
+        // (collapsed, hover_presented) -> shown
+        assert!(
+            !workspace_sidebar_toggle_target(false, false),
+            "docked panel should collapse"
+        );
+        assert!(
+            workspace_sidebar_toggle_target(true, false),
+            "collapsed panel should dock"
+        );
+        assert!(
+            !workspace_sidebar_toggle_target(true, true),
+            "hover-revealed panel should collapse, not dock"
+        );
+        assert!(
+            !workspace_sidebar_toggle_target(false, true),
+            "docked panel under a reveal should still collapse"
+        );
+    }
 
     // Build (advance, cluster) pairs for an ASCII or per-char string where every
     // char is one glyph of `advance` px and the cluster is its byte offset.

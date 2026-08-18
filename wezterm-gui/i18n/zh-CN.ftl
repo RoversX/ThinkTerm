@@ -443,3 +443,15 @@ settings-status-import-field-disabled = 已从导入选择中移除“{ $field }
 settings-status-import-selection-error = 无法保存导入选择：{ $error }
 settings-status-import-all-selected = 已选择全部 { $count } 项支持的设置。
 settings-status-import-all-cleared = 已清除导入选择。
+# -- 首次运行 ----------------------------------------------------------------
+onboarding-window-title = ThinkTerm 设置
+onboarding-title = 欢迎使用 ThinkTerm
+onboarding-subtitle = 让终端和你的工作待在一起
+onboarding-language = 语言
+onboarding-appearance = 外观
+onboarding-theme-system = 跟随系统
+onboarding-theme-light = 浅色
+onboarding-theme-dark = 深色
+onboarding-privacy = 你打开的一切都不会离开这台设备。
+onboarding-skip = 跳过
+onboarding-start = 开始使用

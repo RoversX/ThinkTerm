@@ -55,14 +55,6 @@ impl Default for NativeThemeMode {
 }
 
 impl NativeThemeMode {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-        }
-    }
-
     pub(crate) fn effective_appearance(self, system: Appearance) -> Appearance {
         match self {
             Self::System => system,
@@ -145,17 +137,6 @@ pub(crate) enum NativeLanguagePreference {
 impl Default for NativeLanguagePreference {
     fn default() -> Self {
         Self::System
-    }
-}
-
-impl NativeLanguagePreference {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::System => "Follow System",
-            Self::English => "English",
-            Self::Chinese => "中文",
-            Self::Japanese => "日本語",
-        }
     }
 }
 
@@ -637,6 +618,24 @@ pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
     let mut settings = load();
     settings.chrome.workspace_sidebar_width = Some(width);
     save(&settings)
+}
+
+/// Remember whether the workspace sidebar is open, so a new window starts the
+/// way the last one was left.
+///
+/// This value seeds every window's collapsed state (`TermWindow::new`), but
+/// nothing used to write it outside the first-run wizard — so collapsing the
+/// sidebar was forgotten on the next window, and the setting had no home once
+/// the wizard stopped asking about it.
+pub(crate) fn save_workspace_sidebar_shown(shown: bool) {
+    let mut settings = load();
+    if settings.onboarding.show_left_sidebar_by_default == shown {
+        return;
+    }
+    settings.onboarding.show_left_sidebar_by_default = shown;
+    if let Err(err) = save(&settings) {
+        log::warn!("failed to save workspace sidebar visibility: {err:#}");
+    }
 }
 
 /// Hover-reveal of the collapsed left sidebar. On unless explicitly turned

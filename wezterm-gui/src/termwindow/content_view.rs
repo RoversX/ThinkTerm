@@ -9,7 +9,6 @@ use crate::ui::{DrawContext, UiPalette};
 use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{PositionedSplit, TabId};
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -538,12 +537,6 @@ pub(crate) trait ContentView {
     /// Handle the synthetic tab close button / Escape-style close request.
     fn on_close_requested(&mut self) -> ContentViewResponse {
         ContentViewResponse::Close
-    }
-
-    /// Handle a folder selected by a native folder picker that was initiated by
-    /// this view.
-    fn on_folder_picked(&mut self, _path: PathBuf) -> ContentViewResponse {
-        ContentViewResponse::Ignored
     }
 
     /// Text to copy to the clipboard for ⌘C (e.g. the focused field), if any.

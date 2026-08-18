@@ -5093,27 +5093,6 @@ impl TermWindow {
         }
     }
 
-    pub(crate) fn pick_content_view_folder(&mut self) {
-        let Some(view_id) = self.active_content_view_id else {
-            return;
-        };
-        let Some(window) = self.window.as_ref().cloned() else {
-            return;
-        };
-        let notify_window = window.clone();
-        window.pick_folder_async(Box::new(move |path| {
-            if let Some(path) = path {
-                notify_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let response = term_window
-                        .content_view_mut_by_id(view_id)
-                        .map(|view| view.on_folder_picked(path))
-                        .unwrap_or(crate::termwindow::content_view::ContentViewResponse::Ignored);
-                    term_window.handle_content_response_for(view_id, response);
-                })));
-            }
-        }));
-    }
-
     pub(crate) fn set_content_view_active(&mut self, active: bool) {
         if active {
             let id = self

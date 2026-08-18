@@ -443,3 +443,15 @@ settings-status-import-field-disabled = 「{ $field }」をインポート対象
 settings-status-import-selection-error = インポート対象を保存できません：{ $error }
 settings-status-import-all-selected = 対応する設定をすべて選択しました（{ $count } 件）。
 settings-status-import-all-cleared = インポート対象をすべて解除しました。
+# -- 初期設定 ----------------------------------------------------------------
+onboarding-window-title = ThinkTerm 設定
+onboarding-title = ThinkTerm へようこそ
+onboarding-subtitle = 作業とターミナルをひとつにまとめる
+onboarding-language = 言語
+onboarding-appearance = 外観
+onboarding-theme-system = システムに合わせる
+onboarding-theme-light = ライト
+onboarding-theme-dark = ダーク
+onboarding-privacy = 開いたものはこの端末の外に出ません。
+onboarding-skip = スキップ
+onboarding-start = 使ってみる
