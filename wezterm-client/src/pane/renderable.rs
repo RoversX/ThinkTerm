@@ -634,13 +634,24 @@ impl RenderableInner {
             return false;
         }
 
-        let preserve_lines = self.dimensions.cols == size.cols;
+        let width_changed = self.dimensions.cols != size.cols;
         self.dimensions.cols = size.cols;
         self.dimensions.viewport_rows = size.rows;
         self.dimensions.pixel_width = size.pixel_width;
         self.dimensions.pixel_height = size.pixel_height;
         self.dimensions.dpi = size.dpi;
-        self.invalidate_line_cache(preserve_lines);
+        // Keep showing the old rows while the refetch is in flight, exactly
+        // as the LiveResize preview does: dropping them here painted the
+        // whole pane blank for a server round trip every time chrome (the
+        // sidebars) changed the terminal's width. A width change normalizes
+        // the retained cell storage so an old-width row can never be
+        // interpreted as already matching the new grid.
+        self.line_cache_epoch = self.line_cache_epoch.wrapping_add(1);
+        if width_changed {
+            resize_stale_line_entries(&mut self.lines, size.cols);
+        } else {
+            invalidate_line_entries(&mut self.lines, true);
+        }
         true
     }
 
