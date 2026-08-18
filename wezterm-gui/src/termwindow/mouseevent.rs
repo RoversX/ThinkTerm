@@ -1026,12 +1026,12 @@ impl super::TermWindow {
             let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
             if !spaces
                 .iter()
-                .any(|space| space.id == self.active_space_id && !space.is_remote)
+                .any(|space| space.id == self.active_space_id && space.is_swipe_reachable())
             {
                 return None;
             }
             let (previous, next) =
-                crate::workspace_threads::adjacent_local_space_ids(&spaces, &self.active_space_id);
+                crate::workspace_threads::adjacent_swipe_space_ids(&spaces, &self.active_space_id);
             if self.workspace_space_swipe_source_frame.is_none() {
                 self.prepare_workspace_space_swipe_source_capture();
             }
@@ -1149,9 +1149,7 @@ impl super::TermWindow {
             .is_some_and(|visual| visual.source_space_id == self.active_space_id);
         let target_is_available = crate::workspace_threads::spaces_for_window(self.space_owner_id)
             .iter()
-            .any(|space| {
-                space.id == target && !space.is_remote && !space.is_occupied_by_other_window
-            });
+            .any(|space| space.id == target && space.is_swipe_reachable());
         let gui_window = self.window.clone();
         let switched = source_is_current
             && target_is_available
@@ -7906,6 +7904,7 @@ mod space_menu_tests {
             is_occupied_by_other_window: false,
             is_remote,
             domain: is_remote.then(|| "DO SYD X user".to_string()),
+            is_domain_attached: false,
         }
     }
 

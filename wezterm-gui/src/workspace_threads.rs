@@ -332,25 +332,46 @@ pub struct SpaceView {
     /// The mux domain hosting this Space, when it is remote. One server can
     /// host several Spaces, so the Space menu groups by this.
     pub domain: Option<String>,
+    /// True while the hosting domain is attached and not mid-(re)connect.
+    /// Always false for local Spaces; consult `is_swipe_reachable` instead of
+    /// reading this directly.
+    pub is_domain_attached: bool,
 }
 
-pub fn adjacent_local_space_ids(
+impl SpaceView {
+    /// Whether a Space swipe may pass through or land on this Space.
+    ///
+    /// A swipe commit adopts the destination the moment the finger lifts, so
+    /// the destination must be paintable and adoptable right now: local
+    /// Spaces always are, remote Spaces only while their domain is attached.
+    /// A disconnected domain keeps its click-to-connect flow (with its
+    /// connection UI and error reporting) instead of parking the gesture on a
+    /// page that may take ten seconds to exist or never arrive.
+    pub fn is_swipe_reachable(&self) -> bool {
+        !self.is_occupied_by_other_window && (!self.is_remote || self.is_domain_attached)
+    }
+}
+
+pub fn adjacent_swipe_space_ids(
     spaces: &[SpaceView],
     active_space_id: &str,
 ) -> (Option<SpaceId>, Option<SpaceId>) {
-    let local = spaces
+    let reachable = spaces
         .iter()
-        .filter(|space| !space.is_remote && !space.is_occupied_by_other_window)
+        .filter(|space| space.is_swipe_reachable())
         .collect::<Vec<_>>();
-    let Some(index) = local.iter().position(|space| space.id == active_space_id) else {
+    let Some(index) = reachable
+        .iter()
+        .position(|space| space.id == active_space_id)
+    else {
         return (None, None);
     };
 
     let previous = index
         .checked_sub(1)
-        .and_then(|previous| local.get(previous))
+        .and_then(|previous| reachable.get(previous))
         .map(|space| space.id.clone());
-    let next = local.get(index + 1).map(|space| space.id.clone());
+    let next = reachable.get(index + 1).map(|space| space.id.clone());
     (previous, next)
 }
 
@@ -789,7 +810,7 @@ pub fn spaces_for_window(owner_id: u64) -> Vec<SpaceView> {
     if store.normalize_after_load() {
         persist_locked(&store);
     }
-    store
+    let mut views: Vec<SpaceView> = store
         .spaces
         .iter()
         .map(|space| SpaceView {
@@ -802,8 +823,18 @@ pub fn spaces_for_window(owner_id: u64) -> Vec<SpaceView> {
                 .any(|(owner, active_space)| *owner != owner_id && active_space == &space.id),
             is_remote: space.client_domain.is_some(),
             domain: space.client_domain.clone(),
+            is_domain_attached: false,
         })
-        .collect()
+        .collect();
+    // Resolved after the store lock is released: the mux takes its own locks
+    // and must not nest inside ours.
+    drop(store);
+    for view in &mut views {
+        if let Some(domain) = view.domain.as_deref() {
+            view.is_domain_attached = remote_tree_domain_is_attached(domain);
+        }
+    }
+    views
 }
 
 pub fn active_space_name(space_id: &str) -> Option<String> {
@@ -6494,6 +6525,14 @@ mod tests {
             is_occupied_by_other_window,
             is_remote,
             domain: is_remote.then(|| "server".to_string()),
+            is_domain_attached: false,
+        }
+    }
+
+    fn attached_remote_space_view(id: &str) -> SpaceView {
+        SpaceView {
+            is_domain_attached: true,
+            ..space_view(id, true, false)
         }
     }
 
@@ -6545,18 +6584,45 @@ mod tests {
         ];
 
         assert_eq!(
-            adjacent_local_space_ids(&spaces, "local-2"),
+            adjacent_swipe_space_ids(&spaces, "local-2"),
             (Some("local-1".into()), Some("local-3".into()))
         );
         assert_eq!(
-            adjacent_local_space_ids(&spaces, "local-1"),
+            adjacent_swipe_space_ids(&spaces, "local-1"),
             (None, Some("local-2".into()))
         );
         assert_eq!(
-            adjacent_local_space_ids(&spaces, "local-3"),
+            adjacent_swipe_space_ids(&spaces, "local-3"),
             (Some("local-2".into()), None)
         );
-        assert_eq!(adjacent_local_space_ids(&spaces, "remote"), (None, None));
+        assert_eq!(adjacent_swipe_space_ids(&spaces, "remote"), (None, None));
+    }
+
+    #[test]
+    fn adjacent_space_swipe_targets_include_attached_remote_spaces() {
+        let spaces = vec![
+            space_view("local-1", false, false),
+            attached_remote_space_view("attached"),
+            space_view("offline", true, false),
+            space_view("local-2", false, false),
+        ];
+
+        // The attached domain sits in the swipe order; the offline one is
+        // skipped over as if it were not there.
+        assert_eq!(
+            adjacent_swipe_space_ids(&spaces, "local-1"),
+            (None, Some("attached".into()))
+        );
+        assert_eq!(
+            adjacent_swipe_space_ids(&spaces, "attached"),
+            (Some("local-1".into()), Some("local-2".into()))
+        );
+        assert_eq!(
+            adjacent_swipe_space_ids(&spaces, "local-2"),
+            (Some("attached".into()), None)
+        );
+        // Standing on an unreachable Space starts nothing.
+        assert_eq!(adjacent_swipe_space_ids(&spaces, "offline"), (None, None));
     }
 
     /// A store that fails to parse must not come back as an empty one that
