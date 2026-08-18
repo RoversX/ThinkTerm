@@ -1,7 +1,9 @@
-use crate::quad::{HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator};
+use crate::quad::{
+    HeapQuadAllocator, HeapQuadMark, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
+};
 use crate::termwindow::content_view::{ContentViewTypography, TerminalPreviewRequest};
 use crate::termwindow::render::{LineToEleShapeCacheKey, RenderScreenLineParams};
-use crate::termwindow::{RenderFrame, TermWindowNotif};
+use crate::termwindow::{RenderFrame, TermWindowNotif, UIItem, UIItemType};
 use crate::ui::{DrawContext, UiPalette};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::color::LinearRgba;
@@ -17,10 +19,10 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use window::Dimensions;
 use wezterm_font::ClearShapeCache;
 use wezterm_term::color::ColorAttribute;
 use wezterm_term::TerminalSize;
+use window::Dimensions;
 
 const TERMINAL_PREVIEW_EXTENT_BUCKET_DESIGN_PX: f32 = 8.0;
 /// Coarse on purpose: every distinct bucket becomes a `FontConfiguration`
@@ -432,7 +434,8 @@ impl crate::TermWindow {
         self.filled_rectangle(layers, 0, area, palette.window_bg)
             .context("frontend handoff opaque background")?;
 
-        let font_size = crate::native_settings::home_font_size(&crate::native_settings::load_shared());
+        let font_size =
+            crate::native_settings::home_font_size(&crate::native_settings::load_shared());
         let title_font = self.fonts.title_font_with_size(font_size + 2.0)?;
         let hint_font = self.fonts.title_font_with_size(font_size)?;
         let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&title_font.metrics());
@@ -797,8 +800,12 @@ impl crate::TermWindow {
         // the animation, which then only advances when some terminal happens
         // to emit output. Measured: 150-210ms between transition frames, with
         // the main thread idle the whole time.
-        let owes_frames_regardless_of_focus =
-            self.content_view_fade.is_some() || self.active_content_view_index().is_some();
+        let owes_frames_regardless_of_focus = self.content_view_fade.is_some()
+            || self.active_content_view_index().is_some()
+            // A dwell or grace deadline registered while the window is
+            // unfocused would otherwise be dropped, stranding a half-slid
+            // panel until some terminal happens to emit output.
+            || self.workspace_sidebar_hover.needs_frames();
         if self.focused.is_some() || owes_frames_regardless_of_focus {
             if let Some(next_due) = *self.has_animation.borrow() {
                 // "The next frame the display will give me" is the common
@@ -1314,9 +1321,10 @@ impl crate::TermWindow {
             }
         };
 
-        let defer_preview_captures = self.content_view_fade.as_ref().is_some_and(|fade| {
-            fade.flight.is_none()
-        });
+        let defer_preview_captures = self
+            .content_view_fade
+            .as_ref()
+            .is_some_and(|fade| fade.flight.is_none());
         let (next_frame, previews) = {
             let gl_state = self.render_state.as_ref().unwrap();
             let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
@@ -1600,9 +1608,7 @@ impl crate::TermWindow {
             // texture for each one would churn.
             let wanted_w = (preview.area.size.width.ceil() as u32).max(1);
             let wanted_h = (preview.area.size.height.ceil() as u32).max(1);
-            let tex = match prior_texture
-                .filter(|t| t.width == wanted_w && t.height == wanted_h)
-            {
+            let tex = match prior_texture.filter(|t| t.width == wanted_w && t.height == wanted_h) {
                 Some(prior) => Ok(prior),
                 None => self.create_card_texture(preview.area),
             };
@@ -1614,12 +1620,14 @@ impl crate::TermWindow {
                         heap.extract_vertices(&mut frame_verts);
                         (base, (frame_verts.len() - base) / 4)
                     };
-                    self.pending_card_renders.borrow_mut().push(PendingCardRender {
-                        texture: Rc::clone(&tex),
-                        first_vertex,
-                        quad_count,
-                        area: preview.area,
-                    });
+                    self.pending_card_renders
+                        .borrow_mut()
+                        .push(PendingCardRender {
+                            texture: Rc::clone(&tex),
+                            first_vertex,
+                            quad_count,
+                            area: preview.area,
+                        });
                     self.card_composites.borrow_mut().push(CardComposite {
                         texture: Rc::clone(&tex),
                         dest: preview.area,
@@ -1708,12 +1716,14 @@ impl crate::TermWindow {
                 cached.texture = Some(Rc::clone(&texture));
                 (base, (frame_verts.len() - base) / 4)
             };
-            self.pending_card_renders.borrow_mut().push(PendingCardRender {
-                texture,
-                first_vertex,
-                quad_count,
-                area: recorded_area,
-            });
+            self.pending_card_renders
+                .borrow_mut()
+                .push(PendingCardRender {
+                    texture,
+                    first_vertex,
+                    quad_count,
+                    area: recorded_area,
+                });
         }
         let Some(texture) = self
             .preview_quad_cache
@@ -1770,7 +1780,8 @@ impl crate::TermWindow {
         let maximum_scale = (global_scale * 0.84).max(minimum_scale);
         let desired_scale = (global_scale * f64::from(width_ratio.min(height_ratio)))
             .clamp(minimum_scale, maximum_scale);
-        let mut quantized_scale = quantize_terminal_preview_scale_down(desired_scale, minimum_scale);
+        let mut quantized_scale =
+            quantize_terminal_preview_scale_down(desired_scale, minimum_scale);
         // Mid-drag, keep the scale this grid was last drawn at. The search
         // in the render path would otherwise walk a new bucket every few
         // pixels of card width, and every bucket is a `FontConfiguration`.
@@ -2083,8 +2094,7 @@ impl crate::TermWindow {
             // macro meant the transform was never applied in the build users
             // run -- panes were drawn at their authored size and whatever did
             // not fit was clipped away.
-            let transformed =
-                layers.set_heap_position_transform(Some((source_rect, target_rect)));
+            let transformed = layers.set_heap_position_transform(Some((source_rect, target_rect)));
             debug_assert!(transformed);
             // In the same pane-relative space as `source_rect`.
             let source_visible_top =
@@ -2642,6 +2652,274 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Step the hover-reveal machine from the frame loop, so a motionless
+    /// pointer still reveals at dwell expiry and a departed one still
+    /// retreats at grace expiry.
+    fn advance_workspace_sidebar_hover(&mut self, now: Instant) {
+        let input = self.workspace_sidebar_hover_input();
+        match self.workspace_sidebar_hover.step(input, now) {
+            crate::termwindow::sidebar_hover::HoverFrame::None => {}
+            // Unnamed interval, as with the Space swipe below: the backend
+            // paces repaints to min(max_fps, this display's rate).
+            crate::termwindow::sidebar_hover::HoverFrame::Now => {
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            // One wakeup at the deadline, as the sidebar scrollbar does.
+            crate::termwindow::sidebar_hover::HoverFrame::At(due) => {
+                self.update_next_frame_time(Some(due));
+            }
+        }
+    }
+
+    /// Record the hover-revealed sidebar off-screen, holding back its hit
+    /// targets until after the tab bar has laid out its own.
+    ///
+    /// Returns the recording, how far the panel still has to travel
+    /// (0 = arrived) and the items to register once it is safe to.
+    fn record_workspace_sidebar_hover_overlay(
+        &mut self,
+        now: Instant,
+    ) -> anyhow::Result<Option<(HeapQuadAllocator, f32, Vec<UIItem>)>> {
+        if !self.workspace_sidebar_collapsed {
+            return Ok(None);
+        }
+        let Some(progress) = self.workspace_sidebar_hover.progress(now) else {
+            return Ok(None);
+        };
+        let ui_items_before = self.ui_items.len();
+        let mut sidebar_frame = HeapQuadAllocator::default();
+        let result = {
+            let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
+            self.paint_workspace_sidebar(&mut sidebar_layers)
+        };
+        // The marks describe `sidebar_frame`, which the swipe composite below
+        // may still split; nobody downstream of this fn may.
+        let live_list = self.workspace_sidebar_list_quads;
+        self.workspace_sidebar_list_quads = None;
+        result.context("record hover-revealed workspace sidebar")?;
+        let mut items: Vec<UIItem> = self.ui_items.drain(ui_items_before..).collect();
+        if !self.workspace_sidebar_hover.is_fully_presented(now) {
+            // While the panel is moving, no target inside it is where the
+            // user thinks it is. One inert item (its handler only sets the
+            // arrow cursor) keeps the revealed strip from handing clicks to
+            // the terminal underneath, and keeps the row-drag target lookup's
+            // x-extent truthful.
+            items.clear();
+            if let Some(rect) = self.workspace_sidebar_rect() {
+                let revealed = (rect.width as f32 * progress).round() as usize;
+                if revealed > 0 {
+                    items.push(UIItem {
+                        x: rect.x,
+                        y: 0,
+                        width: revealed,
+                        height: rect.y + rect.height,
+                        item_type: UIItemType::WorkspaceSidebarBackground,
+                    });
+                }
+            }
+        }
+        let quads = self
+            .composite_space_swipe_into_hover_overlay(sidebar_frame, live_list, now)
+            .context("composite space swipe into hover overlay")?;
+        Ok(Some((quads, 1.0 - progress, items)))
+    }
+
+    /// While a Space swipe runs on the hover-revealed panel, its page slide
+    /// has to happen inside the recording: the overlay replaces the live
+    /// sidebar paint entirely, so this mirrors the docked compositing branch
+    /// of `paint_pass`, writing into a heap instead of the GPU stream. When
+    /// no swipe is in flight the recording passes through untouched.
+    fn composite_space_swipe_into_hover_overlay(
+        &mut self,
+        sidebar_frame: HeapQuadAllocator,
+        live_list: Option<(HeapQuadMark, HeapQuadMark)>,
+        now: Instant,
+    ) -> anyhow::Result<HeapQuadAllocator> {
+        let render_space_push = self.workspace_space_swipe_push_active
+            && self.workspace_space_swipe_source_frame.is_some();
+        let render_space_track = !render_space_push
+            && !self.workspace_space_swipe_push_active
+            && self.workspace_space_swipe_target_frame.is_some();
+        let capture_space_source =
+            self.workspace_space_swipe_capture_source && !render_space_push && !render_space_track;
+
+        if capture_space_source {
+            // MayBegin captured the panel at rest: keep a copy as the
+            // outgoing page and present the original untouched.
+            self.workspace_space_swipe_source_frame = Some(crate::termwindow::CapturedSidebar {
+                quads: sidebar_frame.clone(),
+                list: live_list,
+            });
+            self.workspace_space_swipe_capture_source = false;
+            #[cfg(target_os = "macos")]
+            if self.workspace_space_swipe_pending_commit.is_some() {
+                if let Some(window) = self.window.clone() {
+                    window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                        term_window.complete_workspace_space_swipe_switch();
+                    })));
+                }
+            }
+            return Ok(sidebar_frame);
+        }
+        if !(render_space_push || render_space_track) {
+            return Ok(sidebar_frame);
+        }
+
+        if self.workspace_space_swipe_needs_settle_start {
+            let gesture_extent = self.workspace_sidebar_presented_width() as f32;
+            let opening = if self.workspace_space_swipe_tracked {
+                crate::termwindow::space_swipe::SettleOpening::WhereTheFingerLeftIt
+            } else {
+                crate::termwindow::space_swipe::SettleOpening::AtRest
+            };
+            self.workspace_sidebar_swipe.resolve_switch(
+                true,
+                Instant::now(),
+                gesture_extent,
+                opening,
+            );
+            self.workspace_space_swipe_needs_settle_start = false;
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+
+        let mut composite = HeapQuadAllocator::default();
+        let mut composited_tracking_frame = false;
+        {
+            let mut composite_layers = TripleLayerQuadAllocator::Heap(&mut composite);
+            if let Some(rect) = self.workspace_sidebar_rect() {
+                // Same rebase and page arithmetic as the docked branch; see
+                // the comments there.
+                let sidebar_clip = crate::quad::QuadClipRect::from_top_left_pixels(
+                    rect.x as f32,
+                    rect.y as f32,
+                    rect.x.saturating_add(rect.width) as f32,
+                    rect.y.saturating_add(rect.height) as f32,
+                    &self.dimensions,
+                );
+                let page_right = (sidebar_clip.right() - 1.0).max(sidebar_clip.left());
+                let page_width = page_right - sidebar_clip.left();
+                let page_clip = sidebar_clip.with_horizontal(sidebar_clip.left(), page_right);
+                let offsets = self
+                    .workspace_space_swipe_push_offsets(now, page_width)
+                    .filter(|_| page_width > 0.0);
+                let offscreen = if render_space_push {
+                    self.workspace_space_swipe_source_frame.as_ref()
+                } else {
+                    self.workspace_space_swipe_target_frame
+                        .as_ref()
+                        .map(|(_, captured)| captured)
+                };
+                let offscreen_span = offscreen.and_then(|captured| captured.list);
+
+                match (offsets, live_list, offscreen_span) {
+                    (Some((source_offset, target_offset)), Some(live), Some(other)) => {
+                        let (live_offset, offscreen_offset) = if render_space_push {
+                            (target_offset, source_offset)
+                        } else {
+                            (source_offset, target_offset)
+                        };
+                        sidebar_frame
+                            .apply_before(&mut composite_layers, &live.0)
+                            .context("hover swipe sidebar chrome above the list")?;
+                        if let Some(captured) = offscreen {
+                            captured
+                                .quads
+                                .apply_between(
+                                    &mut composite_layers,
+                                    &other.0,
+                                    &other.1,
+                                    offscreen_offset,
+                                    page_clip,
+                                )
+                                .context("hover swipe offscreen sidebar page")?;
+                        }
+                        sidebar_frame
+                            .apply_between(
+                                &mut composite_layers,
+                                &live.0,
+                                &live.1,
+                                live_offset,
+                                page_clip,
+                            )
+                            .context("hover swipe live sidebar page")?;
+                        sidebar_frame
+                            .apply_after(&mut composite_layers, &live.1)
+                            .context("hover swipe sidebar chrome below the list")?;
+                        composited_tracking_frame = render_space_track;
+                    }
+                    _ => {
+                        sidebar_frame
+                            .apply_to(&mut composite_layers)
+                            .context("hover swipe sidebar fallback")?;
+                    }
+                }
+            } else {
+                sidebar_frame
+                    .apply_to(&mut composite_layers)
+                    .context("hover swipe sidebar without viewport")?;
+            }
+        }
+        self.workspace_space_swipe_tracked |= composited_tracking_frame;
+
+        // The finger lifted on a committing gesture while the pages were
+        // already tracking it: keep this paint as the outgoing page (see the
+        // docked branch for the full story).
+        if render_space_track && self.workspace_space_swipe_capture_source {
+            self.workspace_space_swipe_source_frame = Some(crate::termwindow::CapturedSidebar {
+                quads: sidebar_frame,
+                list: live_list,
+            });
+            self.workspace_space_swipe_capture_source = false;
+            #[cfg(target_os = "macos")]
+            if self.workspace_space_swipe_pending_commit.is_some() {
+                if let Some(window) = self.window.clone() {
+                    window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                        term_window.complete_workspace_space_swipe_switch();
+                    })));
+                }
+            }
+        }
+        Ok(composite)
+    }
+
+    /// Slide the recorded panel in from the left edge, above everything
+    /// already drawn.
+    ///
+    /// Flattened into the last sub-layer rather than replayed layer for
+    /// layer: see `HeapQuadAllocator::apply_to_single_layer`. Anything
+    /// painted after this -- window borders, the modal, the context menu,
+    /// the drag overlays -- still lands on top, which is why this needs no
+    /// z-index of its own.
+    fn paint_workspace_sidebar_hover_overlay(
+        &self,
+        overlay: &HeapQuadAllocator,
+        hidden: f32,
+    ) -> anyhow::Result<()> {
+        let Some(rect) = self.workspace_sidebar_rect() else {
+            return Ok(());
+        };
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(0)
+            .context("hover sidebar layer")?;
+        let mut layers = layer.quad_allocator();
+        let offset_x = -(hidden * rect.width as f32);
+        // Containment only: the panel travels left and the window crops the
+        // overhang.
+        let clip = crate::quad::QuadClipRect::from_top_left_pixels(
+            0.0,
+            0.0,
+            self.dimensions.pixel_width as f32,
+            self.dimensions.pixel_height as f32,
+            &self.dimensions,
+        );
+        overlay.apply_to_single_layer(&mut layers, 2, offset_x, clip)
+    }
+
     fn advance_workspace_space_swipe_push(&mut self, now: Instant) {
         if self.workspace_sidebar_swipe.advance(now) {
             // Ask for another frame without naming an interval. The native
@@ -2682,7 +2960,7 @@ impl crate::TermWindow {
         now: Instant,
         page_width: f32,
     ) -> Option<(f32, f32)> {
-        let gesture_extent = self.workspace_sidebar_width() as f32;
+        let gesture_extent = self.workspace_sidebar_presented_width() as f32;
         let visual = self.workspace_sidebar_swipe.visual(now, gesture_extent)?;
         // Before the commit the direction is whichever way the finger has
         // travelled; after it, the committed direction is authoritative,
@@ -2712,7 +2990,7 @@ impl crate::TermWindow {
             // destination and the outgoing one is held in the source frame.
             return Ok(());
         }
-        let gesture_extent = self.workspace_sidebar_width() as f32;
+        let gesture_extent = self.workspace_sidebar_presented_width() as f32;
         let target = self
             .workspace_sidebar_swipe
             .visual(now, gesture_extent)
@@ -2773,6 +3051,7 @@ impl crate::TermWindow {
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
         let frame_now = Instant::now();
         self.advance_workspace_space_swipe_push(frame_now);
+        self.advance_workspace_sidebar_hover(frame_now);
         self.advance_content_view_fade(frame_now);
         // Card texture work is queued per pass; a retried pass re-queues it.
         self.pending_card_renders.borrow_mut().clear();
@@ -2935,7 +3214,8 @@ impl crate::TermWindow {
         // the bottom quote most visibly, at 38% alpha over itself -- drawn
         // twice. It also made the return look like a dissolve rather than a
         // move, because the picture being travelled towards was already there.
-        let paint_terminal_world = (!content_view_active && !fading_content_view) || recording_flight;
+        let paint_terminal_world =
+            (!content_view_active && !fading_content_view) || recording_flight;
 
         if !content_view_active {
             // Takeover remains opaque while this actively polls and hydrates
@@ -3029,6 +3309,12 @@ impl crate::TermWindow {
 
             self.capture_workspace_space_swipe_target(frame_now)?;
 
+            // A hover reveal replaces the normal sidebar paint entirely: the
+            // panel is recorded off-screen here and composited after the tab
+            // bar, so both its pixels and its hit targets land above the
+            // chrome that would otherwise cover its top edge.
+            let hover_overlay = self.record_workspace_sidebar_hover_overlay(frame_now)?;
+
             let render_space_push = self.workspace_space_swipe_push_active
                 && self.workspace_space_swipe_source_frame.is_some();
             // Before the commit the window still shows the Space being left, so
@@ -3046,7 +3332,11 @@ impl crate::TermWindow {
             let mut sidebar_frame = HeapQuadAllocator::default();
             let mut composited_tracking_frame = false;
 
-            if render_space_push || render_space_track {
+            if hover_overlay.is_some() {
+                // The overlay recording above already painted the sidebar;
+                // painting it again here would put a second copy underneath
+                // the terminal-glyph sub-layer.
+            } else if render_space_push || render_space_track {
                 let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
                 self.paint_workspace_sidebar(&mut sidebar_layers)
                     .context("paint live workspace sidebar")?;
@@ -3054,7 +3344,7 @@ impl crate::TermWindow {
                 let live_list = self.workspace_sidebar_list_quads;
 
                 if self.workspace_space_swipe_needs_settle_start {
-                    let gesture_extent = self.workspace_sidebar_width() as f32;
+                    let gesture_extent = self.workspace_sidebar_presented_width() as f32;
                     let opening = if self.workspace_space_swipe_tracked {
                         crate::termwindow::space_swipe::SettleOpening::WhereTheFingerLeftIt
                     } else {
@@ -3236,6 +3526,35 @@ impl crate::TermWindow {
                     .context("paint_tab_bar")?;
             }
             drop(chrome_layers);
+
+            if let Some((overlay, hidden, items)) = hover_overlay {
+                self.paint_workspace_sidebar_hover_overlay(&overlay, hidden)
+                    .context("paint hover-revealed workspace sidebar")?;
+                // After the tab bar, on purpose: collapsed, the tab strip
+                // starts at x=0 and `resolve_ui_item` is last-pushed-wins,
+                // so items registered before it would lose the top of the
+                // panel to the tabs underneath.
+                self.ui_items.extend(items);
+            } else if self.workspace_sidebar_hover.is_arming() {
+                // The dwell is counting down: show a thin strip at the edge
+                // so a correctly-parked pointer looks different from a
+                // wrongly-parked one. Sub-layer 2, after the tab bar, for the
+                // same reason the overlay itself is.
+                if let Some((zx, zy, _, zh)) = self.workspace_sidebar_hover_hot_zone() {
+                    let hint_width =
+                        self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HINT_WIDTH) as f32;
+                    let palette =
+                        UiPalette::for_appearance(crate::native_settings::effective_appearance());
+                    let mut hint_layers = layer.quad_allocator();
+                    self.filled_rectangle(
+                        &mut hint_layers,
+                        2,
+                        euclid::rect(zx as f32, zy as f32, hint_width, zh as f32),
+                        palette.sidebar_row_active_border.mul_alpha(0.7),
+                    )
+                    .context("paint sidebar hover arming hint")?;
+                }
+            }
         }
 
         if fading_content_view {

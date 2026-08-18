@@ -239,6 +239,8 @@ pub(crate) struct NativeChromeSettings {
     /// home_font_size.
     pub(crate) right_sidebar_font_size: Option<f64>,
     pub(crate) workspace_sidebar_width: Option<usize>,
+    /// Hover-reveal of the collapsed left sidebar; `None` means enabled.
+    pub(crate) workspace_sidebar_hover_reveal: Option<bool>,
     pub(crate) right_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_file_preview_width: Option<usize>,
     pub(crate) right_sidebar_note_pane_width: Option<usize>,
@@ -635,6 +637,16 @@ pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
     let mut settings = load();
     settings.chrome.workspace_sidebar_width = Some(width);
     save(&settings)
+}
+
+/// Hover-reveal of the collapsed left sidebar. On unless explicitly turned
+/// off, so `None` reads as enabled. `load_shared` rather than `load`: this is
+/// asked once per mouse event and once per frame, and `load` deep-clones.
+pub(crate) fn workspace_sidebar_hover_reveal_enabled() -> bool {
+    load_shared()
+        .chrome
+        .workspace_sidebar_hover_reveal
+        .unwrap_or(true)
 }
 
 pub(crate) fn right_sidebar_width() -> Option<usize> {

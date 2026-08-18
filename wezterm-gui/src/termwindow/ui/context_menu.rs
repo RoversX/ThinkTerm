@@ -303,6 +303,11 @@ impl crate::TermWindow {
             // button is still down forever. Release that bookkeeping here,
             // where we know the release can no longer be observed.
             self.release_pointer_ownership_for_native_menu();
+            // The only trace that a native menu is open: the hover-reveal
+            // machine must not retreat the panel this menu is anchored to.
+            // Cleared by whichever of PerformKeyAssignment /
+            // PerformContextMenuAction / ContextMenuDismissed ends the menu.
+            self.native_context_menu_open = true;
             context.show_context_menu(coords, items);
             return;
         }

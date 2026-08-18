@@ -789,6 +789,89 @@ impl super::TermWindow {
         }
     }
 
+    /// Feed the pointer to the hover-reveal machine. Called for every
+    /// pointer event, before any dispatch, and never consumes one.
+    fn update_workspace_sidebar_hover(&mut self, context: &dyn WindowOps) {
+        let input = self.workspace_sidebar_hover_input();
+        if self
+            .workspace_sidebar_hover
+            .step(input, std::time::Instant::now())
+            != crate::termwindow::sidebar_hover::HoverFrame::None
+        {
+            // Deadlines are registered by the paint pass, not here:
+            // `update_next_frame_time` writes into `has_animation`, which
+            // `paint_impl` clears on entry. Asking for a frame is enough --
+            // that frame's advance registers the wakeup.
+            context.invalidate();
+        }
+    }
+
+    pub(crate) fn workspace_sidebar_hover_input(
+        &self,
+    ) -> crate::termwindow::sidebar_hover::HoverInput {
+        use crate::termwindow::sidebar_hover::{HoverInput, PointerZone};
+        let eligible = crate::native_settings::workspace_sidebar_hover_reveal_enabled()
+            && self.workspace_sidebar_collapsed
+            && !self.content_view_foreground()
+            && !self.content_view_transition_running()
+            && !self.frontend_surface_blocked()
+            && self.modal.borrow().is_none()
+            && self.context_menu.is_none()
+            && !self.native_context_menu_open
+            && self.inline_tab_rename.is_none();
+        // Panel is checked before the hot zone on purpose: once revealed,
+        // the strip is inside the panel.
+        let pointer = match &self.current_mouse_event {
+            None => PointerZone::Away,
+            Some(event) => {
+                let x = event.coords.x;
+                let y = event.coords.y;
+                let in_panel = self.workspace_sidebar_rect().is_some_and(|rect| {
+                    x >= rect.x as isize
+                        && x < rect.x.saturating_add(rect.width) as isize
+                        && y >= rect.y as isize
+                        && y < rect.y.saturating_add(rect.height) as isize
+                });
+                let zone = self
+                    .workspace_sidebar_hover_hot_zone()
+                    .and_then(|(zx, zy, zw, zh)| {
+                        if y < zy as isize || y >= zy.saturating_add(zh) as isize || x < zx as isize
+                        {
+                            return None;
+                        }
+                        if x < zx.saturating_add(zw) as isize {
+                            return Some(PointerZone::HotZone);
+                        }
+                        // The sticky band shares the strip's vertical extent
+                        // and only widens it: close enough to keep a running
+                        // dwell alive, not close enough to start one.
+                        let sticky = self
+                            .ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_STICKY_ZONE_WIDTH);
+                        (x < zx.saturating_add(sticky) as isize).then_some(PointerZone::NearHotZone)
+                    });
+                if in_panel {
+                    PointerZone::Panel
+                } else {
+                    zone.unwrap_or(PointerZone::Away)
+                }
+            }
+        };
+        let pinned = !self.current_mouse_buttons.is_empty()
+            || self.current_mouse_capture.is_some()
+            || self.dragging.is_some()
+            || self.sidebar_row_drag.is_some()
+            || self.right_sidebar_file_drag.is_some()
+            || self.pane_tab_drag.is_some()
+            // A Space swipe on the revealed panel pins it open: retreating
+            // mid-gesture would slide the ground out from under the pages.
+            || self.workspace_sidebar_swipe.is_active();
+        HoverInput {
+            eligible,
+            pointer,
+            pinned,
+        }
+    }
+
     fn mouse_wheel_workspace_sidebar(
         &mut self,
         event: &MouseEvent,
@@ -891,8 +974,14 @@ impl super::TermWindow {
             return None;
         }
 
+        // Docked, or hover-revealed and fully arrived: a panel still sliding
+        // out must not host a second animation.
+        let panel_ready_for_swipe = !self.workspace_sidebar_collapsed
+            || self
+                .workspace_sidebar_hover
+                .is_fully_presented(Instant::now());
         let can_begin_without_space_lookup = inside_sidebar
-            && !self.workspace_sidebar_collapsed
+            && panel_ready_for_swipe
             && self.context_menu.is_none()
             && self.modal.borrow().is_none()
             && self.inline_tab_rename.is_none()
@@ -993,7 +1082,7 @@ impl super::TermWindow {
         now: Instant,
         context: &dyn WindowOps,
     ) -> bool {
-        let width = self.workspace_sidebar_width() as f32;
+        let width = self.workspace_sidebar_presented_width() as f32;
         let finish = self.workspace_sidebar_swipe.finish(now, width);
         match finish {
             SidebarSpaceSwipeFinish::Switch(target) => {
@@ -1052,7 +1141,7 @@ impl super::TermWindow {
         let Some((target, direction)) = self.workspace_space_swipe_pending_commit.take() else {
             return;
         };
-        let width = self.workspace_sidebar_width() as f32;
+        let width = self.workspace_sidebar_presented_width() as f32;
         let now = Instant::now();
         let source_is_current = self
             .workspace_sidebar_swipe
@@ -1594,6 +1683,7 @@ impl super::TermWindow {
         }
 
         self.current_mouse_event.replace(event.clone());
+        self.update_workspace_sidebar_hover(context);
 
         if self.consume_context_menu_suppressed_release(&event) {
             self.release_pointer_ownership(&event);
@@ -2031,6 +2121,8 @@ impl super::TermWindow {
                 && event.coords.y as usize <= self.dimensions.pixel_height
         });
         self.current_mouse_event = None;
+        // The machine reads `Away` now: cancels an Arming, starts a grace.
+        self.update_workspace_sidebar_hover(context);
         self.update_title();
         if !preserve_cursor {
             context.set_cursor(Some(MouseCursor::Arrow));

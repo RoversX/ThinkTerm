@@ -147,10 +147,7 @@ impl QuadPositionTransform {
         let source_height = source.bottom() - source.top();
         let target_width = target.width();
         let target_height = target.bottom() - target.top();
-        if !(source_width > 0.0
-            && source_height > 0.0
-            && target_width > 0.0
-            && target_height > 0.0)
+        if !(source_width > 0.0 && source_height > 0.0 && target_width > 0.0 && target_height > 0.0)
         {
             return None;
         }
@@ -158,10 +155,7 @@ impl QuadPositionTransform {
         let scale_y = target_height / source_height;
         let offset_x = target.left() - source.left() * scale_x;
         let offset_y = target.top() - source.top() * scale_y;
-        (scale_x.is_finite()
-            && scale_y.is_finite()
-            && offset_x.is_finite()
-            && offset_y.is_finite())
+        (scale_x.is_finite() && scale_y.is_finite() && offset_x.is_finite() && offset_y.is_finite())
             .then_some(Self {
                 scale_x,
                 scale_y,
@@ -170,13 +164,7 @@ impl QuadPositionTransform {
             })
     }
 
-    fn map_position(
-        self,
-        left: f32,
-        top: f32,
-        right: f32,
-        bottom: f32,
-    ) -> (f32, f32, f32, f32) {
+    fn map_position(self, left: f32, top: f32, right: f32, bottom: f32) -> (f32, f32, f32, f32) {
         (
             left * self.scale_x + self.offset_x,
             top * self.scale_y + self.offset_y,
@@ -190,9 +178,7 @@ impl<'a> QuadTrait for QuadImpl<'a> {
     fn set_texture_discrete(&mut self, x1: f32, x2: f32, y1: f32, y2: f32) {
         match self {
             Self::Vert(q) => q.set_texture_discrete(x1, x2, y1, y2),
-            Self::Boxed(q) | Self::TransformedBoxed(q, _) => {
-                q.set_texture_discrete(x1, x2, y1, y2)
-            }
+            Self::Boxed(q) | Self::TransformedBoxed(q, _) => q.set_texture_discrete(x1, x2, y1, y2),
             Self::Tee(gpu, heap) => {
                 gpu.set_texture_discrete(x1, x2, y1, y2);
                 heap.set_texture_discrete(x1, x2, y1, y2);
@@ -281,8 +267,7 @@ impl<'a> QuadTrait for QuadImpl<'a> {
             Self::Vert(q) => q.set_position(left, top, right, bottom),
             Self::Boxed(q) => q.set_position(left, top, right, bottom),
             Self::TransformedBoxed(q, transform) => {
-                let (left, top, right, bottom) =
-                    transform.map_position(left, top, right, bottom);
+                let (left, top, right, bottom) = transform.map_position(left, top, right, bottom);
                 q.set_position(left, top, right, bottom);
             }
             Self::Tee(gpu, heap) => {
@@ -634,7 +619,6 @@ impl BoxedQuad {
         }
         Some(clipped)
     }
-
 }
 
 fn lerp(start: f32, end: f32, amount: f32) -> f32 {
@@ -651,7 +635,7 @@ fn bilerp_color(corners: [[f32; 4]; 4], x: f32, y: f32) -> [f32; 4] {
     lerp_color(top, bottom, y)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct HeapQuadAllocator {
     // Quads are stored inline: a cached surface with hundreds of thousands of
     // quads would otherwise be that many separate 96-byte allocations, which
@@ -834,10 +818,7 @@ impl HeapQuadAllocator {
     }
 
     pub fn quad_count(&self) -> usize {
-        self.layers()
-            .iter()
-            .map(|(_, quads)| quads.len())
-            .sum()
+        self.layers().iter().map(|(_, quads)| quads.len()).sum()
     }
 
     /// Position, texture coordinates and per-corner colors are transformed
@@ -961,6 +942,39 @@ impl HeapQuadAllocator {
             }
         }
         metrics::histogram!("quad_buffer_translated_rect_clip_apply").record(started.elapsed());
+        Ok(())
+    }
+
+    /// Replay every recorded quad into ONE sub-layer of `other`, shifted
+    /// horizontally and cropped to `clip`.
+    ///
+    /// The sub-layer a quad was recorded in decides only *when* it is drawn:
+    /// each layer's three buffers are submitted 0, 1, 2 whatever order they
+    /// were filled in (see `render/draw.rs`). A surface that has to float
+    /// over the terminal therefore cannot keep its own sub-layers -- the
+    /// terminal's glyphs live in sub-buffer 2 and would draw straight through
+    /// a panel background recorded in sub-buffer 0. Collapsing the recording
+    /// into the last sub-buffer, in recorded order, keeps the surface's own
+    /// back-to-front order and puts all of it above anything drawn earlier:
+    /// the same arrangement the context menu gets by painting its panel into
+    /// sub-layer 2 by hand.
+    pub fn apply_to_single_layer(
+        &self,
+        other: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        offset_x: f32,
+        clip: QuadClipRect,
+    ) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        for (_recorded_layer, quads) in self.layers() {
+            for quad in quads {
+                let Some(clipped) = quad.translated_clipped(offset_x, 0.0, clip) else {
+                    continue;
+                };
+                other.extend_with(layer_num, &clipped.to_vertices());
+            }
+        }
+        metrics::histogram!("quad_buffer_single_layer_apply").record(started.elapsed());
         Ok(())
     }
 
@@ -1205,6 +1219,56 @@ fn heap_position_transform_maps_new_and_cached_quads_in_one_pass() {
 
     assert_eq!(heap.layer0[0].position, (50.0, 25.0, 90.0, 45.0));
     assert_eq!(heap.layer1[0].position, (50.0, 25.0, 90.0, 45.0));
+}
+
+#[cfg(test)]
+#[test]
+fn single_layer_replay_flattens_three_sub_layers_in_recorded_order() {
+    let mut heap = HeapQuadAllocator::default();
+    {
+        let mut layers = TripleLayerQuadAllocator::Heap(&mut heap);
+        for (layer_num, x) in [(0usize, 0.0f32), (1, 100.0), (2, 200.0)] {
+            let mut quad = layers.allocate(layer_num).unwrap();
+            quad.set_position(x, 0.0, x + 50.0, 50.0);
+        }
+    }
+
+    let mut target_heap = HeapQuadAllocator::default();
+    {
+        let mut target = TripleLayerQuadAllocator::Heap(&mut target_heap);
+        let clip = QuadClipRect::from_top_left_pixels(-500.0, -500.0, 500.0, 500.0, &TEST_ORIGIN);
+        heap.apply_to_single_layer(&mut target, 2, -10.0, clip)
+            .unwrap();
+    }
+
+    assert!(target_heap.layer0.is_empty());
+    assert!(target_heap.layer1.is_empty());
+    assert_eq!(target_heap.layer2.len(), 3);
+    // Recorded order 0 -> 1 -> 2 survives as draw order, shifted by -10.
+    assert_eq!(target_heap.layer2[0].position, (-10.0, 0.0, 40.0, 50.0));
+    assert_eq!(target_heap.layer2[1].position, (90.0, 0.0, 140.0, 50.0));
+    assert_eq!(target_heap.layer2[2].position, (190.0, 0.0, 240.0, 50.0));
+}
+
+#[cfg(test)]
+#[test]
+fn single_layer_replay_drops_quads_the_shift_pushes_out_of_the_clip() {
+    let mut heap = HeapQuadAllocator::default();
+    {
+        let mut layers = TripleLayerQuadAllocator::Heap(&mut heap);
+        let mut quad = layers.allocate(0).unwrap();
+        quad.set_position(0.0, 0.0, 50.0, 50.0);
+    }
+
+    let mut target_heap = HeapQuadAllocator::default();
+    {
+        let mut target = TripleLayerQuadAllocator::Heap(&mut target_heap);
+        let clip = QuadClipRect::from_top_left_pixels(0.0, 0.0, 500.0, 500.0, &TEST_ORIGIN);
+        // Shifted fully left of the clip: nothing lands.
+        heap.apply_to_single_layer(&mut target, 2, -100.0, clip)
+            .unwrap();
+    }
+    assert_eq!(target_heap.quad_count(), 0);
 }
 
 #[cfg(test)]

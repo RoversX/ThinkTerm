@@ -67,6 +67,50 @@ fn remote_divider_can_pump(
     !in_flight && has_pending && (strategy == super::RemoteDividerResizeStrategy::Live || finishing)
 }
 
+/// The tab geometry a local viewport publish was computed against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalTabShape {
+    size: TerminalSize,
+    /// Sorted, so two snapshots of the same pane set always compare equal.
+    panes: Vec<PaneId>,
+}
+
+impl LocalTabShape {
+    fn of(tab: &Arc<mux::tab::Tab>) -> Self {
+        let mut panes: Vec<PaneId> = tab
+            .iter_all_panes()
+            .into_iter()
+            .map(|pane| pane.pane_id())
+            .collect();
+        panes.sort_unstable();
+        Self {
+            size: tab.get_size(),
+            panes,
+        }
+    }
+}
+
+/// The last locally-published viewport the mux rejected, together with the
+/// tab shape it was computed against. A rejected viewport is deterministic:
+/// republishing it fails identically, and the failure revokes the lease and
+/// notifies every renderer — which brings us straight back here at the 120ms
+/// report cadence. Stay quiet until the geometry or the tab actually changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RejectedLocalViewport {
+    viewport: mux::FrontendViewport,
+    shape: LocalTabShape,
+}
+
+/// A publish is worth attempting unless the exact same geometry was already
+/// rejected against the exact same tab shape.
+fn local_viewport_publish_is_worthwhile(
+    rejected: Option<&RejectedLocalViewport>,
+    candidate: &mux::FrontendViewport,
+    shape: &LocalTabShape,
+) -> bool {
+    rejected.is_none_or(|prior| prior.viewport != *candidate || prior.shape != *shape)
+}
+
 // Full-screen TUIs handle SIGWINCH asynchronously after the server-side PTY
 // resize has returned.  Keep two 125ms overlay frames of quiet time so a
 // slightly delayed clear/redraw cannot become the first visible GUI frame.
@@ -993,6 +1037,8 @@ impl super::TermWindow {
             let Some(client_id) = mux.active_identity() else {
                 return;
             };
+            // An explicit user takeover re-arms the local publish path.
+            self.forget_rejected_local_viewport(tab_id);
             let viewport = self.local_frontend_viewport_for_tab(&tab, true);
             if let Err(err) = mux.claim_local_frontend_viewport(&client_id, tab_id, viewport) {
                 log::warn!("claiming local GUI frontend viewport: {err:#}");
@@ -1098,6 +1144,8 @@ impl super::TermWindow {
             codec::FrontendAccessMode::TmuxLatest => mux::FrontendAccessMode::TmuxLatest,
             codec::FrontendAccessMode::Handoff => mux::FrontendAccessMode::Handoff,
         };
+        // A mode change is an explicit user action: re-arm the local publish.
+        self.forget_rejected_local_viewport(tab_id);
         let viewport = self.local_frontend_viewport_for_tab(&tab, true);
         if let Err(err) =
             mux.validate_frontend_access_mode_change(&client_id, target, tab_id, &viewport)
@@ -1205,6 +1253,9 @@ impl super::TermWindow {
 
     fn report_frontend_viewport_now(&mut self) {
         let mux = Mux::get();
+        // Rejections for tabs that no longer exist have nothing left to damp.
+        self.rejected_local_viewports
+            .retain(|tab_id, _| mux.get_tab(*tab_id).is_some());
         let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
             return;
         };
@@ -1491,7 +1542,14 @@ impl super::TermWindow {
         .detach();
     }
 
-    fn report_frontend_viewport_for_tab(&self, tab: &Arc<mux::tab::Tab>) {
+    /// Allow the next local publish for `tab_id` even if an identical one was
+    /// rejected: an explicit user action (a claim, a mode change) means a
+    /// retry is meaningful again.
+    pub(crate) fn forget_rejected_local_viewport(&mut self, tab_id: mux::tab::TabId) {
+        self.rejected_local_viewports.remove(&tab_id);
+    }
+
+    fn report_frontend_viewport_for_tab(&mut self, tab: &Arc<mux::tab::Tab>) {
         let mux = Mux::get();
         let Some(active_pane) = tab.get_active_pane() else {
             return;
@@ -1553,12 +1611,25 @@ impl super::TermWindow {
         let Some(client_id) = mux.active_identity() else {
             return;
         };
-        if let Err(err) = mux.set_client_viewport(
-            &client_id,
-            tab_id,
-            self.local_frontend_viewport_for_tab(tab, owns),
+        let viewport = self.local_frontend_viewport_for_tab(tab, owns);
+        let shape = LocalTabShape::of(tab);
+        if !local_viewport_publish_is_worthwhile(
+            self.rejected_local_viewports.get(&tab_id),
+            &viewport,
+            &shape,
         ) {
-            log::warn!("cannot publish local GUI viewport: {err:#}");
+            mux::zoom_trace!("gui.viewport.skip tab={tab_id} reason=rejected");
+            return;
+        }
+        match mux.set_client_viewport(&client_id, tab_id, viewport.clone()) {
+            Ok(_) => {
+                self.rejected_local_viewports.remove(&tab_id);
+            }
+            Err(err) => {
+                log::warn!("cannot publish local GUI viewport: {err:#}");
+                self.rejected_local_viewports
+                    .insert(tab_id, RejectedLocalViewport { viewport, shape });
+            }
         }
     }
 
@@ -2654,13 +2725,84 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 #[cfg(test)]
 mod frontend_geometry_tests {
     use super::{
-        frontend_geometry_action, geometry_confirmation_settled, remote_divider_can_pump,
+        frontend_geometry_action, geometry_confirmation_settled,
+        local_viewport_publish_is_worthwhile, remote_divider_can_pump,
         remote_divider_target_is_owed, visible_geometry_targets, FrontendGeometryAction,
-        FRONTEND_GEOMETRY_SETTLE,
+        LocalTabShape, RejectedLocalViewport, FRONTEND_GEOMETRY_SETTLE,
     };
     use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy};
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+    use wezterm_term::TerminalSize;
+
+    fn test_size(cols: usize, rows: usize) -> TerminalSize {
+        TerminalSize {
+            cols,
+            rows,
+            pixel_width: cols * 8,
+            pixel_height: rows * 16,
+            dpi: 96,
+        }
+    }
+
+    fn test_shape(cols: usize, rows: usize, panes: &[usize]) -> LocalTabShape {
+        LocalTabShape {
+            size: test_size(cols, rows),
+            panes: panes.to_vec(),
+        }
+    }
+
+    fn test_viewport(cols: usize, rows: usize) -> mux::FrontendViewport {
+        mux::FrontendViewport::CellGrid {
+            size: test_size(cols, rows),
+        }
+    }
+
+    #[test]
+    fn an_identical_rejected_local_viewport_is_not_republished() {
+        let viewport = test_viewport(120, 40);
+        let shape = test_shape(120, 40, &[1, 2]);
+        assert!(local_viewport_publish_is_worthwhile(
+            None, &viewport, &shape
+        ));
+
+        let rejected = RejectedLocalViewport {
+            viewport: viewport.clone(),
+            shape: shape.clone(),
+        };
+        assert!(!local_viewport_publish_is_worthwhile(
+            Some(&rejected),
+            &viewport,
+            &shape
+        ));
+    }
+
+    #[test]
+    fn a_changed_viewport_or_tab_shape_re_arms_the_local_publish() {
+        let rejected = RejectedLocalViewport {
+            viewport: test_viewport(120, 40),
+            shape: test_shape(120, 40, &[1, 2]),
+        };
+
+        // A different viewport is worth publishing...
+        assert!(local_viewport_publish_is_worthwhile(
+            Some(&rejected),
+            &test_viewport(100, 30),
+            &test_shape(120, 40, &[1, 2]),
+        ));
+        // ...as is the same viewport against a resized tab...
+        assert!(local_viewport_publish_is_worthwhile(
+            Some(&rejected),
+            &test_viewport(120, 40),
+            &test_shape(90, 40, &[1, 2]),
+        ));
+        // ...or against a changed pane set.
+        assert!(local_viewport_publish_is_worthwhile(
+            Some(&rejected),
+            &test_viewport(120, 40),
+            &test_shape(120, 40, &[1, 2, 3]),
+        ));
+    }
 
     #[test]
     fn only_takeover_geometry_obscures_the_terminal() {

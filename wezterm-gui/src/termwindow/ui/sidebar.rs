@@ -150,14 +150,46 @@ impl crate::TermWindow {
         workspace_threads::acknowledge_thread_work_for_workspace_deferred(window.get_workspace())
     }
 
+    /// The docked width, clamped. Not "the width right now": ask
+    /// `workspace_sidebar_width` for what the terminal is laid out against
+    /// and `workspace_sidebar_presented_width` for what is on screen.
+    fn workspace_sidebar_docked_width(&self) -> usize {
+        let min_width = scale_ui_usize(SIDEBAR_MIN_WIDTH, self.dimensions.dpi);
+        self.workspace_sidebar_width
+            .clamp(min_width, self.workspace_sidebar_max_width())
+    }
+
+    /// The width the TERMINAL is laid out against. Zero whenever the sidebar
+    /// is collapsed, hover reveal or not: a hover must never reflow a PTY.
+    /// Every consumer that decides where the terminal, the tab bar or a pane
+    /// lives asks this one.
     pub fn workspace_sidebar_width(&self) -> usize {
         if self.workspace_sidebar_collapsed {
             0
         } else {
-            let min_width = scale_ui_usize(SIDEBAR_MIN_WIDTH, self.dimensions.dpi);
-            self.workspace_sidebar_width
-                .clamp(min_width, self.workspace_sidebar_max_width())
+            self.workspace_sidebar_docked_width()
         }
+    }
+
+    /// The width the panel is DRAWN and HIT-TESTED at. Equal to
+    /// `workspace_sidebar_width` while docked; the full docked width while a
+    /// hover reveal is on screen, at which point the terminal behind it has
+    /// not moved. Presentation and pointer routing only.
+    pub(crate) fn workspace_sidebar_presented_width(&self) -> usize {
+        if self.workspace_sidebar_collapsed {
+            if self.workspace_sidebar_hover.is_presented() {
+                self.workspace_sidebar_docked_width()
+            } else {
+                0
+            }
+        } else {
+            self.workspace_sidebar_docked_width()
+        }
+    }
+
+    /// Whether the panel is on screen at all, by either route.
+    pub(crate) fn workspace_sidebar_is_presented(&self) -> bool {
+        !self.workspace_sidebar_collapsed || self.workspace_sidebar_hover.is_presented()
     }
 
     pub fn workspace_sidebar_max_width(&self) -> usize {
@@ -185,17 +217,22 @@ impl crate::TermWindow {
         self.workspace_sidebar_swipe.cancel_immediately();
         self.clear_workspace_space_swipe_frame_transition();
         self.workspace_sidebar_collapsed = !self.workspace_sidebar_collapsed;
+        // Whichever way this went, the hover machine must not act on the
+        // pointer still sitting where it was: collapsing must not instantly
+        // re-reveal, and expanding makes the reveal moot.
+        self.workspace_sidebar_hover.suppress_until_pointer_leaves();
     }
 
     pub fn expand_workspace_sidebar(&mut self) {
         self.workspace_sidebar_collapsed = false;
+        self.workspace_sidebar_hover.suppress_until_pointer_leaves();
     }
 
     pub(crate) fn workspace_sidebar_toggle_icon(&self) -> SvgIcon {
-        if self.workspace_sidebar_collapsed {
-            SvgIcon::PanelLeftOpen
-        } else {
+        if self.workspace_sidebar_is_presented() {
             SvgIcon::PanelLeftClose
+        } else {
+            SvgIcon::PanelLeftOpen
         }
     }
 
@@ -204,7 +241,13 @@ impl crate::TermWindow {
         border.left.get() as usize + self.workspace_sidebar_width()
     }
 
+    /// The panel as presented — a hover reveal is included. Anything
+    /// deriving terminal geometry wants `workspace_sidebar_width` instead.
     pub fn workspace_sidebar_rect(&self) -> Option<WorkspaceSidebarRect> {
+        self.workspace_sidebar_rect_for_width(self.workspace_sidebar_presented_width())
+    }
+
+    fn workspace_sidebar_rect_for_width(&self, width: usize) -> Option<WorkspaceSidebarRect> {
         let border = self.get_os_border();
         let bottom_tab_bar_height = if self.config.tab_bar_at_bottom && self.show_tab_bar {
             self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize
@@ -214,7 +257,7 @@ impl crate::TermWindow {
 
         let x = border.left.get() as usize;
         let y = border.top.get() as usize;
-        let width = self.workspace_sidebar_width().min(
+        let width = width.min(
             self.dimensions
                 .pixel_width
                 .saturating_sub((border.left + border.right).get() as usize),
@@ -234,6 +277,25 @@ impl crate::TermWindow {
             width,
             height,
         })
+    }
+
+    /// The left-edge strip that arms a hover reveal, as (x, y, w, h) in
+    /// window pixels. Computed against the docked rect so it exists while
+    /// the panel does not.
+    pub(crate) fn workspace_sidebar_hover_hot_zone(&self) -> Option<(usize, usize, usize, usize)> {
+        let rect = self.workspace_sidebar_rect_for_width(self.workspace_sidebar_docked_width())?;
+        let top_tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize
+        } else {
+            0
+        };
+        crate::termwindow::sidebar_hover::hot_zone(
+            rect.x,
+            rect.y,
+            rect.height,
+            self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HOT_ZONE_WIDTH),
+            top_tab_bar_height,
+        )
     }
 
     fn workspace_sidebar_list_height(
@@ -679,7 +741,7 @@ impl crate::TermWindow {
         let Some(rect) = self.workspace_sidebar_rect() else {
             return 0.0;
         };
-        if self.workspace_sidebar_collapsed {
+        if !self.workspace_sidebar_is_presented() {
             return 0.0;
         }
 
@@ -723,7 +785,7 @@ impl crate::TermWindow {
     /// the header strip and footer, so it must not be used for that.
     pub(crate) fn workspace_sidebar_list_viewport(&self) -> Option<(isize, isize)> {
         let rect = self.workspace_sidebar_rect()?;
-        if self.workspace_sidebar_collapsed {
+        if !self.workspace_sidebar_is_presented() {
             return None;
         }
         let ui_cell_height = self.workspace_sidebar_cell_height();
@@ -737,7 +799,7 @@ impl crate::TermWindow {
 
     pub fn workspace_sidebar_scroll_geometry(&self) -> Option<WorkspaceSidebarScrollGeometry> {
         let rect = self.workspace_sidebar_rect()?;
-        if self.workspace_sidebar_collapsed {
+        if !self.workspace_sidebar_is_presented() {
             return None;
         }
 
@@ -968,7 +1030,7 @@ impl crate::TermWindow {
             item_type: UIItemType::WorkspaceSidebarResize,
         });
 
-        if self.workspace_sidebar_collapsed {
+        if !self.workspace_sidebar_is_presented() {
             return Ok(());
         }
 

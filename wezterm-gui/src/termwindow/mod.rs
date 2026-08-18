@@ -164,6 +164,7 @@ pub(crate) mod remote_walk;
 pub mod render;
 pub mod resize;
 mod selection;
+mod sidebar_hover;
 mod space_swipe;
 pub mod spawn;
 pub mod ssh_hosts_view;
@@ -1450,6 +1451,11 @@ pub struct TermWindow {
     /// epoch reaches the normal local render-surface confirmation point.
     frontend_recovery_geometry: HashMap<TabId, FrontendRecoveryGeometry>,
     frontend_geometry_resync_after_epoch: HashSet<TabId>,
+    /// The last locally-published viewport the mux rejected, per tab. Blocks
+    /// republishing an identical viewport against an identical tab shape,
+    /// which would otherwise loop: reject → lease revoked → notification →
+    /// republish → reject. See `resize::RejectedLocalViewport`.
+    rejected_local_viewports: HashMap<TabId, resize::RejectedLocalViewport>,
     /// Latest-only full-viewport streams for native divider drags. A stream
     /// owns the matching ClientPane preview epoch until its final target is
     /// confirmed or explicitly rolled back.
@@ -1502,7 +1508,8 @@ pub struct TermWindow {
     /// dropped for cards that stop asking for a preview, and invalidated
     /// wholesale when the glyph atlas is repacked -- the quads hold atlas
     /// coordinates.
-    preview_quad_cache: RefCell<HashMap<TabId, crate::termwindow::render::paint::CachedPreviewQuads>>,
+    preview_quad_cache:
+        RefCell<HashMap<TabId, crate::termwindow::render::paint::CachedPreviewQuads>>,
     /// The one card rebuild currently sliced across frames, if any.
     preview_rebuild_partial:
         RefCell<Option<crate::termwindow::render::paint::PreviewRebuildPartial>>,
@@ -1656,6 +1663,15 @@ pub struct TermWindow {
     /// no other; a paint that bailed out before the list leaves it `None`.
     workspace_sidebar_list_quads: Option<(HeapQuadMark, HeapQuadMark)>,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
+    /// Presentation-only hover reveal of the collapsed sidebar. This never
+    /// touches `workspace_sidebar_collapsed` or `workspace_sidebar_width`:
+    /// the terminal must not reflow for a hover.
+    workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal,
+    /// A native (AppKit) context menu is open. The fallback menu tracks
+    /// itself in `context_menu`; the native path otherwise leaves no trace,
+    /// and the hover machine must not retreat the panel a menu is anchored
+    /// to.
+    native_context_menu_open: bool,
     /// Last notification state painted by this GUI window. Comparing identities
     /// and statuses (rather than just the count) lets the bell pulse when one
     /// notification replaces another without changing the total.
@@ -2163,6 +2179,7 @@ impl TermWindow {
 
         if self.focused.is_none() {
             self.workspace_sidebar_swipe.cancel_immediately();
+            self.workspace_sidebar_hover.cancel_immediately();
             self.clear_workspace_space_swipe_frame_transition();
             self.right_sidebar_note.native_text_input_snapshot_key = None;
             window.set_native_text_input_snapshot(None);
@@ -2404,6 +2421,7 @@ impl TermWindow {
             frontend_geometry_confirmations: HashMap::new(),
             frontend_recovery_geometry: HashMap::new(),
             frontend_geometry_resync_after_epoch: HashSet::new(),
+            rejected_local_viewports: HashMap::new(),
             remote_divider_resize_streams: HashMap::new(),
             next_frontend_geometry_epoch: 1,
             frontend_viewport_report_pending: Arc::new(AtomicBool::new(false)),
@@ -2576,6 +2594,8 @@ impl TermWindow {
             workspace_space_swipe_pending_commit: None,
             workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
+            workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
+            native_context_menu_open: false,
             workspace_notification_snapshot: None,
             workspace_notification_pulse_started_at: None,
             right_sidebar_width: ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize),
@@ -2891,6 +2911,9 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::PerformKeyAssignment(action) => {
+                // A native context menu delivers its selection this way;
+                // whichever way the menu ended, it is over now.
+                self.native_context_menu_open = false;
                 if let Some(pane) = self.get_active_pane_or_overlay() {
                     self.perform_key_assignment(&pane, &action)?;
                     window.invalidate();
@@ -2898,11 +2921,13 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::PerformContextMenuAction(action_id) => {
+                self.native_context_menu_open = false;
                 self.perform_context_menu_application_action(action_id);
                 window.invalidate();
                 Ok(true)
             }
             WindowEvent::ContextMenuDismissed => {
+                self.native_context_menu_open = false;
                 self.context_menu_was_dismissed();
                 window.invalidate();
                 Ok(true)
@@ -2941,6 +2966,10 @@ impl TermWindow {
                     self.workspace_sidebar_swipe.cancel_immediately();
                     self.clear_workspace_space_swipe_frame_transition();
                 }
+                // Land a travelling hover reveal rather than deleting it: a
+                // settled overlay survives a resize cleanly, a mid-flight one
+                // would jump.
+                self.workspace_sidebar_hover.settle_immediately();
                 self.resize(dimensions, window_state, window, live_resizing);
                 Ok(true)
             }
@@ -4831,7 +4860,9 @@ impl TermWindow {
 
     fn begin_content_view_fade_to(&mut self, closing: bool, destination: Option<RectF>) {
         let now = Instant::now();
-        let ghost = closing.then(|| self.content_view_last_frame.take()).flatten();
+        let ghost = closing
+            .then(|| self.content_view_last_frame.take())
+            .flatten();
         if closing && ghost.is_none() {
             // Nothing was ever composited for this view -- it opened and
             // closed inside a single frame. There is no picture to take away.
@@ -4880,7 +4911,11 @@ impl TermWindow {
                 now,
                 chrome_from,
                 to,
-                if closing { CHROME_RETURN_DELAY } else { Duration::ZERO },
+                if closing {
+                    CHROME_RETURN_DELAY
+                } else {
+                    Duration::ZERO
+                },
                 CONTENT_VIEW_CHROME_TRAVEL.mul_f32(span(chrome_from)),
                 crate::ui::anim::Easing::OutCubic,
             ),
@@ -5070,9 +5105,7 @@ impl TermWindow {
             // by whatever share the padding held, non-uniformly, because the
             // card it landed in had never accounted for it.
             let content = self.terminal_content_rect();
-            let host_preview_aspect = if content.size.height > 0.0
-                && content.size.width > 0.0
-            {
+            let host_preview_aspect = if content.size.height > 0.0 && content.size.width > 0.0 {
                 content.size.width / content.size.height
             } else if self.terminal_size.pixel_height > 0 {
                 self.terminal_size.pixel_width as f32 / self.terminal_size.pixel_height as f32
@@ -7417,9 +7450,7 @@ impl TermWindow {
                 // call -- it returns None when it cannot.
                 !pos.is_active
                     && pos.width <= threshold
-                    && !self
-                        .collapsed_pane_layouts
-                        .contains_key(&pos.pane_stack_id)
+                    && !self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id)
             })
             .map(|pos| pos.index)
             .collect();
