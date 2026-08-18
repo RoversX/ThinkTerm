@@ -179,6 +179,16 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
             .unwrap_or(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS),
     )?;
 
+    // Every ordinary RPC is deferred behind the client registration barrier
+    // (see PduRegistrationBarrier) until the bootstrap handshake completes,
+    // and nothing else on this path runs it -- without this, every
+    // subcommand parks forever on a healthy server. The proxy is exempt: it
+    // discards this client and registers its own raw connection with
+    // `is_proxy: true`.
+    if !matches!(cli.sub, CliSubCommand::Proxy(_)) {
+        client.verify_version_compat(&ui).await?;
+    }
+
     match cli.sub {
         CliSubCommand::ListClients(cmd) => cmd.run(client).await,
         CliSubCommand::List(cmd) => cmd.run(client).await,
