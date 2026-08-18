@@ -267,6 +267,15 @@ struct FrontendLeaseState {
     /// Distinguishes initial server startup (first renderer auto-owns) from an
     /// owner disconnect (everyone stays blocked until an explicit takeover).
     handoff_ever_owned: bool,
+    /// Clients that have ever advertised or claimed a viewport during their
+    /// current registration. Handoff's gate exists to stop two *screens* from
+    /// fighting over one terminal; a client that never renders -- `thinkterm
+    /// cli send-text` and friends -- is not a screen, so it is exempt from
+    /// that gate rather than being told the terminal "is being operated on
+    /// another device" by a session it can never see. Sticky, unlike the
+    /// per-tab `viewports` maps (which are pruned as tabs close): once a
+    /// connection has rendered anything it is a frontend for its whole life.
+    ever_rendered: HashSet<ClientId>,
     access_initialized: bool,
     access_generation: u64,
     next_generation: u64,
@@ -279,6 +288,7 @@ impl Default for FrontendLeaseState {
             access_mode: FrontendAccessMode::Handoff,
             handoff_owner: None,
             handoff_ever_owned: false,
+            ever_rendered: HashSet::new(),
             access_initialized: false,
             access_generation: 0,
             next_generation: 1,
@@ -957,7 +967,15 @@ impl Mux {
         let lease = self.frontend_lease.lock();
         match lease.access_mode {
             FrontendAccessMode::TmuxLatest => true,
-            FrontendAccessMode::Handoff => lease.handoff_owner.as_ref() == Some(client_id),
+            // Non-rendering clients (never advertised a viewport) pass: the
+            // gate arbitrates between screens, and they are not one. This is
+            // also what lets a headless `thinkterm cli` work at all in
+            // Handoff -- with no owner and `handoff_ever_owned` set, nothing
+            // else would ever answer true for it.
+            FrontendAccessMode::Handoff => {
+                lease.handoff_owner.as_ref() == Some(client_id)
+                    || !lease.ever_rendered.contains(client_id)
+            }
         }
     }
 
@@ -1041,6 +1059,7 @@ impl Mux {
         self.validate_frontend_viewport(tab_id, &viewport)?;
         let (should_apply, should_publish, access_changed) = {
             let mut lease = self.frontend_lease.lock();
+            lease.ever_rendered.insert(client_id.clone());
             let mut access_changed = false;
             if lease.access_mode == FrontendAccessMode::Handoff
                 && lease.handoff_owner.is_none()
@@ -1179,7 +1198,7 @@ impl Mux {
         }
         drop(registrations);
         self.client_had_input(client_id);
-        let (mode, handoff_owner, viewport) = {
+        let (mode, handoff_owner, viewport, ever_rendered) = {
             let lease = self.frontend_lease.lock();
             (
                 lease.access_mode,
@@ -1188,10 +1207,16 @@ impl Mux {
                     .tabs
                     .get(&tab_id)
                     .and_then(|state| state.viewports.get(client_id).cloned()),
+                lease.ever_rendered.contains(client_id),
             )
         };
         match mode {
-            FrontendAccessMode::Handoff => handoff_owner.as_ref() == Some(client_id),
+            // Same exemption as `client_has_frontend_access`: input from a
+            // client that never renders (CLI automation) is not a second
+            // screen fighting the owner.
+            FrontendAccessMode::Handoff => {
+                handoff_owner.as_ref() == Some(client_id) || !ever_rendered
+            }
             FrontendAccessMode::TmuxLatest => {
                 if let Some(viewport) = viewport {
                     if let Err(err) = self.claim_frontend_viewport(client_id, tab_id, viewport) {
@@ -1255,6 +1280,7 @@ impl Mux {
         }
         let (access_changed, mut affected_tabs) = {
             let mut lease = self.frontend_lease.lock();
+            lease.ever_rendered.insert(client_id.clone());
             let mode = lease.access_mode;
             let mut access_changed = false;
             let mut affected_tabs = vec![tab_id];
@@ -1904,6 +1930,7 @@ impl Mux {
         }
         let (affected, access_changed) = {
             let mut lease = self.frontend_lease.lock();
+            lease.ever_rendered.remove(client_id);
             let mut affected = Vec::new();
             for (tab_id, state) in &mut lease.tabs {
                 state.viewports.remove(client_id);
@@ -3797,6 +3824,91 @@ mod tests {
             mux.frontend_access_state().owner.as_ref(),
             Some(second.as_ref())
         );
+    }
+
+    /// B arbitrates between screens. A connection that never advertises a
+    /// viewport -- `thinkterm cli send-text` and friends -- is not a screen,
+    /// so its input and chrome mutations pass the gate; and passing must not
+    /// itself claim anything from the real owner.
+    #[test]
+    fn handoff_exempts_clients_that_never_render() {
+        let mux = Mux::new(None);
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab);
+        let tab_id = tab.tab_id();
+        let screen = Arc::new(client_id(70));
+        let cli = Arc::new(client_id(71));
+        let screen_registration = mux.register_client(Arc::clone(&screen));
+        let cli_registration = mux.register_client(Arc::clone(&cli));
+        let grid = FrontendViewport::CellGrid {
+            size: TerminalSize::default(),
+        };
+
+        mux.set_registered_client_viewport(&screen, screen_registration, tab_id, grid.clone())
+            .unwrap();
+        assert_eq!(
+            mux.registered_client_has_frontend_access(&screen, screen_registration),
+            Some(true)
+        );
+
+        assert_eq!(
+            mux.registered_client_has_frontend_access(&cli, cli_registration),
+            Some(true)
+        );
+        assert!(mux.registered_client_had_tab_input(&cli, cli_registration, tab_id));
+        assert_eq!(
+            mux.frontend_access_state().owner.as_ref(),
+            Some(screen.as_ref()),
+            "the exemption must not steal the screen's lease"
+        );
+
+        // The moment the same connection renders, it is a second screen and
+        // the gate applies to it like any other.
+        mux.set_registered_client_viewport(&cli, cli_registration, tab_id, grid)
+            .unwrap();
+        assert_eq!(
+            mux.registered_client_has_frontend_access(&cli, cli_registration),
+            Some(false)
+        );
+        assert!(!mux.registered_client_had_tab_input(&cli, cli_registration, tab_id));
+    }
+
+    /// The headless shape of the same rule: after the owner disconnects
+    /// (`handoff_ever_owned` set, no owner elected), surviving screens stay
+    /// blocked until an explicit takeover -- but a non-rendering CLI still
+    /// passes, because there is no screen it could be fighting.
+    #[test]
+    fn handoff_exempts_non_renderers_after_owner_disconnect() {
+        let mux = Mux::new(None);
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab);
+        let tab_id = tab.tab_id();
+        let screen = Arc::new(client_id(72));
+        let survivor = Arc::new(client_id(73));
+        let cli = Arc::new(client_id(74));
+        let screen_registration = mux.register_client(Arc::clone(&screen));
+        let survivor_registration = mux.register_client(Arc::clone(&survivor));
+        let cli_registration = mux.register_client(Arc::clone(&cli));
+        let grid = FrontendViewport::CellGrid {
+            size: TerminalSize::default(),
+        };
+
+        mux.set_registered_client_viewport(&screen, screen_registration, tab_id, grid.clone())
+            .unwrap();
+        mux.set_registered_client_viewport(&survivor, survivor_registration, tab_id, grid)
+            .unwrap();
+        mux.unregister_client(&screen, screen_registration);
+
+        assert_eq!(
+            mux.registered_client_has_frontend_access(&survivor, survivor_registration),
+            Some(false),
+            "a surviving screen still needs an explicit takeover"
+        );
+        assert_eq!(
+            mux.registered_client_has_frontend_access(&cli, cli_registration),
+            Some(true)
+        );
+        assert!(mux.registered_client_had_tab_input(&cli, cli_registration, tab_id));
     }
 
     #[test]
