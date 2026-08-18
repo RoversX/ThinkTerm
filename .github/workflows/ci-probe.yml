@@ -1,0 +1,122 @@
+# Temporary probe workflow.
+#
+# Confirms the tree still compiles on Linux and Windows before we invest in the
+# full release pipeline. Linux has never compiled successfully in CI here, and
+# the last green Windows build was 2026-06-06 (132 commits ago).
+#
+# Delete this file once the answer is known.
+
+name: ci-probe
+
+on:
+  push:
+    branches: ['ci/probe']
+  # The workflow_dispatch button only appears once this file reaches the default
+  # branch, so during the probe phase the push trigger above is what fires.
+  workflow_dispatch:
+
+# Cancel a superseded run when several commits are pushed back to back
+concurrency:
+  group: ci-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  linux:
+    name: linux x86_64
+    runs-on: ubuntu-latest
+    # Backstop: a hung job would otherwise burn the default 6h, which on a
+    # private repo is 360 billed minutes.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # third_party/lucide and third_party/simple-icons are include_bytes!'d by
+      # wezterm-gui/src/termwindow/ui/icons.rs, so an empty checkout of either
+      # fails the build 20 minutes in rather than here.
+      - name: Sanity check submodules
+        run: |
+          for d in deps/freetype/zlib \
+                   deps/freetype/libpng \
+                   deps/freetype/freetype2 \
+                   deps/harfbuzz/harfbuzz \
+                   third_party/lucide \
+                   third_party/simple-icons ; do
+            test -n "$(ls -A $d 2>/dev/null)" || { echo "::error::submodule $d is empty"; exit 1; }
+            echo "ok  $d"
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The probe is expected to go red and be retried; without this every
+          # retry recompiles all dependencies from scratch.
+          cache-on-failure: true
+
+      - name: Install system deps
+        run: env CI=yes PATH=$PATH ./get-deps
+
+      - name: Build
+        run: |
+          cargo build \
+            -p wezterm \
+            -p wezterm-gui \
+            -p wezterm-mux-server \
+            -p strip-ansi-escapes
+
+  windows:
+    name: windows x86_64
+    runs-on: windows-2022
+    # More headroom than Linux: the only datapoint we have (2026-06-06, release
+    # build with sccache) was 37m42s on this runner, and Windows bills at 2x, so
+    # a timeout here is the most expensive way to learn nothing.
+    timeout-minutes: 90
+
+    env:
+      RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Sanity check submodules
+        shell: bash
+        run: |
+          for d in deps/freetype/zlib \
+                   deps/freetype/libpng \
+                   deps/freetype/freetype2 \
+                   deps/harfbuzz/harfbuzz \
+                   third_party/lucide \
+                   third_party/simple-icons ; do
+            test -n "$(ls -A $d 2>/dev/null)" || { echo "::error::submodule $d is empty"; exit 1; }
+            echo "ok  $d"
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # openssl-src needs perl; Strawberry Perl ships on the runner but is not
+      # on PATH by default.
+      - name: Build
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes

@@ -78,5 +78,8 @@ ThinkTerm-macos-v0.1.0.zip
 !/docs/thinkterm/
 !/docs/thinkterm/*.md
 
+# Keep CI documentation under version control despite the blanket *.md rule.
+!/ci/legacy-workflows/README.md
+
 # well...
 /.claude
