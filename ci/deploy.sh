@@ -129,7 +129,11 @@ case $OSTYPE in
     sed -e "s/@TAG@/$TAG_NAME/g" -e "s/@SHA256@/$SHA256/g" < ci/wezterm-homebrew-macos.rb.template > wezterm.rb
 
     ;;
-  msys)
+  # Every Windows bash reports something different here -- Git Bash and MSYS2
+  # say msys, Cygwin says cygwin, older mingw builds say win32 or mingw -- and
+  # a bare `msys)` silently fell through to the catch-all on GitHub's runner,
+  # producing no package at all while still exiting 0.
+  msys* | cygwin* | mingw* | win32*)
     zipdir=ThinkTerm-windows-$TAG_NAME
     if [[ "$BUILD_REASON" == "Schedule" ]] ; then
       zipname=ThinkTerm-windows-nightly.zip
@@ -493,5 +497,10 @@ EOF
     esac
     ;;
   *)
+    # Refusing here is the point: an unrecognised platform used to package
+    # nothing and report success, so the failure only surfaced later as an
+    # empty artifact upload -- or not at all, had the upload been lenient.
+    echo "ci/deploy.sh: don't know how to package for OSTYPE '$OSTYPE'" >&2
+    exit 1
     ;;
 esac
