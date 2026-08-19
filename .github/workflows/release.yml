@@ -173,6 +173,18 @@ jobs:
       - name: Check submodules
         run: bash ci/check-submodules.sh
 
+      # wezterm-version's build.rs prefers a `.tag` file over deriving the
+      # version from git. Without it a released binary reports a commit stamp,
+      # and wezterm-gui's update check compares that against a `v*` release tag
+      # -- two unrelated schemes, so every release looks newer forever.
+      # Via env rather than a ${{ }} splice: on a tag push this is
+      # GITHUB_REF_NAME, and git accepts refs containing shell metacharacters.
+      - name: Stamp version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: echo "$RELEASE_TAG" > .tag
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -238,6 +250,15 @@ jobs:
       - name: Check submodules
         shell: bash
         run: bash ci/check-submodules.sh
+
+      # See the macOS job: without this a released binary reports a commit
+      # stamp rather than the release tag, and the update check compares two
+      # unrelated version schemes.
+      - name: Stamp version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: echo "$RELEASE_TAG" > .tag
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -333,6 +354,18 @@ jobs:
 
       - name: Check submodules
         run: bash ci/check-submodules.sh
+
+      # wezterm-version's build.rs prefers a `.tag` file over deriving the
+      # version from git. Without it a released binary reports a commit stamp,
+      # and wezterm-gui's update check compares that against a `v*` release tag
+      # -- two unrelated schemes, so every release looks newer forever.
+      # Via env rather than a ${{ }} splice: on a tag push this is
+      # GITHUB_REF_NAME, and git accepts refs containing shell metacharacters.
+      - name: Stamp version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: echo "$RELEASE_TAG" > .tag
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

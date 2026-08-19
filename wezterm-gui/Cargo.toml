@@ -93,6 +93,7 @@ rayon.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 resvg.workspace = true
+semver.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
 shlex.workspace = true
@@ -134,6 +135,9 @@ wezterm-toast-notification.workspace = true
 wgpu.workspace = true
 window-funcs.workspace = true
 window.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 shared_library.workspace = true

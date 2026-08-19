@@ -77,9 +77,9 @@ pub fn load_last_release_info_and_set_banner() {
             Err(_) => return,
         };
 
-        let current = wezterm_version();
+        let current = running_release_version();
         let force_ui = always_show_update_ui();
-        if latest.tag_name.as_str() <= current && !force_ui {
+        if !is_newer_release(&latest.tag_name, &current) && !force_ui {
             return;
         }
 
@@ -132,8 +132,8 @@ fn set_banner_from_release_info(latest: &Release) {
 }
 
 fn schedule_set_banner_from_release_info(latest: &Release) {
-    let current = wezterm_version();
-    if latest.tag_name.as_str() <= current {
+    let current = running_release_version();
+    if !is_newer_release(&latest.tag_name, &current) {
         return;
     }
     promise::spawn::spawn_into_main_thread({
@@ -143,6 +143,118 @@ fn schedule_set_banner_from_release_info(latest: &Release) {
         }
     })
     .detach();
+}
+
+/// The release version of the running build, for comparison against the tag
+/// of the latest GitHub release.
+///
+/// `wezterm_version()` is baked in at compile time from `.tag`, which only the
+/// release workflow writes -- and macOS is the one platform whose packages are
+/// built by hand rather than in CI, so its binaries carry a commit stamp that
+/// `is_newer_release` deliberately refuses to compare against a `v*` tag. The
+/// bundle's Info.plist does carry the release version, is read at runtime
+/// rather than compile time, and is already what Finder and the About panel
+/// show, so prefer it when we are running from inside an app bundle.
+fn running_release_version() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(version) = macos_bundle_version() {
+            return version;
+        }
+    }
+    wezterm_version().to_string()
+}
+
+/// `<bundle>.app/Contents/MacOS/<exe>` puts Info.plist one level up from the
+/// executable's directory. Returns None for a bare `cargo build` binary, which
+/// has no bundle and should keep reporting its commit stamp.
+#[cfg(target_os = "macos")]
+fn macos_bundle_version() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    version_from_info_plist(exe.parent()?.parent()?.join("Info.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn version_from_info_plist(path: std::path::PathBuf) -> Option<String> {
+    let value = plist::Value::from_file(path).ok()?;
+    let version = value
+        .as_dictionary()?
+        .get("CFBundleShortVersionString")?
+        .as_string()?
+        .trim()
+        .to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+/// Is `latest` a release the running build should be told about?
+///
+/// The two strings only compare meaningfully when they use the same scheme.
+/// A CI build carries the release tag (the workflow writes `.tag`, which
+/// wezterm-version's build.rs prefers); anything built from a plain checkout
+/// carries a `<date>-<hash>` commit stamp instead. Comparing across the two
+/// with `>` is what made every `v*` release look permanently newer than every
+/// local build: 'v' sorts above every digit, so the banner never went away.
+fn is_newer_release(latest: &str, current: &str) -> bool {
+    let parse = |s: &str| semver::Version::parse(s.trim_start_matches('v')).ok();
+    match (parse(latest), parse(current)) {
+        (Some(latest), Some(current)) => latest > current,
+        // Both on the commit-stamp scheme, which upstream still uses for its
+        // own tags. It starts with a zero-padded date, so lexicographic order
+        // is chronological order.
+        (None, None) => latest > current,
+        // One of each: there is no ordering between the schemes, and a build
+        // that never came from a release is not something to nag about.
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod update_version_tests {
+    use super::is_newer_release;
+
+    const STAMP: &str = "20260819-153532-9d50c4cc";
+
+    #[test]
+    fn semver_releases_compare_numerically() {
+        assert!(is_newer_release("v0.2.0", "v0.1.0"));
+        assert!(!is_newer_release("v0.1.0", "v0.2.0"));
+        assert!(!is_newer_release("v0.1.0", "v0.1.0"));
+        // The reason a plain string compare is not good enough.
+        assert!(is_newer_release("v0.10.0", "v0.9.0"));
+    }
+
+    #[test]
+    fn a_release_never_nags_a_local_build() {
+        assert!(!is_newer_release("v0.1.0", STAMP));
+        assert!(!is_newer_release("v9.9.9", STAMP));
+        assert!(!is_newer_release(STAMP, "v0.1.0"));
+    }
+
+    #[test]
+    fn commit_stamps_still_compare_chronologically() {
+        assert!(is_newer_release("20260901-000000-aaaaaaaa", STAMP));
+        assert!(!is_newer_release("20260101-000000-aaaaaaaa", STAMP));
+    }
+
+    /// The bundle template is the version a hand-built macOS package reports,
+    /// so a release that forgets to bump it silently stops notifying users.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_template_carries_a_comparable_version() {
+        let plist = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/macos/ThinkTerm.app/Contents/Info.plist");
+        let version = super::version_from_info_plist(plist)
+            .expect("the shipped Info.plist must declare CFBundleShortVersionString");
+        assert!(
+            semver::Version::parse(version.trim_start_matches('v')).is_ok(),
+            "Info.plist version {version:?} must parse as semver, or macOS \
+             builds cannot be compared against a release tag"
+        );
+    }
 }
 
 /// Returns true if the provided socket path is dead.
@@ -183,8 +295,8 @@ fn update_checker() {
         if configuration().check_for_updates {
             if let Ok(latest) = get_latest_release_info() {
                 schedule_set_banner_from_release_info(&latest);
-                let current = wezterm_version();
-                if latest.tag_name.as_str() > current || force_ui {
+                let current = running_release_version();
+                if is_newer_release(&latest.tag_name, &current) || force_ui {
                     log::info!(
                         "latest release {} is newer than current build {}",
                         latest.tag_name,

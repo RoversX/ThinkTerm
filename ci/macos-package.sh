@@ -68,6 +68,9 @@ if [[ "$MODE" != adhoc && "$MODE" != developerid ]]; then
   exit 2
 fi
 
+INFO_PLIST=assets/macos/ThinkTerm.app/Contents/Info.plist
+bundle_version=$(plutil -extract CFBundleShortVersionString raw "$INFO_PLIST")
+
 if [[ -z "$TAG" ]]; then
   # The tag names the archive, and ci/wezterm-homebrew-macos.rb.template builds
   # its download URL out of it, so it has to match the GitHub release tag byte
@@ -75,8 +78,7 @@ if [[ -z "$TAG" ]]; then
   # only triggers on 'v*', so every release this has to line up with has one.
   # Deliberately not ci/tag-name.sh's build timestamp -- that identifies a build
   # rather than a release, and `thinkterm --version` already reports it.
-  suggested="v$(plutil -extract CFBundleShortVersionString raw \
-    assets/macos/ThinkTerm.app/Contents/Info.plist)"
+  suggested="v$bundle_version"
   printf "Version tag [%s]: " "$suggested"
   read -r TAG || { echo; exit 1; }
   TAG=${TAG:-$suggested}
@@ -89,6 +91,17 @@ fi
 if [[ ! "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "Refusing tag: $TAG" >&2
   echo "Use only letters, digits, dot, underscore and dash." >&2
+  exit 2
+fi
+
+# The bundle's version is what the shipped app reports to the update check, and
+# the tag is what it gets compared against.  A mismatch ships an app that
+# announces an update to the version it already is, on every launch, because
+# installing that update cannot change what the binary claims about itself.
+if [[ "${TAG#v}" != "$bundle_version" ]]; then
+  echo "Tag $TAG does not match the bundle version $bundle_version." >&2
+  echo "Bump CFBundleShortVersionString in $INFO_PLIST first," >&2
+  echo "or package the version the bundle already declares." >&2
   exit 2
 fi
 
