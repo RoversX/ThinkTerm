@@ -69,7 +69,20 @@ __pycache__/
 /nix/result
 /research/
 /docs/
-ThinkTerm-macos-v0.1.0.zip
+# Packaging output. The ThinkTerm-/thinkterm- names are what ci/deploy.sh and
+# ci/appimage.sh produce now; the WezTerm-/wezterm- ones above are kept for
+# anything left over from before the rename.
+/ThinkTerm-*.zip
+/ThinkTerm-*.exe
+/ThinkTerm-*.AppImage
+/ThinkTerm-*.AppImage.zsync
+/ThinkTerm-macos-*
+/thinkterm*.deb
+/thinkterm*.rpm
+/thinkterm*.tar.xz
+/thinkterm.spec
+/thinkterm.rb
+
 *.md
 
 # Keep ThinkTerm-specific design documentation under version control.

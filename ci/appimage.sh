@@ -15,7 +15,22 @@ install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/com.roversx.
 install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py AppDir/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 
-[ -x /tmp/linuxdeploy ] || ( curl -L 'https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage' -o /tmp/linuxdeploy && chmod +x /tmp/linuxdeploy )
+# linuxdeploy publishes per-machine names (x86_64, aarch64); the rest of the
+# release labels the same machine arm64, so normalise for the output name.
+MACHINE=$(uname -m)
+case "$MACHINE" in
+  aarch64) ARCH=arm64 ;;
+  *)       ARCH=$MACHINE ;;
+esac
+
+# -f matters: without it curl writes the HTTP error body to the file, chmod
+# makes it executable, and the [ -x ] guard then caches that corrupt download
+# for the rest of the job.
+[ -x /tmp/linuxdeploy ] || ( curl -fL --retry 3 "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${MACHINE}.AppImage" -o /tmp/linuxdeploy && chmod +x /tmp/linuxdeploy )
+
+# GitHub's job containers have no /dev/fuse, so both linuxdeploy itself and the
+# AppImage it produces have to self-extract instead of FUSE-mounting.
+export APPIMAGE_EXTRACT_AND_RUN=1
 
 TAG_NAME=${TAG_NAME:-$(git -c "core.abbrev=8" show -s "--format=%cd-%h" "--date=format:%Y%m%d-%H%M%S")}
 distro=$(lsb_release -is 2>/dev/null || sh -c "source /etc/os-release && echo \$NAME")
@@ -23,12 +38,15 @@ distver=$(lsb_release -rs 2>/dev/null || sh -c "source /etc/os-release && echo \
 
 # Embed appropriate update info
 # https://github.com/AppImage/AppImageSpec/blob/master/draft.md#github-releases
+# The glob has to pin the architecture: a release now carries both an x86_64
+# and an aarch64 AppImage, and an arch-blind pattern would let AppImageUpdate
+# overwrite an arm64 binary with the x86_64 one.
 if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-  UPDATE="gh-releases-zsync|RoversX|thinkterm|nightly|ThinkTerm-*.AppImage.zsync"
-  OUTPUT=ThinkTerm-nightly-$distro$distver.AppImage
+  UPDATE="gh-releases-zsync|RoversX|thinkterm|nightly|ThinkTerm-*-$ARCH.AppImage.zsync"
+  OUTPUT=ThinkTerm-nightly-$distro$distver-$ARCH.AppImage
 else
-  UPDATE="gh-releases-zsync|RoversX|thinkterm|latest|ThinkTerm-*.AppImage.zsync"
-  OUTPUT=ThinkTerm-$TAG_NAME-$distro$distver.AppImage
+  UPDATE="gh-releases-zsync|RoversX|thinkterm|latest|ThinkTerm-*-$ARCH.AppImage.zsync"
+  OUTPUT=ThinkTerm-$TAG_NAME-$distro$distver-$ARCH.AppImage
 fi
 
 # Munge the path so that it finds our appstreamcli wrapper

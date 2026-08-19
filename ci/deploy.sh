@@ -19,9 +19,13 @@ fi
 
 case $OSTYPE in
   darwin*)
-    zipdir=ThinkTerm-macos-$TAG_NAME
+    # Each CI job builds a single architecture, so the arch has to be part of
+    # the name or the arm64 and x86_64 runs would overwrite each other's zip.
+    # Unset means "whatever this machine produced", which is what a plain local
+    # `cargo build --release` wants.
+    zipdir=ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-$TAG_NAME
     if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-      zipname=ThinkTerm-macos-nightly.zip
+      zipname=ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-nightly.zip
     else
       zipname=$zipdir.zip
     fi
@@ -124,16 +128,22 @@ case $OSTYPE in
       $TARGET_DIR/release/thinkterm-mux-server.exe \
       $TARGET_DIR/release/thinkterm-gui.exe \
       $TARGET_DIR/release/strip-ansi-escapes.exe \
-      $TARGET_DIR/release/thinkterm.pdb \
-      $TARGET_DIR/release/wezterm.pdb \
       assets/windows/conhost/conpty.dll \
       assets/windows/conhost/OpenConsole.exe \
       assets/windows/angle/libEGL.dll \
       assets/windows/angle/libGLESv2.dll \
       $zipdir
+
+    # `[profile.release]` leaves `debug` off, so no PDBs exist today and
+    # copying them unconditionally would abort the whole step under `set -e`.
+    # Glob rather than name them: turning debuginfo on should ship symbols for
+    # every binary, not just the two that happened to be listed here.
+    cp $TARGET_DIR/release/*.pdb $zipdir 2>/dev/null || true
+
+    # Same source as the four DLLs above -- wezterm-gui's build script only
+    # stages a copy of it next to the exe, so take it from assets directly.
     mkdir $zipdir/mesa
-    cp $TARGET_DIR/release/mesa/opengl32.dll \
-        $zipdir/mesa
+    cp assets/windows/mesa/opengl32.dll $zipdir/mesa
     7z a -tzip $zipname $zipdir
     iscc.exe -DMyAppVersion=${TAG_NAME#nightly} -F${instname} ci/windows-installer.iss
     ;;
@@ -142,7 +152,7 @@ case $OSTYPE in
     distver=$(lsb_release -rs 2>/dev/null || sh -c "source /etc/os-release && echo \$VERSION_ID")
     case "$distro" in
       *Fedora*|*CentOS*|*SUSE*)
-        WEZTERM_RPM_VERSION=$(echo ${TAG_NAME#nightly-} | tr - _)
+        THINKTERM_RPM_VERSION=$(echo ${TAG_NAME#nightly-} | tr - _)
         distroid=$(sh -c "source /etc/os-release && echo \$ID" | tr - _)
         distver=$(sh -c "source /etc/os-release && echo \$VERSION_ID" | tr - _)
 
@@ -194,16 +204,16 @@ BUILDEOFEOF
         fi
 
         # Generate single spec with subpackages
-        cat > wezterm.spec <<EOF
-Name: wezterm
-Version: ${WEZTERM_RPM_VERSION}
+        cat > thinkterm.spec <<EOF
+Name: thinkterm
+Version: ${THINKTERM_RPM_VERSION}
 Release: ${SPEC_RELEASE}
 Packager: RoversX
 License: MIT
 URL: https://github.com/RoversX/thinkterm
 Summary: ThinkTerm workspace-first terminal emulator.
 ${BUILD_REQUIRES}
-Requires: wezterm-common, wezterm-gui, wezterm-mux-server
+Requires: thinkterm-common, thinkterm-gui, thinkterm-mux-server
 
 %global debug_package %{nil}
 
@@ -212,34 +222,34 @@ ThinkTerm is a terminal emulator with support for modern features
 such as fonts with ligatures, hyperlinks, tabs and multiple
 windows.
 
-# Subpackage: wezterm-common
-%package -n wezterm-common
+# Subpackage: thinkterm-common
+%package -n thinkterm-common
 Summary: ThinkTerm - Common CLI components
 Requires: openssl
-%description -n wezterm-common
-wezterm-common provides the base CLI launcher and utilities shared by
-all wezterm components.
+%description -n thinkterm-common
+thinkterm-common provides the base CLI launcher and utilities shared by
+all ThinkTerm components.
 
-# Subpackage: wezterm-gui
-%package -n wezterm-gui
+# Subpackage: thinkterm-gui
+%package -n thinkterm-gui
 Summary: ThinkTerm - GUI and multiplexer
-Requires: wezterm-common
+Requires: thinkterm-common
 %if 0%{?suse_version}
 Requires: dbus-1, fontconfig, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-egl1, libwayland-cursor0, Mesa-libEGL1, libxcb-keysyms1, libxcb-ewmh2, libxcb-icccm4
 %else
 Requires: dbus, fontconfig, libxcb, libxkbcommon, libxkbcommon-x11, libwayland-client, libwayland-egl, libwayland-cursor, mesa-libEGL, xcb-util-keysyms, xcb-util-wm
 %endif
-%description -n wezterm-gui
-wezterm-gui is a GPU-accelerated cross-platform terminal emulator with
+%description -n thinkterm-gui
+thinkterm-gui is a GPU-accelerated cross-platform terminal emulator with
 support for modern features such as fonts with ligatures, hyperlinks,
 tabs and multiple windows.
 
-# Subpackage: wezterm-mux-server
-%package -n wezterm-mux-server
+# Subpackage: thinkterm-mux-server
+%package -n thinkterm-mux-server
 Summary: ThinkTerm - Multiplexer server (headless)
 Requires: openssl
-%description -n wezterm-mux-server
-wezterm-mux-server is a headless terminal multiplexer that can be used
+%description -n thinkterm-mux-server
+thinkterm-mux-server is a headless terminal multiplexer that can be used
 as a session manager for terminal sessions, without requiring X11,
 Wayland, or other GUI libraries.
 
@@ -269,7 +279,7 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 %files
 # Main package (metapackage) has no files
 
-%files -n wezterm-common
+%files -n thinkterm-common
 /usr/bin/thinkterm
 /usr/bin/wezterm
 /usr/bin/strip-ansi-escapes
@@ -280,7 +290,7 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 /etc/bash_completion.d/wezterm
 /etc/profile.d/*
 
-%files -n wezterm-gui
+%files -n thinkterm-gui
 /usr/bin/open-thinkterm-here
 /usr/bin/open-wezterm-here
 /usr/bin/thinkterm-gui
@@ -289,7 +299,7 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 /usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 /usr/share/nautilus-python/extensions/wezterm-nautilus.py*
 
-%files -n wezterm-mux-server
+%files -n thinkterm-mux-server
 /usr/bin/thinkterm-mux-server
 
 %changelog
@@ -298,10 +308,10 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 EOF
 
         if test -n "${COPR_SRPM}" ; then
-          /usr/bin/rpmbuild -bs --rmspec wezterm.spec --verbose
-          mv $(rpm --eval '%{_srcrpmdir}')/wezterm-${TAR_NAME}*.src.rpm "${COPR_SRPM}"/
+          /usr/bin/rpmbuild -bs --rmspec thinkterm.spec --verbose
+          mv $(rpm --eval '%{_srcrpmdir}')/thinkterm-${TAR_NAME}*.src.rpm "${COPR_SRPM}"/
         else
-          /usr/bin/rpmbuild -bb --rmspec wezterm.spec --verbose
+          /usr/bin/rpmbuild -bb --rmspec thinkterm.spec --verbose
         fi
 
         ;;
@@ -310,11 +320,11 @@ EOF
         mkdir -p pkg/debian/usr/bin pkg/debian/DEBIAN pkg/debian/usr/share/{applications,wezterm}
 
         if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-          pkgname=wezterm-nightly
-          conflicts=wezterm
+          pkgname=thinkterm-nightly
+          conflicts=thinkterm
         else
-          pkgname=wezterm
-          conflicts=wezterm-nightly
+          pkgname=thinkterm
+          conflicts=thinkterm-nightly
         fi
 
         cat > pkg/debian/control <<EOF
@@ -381,9 +391,9 @@ EOF
         install -Dm644 assets/shell-integration/* -t pkg/debian/etc/profile.d
 
         if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-          debname=wezterm-nightly.$distro$distver
+          debname=thinkterm-nightly.$distro$distver
         else
-          debname=wezterm-$TAG_NAME.$distro$distver
+          debname=thinkterm-$TAG_NAME.$distro$distver
         fi
         arch=$(dpkg-architecture -q DEB_BUILD_ARCH_CPU)
         case $arch in
@@ -400,8 +410,8 @@ EOF
           $SUDO apt-get install ./$debname.deb
         fi
 
-        mv pkg/debian pkg/wezterm
-        tar cJf $debname.tar.xz -C pkg wezterm
+        mv pkg/debian pkg/thinkterm
+        tar cJf $debname.tar.xz -C pkg thinkterm
         rm -rf pkg
       ;;
     esac
@@ -413,8 +423,8 @@ EOF
         abuild-keygen -a -n -b 8192
         pkgver="${TAG_NAME#nightly-}"
         cat > APKBUILD <<EOF
-# Maintainer: Wez Furlong <wez@wezfurlong.org>
-pkgname=wezterm
+# Maintainer: RoversX
+pkgname=thinkterm
 pkgver=$(echo "$pkgver" | cut -d'-' -f1-2 | tr - .)
 _pkgver=$pkgver
 pkgrel=0

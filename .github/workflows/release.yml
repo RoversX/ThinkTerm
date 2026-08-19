@@ -1,0 +1,423 @@
+# Builds and publishes ThinkTerm for every supported platform.
+#
+# Two ways in:
+#   * push a tag matching v*  -> builds everything and publishes a release
+#   * Run workflow            -> tick the platforms you want; publishing is opt-in
+#
+# The packaging itself lives in ci/deploy.sh and ci/appimage.sh; this file only
+# decides what to build, on which runner, and what to do with the results.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      macos_arm64:
+        description: macOS arm64
+        type: boolean
+        default: true
+      macos_x86_64:
+        description: macOS x86_64
+        type: boolean
+        default: true
+      windows_x86_64:
+        description: Windows x86_64
+        type: boolean
+        default: true
+      linux_x86_64:
+        description: Linux x86_64 (deb + rpm + AppImage)
+        type: boolean
+        default: true
+      linux_arm64:
+        description: Linux arm64 (arm64 runners are free on public repos only)
+        type: boolean
+        default: true
+      publish:
+        description: Publish to a GitHub Release (otherwise artifacts only)
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  # Resolves one build plan for every downstream job. Computing the version
+  # here rather than per-job matters: ci/tag-name.sh derives it from the
+  # current time, so eight runners would otherwise stamp eight different
+  # versions onto the same release.
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      publish: ${{ steps.plan.outputs.publish }}
+      windows: ${{ steps.plan.outputs.windows }}
+      macos_matrix: ${{ steps.plan.outputs.macos_matrix }}
+      linux_matrix: ${{ steps.plan.outputs.linux_matrix }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve build plan
+        id: plan
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = 'push' ]; then
+            # A tag build is always the full matrix, published.
+            release_tag="$GITHUB_REF_NAME"
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+            macos_arm64=true
+            macos_x86_64=true
+            windows=true
+            linux_x86_64=true
+            # arm64 hosted runners are free on public repos only. Scheduling
+            # them from a private repo fails the leg, and the publish gate
+            # below refuses to ship a release with any failed job -- so a tag
+            # push would burn two macOS jobs at 10x and publish nothing. This
+            # starts including arm64 by itself once the repo goes public.
+            linux_arm64='${{ !github.event.repository.private }}'
+          else
+            release_tag="$(bash ci/tag-name.sh)"
+            version="$release_tag"
+            publish='${{ inputs.publish }}'
+            macos_arm64='${{ inputs.macos_arm64 }}'
+            macos_x86_64='${{ inputs.macos_x86_64 }}'
+            windows='${{ inputs.windows_x86_64 }}'
+            linux_x86_64='${{ inputs.linux_x86_64 }}'
+            linux_arm64='${{ inputs.linux_arm64 }}'
+          fi
+
+          macos_matrix="$(jq -nc \
+            --argjson a "$macos_arm64" --argjson x "$macos_x86_64" '
+            [ if $a then {arch: "arm64",  target: "aarch64-apple-darwin"} else empty end,
+              if $x then {arch: "x86_64", target: "x86_64-apple-darwin"}  else empty end ]')"
+
+          linux_matrix="$(jq -nc \
+            --argjson x "$linux_x86_64" --argjson a "$linux_arm64" '
+            [ {name: "ubuntu22.04", container: "ubuntu:22.04", appimage: true},
+              {name: "debian12",    container: "debian:12",    appimage: false},
+              {name: "fedora41",    container: "fedora:41",    appimage: false} ] as $distros
+            | [ if $x then {arch: "x86_64", runs_on: "ubuntu-latest"}    else empty end,
+                if $a then {arch: "arm64",  runs_on: "ubuntu-24.04-arm"} else empty end ] as $arches
+            | [ $distros[] as $d | $arches[] as $r | $d + $r ]')"
+
+          {
+            echo "version=$version"
+            echo "release_tag=$release_tag"
+            echo "publish=$publish"
+            echo "windows=$windows"
+            echo "macos_matrix=$macos_matrix"
+            echo "linux_matrix=$linux_matrix"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Build plan"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| version | \`$version\` |"
+            echo "| release tag | \`$release_tag\` |"
+            echo "| publish | \`$publish\` |"
+            echo "| macOS | \`$(jq -r 'if length == 0 then "none" else [.[].arch] | join(", ") end' <<<"$macos_matrix")\` |"
+            echo "| Windows | \`$windows\` |"
+            echo "| Linux | \`$(jq -r 'if length == 0 then "none" else [.[] | "\(.name)/\(.arch)"] | join(", ") end' <<<"$linux_matrix")\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # One job per architecture, each producing its own zip. We deliberately do not
+  # lipo them into a universal bundle: that doubles the download for an Intel
+  # audience that is on its way out.
+  macos:
+    name: macos ${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.macos_matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.macos_matrix) }}
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      TAG_NAME: ${{ needs.prepare.outputs.version }}
+      MACOS_ARCH: ${{ matrix.arch }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check submodules
+        run: bash ci/check-submodules.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Caches are ref-scoped and a tag run can only read its own ref plus the
+      # default branch, so writing from tags would produce entries nothing ever
+      # restores. Save from main, restore everywhere.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Install system deps
+        run: env CI=yes PATH=$PATH ./get-deps
+
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p wezterm \
+            -p wezterm-gui \
+            -p wezterm-mux-server \
+            -p strip-ansi-escapes
+
+      # Without signing credentials ci/deploy.sh falls back to an ad-hoc
+      # signature: the bundle is well-formed but Gatekeeper will still warn on
+      # another machine.
+      - name: Package
+        env:
+          MACOS_APPLEID: ${{ secrets.MACOS_APPLEID }}
+          MACOS_APP_PW: ${{ secrets.MACOS_APP_PW }}
+          MACOS_CERT: ${{ secrets.MACOS_CERT }}
+          MACOS_CERT_PW: ${{ secrets.MACOS_CERT_PW }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: bash ci/deploy.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          path: ThinkTerm-macos-*.zip
+          if-no-files-found: error
+
+  windows:
+    name: windows x86_64
+    needs: prepare
+    if: needs.prepare.outputs.windows == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
+      TAG_NAME: ${{ needs.prepare.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check submodules
+        shell: bash
+        run: bash ci/check-submodules.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      # ci/deploy.sh calls iscc.exe unconditionally, so a missing Inno Setup
+      # would only surface after a 25 minute build.
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue)) {
+            $inno = "${env:ProgramFiles(x86)}\Inno Setup 6"
+            if (-not (Test-Path "$inno\ISCC.exe")) {
+              choco install innosetup -y --no-progress
+            }
+            Add-Content -Path $env:GITHUB_PATH -Value $inno
+          }
+
+      # openssl-src needs perl; Strawberry Perl ships on the runner but is not
+      # on PATH by default.
+      - name: Build
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+
+      - name: Package
+        shell: bash
+        run: bash ci/deploy.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64
+          path: |
+            ThinkTerm-*.zip
+            ThinkTerm-*.exe
+          if-no-files-found: error
+
+  # Each distro builds inside its own container so the resulting deb/rpm links
+  # against that distro's glibc, and the arch comes from the runner underneath.
+  linux:
+    name: ${{ matrix.name }} ${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.linux_matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.linux_matrix) }}
+    runs-on: ${{ matrix.runs_on }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 90
+
+    env:
+      TAG_NAME: ${{ needs.prepare.outputs.version }}
+      # Job-wide, not per-step: ./get-deps pulls in tzdata and friends, and a
+      # debconf prompt there would hang until timeout-minutes with no output.
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      # git has to exist before actions/checkout runs, otherwise it silently
+      # falls back to downloading a tarball -- and then there is no .git for
+      # ci/deploy.sh to read, and no submodules either.
+      - name: Bootstrap container
+        run: |
+          set -eu
+          if command -v apt-get >/dev/null 2>&1 ; then
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              ca-certificates curl git xz-utils
+          else
+            # Not `curl`: the fedora image ships curl-minimal, which already
+            # provides /usr/bin/curl, and dnf refuses to swap them without
+            # --allowerasing.
+            dnf install -y ca-certificates git rpm-build
+          fi
+
+      - name: Allow git to read the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check submodules
+        run: bash ci/check-submodules.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # rust-cache keys on the job id, which is just "linux" for all six legs.
+      # Without an explicit key a fedora job would happily restore a target dir
+      # built inside ubuntu, and whichever leg finishes first wins the write
+      # while the others burn minutes compressing an entry they cannot save.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}-${{ matrix.arch }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Install system deps
+        run: env CI=yes PATH=$PATH ./get-deps
+
+      - name: Build
+        run: |
+          cargo build --release \
+            -p wezterm \
+            -p wezterm-gui \
+            -p wezterm-mux-server \
+            -p strip-ansi-escapes
+
+      - name: Package
+        run: bash ci/deploy.sh
+
+      - name: Collect RPMs
+        if: startsWith(matrix.name, 'fedora')
+        run: mv "$HOME"/rpmbuild/RPMS/*/*.rpm .
+
+      - name: Build AppImage
+        if: matrix.appimage
+        run: |
+          set -eu
+          apt-get install -y --no-install-recommends file zsync
+          bash ci/appimage.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}-${{ matrix.arch }}
+          path: |
+            thinkterm-*.deb
+            thinkterm-*.tar.xz
+            thinkterm-*.rpm
+            ThinkTerm-*.AppImage
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [prepare, macos, windows, linux]
+    # Runs even when some platforms were deselected (those jobs report as
+    # skipped), but never after a real failure -- half a release is worse than
+    # none.
+    if: >-
+      !cancelled()
+      && needs.prepare.outputs.publish == 'true'
+      && !contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksum
+        run: |
+          set -eu
+          mkdir -p dist
+          cd dist
+          # A plan with every platform deselected reaches this job with nothing
+          # downloaded. Stop here rather than let ci/create-release.sh mint an
+          # empty tag and prerelease on the default branch.
+          [ -n "$(ls -A .)" ] || { echo "::error::no artifacts to publish"; exit 1; }
+          for f in * ; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -l
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash ci/retry.sh bash ci/create-release.sh '${{ needs.prepare.outputs.release_tag }}'
+
+      - name: Upload to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash ci/retry.sh gh release upload --clobber \
+            '${{ needs.prepare.outputs.release_tag }}' dist/*

@@ -4,6 +4,12 @@ import sys
 import glob
 from copy import deepcopy
 
+# These workflows are WezTerm's, kept for reference only -- see the README in
+# that directory. Generating into .github/workflows/ would resurrect 33 live
+# workflows, eleven of which trigger on tags and would race release.yml for the
+# same release assets.
+GEN_DIR = "ci/legacy-workflows"
+
 TRIGGER_PATHS = [
     "**/*.rs",
     "**/Cargo.lock",
@@ -963,7 +969,7 @@ def generate_actions(namer, jobber, trigger, is_continuous, is_tag=False):
         print(name)
         job, uploader = jobber(t)
 
-        file_name = f".github/workflows/gen_{name}.yml"
+        file_name = f"{GEN_DIR}/gen_{name}.yml"
         if job.container:
             if t.app_image:
                 container = f"container:\n      image: {yv(job.container)}\n      options: --privileged"
@@ -1081,7 +1087,7 @@ on:
 
 
 def remove_gen_actions():
-    for name in glob.glob(".github/workflows/gen_*.yml"):
+    for name in glob.glob(f"{GEN_DIR}/gen_*.yml"):
         os.remove(name)
 
 
