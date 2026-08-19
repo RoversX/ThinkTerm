@@ -103,8 +103,12 @@ jobs:
 
           linux_matrix="$(jq -nc \
             --argjson x "$linux_x86_64" --argjson a "$linux_arm64" '
+            # Only two package formats are needed. glibc is forward compatible
+            # only, so building the deb on the oldest base we support (22.04,
+            # glibc 2.35) also covers Ubuntu 24.04, Debian 12/13 and their
+            # derivatives -- a separate Debian 12 build would ship a strictly
+            # less portable deb with the same dependencies.
             [ {name: "ubuntu22.04", container: "ubuntu:22.04", appimage: true},
-              {name: "debian12",    container: "debian:12",    appimage: false},
               {name: "fedora41",    container: "fedora:41",    appimage: false} ] as $distros
             | [ if $x then {arch: "x86_64", runs_on: "ubuntu-latest"}    else empty end,
                 if $a then {arch: "arm64",  runs_on: "ubuntu-24.04-arm"} else empty end ] as $arches
