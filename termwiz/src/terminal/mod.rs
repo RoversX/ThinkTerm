@@ -8,8 +8,11 @@ use crate::caps::Capabilities;
 use crate::input::InputEvent;
 #[cfg(any(unix, windows))]
 use crate::surface::Change;
+#[cfg(any(unix, windows))]
 use crate::{format_err, Result};
+#[cfg(any(unix, windows))]
 use num_traits::NumCast;
+#[cfg(any(unix, windows))]
 use std::fmt::Display;
 #[cfg(any(unix, windows))]
 use std::time::Duration;
@@ -142,6 +145,7 @@ pub fn new_terminal(caps: Capabilities) -> Result<impl Terminal> {
     SystemTerminal::new(caps)
 }
 
+#[cfg(any(unix, windows))]
 pub(crate) fn cast<T: NumCast + Display + Copy, U: NumCast>(n: T) -> Result<U> {
     num_traits::cast(n).ok_or_else(|| format_err!("{} is out of bounds for this system", n))
 }
