@@ -20,7 +20,6 @@ const CLS_NAME: &str = "WezTermAppDelegate";
 extern "C" {
     static NSAboutPanelOptionApplicationName: id;
     static NSAboutPanelOptionApplicationIcon: id;
-    static NSAboutPanelOptionApplicationVersion: id;
     static NSAboutPanelOptionVersion: id;
 }
 
@@ -164,8 +163,12 @@ extern "C" fn thinkterm_order_front_standard_about_panel(
     unsafe {
         let app = NSApp();
         let app_name = nsstring("ThinkTerm");
-        let empty_app_version = nsstring("");
-        let empty_build_version = nsstring("");
+        // The panel renders these as "Version {ApplicationVersion} ({Version})".
+        // ApplicationVersion is left to default from CFBundleShortVersionString
+        // so the marketing version has a single source; the parenthesised slot
+        // carries the build stamp, which is what makes a screenshot of this
+        // window enough to identify the exact commit a user is running.
+        let build_version = nsstring(config::wezterm_version());
         let current_icon: id = msg_send![app, applicationIconImage];
         let loaded_icon = if current_icon == nil {
             thinkterm_icon_path().and_then(|path| load_thinkterm_icon(&path))
@@ -173,12 +176,8 @@ extern "C" fn thinkterm_order_front_standard_about_panel(
             None
         };
 
-        let mut keys = vec![
-            NSAboutPanelOptionApplicationName,
-            NSAboutPanelOptionApplicationVersion,
-            NSAboutPanelOptionVersion,
-        ];
-        let mut objects = vec![*app_name, *empty_app_version, *empty_build_version];
+        let mut keys = vec![NSAboutPanelOptionApplicationName, NSAboutPanelOptionVersion];
+        let mut objects = vec![*app_name, *build_version];
 
         let app_icon = if current_icon != nil {
             current_icon
