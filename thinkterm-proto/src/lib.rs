@@ -13,6 +13,7 @@
 //! deliberately; they are per-session counters and never get near that.
 
 pub mod client;
+pub mod command;
 pub mod keyassignment;
 pub mod layout;
 pub mod pane;
@@ -20,6 +21,7 @@ pub mod renderable;
 pub mod split;
 
 pub use client::{ClientId, ClientInfo};
+pub use command::{CommandSpec, EnvVar};
 pub use keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 pub use layout::{PaneEntry, PaneNode, PaneStackEntry, SerdeUrl};
 pub use pane::{Pattern, SearchResult};
