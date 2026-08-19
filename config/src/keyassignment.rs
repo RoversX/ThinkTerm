@@ -4,11 +4,10 @@ use crate::window::WindowLevel;
 use luahelper::impl_lua_conversion_dynamic;
 use ordered_float::NotNan;
 use portable_pty::CommandBuilder;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::PathBuf;
-use wezterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
+use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_input_types::{KeyCode, Modifiers};
 use wezterm_term::input::MouseButton;
 use wezterm_term::SemanticType;
@@ -150,25 +149,9 @@ pub enum MouseEventTrigger {
     Up { streak: usize, button: MouseButton },
 }
 
-/// When spawning a tab, specify which domain should be used to
-/// host/spawn that tab.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, FromDynamic, ToDynamic)]
-pub enum SpawnTabDomain {
-    /// Use the default domain
-    DefaultDomain,
-    /// Use the domain from the current tab in the associated window
-    CurrentPaneDomain,
-    /// Use a specific domain by name
-    DomainName(String),
-    /// Use a specific domain by id
-    DomainId(usize),
-}
-
-impl Default for SpawnTabDomain {
-    fn default() -> Self {
-        Self::CurrentPaneDomain
-    }
-}
+// Moved to thinkterm-proto (it travels in spawn PDUs); re-exported so the
+// config::keyassignment::SpawnTabDomain path keeps resolving.
+pub use thinkterm_proto::SpawnTabDomain;
 
 #[derive(Default, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct SpawnCommand {
@@ -266,46 +249,9 @@ impl SpawnCommand {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, FromDynamic, ToDynamic)]
-pub enum PaneDirection {
-    Up,
-    Down,
-    Left,
-    Right,
-    Next,
-    Prev,
-}
-
-impl PaneDirection {
-    pub fn direction_from_str(arg: &str) -> Result<PaneDirection, String> {
-        for candidate in PaneDirection::variants() {
-            if candidate.to_lowercase() == arg.to_lowercase() {
-                if let Ok(direction) = PaneDirection::from_dynamic(
-                    &Value::String(candidate.to_string()),
-                    FromDynamicOptions::default(),
-                ) {
-                    return Ok(direction);
-                }
-            }
-        }
-        Err(format!(
-            "invalid direction {arg}, possible values are {:?}",
-            PaneDirection::variants()
-        ))
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, FromDynamic, ToDynamic, Serialize, Deserialize)]
-pub enum ScrollbackEraseMode {
-    ScrollbackOnly,
-    ScrollbackAndViewport,
-}
-
-impl Default for ScrollbackEraseMode {
-    fn default() -> Self {
-        Self::ScrollbackOnly
-    }
-}
+// Moved to thinkterm-proto (they travel in PDUs); re-exported so existing
+// config::keyassignment paths keep resolving.
+pub use thinkterm_proto::{PaneDirection, ScrollbackEraseMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum ClipboardCopyDestination {

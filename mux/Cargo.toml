@@ -43,6 +43,7 @@ terminfo.workspace = true
 termwiz-funcs.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true
+thinkterm-proto = { workspace = true, features = ["lua"] }
 thiserror.workspace = true
 url.workspace = true
 wezterm-dynamic.workspace = true

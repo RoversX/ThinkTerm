@@ -16,7 +16,6 @@ use codec::{ClientViewport, FrontendAccessMode, ThinkTermSessionState};
 use config::keyassignment::{PaneDirection, SpawnTabDomain};
 use config::{ConfigHandle, SshMultiplexing};
 use model::{AppModel, ThreadKey, TreeNodeKey};
-use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::{Domain, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId, Pattern};
@@ -569,7 +568,7 @@ async fn run_async(config: ConfigHandle, options: TuiOptions) -> Result<()> {
     let connection_items = connection_catalog(&available, &catalog.local_domain_name);
     let mux = Arc::new(Mux::new(None));
     Mux::set_mux(&mux);
-    let client_id = Arc::new(ClientId::new());
+    let client_id = Arc::new(mux::client::generate_client_id());
     mux.register_client(Arc::clone(&client_id));
     mux.replace_identity(Some(client_id));
 

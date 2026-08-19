@@ -856,18 +856,17 @@ dependencies = [
  "anyhow",
  "base91",
  "chrono",
- "config",
  "futures-lite",
  "leb128",
  "log",
  "metrics",
- "mux",
  "portable-pty",
  "rangeset",
  "ruzstd",
  "serde",
  "serde_json",
  "termwiz 0.24.0",
+ "thinkterm-proto",
  "thiserror 1.0.69",
  "varbincode",
  "wezterm-term",
@@ -988,6 +987,7 @@ dependencies = [
  "smol",
  "tempfile",
  "termwiz 0.24.0",
+ "thinkterm-proto",
  "toml 0.8.23",
  "umask",
  "wezterm-bidi 0.2.3",
@@ -3814,6 +3814,7 @@ dependencies = [
  "termwiz 0.24.0",
  "termwiz-funcs",
  "textwrap",
+ "thinkterm-proto",
  "thiserror 1.0.69",
  "url",
  "wezterm-dynamic 0.2.1",
@@ -6430,6 +6431,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "thinkterm-proto"
+version = "0.1.0"
+dependencies = [
+ "bintree",
+ "chrono",
+ "luahelper",
+ "mlua",
+ "serde",
+ "termwiz 0.24.0",
+ "url",
+ "wezterm-dynamic 0.2.1",
+ "wezterm-term",
 ]
 
 [[package]]

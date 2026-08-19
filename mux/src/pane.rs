@@ -22,7 +22,7 @@ use wezterm_term::{
 };
 
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
-pub type PaneId = usize;
+pub use thinkterm_proto::{PaneId, Pattern, SearchResult};
 
 pub fn alloc_pane_id() -> PaneId {
     PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
@@ -107,52 +107,8 @@ pub enum PerformAssignmentResult {
     BlockAssignmentAndRouteToKeyDown,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct SearchResult {
-    pub start_y: StableRowIndex,
-    /// The cell index into the line of the start of the match
-    pub start_x: usize,
-    pub end_y: StableRowIndex,
-    /// The cell index into the line of the end of the match
-    pub end_x: usize,
-    /// An identifier that can be used to group results that have
-    /// the same textual content
-    pub match_id: usize,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub enum Pattern {
-    CaseSensitiveString(String),
-    CaseInSensitiveString(String),
-    Regex(String),
-}
-
-impl Default for Pattern {
-    fn default() -> Self {
-        Self::CaseSensitiveString("".to_string())
-    }
-}
-
-impl std::ops::Deref for Pattern {
-    type Target = String;
-    fn deref(&self) -> &String {
-        match self {
-            Pattern::CaseSensitiveString(s) => s,
-            Pattern::CaseInSensitiveString(s) => s,
-            Pattern::Regex(s) => s,
-        }
-    }
-}
-
-impl std::ops::DerefMut for Pattern {
-    fn deref_mut(&mut self) -> &mut String {
-        match self {
-            Pattern::CaseSensitiveString(s) => s,
-            Pattern::CaseInSensitiveString(s) => s,
-            Pattern::Regex(s) => s,
-        }
-    }
-}
+// SearchResult and Pattern moved to thinkterm-proto; re-exported at the top
+// of this module. PatternType stays: it is not a wire type.
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum PatternType {

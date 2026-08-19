@@ -1503,7 +1503,7 @@ impl Client {
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
-        let client_id = ClientId::new();
+        let client_id = mux::client::generate_client_id();
         let connection_phase = Arc::new(AtomicU8::new(ClientConnectionPhase::Registering as u8));
         let reader_connection_phase = Arc::clone(&connection_phase);
         let (resume_reconnect_tx, resume_reconnect_rx) = channel::<()>();

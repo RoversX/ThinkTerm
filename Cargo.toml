@@ -7,6 +7,7 @@ members = [
   "sync-color-schemes",
   "thinkterm-syntax",
   "thinkterm-core",
+  "thinkterm-proto",
   "thinkterm-tui",
   "deps/cairo",
   "wezterm",
@@ -74,6 +75,7 @@ color-funcs = { path = "lua-api-crates/color-funcs" }
 colorgrad = "0.6"
 config = { path = "config" }
 thinkterm-core = { path = "thinkterm-core" }
+thinkterm-proto = { path = "thinkterm-proto" }
 core-foundation = "=0.10.0"
 core-graphics = "=0.24.0"
 core-text = "=21.0.0"

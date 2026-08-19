@@ -9,13 +9,12 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-config.workspace = true
 leb128.workspace = true
 log.workspace = true
 metrics.workspace = true
-mux.workspace = true
 portable-pty = { workspace = true, features = ["serde_support"]}
 rangeset.workspace = true
+thinkterm-proto.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 futures-lite.workspace = true
 termwiz.workspace = true

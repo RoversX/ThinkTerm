@@ -1959,7 +1959,7 @@ mod tests {
             .to_string();
         assert!(missing_identity.contains("identified client"));
 
-        let client = Arc::new(ClientId::new());
+        let client = Arc::new(mux::client::generate_client_id());
         let missing_registration = claim_viewport_for_pane(&mux, Some(&client), None, usize::MAX)
             .unwrap_err()
             .to_string();
@@ -1978,7 +1978,7 @@ mod tests {
     fn moved_pane_workspace_is_resolved_from_the_requesting_client() {
         config::use_test_configuration();
         let mux = Mux::new(None);
-        let client = Arc::new(ClientId::new());
+        let client = Arc::new(mux::client::generate_client_id());
         mux.register_client(Arc::clone(&client));
         mux.set_active_workspace_for_client(&client, "space-2");
 

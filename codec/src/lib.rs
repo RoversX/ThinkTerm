@@ -12,12 +12,10 @@
 #![allow(clippy::range_plus_one)]
 
 use anyhow::{Context as _, Error, bail};
-use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
-use mux::client::{ClientId, ClientInfo};
-use mux::pane::PaneId;
-use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::{PaneNode, SerdeUrl, SplitRequest, TabId};
-use mux::window::WindowId;
+use thinkterm_proto::{
+    ClientId, ClientInfo, PaneDirection, PaneId, PaneNode, RenderableDimensions,
+    ScrollbackEraseMode, SerdeUrl, SplitRequest, StableCursorPosition, TabId, WindowId,
+};
 use portable_pty::CommandBuilder;
 use rangeset::*;
 use serde::{Deserialize, Serialize};
@@ -741,7 +739,7 @@ pub struct SplitPane {
     pub split_request: SplitRequest,
     pub command: Option<CommandBuilder>,
     pub command_dir: Option<String>,
-    pub domain: config::keyassignment::SpawnTabDomain,
+    pub domain: thinkterm_proto::SpawnTabDomain,
     /// Instead of spawning a command, move the specified
     /// pane into the new split target
     pub move_pane_id: Option<PaneId>,
@@ -754,7 +752,7 @@ pub struct SpawnPaneInStack {
     pub pane_id: PaneId,
     pub command: Option<CommandBuilder>,
     pub command_dir: Option<String>,
-    pub domain: config::keyassignment::SpawnTabDomain,
+    pub domain: thinkterm_proto::SpawnTabDomain,
 }
 
 /// Make `pane_id` the visible pane of the stack that contains it.
@@ -788,7 +786,7 @@ pub struct MovePaneToNewTabResponse {
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SpawnV2 {
-    pub domain: config::keyassignment::SpawnTabDomain,
+    pub domain: thinkterm_proto::SpawnTabDomain,
     /// If None, create a new window for this new tab
     pub window_id: Option<WindowId>,
     pub command: Option<CommandBuilder>,
@@ -1500,14 +1498,14 @@ pub struct EraseScrollbackRequest {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SearchScrollbackRequest {
     pub pane_id: PaneId,
-    pub pattern: mux::pane::Pattern,
+    pub pattern: thinkterm_proto::Pattern,
     pub range: Range<StableRowIndex>,
     pub limit: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SearchScrollbackResponse {
-    pub results: Vec<mux::pane::SearchResult>,
+    pub results: Vec<thinkterm_proto::SearchResult>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1532,10 +1530,10 @@ mod golden {
     //! without any error. These literals were captured before the move;
     //! they must stay green, byte for byte, after it.
     use super::*;
-    use mux::client::{ClientId, ClientInfo};
-    use mux::pane::Pattern;
-    use mux::tab::{PaneEntry, PaneStackEntry, SplitDirection, SplitDirectionAndSize, SplitSize};
     use std::sync::Arc;
+    use thinkterm_proto::{
+        PaneEntry, PaneStackEntry, Pattern, SplitDirection, SplitDirectionAndSize, SplitSize,
+    };
 
     fn varbincode_bytes<T: serde::Serialize>(t: &T) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -1612,7 +1610,7 @@ mod golden {
             },
             command: None,
             command_dir: Some("/home".to_string()),
-            domain: config::keyassignment::SpawnTabDomain::DomainName("dom".to_string()),
+            domain: thinkterm_proto::SpawnTabDomain::DomainName("dom".to_string()),
             move_pane_id: Some(2),
         }
     }

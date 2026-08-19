@@ -1,0 +1,36 @@
+[package]
+name = "thinkterm-proto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The pure-data types shared by the mux wire protocol (codec), the mux
+# server, and every client. This crate must always build for
+# wasm32-unknown-unknown; that constraint is what keeps a pure client
+# (web, mobile) able to speak the protocol. Do not add dependencies that
+# touch processes, files, sockets or threads.
+
+[dependencies]
+bintree.workspace = true
+chrono.workspace = true
+serde = { workspace = true, features = ["rc", "derive"] }
+termwiz = { workspace = true, features = ["use_serde"] }
+url.workspace = true
+wezterm-dynamic.workspace = true
+wezterm-term = { workspace = true, features = ["use_serde"] }
+
+# The lua conversions expand to mlua trait impls, which the orphan rule
+# forces into this crate. They ride behind a feature so that the wasm
+# build (codec and below) never sees vendored Lua.
+luahelper = { workspace = true, optional = true }
+mlua = { workspace = true, optional = true, features = [
+  "vendored",
+  "lua54",
+  "async",
+  "send",
+  "serialize",
+] }
+
+[features]
+default = []
+lua = ["dep:luahelper", "dep:mlua"]

@@ -1085,7 +1085,7 @@ fn setup_mux(
 ) -> anyhow::Result<Arc<Mux>> {
     let mux = Arc::new(mux::Mux::new(Some(local_domain.clone())));
     Mux::set_mux(&mux);
-    let client_id = Arc::new(mux::client::ClientId::new());
+    let client_id = Arc::new(mux::client::generate_client_id());
     mux.register_client(client_id.clone());
     mux.replace_identity(Some(client_id));
     let default_workspace_name = default_workspace_name.unwrap_or(
