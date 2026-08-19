@@ -38,6 +38,7 @@ use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
 pub mod activity;
 pub mod client;
+pub mod command_spec;
 pub mod connui;
 pub mod domain;
 pub mod geometrytrace;
