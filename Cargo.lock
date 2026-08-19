@@ -855,6 +855,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base91",
+ "chrono",
  "config",
  "futures-lite",
  "leb128",
@@ -865,6 +866,7 @@ dependencies = [
  "rangeset",
  "ruzstd",
  "serde",
+ "serde_json",
  "termwiz 0.24.0",
  "thiserror 1.0.69",
  "varbincode",

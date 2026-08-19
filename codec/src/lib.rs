@@ -1525,6 +1525,222 @@ pub struct GetImageCellResponse {
 }
 
 #[cfg(test)]
+mod golden {
+    //! Byte-level fixtures for every type that is moving into
+    //! thinkterm-proto. varbincode is positional -- no field names, no field
+    //! counts -- so reordering fields during the move corrupts the wire
+    //! without any error. These literals were captured before the move;
+    //! they must stay green, byte for byte, after it.
+    use super::*;
+    use mux::client::{ClientId, ClientInfo};
+    use mux::pane::Pattern;
+    use mux::tab::{PaneEntry, PaneStackEntry, SplitDirection, SplitDirectionAndSize, SplitSize};
+    use std::sync::Arc;
+
+    fn varbincode_bytes<T: serde::Serialize>(t: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut ser = varbincode::Serializer::new(&mut buf);
+        t.serialize(&mut ser).unwrap();
+        buf
+    }
+
+    fn size(rows: usize, cols: usize) -> TerminalSize {
+        TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * 8,
+            pixel_height: rows * 16,
+            dpi: 96,
+        }
+    }
+
+    fn pane_entry(pane_id: PaneId, title: &str) -> PaneEntry {
+        PaneEntry {
+            window_id: 1,
+            tab_id: 2,
+            pane_id,
+            title: title.to_string(),
+            size: size(24, 80),
+            working_dir: Some(
+                std::convert::TryFrom::try_from("file:///tmp/x".to_string()).unwrap(),
+            ),
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            alt_screen: true,
+            workspace: "default".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: -3,
+            top_row: 0,
+            left_col: 0,
+            tty_name: Some("/dev/ttys001".to_string()),
+        }
+    }
+
+    fn list_panes_response() -> ListPanesResponse {
+        let mut window_titles = HashMap::new();
+        window_titles.insert(1usize, "win".to_string());
+        ListPanesResponse {
+            tabs: vec![
+                PaneNode::Empty,
+                PaneNode::Split {
+                    left: Box::new(PaneNode::Leaf(pane_entry(3, "left"))),
+                    right: Box::new(PaneNode::Stack(PaneStackEntry {
+                        active: 0,
+                        panes: vec![pane_entry(4, "stacked")],
+                        pane_stack_id: Some(7),
+                    })),
+                    node: SplitDirectionAndSize {
+                        direction: SplitDirection::Horizontal,
+                        first: size(24, 40),
+                        second: size(24, 39),
+                    },
+                },
+            ],
+            tab_titles: vec!["main".to_string()],
+            window_titles,
+        }
+    }
+
+    fn split_pane() -> SplitPane {
+        SplitPane {
+            pane_id: 5,
+            split_request: SplitRequest {
+                direction: SplitDirection::Vertical,
+                target_is_second: true,
+                top_level: false,
+                size: SplitSize::Percent(30),
+            },
+            command: None,
+            command_dir: Some("/home".to_string()),
+            domain: config::keyassignment::SpawnTabDomain::DomainName("dom".to_string()),
+            move_pane_id: Some(2),
+        }
+    }
+
+    fn search_request() -> SearchScrollbackRequest {
+        SearchScrollbackRequest {
+            pane_id: 3,
+            pattern: Pattern::Regex("a+".to_string()),
+            range: -5..10,
+            limit: Some(100),
+        }
+    }
+
+    fn client_list_response() -> GetClientListResponse {
+        let when = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        GetClientListResponse {
+            clients: vec![ClientInfo {
+                client_id: Arc::new(ClientId {
+                    hostname: "host".to_string(),
+                    username: "user".to_string(),
+                    pid: 100,
+                    epoch: 2,
+                    id: 3,
+                    ssh_auth_sock: None,
+                }),
+                connected_at: when,
+                active_workspace: Some("default".to_string()),
+                last_input: when,
+                focused_pane_id: Some(4),
+            }],
+        }
+    }
+
+    fn render_changes_response() -> GetPaneRenderChangesResponse {
+        GetPaneRenderChangesResponse {
+            pane_id: 1,
+            mouse_grabbed: false,
+            alt_screen: true,
+            cursor_position: StableCursorPosition::default(),
+            dimensions: RenderableDimensions {
+                cols: 80,
+                viewport_rows: 24,
+                scrollback_rows: 100,
+                physical_top: -7,
+                scrollback_top: -76,
+                dpi: 96,
+                pixel_width: 640,
+                pixel_height: 384,
+                reverse_video: false,
+            },
+            dirty_lines: vec![0..2, 5..6],
+            title: "title".to_string(),
+            working_dir: None,
+            bonus_lines: Vec::new().into(),
+            input_serial: None,
+            seqno: 42,
+        }
+    }
+
+    // Captured from the code as it stood before the type move; regenerating
+    // them after a change defeats their purpose.
+    const LIST_PANES: &[u8] = &[
+        2, 0, 1, 2, 1, 2, 3, 4, 108, 101, 102, 116, 24, 80, 128, 5, 128, 3, 96, 1, 13, 102, 105,
+        108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 120, 1, 0, 1, 7, 100, 101, 102, 97, 117, 108,
+        116, 0, 0, 0, 1, 125, 0, 0, 1, 12, 47, 100, 101, 118, 47, 116, 116, 121, 115, 48, 48, 49,
+        3, 0, 1, 1, 2, 4, 7, 115, 116, 97, 99, 107, 101, 100, 24, 80, 128, 5, 128, 3, 96, 1, 13,
+        102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 120, 1, 0, 1, 7, 100, 101, 102, 97,
+        117, 108, 116, 0, 0, 0, 1, 125, 0, 0, 1, 12, 47, 100, 101, 118, 47, 116, 116, 121, 115,
+        48, 48, 49, 1, 7, 0, 24, 40, 192, 2, 128, 3, 96, 24, 39, 184, 2, 128, 3, 96, 1, 4, 109,
+        97, 105, 110, 1, 1, 3, 119, 105, 110,
+    ];
+    const SPLIT_PANE: &[u8] = &[
+        5, 1, 1, 0, 1, 30, 0, 1, 5, 47, 104, 111, 109, 101, 2, 3, 100, 111, 109, 1, 2,
+    ];
+    const SEARCH: &[u8] = &[3, 2, 2, 97, 43, 123, 10, 1, 100];
+    const CLIENT_LIST: &[u8] = &[
+        1, 4, 104, 111, 115, 116, 4, 117, 115, 101, 114, 100, 2, 3, 0, 128, 226, 207, 170, 6, 1,
+        7, 100, 101, 102, 97, 117, 108, 116, 128, 226, 207, 170, 6, 1, 4,
+    ];
+    const RENDER_CHANGES: &[u8] = &[
+        1, 0, 1, 0, 0, 0, 1, 80, 24, 100, 121, 180, 127, 96, 128, 5, 128, 3, 0, 2, 0, 2, 5, 6, 5,
+        116, 105, 116, 108, 101, 0, 0, 0, 0, 0, 42,
+    ];
+    const LAYOUT_JSON: &str = r#"["Empty",{"Split":{"left":{"Leaf":{"window_id":1,"tab_id":2,"pane_id":3,"title":"left","size":{"rows":24,"cols":80,"pixel_width":640,"pixel_height":384,"dpi":96},"working_dir":"file:///tmp/x","is_active_pane":true,"is_zoomed_pane":false,"alt_screen":true,"workspace":"default","cursor_pos":{"x":0,"y":0,"shape":"Default","visibility":"Visible"},"physical_top":-3,"top_row":0,"left_col":0,"tty_name":"/dev/ttys001"}},"right":{"Stack":{"active":0,"panes":[{"window_id":1,"tab_id":2,"pane_id":4,"title":"stacked","size":{"rows":24,"cols":80,"pixel_width":640,"pixel_height":384,"dpi":96},"working_dir":"file:///tmp/x","is_active_pane":true,"is_zoomed_pane":false,"alt_screen":true,"workspace":"default","cursor_pos":{"x":0,"y":0,"shape":"Default","visibility":"Visible"},"physical_top":-3,"top_row":0,"left_col":0,"tty_name":"/dev/ttys001"}],"pane_stack_id":7}},"node":{"direction":"Horizontal","first":{"rows":24,"cols":40,"pixel_width":320,"pixel_height":384,"dpi":96},"second":{"rows":24,"cols":39,"pixel_width":312,"pixel_height":384,"dpi":96}}}}]"#;
+
+    #[test]
+    fn wire_bytes_are_stable() {
+        assert_eq!(varbincode_bytes(&list_panes_response()), LIST_PANES);
+        assert_eq!(varbincode_bytes(&split_pane()), SPLIT_PANE);
+        assert_eq!(varbincode_bytes(&search_request()), SEARCH);
+        assert_eq!(varbincode_bytes(&client_list_response()), CLIENT_LIST);
+        assert_eq!(varbincode_bytes(&render_changes_response()), RENDER_CHANGES);
+    }
+
+    #[test]
+    fn wire_bytes_decode_back() {
+        fn back<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+            let mut r = bytes;
+            let mut de = varbincode::Deserializer::new(&mut r);
+            serde::Deserialize::deserialize(&mut de).unwrap()
+        }
+        assert_eq!(back::<ListPanesResponse>(LIST_PANES), list_panes_response());
+        assert_eq!(back::<SplitPane>(SPLIT_PANE), split_pane());
+        assert_eq!(back::<SearchScrollbackRequest>(SEARCH), search_request());
+        assert_eq!(
+            back::<GetClientListResponse>(CLIENT_LIST),
+            client_list_response()
+        );
+        assert_eq!(
+            back::<GetPaneRenderChangesResponse>(RENDER_CHANGES),
+            render_changes_response()
+        );
+    }
+
+    /// PaneNode/PaneEntry are also the on-disk serde_json format of saved
+    /// Thread layouts; JSON is keyed by field *name*, so the move must not
+    /// rename anything either. The last accidental format change here made
+    /// every Thread open as a single empty pane and overwrite its own saved
+    /// layout (see the comment on PaneEntry::alt_screen).
+    #[test]
+    fn layout_json_is_stable() {
+        let tabs: Vec<PaneNode> = serde_json::from_str(LAYOUT_JSON).unwrap();
+        assert_eq!(tabs, list_panes_response().tabs);
+        assert_eq!(serde_json::to_string(&tabs).unwrap(), LAYOUT_JSON);
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
 

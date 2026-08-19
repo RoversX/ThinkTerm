@@ -34,6 +34,8 @@ ruzstd.workspace = true
 
 [dev-dependencies]
 base91.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
 # The native test suite proves ruzstd can decode zstd's output, which is the
 # wasm client's receive path.
 ruzstd.workspace = true
