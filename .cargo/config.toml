@@ -1,3 +1,9 @@
+# getrandom refuses to build for this target unless it is told where entropy
+# comes from, and it wants a cfg rather than a feature. The browser's
+# crypto.getRandomValues is the only source there is.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-gcc-ar"

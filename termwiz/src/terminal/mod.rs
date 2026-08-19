@@ -1,12 +1,18 @@
 //! An abstraction over a terminal device
 
+#[cfg(any(unix, windows))]
 use crate::caps::probed::ProbeCapabilities;
+#[cfg(any(unix, windows))]
 use crate::caps::Capabilities;
+#[cfg(any(unix, windows))]
 use crate::input::InputEvent;
+#[cfg(any(unix, windows))]
 use crate::surface::Change;
+#[cfg(any(unix, windows))]
 use crate::{format_err, Result};
 use num_traits::NumCast;
 use std::fmt::Display;
+#[cfg(any(unix, windows))]
 use std::time::Duration;
 
 #[cfg(feature = "use_serde")]
@@ -19,6 +25,11 @@ pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 
+// Everything below that drives a live terminal -- the Terminal trait, its
+// buffered wrapper and new_terminal -- exists only where there is a terminal
+// to drive. ScreenSize and Blocking stay unconditional: they are plain data
+// that the surface and cell layers use on every target, wasm included.
+#[cfg(any(unix, windows))]
 pub mod buffered;
 
 #[cfg(unix)]
@@ -58,6 +69,7 @@ pub enum Blocking {
 /// If the `set_raw_mode` or `set_cooked_mode` functions are used in
 /// any combination, the implementation is required to restore the
 /// terminal mode that was in effect when it was created.
+#[cfg(any(unix, windows))]
 pub trait Terminal {
     /// Raw mode disables input line buffering, allowing data to be
     /// read as the user presses keys, disables local echo, so keys
@@ -126,6 +138,7 @@ pub type SystemTerminal = WindowsTerminal;
 /// If you have a more advanced use case you will want to look to the
 /// constructors for `UnixTerminal` and `WindowsTerminal` and call whichever
 /// one is most suitable for your needs.
+#[cfg(any(unix, windows))]
 pub fn new_terminal(caps: Capabilities) -> Result<impl Terminal> {
     SystemTerminal::new(caps)
 }

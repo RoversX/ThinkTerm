@@ -9,6 +9,7 @@ use num_traits::ToPrimitive;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use terminfo::{Database, Value};
@@ -443,16 +444,33 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
 /// back-pressure when there is a lot of data to read,
 /// and we're in control of the write side, which represents
 /// input from the interactive user, or pastes.
+#[cfg(not(target_family = "wasm"))]
 struct ThreadedWriter {
     sender: Sender<WriterMessage>,
 }
 
+#[cfg(target_family = "wasm")]
+struct ThreadedWriter {
+    writer: Box<dyn std::io::Write + Send>,
+}
+
+#[cfg(not(target_family = "wasm"))]
 enum WriterMessage {
     Data(Vec<u8>),
     Flush,
 }
 
 impl ThreadedWriter {
+    /// wasm has no threads, and nothing to be freed from blocking on: there is
+    /// no pty behind the writer, only whatever the embedder passed in. Hand
+    /// writes straight through rather than queueing them for a worker that
+    /// cannot exist -- std::thread::spawn does not fail there, it panics.
+    #[cfg(target_family = "wasm")]
+    fn new(writer: Box<dyn std::io::Write + Send>) -> Self {
+        Self { writer }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn new(mut writer: Box<dyn std::io::Write + Send>) -> Self {
         let (sender, receiver) = channel::<WriterMessage>();
 
@@ -477,6 +495,18 @@ impl ThreadedWriter {
     }
 }
 
+#[cfg(target_family = "wasm")]
+impl std::io::Write for ThreadedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 impl std::io::Write for ThreadedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.sender

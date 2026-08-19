@@ -1,0 +1,14 @@
+[package]
+name = "wasm-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Proves the terminal core links for wasm32, not merely that it compiles:
+# rlib output would never exercise the linker.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+termwiz.workspace = true
+wezterm-term.workspace = true

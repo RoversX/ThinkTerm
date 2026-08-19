@@ -308,7 +308,15 @@ fn read_shared_memory_data(
     Ok(data)
 }
 
-#[cfg(all(feature = "kitty-shm", unix, target_os = "android"))]
+// Android has the API surface but not the permission to use it, and targets
+// like wasm32 have no shared memory at all. Both answer the same way, so the
+// parser keeps understanding the escape sequence and simply declines the
+// transfer rather than failing to build.
+#[cfg(all(
+    feature = "kitty-shm",
+    not(windows),
+    any(not(unix), target_os = "android")
+))]
 fn read_shared_memory_data(
     _name: &str,
     _data_offset: Option<u32>,

@@ -51,6 +51,9 @@ pub use wezterm_surface::hyperlink;
 pub mod input;
 pub mod istty;
 pub mod keymap;
+// The line editor and the tty probe both drive a live terminal, so they
+// follow the Terminal trait in being unavailable where there is none.
+#[cfg(any(unix, windows))]
 pub mod lineedit;
 mod macros;
 pub use wezterm_char_props::nerdfonts;

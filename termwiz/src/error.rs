@@ -66,6 +66,10 @@ pub enum InternalError {
     #[error(transparent)]
     Terminfo(#[from] terminfo::Error),
 
+    // Produced only by the terminal:: implementations, which exist on unix and
+    // windows alone; the crate otherwise builds for targets that have no such
+    // descriptors at all.
+    #[cfg(any(unix, windows))]
     #[error(transparent)]
     FileDescriptor(#[from] filedescriptor::Error),
 

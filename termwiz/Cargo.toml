@@ -15,7 +15,6 @@ anyhow.workspace = true
 bitflags = "2.0"
 cassowary = {workspace=true, optional=true}
 fancy-regex.workspace = true
-filedescriptor.workspace = true
 finl_unicode.workspace = true
 fixedbitset.workspace = true
 fnv = {workspace=true, optional=true}
@@ -60,6 +59,12 @@ docs = ["widgets", "use_serde", "image", "tmux_cc"]
 criterion.workspace = true
 env_logger.workspace = true
 k9.workspace = true
+
+# Only the terminal:: implementations need this, and those are already gated on
+# unix/windows. Keeping it off other targets is what lets the escape parsing,
+# cell model and surface layers build for wasm32.
+[target."cfg(any(unix, windows))".dependencies]
+filedescriptor.workspace = true
 
 [target."cfg(unix)".dependencies]
 signal-hook.workspace = true

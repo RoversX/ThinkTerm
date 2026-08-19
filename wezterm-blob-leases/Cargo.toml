@@ -16,6 +16,14 @@ tempfile = {workspace=true, optional=true}
 thiserror.workspace = true
 uuid = {workspace=true, features=["v4", "rng"]}
 
+# wasm32-unknown-unknown has no OS entropy of its own, so both crates that need
+# randomness have to be told to reach for the browser's crypto.getRandomValues.
+# getrandom additionally requires --cfg getrandom_backend="wasm_js" at build
+# time; see .cargo/config.toml.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = {workspace=true, features=["wasm_js"]}
+uuid = {workspace=true, features=["v4", "rng", "js"]}
+
 [features]
 default = []
 serde = ["dep:serde", "uuid/serde"]
