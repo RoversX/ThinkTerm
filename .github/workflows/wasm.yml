@@ -1,0 +1,52 @@
+# The portability sentinel. The terminal core and the mux protocol must
+# always build AND run on wasm32-unknown-unknown -- not because a web build
+# ships today, but because wasm is the strictest target there is: no
+# threads, no files, no processes, no sockets. Code that passes here is
+# clean for every future pure client (web, Android, iOS). If this job goes
+# red, something native leaked below the protocol line; fix the leak, don't
+# gate the job.
+#
+# Two teeth, because they bite different things:
+#  * the compile check catches dependency leaks -- C libraries, unix-only
+#    crates, impls that don't exist off unix/windows (OsString serde);
+#  * the probe run catches std APIs that compile everywhere but panic on
+#    wasm (thread::spawn, SystemTime::now, fs) on the paths it exercises.
+name: wasm-sentinel
+
+# Manual-only for now; flip the push trigger on when automatic coverage is
+# wanted:
+#
+#   push:
+#     branches: ["main"]
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: wasm-sentinel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # No submodules: the crates below don't touch the vendored assets.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check the portable core for wasm32
+        run: |
+          cargo check -p thinkterm-proto -p codec -p wezterm-term -p termwiz \
+            --target wasm32-unknown-unknown
+      - name: Run the terminal core in a wasm VM
+        run: |
+          cargo build -p wasm-probe --target wasm32-unknown-unknown --release
+          node wasm-probe/run-probe.js \
+            target/wasm32-unknown-unknown/release/wasm_probe.wasm
