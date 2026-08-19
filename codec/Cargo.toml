@@ -17,12 +17,23 @@ mux.workspace = true
 portable-pty = { workspace = true, features = ["serde_support"]}
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
-smol.workspace = true
+futures-lite.workspace = true
 termwiz.workspace = true
 thiserror.workspace = true
 varbincode.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
+
+# zstd binds the C library, which does not build for wasm. There the crate
+# decompresses with the pure-Rust ruzstd and never compresses -- legal because
+# is_compressed is a unilateral per-PDU choice by the sender.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 zstd.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+ruzstd.workspace = true
 
 [dev-dependencies]
 base91.workspace = true
+# The native test suite proves ruzstd can decode zstd's output, which is the
+# wasm client's receive path.
+ruzstd.workspace = true

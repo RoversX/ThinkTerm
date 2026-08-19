@@ -21,8 +21,11 @@ use mux::window::WindowId;
 use portable_pty::CommandBuilder;
 use rangeset::*;
 use serde::{Deserialize, Serialize};
-use smol::io::AsyncWriteExt;
-use smol::prelude::*;
+// smol's io/prelude are pure re-exports of these futures-lite modules, so
+// this is the same set of traits -- minus smol's runtime (async-io, polling),
+// which does not build for wasm and which nothing in this crate uses.
+use futures_lite::io::AsyncWriteExt;
+use futures_lite::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io::Cursor;
@@ -292,6 +295,7 @@ pub struct DecodedPdu {
 }
 
 /// If the serialized size is larger than this, then we'll consider compressing it
+#[cfg(not(target_family = "wasm"))]
 const COMPRESS_THRESH: usize = 32;
 
 fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
@@ -299,27 +303,38 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
     let mut encode = varbincode::Serializer::new(&mut uncompressed);
     t.serialize(&mut encode)?;
 
-    if uncompressed.len() <= COMPRESS_THRESH {
-        return Ok((uncompressed, false));
-    }
-    // It's a little heavy; let's try compressing it
-    let mut compressed = Vec::new();
-    let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    let mut encode = varbincode::Serializer::new(&mut compress);
-    t.serialize(&mut encode)?;
-    drop(encode);
-    compress.finish()?;
-
-    log::debug!(
-        "serialized+compress len {} vs {}",
-        compressed.len(),
-        uncompressed.len()
-    );
-
-    if compressed.len() < uncompressed.len() {
-        Ok((compressed, true))
-    } else {
+    // No zstd on wasm, so a wasm sender never compresses. The receiving side
+    // handles both forms regardless, and the outbound traffic of a thin
+    // client is mostly keystrokes, so there is nothing worth compressing.
+    #[cfg(target_family = "wasm")]
+    {
         Ok((uncompressed, false))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        if uncompressed.len() <= COMPRESS_THRESH {
+            return Ok((uncompressed, false));
+        }
+        // It's a little heavy; let's try compressing it
+        let mut compressed = Vec::new();
+        let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+        let mut encode = varbincode::Serializer::new(&mut compress);
+        t.serialize(&mut encode)?;
+        drop(encode);
+        compress.finish()?;
+
+        log::debug!(
+            "serialized+compress len {} vs {}",
+            compressed.len(),
+            uncompressed.len()
+        );
+
+        if compressed.len() < uncompressed.len() {
+            Ok((compressed, true))
+        } else {
+            Ok((uncompressed, false))
+        }
     }
 }
 
@@ -328,7 +343,13 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     is_compressed: bool,
 ) -> Result<T, Error> {
     if is_compressed {
+        #[cfg(not(target_family = "wasm"))]
         let mut decompress = zstd::Decoder::new(r)?;
+        // The pure-Rust decoder stands in where the zstd C library cannot
+        // build; it also implements std::io::Read, so the shape is identical.
+        #[cfg(target_family = "wasm")]
+        let mut decompress = ruzstd::decoding::StreamingDecoder::new(r)
+            .map_err(|e| anyhow::anyhow!("ruzstd: {e}"))?;
         let mut decode = varbincode::Deserializer::new(&mut decompress);
         serde::Deserialize::deserialize(&mut decode).map_err(Into::into)
     } else {
@@ -1506,6 +1527,37 @@ pub struct GetImageCellResponse {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// First coverage of the compressed path: every pre-existing test payload
+    /// sits under COMPRESS_THRESH and never touches zstd.
+    #[test]
+    fn compressed_serialize_round_trips() {
+        let payload: Vec<u8> = std::iter::repeat(b"thinkterm ".as_slice())
+            .take(100)
+            .flatten()
+            .copied()
+            .collect();
+        let (bytes, is_compressed) = serialize(&payload).unwrap();
+        assert!(is_compressed, "1000 repetitive bytes must compress");
+        let back: Vec<u8> = deserialize(bytes.as_slice(), is_compressed).unwrap();
+        assert_eq!(back, payload);
+    }
+
+    /// The wasm client's receive path: a native server compresses with the
+    /// zstd C library, the wasm side decodes with pure-Rust ruzstd. Proven
+    /// here on native, where both libraries are available.
+    #[test]
+    fn ruzstd_decodes_zstd_output() {
+        let payload: Vec<u8> = (0u32..500).flat_map(|v| v.to_le_bytes()).collect();
+        let (bytes, is_compressed) = serialize(&payload).unwrap();
+        assert!(is_compressed);
+
+        let mut decompress =
+            ruzstd::decoding::StreamingDecoder::new(bytes.as_slice()).expect("ruzstd frame");
+        let mut decode = varbincode::Deserializer::new(&mut decompress);
+        let back: Vec<u8> = serde::Deserialize::deserialize(&mut decode).unwrap();
+        assert_eq!(back, payload);
+    }
 
     #[test]
     fn test_frame() {
