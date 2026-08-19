@@ -8,7 +8,6 @@ use crate::caps::Capabilities;
 use crate::input::InputEvent;
 #[cfg(any(unix, windows))]
 use crate::surface::Change;
-#[cfg(any(unix, windows))]
 use crate::{format_err, Result};
 use num_traits::NumCast;
 use std::fmt::Display;
