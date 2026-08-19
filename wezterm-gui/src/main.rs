@@ -1007,7 +1007,9 @@ impl Publish {
                             .spawn_v2(codec::SpawnV2 {
                                 domain,
                                 window_id,
-                                command,
+                                command: command
+                                    .as_ref()
+                                    .map(mux::command_spec::CommandSpecExt::from_command_builder),
                                 command_dir: None,
                                 size: config.initial_size(0, None),
                                 workspace: workspace.unwrap_or(

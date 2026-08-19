@@ -4,6 +4,7 @@ use codec::*;
 use config::keyassignment::SpawnTabDomain;
 use config::TermConfig;
 use mux::client::ClientId;
+use mux::command_spec::CommandSpecExt;
 use mux::domain::SplitSource;
 use mux::pane::{CachePolicy, Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
@@ -1799,7 +1800,7 @@ async fn spawn_pane_in_stack(request: SpawnPaneInStack) -> anyhow::Result<Pdu> {
         .spawn_pane_in_stack(
             request.pane_id,
             request.domain,
-            request.command,
+            request.command.map(|c| c.into_command_builder()),
             request.command_dir,
             size,
         )
@@ -1826,7 +1827,7 @@ async fn split_pane(split: SplitPane) -> anyhow::Result<Pdu> {
         SplitSource::MovePane(move_pane_id)
     } else {
         SplitSource::Spawn {
-            command: split.command,
+            command: split.command.map(|c| c.into_command_builder()),
             command_dir: split.command_dir,
         }
     };
@@ -1854,7 +1855,7 @@ async fn domain_spawn_v2(spawn: SpawnV2) -> anyhow::Result<Pdu> {
         .spawn_tab_or_window(
             spawn.window_id,
             spawn.domain,
-            spawn.command,
+            spawn.command.map(|c| c.into_command_builder()),
             spawn.command_dir,
             spawn.size,
             None, // optional current pane_id

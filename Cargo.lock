@@ -860,7 +860,6 @@ dependencies = [
  "leb128",
  "log",
  "metrics",
- "portable-pty",
  "rangeset",
  "ruzstd",
  "serde",

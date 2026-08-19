@@ -13,10 +13,9 @@
 
 use anyhow::{Context as _, Error, bail};
 use thinkterm_proto::{
-    ClientId, ClientInfo, PaneDirection, PaneId, PaneNode, RenderableDimensions,
+    ClientId, ClientInfo, CommandSpec, PaneDirection, PaneId, PaneNode, RenderableDimensions,
     ScrollbackEraseMode, SerdeUrl, SplitRequest, StableCursorPosition, TabId, WindowId,
 };
-use portable_pty::CommandBuilder;
 use rangeset::*;
 use serde::{Deserialize, Serialize};
 // smol's io/prelude are pure re-exports of these futures-lite modules, so
@@ -480,7 +479,10 @@ macro_rules! pdu {
 /// 56: Pane entries carry that state too, so a renderer knows it on arrival.
 /// 57: Frontends publish and follow a shared per-tab scroll position.
 /// 58: Connection-wide A/B access modes and atomic geometry-bearing claims.
-pub const CODEC_VERSION: usize = 59;
+/// 60: Spawn PDUs carry a portable CommandSpec instead of CommandBuilder;
+///     argv, env and cwd travel as byte strings rather than OsString, and
+///     the umask field exists on every platform instead of only unix.
+pub const CODEC_VERSION: usize = 60;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -737,7 +739,7 @@ pub struct ListPanesResponse {
 pub struct SplitPane {
     pub pane_id: PaneId,
     pub split_request: SplitRequest,
-    pub command: Option<CommandBuilder>,
+    pub command: Option<CommandSpec>,
     pub command_dir: Option<String>,
     pub domain: thinkterm_proto::SpawnTabDomain,
     /// Instead of spawning a command, move the specified
@@ -750,7 +752,7 @@ pub struct SplitPane {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SpawnPaneInStack {
     pub pane_id: PaneId,
-    pub command: Option<CommandBuilder>,
+    pub command: Option<CommandSpec>,
     pub command_dir: Option<String>,
     pub domain: thinkterm_proto::SpawnTabDomain,
 }
@@ -789,7 +791,7 @@ pub struct SpawnV2 {
     pub domain: thinkterm_proto::SpawnTabDomain,
     /// If None, create a new window for this new tab
     pub window_id: Option<WindowId>,
-    pub command: Option<CommandBuilder>,
+    pub command: Option<CommandSpec>,
     pub command_dir: Option<String>,
     pub size: TerminalSize,
     pub workspace: String,
@@ -1800,6 +1802,67 @@ mod test {
         }
     }
 
+    /// All three spawn-class PDUs, populated with a CommandSpec that
+    /// exercises every field: non-utf8 argv bytes, base and explicit env
+    /// entries, a cwd, a umask and a lowered tty flag. Pure codec -- no pty
+    /// dependency -- which also proves the crate is self-contained.
+    #[test]
+    fn spawn_pdus_round_trip_at_version_60() {
+        use thinkterm_proto::{EnvVar, SpawnTabDomain};
+
+        let spec = CommandSpec {
+            args: vec![b"htop".to_vec(), vec![0x66, 0x80, 0x6f]],
+            env: vec![
+                EnvVar {
+                    key: b"PATH".to_vec(),
+                    value: b"/usr/bin".to_vec(),
+                    is_from_base_env: true,
+                },
+                EnvVar {
+                    key: b"FOO".to_vec(),
+                    value: b"bar".to_vec(),
+                    is_from_base_env: false,
+                },
+            ],
+            cwd: Some(b"/tmp".to_vec()),
+            umask: Some(0o022),
+            controlling_tty: false,
+        };
+
+        let pdus = [
+            Pdu::SpawnV2(SpawnV2 {
+                domain: SpawnTabDomain::DefaultDomain,
+                window_id: Some(1),
+                command: Some(spec.clone()),
+                command_dir: None,
+                size: TerminalSize::default(),
+                workspace: "default".to_string(),
+            }),
+            Pdu::SplitPane(SplitPane {
+                pane_id: 2,
+                split_request: SplitRequest::default(),
+                command: Some(spec.clone()),
+                command_dir: Some("/home".to_string()),
+                domain: SpawnTabDomain::CurrentPaneDomain,
+                move_pane_id: None,
+            }),
+            Pdu::SpawnPaneInStack(SpawnPaneInStack {
+                pane_id: 3,
+                command: None,
+                command_dir: None,
+                domain: SpawnTabDomain::DomainName("dom".to_string()),
+            }),
+        ];
+
+        for pdu in pdus {
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 0x11).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.pdu, pdu);
+            assert_eq!(decoded.serial, 0x11);
+        }
+    }
+
     #[test]
     fn test_pdu_ping() {
         let mut encoded = Vec::new();
@@ -1903,8 +1966,8 @@ mod test {
     }
 
     #[test]
-    fn thinkterm_session_viewport_and_landing_protocol_round_trip_at_version_59() {
-        assert_eq!(CODEC_VERSION, 59);
+    fn thinkterm_session_viewport_and_landing_protocol_round_trip_at_version_60() {
+        assert_eq!(CODEC_VERSION, 60);
         let size = TerminalSize {
             rows: 40,
             cols: 132,

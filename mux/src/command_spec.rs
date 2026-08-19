@@ -1,6 +1,6 @@
 use portable_pty::CommandBuilder;
 use std::ffi::{OsStr, OsString};
-use thinkterm_proto::{CommandSpec, EnvVar};
+pub use thinkterm_proto::{CommandSpec, EnvVar};
 
 /// Free-standing conversions rather than `From` impls: both types are
 /// foreign here. `CommandSpec` belongs to thinkterm-proto, which must stay

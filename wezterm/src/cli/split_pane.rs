@@ -1,6 +1,7 @@
 use crate::cli::resolve_relative_cwd;
 use clap::{Parser, ValueHint};
 use mux::pane::PaneId;
+use mux::command_spec::{CommandSpec, CommandSpecExt};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize};
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::OsString;
@@ -101,7 +102,7 @@ impl SplitPane {
                     None
                 } else {
                     let builder = CommandBuilder::from_argv(self.prog);
-                    Some(builder)
+                    Some(CommandSpec::from_command_builder(&builder))
                 },
                 command_dir: resolve_relative_cwd(self.cwd)?,
                 move_pane_id: self.move_pane_id,

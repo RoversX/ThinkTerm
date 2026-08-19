@@ -6,6 +6,7 @@ use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::connui::{ConnectionUI, ConnectionUIParams};
+use mux::command_spec::{CommandSpec, CommandSpecExt};
 use mux::domain::{Domain, DomainId, DomainState, SplitSource, alloc_domain_id};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitRequest, Tab, TabId};
@@ -3082,7 +3083,7 @@ impl Domain for ClientDomain {
             .client
             .spawn_pane_in_stack(codec::SpawnPaneInStack {
                 pane_id: pane.remote_pane_id,
-                command,
+                command: command.as_ref().map(CommandSpec::from_command_builder),
                 command_dir,
                 domain: SpawnTabDomain::CurrentPaneDomain,
             })
@@ -3277,7 +3278,7 @@ impl Domain for ClientDomain {
                 domain: SpawnTabDomain::DefaultDomain,
                 window_id: inner.local_to_remote_window(window),
                 size,
-                command,
+                command: command.as_ref().map(CommandSpec::from_command_builder),
                 command_dir,
                 workspace,
             })
@@ -3406,7 +3407,7 @@ impl Domain for ClientDomain {
                 domain: SpawnTabDomain::CurrentPaneDomain,
                 pane_id: target_remote_pane_id,
                 split_request,
-                command,
+                command: command.as_ref().map(CommandSpec::from_command_builder),
                 command_dir,
                 move_pane_id,
             })

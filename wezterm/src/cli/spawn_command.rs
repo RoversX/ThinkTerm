@@ -3,6 +3,7 @@ use clap::{Parser, ValueHint};
 use config::keyassignment::SpawnTabDomain;
 use config::ConfigHandle;
 use mux::pane::PaneId;
+use mux::command_spec::{CommandSpec, CommandSpecExt};
 use mux::window::WindowId;
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::OsString;
@@ -110,7 +111,7 @@ impl SpawnCommand {
                     None
                 } else {
                     let builder = CommandBuilder::from_argv(self.prog);
-                    Some(builder)
+                    Some(CommandSpec::from_command_builder(&builder))
                 },
                 command_dir: resolve_relative_cwd(self.cwd)?,
                 size,
