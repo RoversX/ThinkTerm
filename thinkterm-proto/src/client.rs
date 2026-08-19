@@ -84,7 +84,9 @@ impl ClientInfo {
     pub fn update_last_input(&mut self) {
         self.last_input = utc_now();
     }
+}
 
+impl ClientInfo {
     pub fn update_focused_pane(&mut self, pane_id: PaneId) {
         self.focused_pane_id.replace(pane_id);
     }
