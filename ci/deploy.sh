@@ -23,15 +23,18 @@ case $OSTYPE in
     # the name or the arm64 and x86_64 runs would overwrite each other's zip.
     # Unset means "whatever this machine produced", which is what a plain local
     # `cargo build --release` wants.
-    zipdir=ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-$TAG_NAME
+    zipdir="ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-$TAG_NAME"
     if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-      zipname=ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-nightly.zip
+      zipname="ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-nightly.zip"
     else
-      zipname=$zipdir.zip
+      zipname="$zipdir.zip"
     fi
-    rm -rf $zipdir $zipname
-    mkdir $zipdir
-    cp -r assets/macos/ThinkTerm.app $zipdir/
+    # Quoted because $TAG_NAME reaches here from an interactive prompt in
+    # ci/macos-package.sh.  Unquoted, a tag of "v1 assets" would expand this
+    # rm into two paths and delete assets/ from the repository root.
+    rm -rf "$zipdir" "$zipname"
+    mkdir "$zipdir"
+    cp -r assets/macos/ThinkTerm.app "$zipdir/"
     # Omit MetalANGLE for now; it's a bit laggy compared to CGL,
     # and on M1/Big Sur, CGL is implemented in terms of Metal anyway
     rm $zipdir/ThinkTerm.app/*.dylib
@@ -58,8 +61,14 @@ case $OSTYPE in
     done
 
     set +x
+    # Only a Developer ID signature is eligible for notarization; the notary
+    # service rejects adhoc and Apple Development identities outright.
+    notarize=no
     if [[ -n "${MACOS_SIGNING_MODE:-}" ]] ; then
       bash ci/macos-sign-local.sh "$zipdir/ThinkTerm.app" "$MACOS_SIGNING_MODE"
+      if [[ "$MACOS_SIGNING_MODE" == developerid ]] ; then
+        notarize=yes
+      fi
     elif [ -n "$MACOS_TEAM_ID" ] ; then
       MACOS_PW=$(echo $MACOS_CERT_PW | base64 --decode)
       echo "pw sha"
@@ -91,6 +100,7 @@ case $OSTYPE in
       security default-keychain -d user -s $def_keychain
       echo "Remove build.keychain"
       security delete-keychain build.keychain || true
+      notarize=yes
     else
       # A normal local package should still be a correctly sealed app bundle.
       # Development/Developer ID identities remain opt-in, but ad-hoc signing
@@ -98,17 +108,24 @@ case $OSTYPE in
       bash ci/macos-sign-local.sh "$zipdir/ThinkTerm.app" adhoc
     fi
 
-    set -x
-    zip -r $zipname $zipdir
-    set +x
-
-    if [[ -z "${MACOS_SIGNING_MODE:-}" && -n "$MACOS_TEAM_ID" ]] ; then
-      echo "Notarize"
-      xcrun notarytool submit $zipname --wait --team-id "$MACOS_TEAM_ID" --apple-id "$MACOS_APPLEID" --password "$MACOS_APP_PW"
+    # Notarize and staple before packing, not after.  Stapling rewrites the
+    # bundle, so an archive built first would ship without the ticket and make
+    # every first launch wait on a round trip to Apple's servers -- or fail
+    # outright behind a firewall that blocks them.
+    if [[ "$notarize" == yes ]] ; then
+      bash ci/macos-notarize-local.sh "$zipdir/ThinkTerm.app"
     fi
-    set -x
 
-    SHA256=$(shasum -a 256 $zipname | cut -d' ' -f1)
+    set -x
+    # --sequesterRsrc is what makes this safe to hand to plain `unzip`.  macOS
+    # stamps com.apple.provenance on every file, so ditto emits an AppleDouble
+    # ._ sidecar for each one; without sequestering they land inside the bundle
+    # on extraction, and codesign then reports "a sealed resource is missing or
+    # invalid" -- Finder calls that "damaged".  Sequestering routes them to a
+    # sibling __MACOSX/ that extractors ignore.
+    /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$zipdir" "$zipname"
+
+    SHA256=$(shasum -a 256 "$zipname" | cut -d' ' -f1)
     sed -e "s/@TAG@/$TAG_NAME/g" -e "s/@SHA256@/$SHA256/g" < ci/wezterm-homebrew-macos.rb.template > wezterm.rb
 
     ;;

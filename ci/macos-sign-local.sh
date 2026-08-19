@@ -2,35 +2,38 @@
 
 set -euo pipefail
 
-APP_PATH=${1:?usage: macos-sign-local.sh path/to/ThinkTerm.app [adhoc|development]}
+APP_PATH=${1:?usage: macos-sign-local.sh path/to/ThinkTerm.app [adhoc|development|developerid]}
 SIGNING_MODE=${2:-adhoc}
 
-# This is the active Individual team used by the developer's current macOS
-# applications.  It is public signing metadata, not a credential.  Override it
-# when intentionally testing with another team.
-DEVELOPMENT_TEAM=${THINKTERM_MACOS_DEVELOPMENT_TEAM:-D4KD8XCCL6}
+# Extra codesign flags that only the distribution mode needs.  Kept as an array
+# so the two codesign invocations below stay identical across modes.
+CODESIGN_EXTRA=()
+
+. "$(dirname "$0")/macos-identity.sh"
+
+# Resolved against this script, not the caller's cwd: signing an already
+# extracted bundle from some other directory is an obvious thing to want, and a
+# cwd-relative path would fail only after every nested binary had been re-signed.
+ENTITLEMENTS="$(dirname "$0")/macos-entitlement.plist"
 
 case "$SIGNING_MODE" in
   adhoc)
     SIGNING_IDENTITY=-
     ;;
   development)
-    SIGNING_IDENTITY=${MACOS_SIGNING_IDENTITY:-}
-    if [[ -z "$SIGNING_IDENTITY" ]]; then
-      SIGNING_IDENTITY=$(
-        security find-identity -v -p codesigning |
-          sed -n "s/.*\"\(Apple Development:.*(${DEVELOPMENT_TEAM})\)\".*/\1/p" |
-          head -n 1
-      )
-    fi
-    if [[ -z "$SIGNING_IDENTITY" ]]; then
-      echo "No Apple Development identity found for team ${DEVELOPMENT_TEAM}." >&2
-      echo "Create or download it in Xcode > Settings > Accounts > Manage Certificates." >&2
-      exit 1
-    fi
+    SIGNING_IDENTITY=$(resolve_signing_identity "Apple Development")
+    ;;
+  developerid)
+    SIGNING_IDENTITY=$(resolve_signing_identity "Developer ID Application")
+    # Notarization rejects submissions that lack Hardened Runtime or a secure
+    # timestamp, and neither is a codesign default.  Both have to be applied to
+    # the nested executables as well as the outer bundle, so they live here
+    # rather than only on the final seal.
+    CODESIGN_EXTRA=(--options runtime --timestamp)
     ;;
   *)
-    echo "Unsupported signing mode: ${SIGNING_MODE} (expected adhoc or development)" >&2
+    echo "Unsupported signing mode: ${SIGNING_MODE}" >&2
+    echo "(expected adhoc, development or developerid)" >&2
     exit 2
     ;;
 esac
@@ -42,23 +45,44 @@ fi
 
 # Sign nested executables first, then seal the outer bundle.  This avoids
 # relying on codesign --deep to guess which bundled files are code.  Local
-# builds can link Homebrew dylibs, so these development-only modes deliberately
-# omit Hardened Runtime/library validation.  The Developer ID release path in
-# deploy.sh continues to enable Hardened Runtime before notarization.
+# builds can link Homebrew dylibs, so adhoc and development deliberately omit
+# Hardened Runtime/library validation; developerid turns it back on through
+# CODESIGN_EXTRA above, because notarization refuses anything without it.
+# The ${arr[@]+"${arr[@]}"} dance is not decoration: /bin/bash on macOS is 3.2,
+# where `set -u` treats an empty array expansion as an unbound variable.
+#
+# -perm +111 matches any execute bit.  -perm -111 would demand all three, and
+# ci/deploy.sh copies these binaries with plain cp, so a caller running under a
+# restrictive umask gets 0700 files, matches nothing, and silently ships a
+# bundle whose nested binaries were never signed.
+#
+# The entitlements are deliberately applied to every binary, not just the outer
+# seal: only CFBundleExecutable inherits the bundle's entitlements, so the mux
+# server and CLIs would otherwise run under Hardened Runtime with an empty set
+# and be denied by TCC in developerid builds alone.
 while IFS= read -r executable; do
-  codesign --force --sign "$SIGNING_IDENTITY" "$executable"
-done < <(find "$APP_PATH/Contents/MacOS" -type f -perm -111 -print | sort)
+  codesign --force ${CODESIGN_EXTRA[@]+"${CODESIGN_EXTRA[@]}"} \
+    --entitlements "$ENTITLEMENTS" \
+    --sign "$SIGNING_IDENTITY" "$executable"
+done < <(find "$APP_PATH/Contents/MacOS" -type f -perm +111 -print | sort)
 
-codesign --force \
-  --entitlements ci/macos-entitlement.plist \
+codesign --force ${CODESIGN_EXTRA[@]+"${CODESIGN_EXTRA[@]}"} \
+  --entitlements "$ENTITLEMENTS" \
   --sign "$SIGNING_IDENTITY" \
   "$APP_PATH"
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
-if [[ "$SIGNING_MODE" == adhoc ]]; then
-  echo "Ad-hoc signed ${APP_PATH}; TeamIdentifier is intentionally unset."
-  echo "Configured development team for the next stage: ${DEVELOPMENT_TEAM}"
-else
-  echo "Development-signed ${APP_PATH} with ${SIGNING_IDENTITY}"
-fi
+case "$SIGNING_MODE" in
+  adhoc)
+    echo "Ad-hoc signed ${APP_PATH}; TeamIdentifier is intentionally unset."
+    ;;
+  development)
+    echo "Development-signed ${APP_PATH} with ${SIGNING_IDENTITY}"
+    ;;
+  developerid)
+    echo "Developer ID signed ${APP_PATH} with ${SIGNING_IDENTITY}"
+    echo "Hardened Runtime is on, so Gatekeeper will still reject this until it"
+    echo "has been notarized and stapled -- see ci/macos-notarize-local.sh."
+    ;;
+esac

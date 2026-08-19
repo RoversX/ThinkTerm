@@ -14,14 +14,17 @@ on:
     tags: ['v*']
   workflow_dispatch:
     inputs:
+      # Off by default: this runner has no Developer ID certificate, so
+      # ci/deploy.sh falls back to an ad-hoc signature that Gatekeeper refuses.
+      # Release builds are produced locally with ci/macos-package.sh instead.
       macos_arm64:
-        description: macOS arm64
+        description: macOS arm64 (no certificate here -- ad-hoc signed only)
         type: boolean
-        default: true
+        default: false
       macos_x86_64:
-        description: macOS x86_64
+        description: macOS x86_64 (no certificate here -- ad-hoc signed only)
         type: boolean
-        default: true
+        default: false
       windows_x86_64:
         description: Windows x86_64
         type: boolean
@@ -71,12 +74,18 @@ jobs:
           set -euo pipefail
 
           if [ "$GITHUB_EVENT_NAME" = 'push' ]; then
-            # A tag build is always the full matrix, published.
+            # A tag build publishes everything CI can build correctly.
             release_tag="$GITHUB_REF_NAME"
             version="${GITHUB_REF_NAME#v}"
             publish=true
-            macos_arm64=true
-            macos_x86_64=true
+            # macOS is signed, notarized and stapled locally by
+            # ci/macos-package.sh, because the Developer ID certificate lives
+            # in a keychain rather than in this repo's secrets. Building it
+            # here would attach an ad-hoc signed zip that no other Mac can
+            # open -- a broken download is worse than a missing one -- and
+            # bill two jobs at the 10x macOS rate to do it.
+            macos_arm64=false
+            macos_x86_64=false
             windows=true
             linux_x86_64=true
             # arm64 hosted runners are free on public repos only. Scheduling
@@ -414,14 +423,20 @@ jobs:
           done
           ls -l
 
+      # The tag reaches these steps through env rather than a ${{ }} splice into
+      # the script body. On a tag push it is GITHUB_REF_NAME verbatim, and git
+      # accepts refs containing quotes and $(...) -- spliced inline, such a tag
+      # would run as shell in a job holding contents: write and a token.
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash ci/retry.sh bash ci/create-release.sh '${{ needs.prepare.outputs.release_tag }}'
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: bash ci/retry.sh bash ci/create-release.sh "$RELEASE_TAG"
 
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           bash ci/retry.sh gh release upload --clobber \
-            '${{ needs.prepare.outputs.release_tag }}' dist/*
+            "$RELEASE_TAG" dist/*
