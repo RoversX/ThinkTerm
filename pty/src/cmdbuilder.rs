@@ -317,16 +317,48 @@ impl CommandBuilder {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
-        let key: OsString = key.as_ref().into();
-        let value: OsString = value.as_ref().into();
+        self.insert_env(key.as_ref(), value.as_ref(), false);
+    }
+
+    /// Set a variable that is to be treated as though it had been inherited
+    /// from the caller's own environment rather than set for this command.
+    ///
+    /// Exists so that a command reconstructed from its serialized form can
+    /// restore the distinction: `iter_extra_env_as_str` is what decides
+    /// which variables reach an ssh host or `flatpak-spawn --env=`, and
+    /// re-adding everything through `env` would forward the caller's whole
+    /// environment there.
+    pub fn base_env<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.insert_env(key.as_ref(), value.as_ref(), true);
+    }
+
+    fn insert_env(&mut self, key: &OsStr, value: &OsStr, is_from_base_env: bool) {
+        let key: OsString = key.into();
         self.envs.insert(
             EnvEntry::map_key(key.clone()),
             EnvEntry {
-                is_from_base_env: false,
+                is_from_base_env,
                 preferred_key: key,
-                value: value,
+                value: value.into(),
             },
         );
+    }
+
+    /// Iterate the environment losslessly. Unlike `iter_full_env_as_str`
+    /// this keeps the inherited/explicit flag and does not silently drop
+    /// entries that are not valid utf-8.
+    pub fn iter_env_entries(&self) -> impl Iterator<Item = (&OsStr, &OsStr, bool)> {
+        self.envs.values().map(|e| {
+            (
+                e.preferred_key.as_os_str(),
+                e.value.as_os_str(),
+                e.is_from_base_env,
+            )
+        })
     }
 
     pub fn env_remove<K>(&mut self, key: K)
@@ -423,6 +455,10 @@ impl CommandBuilder {
 impl CommandBuilder {
     pub fn umask(&mut self, mask: Option<libc::mode_t>) {
         self.umask = mask;
+    }
+
+    pub fn get_umask(&self) -> Option<libc::mode_t> {
+        self.umask
     }
 
     fn resolve_path(&self) -> Option<&OsStr> {
