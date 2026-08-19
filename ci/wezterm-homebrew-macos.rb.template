@@ -7,7 +7,9 @@ cask "thinkterm" do
   version "@TAG@"
   sha256 "@SHA256@"
 
-  url "https://github.com/RoversX/thinkterm/releases/download/#{version}/ThinkTerm-macos-#{version}.zip"
+  # The v belongs to the git tag only: Homebrew expects a bare version, and the
+  # asset is named without one to match the Linux and Windows artifacts.
+  url "https://github.com/RoversX/thinkterm/releases/download/v#{version}/ThinkTerm-macos-#{version}.zip"
   name "ThinkTerm"
   desc "A workspace-first terminal"
   homepage "https://github.com/RoversX/thinkterm"

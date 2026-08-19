@@ -145,12 +145,20 @@ EOT
   echo "    notarization credentials: profile '$NOTARY_PROFILE' works"
 fi
 
+# The tag keeps its v so it matches the GitHub release, but the filename drops
+# it. That is the same split the workflow makes -- release.yml derives
+# version="${GITHUB_REF_NAME#v}" and names every Linux and Windows artifact
+# from it -- and matching here is what keeps one release page from carrying
+# both ThinkTerm-macos-v0.1.0.zip and thinkterm-0.1.0.Ubuntu22.04.deb. The v
+# has to go for deb and rpm regardless: their version fields reject it.
+version="${TAG#v}"
+
 echo
 echo "==> Packaging as $TAG in $MODE mode"
-TAG_NAME="$TAG" MACOS_SIGNING_MODE="$MODE" bash ci/deploy.sh
+TAG_NAME="$version" MACOS_SIGNING_MODE="$MODE" bash ci/deploy.sh
 
 # deploy.sh derives both names the same way; keep them in sync with it.
-zipdir="ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-$TAG"
+zipdir="ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-$version"
 zipname="$zipdir.zip"
 app="$zipdir/ThinkTerm.app"
 
