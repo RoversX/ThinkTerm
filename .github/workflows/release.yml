@@ -406,6 +406,10 @@ jobs:
           apt-get install -y --no-install-recommends file zsync
           bash ci/appimage.sh
 
+      # The .zsync pattern matters: ci/appimage.sh embeds an update URL that
+      # points at that file, so leaving it behind makes every AppImageUpdate
+      # check resolve to a 404. if-no-files-found applies to the pattern list
+      # as a whole, so the distros that build no AppImage are unaffected.
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
@@ -415,6 +419,7 @@ jobs:
             thinkterm-*.tar.xz
             thinkterm-*.rpm
             ThinkTerm-*.AppImage
+            ThinkTerm-*.AppImage.zsync
           if-no-files-found: error
 
   publish:
