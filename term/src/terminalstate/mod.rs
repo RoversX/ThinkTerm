@@ -2166,7 +2166,10 @@ impl TerminalState {
 
                 if x >= self.left_and_right_margins.start && x < self.left_and_right_margins.end {
                     let right_margin = self.left_and_right_margins.end;
-                    let limit = (x + n as usize).min(right_margin);
+                    // n comes from the escape sequence and reaches u32::MAX,
+                    // which overflows usize on 32-bit targets before min() can
+                    // clamp it.
+                    let limit = x.saturating_add(n as usize).min(right_margin);
 
                     let blank_attr = self.pen.clone_sgr_only();
                     let screen = self.screen_mut();
@@ -2196,7 +2199,11 @@ impl TerminalState {
             Edit::EraseCharacter(n) => {
                 let y = self.cursor.y;
                 let x = self.cursor.x;
-                let limit = (x + n as usize).min(self.screen().physical_cols);
+                // Saturating because n reaches u32::MAX, which overflows usize
+                // on 32-bit targets before min() can clamp it.
+                let limit = x
+                    .saturating_add(n as usize)
+                    .min(self.screen().physical_cols);
                 {
                     let blank = Cell::blank_with_attrs(self.pen.clone_sgr_only());
                     let screen = self.screen_mut();
@@ -2240,8 +2247,14 @@ impl TerminalState {
                     && self.left_and_right_margins.contains(&x)
                 {
                     let margin = self.left_and_right_margins.end;
+                    // As the comment above says, characters past the margin are
+                    // lost: once the row is blank from the cursor to the margin
+                    // each further insert only shifts blanks and drops one off
+                    // the end, so those iterations cannot be observed. n reaches
+                    // u32::MAX, which is a minute and a half of them.
+                    let n = (n as usize).min(margin.saturating_sub(x));
                     let screen = self.screen_mut();
-                    for _ in 0..n as usize {
+                    for _ in 0..n {
                         screen.insert_cell(x, y, margin, seqno);
                     }
                 }
@@ -2297,6 +2310,23 @@ impl TerminalState {
                             }
                         }
                     }
+                };
+
+                // Repeats wrap and scroll, so unlike ICH the screen keeps
+                // changing -- but only until the viewport and the scrollback
+                // hold nothing but the repeated cell. Past that only the cursor
+                // column still depends on n, and it cycles with the margin
+                // width, so keeping the remainder leaves the cursor exactly
+                // where it would have landed and drops the rest. Otherwise n
+                // reaches u32::MAX and this loop runs for a minute.
+                let width = (left_and_right_margins.end - left_and_right_margins.start).max(1);
+                let saturated = width
+                    .saturating_mul(self.screen().physical_rows + self.config.scrollback_size());
+                let n = n as usize;
+                let n = if n > saturated {
+                    saturated + (n % width)
+                } else {
+                    n
                 };
 
                 for _ in 0..n {
@@ -2381,11 +2411,17 @@ impl TerminalState {
             }
 
             Cursor::ForwardTabulation(n) => {
+                // Each tab moves at least one column and then sticks at the
+                // right margin, so more tabs than there are columns cannot move
+                // the cursor any further; n reaches u32::MAX.
+                let n = (n as usize).min(self.screen().physical_cols);
                 for _ in 0..n {
                     self.c0_horizontal_tab();
                 }
             }
             Cursor::BackwardTabulation(n) => {
+                // Likewise, but sticking at column zero.
+                let n = (n as usize).min(self.screen().physical_cols);
                 for _ in 0..n {
                     let x = match self.tabs.find_prev_tab_stop(self.cursor.x) {
                         Some(x) => x,
@@ -2414,12 +2450,15 @@ impl TerminalState {
             Cursor::Right(n) => {
                 // https://vt100.net/docs/vt510-rm/CUF.html
                 let cols = self.screen().physical_cols;
+                // Saturating because n reaches u32::MAX, which overflows usize
+                // on 32-bit targets before min() can clamp it.
+                let target = self.cursor.x.saturating_add(n as usize);
                 let new_x = if self.cursor.x >= self.left_and_right_margins.end {
                     // outside the margin, so allow movement to screen edge
-                    (self.cursor.x + n as usize).min(cols - 1)
+                    target.min(cols - 1)
                 } else {
                     // Else constrain to margin
-                    (self.cursor.x + n as usize).min(self.left_and_right_margins.end - 1)
+                    target.min(self.left_and_right_margins.end - 1)
                 };
 
                 self.cursor.x = new_x;
