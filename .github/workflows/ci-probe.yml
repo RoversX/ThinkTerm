@@ -11,9 +11,16 @@ name: ci-probe
 on:
   push:
     branches: ['ci/probe']
-  # The workflow_dispatch button only appears once this file reaches the default
-  # branch, so during the probe phase the push trigger above is what fires.
   workflow_dispatch:
+    inputs:
+      linux:
+        description: Probe Linux
+        type: boolean
+        default: true
+      windows:
+        description: Probe Windows
+        type: boolean
+        default: true
 
 # Cancel a superseded run when several commits are pushed back to back
 concurrency:
@@ -26,6 +33,8 @@ env:
 jobs:
   linux:
     name: linux x86_64
+    # `inputs` is empty for push events, so fall through to running everything.
+    if: github.event_name != 'workflow_dispatch' || inputs.linux
     runs-on: ubuntu-latest
     # Backstop: a hung job would otherwise burn the default 6h, which on a
     # private repo is 360 billed minutes.
@@ -75,6 +84,7 @@ jobs:
 
   windows:
     name: windows x86_64
+    if: github.event_name != 'workflow_dispatch' || inputs.windows
     runs-on: windows-2022
     # More headroom than Linux: the only datapoint we have (2026-06-06, release
     # build with sccache) was 37m42s on this runner, and Windows bills at 2x, so
