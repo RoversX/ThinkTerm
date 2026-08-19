@@ -92,15 +92,19 @@ fn linux_read_commands() -> Vec<(&'static str, &'static [&'static str])> {
     commands
 }
 
+// clipboard-win reports failures as error_code::ErrorCode, which does not
+// implement std::error::Error, so anyhow's Context is not applicable here.
 #[cfg(windows)]
 fn platform_write(bytes: &[u8]) -> Result<()> {
     let text = String::from_utf8(bytes.to_vec()).context("clipboard text is not UTF-8")?;
-    clipboard_win::set_clipboard_string(&text).context("write Windows clipboard")
+    clipboard_win::set_clipboard_string(&text)
+        .map_err(|err| anyhow::anyhow!("write Windows clipboard: {err}"))
 }
 
 #[cfg(windows)]
 fn platform_read() -> Result<Vec<u8>> {
-    let text = clipboard_win::get_clipboard_string().context("read Windows clipboard")?;
+    let text = clipboard_win::get_clipboard_string()
+        .map_err(|err| anyhow::anyhow!("read Windows clipboard: {err}"))?;
     Ok(text.into_bytes())
 }
 
