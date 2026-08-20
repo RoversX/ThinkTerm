@@ -1684,7 +1684,22 @@ impl ClientDomain {
             .ok_or_else(|| anyhow!("domain {domain_id} disappeared during reattach"))?;
 
         ui.output_str("Checking server version and restoring client identity\n");
-        let server = inner.client.verify_version_compat(&ui).await?;
+        let server = match inner.client.verify_version_compat(&ui).await {
+            Ok(server) => server,
+            Err(err) => {
+                // A version mismatch cannot be fixed by reconnecting: the
+                // transport comes up fine every time and this check fails
+                // every time. Tell the reconnect loop to surface it and
+                // stop, instead of cycling "Reconnecting..." forever.
+                if err
+                    .downcast_ref::<crate::client::IncompatibleVersionError>()
+                    .is_some()
+                {
+                    inner.client.set_fatal_connection_error(format!("{err:#}"));
+                }
+                return Err(err);
+            }
+        };
         let server_replaced =
             server_runtime_replaced(prior_server_id.as_deref(), &server.server_id);
         if inner.client.connection_generation() != connection_generation {

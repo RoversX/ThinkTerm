@@ -32,7 +32,7 @@ use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::channel;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -188,6 +188,13 @@ pub struct Client {
     /// reconnect gets a fresh value so queued unilateral messages from the
     /// superseded reader cannot be mistaken for current server state.
     connection_generation: Arc<AtomicU64>,
+    /// Set when a reconnect cycle hits an error that retrying can never fix
+    /// (a codec version mismatch). The transport reconnects fine in that
+    /// state, so without this the loop would cycle "Reconnecting..."
+    /// forever, showing the real error only to a headless UI. The reconnect
+    /// loop checks it after every dead session, surfaces it in a visible
+    /// window, and stops.
+    fatal_connection_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Client {
@@ -1510,6 +1517,8 @@ impl Client {
         let remote_server_id = Arc::new(RwLock::new(None));
         let connection_generation = Arc::new(AtomicU64::new(0));
         let reader_connection_generation = Arc::clone(&connection_generation);
+        let fatal_connection_error = Arc::new(Mutex::new(None));
+        let reader_fatal_connection_error = Arc::clone(&fatal_connection_error);
 
         thread::spawn(move || {
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
@@ -1608,6 +1617,19 @@ impl Client {
 
                     if let Some(err) = e.root_cause().downcast_ref::<NotReconnectableError>() {
                         log::error!("{}; won't try to reconnect", err);
+                        break;
+                    }
+
+                    // A fatal error reported by the reattach task (codec
+                    // version mismatch). The transport itself reconnects
+                    // fine, so retrying would cycle forever with the real
+                    // error visible only to a headless UI; show it in a
+                    // window of its own and stop.
+                    if let Some(reason) = reader_fatal_connection_error.lock().unwrap().take() {
+                        log::error!("{reason}; won't try to reconnect");
+                        let ui = ConnectionUI::new_with_no_close_delay();
+                        ui.title("ThinkTerm: connection failed");
+                        ui.output_str(&format!("{reason}\n"));
                         break;
                     }
 
@@ -1842,7 +1864,18 @@ impl Client {
             resume_reconnect_tx,
             remote_server_id,
             connection_generation,
+            fatal_connection_error,
         }
+    }
+
+    /// Mark the connection as failed in a way no amount of retrying can fix.
+    /// The reconnect loop surfaces the reason and stops after the current
+    /// session dies.
+    pub fn set_fatal_connection_error(&self, reason: String) {
+        self.fatal_connection_error
+            .lock()
+            .unwrap()
+            .replace(reason);
     }
 
     pub fn into_client_domain_config(self) -> ClientDomainConfig {
