@@ -14,26 +14,43 @@ NOTARY_PROFILE=${MACOS_NOTARY_PROFILE:-thinkterm}
 
 usage() {
   cat <<EOT
-usage: ci/macos-package.sh [adhoc|developerid] [tag]
+usage: ci/macos-package.sh [--build] [adhoc|developerid] [tag]
 
+  --build       Run \`cargo build --release\` before packaging.
   adhoc         Self-signed.  Fast and offline, but Gatekeeper rejects the
                 result everywhere except the machine that built it.
   developerid   Developer ID signature, notarization and stapling.  Needs
                 network and an Apple Developer account; opens on any Mac.
 
-Both arguments are optional -- you are prompted for whatever is missing.
+Both positional arguments are optional -- you are prompted for whatever is
+missing.
 EOT
 }
 
+# --build is orthogonal to the signing mode, so it is a flag rather than a
+# third mode.  ci/deploy.sh only copies whatever target/release already holds,
+# which makes the package exactly as old as the last build -- and a partial
+# \`cargo build -p wezterm-gui\` refreshes two of the five binaries and leaves a
+# bundle whose parts come from different commits.
+BUILD=no
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --build)
+      BUILD=yes
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 MODE=${1:-}
 TAG=${2:-${TAG_NAME:-}}
-
-case "$MODE" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-esac
 
 if [[ -z "$MODE" ]]; then
   cat <<'EOT'
@@ -47,15 +64,25 @@ ThinkTerm macOS packaging
      Signs with your Developer ID certificate, submits to Apple, staples
      the ticket into the bundle.  Uploads ~60MB and takes a few minutes.
      Opens on any Mac with no warning, and needs no network to verify.
+     Packages the binaries already in target/release, whatever their age.
+
+  3) Build, then Developer ID + notarized
+     Everything option 2 does, but compiles all five binaries first so the
+     bundle cannot carry a mix of commits.  This is the one to use for a
+     release.
 
 EOT
   while [[ -z "$MODE" ]]; do
-    printf "Select [1/2]: "
+    printf "Select [1/2/3]: "
     read -r reply || { echo; exit 1; }
     case "$reply" in
       1) MODE=adhoc ;;
       2) MODE=developerid ;;
-      *) echo "Enter 1 or 2." ;;
+      3)
+        MODE=developerid
+        BUILD=yes
+        ;;
+      *) echo "Enter 1, 2 or 3." ;;
     esac
   done
   echo
@@ -107,19 +134,9 @@ fi
 
 echo "==> Checking prerequisites"
 
-# Catch a missing build here rather than letting deploy.sh fail halfway through
-# assembling a bundle it cannot populate.
-missing=
-for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes; do
-  [[ -f "target/release/$bin" ]] || missing="$missing $bin"
-done
-if [[ -n "$missing" ]]; then
-  echo "Missing release binaries:$missing" >&2
-  echo "Build them first:  cargo build --release" >&2
-  exit 1
-fi
-echo "    release binaries: present"
-
+# The certificate and the notary round trip come first: they are cheap, and
+# failing them after a fifteen minute --build would be the worst possible
+# ordering.
 if [[ "$MODE" == developerid ]]; then
   identity=$(resolve_signing_identity "Developer ID Application")
   team=$(team_id_from_identity "$identity")
@@ -143,6 +160,57 @@ EOT
     exit 1
   fi
   echo "    notarization credentials: profile '$NOTARY_PROFILE' works"
+fi
+
+BINARIES="wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes"
+
+if [[ "$BUILD" == yes ]]; then
+  echo
+  echo "==> Building"
+  # No -p: every binary the bundle carries has to come from the same tree.
+  cargo build --release
+  echo
+  echo "==> Checking prerequisites (continued)"
+fi
+
+# Catch a missing build here rather than letting deploy.sh fail halfway through
+# assembling a bundle it cannot populate.
+missing=
+for bin in $BINARIES; do
+  [[ -f "target/release/$bin" ]] || missing="$missing $bin"
+done
+if [[ -n "$missing" ]]; then
+  echo "Missing release binaries:$missing" >&2
+  echo "Build them first with 'cargo build --release', or re-run with" >&2
+  echo "--build to have this script do it." >&2
+  exit 1
+fi
+
+if [[ "$BUILD" == yes ]]; then
+  echo "    release binaries: just built"
+else
+  # deploy.sh copies each binary independently, so a bundle can quietly carry
+  # binaries from different commits: a partial `cargo build -p wezterm-gui`
+  # refreshes two of these five and leaves the other three behind, and the
+  # result is an app whose --version disagrees with its own terminal code.
+  # Anything older than the current commit gets named here rather than
+  # discovered later.
+  head_time=$(git log -1 --format=%ct 2>/dev/null || true)
+  stale=
+  if [[ -n "$head_time" ]]; then
+    for bin in $BINARIES; do
+      [[ "$(stat -f %m "target/release/$bin")" -lt "$head_time" ]] &&
+        stale="$stale $bin"
+    done
+  fi
+  if [[ -n "$stale" ]]; then
+    echo "    release binaries: PRESENT BUT OLDER THAN HEAD --$stale"
+    echo "    HEAD is $(git log -1 --format='%h %s')"
+    echo "    Re-run with --build, or with option 3, unless you know those"
+    echo "    binaries do not depend on anything that has changed since."
+  else
+    echo "    release binaries: present, none older than HEAD"
+  fi
 fi
 
 # The tag keeps its v so it matches the GitHub release, but the filename drops
