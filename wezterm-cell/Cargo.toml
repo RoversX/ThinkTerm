@@ -23,6 +23,15 @@ wezterm-color-types.workspace = true
 wezterm-escape-parser.workspace = true
 wezterm-dynamic.workspace = true
 
+# sha2 only takes its aarch64 hardware-SHA path behind the `asm` feature
+# (x86 enables hardware unconditionally; the asymmetry is sha2's, not ours).
+# Scoped to aarch64 so `sha2-asm` (a C crate) never enters the wasm sentinel
+# or cross-build dependency graphs. The aarch64 implementation is actually
+# pure-Rust intrinsics with runtime detection; sha2-asm just rides along as
+# the feature's carrier.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = {workspace=true, optional=true, features=["asm"]}
+
 [features]
 std = ["serde/std", "wezterm-char-props/std", "wezterm-color-types/std", "wezterm-escape-parser/std", "wezterm-dynamic/std", "finl_unicode/std"]
 use_serde = ["dep:serde", "wezterm-color-types/use_serde"]

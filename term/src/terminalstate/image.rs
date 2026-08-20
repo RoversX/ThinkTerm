@@ -262,8 +262,13 @@ impl TerminalState {
         if let Some(item) = self.image_cache.get(&key) {
             Ok(Arc::clone(item))
         } else {
+            // swap_out preserves the hash byte-for-byte (Rgba8/AnimRgba8
+            // pass through; EncodedFile becomes an EncodedLease whose
+            // ContentId is the same SHA-256 of the same bytes), so the key
+            // computed for the cache lookup above is reused instead of
+            // hashing the full payload a second time.
             let data = data.swap_out()?;
-            let image_data = Arc::new(ImageData::with_data(data));
+            let image_data = Arc::new(ImageData::with_data_and_hash(data, key));
             self.image_cache.put(key, Arc::clone(&image_data));
             Ok(image_data)
         }

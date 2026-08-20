@@ -308,7 +308,21 @@ impl ImageDataType {
         match self {
             ImageDataType::EncodedFile(data) => hasher.update(data),
             ImageDataType::EncodedLease(lease) => return lease.content_id().as_hash_bytes(),
-            ImageDataType::Rgba8 { data, .. } => hasher.update(data),
+            ImageDataType::Rgba8 { data, hash, .. } => {
+                // The stored hash IS hash_bytes(data): the only constructor
+                // computes it and every in-place pixel edit refreshes it
+                // (see terminalstate/kitty.rs), so full-frame payloads are
+                // not re-hashed here — at video-like kitty frame rates that
+                // second SHA-256 dominated the pty read thread. The debug
+                // assert turns any future forgotten refresh into a loud
+                // test failure instead of a stale-image glitch.
+                debug_assert_eq!(
+                    *hash,
+                    Self::hash_bytes(data),
+                    "Rgba8 hash field is stale; a pixel mutation forgot to refresh it"
+                );
+                return *hash;
+            }
             ImageDataType::AnimRgba8 {
                 frames, durations, ..
             } => {
@@ -553,7 +567,11 @@ impl ImageData {
         Self::with_data_and_hash(ImageDataType::EncodedFile(data).decode(), hash)
     }
 
-    fn with_data_and_hash(data: ImageDataType, hash: [u8; 32]) -> Self {
+    /// `hash` must equal `data.compute_hash()`; the caller supplies it to
+    /// avoid re-hashing image payloads that were already hashed for cache
+    /// lookup (a full-frame SHA-256 per kitty transmission otherwise runs
+    /// twice on the pty read thread while it holds the terminal lock).
+    pub fn with_data_and_hash(data: ImageDataType, hash: [u8; 32]) -> Self {
         Self {
             data: Mutex::new(data),
             hash,
