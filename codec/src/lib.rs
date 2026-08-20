@@ -1698,6 +1698,45 @@ mod golden {
     ];
     const LAYOUT_JSON: &str = r#"["Empty",{"Split":{"left":{"Leaf":{"window_id":1,"tab_id":2,"pane_id":3,"title":"left","size":{"rows":24,"cols":80,"pixel_width":640,"pixel_height":384,"dpi":96},"working_dir":"file:///tmp/x","is_active_pane":true,"is_zoomed_pane":false,"alt_screen":true,"workspace":"default","cursor_pos":{"x":0,"y":0,"shape":"Default","visibility":"Visible"},"physical_top":-3,"top_row":0,"left_col":0,"tty_name":"/dev/ttys001"}},"right":{"Stack":{"active":0,"panes":[{"window_id":1,"tab_id":2,"pane_id":4,"title":"stacked","size":{"rows":24,"cols":80,"pixel_width":640,"pixel_height":384,"dpi":96},"working_dir":"file:///tmp/x","is_active_pane":true,"is_zoomed_pane":false,"alt_screen":true,"workspace":"default","cursor_pos":{"x":0,"y":0,"shape":"Default","visibility":"Visible"},"physical_top":-3,"top_row":0,"left_col":0,"tty_name":"/dev/ttys001"}],"pane_stack_id":7}},"node":{"direction":"Horizontal","first":{"rows":24,"cols":40,"pixel_width":320,"pixel_height":384,"dpi":96},"second":{"rows":24,"cols":39,"pixel_width":312,"pixel_height":384,"dpi":96}}}}]"#;
 
+    fn command_spec() -> CommandSpec {
+        use thinkterm_proto::EnvVar;
+        CommandSpec {
+            args: vec![b"prog".to_vec(), vec![0x66, 0x80, 0x6f]],
+            env: vec![
+                EnvVar {
+                    key: b"PATH".to_vec(),
+                    value: b"/usr/bin".to_vec(),
+                    is_from_base_env: true,
+                },
+                EnvVar {
+                    key: b"FOO".to_vec(),
+                    value: b"bar".to_vec(),
+                    is_from_base_env: false,
+                },
+            ],
+            cwd: Some(b"/tmp".to_vec()),
+            umask: Some(0o022),
+            controlling_tty: false,
+        }
+    }
+
+    // The v60 baseline for CommandSpec, captured when the type was
+    // introduced. The other literals guard against changing an old format;
+    // this one guards against accidentally changing the new one.
+    const COMMAND_SPEC: &[u8] = &[
+        2, 4, 112, 114, 111, 103, 3, 102, 128, 111, 2, 4, 80, 65, 84, 72, 8, 47, 117, 115, 114,
+        47, 98, 105, 110, 1, 3, 70, 79, 79, 3, 98, 97, 114, 0, 1, 4, 47, 116, 109, 112, 1, 18, 0,
+    ];
+
+    #[test]
+    fn command_spec_bytes_are_stable() {
+        assert_eq!(varbincode_bytes(&command_spec()), COMMAND_SPEC);
+        let mut r = COMMAND_SPEC;
+        let mut de = varbincode::Deserializer::new(&mut r);
+        let back: CommandSpec = serde::Deserialize::deserialize(&mut de).unwrap();
+        assert_eq!(back, command_spec());
+    }
+
     #[test]
     fn wire_bytes_are_stable() {
         assert_eq!(varbincode_bytes(&list_panes_response()), LIST_PANES);

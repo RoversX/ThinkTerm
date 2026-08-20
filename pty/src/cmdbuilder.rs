@@ -810,6 +810,31 @@ fn is_cwd_relative_path<P: AsRef<Path>>(p: P) -> bool {
 mod tests {
     use super::*;
 
+    /// Deliberately exhaustive: adding a field to CommandBuilder makes this
+    /// stop compiling. That is the point -- the wire conversion in
+    /// mux/src/command_spec.rs will not carry a field it has never heard
+    /// of, and nothing else would tell you. When this breaks, either carry
+    /// the new field in thinkterm_proto::CommandSpec (and bump
+    /// CODEC_VERSION) or record here why it does not travel.
+    #[test]
+    fn every_field_is_accounted_for_on_the_wire() {
+        #[cfg(unix)]
+        let CommandBuilder {
+            args: _,
+            envs: _,
+            cwd: _,
+            umask: _,
+            controlling_tty: _,
+        } = CommandBuilder::new("prog");
+        #[cfg(not(unix))]
+        let CommandBuilder {
+            args: _,
+            envs: _,
+            cwd: _,
+            controlling_tty: _,
+        } = CommandBuilder::new("prog");
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_cwd_relative() {
