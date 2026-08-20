@@ -381,6 +381,11 @@ impl crate::TermWindow {
         &self,
         mut view: workspace_threads::WorkspaceThreadsView,
     ) -> workspace_threads::WorkspaceThreadsView {
+        // A collection is a hand-curated list; hiding rows by work status
+        // would blank it with no explanation.
+        if crate::workspace_threads::is_collection_space(self.workspace_sidebar_space_id()) {
+            return view;
+        }
         let hidden = crate::native_settings::workspace_sidebar_hidden_statuses()
             .iter()
             .filter_map(|key| workspace_threads::WorkspaceThreadWorkStatus::from_settings_key(key))
@@ -1547,11 +1552,18 @@ impl crate::TermWindow {
                     label_icon_size,
                     muted_fg,
                 )?;
+                let section_label = if crate::workspace_threads::is_collection_space(
+                    self.workspace_sidebar_space_id(),
+                ) {
+                    crate::i18n::tr("sidebar-collection-threads")
+                } else {
+                    crate::i18n::tr("sidebar-pinned")
+                };
                 self.paint_sidebar_text(
                     layers,
                     &ui_font,
                     ui_metrics,
-                    &crate::i18n::tr("sidebar-pinned"),
+                    &section_label,
                     label_text_x,
                     label_y + ((session_row_height.saturating_sub(ui_cell_height)) / 2),
                     item_x
@@ -1666,20 +1678,40 @@ impl crate::TermWindow {
                     )?;
 
                     if is_hovered && !is_renaming_session {
-                        for (x, item_type, icon, _context_name) in [
+                        // In a collection Space the pin toggle would mutate
+                        // the origin thread; only removal makes sense there.
+                        let in_collection = crate::workspace_threads::is_collection_space(
+                            self.workspace_sidebar_space_id(),
+                        );
+                        // An X, not a trash can: the affordance removes the
+                        // reference, the origin thread keeps running.
+                        let mut affordances = vec![if in_collection {
                             (
-                                pin_x,
-                                UIItemType::WorkspaceThreadPin(session.id.clone()),
-                                SvgIcon::PinOff,
-                                "sidebar unpin pinned thread button",
-                            ),
+                                delete_x,
+                                UIItemType::WorkspaceThreadDelete(session.id.clone()),
+                                SvgIcon::X,
+                                "sidebar remove collection reference button",
+                            )
+                        } else {
                             (
                                 delete_x,
                                 UIItemType::WorkspaceThreadDelete(session.id.clone()),
                                 SvgIcon::Trash2,
                                 "sidebar delete pinned thread button",
-                            ),
-                        ] {
+                            )
+                        }];
+                        if !in_collection {
+                            affordances.insert(
+                                0,
+                                (
+                                    pin_x,
+                                    UIItemType::WorkspaceThreadPin(session.id.clone()),
+                                    SvgIcon::PinOff,
+                                    "sidebar unpin pinned thread button",
+                                ),
+                            );
+                        }
+                        for (x, item_type, icon, _context_name) in affordances {
                             let hovered =
                                 self.is_pointer_over_ui_rect(x, action_y, action_size, action_size);
                             self.ui_items.push(UIItem {

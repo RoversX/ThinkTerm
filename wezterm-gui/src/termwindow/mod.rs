@@ -430,6 +430,19 @@ pub(crate) enum ContextMenuApplicationAction {
     },
     /// Sidebar view-options: show/hide threads with this work status.
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
+    /// Add a thread reference to a collection Space; `None` creates the
+    /// first collection Space and adds there.
+    AddThreadToCollection {
+        collection_space_id: Option<String>,
+        thread_id: String,
+    },
+    /// Drop a thread reference from a collection Space.
+    RemoveThreadFromCollection {
+        collection_space_id: String,
+        thread_id: String,
+    },
+    /// Space menu: create a collection Space and switch to it.
+    CreateCollectionSpace,
     /// Fetch a file from the remote Files panel into the Downloads folder.
     DownloadRemoteFile {
         path: remote_files::RemotePath,

@@ -1689,12 +1689,26 @@ impl super::TermWindow {
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return;
         };
+        let space_id = self.space_id_for_layout_snapshot(window.get_workspace());
         crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
-            &self.active_space_id,
+            &space_id,
             window.get_workspace(),
             self.mux_window_id,
             |pane_id| self.persisted_font_scale_for_pane(pane_id),
         );
+    }
+
+    /// The Space a layout snapshot should be recorded under. A collection
+    /// Space window displays workspaces that belong to other Spaces, and the
+    /// snapshot store refuses a Space/workspace mismatch — so resolve the
+    /// workspace's own Space there; everywhere else the window's Space is it.
+    fn space_id_for_layout_snapshot(&self, workspace: &str) -> String {
+        if crate::workspace_threads::is_collection_space(&self.active_space_id) {
+            if let Some(space_id) = crate::workspace_threads::space_id_for_workspace(workspace) {
+                return space_id;
+            }
+        }
+        self.active_space_id.clone()
     }
 
     fn persist_workspace_pane_font_scales(&self) {
@@ -1702,8 +1716,9 @@ impl super::TermWindow {
         let Some(window) = mux.get_window(self.mux_window_id) else {
             return;
         };
+        let space_id = self.space_id_for_layout_snapshot(window.get_workspace());
         crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
-            &self.active_space_id,
+            &space_id,
             window.get_workspace(),
             self.mux_window_id,
             |pane_id| self.persisted_font_scale_for_pane(pane_id),

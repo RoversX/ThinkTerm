@@ -227,6 +227,33 @@ impl crate::TermWindow {
             ) => {
                 self.toggle_workspace_sidebar_status_filter(status);
             }
+            crate::termwindow::ContextMenuApplicationAction::AddThreadToCollection {
+                collection_space_id,
+                thread_id,
+            } => {
+                let collection_space_id = collection_space_id
+                    .unwrap_or_else(|| crate::workspace_threads::create_collection_space(None));
+                if crate::workspace_threads::add_thread_ref(&collection_space_id, &thread_id) {
+                    self.invalidate_window();
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::RemoveThreadFromCollection {
+                collection_space_id,
+                thread_id,
+            } => {
+                if crate::workspace_threads::remove_thread_ref(&collection_space_id, &thread_id) {
+                    self.invalidate_window();
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::CreateCollectionSpace => {
+                let Some(window) = self.window.clone() else {
+                    return;
+                };
+                let space_id = crate::workspace_threads::create_collection_space(None);
+                self.switch_space(space_id.clone(), &window);
+                self.prompt_rename_space(space_id);
+                window.invalidate();
+            }
             crate::termwindow::ContextMenuApplicationAction::DownloadRemoteFile {
                 path,
                 origin,

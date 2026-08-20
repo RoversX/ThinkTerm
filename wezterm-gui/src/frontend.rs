@@ -715,10 +715,11 @@ impl GuiFrontEnd {
         let thread_id = crate::workspace_threads::ensure_active_thread_for_space(space_id)
             .ok_or_else(|| anyhow!("failed to ensure active thread for Space {space_id}"))?;
         let live_workspaces = mux.iter_workspaces();
-        let plan = crate::workspace_threads::activate_thread_record(&thread_id, &live_workspaces)
-            .ok_or_else(|| {
-            anyhow!("failed to activate thread {thread_id} for Space {space_id}")
-        })?;
+        let plan =
+            crate::workspace_threads::activate_thread_record(&thread_id, &live_workspaces, true)
+                .ok_or_else(|| {
+                    anyhow!("failed to activate thread {thread_id} for Space {space_id}")
+                })?;
         let created_mux_window = plan.needs_materialize;
 
         if plan.needs_materialize {
