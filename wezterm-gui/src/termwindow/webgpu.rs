@@ -451,6 +451,22 @@ impl WebGpuState {
             })
             .await?;
 
+        // wgpu's default reaction to an uncaptured error is to abort the
+        // process. A validation error during a paint is recoverable — at
+        // worst one garbled frame — and this has killed the app repeatedly
+        // under video-rate kitty streams, so log it (its text names the
+        // actual offender) and keep running. OutOfMemory/Internal are a
+        // different story: the device is in no state to keep rendering, and
+        // limping on would just be a silent blank window — die loudly.
+        device.on_uncaptured_error(Box::new(|err| match &err {
+            wgpu::Error::Validation { .. } => {
+                log::error!("wgpu validation error (continuing): {err}");
+            }
+            _ => {
+                panic!("fatal wgpu error: {err}");
+            }
+        }));
+
         let queue = Arc::new(queue);
 
         // Explicitly request an SRGB format, if available

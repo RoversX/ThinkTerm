@@ -812,6 +812,12 @@ impl crate::TermWindow {
                         }
                     } else {
                         log::error!("paint_pass failed: {:#}", err);
+                        // The frame is half-built: quads reference state from
+                        // the aborted pass, and submitting them is what used
+                        // to trip wgpu validation (index buffer overrun) and
+                        // abort the process. Skip presenting, exactly like
+                        // the shape-retry cap above.
+                        present_frame = false;
                         break 'pass;
                     }
                 }
@@ -2678,6 +2684,107 @@ impl crate::TermWindow {
 
     /// Floating label that follows the cursor during a drag. Painted after
     /// everything else so it stays on top; registers no UIItem.
+    /// Name tag for an icon-only button the pointer has been resting on.
+    ///
+    /// Anchored beside the button rather than under the pointer: the pointer
+    /// is already sitting on the icon, so a tag placed under it would cover
+    /// the very thing it names.
+    fn paint_hover_tooltip(&mut self) -> anyhow::Result<()> {
+        let Some(hover) = self.hover_tooltip.clone() else {
+            return Ok(());
+        };
+        let remaining = crate::termwindow::TOOLTIP_DELAY.saturating_sub(hover.since.elapsed());
+        if !remaining.is_zero() {
+            // Ask for the frame that will find the delay elapsed. This has to
+            // happen here and not where the pointer arrived: paint_impl clears
+            // has_animation on entry, so a deadline registered from the mouse
+            // handler is wiped before anything can read it, and the tag would
+            // then only appear when some unrelated event forced a repaint.
+            self.update_next_frame_time(Some(Instant::now() + remaining));
+            return Ok(());
+        }
+        let Some(label) = crate::termwindow::tooltip_label_for(&hover.item.item_type) else {
+            return Ok(());
+        };
+
+        let settings = crate::native_settings::load_shared();
+        let font_size = crate::native_settings::home_font_size(&settings);
+        let ui_font = self
+            .fonts
+            .title_font_with_size(font_size)
+            .context("hover tooltip font")?;
+        let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&ui_font.metrics());
+        let line_height = metrics.cell_size.height as f32;
+
+        // From the shared chrome palette, not a hand-picked grey: the tag sits
+        // directly against the sidebar it overhangs, so anything lighter than
+        // the sidebar's own controls reads as a foreign surface.
+        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::TOOLTIP_ZINDEX)
+            .context("hover tooltip layer")?;
+        let mut layers = layer.quad_allocator();
+
+        let ctx = DrawContext::new(gl_state, self.dimensions, &metrics);
+        let max_width = (self.dimensions.pixel_width as f32 * 0.4).max(80.0);
+        let display_text = ctx.text_with_ellipsis(&ui_font, &label, max_width);
+        let text_width = ctx
+            .measure_text_width(&ui_font, &display_text)
+            .min(max_width);
+
+        let pad_x = self.ui_f32(8.0);
+        let pad_y = self.ui_f32(4.0);
+        let gap = self.ui_f32(8.0);
+        let tip_w = text_width + pad_x * 2.0;
+        let tip_h = line_height + pad_y * 2.0;
+
+        let (bx, by, bw, bh) = (
+            hover.item.x as f32,
+            hover.item.y as f32,
+            hover.item.width as f32,
+            hover.item.height as f32,
+        );
+        let window_w = self.dimensions.pixel_width as f32;
+        let window_h = self.dimensions.pixel_height as f32;
+
+        // Above the button, centred on it. Beside it would sit on top of the
+        // neighbouring buttons in the same row — these are laid out
+        // horizontally, so the only free direction is up. Flip below when
+        // there is no room above.
+        let x = (bx + (bw - tip_w) / 2.0).clamp(0.0, (window_w - tip_w).max(0.0));
+        let y = if by - gap - tip_h >= 0.0 {
+            by - gap - tip_h
+        } else {
+            (by + bh + gap).min((window_h - tip_h).max(0.0))
+        };
+
+        self.fill_rounded_rectangle_with_border(
+            &mut layers,
+            0,
+            euclid::rect(x, y, tip_w, tip_h),
+            chrome.control_bg,
+            chrome.control_border,
+            self.ui_f32(6.0),
+            1.0,
+        )
+        .context("hover tooltip background")?;
+        ctx.draw_text_on_layer(
+            &mut layers,
+            2,
+            &ui_font,
+            x + pad_x,
+            y + pad_y,
+            &display_text,
+            chrome.text,
+            max_width,
+        )
+        .context("hover tooltip label")?;
+
+        Ok(())
+    }
+
     fn paint_drag_ghost_pill(
         &mut self,
         label: &str,
@@ -3690,6 +3797,9 @@ impl crate::TermWindow {
             .context("paint_sidebar_row_drag_overlay")?;
         self.paint_file_drag_ghost()
             .context("paint_file_drag_ghost")?;
+        // Last, so the tag sits above every chrome surface it might overhang.
+        self.paint_hover_tooltip()
+            .context("paint_hover_tooltip")?;
 
         Ok(())
     }
