@@ -6043,12 +6043,28 @@ impl super::TermWindow {
                             Some(domain) => domain,
                             None => crate::connect_domain_from_ssh_host(&domain_name)?,
                         };
-                        domain.attach(Some(mux_window_id)).await?;
-                        anyhow::Ok(())
+                        let ui = mux::connui::ConnectionUI::with_params(
+                            mux::connui::ConnectionUIParams {
+                                window_id: Some(mux_window_id),
+                                ..Default::default()
+                            },
+                        );
+                        let outcome = crate::attach_domain_with_retry(
+                            domain,
+                            Some(mux_window_id),
+                            ui,
+                            move || Mux::get().get_window(mux_window_id).is_some(),
+                            Some(std::time::Duration::from_secs(60)),
+                        )
+                        .await?;
+                        anyhow::Ok(matches!(outcome, crate::AttachRetryOutcome::Attached))
                     }
                     .await;
                     match result {
-                        Ok(()) => {
+                        // Cancelled (the hosting window went away mid-retry)
+                        // leaves nothing to activate.
+                        Ok(false) => {}
+                        Ok(true) => {
                             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                                 if let Some(win) = term_window.window.clone() {
                                     term_window.activate_workspace_thread_impl(

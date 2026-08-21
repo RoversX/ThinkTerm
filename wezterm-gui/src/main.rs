@@ -296,16 +296,39 @@ fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<Stri
     }
 }
 
-/// Backoff for a retrying in-window connection, waking frequently enough that
-/// closing the empty ConnectionUI window is a real cancellation rather than a
-/// hidden retry loop that keeps the process alive.
-async fn wait_connect_backoff_while_window_exists(
-    window_id: mux::window::WindowId,
+/// Errors that no amount of retrying can fix: the user declined an auth
+/// prompt, or the server speaks an incompatible codec version. Everything
+/// else on the attach path (a VPN route that is not up yet, a stalled
+/// handshake, losing the race against a concurrent attach) can succeed on
+/// a later attempt.
+///
+/// Walks the whole chain rather than just the root cause, so that adding a
+/// `.context()` anywhere on the way up cannot silently disable it.
+pub(crate) fn is_fatal_attach_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<mux::ssh::AuthCancelledError>().is_some()
+            || cause
+                .downcast_ref::<wezterm_client::client::IncompatibleVersionError>()
+                .is_some()
+    })
+}
+
+pub(crate) enum AttachRetryOutcome {
+    Attached,
+    /// `keep_going` said stop before the domain attached; the UI has been
+    /// closed and the domain is still detached.
+    Cancelled,
+}
+
+/// Backoff sleep that wakes frequently enough for `keep_going` turning
+/// false to be a real cancellation rather than a hidden retry loop.
+async fn wait_attach_backoff(
+    keep_going: &mut impl FnMut() -> bool,
     duration: std::time::Duration,
 ) -> bool {
     let deadline = std::time::Instant::now() + duration;
     loop {
-        if Mux::get().get_window(window_id).is_none() {
+        if !keep_going() {
             return false;
         }
         let now = std::time::Instant::now();
@@ -318,6 +341,92 @@ async fn wait_connect_backoff_while_window_exists(
                 .min(std::time::Duration::from_millis(100)),
         )
         .await;
+    }
+}
+
+/// Attach `domain`, retrying transient failures with exponential backoff.
+/// Transient network failures (a VPN whose routes are not up yet at login,
+/// egress rotation, sleepy wifi) are common on the way to a remote mux.
+///
+/// The caller supplies one ConnectionUI that hosts every attempt;
+/// per-attempt UIs (which is what plain `Domain::attach` creates) would
+/// pile up as dead tabs, because the attach failure path deliberately
+/// leaves the UI open to show the error. That also means: on Err the UI is
+/// still open displaying the failure, on Ok it has been closed.
+///
+/// Fatal errors are returned immediately; transient ones are returned once
+/// `max_total` has elapsed (`None` retries until cancelled).
+pub(crate) async fn attach_domain_with_retry(
+    domain: Arc<dyn Domain>,
+    window_id: Option<mux::window::WindowId>,
+    ui: mux::connui::ConnectionUI,
+    mut keep_going: impl FnMut() -> bool,
+    max_total: Option<std::time::Duration>,
+) -> anyhow::Result<AttachRetryOutcome> {
+    let start = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_secs(1);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+    loop {
+        if !keep_going() {
+            ui.close();
+            return Ok(AttachRetryOutcome::Cancelled);
+        }
+        let attempt = match domain.downcast_ref::<ClientDomain>() {
+            Some(client) => client.attach_with_ui(window_id, ui.clone()).await,
+            None => domain.attach(window_id).await,
+        };
+        match attempt {
+            Ok(()) => return Ok(AttachRetryOutcome::Attached),
+            Err(err) if is_fatal_attach_error(&err) => return Err(err),
+            Err(err) => {
+                if max_total.map_or(false, |limit| start.elapsed() + backoff >= limit) {
+                    return Err(err);
+                }
+                log::error!(
+                    "attaching {} failed: {err:#}; retrying in {backoff:?}",
+                    domain.domain_name()
+                );
+                ui.output_str(&format!("Will retry in {backoff:?}...\n"));
+                if !wait_attach_backoff(&mut keep_going, backoff).await {
+                    ui.close();
+                    return Ok(AttachRetryOutcome::Cancelled);
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod attach_retry_tests {
+    use super::is_fatal_attach_error;
+    use anyhow::{anyhow, Context};
+
+    #[test]
+    fn auth_cancelled_is_fatal_even_when_wrapped() {
+        let err = anyhow::Error::new(mux::ssh::AuthCancelledError)
+            .context("ssh session setup")
+            .context("attaching domain devbox");
+        assert!(is_fatal_attach_error(&err));
+    }
+
+    #[test]
+    fn incompatible_version_is_fatal() {
+        let err = anyhow::Error::new(wezterm_client::client::IncompatibleVersionError {
+            version: "20990101-000000-abcdef".to_string(),
+            codec_vers: 1,
+        });
+        assert!(is_fatal_attach_error(&err));
+    }
+
+    #[test]
+    fn handshake_stall_and_routing_errors_are_transient() {
+        let stalled =
+            anyhow::Error::new(wezterm_client::client::VersionHandshakeStalled { timeout_secs: 60 })
+                .context("Checking server version");
+        assert!(!is_fatal_attach_error(&stalled));
+        let no_route = anyhow!("Connection failed: No route to host (os error 65)");
+        assert!(!is_fatal_attach_error(&no_route));
     }
 }
 
@@ -599,52 +708,41 @@ pub(crate) async fn connect_domain_into_space(
     let connect_activity = mux::activity::Activity::new();
 
     // The ConnectionUI (auth prompts) appears as a tab inside this window.
-    // Transient network failures (VPN egress rotation, sleepy wifi) are
-    // common on the way to a remote mux; keep retrying with backoff instead
-    // of terminating the process on the first failed attempt. The user can
-    // bail out by closing the window.
+    // Transient failures retry with backoff instead of terminating the
+    // process; the user can bail out by closing the window. Fatal failures
+    // (auth declined, version mismatch) leave the UI open showing the error
+    // and skip the rest of the setup — the window closes itself once the
+    // ConnectionUI's close delay runs out, or when the user closes it.
     {
-        let mut backoff = std::time::Duration::from_secs(1);
-        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
-        // One ConnectionUI tab hosts every attempt; per-attempt UIs would
-        // pile up as dead tabs because the startup Activity token blocks
-        // pruning for as long as we are still retrying.
         let ui = mux::connui::ConnectionUI::with_params(mux::connui::ConnectionUIParams {
             window_id: Some(window_id),
             ..Default::default()
         });
-        loop {
-            if mux.get_window(window_id).is_none() {
-                ui.close();
-                return Ok(());
+        match attach_domain_with_retry(
+            domain.clone(),
+            Some(window_id),
+            ui.clone(),
+            move || Mux::get().get_window(window_id).is_some(),
+            None,
+        )
+        .await
+        {
+            Ok(AttachRetryOutcome::Cancelled) => return Ok(()),
+            Ok(AttachRetryOutcome::Attached) => {
+                // The transport can finish connecting just after the user
+                // closes its GUI. Do not turn that late success into a
+                // headless attached domain.
+                if mux.get_window(window_id).is_none() {
+                    ui.close();
+                    if domain.state() == DomainState::Attached {
+                        domain.detach()?;
+                    }
+                    return Ok(());
+                }
             }
-            let attempt = match domain.downcast_ref::<ClientDomain>() {
-                Some(client) => client.attach_with_ui(Some(window_id), ui.clone()).await,
-                None => domain.attach(Some(window_id)).await,
-            };
-            match attempt {
-                Ok(()) => {
-                    // The transport can finish connecting just after the user
-                    // closes its GUI. Do not turn that late success into a
-                    // headless attached domain.
-                    if mux.get_window(window_id).is_none() {
-                        ui.close();
-                        if domain.state() == DomainState::Attached {
-                            domain.detach()?;
-                        }
-                        return Ok(());
-                    }
-                    break;
-                }
-                Err(err) => {
-                    log::error!("attaching {domain_name} failed: {err:#}; retrying in {backoff:?}");
-                    ui.output_str(&format!("Will retry in {backoff:?}...\n"));
-                    if !wait_connect_backoff_while_window_exists(window_id, backoff).await {
-                        ui.close();
-                        return Ok(());
-                    }
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                }
+            Err(err) => {
+                log::error!("attaching {domain_name} failed: {err:#}");
+                return Ok(());
             }
         }
     }
@@ -729,11 +827,53 @@ pub(crate) async fn connect_domain_into_space(
 
 async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
     let mux = Mux::get();
-    let domains = mux.iter_domains();
-    for dom in domains {
-        if let Some(dom) = dom.downcast_ref::<ClientDomain>() {
-            if dom.connect_automatically() {
-                dom.attach(None).await?;
+    for dom in mux.iter_domains() {
+        let Some(client) = dom.downcast_ref::<ClientDomain>() else {
+            continue;
+        };
+        if !client.connect_automatically() {
+            continue;
+        }
+        // One UI (its own window, since no GUI window exists yet) hosts the
+        // first attempt and any background retries for this domain.
+        let ui = mux::connui::ConnectionUI::with_params(Default::default());
+        // The first attempt stays synchronous so that, on the happy path,
+        // auto-connected domains are live before the first GUI window opens
+        // (their windows adopt/fold correctly instead of racing startup).
+        match client.attach_with_ui(None, ui.clone()).await {
+            Ok(()) => {}
+            Err(err) if is_fatal_attach_error(&err) => {
+                log::error!("auto-connect {}: {err:#}", dom.domain_name());
+            }
+            Err(err) => {
+                // A domain that is unreachable at login (VPN routes not up
+                // yet) must neither block GUI startup nor take the other
+                // auto-connect domains down with it: keep retrying in the
+                // background and let startup proceed.
+                log::error!(
+                    "auto-connect {}: {err:#}; retrying in the background",
+                    dom.domain_name()
+                );
+                let domain = Arc::clone(&dom);
+                let gate_domain = Arc::clone(&dom);
+                promise::spawn::spawn(async move {
+                    let name = domain.domain_name().to_string();
+                    match attach_domain_with_retry(
+                        domain,
+                        None,
+                        ui,
+                        move || gate_domain.state() == mux::domain::DomainState::Detached,
+                        Some(std::time::Duration::from_secs(60)),
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(err) => {
+                            log::error!("auto-connect {name}: giving up: {err:#}");
+                        }
+                    }
+                })
+                .detach();
             }
         }
     }

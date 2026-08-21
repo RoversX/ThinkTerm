@@ -3913,7 +3913,22 @@ impl TermWindow {
                     }
                 }
                 if domain.state() != mux::domain::DomainState::Attached {
-                    domain.attach(Some(mux_window_id)).await?;
+                    // The spinner row (space_reconnects_in_flight) stays lit
+                    // for the whole retry sequence; Cancelled just falls
+                    // through to the cleanup notify below.
+                    let ui =
+                        mux::connui::ConnectionUI::with_params(mux::connui::ConnectionUIParams {
+                            window_id: Some(mux_window_id),
+                            ..Default::default()
+                        });
+                    crate::attach_domain_with_retry(
+                        domain,
+                        Some(mux_window_id),
+                        ui,
+                        move || Mux::get().get_window(mux_window_id).is_some(),
+                        Some(std::time::Duration::from_secs(60)),
+                    )
+                    .await?;
                 }
                 anyhow::Ok(())
             }
@@ -7459,7 +7474,25 @@ impl TermWindow {
                     let domain = mux
                         .get_domain_by_name(&domain)
                         .ok_or_else(|| anyhow!("{} is not a valid domain name", domain))?;
-                    domain.attach(Some(window)).await?;
+                    let ui =
+                        mux::connui::ConnectionUI::with_params(mux::connui::ConnectionUIParams {
+                            window_id: Some(window),
+                            ..Default::default()
+                        });
+                    match crate::attach_domain_with_retry(
+                        domain.clone(),
+                        Some(window),
+                        ui,
+                        move || Mux::get().get_window(window).is_some(),
+                        Some(std::time::Duration::from_secs(60)),
+                    )
+                    .await?
+                    {
+                        crate::AttachRetryOutcome::Attached => {}
+                        crate::AttachRetryOutcome::Cancelled => {
+                            return Result::<(), anyhow::Error>::Ok(())
+                        }
+                    }
 
                     let have_panes_in_domain = mux
                         .iter_panes()
