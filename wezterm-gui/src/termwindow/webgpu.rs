@@ -463,7 +463,7 @@ impl WebGpuState {
                 log::error!("wgpu validation error (continuing): {err}");
             }
             _ => {
-                panic!("fatal wgpu error: {err}");
+                panic!("fatal wgpu error: {}", err);
             }
         }));
 
