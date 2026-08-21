@@ -259,10 +259,18 @@ impl TerminalState {
         data: ImageDataType,
     ) -> Result<Arc<ImageData>, termwiz::error::InternalError> {
         let key = data.compute_hash();
+        // A nonce key means the payload was too large to content-hash: it
+        // can never match a cached entry, and inserting it would evict the
+        // dedup entries that do work — so streaming frames bypass the cache
+        // entirely.
+        if ImageDataType::is_nonce_key(&key) {
+            let data = data.swap_out()?;
+            return Ok(Arc::new(ImageData::with_data_and_hash(data, key)));
+        }
         if let Some(item) = self.image_cache.get(&key) {
             Ok(Arc::clone(item))
         } else {
-            // swap_out preserves the hash byte-for-byte (Rgba8/AnimRgba8
+            // swap_out preserves the key byte-for-byte (Rgba8/AnimRgba8
             // pass through; EncodedFile becomes an EncodedLease whose
             // ContentId is the same SHA-256 of the same bytes), so the key
             // computed for the cache lookup above is reused instead of
@@ -320,5 +328,66 @@ fn one_or_zero<T: Zero + One>(b: bool) -> T {
         T::one()
     } else {
         T::zero()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Cfg;
+    impl crate::TerminalConfiguration for Cfg {
+        fn color_palette(&self) -> crate::color::ColorPalette {
+            Default::default()
+        }
+    }
+
+    fn test_term() -> crate::Terminal {
+        crate::Terminal::new(
+            wezterm_term_size(),
+            Arc::new(Cfg),
+            "ThinkTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn wezterm_term_size() -> crate::TerminalSize {
+        crate::TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 0,
+        }
+    }
+
+    fn frame(width: u32, height: u32, fill: u8) -> ImageDataType {
+        ImageDataType::new_single_frame(width, height, vec![fill; (width * height * 4) as usize])
+    }
+
+    #[test]
+    fn nonce_keyed_images_bypass_the_dedup_cache() {
+        let mut term = test_term();
+        // 640x512x4 = 1.25 MiB: over the content-hash threshold.
+        let a = term.raw_image_to_image_data(frame(640, 512, 0)).unwrap();
+        let b = term.raw_image_to_image_data(frame(640, 512, 0)).unwrap();
+        assert_ne!(
+            a.hash(),
+            b.hash(),
+            "streaming frames are identity-keyed, never content-deduped"
+        );
+        assert_eq!(
+            term.image_cache.len(),
+            0,
+            "nonce-keyed frames must not occupy dedup cache slots"
+        );
+
+        // Small images keep content dedup: same pixels, same Arc.
+        let s1 = term.raw_image_to_image_data(frame(4, 4, 1)).unwrap();
+        let s2 = term.raw_image_to_image_data(frame(4, 4, 1)).unwrap();
+        assert!(Arc::ptr_eq(&s1, &s2));
+        assert_eq!(term.image_cache.len(), 1);
     }
 }

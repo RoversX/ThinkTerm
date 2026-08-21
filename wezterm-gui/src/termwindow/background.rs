@@ -141,9 +141,12 @@ impl CachedGradient {
         }
 
         let data = imgbuf.into_vec();
-        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
-            width, height, data,
-        )));
+        // Content-hashed on purpose: reload_background_image reuses textures
+        // and animation state by hash equality across config reloads, and a
+        // window-sized gradient exceeds the nonce threshold.
+        let image = Arc::new(ImageData::with_data(
+            ImageDataType::new_single_frame_content_hashed(width, height, data),
+        ));
 
         Ok(image)
     }
@@ -323,9 +326,12 @@ fn load_background_layer(
                 *pixel = src_pixel;
             }
             let data = imgbuf.into_vec();
-            Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
-                size, size, data,
-            )))
+            // Content-hashed like the gradient above: reload_background_image
+            // reuses layers by hash equality, and the generated square can
+            // exceed the nonce threshold on large windows.
+            Arc::new(ImageData::with_data(
+                ImageDataType::new_single_frame_content_hashed(size, size, data),
+            ))
         }
         BackgroundSource::File(source) => CachedImage::load(&source.path, source.speed)?,
     };

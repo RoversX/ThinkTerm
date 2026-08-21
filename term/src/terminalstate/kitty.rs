@@ -487,7 +487,7 @@ impl TerminalState {
 
                 drop(dest);
 
-                *hash = ImageDataType::hash_bytes(data);
+                *hash = ImageDataType::content_key(data);
             }
             ImageDataType::AnimRgba8 {
                 width,
@@ -530,7 +530,7 @@ impl TerminalState {
                 )?;
 
                 drop(dest);
-                hashes[target_frame - 1] = ImageDataType::hash_bytes(&frames[target_frame - 1]);
+                hashes[target_frame - 1] = ImageDataType::content_key(&frames[target_frame - 1]);
             }
         }
 
@@ -639,7 +639,7 @@ impl TerminalState {
                         blit(&mut anim_img, &img, x, y, frame.composition_mode)?;
 
                         drop(anim_img);
-                        *hash = ImageDataType::hash_bytes(data);
+                        *hash = ImageDataType::content_key(data);
                     }
                     Some(2) | None => {
                         // Create a second frame
@@ -653,7 +653,7 @@ impl TerminalState {
                         blit(&mut new_frame, &img, x, y, frame.composition_mode)?;
 
                         let new_frame_data = new_frame.into_vec();
-                        let new_frame_hash = ImageDataType::hash_bytes(&new_frame_data);
+                        let new_frame_hash = ImageDataType::content_key(&new_frame_data);
 
                         let frames = vec![std::mem::take(data), new_frame_data];
                         let durations = vec![Duration::from_millis(0), frame_gap];
@@ -701,7 +701,7 @@ impl TerminalState {
                     blit(&mut new_frame, &img, x, y, frame.composition_mode)?;
 
                     let new_frame_data = new_frame.into_vec();
-                    let new_frame_hash = ImageDataType::hash_bytes(&new_frame_data);
+                    let new_frame_hash = ImageDataType::content_key(&new_frame_data);
 
                     frames.push(new_frame_data);
                     hashes.push(new_frame_hash);
@@ -732,7 +732,7 @@ impl TerminalState {
                     blit(&mut anim_img, &img, x, y, frame.composition_mode)?;
 
                     drop(anim_img);
-                    hashes[frame_no - 1] = ImageDataType::hash_bytes(&frames[frame_no - 1]);
+                    hashes[frame_no - 1] = ImageDataType::content_key(&frames[frame_no - 1]);
                 }
             }
         }

@@ -1156,6 +1156,32 @@ impl GlyphCache {
     ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
         let hash = image_data.hash();
 
+        // A nonce key marks a one-shot streaming frame (video-like kitty
+        // content): it can never be requested again under the same key, so
+        // caching the DecodedImage would only pin the multi-MB frame long
+        // after it scrolled away — 256 retained frames is gigabytes. Loading
+        // is a cheap wrap for decoded pixels, and the sprite in frame_cache
+        // still prevents re-uploading the frame to the GPU between paints.
+        //
+        // Only single-frame Rgba8 gets the bypass: a large image later
+        // promoted to AnimRgba8 keeps its original nonce as the outer key,
+        // and recreating the DecodedImage every paint would reset the
+        // animation clock so it never advances. Animations are single
+        // persistent objects, so caching them cannot accumulate.
+        if ImageDataType::is_nonce_key(&hash)
+            && matches!(&*image_data.data(), ImageDataType::Rgba8 { .. })
+        {
+            let decoded = DecodedImage::load(image_data);
+            return Self::cached_image_impl(
+                &mut self.frame_cache,
+                &mut self.atlas,
+                &decoded,
+                padding,
+                self.min_frame_duration,
+                allow_image,
+            );
+        }
+
         if let Some(decoded) = self.image_cache.get(&hash) {
             Self::cached_image_impl(
                 &mut self.frame_cache,

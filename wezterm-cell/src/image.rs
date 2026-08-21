@@ -266,9 +266,34 @@ impl std::fmt::Debug for ImageDataType {
     }
 }
 
+/// Decoded pixel payloads larger than this skip content hashing: their
+/// identity key is a process-unique nonce instead of a SHA-256. Content
+/// dedup never hits for video-like kitty streams (every frame differs),
+/// while hashing tens of MB per frame dominated the pty read thread; small
+/// images keep real content hashes so repeated logos still dedup for free.
+pub const CONTENT_HASH_MAX: usize = 1024 * 1024;
+
+/// First 8 bytes of every nonce key, so debug checks and the dedup cache
+/// can tell identity-only keys apart from content hashes. A real SHA-256
+/// starting with these exact bytes is a ~2^-64 coincidence.
+const NONCE_KEY_MARKER: [u8; 8] = [0x54, 0x54, 0x4e, 0x43, 0x9d, 0x1b, 0x7a, 0xe4];
+
 impl ImageDataType {
     pub fn new_single_frame(width: u32, height: u32, data: Vec<u8>) -> Self {
+        let hash = Self::content_key(&data);
+        Self::new_single_frame_with_hash(width, height, data, hash)
+    }
+
+    /// Like `new_single_frame` but always content-hashed, for callers that
+    /// rely on "equal pixels => equal key" across reconstructions (e.g. the
+    /// background layer reload reusing textures by hash) and only construct
+    /// occasionally.
+    pub fn new_single_frame_content_hashed(width: u32, height: u32, data: Vec<u8>) -> Self {
         let hash = Self::hash_bytes(&data);
+        Self::new_single_frame_with_hash(width, height, data, hash)
+    }
+
+    fn new_single_frame_with_hash(width: u32, height: u32, data: Vec<u8>, hash: [u8; 32]) -> Self {
         assert_eq!(
             width * height * 4,
             data.len() as u32,
@@ -283,6 +308,64 @@ impl ImageDataType {
             data,
             hash,
         }
+    }
+
+    /// Identity key for an image payload: a real content hash for small
+    /// payloads, a process-unique nonce for large ones. The key is opaque
+    /// everywhere it travels — mux peers, caches and the GPU only store and
+    /// compare it — so the two kinds coexist freely.
+    pub fn content_key(bytes: &[u8]) -> [u8; 32] {
+        if bytes.len() > CONTENT_HASH_MAX {
+            Self::nonce_key()
+        } else {
+            Self::hash_bytes(bytes)
+        }
+    }
+
+    /// A key that is unique rather than content-derived:
+    /// marker || per-process random salt || counter. The salt keeps keys
+    /// minted by different processes (this GUI, every mux server) from
+    /// colliding in the client- and GPU-side caches that mix all sources.
+    fn nonce_key() -> [u8; 32] {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+        static SALT: OnceLock<[u8; 16]> = OnceLock::new();
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let salt = SALT.get_or_init(|| {
+            // wasm32-unknown-unknown has no process id and SystemTime::now()
+            // traps there. A wasm client is single-instance, so it needs no
+            // cross-process entropy of its own, and colliding with a peer's
+            // randomly-salted nonces would require matching all 16 salt
+            // bytes AND the counter.
+            #[cfg(target_arch = "wasm32")]
+            {
+                [
+                    0x9c, 0x3f, 0x51, 0xe8, 0x27, 0xb4, 0x6a, 0xd1, 0x08, 0xf5, 0x72, 0xc9, 0x3e,
+                    0x84, 0x1b, 0x67,
+                ]
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut seed = Vec::new();
+                seed.extend_from_slice(&std::process::id().to_ne_bytes());
+                if let Ok(t) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    seed.extend_from_slice(&t.as_nanos().to_ne_bytes());
+                }
+                Self::hash_bytes(&seed)[..16]
+                    .try_into()
+                    .expect("16-byte slice")
+            }
+        });
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&NONCE_KEY_MARKER);
+        key[8..24].copy_from_slice(salt);
+        key[24..].copy_from_slice(&n.to_be_bytes());
+        key
+    }
+
+    pub fn is_nonce_key(key: &[u8; 32]) -> bool {
+        key[..8] == NONCE_KEY_MARKER
     }
 
     /// Black pixels
@@ -309,25 +392,34 @@ impl ImageDataType {
             ImageDataType::EncodedFile(data) => hasher.update(data),
             ImageDataType::EncodedLease(lease) => return lease.content_id().as_hash_bytes(),
             ImageDataType::Rgba8 { data, hash, .. } => {
-                // The stored hash IS hash_bytes(data): the only constructor
-                // computes it and every in-place pixel edit refreshes it
-                // (see terminalstate/kitty.rs), so full-frame payloads are
-                // not re-hashed here — at video-like kitty frame rates that
-                // second SHA-256 dominated the pty read thread. The debug
-                // assert turns any future forgotten refresh into a loud
-                // test failure instead of a stale-image glitch.
-                debug_assert_eq!(
-                    *hash,
-                    Self::hash_bytes(data),
-                    "Rgba8 hash field is stale; a pixel mutation forgot to refresh it"
-                );
+                // The stored key is authoritative: the constructors compute
+                // it and every in-place pixel edit refreshes it (see
+                // terminalstate/kitty.rs), so full-frame payloads are not
+                // re-hashed here — at video-like kitty frame rates that
+                // second SHA-256 dominated the pty read thread. For
+                // content-hashed (small) payloads the debug assert turns any
+                // future forgotten refresh into a loud test failure instead
+                // of a stale-image glitch; nonce keys are identity-only and
+                // have nothing to re-derive.
+                if !Self::is_nonce_key(hash) {
+                    debug_assert_eq!(
+                        *hash,
+                        Self::hash_bytes(data),
+                        "Rgba8 hash field is stale; a pixel mutation forgot to refresh it"
+                    );
+                }
                 return *hash;
             }
             ImageDataType::AnimRgba8 {
-                frames, durations, ..
+                hashes, durations, ..
             } => {
-                for data in frames {
-                    hasher.update(data);
+                // Fold the per-frame keys instead of re-hashing every
+                // frame's pixels: the keys already identify the frame
+                // content (or are unique nonces), and hashing 32 bytes per
+                // frame is microseconds where the old full re-hash was the
+                // remaining full-payload SHA-256 on the pty thread.
+                for hash in hashes {
+                    hasher.update(hash);
                 }
                 for d in durations {
                     let d = d.as_secs_f32();
@@ -483,7 +575,7 @@ impl ImageDataType {
             width = w;
             height = h;
             let data = image.into_vec();
-            hashes.push(Self::hash_bytes(&data));
+            hashes.push(Self::content_key(&data));
             frames.push(data);
         }
         Self::AnimRgba8 {
@@ -502,7 +594,7 @@ impl ImageDataType {
                 let image = image.to_rgba8();
                 let (width, height) = image.dimensions();
                 let data = image.into_vec();
-                let hash = Self::hash_bytes(&data);
+                let hash = Self::content_key(&data);
                 Self::Rgba8 {
                     width,
                     height,
@@ -602,5 +694,53 @@ impl ImageData {
 
     pub fn hash(&self) -> [u8; 32] {
         self.hash
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_payloads_get_stable_content_hashes() {
+        let data = vec![7u8; 64];
+        let a = ImageDataType::content_key(&data);
+        let b = ImageDataType::content_key(&data);
+        assert_eq!(a, b);
+        assert!(!ImageDataType::is_nonce_key(&a));
+        assert_eq!(a, ImageDataType::hash_bytes(&data));
+    }
+
+    #[test]
+    fn large_payloads_get_unique_nonce_keys() {
+        let data = vec![7u8; CONTENT_HASH_MAX + 1];
+        let a = ImageDataType::content_key(&data);
+        let b = ImageDataType::content_key(&data);
+        assert_ne!(a, b, "identical large payloads must get distinct keys");
+        assert!(ImageDataType::is_nonce_key(&a));
+        assert!(ImageDataType::is_nonce_key(&b));
+    }
+
+    #[test]
+    fn anim_identity_folds_frame_keys_without_reading_pixels() {
+        let mk = |frames: Vec<Vec<u8>>, hashes: Vec<[u8; 32]>| ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::from_millis(10); frames.len()],
+            frames,
+            hashes,
+        };
+        let hashes = vec![[1u8; 32], [2u8; 32]];
+        let a = mk(vec![vec![0, 0, 0, 0xff]; 2], hashes.clone());
+        // Different pixels but identical per-frame keys: the identity must
+        // not change, which proves frames are no longer re-hashed.
+        let b = mk(vec![vec![0xff, 0, 0, 0xff]; 2], hashes.clone());
+        assert_eq!(a.compute_hash(), b.compute_hash());
+        // Different per-frame keys must change the identity.
+        let c = mk(
+            vec![vec![0, 0, 0, 0xff]; 2],
+            vec![[1u8; 32], [3u8; 32]],
+        );
+        assert_ne!(a.compute_hash(), c.compute_hash());
     }
 }
