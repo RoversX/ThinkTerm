@@ -9920,15 +9920,16 @@ impl crate::TermWindow {
         &self,
     ) -> Result<Option<workspace_threads::RemoteFilesTarget>, String> {
         let mux = Mux::get();
+        // In a collection window the displayed workspace belongs to another
+        // Space; Files must target that Space's machine, not the (local)
+        // collection.
+        let space_id = self.content_space_id();
         let active_workspace = self
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view = workspace_threads::view_for_current_project(
-            &self.active_space_id,
-            &active_workspace,
-            &workspaces,
-        );
+        let view =
+            workspace_threads::view_for_current_project(&space_id, &active_workspace, &workspaces);
         let project = view
             .projects
             .iter()
@@ -9938,12 +9939,10 @@ impl crate::TermWindow {
         if !project.is_remote {
             return Ok(None);
         }
-        if let Some(target) =
-            workspace_threads::remote_files_target(&self.active_space_id, &project.id)
-        {
+        if let Some(target) = workspace_threads::remote_files_target(&space_id, &project.id) {
             return Ok(Some(target));
         }
-        let Some(domain) = workspace_threads::client_domain_for_space(&self.active_space_id) else {
+        let Some(domain) = workspace_threads::client_domain_for_space(&space_id) else {
             return Err("Remote Files source is unavailable".to_string());
         };
         Ok(Some(workspace_threads::RemoteFilesTarget {
@@ -10404,7 +10403,7 @@ impl crate::TermWindow {
         TerminalPasteTarget {
             pane_id,
             remote: Some(Ok(RemoteTerminalPasteTarget {
-                space_id: self.active_space_id.clone(),
+                space_id: self.content_space_id(),
                 target,
                 source_key,
                 connection_key,
@@ -10433,7 +10432,7 @@ impl crate::TermWindow {
             .ok_or_else(|| "Paste canceled because its pane was closed".to_string())?;
         let mismatch = terminal_paste_snapshot_mismatch(
             &remote.space_id,
-            &self.active_space_id,
+            &self.content_space_id(),
             &remote.target,
             current_target.as_ref(),
             &remote.connection_key,
@@ -13127,7 +13126,8 @@ impl crate::TermWindow {
     }
 
     fn active_local_project_for_files(&self) -> Result<RightSidebarFileRoot, String> {
-        if workspace_threads::client_domain_for_space(&self.active_space_id).is_some() {
+        let space_id = self.content_space_id();
+        if workspace_threads::client_domain_for_space(&space_id).is_some() {
             return Err("Remote file browsing is not supported yet".to_string());
         }
 
@@ -13136,11 +13136,8 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view = workspace_threads::view_for_current_project(
-            &self.active_space_id,
-            &active_workspace,
-            &workspaces,
-        );
+        let view =
+            workspace_threads::view_for_current_project(&space_id, &active_workspace, &workspaces);
         let project = view
             .projects
             .iter()

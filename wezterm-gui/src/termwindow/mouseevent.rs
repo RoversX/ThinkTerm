@@ -5890,6 +5890,15 @@ impl super::TermWindow {
             context.invalidate();
             return;
         }
+        if via_collection_ref {
+            // Remember the choice so switching back to the collection
+            // restores this reference, like a normal Space restores its
+            // active thread.
+            crate::workspace_threads::note_collection_active_ref(
+                &self.active_space_id,
+                &thread_id,
+            );
+        }
 
         let mux = Mux::get();
         let live_workspaces = mux.iter_workspaces();

@@ -2146,6 +2146,32 @@ impl TermWindow {
             .unwrap_or(self.active_space_id.as_str())
     }
 
+    /// The Space whose projects/domain the right-sidebar features (Files,
+    /// remote connect, paste targets) should act on. A collection window
+    /// displays workspaces that belong to other Spaces, so resolve through
+    /// the displayed workspace there; everywhere else the window's Space is
+    /// the answer.
+    pub(crate) fn content_space_id(&self) -> String {
+        if crate::workspace_threads::is_collection_space(&self.active_space_id) {
+            if let Some(workspace) = self.current_mux_workspace() {
+                // Only resolve through the displayed workspace when it is a
+                // reference this collection actually holds. A freshly
+                // switched-to collection still shows the previous Space's
+                // terminal, and that must not leak the previous machine
+                // into Files/paste.
+                if let Some(space_id) =
+                    crate::workspace_threads::origin_space_for_collection_workspace(
+                        &self.active_space_id,
+                        &workspace,
+                    )
+                {
+                    return space_id;
+                }
+            }
+        }
+        self.active_space_id.clone()
+    }
+
     fn clear_workspace_space_swipe_frame_transition(&mut self) {
         self.workspace_space_swipe_source_frame = None;
         self.workspace_space_swipe_target_frame = None;

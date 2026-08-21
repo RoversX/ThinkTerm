@@ -80,6 +80,11 @@ pub struct Space {
     /// pruned on the next load.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thread_refs: Vec<String>,
+    /// The reference last opened from this collection, restored when the
+    /// window switches back — a collection's counterpart of a normal Space's
+    /// active project/thread pointers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_thread_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1047,6 +1052,26 @@ pub fn collection_thread_refs(collection_space_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Remember which reference the user last opened from a collection, so the
+/// next switch back restores it.
+pub fn note_collection_active_ref(collection_space_id: &str, thread_id: &str) {
+    let mut store = THREAD_STORE.lock();
+    let Some(space) = store
+        .spaces
+        .iter_mut()
+        .find(|space| space.id == collection_space_id && space.is_collection)
+    else {
+        return;
+    };
+    if !space.thread_refs.iter().any(|id| id == thread_id) {
+        return;
+    }
+    if space.active_thread_ref.as_deref() != Some(thread_id) {
+        space.active_thread_ref = Some(thread_id.to_string());
+        schedule_workspace_thread_store_persist();
+    }
+}
+
 pub fn thread_ref_exists(collection_space_id: &str, thread_id: &str) -> bool {
     THREAD_STORE
         .lock()
@@ -1406,12 +1431,15 @@ pub fn ensure_active_thread_for_space(space_id: &str) -> Option<WorkspaceThreadI
         return None;
     }
     // A collection Space owns no projects and must not be seeded with a Home
-    // project; its rows are references into other Spaces.
+    // project; its rows are references into other Spaces. Switching to it
+    // restores the reference the user last opened here (or the first one),
+    // so the terminal follows the sidebar like it does in a normal Space.
     if store.is_collection_space(space_id) {
+        let restore = store.collection_restore_ref(space_id);
         if changed {
             persist_locked(&store);
         }
-        return None;
+        return restore;
     }
     let project_id = store
         .active_project_id_for_space(space_id)
@@ -1463,6 +1491,33 @@ pub fn thread_to_restore_for_space(space_id: &str) -> Option<WorkspaceThreadId> 
 pub fn space_id_for_workspace(workspace: &str) -> Option<SpaceId> {
     let store = THREAD_STORE.lock();
     store.workspace_space_id(workspace)
+}
+
+/// The origin Space of `workspace`, but only when the thread it is bound to
+/// is actually referenced by `collection_space_id`. A collection window that
+/// was just switched to (nothing clicked yet) still displays the previous
+/// Space's workspace — that one must NOT leak through, or Files/paste would
+/// silently keep targeting the previous machine.
+pub fn origin_space_for_collection_workspace(
+    collection_space_id: &str,
+    workspace: &str,
+) -> Option<SpaceId> {
+    let store = THREAD_STORE.lock();
+    let space = store
+        .spaces
+        .iter()
+        .find(|space| space.id == collection_space_id && space.is_collection)?;
+    store.projects.iter().find_map(|project| {
+        project
+            .threads
+            .iter()
+            .any(|session| {
+                (session.materialized_workspace_name.as_deref() == Some(workspace)
+                    || workspace_name_for_thread(&project.id, &session.id) == workspace)
+                    && space.thread_refs.iter().any(|id| id == &session.id)
+            })
+            .then(|| project.space_id.clone())
+    })
 }
 
 pub fn workspace_has_thread_binding(workspace: &str) -> bool {
@@ -3466,6 +3521,7 @@ impl WorkspaceThreadStore {
                 client_domain: None,
                 is_collection: false,
                 thread_refs: Vec::new(),
+                active_thread_ref: None,
             });
             changed = true;
         }
@@ -3561,6 +3617,12 @@ impl WorkspaceThreadStore {
             let before = space.thread_refs.len();
             space.thread_refs.retain(|id| known.contains(id.as_str()));
             changed |= space.thread_refs.len() != before;
+            if let Some(active) = &space.active_thread_ref {
+                if !space.thread_refs.contains(active) {
+                    space.active_thread_ref = None;
+                    changed = true;
+                }
+            }
         }
         changed
     }
@@ -3588,6 +3650,7 @@ impl WorkspaceThreadStore {
             client_domain,
             is_collection: false,
             thread_refs: Vec::new(),
+            active_thread_ref: None,
         });
         id
     }
@@ -3682,6 +3745,17 @@ impl WorkspaceThreadStore {
             .any(|space| space.id == space_id && space.is_collection)
     }
 
+    /// The reference a collection window should open on switch: the one the
+    /// user last opened here when it is still referenced, else the first.
+    fn collection_restore_ref(&self, space_id: &str) -> Option<WorkspaceThreadId> {
+        let space = self.spaces.iter().find(|space| space.id == space_id)?;
+        space
+            .active_thread_ref
+            .clone()
+            .filter(|id| space.thread_refs.contains(id))
+            .or_else(|| space.thread_refs.first().cloned())
+    }
+
     fn add_thread_ref(&mut self, collection_space_id: &str, thread_id: &str) -> bool {
         let exists = self
             .projects
@@ -3714,6 +3788,9 @@ impl WorkspaceThreadStore {
         };
         let before = space.thread_refs.len();
         space.thread_refs.retain(|id| id != thread_id);
+        if space.active_thread_ref.as_deref() == Some(thread_id) {
+            space.active_thread_ref = None;
+        }
         space.thread_refs.len() != before
     }
 
@@ -4947,6 +5024,7 @@ impl WorkspaceThreadStore {
                     client_domain: Some(domain_name.to_string()),
                     is_collection: false,
                     thread_refs: Vec::new(),
+                    active_thread_ref: None,
                 }
             })
             .collect();
@@ -7057,6 +7135,29 @@ mod tests {
             .unwrap()
             .is_collection = true;
         assert_eq!(next_collection_space_name(&store.spaces), "Collection 3");
+    }
+
+    #[test]
+    fn collection_restores_last_opened_ref_then_first() {
+        let (mut store, coll, t1, t2) = store_with_collection();
+        assert!(store.add_thread_ref(&coll, &t1));
+        assert!(store.add_thread_ref(&coll, &t2));
+        // Nothing opened yet: fall back to the first reference.
+        assert_eq!(store.collection_restore_ref(&coll).as_deref(), Some(t1.as_str()));
+
+        store
+            .spaces
+            .iter_mut()
+            .find(|s| s.id == coll)
+            .unwrap()
+            .active_thread_ref = Some(t2.clone());
+        assert_eq!(store.collection_restore_ref(&coll).as_deref(), Some(t2.as_str()));
+
+        // Removing the remembered reference clears it and falls back.
+        assert!(store.remove_thread_ref(&coll, &t2));
+        let space = store.spaces.iter().find(|s| s.id == coll).unwrap();
+        assert_eq!(space.active_thread_ref, None);
+        assert_eq!(store.collection_restore_ref(&coll).as_deref(), Some(t1.as_str()));
     }
 
     #[test]
@@ -9289,6 +9390,7 @@ mod tests {
             client_domain: Some(domain.to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            active_thread_ref: None,
         });
         store
     }
@@ -9745,6 +9847,7 @@ mod tests {
             client_domain: Some("ams".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            active_thread_ref: None,
         });
 
         let owned_by_syd = store.space_ids_for_domain("syd");
@@ -9796,6 +9899,7 @@ mod tests {
             client_domain: Some("ssh:x@203.0.113.9".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            active_thread_ref: None,
         });
         store.spaces.push(Space {
             id: "space-elsewhere".to_string(),
@@ -9806,6 +9910,7 @@ mod tests {
             client_domain: Some("DO AMS".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            active_thread_ref: None,
         });
 
         let names = vec!["ssh:x@203.0.113.9".to_string(), "DO SYD".to_string()];
@@ -9839,6 +9944,7 @@ mod tests {
             client_domain: Some("syd".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            active_thread_ref: None,
         });
         store.projects.push(Project {
             id: "rp2".to_string(),
@@ -9875,6 +9981,7 @@ mod tests {
             client_domain: Some("syd".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            active_thread_ref: None,
         });
 
         // With nothing remembered, connecting lands on the server's first.
@@ -9941,6 +10048,7 @@ mod tests {
             client_domain: Some("syd".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            active_thread_ref: None,
         });
         // Once it is known, they are hands off.
         assert!(space_id_from_remote_project_id(&sibling)
