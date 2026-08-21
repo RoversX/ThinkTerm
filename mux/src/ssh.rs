@@ -22,10 +22,19 @@ use termwiz::lineedit::*;
 use termwiz::render::terminfo::TerminfoRenderer;
 use termwiz::surface::{Change, LineAttribute};
 use termwiz::terminal::{ScreenSize, Terminal, TerminalWaker};
+use thiserror::Error;
 use wezterm_ssh::{
     ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
 };
 use wezterm_term::TerminalSize;
+
+/// The user dismissed an auth prompt instead of answering it. Distinct from a
+/// wrong password or an unreachable host: those deserve another attempt, this
+/// one means "not now", so the reconnect loop parks instead of retrying (and,
+/// historically, instead of tearing the whole domain down).
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("Authentication was cancelled")]
+pub struct AuthCancelledError;
 
 #[derive(Default)]
 struct PasswordPromptHost {
@@ -93,15 +102,18 @@ pub fn ssh_connect_with_ui_and_password(
                 }
                 SessionEvent::HostVerify(verify) => {
                     ui.output_str(&format!("{}\n", verify.message));
-                    let ok = if let Ok(line) = ui.input("Enter [y/n]> ") {
-                        match line.as_ref() {
-                            "y" | "Y" | "yes" | "YES" => true,
-                            "n" | "N" | "no" | "NO" | _ => false,
-                        }
-                    } else {
-                        false
-                    };
+                    let answer = ui.input("Enter [y/n]> ");
+                    let ok = matches!(answer.as_deref(), Ok("y" | "Y" | "yes" | "YES"));
+                    // Answer first either way, so the ssh session is never
+                    // left waiting on us.
                     smol::block_on(verify.answer(ok)).context("send verify response")?;
+                    // An explicit "no" is as final as dismissing the prompt:
+                    // without the cancellation marker the refusal surfaces as
+                    // an ordinary error, the reconnect loop retries, and the
+                    // same trust question pops right back up.
+                    if !ok {
+                        return Err(AuthCancelledError.into());
+                    }
                 }
                 SessionEvent::Authenticate(auth) => {
                     if !auth.username.is_empty() {
@@ -131,13 +143,17 @@ pub fn ssh_connect_with_ui_and_password(
                         if let Ok(line) = res {
                             answers.push(line);
                         } else {
-                            anyhow::bail!("Authentication was cancelled");
+                            return Err(AuthCancelledError.into());
                         }
                     }
                     smol::block_on(auth.answer(answers))?;
                 }
                 SessionEvent::HostVerificationFailed(failed) => {
                     let message = format_host_verification_for_terminal(failed);
+                    // Nothing is read back here, so a lazily-materialized UI
+                    // would stay silent and swallow the banner — and a changed
+                    // host key is the one thing the user must not miss.
+                    ui.materialize();
                     ui.output(message);
                     anyhow::bail!("Host key verification failed");
                 }

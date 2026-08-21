@@ -273,6 +273,53 @@ pub struct IncompatibleVersionError {
     pub codec_vers: usize,
 }
 
+/// The server accepted the connection but never answered the version
+/// handshake. Unlike [`IncompatibleVersionError`] this is a transient
+/// condition — a wedged or overloaded server (e.g. one pane consuming all
+/// of its resources) or a stalled link — and retrying can succeed, so it
+/// must never be classified as fatal.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error(
+    "The server did not answer the version handshake within {timeout_secs} \
+     seconds. The server may be overloaded or wedged, or the link may have \
+     stalled. This is transient — it is NOT a version mismatch — and \
+     reconnecting can succeed."
+)]
+pub struct VersionHandshakeStalled {
+    pub timeout_secs: u64,
+}
+
+/// Human-readable description of a failed version handshake, for errors
+/// that are not a timeout. The wording deliberately does not claim a
+/// version mismatch: a real mismatch is detected from an actual response
+/// ([`IncompatibleVersionError`]); landing here means no usable answer
+/// arrived at all, which is most often a transport or server-health
+/// problem.
+fn describe_handshake_failure(err: &anyhow::Error) -> String {
+    if err.root_cause().is::<CorruptResponse>() {
+        "Received an implausible and likely corrupt response from \
+         the server. This can happen if the remote host outputs \
+         to stdout prior to running commands. \
+         Check your shell startup!"
+            .to_string()
+    } else if err.root_cause().is::<ChannelSendError>() {
+        "Internal channel was closed prior to sending request. \
+         This may indicate that the remote host output invalid data \
+         to stdout prior to running the requested command. \
+         Check your shell startup!"
+            .to_string()
+    } else {
+        format!(
+            "The version handshake with the server failed: '{err}'. \
+             Possible causes: the connection or the server stalled before \
+             answering; the remote host printed to stdout during shell \
+             startup (check your shell startup files); or the server build \
+             is too old to answer at all. An actual version mismatch is \
+             reported explicitly, so do not assume one from this message."
+        )
+    }
+}
+
 /// Describe a server whose build differs from ours, or `None` when they match.
 ///
 /// [`CODEC_VERSION`] guards the wire format, not behaviour: two builds that
@@ -688,6 +735,17 @@ enum NotReconnectableError {
     ClientWasDestroyed,
 }
 
+/// Did this failure come from the user dismissing an auth prompt rather than
+/// from a wrong password or an unreachable host? Retrying would only ask the
+/// same question again, so we park instead.
+///
+/// Walks the whole chain rather than just the root cause, so that adding a
+/// `.context()` anywhere on the way up cannot silently disable it.
+fn is_auth_cancelled(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<mux::ssh::AuthCancelledError>().is_some())
+}
+
 fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
@@ -858,7 +916,18 @@ async fn client_thread_async(
                             }
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
-                                return Err(NotReconnectableError::ClientWasDestroyed.into());
+                                // The requester stopped waiting — e.g. a
+                                // bootstrap RPC timed out and dropped its
+                                // receiver. That abandons one request, not
+                                // the client: killing the connection here
+                                // turned a transient handshake stall into a
+                                // permanent detach. Client teardown proper is
+                                // detected by the channel close below.
+                                log::debug!(
+                                    "response for serial {} arrived after its \
+                                     requester gave up; discarding",
+                                    decoded.serial
+                                );
                             }
                         } else {
                             let reason =
@@ -1536,13 +1605,13 @@ impl Client {
             // connecting. Only established-then-dead sessions count; a
             // connect() that fails outright (network still down) does not.
             let mut short_sessions = 0usize;
-            // One visible reconnect tab for the lifetime of this client,
-            // reused across reconnect cycles. It is closed by a successful
-            // reattach or when we give up; creating one per cycle piles up
-            // dead "Reconnecting..." tabs while the remote is unhealthy.
-            // Paired with the workspace it was hosted in, so a Space switch
-            // that moves it off screen rebuilds it where the user is now.
-            let mut windowed_ui: Option<(ConnectionUI, String)> = None;
+            // One reconnect UI for the lifetime of this client, reused across
+            // reconnect cycles. It is closed by a successful reattach or when
+            // we give up; creating one per cycle piles up dead relays while
+            // the remote is unhealthy. It starts with no window at all and
+            // grows one only if a prompt needs answering, so window placement
+            // and Space drift are the relay's problem, not ours.
+            let mut reconnect_ui: Option<ConnectionUI> = None;
 
             let mut pending_reattach_ui: Option<ConnectionUI> = None;
             'client: loop {
@@ -1646,22 +1715,12 @@ impl Client {
                         short_sessions += 1;
                     }
 
-                    // A successful reattach closes the shared tab behind our
-                    // back; detect that so we build a fresh one when needed.
-                    if windowed_ui
-                        .as_ref()
-                        .map_or(false, |(ui, _)| !ui.test_alive())
-                    {
-                        windowed_ui = None;
+                    // A successful reattach closes the UI behind our back;
+                    // detect that so we build a fresh one when needed.
+                    if reconnect_ui.as_ref().map_or(false, |ui| !ui.test_alive()) {
+                        reconnect_ui = None;
                     }
 
-                    // The first couple of attempts run headless: with key
-                    // auth or a stored password the reconnect is completely
-                    // silent and the user just sees the pane resume. Only
-                    // if we still can't get back (interactive auth needed,
-                    // or a longer outage) do we escalate to a visible UI
-                    // tab hosted in a window of this domain.
-                    let mut attempt = 0usize;
                     // After this much continuous failure, stop hammering
                     // the network and park until the user asks for another
                     // round (the sidebar Reconnect button). Nothing is torn
@@ -1671,73 +1730,33 @@ impl Client {
                     let mut outage_started = std::time::Instant::now();
 
                     loop {
-                        attempt += 1;
-                        let mut ui = if attempt <= 2 && windowed_ui.is_none() {
-                            ConnectionUI::new_headless()
-                        } else {
-                            // Host the reconnect UI (and any auth prompts)
-                            // as a tab inside a window that already shows
-                            // this domain's panes; a standalone UI window
-                            // would materialize a whole new ThinkTerm
-                            // window over the frozen session.
-                            let (window_tx, window_rx) = channel();
-                            promise::spawn::spawn_into_main_thread(async move {
-                                // Only windows of the ACTIVE workspace are on
-                                // screen; hosting the reconnect UI (and its
-                                // auth prompts) in a background-workspace
-                                // window would block the reconnect invisibly
-                                // forever. If this domain has no on-screen
-                                // window, fall back to a standalone window.
-                                let placement = Mux::try_get().map(|mux| {
-                                    let workspace = mux.active_workspace();
-                                    let window_id = mux
-                                        .iter_windows_in_workspace(&workspace)
-                                        .into_iter()
-                                        .find(|window_id| {
-                                            mux.get_window(*window_id).map_or(false, |w| {
-                                                w.iter().any(|tab| {
-                                                    tab.iter_panes_ignoring_zoom().iter().any(|p| {
-                                                        p.pane.domain_id() == local_domain_id
-                                                    })
-                                                })
-                                            })
-                                        });
-                                    (workspace, window_id)
-                                });
-                                window_tx.send(placement).ok();
-                            })
-                            .detach();
-                            let (active_workspace, ui_window_id) = window_rx
-                                .recv_timeout(Duration::from_secs(2))
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| (String::new(), None));
-
-                            // The user may have switched Spaces since the
-                            // visible UI was created; a UI hosted in a
-                            // background workspace is off screen and its
-                            // prompts can never be answered. Rebuild it
-                            // where the user is now.
-                            if let Some((ui, hosted_ws)) = &windowed_ui {
-                                if !active_workspace.is_empty() && hosted_ws != &active_workspace {
-                                    ui.close();
-                                    windowed_ui = None;
-                                }
-                            }
-
-                            if let Some((ui, _)) = &windowed_ui {
-                                ui.clone()
-                            } else {
-                                let ui =
-                                    ConnectionUI::with_params(mux::connui::ConnectionUIParams {
-                                        window_id: ui_window_id,
+                        // Reconnect silently. The outage is already on screen
+                        // four ways — an opaque overlay across every pane of
+                        // this domain, the orange sidebar Space icon, the
+                        // sidebar Reconnect row once we suspend, and the Space
+                        // menu group header — so a progress UI here was only
+                        // ever a fifth copy, and one that stole the user's
+                        // active tab or opened a window over a frozen session.
+                        // The lazy UI grows a window only if ssh genuinely
+                        // needs a password or a host key confirmed.
+                        let mut ui = match &reconnect_ui {
+                            Some(ui) => ui.clone(),
+                            None => {
+                                let ui = ConnectionUI::new_lazy(
+                                    mux::connui::ConnectionUIParams {
+                                        host_domain_id: Some(local_domain_id),
                                         ..Default::default()
-                                    });
+                                    },
+                                );
                                 ui.title("ThinkTerm: Reconnecting...");
-                                windowed_ui = Some((ui.clone(), active_workspace));
+                                reconnect_ui = Some(ui.clone());
                                 ui
                             }
                         };
+
+                        // Set when we should stop retrying and park, rather
+                        // than keep going or tear the domain down.
+                        let mut suspend: Option<String> = None;
 
                         if ui
                             .sleep_with_reason(
@@ -1746,72 +1765,81 @@ impl Client {
                             )
                             .is_err()
                         {
-                            // The user closed the reconnect window: stop
-                            // trying and detach.
-                            log::error!("reconnect cancelled by user");
-                            break 'client;
-                        }
-                        let initial = false;
-                        // Normally a reconnect must not auto-start a server:
-                        // during a network blip the server is alive and would
-                        // be fought by a second instance. But when freshly
-                        // established sessions keep dying instantly, the ssh
-                        // hop is fine and it is the remote mux server that is
-                        // gone (e.g. the host rebooted); refusing auto-start
-                        // then loops forever without ever converging. Let the
-                        // proxy revive the server after a couple of instant
-                        // deaths — it still only spawns one if connecting to
-                        // the existing socket fails.
-                        let no_auto_start = short_sessions < 2;
-                        match reconnectable.connect(initial, &mut ui, no_auto_start) {
-                            Ok(_) => {
-                                log::info!("Transport reconnected; restoring mux session");
-                                reader_connection_phase.store(
-                                    ClientConnectionPhase::Registering as u8,
-                                    Ordering::Release,
-                                );
-                                pending_reattach_ui = Some(ui.clone());
-                                crate::domain::wake_thinkterm_frontend();
-                                break;
-                            }
-                            Err(err) => {
-                                backoff = (backoff + backoff).min(MAX_INTERVAL);
-                                ui.output_str(&format!(
-                                    "problem reconnecting: {}; will reconnect in {:?}\n",
-                                    err, backoff
-                                ));
-                                if outage_started.elapsed() >= GIVE_UP_AFTER {
-                                    log::error!(
-                                        "unable to reconnect for {GIVE_UP_AFTER:?}; \
-                                         suspending retries until requested"
-                                    );
-                                    if let Some((ui, _)) = windowed_ui.take() {
-                                        ui.close();
-                                    }
+                            // Only reachable once a prompt window exists and
+                            // the user dismissed it; the silent path always
+                            // answers a sleep with Ok.
+                            suspend = Some("reconnect prompt dismissed".to_string());
+                        } else {
+                            let initial = false;
+                            // Normally a reconnect must not auto-start a
+                            // server: during a network blip the server is
+                            // alive and would be fought by a second instance.
+                            // But when freshly established sessions keep dying
+                            // instantly, the ssh hop is fine and it is the
+                            // remote mux server that is gone (e.g. the host
+                            // rebooted); refusing auto-start then loops
+                            // forever without ever converging. Let the proxy
+                            // revive the server after a couple of instant
+                            // deaths — it still only spawns one if connecting
+                            // to the existing socket fails.
+                            let no_auto_start = short_sessions < 2;
+                            match reconnectable.connect(initial, &mut ui, no_auto_start) {
+                                Ok(_) => {
+                                    log::info!("Transport reconnected; restoring mux session");
                                     reader_connection_phase.store(
-                                        ClientConnectionPhase::Suspended as u8,
+                                        ClientConnectionPhase::Registering as u8,
                                         Ordering::Release,
                                     );
+                                    pending_reattach_ui = Some(ui.clone());
                                     crate::domain::wake_thinkterm_frontend();
-                                    match resume_reconnect_rx.recv() {
-                                        Ok(()) => {
-                                            reader_connection_phase.store(
-                                                ClientConnectionPhase::Reconnecting as u8,
-                                                Ordering::Release,
-                                            );
-                                            outage_started = std::time::Instant::now();
-                                            backoff = BASE_INTERVAL;
-                                            short_sessions = 0;
-                                        }
-                                        Err(_) => {
-                                            // Every Client handle is gone;
-                                            // nobody can ever resume us.
-                                            log::error!(
-                                                "reconnect suspended and client dropped; detaching"
-                                            );
-                                            break 'client;
-                                        }
+                                    break;
+                                }
+                                Err(err) => {
+                                    backoff = (backoff + backoff).min(MAX_INTERVAL);
+                                    ui.output_str(&format!(
+                                        "problem reconnecting: {}; will reconnect in {:?}\n",
+                                        err, backoff
+                                    ));
+                                    if is_auth_cancelled(&err) {
+                                        // We asked and they declined; another
+                                        // attempt would only ask again.
+                                        suspend = Some("authentication was declined".to_string());
+                                    } else if outage_started.elapsed() >= GIVE_UP_AFTER {
+                                        suspend = Some(format!(
+                                            "unable to reconnect for {GIVE_UP_AFTER:?}"
+                                        ));
                                     }
+                                }
+                            }
+                        }
+
+                        if let Some(reason) = suspend {
+                            log::error!("{reason}; suspending retries until requested");
+                            if let Some(ui) = reconnect_ui.take() {
+                                ui.close();
+                            }
+                            reader_connection_phase.store(
+                                ClientConnectionPhase::Suspended as u8,
+                                Ordering::Release,
+                            );
+                            crate::domain::wake_thinkterm_frontend();
+                            match resume_reconnect_rx.recv() {
+                                Ok(()) => {
+                                    reader_connection_phase.store(
+                                        ClientConnectionPhase::Reconnecting as u8,
+                                        Ordering::Release,
+                                    );
+                                    outage_started = std::time::Instant::now();
+                                    backoff = BASE_INTERVAL;
+                                    short_sessions = 0;
+                                }
+                                Err(_) => {
+                                    // Every Client handle is gone; nobody can
+                                    // ever resume us.
+                                    log::error!(
+                                        "reconnect suspended and client dropped; detaching"
+                                    );
+                                    break 'client;
                                 }
                             }
                         }
@@ -1822,11 +1850,11 @@ impl Client {
                 }
             }
 
-            // Whatever ended the loop (cancelled by user, not
-            // reconnectable), don't leave the reconnect tab behind. The
-            // domain detaches below, so we are no longer "reconnecting".
+            // Whatever ended the loop (not reconnectable, or every Client
+            // handle gone), don't leave the reconnect UI behind. The domain
+            // detaches below, so we are no longer "reconnecting".
             reader_connection_phase.store(ClientConnectionPhase::Detached as u8, Ordering::Release);
-            if let Some((ui, _)) = windowed_ui.take() {
+            if let Some(ui) = reconnect_ui.take() {
                 ui.close();
             }
 
@@ -1911,6 +1939,16 @@ impl Client {
                         client_id: self.client_id.clone(),
                         is_proxy: false,
                     }))
+                    .or(async {
+                        // Without this, a server that answers the version
+                        // query and then wedges leaves the attach hanging
+                        // forever.
+                        smol::Timer::after(Duration::from_secs(60)).await;
+                        Err(anyhow::Error::new(VersionHandshakeStalled {
+                            timeout_secs: 60,
+                        }))
+                        .context("timed out waiting for SetClientId acknowledgement")
+                    })
                     .await?
                 {
                     Pdu::UnitResponse(_) => {}
@@ -1938,33 +1976,17 @@ impl Client {
             }
             Err(err) => {
                 log::trace!("{:?}", err);
-                let msg = if err.root_cause().is::<Timeout>() {
-                    "Timed out while parsing the response from the server. \
-                    This may be due to network connectivity issues"
-                        .to_string()
-                } else if err.root_cause().is::<CorruptResponse>() {
-                    "Received an implausible and likely corrupt response from \
-                    the server. This can happen if the remote host outputs \
-                    to stdout prior to running commands. \
-                    Check your shell startup!"
-                        .to_string()
-                } else if err.root_cause().is::<ChannelSendError>() {
-                    "Internal channel was closed prior to sending request. \
-                    This may indicate that the remote host output invalid data \
-                    to stdout prior to running the requested command. \
-                    Check your shell startup!"
-                        .to_string()
-                } else {
-                    format!(
-                        "Please install a compatible ThinkTerm/WezTerm remote mux binary \
-                     on the server! \
-                     The server reported error '{err}' while being asked for its \
-                     version.  This likely means that the server is older \
-                     than the client, but it could also happen if the remote \
-                     host outputs to stdout prior to running commands. \
-                     Check your shell startup!",
-                    )
-                };
+                // A timeout stays typed so the reattach path can classify
+                // it as transient (retryable) rather than treating it like
+                // an incompatibility.
+                if err.root_cause().is::<Timeout>() {
+                    let stalled = VersionHandshakeStalled { timeout_secs: 60 };
+                    let msg = stalled.to_string();
+                    ui.output_str(&msg);
+                    log::error!("{msg}");
+                    return Err(anyhow::Error::new(stalled));
+                }
+                let msg = describe_handshake_failure(&err);
                 ui.output_str(&msg);
                 bail!("{}", msg);
             }
@@ -2203,7 +2225,9 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{describe_server_build_mismatch, Reconnectable, RegistrationBarrier};
+    use super::{
+        describe_server_build_mismatch, is_auth_cancelled, Reconnectable, RegistrationBarrier,
+    };
 
     #[test]
     fn an_identical_build_is_not_worth_warning_about() {
@@ -2248,6 +2272,22 @@ mod tests {
     }
 
     #[test]
+    fn auth_cancellation_survives_being_wrapped_in_context() {
+        // The reconnect loop parks instead of retrying when it sees this, so
+        // it has to keep matching however far up the stack it is re-wrapped.
+        let err = anyhow::Error::new(mux::ssh::AuthCancelledError)
+            .context("ssh_connect_with_ui_and_password")
+            .context("reconnecting");
+        assert!(is_auth_cancelled(&err));
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_auth_cancellation() {
+        let err = anyhow::anyhow!("Connecting to host within 10s: timed out");
+        assert!(!is_auth_cancelled(&err));
+    }
+
+    #[test]
     fn remote_mux_command_uses_configured_path() {
         assert_eq!(
             Reconnectable::remote_mux_command(
@@ -2263,5 +2303,32 @@ mod tests {
         let cmd = Reconnectable::remote_mux_command(&None, "cli --prefer-mux proxy");
         assert!(cmd.contains("thinkterm cli --prefer-mux proxy"), "{}", cmd);
         assert!(cmd.contains("wezterm cli --prefer-mux proxy"), "{}", cmd);
+    }
+}
+
+#[cfg(test)]
+mod handshake_classification_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_failure_does_not_claim_a_version_mismatch() {
+        let err = anyhow::anyhow!("Client was destroyed");
+        let msg = describe_handshake_failure(&err);
+        assert!(!msg.contains("install a compatible"), "{msg}");
+        assert!(msg.contains("Client was destroyed"), "{msg}");
+    }
+
+    #[test]
+    fn channel_send_error_keeps_its_specific_guidance() {
+        let err = anyhow::Error::new(ChannelSendError).context("send_pdu");
+        let msg = describe_handshake_failure(&err);
+        assert!(msg.contains("Internal channel was closed"), "{msg}");
+    }
+
+    #[test]
+    fn stalled_handshake_reads_as_transient() {
+        let msg = VersionHandshakeStalled { timeout_secs: 60 }.to_string();
+        assert!(msg.contains("transient"), "{msg}");
+        assert!(msg.contains("NOT a version mismatch"), "{msg}");
     }
 }
