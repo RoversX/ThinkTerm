@@ -50,7 +50,11 @@ pub(crate) enum NativeThemeMode {
 
 impl Default for NativeThemeMode {
     fn default() -> Self {
-        Self::System
+        // Dark rather than Follow System: a terminal spends its life next to
+        // other terminals, and following a light desktop theme is the one
+        // default nobody keeps. Existing installs are unaffected — their
+        // settings.json already records an explicit theme_mode.
+        Self::Dark
     }
 }
 

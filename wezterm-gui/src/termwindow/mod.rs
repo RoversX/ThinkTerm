@@ -309,6 +309,11 @@ const CHROME_RETURN_DELAY: Duration = Duration::from_millis(90);
 /// the grid that is arriving underneath it.
 pub(crate) const CONTENT_VIEW_FLIGHT_ZINDEX: i8 = 9;
 
+/// Above every other chrome surface, including the content-view flight layer.
+/// A hover tag explains a button that sits at the edge of a sidebar, so it
+/// necessarily overhangs that sidebar and must not be painted underneath it.
+pub(crate) const TOOLTIP_ZINDEX: i8 = 10;
+
 /// Z-index a transitioning full-window view is composited into.
 ///
 /// Everything else in the window draws at zero. The quad layers within a
@@ -1055,6 +1060,45 @@ pub(crate) fn pane_drop_action(
 }
 
 #[cfg(test)]
+mod tooltip_tests {
+    use super::*;
+
+    #[test]
+    fn every_icon_only_sidebar_button_has_a_name() {
+        // These five carry no text of their own, so the hover tag is the only
+        // place their name appears.
+        for item_type in [
+            UIItemType::WorkspaceSidebarSettings,
+            UIItemType::WorkspaceSidebarViewOptions,
+            UIItemType::WorkspaceSidebarSshHosts,
+            UIItemType::WorkspaceSidebarLiveOverview,
+            UIItemType::WorkspaceSidebarNotifications,
+        ] {
+            let label = tooltip_label_for(&item_type)
+                .unwrap_or_else(|| panic!("no tooltip label for {:?}", item_type));
+            assert!(!label.is_empty(), "empty tooltip label for {:?}", item_type);
+            // A missing translation surfaces as the key itself.
+            assert!(
+                !label.starts_with("tooltip-"),
+                "untranslated tooltip label {:?}",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn rows_that_already_show_their_own_text_get_no_tag() {
+        for item_type in [
+            UIItemType::SpaceMenu,
+            UIItemType::WorkspaceSidebarBackground,
+            UIItemType::Project("p".to_string()),
+        ] {
+            assert!(tooltip_label_for(&item_type).is_none(), "{:?}", item_type);
+        }
+    }
+}
+
+#[cfg(test)]
 mod pane_drop_tests {
     use super::*;
 
@@ -1201,6 +1245,33 @@ pub struct UIItem {
     pub width: usize,
     pub height: usize,
     pub item_type: UIItemType,
+}
+
+/// How long the pointer must rest on an icon-only button before its name
+/// appears. Long enough that crossing the sidebar on the way somewhere else
+/// shows nothing.
+pub const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
+
+/// A pending or visible hover tag: which button, where it sits, and when the
+/// pointer arrived.
+#[derive(Clone, Debug)]
+pub struct HoverTooltip {
+    pub item: UIItem,
+    pub since: Instant,
+}
+
+/// The name to show for an icon-only button, or `None` for everything that
+/// already carries its own label (or whose meaning is obvious from position).
+pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
+    let key = match item_type {
+        UIItemType::WorkspaceSidebarSettings => "tooltip-sidebar-settings",
+        UIItemType::WorkspaceSidebarViewOptions => "tooltip-sidebar-view-options",
+        UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
+        UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",
+        UIItemType::WorkspaceSidebarNotifications => "tooltip-sidebar-notifications",
+        _ => return None,
+    };
+    Some(crate::i18n::tr(key))
 }
 
 impl UIItem {
@@ -1557,6 +1628,10 @@ pub struct TermWindow {
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
+    /// The icon-only button the pointer is resting on, and when it arrived.
+    /// The tag is only painted once it has been there for TOOLTIP_DELAY, so
+    /// that sweeping the pointer across the sidebar does not strobe labels.
+    hover_tooltip: Option<HoverTooltip>,
     /// Tracks whether the current mouse-down event is part of click-focus.
     /// If so, we ignore mouse events until released
     is_click_to_focus_window: bool,
@@ -2817,6 +2892,7 @@ impl TermWindow {
             right_sidebar_open_with_app: crate::native_settings::right_sidebar_open_with_app(),
             right_sidebar_input_layouts: Vec::new(),
             last_ui_item: None,
+            hover_tooltip: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),
             modal: RefCell::new(None),
@@ -2885,7 +2961,32 @@ impl TermWindow {
             }
         });
 
-        let gl = match main_renderer {
+        // Try WebGpu first when it is the selection, but never let its failure
+        // be fatal: a machine with no usable Vulkan/DX12/Metal adapter would
+        // otherwise get a window that never opens *and* no way back, because
+        // the settings window is built the same way and would fail with it.
+        // Falling back costs a log line; not falling back costs the app.
+        let mut effective_renderer = main_renderer;
+        let mut webgpu = None;
+        if matches!(
+            main_renderer,
+            crate::native_settings::NativeRendererBackend::WebGpu
+        ) {
+            gpu_debug(format!(
+                "create WebGpu main_window size={}x{} dpi={}",
+                dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
+            ));
+            match WebGpuState::new(&window, dimensions, &config).await {
+                Ok(state) => webgpu = Some(Rc::new(state)),
+                Err(err) => {
+                    log::error!("WebGpu is unavailable ({err:#}); falling back to OpenGL");
+                    gpu_debug(format!("WebGpu unavailable: {err:#}; falling back to OpenGL"));
+                    effective_renderer = crate::native_settings::NativeRendererBackend::OpenGL;
+                }
+            }
+        }
+
+        let gl = match effective_renderer {
             crate::native_settings::NativeRendererBackend::WebGpu => None,
             crate::native_settings::NativeRendererBackend::OpenGL => {
                 gpu_debug(format!(
@@ -2898,18 +2999,6 @@ impl TermWindow {
 
         {
             let mut myself = tw.borrow_mut();
-            let webgpu = match main_renderer {
-                crate::native_settings::NativeRendererBackend::WebGpu => {
-                    gpu_debug(format!(
-                        "create WebGpu main_window size={}x{} dpi={}",
-                        dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
-                    ));
-                    Some(Rc::new(
-                        WebGpuState::new(&window, dimensions, &config).await?,
-                    ))
-                }
-                crate::native_settings::NativeRendererBackend::OpenGL => None,
-            };
             myself.config_subscription.replace(config_subscription);
             if config.use_resize_increments {
                 window.set_resize_increments(

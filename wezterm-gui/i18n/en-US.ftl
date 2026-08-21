@@ -185,6 +185,13 @@ sidebar-pinned = Pinned
 sidebar-collection-threads = Threads
 sidebar-workspaces = Workspaces
 sidebar-settings = Settings
+# Hover tags on the icon-only sidebar buttons. Keep these to a couple of
+# words: they are labels for an icon, not descriptions.
+tooltip-sidebar-settings = Settings
+tooltip-sidebar-view-options = View Options
+tooltip-sidebar-ssh-hosts = SSH Hosts
+tooltip-sidebar-live-overview = Live Overview
+tooltip-sidebar-notifications = Notifications
 menu-rename-project = Rename Project…
 menu-new-thread = New Thread
 menu-toggle-threads = Collapse / Expand Threads
@@ -458,6 +465,8 @@ onboarding-appearance = Appearance
 onboarding-theme-system = Follow System
 onboarding-theme-light = Light
 onboarding-theme-dark = Dark
+# Shown under the theme tiles only while Follow System or Light is selected.
+onboarding-theme-light-note = Bold choice — most terminals never see daylight.
 onboarding-privacy = Nothing you open leaves this machine.
 onboarding-skip = Skip
 onboarding-start = Get Started

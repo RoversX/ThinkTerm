@@ -501,6 +501,7 @@ impl OnboardingView {
             + label_h
             + tile_rows * body_h
             + body_h
+            + body_h
             + body_h;
         let flex = ctx.px(MARK_SIZE
             + MARK_TO_TITLE
@@ -510,6 +511,7 @@ impl OnboardingView {
             + (rows_n - 1.0).max(0.0) * CHIP_GAP
             + tile_rows * (TILE_H + TILE_LABEL_GAP)
             + (tile_rows - 1.0).max(0.0) * TILE_GAP
+            + TILE_LABEL_GAP
             + BTN_PAD_Y * 2.0
             + SECTION_GAP * 4.0);
         let fit = fit_factor(area.size.height - ctx.px(SIDE_PAD) * 2.0, rigid, flex);
@@ -520,8 +522,14 @@ impl OnboardingView {
         let chips_h = rows_n * chip_h + (rows_n - 1.0).max(0.0) * fx(CHIP_GAP);
         let tile_w = tile_w_base * fit;
         let tile_h = fx(TILE_H);
-        let modes_h = tile_rows * (tile_h + fx(TILE_LABEL_GAP) + body_h)
+        // The light-theme footnote is only drawn for Follow System and Light,
+        // but its room is reserved either way: the page is vertically centred,
+        // so letting the height depend on the selection would make everything
+        // above and below jump as the user tries the three tiles.
+        let note_h = fx(TILE_LABEL_GAP) + body_h;
+        let tiles_h = tile_rows * (tile_h + fx(TILE_LABEL_GAP) + body_h)
             + (tile_rows - 1.0).max(0.0) * fx(TILE_GAP);
+        let modes_h = tiles_h + note_h;
         let brand_h = fx(MARK_SIZE) + fx(MARK_TO_TITLE) + title_h + fx(TITLE_TO_SUB) + body_h;
         let group_h = |controls: f32| label_h + fx(LABEL_GAP) + controls;
         let actions_h = body_h + fx(BTN_PAD_Y) * 2.0;
@@ -643,6 +651,23 @@ impl OnboardingView {
                 fit,
             )?;
         }
+
+        // --- light-theme footnote; its space is reserved in modes_h either way
+        if matches!(
+            self.selected_appearance,
+            NativeThemeMode::System | NativeThemeMode::Light
+        ) {
+            ctx.draw_text(
+                layers,
+                font,
+                col_x,
+                y + tiles_h + fx(TILE_LABEL_GAP),
+                &crate::i18n::tr("onboarding-theme-light-note"),
+                palette.muted_text,
+                col_w,
+            )?;
+        }
+
         y += modes_h + gap;
 
         // --- privacy footnote

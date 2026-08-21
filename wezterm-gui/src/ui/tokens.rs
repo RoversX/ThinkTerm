@@ -106,7 +106,7 @@ impl Default for UiTokens {
         Self {
             sidebar_min_width: 340.0,
             sidebar_max_width: 580.0,
-            sidebar_default_width: 380.0,
+            sidebar_default_width: 440.0,
             sidebar_padding: 28.0,
             row_height: 48.0,
             row_gap: 8.0,

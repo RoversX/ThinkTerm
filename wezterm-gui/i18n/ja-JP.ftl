@@ -185,6 +185,13 @@ sidebar-pinned = ピン留め
 sidebar-collection-threads = セッション
 sidebar-workspaces = ワークスペース
 sidebar-settings = 設定
+# Hover tags on the icon-only sidebar buttons. Keep these to a couple of
+# words: they are labels for an icon, not descriptions.
+tooltip-sidebar-settings = 設定
+tooltip-sidebar-view-options = 表示オプション
+tooltip-sidebar-ssh-hosts = SSH ホスト
+tooltip-sidebar-live-overview = ライブ概要
+tooltip-sidebar-notifications = 通知
 menu-rename-project = プロジェクト名を変更…
 menu-new-thread = 新しいセッション
 menu-toggle-threads = セッションを折りたたむ／展開
@@ -458,6 +465,8 @@ onboarding-appearance = 外観
 onboarding-theme-system = システムに合わせる
 onboarding-theme-light = ライト
 onboarding-theme-dark = ダーク
+# Shown under the theme tiles only while Follow System or Light is selected.
+onboarding-theme-light-note = 勇気ある選択です。ほとんどの端末は日の光を知りません。
 onboarding-privacy = 開いたものはこの端末の外に出ません。
 onboarding-skip = スキップ
 onboarding-start = 使ってみる

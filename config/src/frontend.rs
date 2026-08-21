@@ -3,8 +3,12 @@ use wezterm_dynamic::{FromDynamic, ToDynamic};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic, Default)]
 pub enum FrontEndSelection {
-    #[default]
     OpenGL,
+    /// The default since the main window learned to fall back: wgpu asks for
+    /// every backend it has (Metal, then DX12/Vulkan/GL depending on the
+    /// platform), and if none of them can be brought up the window quietly
+    /// opens on OpenGL instead of failing to open at all.
+    #[default]
     WebGpu,
     Software,
 }

@@ -1440,6 +1440,34 @@ impl super::TermWindow {
         }
     }
 
+    /// Track which icon-only button the pointer is resting on.
+    ///
+    /// Keyed by item *type*, not by the UIItem: the sidebar rebuilds its items
+    /// every frame and a button's rect can shift by a pixel, which must not
+    /// restart the delay and leave the tag forever one frame away.
+    ///
+    /// Only records when the pointer arrived. The wakeup that makes the tag
+    /// appear is registered by `paint_hover_tooltip`, because `paint_impl`
+    /// clears `has_animation` on entry and would discard a deadline set here.
+    fn update_hover_tooltip(&mut self, item: Option<&UIItem>) {
+        let labelled =
+            item.filter(|item| crate::termwindow::tooltip_label_for(&item.item_type).is_some());
+        match labelled {
+            None => self.hover_tooltip = None,
+            Some(item) => match self.hover_tooltip.as_mut() {
+                Some(hover) if hover.item.item_type == item.item_type => {
+                    hover.item = item.clone();
+                }
+                _ => {
+                    self.hover_tooltip = Some(crate::termwindow::HoverTooltip {
+                        item: item.clone(),
+                        since: Instant::now(),
+                    });
+                }
+            },
+        }
+    }
+
     fn enter_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
             UIItemType::TabBar(_) => {}
@@ -2034,6 +2062,10 @@ impl super::TermWindow {
         } else {
             None
         };
+
+        // Also clears while a drag holds the capture: a tag hovering next to
+        // the pointer mid-drag is noise.
+        self.update_hover_tooltip(ui_item.as_ref());
 
         // A press anywhere other than the row being renamed commits a pending
         // inline rename (Enter semantics); otherwise the editor stays armed

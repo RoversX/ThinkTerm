@@ -185,6 +185,13 @@ sidebar-pinned = 已置顶
 sidebar-collection-threads = 会话
 sidebar-workspaces = 工作区
 sidebar-settings = 设置
+# Hover tags on the icon-only sidebar buttons. Keep these to a couple of
+# words: they are labels for an icon, not descriptions.
+tooltip-sidebar-settings = 设置
+tooltip-sidebar-view-options = 视图选项
+tooltip-sidebar-ssh-hosts = SSH 主机
+tooltip-sidebar-live-overview = 实时总览
+tooltip-sidebar-notifications = 通知
 menu-rename-project = 重命名项目…
 menu-new-thread = 新建会话
 menu-toggle-threads = 折叠 / 展开会话
@@ -458,6 +465,8 @@ onboarding-appearance = 外观
 onboarding-theme-system = 跟随系统
 onboarding-theme-light = 浅色
 onboarding-theme-dark = 深色
+# Shown under the theme tiles only while Follow System or Light is selected.
+onboarding-theme-light-note = 很有勇气 —— 大多数终端从不见光。
 onboarding-privacy = 你打开的一切都不会离开这台设备。
 onboarding-skip = 跳过
 onboarding-start = 开始使用
