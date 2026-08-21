@@ -44,6 +44,7 @@ pub mod domain;
 pub mod geometrytrace;
 pub mod localpane;
 pub mod pane;
+mod parse_watchdog;
 pub mod renderable;
 pub mod ssh;
 pub mod ssh_agent;
@@ -514,7 +515,13 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
     histogram!("send_actions_to_mux.rate").record(1.);
 }
 
-fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: FileDescriptor) {
+fn parse_buffered_data(
+    pane: Weak<dyn Pane>,
+    pane_id: PaneId,
+    dead: &Arc<AtomicBool>,
+    mut rx: FileDescriptor,
+    heartbeat: Arc<parse_watchdog::ParseHeartbeat>,
+) {
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
@@ -534,6 +541,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                 break;
             }
             Ok(size) => {
+                let work_started = Instant::now();
                 parser.parse(&buf[0..size], |action| {
                     let mut flush = false;
                     match &action {
@@ -567,6 +575,10 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                         action_size = 0;
                     }
                 });
+                // The poll() wait below is idle time, so busy work is
+                // recorded here (the parse, including any mid-parse flushes
+                // into the terminal) and separately around the flush below.
+                heartbeat.add(work_started.elapsed(), size);
                 action_size += size;
                 if !actions.is_empty() && !hold {
                     // If we haven't accumulated too much data,
@@ -598,7 +610,9 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                         }
                     }
 
+                    let flush_started = Instant::now();
                     send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                    heartbeat.add(flush_started.elapsed(), 0);
                     deadline = None;
                     action_size = 0;
                 }
@@ -617,6 +631,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     if !actions.is_empty() {
         send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
     }
+    parse_watchdog::unregister(pane_id);
 }
 
 fn set_socket_buffer(fd: &mut FileDescriptor, option: i32, size: usize) -> anyhow::Result<()> {
@@ -684,9 +699,10 @@ fn read_from_pane_pty(
         }
     };
 
+    let heartbeat = parse_watchdog::register(pane_id);
     std::thread::spawn({
         let dead = Arc::clone(&dead);
-        move || parse_buffered_data(pane, &dead, rx)
+        move || parse_buffered_data(pane, pane_id, &dead, rx, heartbeat)
     });
 
     if let Some(banner) = banner {
