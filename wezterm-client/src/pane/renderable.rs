@@ -975,8 +975,21 @@ pub(crate) async fn hydrate_lines(
         }
     }
 
-    for (_, request) in requests {
-        match client.client.get_image_cell(request).await {
+    // Concurrently, not one at a time: these are independent round trips, so
+    // awaiting them serially cost a line with N distinct images N times the
+    // latency. It also lost the race more often — the server answers by
+    // matching the hash against whatever occupies that cell *now*, so every
+    // extra round trip spent waiting is another chance for a newer frame to
+    // have overwritten it.
+    let fetched = futures::future::join_all(
+        requests
+            .into_values()
+            .map(|request| client.client.get_image_cell(request)),
+    )
+    .await;
+
+    for result in fetched {
+        match result {
             Ok(GetImageCellResponse {
                 data: Some(data), ..
             }) => {
@@ -987,7 +1000,13 @@ pub(crate) async fn hydrate_lines(
                 data_by_hash.insert(data.hash(), data);
             }
             Ok(GetImageCellResponse { data: None, .. }) => {
-                log::error!("no image data!");
+                // Not an error: the cell holds a different image by the time
+                // the request lands, which is the ordinary outcome for a pane
+                // streaming frames faster than the round trip. This cell just
+                // renders without the image and the next frame supersedes it.
+                // Logging it at error level buried genuine problems under
+                // thousands of lines.
+                log::debug!("image cell no longer holds the requested hash");
             }
 
             Err(err) => {
