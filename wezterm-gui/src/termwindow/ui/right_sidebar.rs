@@ -2,9 +2,9 @@ use crate::markdown_editor::{
     build_spell_check_chunks_in_range, build_visual_document, fit_table_columns, load_remote_image,
     open_vault_document, resolve_local_image, save_document_revision, vault_file_paths,
     vault_markdown_paths, wrap_visual_document_by_width_cached, AutosaveWakeAction, BlockKind,
-    EditorMode, NoteCodeBlockLayout, NoteLineGeometry, NoteLineLayout, NoteRunLayout,
+    EditorMode, InlineStyle, NoteCodeBlockLayout, NoteLineGeometry, NoteLineLayout, NoteRunLayout,
     NoteSpellingIssue, ProjectedCodeBlock, ProjectedObject, SaveState, SourceSelection,
-    TableAlignment, VisualLineKind,
+    TableAlignment, VisualDocument, VisualLineKind,
 };
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::remote_files::{
@@ -1014,6 +1014,58 @@ impl NotePaintProfile {
             self.shape_cache_misses,
             scroll_offset
         );
+    }
+}
+
+/// Idle pre-warmer for the Note shape cache. Painting shapes only the
+/// visible/overscan lines, so a fast flick into never-seen content pays the
+/// full shaping cost (~2ms per CJK line) mid-scroll. After a wrapped document
+/// lands, this walks the whole document a few milliseconds per step and
+/// shapes every run into the Note cache, after which any scroll position is
+/// a cache hit.
+pub(crate) struct NotePrewarmState {
+    /// Weak: the warmer must never keep a replaced document's visual alive.
+    visual: std::sync::Weak<VisualDocument>,
+    fonts: NotePrewarmFonts,
+    next_line: usize,
+    shaped_runs: usize,
+    scheduled: bool,
+}
+
+/// The exact fonts the Note painter would pick per run — shaping with
+/// anything else would warm entries the painter never looks up. Mirrors the
+/// per-run font match in the paint loop; keep the two in sync.
+#[derive(Clone)]
+pub(crate) struct NotePrewarmFonts {
+    pub ui: (Rc<LoadedFont>, RenderMetrics),
+    pub bold: (Rc<LoadedFont>, RenderMetrics),
+    pub italic: (Rc<LoadedFont>, RenderMetrics),
+    pub bold_italic: (Rc<LoadedFont>, RenderMetrics),
+    pub h1: (Rc<LoadedFont>, RenderMetrics),
+    pub h2: (Rc<LoadedFont>, RenderMetrics),
+    pub h3: (Rc<LoadedFont>, RenderMetrics),
+    pub h1_italic: (Rc<LoadedFont>, RenderMetrics),
+    pub h2_italic: (Rc<LoadedFont>, RenderMetrics),
+    pub h3_italic: (Rc<LoadedFont>, RenderMetrics),
+    pub code: (Rc<LoadedFont>, RenderMetrics),
+}
+
+impl NotePrewarmFonts {
+    fn for_run(&self, block: BlockKind, style: &InlineStyle) -> (&Rc<LoadedFont>, &RenderMetrics) {
+        let pair = match block {
+            BlockKind::Heading(1) if style.emphasis => &self.h1_italic,
+            BlockKind::Heading(2) if style.emphasis => &self.h2_italic,
+            BlockKind::Heading(_) if style.emphasis => &self.h3_italic,
+            BlockKind::Heading(1) => &self.h1,
+            BlockKind::Heading(2) => &self.h2,
+            BlockKind::Heading(_) => &self.h3,
+            BlockKind::CodeBlock => &self.code,
+            _ if style.strong && style.emphasis => &self.bold_italic,
+            _ if style.strong => &self.bold,
+            _ if style.emphasis => &self.italic,
+            _ => &self.ui,
+        };
+        (&pair.0, &pair.1)
     }
 }
 
@@ -4622,6 +4674,120 @@ impl crate::TermWindow {
             space: space.max(1.0),
             wide: wide.max(1.0),
         })
+    }
+
+    /// Register (or refresh) the pre-warm target for the currently painted
+    /// wrapped document and make sure a warmer step is pending. Called from
+    /// the Note paint tail: the painter is the only place that knows both
+    /// the live visual and the exact fonts it shapes with.
+    fn ensure_right_sidebar_note_prewarm(
+        &mut self,
+        visual: &Arc<VisualDocument>,
+        fonts: NotePrewarmFonts,
+    ) {
+        let same_target = self.right_sidebar_note_prewarm.as_ref().is_some_and(|state| {
+            state.visual.as_ptr() == Arc::as_ptr(visual)
+                // A config/appearance change mints new LoadedFonts (new ids,
+                // new cache keys); restart so the warm entries match paint.
+                && Rc::ptr_eq(&state.fonts.ui.0, &fonts.ui.0)
+        });
+        if !same_target {
+            self.right_sidebar_note_prewarm = Some(NotePrewarmState {
+                visual: Arc::downgrade(visual),
+                fonts,
+                next_line: 0,
+                shaped_runs: 0,
+                scheduled: false,
+            });
+        }
+        self.schedule_right_sidebar_note_prewarm_step();
+    }
+
+    fn schedule_right_sidebar_note_prewarm_step(&mut self) {
+        let Some(state) = self.right_sidebar_note_prewarm.as_mut() else {
+            return;
+        };
+        if state.scheduled {
+            return;
+        }
+        let done = state
+            .visual
+            .upgrade()
+            .map_or(true, |visual| state.next_line >= visual.lines.len());
+        if done {
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        state.scheduled = true;
+        promise::spawn::spawn(async move {
+            // Yield a frame's worth of time so the warmer interleaves with
+            // interactive paints instead of competing for the same slice.
+            smol::Timer::after(Duration::from_millis(8)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                term_window.drive_right_sidebar_note_prewarm();
+            })));
+        })
+        .detach();
+    }
+
+    pub(crate) fn drive_right_sidebar_note_prewarm(&mut self) {
+        let (visual, fonts, mut next_line, mut shaped_runs) = {
+            let Some(state) = self.right_sidebar_note_prewarm.as_mut() else {
+                return;
+            };
+            state.scheduled = false;
+            let Some(visual) = state.visual.upgrade() else {
+                self.right_sidebar_note_prewarm = None;
+                return;
+            };
+            (visual, state.fonts.clone(), state.next_line, state.shaped_runs)
+        };
+        if self.render_state.is_none() {
+            // No GPU state to rasterize into yet; the next paint re-arms us.
+            return;
+        }
+        // Warming past the LFU capacity would evict entries that are still
+        // hot; stop at 3/4 so chrome strings sharing the domain keep room.
+        let cap_budget = self
+            .ui_shape_caches
+            .borrow()
+            .domain(crate::shapecache::UiTextDomain::Note)
+            .cap()
+            .saturating_mul(3)
+            / 4;
+        let previous_domain = self
+            .ui_text_domain
+            .replace(crate::shapecache::UiTextDomain::Note);
+        let start = Instant::now();
+        const STEP_BUDGET: Duration = Duration::from_millis(4);
+        'warm: while next_line < visual.lines.len()
+            && shaped_runs < cap_budget
+            && start.elapsed() < STEP_BUDGET
+        {
+            let line = &visual.lines[next_line];
+            for run in &line.runs {
+                let (font, metrics) = fonts.for_run(line.block, &run.style);
+                let (font, metrics) = (Rc::clone(font), *metrics);
+                if self.cached_ui_shape(&font, &metrics, &run.text).is_err() {
+                    // Shaper errors are cached; a ClearShapeCache unwind is
+                    // not — either way this step should stop, the next one
+                    // resumes from here.
+                    break 'warm;
+                }
+                shaped_runs += 1;
+            }
+            next_line += 1;
+        }
+        self.ui_text_domain.set(previous_domain);
+        if let Some(state) = self.right_sidebar_note_prewarm.as_mut() {
+            state.next_line = next_line;
+            state.shaped_runs = shaped_runs;
+        }
+        if next_line < visual.lines.len() && shaped_runs < cap_budget {
+            self.schedule_right_sidebar_note_prewarm_step();
+        }
     }
 
     fn schedule_right_sidebar_note_spellcheck(&mut self, delay: Duration) {
@@ -8331,6 +8497,22 @@ impl crate::TermWindow {
                 chrome.scrollbar_thumb,
             )?;
         }
+        self.ensure_right_sidebar_note_prewarm(
+            &visual,
+            NotePrewarmFonts {
+                ui: (Rc::clone(ui_font), ui_metrics),
+                bold: (Rc::clone(&bold_font), bold_metrics),
+                italic: (Rc::clone(&italic_font), italic_metrics),
+                bold_italic: (Rc::clone(&bold_italic_font), bold_italic_metrics),
+                h1: (Rc::clone(&h1_font), h1_metrics),
+                h2: (Rc::clone(&h2_font), h2_metrics),
+                h3: (Rc::clone(&h3_font), h3_metrics),
+                h1_italic: (Rc::clone(&h1_italic_font), h1_italic_metrics),
+                h2_italic: (Rc::clone(&h2_italic_font), h2_italic_metrics),
+                h3_italic: (Rc::clone(&h3_italic_font), h3_italic_metrics),
+                code: (Rc::clone(&code_font), code_metrics),
+            },
+        );
         note_layout_stage.finish(true);
         if let Some(before) = note_stats_before {
             let after = self
