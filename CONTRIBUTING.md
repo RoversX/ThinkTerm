@@ -1,129 +1,143 @@
-# Contributing to wezterm
+# Contributing to ThinkTerm
 
-Thanks for considering donating your time and energy!  I value any contribution,
-even if it is just to highlight a typo.
+Thanks for considering it. Anything from a typo fix upward is welcome.
 
-Included here are some guidelines that can help streamline taking in your contribution.
-They are just guidelines and not hard-and-fast rules. Things will probably go faster
-and smoother if you have the time and energy to read and follow these suggestions.
+ThinkTerm is a fork of [WezTerm](https://github.com/wezterm/wezterm). A large
+part of this repository is still Wez Furlong's code, and changes to those parts
+are often best sent upstream instead — they will reach more people there, and
+ThinkTerm picks them up on the next merge. Changes to ThinkTerm's own features
+belong here.
 
-## Contributing Documentation
+## License, and what contributing means
 
-There's never enough!  Pretty much anything is fair game to improve here.
+ThinkTerm is GPL-3.0 — see [LICENSE.md](LICENSE.md). Code inherited from WezTerm
+remains under its original MIT license, preserved in
+[LICENSE-MIT](LICENSE-MIT); other third-party components are listed in
+[licenses/README.md](licenses/README.md).
 
-### Running the doc build yourself
+By opening a pull request you agree to two things:
 
-To check your documentation additions, you can optionally build the docs yourself and see how the changes will look on the webpage. 
+1. Your contribution is licensed under GPL-3.0.
+2. You grant the ThinkTerm project a perpetual, worldwide, non-exclusive,
+   royalty-free and irrevocable right to relicense your contribution under
+   different terms, including a more permissive license such as MIT.
 
-To serve them up, and then automatically rebuild and refresh the docs in your browser, run:
+The second point is not boilerplate. ThinkTerm expects to move to MIT once the
+project is more established, and without that grant the change would require
+tracking down every past contributor for consent. If you are not comfortable
+granting it, say so in the pull request rather than staying quiet — that is a
+conversation worth having before the code is written, not after.
+
+## Getting set up
+
+System dependencies are handled by the `get-deps` script:
+
 ```console
-$ ci/build-docs.sh serve
+$ ./get-deps
+$ cargo build --release
 ```
-And then click on the URL that it prints out after it has performed the first build.
 
-Any arguments passed to `build-docs.sh` are passed down to the underlying `mkdocs` utility.
+That produces three binaries, whose names do not match their crate directories:
 
-Look at [mkdocs serve](https://www.mkdocs.org/user-guide/cli/#mkdocs-serve) for more information on additional parameters.
+| Binary | Crate | What it is |
+| --- | --- | --- |
+| `thinkterm-gui` | `wezterm-gui/` | The terminal itself |
+| `thinkterm-mux-server` | `wezterm-mux-server/` | The multiplexer server |
+| `thinkterm` | `wezterm/` | The CLI |
 
-### Operating system specific installation instructions?
+`wezterm/` also builds a `wezterm` binary. That is a deliberate compatibility
+shim, not a leftover — the environment variables ThinkTerm sets promise that a
+`wezterm` command exists on `PATH`, and third-party tooling relies on it.
 
-There are a lot of targets out there.  Today we have docs that are Ubuntu biased
-and I know that there are a lot of flavors of Linux. Rather than expand the README
-with instructions for those, please translate the instructions into steps that
-can be run in the [`get-deps`](https://github.com/wezterm/wezterm/blob/master/get-deps)
-script.
+## Where things are
 
-## Contributing code
+| Path | What lives there |
+| --- | --- |
+| `term/` | The core terminal model: escape sequences, the cell grid. Windowing-agnostic. |
+| `termwiz/` | The lower-level terminal library — parsing, capabilities, surfaces. |
+| `wezterm-gui/` | The GUI. Rendering, windowing, and most ThinkTerm-specific UI. |
+| `mux/` | The multiplexer model: panes, tabs, windows, domains. |
+| `codec/` | The mux wire protocol. |
+| `thinkterm-proto/` | Pure data types shared by the protocol. |
+| `thinkterm-core/`, `thinkterm-tui/`, `thinkterm-syntax/` | ThinkTerm's own crates. |
+| `wezterm-client/` | The mux client used by the GUI and the TUI. |
+| `config/` | Configuration, including the Lua layer. |
 
-Yes please!
+For terminal escape sequence work, `term/` is almost always the right place, and
+<https://invisible-island.net/xterm/ctlseqs/ctlseqs.html> is the reference to
+match — compatibility with `xterm` behavior is the goal.
 
-If you are new to the Rust language check out <https://doc.rust-lang.org/rust-by-example/>.
+## Two rules that will bite you
 
-### Where to find things?
+**`thinkterm-proto` must keep building for `wasm32-unknown-unknown`.** That
+constraint is what keeps a pure client — web, mobile — able to speak the
+protocol. Do not add dependencies to it that touch processes, files, sockets or
+threads. The same warning is at the top of `thinkterm-proto/Cargo.toml`.
 
-The `term` directory holds the core terminal model code. This is agnostic
-of any windowing system. If you want to add support for terminal escape
-sequences and that sort of thing, you probably want to be in the `term` directory.
-Keep in mind that for maximal compatibility and utility `wezterm` aims to
-be compatible with the `xterm` behavior.
-https://invisible-island.net/xterm/ctlseqs/ctlseqs.html is a useful resource!
+**Changing the wire protocol means bumping `CODEC_VERSION`** in
+`codec/src/lib.rs`. A GUI and a mux server that disagree on it refuse to talk to
+each other, so a silent change is worse than a breaking one. There is a test
+asserting the current value, which will fail and remind you; update it in the
+same commit.
 
-The `src` directory holds the code for the `wezterm` program. This is
-the GUI renderer for the terminal model.  If you want to change something
-about the GUI you want to be in the `src` dir.
+## Iterating
 
-### Iterating
-
-I tend to iterate and sanity check as I develop using `cargo check`; it
-will type-check your code without generating code which is much faster
-than building everything in release mode:
+`cargo check` type-checks without generating code and is much faster than a full
+build:
 
 ```console
 $ cargo check
 ```
 
-Likewise, if you want to quickly check that something works, you can run it
-in debug mode using:
+To run a debug build with better backtraces:
 
 ```console
-$ cargo run
+$ RUST_BACKTRACE=1 cargo run --bin thinkterm-gui
 ```
 
-This will produce a debug-instrumented binary with poor optimization. This will
-give you more detail in the backtrace produced if you run `RUST_BACKTRACE=1 cargo run`.
+## Tests
 
-If you get a panic and want to examine local variables, you'll need to use gdb:
-
-```console
-$ cargo build
-$ gdb ./target/debug/wezterm
-$ break rust_panic               # hit tab to complete the name of the panic symbol!
-$ run
-$ bt
-```
-
-### Please include tests to cover your changes!
-
-This will help ensure that your contributions keep working as things change.
-
-You can run the existing tests using:
+Please include tests covering your changes.
 
 ```console
 $ cargo test --all
 ```
 
-There are some helper classes for writing tests for terminal behavior.
-Here's [an example of a test to verify that the terminal contents
-match expectations](https://github.com/wezterm/wezterm/blob/fd532a8c2fb3b56593597cf8be1775da1feda0a3/term/src/test/mod.rs#L314).
+There are helpers for writing terminal behavior tests — `term/src/test/` has
+examples of asserting that terminal contents match expectations after a sequence
+of input. Comments explaining a test's intent are appreciated; the intent is
+usually harder to recover later than the mechanics.
 
-Please also make a point of adding comments to your tests to help
-clarify the intent of the test!
+## Submitting a pull request
 
-### Please also include documentation if you are adding or changing behavior
-
-This helps to keep things well-understood and working in the long term.
-Don't worry if you're not a wordsmith or English isn't your first language as
-I can help with that. It is more important to capture the intent of the
-feature and having this written out in English also helps when it comes
-to reviewing the code.
-
-## Submitting a Pull Request
-
-After considering all of the above, and once you've prepared your contribution
-and are ready to submit it, you'll need to create a pull request.
-
-If you're new to GitHub Pull Requests, read through
-https://help.github.com/articles/creating-a-pull-request/ to understand
-how the process works.
-
-### Before you submit your code
-
-Make sure that the tests are working and that the code is correctly
-formatted otherwise the continuous integration system will fail your build:
+Before you open it:
 
 ```console
-$ rustup component add rustfmt-preview          # you only need to do this once
-$ cargo test --all
+$ rustup component add rustfmt            # once
 $ cargo fmt --all
+$ cargo test --all
 ```
 
+Formatting settings live in `.rustfmt.toml`.
+
+### There is no CI on pull requests
+
+Everything in `.github/workflows/` runs only on manual dispatch, a push to the
+`ci/probe` branch, or a `v*` tag. Nothing runs automatically when you open a
+pull request. The commands above are the only check between a change and `main`,
+so please actually run them.
+
+## Documentation
+
+Documentation changes are welcome and there is never enough of it. To preview
+the docs site locally — this uses Docker or Podman:
+
+```console
+$ ci/build-docs.sh serve
+```
+
+Then open the URL it prints after the first build. Arguments are passed through
+to `mkdocs`.
+
+Note that `docs/` is still largely inherited WezTerm text and has not been
+adapted for ThinkTerm yet, so expect inconsistencies there.
