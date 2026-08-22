@@ -7142,6 +7142,18 @@ impl crate::TermWindow {
         let component_key = component_hasher.finish();
 
         if self.right_sidebar_note_paint_cache.key != Some(component_key) {
+            // Width measurement below covers EVERY code line and table cell,
+            // visible or not. Real shaping here cost ~130ms per rebuild on a
+            // long document (and the rebuild runs several times while the
+            // provisional/parsed/wrapped visuals land), so use the same
+            // approximate widths the wrap pass uses; they only feed column
+            // sizing and horizontal-scroll bounds, where a few px of error
+            // is invisible and the paint-side clamp absorbs it.
+            let normal_approx_metrics = self.note_approximate_text_metrics(ui_font, &ui_metrics)?;
+            let bold_approx_metrics =
+                self.note_approximate_text_metrics(&bold_font, &bold_metrics)?;
+            let code_approx_metrics =
+                self.note_approximate_text_metrics(&code_font, &code_metrics)?;
             // Component geometry only needs heavyweight objects. Avoid a deep
             // clone of every inline emphasis/link/tag in a multi-megabyte
             // projection when the first full layout is published.
@@ -7199,13 +7211,13 @@ impl crate::TermWindow {
                 }
                 let mut desired_widths = vec![0.0f32; column_count];
                 for (row_index, row) in table.rows.iter().enumerate() {
-                    let (font, metrics) = if row_index == 0 {
-                        (&bold_font, bold_metrics)
+                    let approx = if row_index == 0 {
+                        bold_approx_metrics
                     } else {
-                        (ui_font, ui_metrics)
+                        normal_approx_metrics
                     };
                     for (column_index, cell) in row.iter().enumerate() {
-                        let width = self.cached_ui_text_advance(font, &metrics, &cell.text)?
+                        let width = approximate_note_text_width(&cell.text, approx)
                             + table_horizontal_padding * 2.0;
                         desired_widths[column_index] = desired_widths[column_index].max(width);
                     }
@@ -7277,11 +7289,8 @@ impl crate::TermWindow {
                 let mut max_content_width = 0.0f32;
                 for raw_line in code.text.split_inclusive('\n') {
                     let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-                    max_content_width = max_content_width.max(self.cached_ui_text_advance(
-                        &code_font,
-                        &code_metrics,
-                        line,
-                    )?);
+                    max_content_width = max_content_width
+                        .max(approximate_note_text_width(line, code_approx_metrics));
                 }
                 let max_horizontal_scroll = (max_content_width - code_inner_width).max(0.0);
                 let horizontal_offset = self
