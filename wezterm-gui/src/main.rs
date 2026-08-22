@@ -27,7 +27,8 @@ use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
-use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
+pub(crate) use wezterm_client::domain::AttachRetryOutcome;
+use wezterm_client::domain::{is_fatal_attach_error, ClientDomain, ClientDomainConfig};
 use wezterm_font::shaper::PresentationWidth;
 use wezterm_font::FontConfiguration;
 use wezterm_gui_subcommands::*;
@@ -296,66 +297,10 @@ fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<Stri
     }
 }
 
-/// Errors that no amount of retrying can fix: the user declined an auth
-/// prompt, or the server speaks an incompatible codec version. Everything
-/// else on the attach path (a VPN route that is not up yet, a stalled
-/// handshake, losing the race against a concurrent attach) can succeed on
-/// a later attempt.
-///
-/// Walks the whole chain rather than just the root cause, so that adding a
-/// `.context()` anywhere on the way up cannot silently disable it.
-pub(crate) fn is_fatal_attach_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause.downcast_ref::<mux::ssh::AuthCancelledError>().is_some()
-            || cause
-                .downcast_ref::<wezterm_client::client::IncompatibleVersionError>()
-                .is_some()
-    })
-}
-
-pub(crate) enum AttachRetryOutcome {
-    Attached,
-    /// `keep_going` said stop before the domain attached; the UI has been
-    /// closed and the domain is still detached.
-    Cancelled,
-}
-
-/// Backoff sleep that wakes frequently enough for `keep_going` turning
-/// false to be a real cancellation rather than a hidden retry loop.
-async fn wait_attach_backoff(
-    keep_going: &mut impl FnMut() -> bool,
-    duration: std::time::Duration,
-) -> bool {
-    let deadline = std::time::Instant::now() + duration;
-    loop {
-        if !keep_going() {
-            return false;
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return true;
-        }
-        smol::Timer::after(
-            deadline
-                .saturating_duration_since(now)
-                .min(std::time::Duration::from_millis(100)),
-        )
-        .await;
-    }
-}
-
 /// Attach `domain`, retrying transient failures with exponential backoff.
-/// Transient network failures (a VPN whose routes are not up yet at login,
-/// egress rotation, sleepy wifi) are common on the way to a remote mux.
-///
-/// The caller supplies one ConnectionUI that hosts every attempt;
-/// per-attempt UIs (which is what plain `Domain::attach` creates) would
-/// pile up as dead tabs, because the attach failure path deliberately
-/// leaves the UI open to show the error. That also means: on Err the UI is
-/// still open displaying the failure, on Ok it has been closed.
-///
-/// Fatal errors are returned immediately; transient ones are returned once
-/// `max_total` has elapsed (`None` retries until cancelled).
+/// ClientDomain owns the shared retry engine so generic Domain::attach calls
+/// (including mux spawn/split paths) receive the same behavior. Other domain
+/// kinds have no distinct attach operation and remain single-attempt.
 pub(crate) async fn attach_domain_with_retry(
     domain: Arc<dyn Domain>,
     window_id: Option<mux::window::WindowId>,
@@ -363,71 +308,36 @@ pub(crate) async fn attach_domain_with_retry(
     mut keep_going: impl FnMut() -> bool,
     max_total: Option<std::time::Duration>,
 ) -> anyhow::Result<AttachRetryOutcome> {
-    let start = std::time::Instant::now();
-    let mut backoff = std::time::Duration::from_secs(1);
-    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
-    loop {
-        if !keep_going() {
-            ui.close();
-            return Ok(AttachRetryOutcome::Cancelled);
-        }
-        let attempt = match domain.downcast_ref::<ClientDomain>() {
-            Some(client) => client.attach_with_ui(window_id, ui.clone()).await,
-            None => domain.attach(window_id).await,
-        };
-        match attempt {
-            Ok(()) => return Ok(AttachRetryOutcome::Attached),
-            Err(err) if is_fatal_attach_error(&err) => return Err(err),
-            Err(err) => {
-                if max_total.map_or(false, |limit| start.elapsed() + backoff >= limit) {
-                    return Err(err);
-                }
-                log::error!(
-                    "attaching {} failed: {err:#}; retrying in {backoff:?}",
-                    domain.domain_name()
-                );
-                ui.output_str(&format!("Will retry in {backoff:?}...\n"));
-                if !wait_attach_backoff(&mut keep_going, backoff).await {
-                    ui.close();
-                    return Ok(AttachRetryOutcome::Cancelled);
-                }
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
-        }
+    if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+        return client
+            .attach_with_ui_retry(window_id, ui, keep_going, max_total)
+            .await;
     }
+    if !keep_going() {
+        ui.close();
+        return Ok(AttachRetryOutcome::Cancelled);
+    }
+    domain.attach(window_id).await?;
+    ui.close();
+    Ok(AttachRetryOutcome::Attached)
 }
 
-#[cfg(test)]
-mod attach_retry_tests {
-    use super::is_fatal_attach_error;
-    use anyhow::{anyhow, Context};
-
-    #[test]
-    fn auth_cancelled_is_fatal_even_when_wrapped() {
-        let err = anyhow::Error::new(mux::ssh::AuthCancelledError)
-            .context("ssh session setup")
-            .context("attaching domain devbox");
-        assert!(is_fatal_attach_error(&err));
-    }
-
-    #[test]
-    fn incompatible_version_is_fatal() {
-        let err = anyhow::Error::new(wezterm_client::client::IncompatibleVersionError {
-            version: "20990101-000000-abcdef".to_string(),
-            codec_vers: 1,
-        });
-        assert!(is_fatal_attach_error(&err));
-    }
-
-    #[test]
-    fn handshake_stall_and_routing_errors_are_transient() {
-        let stalled =
-            anyhow::Error::new(wezterm_client::client::VersionHandshakeStalled { timeout_secs: 60 })
-                .context("Checking server version");
-        assert!(!is_fatal_attach_error(&stalled));
-        let no_route = anyhow!("Connection failed: No route to host (os error 65)");
-        assert!(!is_fatal_attach_error(&no_route));
-    }
+async fn attach_domain_in_window_with_retry(
+    domain: Arc<dyn Domain>,
+    window_id: mux::window::WindowId,
+) -> anyhow::Result<AttachRetryOutcome> {
+    let ui = mux::connui::ConnectionUI::with_params(mux::connui::ConnectionUIParams {
+        window_id: Some(window_id),
+        ..Default::default()
+    });
+    attach_domain_with_retry(
+        domain,
+        Some(window_id),
+        ui,
+        move || Mux::get().get_window(window_id).is_some(),
+        Some(std::time::Duration::from_secs(60)),
+    )
+    .await
 }
 
 /// Returns the domain id to tag domain-owned mux windows with, when the
@@ -475,7 +385,10 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     let config = config::configuration();
     config.update_ulimit()?;
 
-    domain.attach(Some(window_id)).await?;
+    match attach_domain_in_window_with_retry(Arc::clone(&domain), window_id).await? {
+        AttachRetryOutcome::Attached => {}
+        AttachRetryOutcome::Cancelled => return Ok(()),
+    }
 
     if have_panes_in_domain_and_ws(&domain, &workspace) {
         trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
@@ -1001,7 +914,10 @@ async fn async_run_terminal_gui(
                 *builder
             };
 
-            domain.attach(Some(window_id)).await?;
+            match attach_domain_in_window_with_retry(Arc::clone(domain), window_id).await? {
+                AttachRetryOutcome::Attached => {}
+                AttachRetryOutcome::Cancelled => return Ok(()),
+            }
             let config = config::configuration();
             let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
             let tab = domain

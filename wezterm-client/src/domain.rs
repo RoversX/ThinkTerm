@@ -1,13 +1,13 @@
 use crate::client::{Client, ClientConnectionPhase};
 use crate::pane::ClientPane;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
-use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::command_spec::{CommandSpec, CommandSpecExt};
-use mux::domain::{Domain, DomainId, DomainState, SplitSource, alloc_domain_id};
+use mux::connui::{ConnectionUI, ConnectionUIParams};
+use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitRequest, Tab, TabId};
 use mux::window::WindowId;
@@ -15,9 +15,123 @@ use mux::{Mux, MuxNotification};
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wezterm_term::TerminalSize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachRetryOutcome {
+    Attached,
+    /// `keep_going` said stop before the domain attached. The ConnectionUI
+    /// has been closed and the domain remains detached.
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AttachRetryTiming {
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    cancellation_poll: Duration,
+}
+
+impl Default for AttachRetryTiming {
+    fn default() -> Self {
+        Self {
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(10),
+            cancellation_poll: Duration::from_millis(100),
+        }
+    }
+}
+
+/// Errors that retrying cannot fix. Walk the complete error chain so adding
+/// context at any layer cannot accidentally turn a fatal error transient.
+pub fn is_fatal_attach_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<mux::ssh::AuthCancelledError>()
+            .is_some()
+            || cause
+                .downcast_ref::<crate::client::IncompatibleVersionError>()
+                .is_some()
+            || cause
+                .downcast_ref::<wezterm_ssh::HostVerificationFailed>()
+                .is_some()
+    })
+}
+
+async fn wait_attach_backoff(
+    keep_going: &mut impl FnMut() -> bool,
+    duration: Duration,
+    cancellation_poll: Duration,
+) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if !keep_going() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        smol::Timer::after(
+            deadline
+                .saturating_duration_since(now)
+                .min(cancellation_poll),
+        )
+        .await;
+    }
+}
+
+fn next_attach_backoff(current: Duration, maximum: Duration) -> Duration {
+    (current * 2).min(maximum)
+}
+
+async fn attach_with_retry_loop<Attempt, AttemptFuture, KeepGoing>(
+    domain_name: &str,
+    ui: ConnectionUI,
+    mut attempt: Attempt,
+    mut keep_going: KeepGoing,
+    max_total: Option<Duration>,
+    timing: AttachRetryTiming,
+) -> anyhow::Result<AttachRetryOutcome>
+where
+    Attempt: FnMut() -> AttemptFuture,
+    AttemptFuture: Future<Output = anyhow::Result<()>>,
+    KeepGoing: FnMut() -> bool,
+{
+    let start = Instant::now();
+    let mut backoff = timing.initial_backoff;
+    loop {
+        if !keep_going() {
+            ui.close();
+            return Ok(AttachRetryOutcome::Cancelled);
+        }
+        match attempt().await {
+            Ok(()) => {
+                // ClientDomain::attach_with_ui already closes on success, but
+                // owning that invariant here keeps the retry runner correct
+                // for tests and any future single-attempt implementation.
+                ui.close();
+                return Ok(AttachRetryOutcome::Attached);
+            }
+            Err(err) if is_fatal_attach_error(&err) => return Err(err),
+            Err(err) => {
+                if max_total.is_some_and(|limit| start.elapsed() + backoff >= limit) {
+                    return Err(err);
+                }
+                log::error!("attaching {domain_name} failed: {err:#}; retrying in {backoff:?}");
+                ui.output_str(&format!("Will retry in {backoff:?}...\n"));
+                if !wait_attach_backoff(&mut keep_going, backoff, timing.cancellation_poll).await {
+                    ui.close();
+                    return Ok(AttachRetryOutcome::Cancelled);
+                }
+                backoff = next_attach_backoff(backoff, timing.max_backoff);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FrontendRecoverySlot {
@@ -2655,14 +2769,18 @@ impl ClientDomain {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
-        FrontendRecoverySlot, RemoteFrontendGate, ViewportLatencyState, accepts_generation,
-        acknowledge_recovery_target, active_remote_tabs_by_workspace, consistent_remote_tab_id,
-        owns_remote_viewport_from_states, remote_frontend_gate_from_state, remote_move_pane_id,
-        server_runtime_replaced, thread_id_for_workspace,
+        accepts_generation, acknowledge_recovery_target, active_remote_tabs_by_workspace,
+        attach_with_retry_loop, consistent_remote_tab_id, is_fatal_attach_error,
+        next_attach_backoff, owns_remote_viewport_from_states, remote_frontend_gate_from_state,
+        remote_move_pane_id, server_runtime_replaced, thread_id_for_workspace, AttachRetryOutcome,
+        AttachRetryTiming, AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
+        FrontendRecoverySlot, RemoteFrontendGate, ViewportLatencyState,
     };
     use crate::client::ClientConnectionPhase;
+    use mux::connui::ConnectionUI;
+    use std::cell::Cell;
     use std::collections::HashMap;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     fn client_id(hostname: &str, id: usize) -> mux::client::ClientId {
@@ -2674,6 +2792,161 @@ mod tests {
             id,
             ssh_auth_sock: None,
         }
+    }
+
+    fn fast_retry_timing() -> AttachRetryTiming {
+        AttachRetryTiming {
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+            cancellation_poll: Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn attach_backoff_doubles_and_caps() {
+        let maximum = Duration::from_secs(10);
+        let mut delay = Duration::from_secs(1);
+        let mut observed = vec![delay];
+        for _ in 0..5 {
+            delay = next_attach_backoff(delay, maximum);
+            observed.push(delay);
+        }
+        assert_eq!(
+            observed,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn transient_attach_failures_retry_until_success() {
+        let attempts = Rc::new(Cell::new(0));
+        let attempt_counter = Rc::clone(&attempts);
+        let outcome = smol::block_on(attach_with_retry_loop(
+            "retry-test",
+            ConnectionUI::new_headless(),
+            move || {
+                let attempt = attempt_counter.get() + 1;
+                attempt_counter.set(attempt);
+                async move {
+                    if attempt < 3 {
+                        Err(anyhow::anyhow!("temporary routing failure"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            || true,
+            None,
+            fast_retry_timing(),
+        ))
+        .expect("transient failures should eventually attach");
+        assert_eq!(outcome, AttachRetryOutcome::Attached);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn cancellation_stops_before_a_second_attempt() {
+        let attempts = Rc::new(Cell::new(0));
+        let attempt_counter = Rc::clone(&attempts);
+        let keep_checks = Rc::new(Cell::new(0));
+        let keep_counter = Rc::clone(&keep_checks);
+        let outcome = smol::block_on(attach_with_retry_loop(
+            "cancel-test",
+            ConnectionUI::new_headless(),
+            move || {
+                attempt_counter.set(attempt_counter.get() + 1);
+                async { Err(anyhow::anyhow!("temporary routing failure")) }
+            },
+            move || {
+                let check = keep_counter.get();
+                keep_counter.set(check + 1);
+                check == 0
+            },
+            None,
+            fast_retry_timing(),
+        ))
+        .expect("cancellation is not an attach error");
+        assert_eq!(outcome, AttachRetryOutcome::Cancelled);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn retry_budget_stops_after_the_current_failure() {
+        let attempts = Rc::new(Cell::new(0));
+        let attempt_counter = Rc::clone(&attempts);
+        let err = smol::block_on(attach_with_retry_loop(
+            "budget-test",
+            ConnectionUI::new_headless(),
+            move || {
+                attempt_counter.set(attempt_counter.get() + 1);
+                async { Err(anyhow::anyhow!("still unavailable")) }
+            },
+            || true,
+            Some(Duration::ZERO),
+            fast_retry_timing(),
+        ))
+        .expect_err("an exhausted retry budget returns the last error");
+        assert!(err.to_string().contains("still unavailable"));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn fatal_attach_errors_do_not_retry_even_when_wrapped() {
+        let fatal_errors = [
+            anyhow::Error::new(mux::ssh::AuthCancelledError).context("ssh setup"),
+            anyhow::Error::new(crate::client::IncompatibleVersionError {
+                version: "20990101-000000-abcdef".to_string(),
+                codec_vers: 1,
+            })
+            .context("version check"),
+            anyhow::Error::new(wezterm_ssh::HostVerificationFailed {
+                remote_address: "example.test:22".to_string(),
+                key: "SHA256:test".to_string(),
+                file: None,
+            })
+            .context("host verification"),
+        ];
+        for err in fatal_errors {
+            assert!(is_fatal_attach_error(&err), "{}", format!("{err:#}"));
+        }
+    }
+
+    #[test]
+    fn retry_loop_stops_after_one_fatal_attempt() {
+        let attempts = Rc::new(Cell::new(0));
+        let attempt_counter = Rc::clone(&attempts);
+        let err = smol::block_on(attach_with_retry_loop(
+            "fatal-test",
+            ConnectionUI::new_headless(),
+            move || {
+                attempt_counter.set(attempt_counter.get() + 1);
+                async { Err(anyhow::Error::new(mux::ssh::AuthCancelledError)) }
+            },
+            || true,
+            None,
+            fast_retry_timing(),
+        ))
+        .expect_err("fatal failures must be returned immediately");
+        assert!(is_fatal_attach_error(&err));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn routing_and_stalled_handshake_errors_remain_transient() {
+        let stalled =
+            anyhow::Error::new(crate::client::VersionHandshakeStalled { timeout_secs: 60 })
+                .context("Checking server version");
+        assert!(!is_fatal_attach_error(&stalled));
+        assert!(!is_fatal_attach_error(&anyhow::anyhow!(
+            "Connection failed: No route to host (os error 65)"
+        )));
     }
 
     fn access(
@@ -3516,7 +3789,20 @@ impl Domain for ClientDomain {
             window_id,
             ..Default::default()
         });
-        self.attach_with_ui(window_id, ui).await
+        let outcome = self
+            .attach_with_ui_retry(
+                window_id,
+                ui,
+                move || {
+                    window_id.is_none_or(|window_id| Mux::get().get_window(window_id).is_some())
+                },
+                Some(Duration::from_secs(60)),
+            )
+            .await?;
+        match outcome {
+            AttachRetryOutcome::Attached => Ok(()),
+            AttachRetryOutcome::Cancelled => bail!("attach cancelled because its window closed"),
+        }
     }
 
     fn detachable(&self) -> bool {
@@ -3538,6 +3824,28 @@ impl Domain for ClientDomain {
 }
 
 impl ClientDomain {
+    /// Attach with one ConnectionUI shared by every attempt. Transient
+    /// failures use 1s..10s exponential backoff; fatal failures return
+    /// immediately. `None` retries until `keep_going` cancels the operation.
+    pub async fn attach_with_ui_retry(
+        &self,
+        window_id: Option<WindowId>,
+        ui: ConnectionUI,
+        keep_going: impl FnMut() -> bool,
+        max_total: Option<Duration>,
+    ) -> anyhow::Result<AttachRetryOutcome> {
+        let attempt_ui = ui.clone();
+        attach_with_retry_loop(
+            self.domain_name(),
+            ui,
+            move || self.attach_with_ui(window_id, attempt_ui.clone()),
+            keep_going,
+            max_total,
+            AttachRetryTiming::default(),
+        )
+        .await
+    }
+
     /// The body of Domain::attach, with a caller-supplied ConnectionUI so
     /// that a retrying caller can funnel every attempt into one UI tab
     /// instead of leaving a dead tab behind per attempt. On failure the UI

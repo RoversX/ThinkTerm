@@ -149,13 +149,13 @@ pub fn ssh_connect_with_ui_and_password(
                     smol::block_on(auth.answer(answers))?;
                 }
                 SessionEvent::HostVerificationFailed(failed) => {
-                    let message = format_host_verification_for_terminal(failed);
+                    let message = format_host_verification_for_terminal(&failed);
                     // Nothing is read back here, so a lazily-materialized UI
                     // would stay silent and swallow the banner — and a changed
                     // host key is the one thing the user must not miss.
                     ui.materialize();
                     ui.output(message);
-                    anyhow::bail!("Host key verification failed");
+                    return Err(failed.into());
                 }
                 SessionEvent::Error(err) => {
                     anyhow::bail!("Error: {}", err);
@@ -167,7 +167,7 @@ pub fn ssh_connect_with_ui_and_password(
     })
 }
 
-fn format_host_verification_for_terminal(failed: HostVerificationFailed) -> Vec<Change> {
+fn format_host_verification_for_terminal(failed: &HostVerificationFailed) -> Vec<Change> {
     vec![
         AttributeChange::Intensity(Intensity::Bold).into(),
         LineAttribute::DoubleHeightTopHalfLine.into(),
@@ -188,7 +188,7 @@ fn format_host_verification_for_terminal(failed: HostVerificationFailed) -> Vec<
         ),
         AttributeChange::Intensity(Intensity::Normal).into(),
         Change::Text("\r\n".to_string()),
-        match failed.file {
+        match failed.file.as_ref() {
             Some(file) => Change::Text(format!(
                 "The host is {}, and its fingerprint is\r\n{}\r\n\
                 If the administrator confirms that the key has changed, you can\r\n\
@@ -792,7 +792,7 @@ fn connect_ssh_session(
             }
             SessionEvent::HostVerificationFailed(failed) => {
                 set_status(SshConnectionStatus::Failed(failed.to_string()));
-                let message = format_host_verification_for_terminal(failed);
+                let message = format_host_verification_for_terminal(&failed);
                 shim.render(&message)?;
             }
             SessionEvent::Authenticated => {
