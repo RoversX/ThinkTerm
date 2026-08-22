@@ -230,7 +230,7 @@ Name: thinkterm
 Version: ${THINKTERM_RPM_VERSION}
 Release: ${SPEC_RELEASE}
 Packager: RoversX
-License: MIT
+License: GPL-3.0-only
 URL: https://github.com/RoversX/thinkterm
 Summary: ThinkTerm workspace-first terminal emulator.
 ${BUILD_REQUIRES}
@@ -450,7 +450,7 @@ pkgver=$(echo "$pkgver" | cut -d'-' -f1-2 | tr - .)
 _pkgver=$pkgver
 pkgrel=0
 pkgdesc="A workspace-first terminal emulator and multiplexer written in Rust"
-license="MIT"
+license="GPL-3.0-only"
 arch="all"
 options="!check"
 url="https://github.com/RoversX/thinkterm"

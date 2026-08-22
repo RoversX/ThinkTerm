@@ -45,7 +45,7 @@ PublisherSupportUrl: https://github.com/RoversX/thinkterm/issues
 Author: RoversX
 PackageName: ThinkTerm
 PackageUrl: https://github.com/RoversX/thinkterm
-License: MIT
+License: GPL-3.0-only
 LicenseUrl: https://github.com/RoversX/thinkterm/blob/main/LICENSE.md
 ShortDescription: A workspace-first terminal emulator and multiplexer implemented in Rust
 ReleaseNotesUrl: https://github.com/RoversX/thinkterm/releases/tag/$TAG_NAME

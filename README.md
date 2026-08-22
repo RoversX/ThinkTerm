@@ -142,7 +142,7 @@ ThinkTerm collects no usage data. Its only outbound request is an update check: 
 
 ThinkTerm is built on [WezTerm](https://github.com/wezterm/wezterm), written in Rust by [@wez](https://github.com/wez/). Terminal emulation, font rendering, GPU drawing, the multiplexer protocol, and SSH transport all come from that project. Thank you.
 
-ThinkTerm is released under **GPL-3.0** — see [LICENSE.md](LICENSE.md). Code originating from WezTerm remains under its original MIT license, and those copyright notices are preserved.
+ThinkTerm is released under **GPL-3.0** — see [LICENSE.md](LICENSE.md). Code originating from WezTerm remains under its original MIT license, preserved verbatim in [LICENSE-MIT](LICENSE-MIT). Bundled fonts and other third-party components are listed in [licenses/README.md](licenses/README.md).
 
 Icons from [Lucide](https://github.com/lucide-icons/lucide), [Simple Icons](https://github.com/simple-icons/simple-icons), and material-icon-theme.
 
