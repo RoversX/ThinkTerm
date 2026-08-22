@@ -292,6 +292,30 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         self.total_weight = 0;
     }
 
+    /// Drop every entry for which `keep` returns false, leaving the rest
+    /// untouched (frequency and recency state included). This is the
+    /// selective alternative to `clear` for invalidations that only affect
+    /// entries matching a predicate.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        for bucket in &mut self.buckets {
+            let mut cursor = bucket.front_mut();
+            while let Some(entry) = cursor.get() {
+                if keep(&entry.key, &entry.value) {
+                    cursor.move_next();
+                } else {
+                    let weight = entry.weight;
+                    unsafe {
+                        self.frequency_index.cursor_mut_from_ptr(entry).remove();
+                        self.recency_index.cursor_mut_from_ptr(entry).remove();
+                    }
+                    cursor.remove();
+                    self.len -= 1;
+                    self.total_weight = self.total_weight.saturating_sub(weight);
+                }
+            }
+        }
+    }
+
     pub fn get<'a, Q: ?Sized + Debug>(&'a mut self, k: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,

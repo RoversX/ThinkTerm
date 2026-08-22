@@ -888,7 +888,7 @@ impl crate::TermWindow {
                 let hb_started = crate::perf::now();
                 match font.shape(
                     &cluster.text,
-                    move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                    move |chars: &[char]| window.notify(TermWindowNotif::InvalidateShapeCacheForChars(chars.to_vec())),
                     BlockKey::filter_out_synthetic,
                     Some(cluster.presentation),
                     cluster.direction,
@@ -1008,7 +1008,7 @@ impl crate::TermWindow {
                     let hb_started = crate::perf::now();
                     match font.shape(
                         seg,
-                        move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                        move |chars: &[char]| window.notify(TermWindowNotif::InvalidateShapeCacheForChars(chars.to_vec())),
                         BlockKey::filter_out_synthetic,
                         Some(cluster.presentation),
                         cluster.direction,

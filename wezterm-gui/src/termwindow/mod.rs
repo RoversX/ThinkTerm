@@ -350,6 +350,18 @@ pub enum MouseCapture {
 /// context of the window-specific event loop
 pub enum TermWindowNotif {
     InvalidateShapeCache,
+    /// A font fallback resolve completed for exactly these codepoints. Only
+    /// entries whose text contains one of them shaped with a placeholder
+    /// and need re-shaping; everything else stays warm. The wholesale
+    /// variant above cost the Note pane its entire cache several times per
+    /// second while a CJK document's fallbacks trickled in.
+    InvalidateShapeCacheForChars(Vec<char>),
+    /// Invalidate only the terminal-side shape caches (the ones whose
+    /// resolved values embed palette colors). The UI text domains key on
+    /// `{font_identity, style, text}` with no color anywhere, so a palette
+    /// change must not throw them away: pane OSC palette traffic used to
+    /// clear the Note caches every frame and re-shape the whole sidebar.
+    InvalidateTerminalShapeCache,
     PerformAssignment {
         pane_id: PaneId,
         assignment: KeyAssignment,
@@ -3442,6 +3454,29 @@ impl TermWindow {
                 self.invalidate_modal();
                 window.invalidate();
             }
+            TermWindowNotif::InvalidateShapeCacheForChars(chars) => {
+                // The generation bump retires the terminal line caches
+                // (their rendered runs may hold placeholder glyphs for these
+                // codepoints); the shape caches evict selectively so lines
+                // without the new codepoints stay warm.
+                self.shape_generation += 1;
+                self.shape_cache
+                    .borrow_mut()
+                    .retain(|key, _| !key.text.chars().any(|c| chars.contains(&c)));
+                self.ui_shape_caches.borrow_mut().evict_containing(&chars);
+                self.publish_ui_shape_cache_diagnostics();
+                self.invalidate_modal();
+                window.invalidate();
+            }
+            TermWindowNotif::InvalidateTerminalShapeCache => {
+                // Bumping the generation retires every color-bearing terminal
+                // cache entry (LineToEleShapeCacheKey, PreviewQuadKey carry
+                // it). The UI text caches stay: their keys have no colors.
+                self.shape_generation += 1;
+                self.shape_cache.borrow_mut().clear();
+                self.invalidate_modal();
+                window.invalidate();
+            }
             TermWindowNotif::PerformAssignment {
                 pane_id,
                 assignment,
@@ -3554,10 +3589,11 @@ impl TermWindow {
                     alert: Alert::PaletteChanged,
                     pane_id,
                 } => {
-                    // Shape cache includes color information, so
-                    // ensure that we invalidate that as part of
-                    // this overall invalidation for the palette
-                    self.dispatch_notif(TermWindowNotif::InvalidateShapeCache, window)?;
+                    // Terminal-side shape caches include resolved palette
+                    // colors, so invalidate them — but only them. The UI text
+                    // caches are colorless and clearing them here made every
+                    // OSC palette write re-shape the whole sidebar.
+                    self.dispatch_notif(TermWindowNotif::InvalidateTerminalShapeCache, window)?;
                     self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::Alert {

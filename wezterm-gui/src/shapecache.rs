@@ -336,6 +336,14 @@ impl UiShapeDomainCache {
         self.cache.clear();
     }
 
+    /// Evict only the entries whose text contains any of `chars`. Used when
+    /// a font fallback resolve lands: entries without the newly resolved
+    /// codepoints shaped correctly the first time and stay warm.
+    pub fn evict_containing(&mut self, chars: &[char]) {
+        self.cache
+            .retain(|key, _| !key.text.chars().any(|c| chars.contains(&c)));
+    }
+
     pub fn update_config(&mut self, config: &config::ConfigHandle) {
         self.cache.update_config(config);
         self.cap = (self.cap_func)(config);
@@ -400,6 +408,14 @@ impl UiShapeCaches {
         self.chrome.clear();
         self.note.clear();
         self.file_preview.clear();
+    }
+
+    /// Selective cross-domain eviction for a completed font fallback
+    /// resolve: see [`UiShapeDomainCache::evict_containing`].
+    pub fn evict_containing(&mut self, chars: &[char]) {
+        self.chrome.evict_containing(chars);
+        self.note.evict_containing(chars);
+        self.file_preview.evict_containing(chars);
     }
 
     /// Note idle release: only the Note domain is dropped.
@@ -522,7 +538,7 @@ mod test {
             let mut infos = font
                 .shape(
                     &cluster.text,
-                    || {},
+                    |_: &[char]| {},
                     |_| {},
                     None,
                     Direction::LeftToRight,
@@ -720,7 +736,7 @@ mod test {
                     let _x = font
                         .shape(
                             &cluster.text,
-                            || {},
+                            |_: &[char]| {},
                             |_| {},
                             None,
                             Direction::LeftToRight,

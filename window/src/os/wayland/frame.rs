@@ -451,7 +451,7 @@ impl ConceptFrame {
         let infos = font
             .shape(
                 title,
-                || {
+                |_: &[char]| {
                     // TODO: font fallback completed, trigger title repaint!
                 },
                 |_| {

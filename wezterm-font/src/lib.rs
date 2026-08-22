@@ -141,7 +141,7 @@ impl LoadedFont {
 
             let (async_resolve, res) = match self.shape_impl(
                 text,
-                move || {
+                move |_: &[char]| {
                     let _ = tx.send(());
                 },
                 |_| {},
@@ -166,7 +166,7 @@ impl LoadedFont {
         }
     }
 
-    pub fn shape<F: FnOnce() + Send + 'static, FS: FnMut(&mut Vec<char>)>(
+    pub fn shape<F: FnOnce(&[char]) + Send + 'static, FS: FnMut(&mut Vec<char>)>(
         &self,
         text: &str,
         completion: F,
@@ -188,7 +188,7 @@ impl LoadedFont {
         Ok(res)
     }
 
-    fn shape_impl<F: FnOnce() + Send + 'static, FS: FnMut(&mut Vec<char>)>(
+    fn shape_impl<F: FnOnce(&[char]) + Send + 'static, FS: FnMut(&mut Vec<char>)>(
         &self,
         text: &str,
         completion: F,
@@ -348,7 +348,10 @@ impl LoadedFont {
 struct FallbackResolveInfo {
     no_glyphs: Vec<char>,
     pending: Arc<Mutex<Vec<ParsedFont>>>,
-    completion: Box<dyn FnOnce() + Send>,
+    /// Called with the codepoints this resolve was about, so the consumer
+    /// can evict only the shape-cache entries containing them instead of
+    /// clearing every cache in the window.
+    completion: Box<dyn FnOnce(&[char]) + Send>,
     font_dirs: Arc<FontDatabase>,
     built_in: Arc<FontDatabase>,
     locator: Arc<dyn FontLocator + Send + Sync>,
@@ -445,14 +448,14 @@ impl FallbackResolveInfo {
         // LoadedFont missing these same codepoints resolves synchronously
         // instead of repeating this search and clearing every shape cache.
         FALLBACK_RESOLVE_MEMO.lock().unwrap().insert(
-            (self.config.generation(), memo_glyphs),
+            (self.config.generation(), memo_glyphs.clone()),
             extra_handles.clone(),
         );
 
         if !extra_handles.is_empty() {
             let mut pending = self.pending.lock().unwrap();
             pending.append(&mut extra_handles);
-            (self.completion)();
+            (self.completion)(&memo_glyphs);
         }
 
         if !wanted.is_empty() {
@@ -583,7 +586,7 @@ impl FontConfigInner {
         Ok(())
     }
 
-    fn schedule_fallback_resolve<F: FnOnce() + Send + 'static>(
+    fn schedule_fallback_resolve<F: FnOnce(&[char]) + Send + 'static>(
         &self,
         no_glyphs: Vec<char>,
         pending: &Arc<Mutex<Vec<ParsedFont>>>,
