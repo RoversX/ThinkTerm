@@ -617,9 +617,8 @@ impl SshHostsView {
                 // nothing resolves the domain to connect, and every rename or
                 // delete is refused because it has to go through a server this
                 // device can no longer name.
-                let orphaned_spaces = workspace_threads::space_ids_for_domains(
-                    &ssh_hosts::domain_names_for_host(&entry.spec),
-                );
+                let host_domains = ssh_hosts::domain_names_for_host(&entry.spec);
+                let orphaned_spaces = workspace_threads::space_ids_for_domains(&host_domains);
 
                 if let Err(err) = ssh_hosts::try_remove_host(&id) {
                     log::error!("failed to delete SSH host {id}: {err:#}");
@@ -627,6 +626,10 @@ impl SshHostsView {
                     return ContentViewResponse::Redraw;
                 }
                 let _ = workspace_threads::remove_project(&id);
+                // References into this host's mux Spaces would otherwise
+                // linger as permanent grey rows: with the host record gone,
+                // nothing can ever resolve them again.
+                workspace_threads::purge_thread_refs_for_machines(&host_domains);
                 self.refresh();
 
                 if orphaned_spaces.is_empty() {

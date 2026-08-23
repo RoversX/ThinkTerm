@@ -545,6 +545,10 @@ pub fn forget_spaces_of_deleted_hosts() {
             Err(err) => log::warn!("cannot remove unreachable Space {space_id}: {err:?}"),
         }
     }
+    // Startup catch-all for references into those machines (a host deleted
+    // while the app was closed, or an interrupted delete): with no host
+    // record left to resolve them, the refs would grey out forever.
+    crate::workspace_threads::purge_thread_refs_for_machines(&unreachable);
 }
 
 pub fn list_system_hosts() -> Vec<SshHostEntry> {
