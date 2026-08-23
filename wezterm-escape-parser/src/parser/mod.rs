@@ -919,6 +919,7 @@ mod test {
                         compression: KittyImageCompression::None,
                         more_data_follows: false,
                     },
+                    verbosity: KittyImageVerbosity::Verbose,
                 })),
                 Action::Esc(Esc::Code(EscCode::StringTerminator)),
             ]
@@ -944,6 +945,7 @@ mod test {
                         compression: KittyImageCompression::None,
                         more_data_follows: false,
                     },
+                    verbosity: KittyImageVerbosity::Verbose,
                 })),
                 Action::Esc(Esc::Code(EscCode::StringTerminator)),
             ]

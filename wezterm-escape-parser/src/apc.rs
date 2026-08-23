@@ -169,33 +169,26 @@ impl KittyImageData {
         }
     }
 
+    /// How much memory this fragment occupies while it waits in a chunked
+    /// transfer. Only the direct forms carry payload bytes; the others hold a
+    /// path or object name that is not read until the transfer completes.
+    /// `load_data` consumes `self` and touches the filesystem, so it cannot be
+    /// used to measure a fragment that is still being accumulated.
+    pub fn in_memory_len(&self) -> usize {
+        match self {
+            Self::Direct(data) => data.len(),
+            Self::DirectBin(data) => data.len(),
+            Self::File { path, .. } | Self::TemporaryFile { path, .. } => path.len(),
+            Self::SharedMem { name, .. } => name.len(),
+        }
+    }
+
     /// Take the image data bytes.
     /// This operation is not repeatable as some of the sources require
     /// removing the underlying file or shared memory object as part
     /// of the read operaiton.
     #[cfg(feature = "kitty-shm")]
     pub fn load_data(self) -> std::io::Result<Vec<u8>> {
-        use std::io::{Read, Seek};
-        fn read_from_file(
-            path: &str,
-            data_offset: Option<u32>,
-            data_size: Option<u32>,
-        ) -> std::io::Result<Vec<u8>> {
-            let mut f = std::fs::File::open(path)?;
-            if let Some(offset) = data_offset {
-                f.seek(std::io::SeekFrom::Start(offset.into()))?;
-            }
-            if let Some(len) = data_size {
-                let mut res = vec![0u8; len as usize];
-                f.read_exact(&mut res)?;
-                Ok(res)
-            } else {
-                let mut res = vec![];
-                f.read_to_end(&mut res)?;
-                Ok(res)
-            }
-        }
-
         match self {
             Self::Direct(data) => base64_decode(data).or_else(|err| {
                 Err(std::io::Error::new(
@@ -214,28 +207,45 @@ impl KittyImageData {
                 data_offset,
                 data_size,
             } => {
-                let data = read_from_file(&path, data_offset, data_size)?;
-                // need to sanity check that the path looks like a reasonable
-                // temporary directory path before blindly unlinking it here.
+                // Read first, but clean up no matter how the read went: an
+                // early error return here (a refused oversized file included)
+                // would leave the temporary file behind on disk.
+                let result = read_from_file(&path, data_offset, data_size);
 
-                fn looks_like_temp_path(p: &str) -> bool {
-                    if p.starts_with("/tmp/")
-                        || p.starts_with("/var/tmp/")
-                        || p.starts_with("/dev/shm/")
-                    {
-                        return true;
+                /// True when `p` resolves to a location we are willing to
+                /// delete from. Testing the unresolved string instead accepts
+                /// `/tmp/../etc/shadow`, and a symlink planted under /tmp can
+                /// name any file on the system; either turns a temporary-file
+                /// transfer into an arbitrary unlink for anything that can
+                /// write to this tty.
+                fn resolves_inside_temp_dir(p: &str) -> bool {
+                    let resolved = match std::fs::canonicalize(p) {
+                        Ok(resolved) => resolved,
+                        Err(_) => return false,
+                    };
+
+                    let mut roots = vec![
+                        std::path::PathBuf::from("/tmp"),
+                        std::path::PathBuf::from("/var/tmp"),
+                        std::path::PathBuf::from("/dev/shm"),
+                    ];
+                    if let Ok(dir) = std::env::var("TMPDIR") {
+                        roots.push(dir.into());
                     }
 
-                    if let Ok(t) = std::env::var("TMPDIR") {
-                        if p.starts_with(&t) {
-                            return true;
-                        }
-                    }
-
-                    false
+                    roots
+                        .iter()
+                        .filter_map(|root| std::fs::canonicalize(root).ok())
+                        // Path::starts_with compares whole components, so
+                        // /tmpfoo does not count as being under /tmp.
+                        .any(|root| resolved.starts_with(root))
                 }
 
-                if looks_like_temp_path(&path) {
+                // Decide using where the path resolves to, but unlink the path
+                // we were given. `unlink` does not follow a final symlink, so
+                // removing the resolved path would delete a symlink's target
+                // instead of the entry the client asked us to clean up.
+                if resolves_inside_temp_dir(&path) {
                     if let Err(err) = std::fs::remove_file(&path) {
                         log::error!(
                             "Unable to remove kitty image protocol temporary file {}: {:#}",
@@ -251,7 +261,7 @@ impl KittyImageData {
                     );
                 }
 
-                Ok(data)
+                result
             }
             Self::SharedMem {
                 name,
@@ -262,6 +272,117 @@ impl KittyImageData {
     }
 }
 
+/// The most bytes a file or shared-memory transmission may hand over. These
+/// payloads are raw bytes — the base64 in the escape carries only the path
+/// or object name — and the largest one that could ever decode is the raw
+/// RGBA of an image at the 100MB limit the terminal enforces (MAX_IMAGE_SIZE
+/// in term's image.rs; move the two together). Without a cap here the escape
+/// names a file and the terminal reads all of it, however large, before
+/// anything downstream gets a chance to refuse it.
+#[cfg(feature = "kitty-shm")]
+const MAX_IMAGE_DATA_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Opens `path` for reading, refusing anything that is not a regular
+/// file. Reading a character device such as /dev/zero never ends, and
+/// opening a fifo blocks until a writer appears; either one wedges the
+/// pane's parser thread on a path chosen by whatever wrote the escape.
+#[cfg(feature = "kitty-shm")]
+fn open_regular_file(path: &str) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK makes opening a writer-less fifo fail instead of
+        // hanging. It does not affect reads from a regular file.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let f = std::fs::File::open(path)?;
+
+    // Checked against the descriptor we already hold, so the answer
+    // cannot change between the check and the read.
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{path} is not a regular file"),
+        ));
+    }
+    Ok(f)
+}
+
+#[cfg(feature = "kitty-shm")]
+fn read_from_file(
+    path: &str,
+    data_offset: Option<u32>,
+    data_size: Option<u32>,
+) -> std::io::Result<Vec<u8>> {
+    read_from_file_capped(path, data_offset, data_size, MAX_IMAGE_DATA_BYTES)
+}
+
+/// The cap is a parameter so the tests can exercise it without a
+/// hundred-megabyte fixture.
+#[cfg(feature = "kitty-shm")]
+fn read_from_file_capped(
+    path: &str,
+    data_offset: Option<u32>,
+    data_size: Option<u32>,
+    cap: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Seek;
+    let mut f = open_regular_file(path)?;
+    if let Some(offset) = data_offset {
+        f.seek(std::io::SeekFrom::Start(offset.into()))?;
+    }
+    if let Some(len) = data_size {
+        read_exactly(&mut f, len, cap)
+    } else {
+        read_to_end_capped(&mut f, cap)
+    }
+}
+
+/// Reads to end-of-file, refusing to hold more than `cap` bytes.
+#[cfg(feature = "kitty-shm")]
+fn read_to_end_capped(f: &mut impl std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut res = Vec::new();
+    f.take(cap.saturating_add(1)).read_to_end(&mut res)?;
+    if res.len() as u64 > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("image data is over the {cap} byte limit"),
+        ));
+    }
+    Ok(res)
+}
+
+/// Reads exactly `len` bytes, without trusting `len` enough to allocate it up
+/// front. `S=` is chosen by whatever wrote the escape sequence and its u32
+/// maximum is 4GiB, so reserving it before reading hands a remote writer a
+/// 4GiB allocation for a one-line escape. Growing a `Vec` to fit what actually
+/// arrives costs the same for honest callers. A `len` over `cap` is refused
+/// before any read happens.
+#[cfg(feature = "kitty-shm")]
+fn read_exactly(f: &mut impl std::io::Read, len: u32, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    if u64::from(len) > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("wanted {len} bytes of image data, over the {cap} byte limit"),
+        ));
+    }
+    let mut res = Vec::new();
+    let got = f.take(len.into()).read_to_end(&mut res)?;
+    if got != len as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("wanted {len} bytes of image data but only {got} were available"),
+        ));
+    }
+    Ok(res)
+}
+
 #[cfg(all(feature = "kitty-shm", unix, not(target_os = "android")))]
 fn read_shared_memory_data(
     name: &str,
@@ -270,7 +391,7 @@ fn read_shared_memory_data(
 ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
     use nix::sys::mman::{shm_open, shm_unlink};
     use std::fs::File;
-    use std::io::{Read, Seek};
+    use std::io::Seek;
 
     let fd = shm_open(
         name,
@@ -284,20 +405,10 @@ fn read_shared_memory_data(
             format!("shm_open {} failed: {:#}", name, err),
         )
     })?;
-    let mut f = File::from(fd);
-    if let Some(offset) = data_offset {
-        f.seek(std::io::SeekFrom::Start(offset.into()))?;
-    }
-    let data = if let Some(len) = data_size {
-        let mut res = vec![0u8; len as usize];
-        f.read_exact(&mut res)?;
-        res
-    } else {
-        let mut res = vec![];
-        f.read_to_end(&mut res)?;
-        res
-    };
-
+    // Unlink immediately: the name disappears but the object lives on until
+    // the descriptor closes, so the reads below still work — and every exit,
+    // a seek error or a refused oversized payload included, cleans up rather
+    // than leaking the object.
     if let Err(err) = shm_unlink(name) {
         log::warn!(
             "Unable to unlink kitty image protocol shm file {}: {:#}",
@@ -305,6 +416,17 @@ fn read_shared_memory_data(
             err
         );
     }
+
+    let mut f = File::from(fd);
+    if let Some(offset) = data_offset {
+        f.seek(std::io::SeekFrom::Start(offset.into()))?;
+    }
+    let data = if let Some(len) = data_size {
+        read_exactly(&mut f, len, MAX_IMAGE_DATA_BYTES)?
+    } else {
+        read_to_end_capped(&mut f, MAX_IMAGE_DATA_BYTES)?
+    };
+
     Ok(data)
 }
 
@@ -617,6 +739,11 @@ pub struct KittyImagePlacement {
     pub placement_id: Option<u32>,
     /// z=...
     pub z_index: Option<i32>,
+    /// A virtual placement draws nothing by itself. It registers that the
+    /// image is ready, and the application then prints U+10EEEE placeholder
+    /// cells to say where it should appear.
+    /// U=0, U=1
+    pub virtual_placement: bool,
 }
 
 impl KittyImagePlacement {
@@ -637,6 +764,11 @@ impl KittyImagePlacement {
                 _ => return None,
             },
             z_index: geti(keys, "z"),
+            virtual_placement: match get(keys, "U") {
+                None | Some("0") => false,
+                Some("1") => true,
+                _ => return None,
+            },
         })
     }
 
@@ -653,6 +785,10 @@ impl KittyImagePlacement {
 
         if self.do_not_move_cursor {
             keys.insert("C", "1".to_string());
+        }
+
+        if self.virtual_placement {
+            keys.insert("U", "1".to_string());
         }
 
         set(keys, "z", &self.z_index);
@@ -984,7 +1120,7 @@ impl KittyImageFrame {
                 None | Some(0) => None,
                 n => n,
             },
-            duration_ms: match geti(keys, "Z") {
+            duration_ms: match geti(keys, "z") {
                 None | Some(0) => None,
                 n => n,
             },
@@ -1002,7 +1138,7 @@ impl KittyImageFrame {
         set(keys, "y", &self.y);
         set(keys, "c", &self.base_frame);
         set(keys, "r", &self.frame_number);
-        set(keys, "Z", &self.duration_ms);
+        set(keys, "z", &self.duration_ms);
         match &self.composition_mode {
             KittyFrameCompositionMode::AlphaBlending => {}
             KittyFrameCompositionMode::Overwrite => {
@@ -1039,7 +1175,10 @@ pub enum KittyImage {
         verbosity: KittyImageVerbosity,
     },
     /// a='q'
-    Query { transmit: KittyImageTransmit },
+    Query {
+        transmit: KittyImageTransmit,
+        verbosity: KittyImageVerbosity,
+    },
     /// a='f'
     TransmitFrame {
         transmit: KittyImageTransmit,
@@ -1057,7 +1196,7 @@ impl KittyImage {
     pub fn verbosity(&self) -> KittyImageVerbosity {
         match self {
             Self::TransmitData { verbosity, .. } => *verbosity,
-            Self::Query { .. } => KittyImageVerbosity::Verbose,
+            Self::Query { verbosity, .. } => *verbosity,
             Self::TransmitDataAndDisplay { verbosity, .. } => *verbosity,
             Self::Display { verbosity, .. } => *verbosity,
             Self::Delete { verbosity, .. } => *verbosity,
@@ -1091,6 +1230,7 @@ impl KittyImage {
             }),
             "q" => Some(Self::Query {
                 transmit: KittyImageTransmit::from_keys(&keys, payload)?,
+                verbosity,
             }),
             "T" => Some(Self::TransmitDataAndDisplay {
                 transmit: KittyImageTransmit::from_keys(&keys, payload)?,
@@ -1130,8 +1270,12 @@ impl KittyImage {
                 verbosity.to_keys(keys);
                 transmit.to_keys(keys);
             }
-            Self::Query { transmit } => {
+            Self::Query {
+                transmit,
+                verbosity,
+            } => {
                 keys.insert("a", "q".to_string());
+                verbosity.to_keys(keys);
                 transmit.to_keys(keys);
             }
             Self::TransmitDataAndDisplay {
@@ -1272,6 +1416,244 @@ mod test {
                     duration_ms: None,
                 },
             }
+        );
+    }
+}
+
+#[cfg(all(test, feature = "kitty-shm", unix, not(target_os = "android")))]
+mod shm_test {
+    use super::*;
+
+    #[test]
+    fn a_refused_shared_memory_payload_is_still_unlinked() {
+        use nix::fcntl::OFlag;
+        use nix::sys::mman::{shm_open, shm_unlink};
+        use nix::sys::stat::Mode;
+
+        let name = format!("/tt-apc-{}", std::process::id());
+        // Tolerate a leftover from a crashed earlier run.
+        let _ = shm_unlink(name.as_str());
+
+        let fd = shm_open(
+            name.as_str(),
+            OFlag::O_CREAT | OFlag::O_RDWR | OFlag::O_EXCL,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .expect("shm_open create");
+        nix::unistd::ftruncate(&fd, 64).expect("ftruncate");
+        drop(fd);
+
+        // S= far over the cap is refused before any read happens; the
+        // object must be unlinked anyway, or refused transfers pile up.
+        let err = KittyImageData::SharedMem {
+            name: name.clone(),
+            data_offset: None,
+            data_size: Some(u32::MAX),
+        }
+        .load_data()
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        assert!(
+            shm_open(name.as_str(), OFlag::O_RDONLY, Mode::empty()).is_err(),
+            "the refused shared-memory object should have been unlinked"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "kitty-shm", unix))]
+mod temp_file_test {
+    use super::*;
+
+    /// Removes its directory when it goes out of scope, so a failing
+    /// assertion does not leave the tree dirty.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        /// Creates a directory that is deliberately *not* under any of the
+        /// temporary roots the protocol is allowed to delete from.
+        fn outside_temp(tag: &str) -> Self {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!(".apc-test-{}-{}", tag, std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn in_temp(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("apc-test-{}-{}", tag, std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn file(&self, name: &str, contents: &[u8]) -> std::path::PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn load_temporary_file(path: String) -> std::io::Result<Vec<u8>> {
+        KittyImageData::TemporaryFile {
+            path,
+            data_offset: None,
+            data_size: None,
+        }
+        .load_data()
+    }
+
+    #[test]
+    fn a_real_temporary_file_is_read_and_unlinked() {
+        let dir = ScratchDir::in_temp("unlink");
+        let file = dir.file("frame.rgba", b"payload");
+
+        let data = load_temporary_file(file.to_str().unwrap().to_string()).unwrap();
+
+        assert_eq!(data, b"payload");
+        assert!(!file.exists(), "a genuine temporary file should be unlinked");
+    }
+
+    #[test]
+    fn traversal_out_of_the_temp_dir_does_not_unlink() {
+        let dir = ScratchDir::outside_temp("traversal");
+        let sentinel = dir.file("sentinel", b"do not delete me");
+
+        // Enough `..` to reach the filesystem root from either /tmp or the
+        // /private/tmp that /tmp resolves to on macOS. This passes the old
+        // `starts_with("/tmp/")` test while naming a file anywhere on disk.
+        let traversal = format!("/tmp/../..{}", sentinel.display());
+
+        let data = load_temporary_file(traversal).unwrap();
+
+        assert_eq!(data, b"do not delete me");
+        assert!(
+            sentinel.exists(),
+            "a path resolving outside the temp dirs must never be unlinked"
+        );
+    }
+
+    #[test]
+    fn a_symlink_pointing_out_of_the_temp_dir_does_not_unlink() {
+        let outside = ScratchDir::outside_temp("symlink-target");
+        let sentinel = outside.file("sentinel", b"do not delete me either");
+
+        let temp = ScratchDir::in_temp("symlink");
+        let link = temp.0.join("frame.rgba");
+        std::os::unix::fs::symlink(&sentinel, &link).unwrap();
+
+        let data = load_temporary_file(link.to_str().unwrap().to_string()).unwrap();
+
+        assert_eq!(data, b"do not delete me either");
+        assert!(
+            sentinel.exists(),
+            "following a symlink out of the temp dirs must not unlink its target"
+        );
+    }
+
+    #[test]
+    fn character_devices_are_not_read() {
+        // Bounded by data_size so that a regression fails the assertion
+        // instead of reading /dev/zero until the machine gives up.
+        let err = KittyImageData::File {
+            path: "/dev/zero".to_string(),
+            data_offset: None,
+            data_size: Some(16),
+        }
+        .load_data()
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn directories_are_not_read() {
+        let err = KittyImageData::File {
+            path: "/tmp".to_string(),
+            data_offset: None,
+            data_size: None,
+        }
+        .load_data()
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn an_oversized_file_read_is_refused() {
+        let dir = ScratchDir::in_temp("cap");
+        let big = dir.file("big", &[0u8; 32]);
+        let small = dir.file("small", &[0u8; 16]);
+
+        let err = read_from_file_capped(big.to_str().unwrap(), None, None, 16).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let data = read_from_file_capped(small.to_str().unwrap(), None, None, 16).unwrap();
+        assert_eq!(data.len(), 16);
+    }
+
+    #[test]
+    fn a_data_size_over_the_cap_is_refused_without_reading() {
+        let dir = ScratchDir::in_temp("cap-size");
+        let file = dir.file("f", &[0u8; 8]);
+
+        let err =
+            read_from_file_capped(file.to_str().unwrap(), None, Some(64), 16).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn an_offset_read_respects_the_cap() {
+        let dir = ScratchDir::in_temp("cap-offset");
+        let file = dir.file("f", &[0u8; 40]);
+
+        // Only 10 bytes lie past the offset: the cap is on the bytes read,
+        // not on the size of the file they come from.
+        let data = read_from_file_capped(file.to_str().unwrap(), Some(30), None, 16).unwrap();
+        assert_eq!(data.len(), 10);
+    }
+
+    #[test]
+    fn a_failed_temporary_file_read_still_unlinks() {
+        let dir = ScratchDir::in_temp("unlink-on-error");
+        let file = dir.file("frame.rgba", &[0u8; 8]);
+
+        let err = KittyImageData::TemporaryFile {
+            path: file.to_str().unwrap().to_string(),
+            data_offset: None,
+            data_size: Some(64),
+        }
+        .load_data()
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            !file.exists(),
+            "a temporary file must be cleaned up even when the read fails"
+        );
+    }
+
+    #[test]
+    fn a_symlink_inside_the_temp_dir_removes_only_the_symlink() {
+        let dir = ScratchDir::in_temp("symlink-inside");
+        let target = dir.file("target", b"still here");
+        let link = dir.0.join("frame.rgba");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let data = load_temporary_file(link.to_str().unwrap().to_string()).unwrap();
+
+        assert_eq!(data, b"still here");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the entry the client named should be removed"
+        );
+        assert!(
+            target.exists(),
+            "unlink does not follow a final symlink, so the target must survive"
         );
     }
 }
