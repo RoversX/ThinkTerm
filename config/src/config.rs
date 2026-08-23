@@ -2650,6 +2650,15 @@ return config
     }
 
     #[test]
+    fn the_mux_server_never_serves_its_own_ssh_auth_sock() {
+        // Panes get the agent.PID indirection instead; the server captures
+        // the inherited value before this scrub runs.  See mux::ssh_agent.
+        assert!(default_mux_env_remove()
+            .iter()
+            .any(|name| name == "SSH_AUTH_SOCK"));
+    }
+
+    #[test]
     fn legacy_data_migration_only_copies_durable_items() {
         let dir = tempfile::tempdir().unwrap();
         let legacy = dir.path().join(LEGACY_PRODUCT_DIR_NAME);

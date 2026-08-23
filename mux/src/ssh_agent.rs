@@ -8,7 +8,7 @@ use std::os::unix::fs::symlink as symlink_file;
 use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// AgentProxy manages an agent.PID symlink in the wezterm runtime
 /// directory.
@@ -79,6 +79,46 @@ fn update_symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> anyho
     }
 }
 
+/// The SSH_AUTH_SOCK this process started with.
+///
+/// `mux_env_remove` deliberately strips SSH_AUTH_SOCK from the mux server's
+/// own environment before it serves anything, so that panes see the
+/// `agent.PID` indirection rather than whatever transport socket the server
+/// happened to inherit.  That removal used to run before `AgentProxy::new`
+/// could read the value, so the server pointed every pane at an `agent.PID`
+/// link that was never created.  Capturing the value first keeps both
+/// properties.
+static INHERITED_SSH_AUTH_SOCK: OnceLock<Option<String>> = OnceLock::new();
+
+/// Called by the mux server immediately before it scrubs its environment.
+/// No other process calls this, so the fallback in
+/// [`AgentProxy::default_ssh_auth_sock`] is inert everywhere else and
+/// `generate_client_id` keeps advertising exactly what it does today.
+pub fn stash_inherited_ssh_auth_sock() {
+    let _ = INHERITED_SSH_AUTH_SOCK.set(std::env::var("SSH_AUTH_SOCK").ok());
+}
+
+/// Pick the agent socket to publish: an explicit configuration wins, then
+/// the live environment, then whatever the mux server captured before its
+/// environment scrub.  Empty strings are not agent paths: `update_now`
+/// elects clients on `ssh_auth_sock.is_some()`, and a `Some("")` would win
+/// the election only to fail `update_symlink`.
+fn resolve_ssh_auth_sock(
+    configured: Option<&str>,
+    env: Option<String>,
+    inherited: Option<&str>,
+) -> Option<String> {
+    configured
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| env.filter(|value| !value.is_empty()))
+        .or_else(|| {
+            inherited
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
 impl AgentProxy {
     pub fn new() -> Self {
         let pid = unsafe { libc::getpid() };
@@ -95,6 +135,11 @@ impl AgentProxy {
             if let Err(err) = update_symlink(&inherited, &sock_path) {
                 log::error!("failed to set {sock_path:?} to initial inherited SSH_AUTH_SOCK value of {inherited:?}: {err:#}");
             }
+        } else {
+            log::debug!(
+                "no SSH_AUTH_SOCK to publish at {sock_path:?} yet; \
+                 it will be created when a client with an agent has input"
+            );
         }
 
         let (sender, receiver) = sync_channel(16);
@@ -109,10 +154,11 @@ impl AgentProxy {
     }
 
     pub fn default_ssh_auth_sock() -> Option<String> {
-        match &config::configuration().default_ssh_auth_sock {
-            Some(value) => Some(value.to_string()),
-            None => std::env::var("SSH_AUTH_SOCK").ok(),
-        }
+        resolve_ssh_auth_sock(
+            config::configuration().default_ssh_auth_sock.as_deref(),
+            std::env::var("SSH_AUTH_SOCK").ok(),
+            INHERITED_SSH_AUTH_SOCK.get().and_then(|value| value.as_deref()),
+        )
     }
 
     pub fn path(&self) -> &Path {
@@ -221,5 +267,50 @@ impl AgentProxy {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_ssh_auth_sock;
+
+    // `stash_inherited_ssh_auth_sock` itself is deliberately untested here:
+    // the OnceLock is write-once for the whole test binary, which also
+    // constructs many Muxes.  The ordering it feeds is covered below.
+
+    #[test]
+    fn a_configured_agent_path_wins_over_everything() {
+        assert_eq!(
+            resolve_ssh_auth_sock(Some("/cfg"), Some("/env".to_string()), Some("/inh")),
+            Some("/cfg".to_string())
+        );
+    }
+
+    #[test]
+    fn the_live_environment_beats_what_the_server_inherited() {
+        assert_eq!(
+            resolve_ssh_auth_sock(None, Some("/env".to_string()), Some("/inh")),
+            Some("/env".to_string())
+        );
+    }
+
+    #[test]
+    fn the_inherited_value_survives_the_mux_env_scrub() {
+        assert_eq!(
+            resolve_ssh_auth_sock(None, None, Some("/inh")),
+            Some("/inh".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_values_are_not_agent_paths() {
+        assert_eq!(
+            resolve_ssh_auth_sock(Some(""), Some(String::new()), Some("/x")),
+            Some("/x".to_string())
+        );
+        assert_eq!(
+            resolve_ssh_auth_sock(Some(""), Some(String::new()), Some("")),
+            None
+        );
     }
 }

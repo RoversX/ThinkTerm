@@ -185,6 +185,12 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Capture what we inherited before either removal loop runs: the mux
+    // server strips SSH_AUTH_SOCK from its own environment on purpose, and
+    // AgentProxy (constructed with the Mux below) needs the value to publish
+    // the agent.PID symlink every pane is pointed at.
+    mux::ssh_agent::stash_inherited_ssh_auth_sock();
+
     // Remove some environment variables that aren't super helpful or
     // that are potentially misleading when we're starting up the
     // server.
