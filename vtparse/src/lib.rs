@@ -312,6 +312,14 @@ const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC: usize = 64;
 const MAX_PARAMS: usize = 256;
 
+/// An APC sequence accumulates until its terminator arrives, so a producer
+/// that never sends one would otherwise grow this buffer until the process
+/// dies. The bound sits above any legal payload — the largest image the
+/// terminal will keep is 100MB, roughly 133MB once base64 encoded — so it only
+/// ever trips on a sequence that was never going to be usable.
+#[cfg(any(feature = "std", feature = "alloc"))]
+const MAX_APC: usize = 256 * 1024 * 1024;
+
 struct OscState {
     #[cfg(any(feature = "std", feature = "alloc"))]
     buffer: Vec<u8>,
@@ -373,6 +381,17 @@ pub struct VTParser {
     params_full: bool,
     #[cfg(any(feature = "std", feature = "alloc"))]
     apc_data: Vec<u8>,
+    /// The largest APC this parser will accumulate. Always `MAX_APC` outside
+    /// of tests, which lower it so the limit can be exercised without moving
+    /// a quarter of a gigabyte through the state machine.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    apc_limit: usize,
+    /// Set once an APC sequence has outgrown `apc_limit`. Its bytes are then
+    /// discarded rather than dispatched: a truncated APC is not a shorter
+    /// command, it is a different one, and acting on it would be worse than
+    /// ignoring it.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    apc_full: bool,
 
     utf8_parser: Utf8Parser,
     utf8_return_state: State,
@@ -469,6 +488,10 @@ impl VTParser {
             utf8_parser: Utf8Parser::new(),
             #[cfg(any(feature = "std", feature = "alloc"))]
             apc_data: Vec::new(),
+            #[cfg(any(feature = "std", feature = "alloc"))]
+            apc_limit: MAX_APC,
+            #[cfg(any(feature = "std", feature = "alloc"))]
+            apc_full: false,
         }
     }
 
@@ -536,6 +559,7 @@ impl VTParser {
                 {
                     self.apc_data.clear();
                     self.apc_data.shrink_to_fit();
+                    self.apc_full = false;
                     self.osc.buffer.clear();
                     self.osc.buffer.shrink_to_fit();
                 }
@@ -643,15 +667,32 @@ impl VTParser {
                 {
                     self.apc_data.clear();
                     self.apc_data.shrink_to_fit();
+                    self.apc_full = false;
                 }
             }
             Action::ApcPut => {
                 #[cfg(any(feature = "std", feature = "alloc"))]
-                self.apc_data.push(param);
+                {
+                    if self.apc_full {
+                        // Abandoned; go on discarding until the sequence ends.
+                    } else if self.apc_data.len() >= self.apc_limit {
+                        self.apc_full = true;
+                        // Assigning rather than clearing releases the capacity.
+                        self.apc_data = Vec::new();
+                    } else {
+                        self.apc_data.push(param);
+                    }
+                }
             }
             Action::ApcEnd => {
                 #[cfg(any(feature = "std", feature = "alloc"))]
-                actor.apc_dispatch(core::mem::take(&mut self.apc_data));
+                {
+                    if self.apc_full {
+                        self.apc_full = false;
+                    } else {
+                        actor.apc_dispatch(core::mem::take(&mut self.apc_data));
+                    }
+                }
             }
 
             Action::Utf8 => self.next_utf8(actor, param),
@@ -1095,6 +1136,49 @@ mod test {
                     byte: b'\\',
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn an_oversized_apc_is_dropped() {
+        let mut parser = VTParser::new();
+        parser.apc_limit = 8;
+        let mut actor = CollectingVTActor::default();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b_G");
+        input.resize(64, b'a');
+        input.extend_from_slice(b"\x1b\\");
+        parser.parse(&input, &mut actor);
+
+        assert!(
+            !actor
+                .into_vec()
+                .iter()
+                .any(|a| matches!(a, VTAction::ApcDispatch(_))),
+            "an APC past the size limit must be dropped, not truncated and dispatched"
+        );
+    }
+
+    #[test]
+    fn an_apc_after_an_oversized_one_is_still_dispatched() {
+        let mut parser = VTParser::new();
+        parser.apc_limit = 8;
+        let mut actor = CollectingVTActor::default();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b_G");
+        input.resize(64, b'a');
+        input.extend_from_slice(b"\x1b\\");
+        parser.parse(&input, &mut actor);
+        parser.parse(b"\x1b_Gf=24;ok\x1b\\", &mut actor);
+
+        assert!(
+            actor
+                .into_vec()
+                .iter()
+                .any(|a| matches!(a, VTAction::ApcDispatch(d) if d == b"Gf=24;ok")),
+            "the limit must reset when the oversized sequence ends"
         );
     }
 
