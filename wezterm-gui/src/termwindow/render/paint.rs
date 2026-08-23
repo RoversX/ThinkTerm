@@ -2883,6 +2883,42 @@ impl crate::TermWindow {
         }
     }
 
+    /// A soft shadow falling off the hover-revealed panel's right edge, so
+    /// the overlay reads as a layer floating above the terminal rather than
+    /// a slab butted against it. Only the hover overlay gets this: the
+    /// docked sidebar sits beside the content, not on top of it.
+    ///
+    /// Painted into the same recording as the panel, so it travels with the
+    /// reveal/retreat animation. A run of thin strips with quadratically
+    /// decaying alpha stands in for a gradient.
+    fn paint_workspace_sidebar_hover_shadow(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let Some(rect) = self.workspace_sidebar_rect() else {
+            return Ok(());
+        };
+        let edge = rect.x.saturating_add(rect.width) as f32;
+        let top = rect.y as f32;
+        let height = rect.height as f32;
+        let spread = self.ui_f32(16.0);
+        const STEPS: usize = 8;
+        const BASE_ALPHA: f32 = 0.22;
+        let step_width = spread / STEPS as f32;
+        for i in 0..STEPS {
+            let t = (i as f32 + 0.5) / STEPS as f32;
+            let alpha = BASE_ALPHA * (1.0 - t) * (1.0 - t);
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(edge + i as f32 * step_width, top, step_width, height),
+                LinearRgba::with_components(0.0, 0.0, 0.0, alpha),
+            )
+            .context("sidebar hover shadow strip")?;
+        }
+        Ok(())
+    }
+
     /// Record the hover-revealed sidebar off-screen, holding back its hit
     /// targets until after the tab bar has laid out its own.
     ///
@@ -2903,6 +2939,7 @@ impl crate::TermWindow {
         let result = {
             let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
             self.paint_workspace_sidebar(&mut sidebar_layers)
+                .and_then(|_| self.paint_workspace_sidebar_hover_shadow(&mut sidebar_layers))
         };
         // The marks describe `sidebar_frame`, which the swipe composite below
         // may still split; nobody downstream of this fn may.

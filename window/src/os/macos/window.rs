@@ -69,6 +69,10 @@ const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FALLBACK_X: f64 = 96.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_GAP: f64 = 8.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE: f64 = 30.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG: NSInteger = 0x7474_7362;
+/// userInfo marker on the titlebar sidebar button's tracking area, so the
+/// WindowView's mouseEntered:/mouseExited: can tell it apart from the
+/// content view's own tracking area.
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TRACKING_KEY: &str = "thinkterm_sidebar_button";
 
 /// `NSDragOperation` values. The dragging entered/updated methods return this
 /// mask, not a BOOL: the runtime reads a full word, so returning a byte-wide
@@ -2208,6 +2212,46 @@ fn install_thinkterm_titlebar_sidebar_button(window: &StrongPtr, target: id) {
         }
 
         let () = msg_send![titlebar_view_container_id, addSubview: button];
+
+        // A tracking area owned by the WindowView, so hovering the native
+        // button reaches the GUI as WorkspaceSidebarButtonHover — this is
+        // what lets the hover-reveal treat it like the painted toggles.
+        let info: id = msg_send![class!(NSMutableDictionary), new];
+        let marker_key = nsstring(THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TRACKING_KEY);
+        let marker_val = nsstring("1");
+        let () = msg_send![info, setObject: *marker_val forKey: *marker_key];
+        // NSTrackingMouseEnteredAndExited | NSTrackingActiveInActiveApp
+        // | NSTrackingInVisibleRect
+        let options: NSUInteger = 0x01 | 0x40 | 0x200;
+        let area: id = msg_send![class!(NSTrackingArea), alloc];
+        let area: id = msg_send![
+            area,
+            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
+            options: options
+            owner: target
+            userInfo: info
+        ];
+        let () = msg_send![button, addTrackingArea: area];
+        let () = msg_send![area, release];
+        let () = msg_send![info, release];
+    }
+}
+
+/// Whether this enter/exit event came from the titlebar sidebar button's
+/// tracking area (as opposed to the content view's own).
+fn event_is_sidebar_button_tracking(nsevent: id) -> bool {
+    unsafe {
+        let area: id = msg_send![nsevent, trackingArea];
+        if area.is_null() {
+            return false;
+        }
+        let info: id = msg_send![area, userInfo];
+        if info.is_null() {
+            return false;
+        }
+        let key = nsstring(THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TRACKING_KEY);
+        let val: id = msg_send![info, objectForKey: *key];
+        !val.is_null()
     }
 }
 
@@ -3745,13 +3789,29 @@ impl WindowView {
         Self::mouse_common(this, nsevent, MouseEventKind::Move, None, None, None);
     }
 
-    extern "C" fn mouse_exited(this: &mut Object, _sel: Sel, _nsevent: id) {
+    extern "C" fn mouse_exited(this: &mut Object, _sel: Sel, nsevent: id) {
+        if let Some(myself) = Self::get_this(this) {
+            let event = if event_is_sidebar_button_tracking(nsevent) {
+                WindowEvent::WorkspaceSidebarButtonHover(false)
+            } else {
+                WindowEvent::MouseLeave
+            };
+            myself.inner.borrow_mut().events.dispatch(event);
+        }
+    }
+
+    /// Only the titlebar sidebar button's tracking area is interesting here;
+    /// the content view's own area announces itself through mouseMoved.
+    extern "C" fn mouse_entered(this: &mut Object, _sel: Sel, nsevent: id) {
+        if !event_is_sidebar_button_tracking(nsevent) {
+            return;
+        }
         if let Some(myself) = Self::get_this(this) {
             myself
                 .inner
                 .borrow_mut()
                 .events
-                .dispatch(WindowEvent::MouseLeave);
+                .dispatch(WindowEvent::WorkspaceSidebarButtonHover(true));
         }
     }
 
@@ -4777,6 +4837,10 @@ impl WindowView {
             cls.add_method(
                 sel!(mouseExited:),
                 Self::mouse_exited as extern "C" fn(&mut Object, Sel, id),
+            );
+            cls.add_method(
+                sel!(mouseEntered:),
+                Self::mouse_entered as extern "C" fn(&mut Object, Sel, id),
             );
             cls.add_method(
                 sel!(resetCursorRects),

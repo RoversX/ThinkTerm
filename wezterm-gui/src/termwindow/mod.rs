@@ -349,7 +349,6 @@ pub enum MouseCapture {
 /// Type used together with Window::notify to do something in the
 /// context of the window-specific event loop
 pub enum TermWindowNotif {
-    InvalidateShapeCache,
     /// A font fallback resolve completed for exactly these codepoints. Only
     /// entries whose text contains one of them shaped with a placeholder
     /// and need re-shaping; everything else stays warm. The wholesale
@@ -3177,6 +3176,20 @@ impl TermWindow {
                 window.invalidate();
                 Ok(true)
             }
+            WindowEvent::WorkspaceSidebarButtonHover(hovering) => {
+                self.titlebar_sidebar_button_hovered = hovering;
+                // Step the hover machine exactly like a mouse event would;
+                // the frame it asks for registers any dwell wakeup.
+                let input = self.workspace_sidebar_hover_input();
+                if self
+                    .workspace_sidebar_hover
+                    .step(input, std::time::Instant::now())
+                    != crate::termwindow::sidebar_hover::HoverFrame::None
+                {
+                    window.invalidate();
+                }
+                Ok(true)
+            }
             WindowEvent::MouseLeave => {
                 self.mouse_leave_impl(window);
                 Ok(true)
@@ -3459,14 +3472,6 @@ impl TermWindow {
         }
 
         match notif {
-            TermWindowNotif::InvalidateShapeCache => {
-                self.shape_generation += 1;
-                self.shape_cache.borrow_mut().clear();
-                self.ui_shape_caches.borrow_mut().clear_all();
-                self.publish_ui_shape_cache_diagnostics();
-                self.invalidate_modal();
-                window.invalidate();
-            }
             TermWindowNotif::InvalidateShapeCacheForChars(chars) => {
                 // The generation bump retires the terminal line caches
                 // (their rendered runs may hold placeholder glyphs for these

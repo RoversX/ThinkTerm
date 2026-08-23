@@ -849,12 +849,34 @@ impl super::TermWindow {
                             .ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_STICKY_ZONE_WIDTH);
                         (x < zx.saturating_add(sticky) as isize).then_some(PointerZone::NearHotZone)
                     });
+                // The sidebar toggle button is a hot zone of its own:
+                // pointing at it already says "I want the sidebar", so the
+                // collapsed panel reveals on hover there too (the same dwell
+                // applies, and set_workspace_sidebar_shown's suppression
+                // keeps a collapse click from instantly re-revealing).
+                let over_toggle = self.ui_items.iter().any(|item| {
+                    matches!(item.item_type, UIItemType::WorkspaceSidebarToggle)
+                        && x >= item.x as isize
+                        && x < item.x.saturating_add(item.width) as isize
+                        && y >= item.y as isize
+                        && y < item.y.saturating_add(item.height) as isize
+                });
                 if in_panel {
                     PointerZone::Panel
+                } else if over_toggle {
+                    PointerZone::HotZone
                 } else {
                     zone.unwrap_or(PointerZone::Away)
                 }
             }
+        };
+        // The native macOS titlebar button lives outside our view, so it is
+        // invisible to current_mouse_event; its hover arrives as a window
+        // event and overrides the pointer zone here.
+        let pointer = if self.titlebar_sidebar_button_hovered {
+            PointerZone::HotZone
+        } else {
+            pointer
         };
         let pinned = !self.current_mouse_buttons.is_empty()
             || self.current_mouse_capture.is_some()

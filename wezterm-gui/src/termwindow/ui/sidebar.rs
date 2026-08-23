@@ -250,15 +250,21 @@ impl crate::TermWindow {
         }
         // Either way the hover machine must not act on the pointer still
         // sitting where it was: collapsing must not instantly re-reveal, and
-        // docking makes the reveal moot.
+        // docking makes the reveal moot. The native titlebar button also
+        // disappears/reappears with this change, so its hover flag would
+        // otherwise go stale (no exit event fires for a removed button).
+        self.titlebar_sidebar_button_hovered = false;
         self.workspace_sidebar_hover.suppress_until_pointer_leaves();
     }
 
     pub(crate) fn workspace_sidebar_toggle_icon(&self) -> SvgIcon {
-        if self.workspace_sidebar_is_presented() {
-            SvgIcon::PanelLeftClose
-        } else {
+        // Keyed to the DOCKED state, not the transient hover reveal: while
+        // the panel is only hover-previewed the button reads "open", telling
+        // the truth about what a click does (pin it open).
+        if self.workspace_sidebar_collapsed {
             SvgIcon::PanelLeftOpen
+        } else {
+            SvgIcon::PanelLeftClose
         }
     }
 
@@ -2914,6 +2920,30 @@ impl crate::TermWindow {
             let settings_body_width = overview_action_x
                 .saturating_sub(settings_row_x)
                 .saturating_sub(self.ui_px(SIDEBAR_INSET) / 2);
+            // When the label cannot fit, the whole row collapses to an
+            // icon-sized pill: a full-width hover capsule around a lone gear
+            // reads as a broken button.
+            let settings_icon_probe = icon_size.min(settings_row_height.saturating_sub(8));
+            let settings_label = crate::i18n::tr("sidebar-settings");
+            let settings_label_x_inset = self.ui_px(SIDEBAR_SETTINGS_ICON_EXTRA_INSET)
+                + settings_icon_probe
+                + self.ui_px(SIDEBAR_ICON_GAP)
+                + 8;
+            let settings_label_fits = self
+                .cached_ui_text_advance(&ui_font, &ui_metrics, &settings_label)
+                .map(|advance| {
+                    settings_label_x_inset
+                        + (advance.ceil() as usize)
+                        + self.ui_px(SIDEBAR_INSET)
+                        <= settings_body_width
+                })
+                .unwrap_or(false);
+            let settings_body_width = if settings_label_fits {
+                settings_body_width
+            } else {
+                (self.ui_px(SIDEBAR_SETTINGS_ICON_EXTRA_INSET) * 2 + settings_icon_probe)
+                    .min(settings_body_width)
+            };
             let settings_hovered = self.is_pointer_over_ui_rect(
                 settings_row_x,
                 settings_row_y,
@@ -3062,18 +3092,23 @@ impl crate::TermWindow {
                 settings_icon_size,
                 foreground,
             )?;
-            self.paint_sidebar_text(
-                layers,
-                &ui_font,
-                ui_metrics,
-                &crate::i18n::tr("sidebar-settings"),
-                settings_text_x,
-                settings_text_y,
-                settings_body_width
-                    .saturating_sub(settings_text_x.saturating_sub(settings_row_x))
-                    .saturating_sub(self.ui_px(SIDEBAR_INSET)),
-                foreground,
-            )?;
+            // A truncated "S…" reads worse than no label: when the sidebar is
+            // too narrow for the whole word, the gear icon stands alone (and
+            // the row shrank to an icon pill above).
+            if settings_label_fits {
+                self.paint_sidebar_text(
+                    layers,
+                    &ui_font,
+                    ui_metrics,
+                    &settings_label,
+                    settings_text_x,
+                    settings_text_y,
+                    settings_body_width
+                        .saturating_sub(settings_text_x.saturating_sub(settings_row_x))
+                        .saturating_sub(self.ui_px(SIDEBAR_INSET)),
+                    foreground,
+                )?;
+            }
             let settings_action_icon_size = settings_icon_size;
             self.paint_sidebar_icon(
                 layers,
@@ -3603,14 +3638,13 @@ fn notification_badge_pulse_phase(elapsed: Duration) -> Option<f32> {
 
 /// The `shown` state a sidebar toggle should move to.
 ///
-/// Split out from [`TermWindow::toggle_workspace_sidebar`] because its two
-/// inputs disagree during a hover reveal — the panel is on screen while
-/// `collapsed` is still true — and that disagreement is exactly where this went
-/// wrong: reading `collapsed` alone turned a click on a button labelled "close"
-/// into a dock.
-fn workspace_sidebar_toggle_target(collapsed: bool, hover_presented: bool) -> bool {
-    let presented = !collapsed || hover_presented;
-    !presented
+/// Split out from [`TermWindow::toggle_workspace_sidebar`] so the hover-reveal
+/// case has one authoritative answer. The toggle acts on the DOCKED state: a
+/// hover reveal is only a preview, so clicking the button there pins the
+/// panel open instead of retracting it — matching its "open" icon, which is
+/// keyed to the same state ([`TermWindow::workspace_sidebar_toggle_icon`]).
+fn workspace_sidebar_toggle_target(collapsed: bool, _hover_presented: bool) -> bool {
+    collapsed
 }
 
 #[cfg(test)]
@@ -3624,13 +3658,13 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    /// Clicking the tab bar's toggle acts on what the user sees. During a hover
-    /// reveal the panel is presented while `collapsed` is still true, and the
-    /// button reads "close" — so it must collapse, not dock. Docking there also
-    /// persisted `show_left_sidebar_by_default`, permanently re-docking the
-    /// panel for every future window.
+    /// The toggle acts on the DOCKED state and its icon is keyed to the same
+    /// state. A hover reveal is only a preview: hovering the toggle button
+    /// pops the panel out, and the click that follows must pin it open — a
+    /// hover-then-click that merely retracted the panel would make the
+    /// button do nothing useful while the panel is previewed.
     #[test]
-    fn toggling_a_hover_revealed_sidebar_collapses_it() {
+    fn toggling_pins_a_hover_revealed_sidebar_open() {
         // (collapsed, hover_presented) -> shown
         assert!(
             !workspace_sidebar_toggle_target(false, false),
@@ -3641,12 +3675,12 @@ mod tests {
             "collapsed panel should dock"
         );
         assert!(
-            !workspace_sidebar_toggle_target(true, true),
-            "hover-revealed panel should collapse, not dock"
+            workspace_sidebar_toggle_target(true, true),
+            "hover-revealed panel should dock (pin open), not retract"
         );
         assert!(
             !workspace_sidebar_toggle_target(false, true),
-            "docked panel under a reveal should still collapse"
+            "docked panel should still collapse regardless of hover state"
         );
     }
 

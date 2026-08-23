@@ -630,6 +630,11 @@ pub enum WindowEvent {
 
     ToggleWorkspaceSidebar,
 
+    /// The pointer entered (true) or left (false) the native titlebar
+    /// sidebar-toggle button (macOS windowed mode). Lets the GUI's
+    /// hover-reveal treat the native button like its own painted toggles.
+    WorkspaceSidebarButtonHover(bool),
+
     Notification(Box<dyn Any + Send + Sync>),
 
     // Called while files are being dragged over the window.
