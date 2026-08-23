@@ -327,14 +327,69 @@ mod unix {
         }
 
         pub fn resolve(class_name: &str) -> anyhow::Result<PathBuf> {
-            let name = Self::compute_path(class_name);
-            std::fs::read_link(&name).with_context(|| format!("reading symlink {}", name.display()))
+            Self::resolve_published_link(&Self::compute_path(class_name), PUBLISHED_LINK_GRACE)
+        }
+
+        /// Resolve a published name to the socket it points at, pruning the
+        /// link when it names a socket that no longer answers.
+        ///
+        /// The link is only removed when it is older than `grace`: a GUI
+        /// binds its socket before publishing, but the guard keeps us from
+        /// judging a publisher that is still coming up.  Parameterized on
+        /// the path and the grace period because `RUNTIME_DIR` is resolved
+        /// once per process and a link created by a test is always young.
+        fn resolve_published_link(name: &Path, grace: Duration) -> anyhow::Result<PathBuf> {
+            let target = std::fs::read_link(name)
+                .with_context(|| format!("reading symlink {}", name.display()))?;
+
+            // read_link may hand back a relative target; probe what the
+            // link actually names, not what that names relative to our cwd.
+            let probe = if target.is_absolute() {
+                target.clone()
+            } else {
+                name.parent().unwrap_or_else(|| Path::new(".")).join(&target)
+            };
+
+            if !is_sock_dead(&probe) {
+                return Ok(target);
+            }
+
+            let age = std::fs::symlink_metadata(name)
+                .map(|meta| meta_age(&meta))
+                .unwrap_or_else(|_| Duration::from_millis(300));
+            if age <= grace {
+                // Too new to call dead; let the caller's own connect
+                // attempt decide.
+                return Ok(target);
+            }
+
+            // Only unpublish the link we just judged: a GUI may have
+            // republished over it in the meantime.  Same guard Drop uses.
+            if std::fs::read_link(name)
+                .map(|now| now == target)
+                .unwrap_or(false)
+            {
+                log::debug!(
+                    "removing stale published name {} -> {}",
+                    name.display(),
+                    target.display()
+                );
+                std::fs::remove_file(name).ok();
+            }
+
+            anyhow::bail!(
+                "{} names {}, which is not accepting connections; \
+                 no GUI is published",
+                name.display(),
+                target.display()
+            );
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::NameHolder;
+        use std::time::Duration;
 
         #[test]
         fn the_published_name_is_scoped_to_the_build_profile() {
@@ -348,6 +403,60 @@ mod unix {
             // Tests are built with debug_assertions, which is precisely the
             // profile that must not land on the release GUI's name.
             assert_ne!(name, NameHolder::compute_display_name(class));
+        }
+
+        // The socket file names below are a single character: sun_path is
+        // capped at ~104 bytes on macOS and tempdirs there are long.
+
+        #[test]
+        fn a_published_link_to_a_listening_socket_resolves() {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("s");
+            let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let link = dir.path().join("l");
+            std::os::unix::fs::symlink(&sock, &link).unwrap();
+
+            let resolved = NameHolder::resolve_published_link(&link, Duration::ZERO).unwrap();
+            assert_eq!(resolved, sock);
+            assert!(std::fs::symlink_metadata(&link).is_ok());
+        }
+
+        #[test]
+        fn a_published_link_to_a_dead_socket_is_unpublished() {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("l");
+            std::os::unix::fs::symlink(dir.path().join("s"), &link).unwrap();
+            // Ensure the link's age is measurably non-zero so a
+            // second-granularity filesystem cannot round it down to the
+            // ZERO grace below.
+            std::thread::sleep(Duration::from_millis(20));
+
+            assert!(NameHolder::resolve_published_link(&link, Duration::ZERO).is_err());
+            assert!(
+                std::fs::symlink_metadata(&link).is_err(),
+                "the stale link should have been removed"
+            );
+        }
+
+        #[test]
+        fn a_freshly_published_link_is_given_the_benefit_of_the_doubt() {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("s");
+            let link = dir.path().join("l");
+            std::os::unix::fs::symlink(&sock, &link).unwrap();
+
+            let resolved =
+                NameHolder::resolve_published_link(&link, Duration::from_secs(60)).unwrap();
+            assert_eq!(resolved, sock);
+            assert!(std::fs::symlink_metadata(&link).is_ok());
+        }
+
+        #[test]
+        fn nothing_published_is_not_a_stale_link() {
+            let dir = tempfile::tempdir().unwrap();
+            let missing = dir.path().join("l");
+            assert!(NameHolder::resolve_published_link(&missing, Duration::ZERO).is_err());
+            assert!(std::fs::symlink_metadata(&missing).is_err());
         }
     }
 }
@@ -365,8 +474,11 @@ pub fn publish_gui_sock_path(path: &Path, class_name: &str) -> anyhow::Result<Na
 }
 
 /// Resolve the last published path for `class_name`.
-/// If successful, there is NO guarantee that the returned path references
-/// a running instance; it is just the last published path.
+/// On unix, a published name whose socket has stopped answering is pruned
+/// (after a short grace period) and reported as an error.  Success is still
+/// NO guarantee that the returned path references a running instance: the
+/// instance can exit at any moment, and a freshly published name is given
+/// the benefit of the doubt.
 pub fn resolve_gui_sock_path(class_name: &str) -> anyhow::Result<PathBuf> {
     NameHolder::resolve(class_name)
 }
@@ -383,24 +495,6 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
     struct Entry {
         path: PathBuf,
         age: Duration,
-    }
-
-    /// Get an idea of the age of the entry.
-    /// Some filesystems don't support reporting `created`,
-    /// so fall back on `modified`.
-    fn meta_age(meta: &std::fs::Metadata) -> Duration {
-        let t = if let Ok(created) = meta.created() {
-            created
-        } else if let Ok(changed) = meta.modified() {
-            changed
-        } else {
-            return Duration::from_millis(300);
-        };
-        if let Ok(d) = SystemTime::now().duration_since(t) {
-            d
-        } else {
-            Duration::from_millis(300)
-        }
     }
 
     if let Ok(dir) = std::fs::read_dir(&*config::RUNTIME_DIR) {
@@ -431,3 +525,27 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
 fn is_sock_dead(sock: &std::path::Path) -> bool {
     UnixStream::connect(sock).is_err()
 }
+
+/// Get an idea of the age of the entry.
+/// Some filesystems don't support reporting `created`,
+/// so fall back on `modified`.
+fn meta_age(meta: &std::fs::Metadata) -> Duration {
+    let t = if let Ok(created) = meta.created() {
+        created
+    } else if let Ok(changed) = meta.modified() {
+        changed
+    } else {
+        return Duration::from_millis(300);
+    };
+    if let Ok(d) = SystemTime::now().duration_since(t) {
+        d
+    } else {
+        Duration::from_millis(300)
+    }
+}
+
+/// A published link younger than this is left alone even when the socket it
+/// names does not answer: the publisher may still be coming up.  Mirrors the
+/// guard `discover_gui_socks` applies to `gui-sock-*` entries.
+#[cfg(unix)]
+const PUBLISHED_LINK_GRACE: Duration = Duration::from_secs(1);

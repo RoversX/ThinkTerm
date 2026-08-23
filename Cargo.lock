@@ -7811,6 +7811,7 @@ dependencies = [
  "rangeset",
  "ratelim",
  "smol",
+ "tempfile",
  "termwiz 0.24.0",
  "textwrap",
  "thiserror 1.0.69",
