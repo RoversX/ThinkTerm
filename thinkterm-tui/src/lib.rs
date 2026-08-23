@@ -345,6 +345,9 @@ pub struct TuiOptions {
     pub domains: Vec<String>,
     /// Window class used by the standard GUI-socket discovery resolver.
     pub class_name: String,
+    /// Skip the published GUI socket and connect straight to the configured
+    /// mux server, mirroring `thinkterm cli --prefer-mux`.
+    pub prefer_mux: bool,
     /// Independent TUI presentation settings. ThinkTerm's Lua config remains
     /// the shared source for connections, shells and terminal behavior.
     pub tui_config_path: Option<PathBuf>,
@@ -355,6 +358,7 @@ impl Default for TuiOptions {
         Self {
             domains: Vec::new(),
             class_name: "com.roversx.thinkterm".to_string(),
+            prefer_mux: false,
             tui_config_path: None,
         }
     }
@@ -553,19 +557,19 @@ async fn run_async(config: ConfigHandle, options: TuiOptions) -> Result<()> {
         log::warn!("failed to load TUI state: {err:#}");
         TuiPersistentState::default()
     });
-    let catalog = all_client_domain_configs(&config, &options.class_name)?;
+    let catalog = all_client_domain_configs(&config, &options.class_name, options.prefer_mux)?;
     let available = catalog.domains;
     if available.is_empty() {
         anyhow::bail!("no mux client domains or multiplexed ThinkTerm SSH hosts are configured");
     }
-    let configs = select_domain_configs(&available, &options.domains, &catalog.local_domain_name)?;
+    let configs = select_domain_configs(&available, &options.domains, &catalog.local.name)?;
     let has_initial_configs = !configs.is_empty();
     let domain_configs = available
         .iter()
         .cloned()
         .map(|domain| (domain.name().to_string(), domain))
         .collect::<BTreeMap<_, _>>();
-    let connection_items = connection_catalog(&available, &catalog.local_domain_name);
+    let connection_items = connection_catalog(&available, &catalog.local.name);
     let mux = Arc::new(Mux::new(None));
     Mux::set_mux(&mux);
     let client_id = Arc::new(mux::client::generate_client_id());
@@ -640,6 +644,7 @@ async fn run_async(config: ConfigHandle, options: TuiOptions) -> Result<()> {
     };
     let result = run_terminal(
         domain_configs,
+        catalog.local,
         connection_items,
         domains.clone(),
         receiver,
@@ -658,25 +663,52 @@ async fn run_async(config: ConfigHandle, options: TuiOptions) -> Result<()> {
 
 struct DomainCatalog {
     domains: Vec<ClientDomainConfig>,
-    local_domain_name: String,
+    local: LocalDomainResolver,
 }
 
-fn all_client_domain_configs(config: &ConfigHandle, class_name: &str) -> Result<DomainCatalog> {
+/// Everything needed to re-run the local-domain resolver.  The TUI resolves
+/// it once at startup, but a published GUI socket can die mid-session, so a
+/// retry has to ask again rather than reuse an answer from minutes ago.
+#[derive(Clone, Debug)]
+struct LocalDomainResolver {
+    /// Configured name (normally `unix`); the resolver's synthetic domains
+    /// have an empty name and the TUI keys everything by name.
+    name: String,
+    class_name: String,
+    prefer_mux: bool,
+}
+
+impl LocalDomainResolver {
+    fn resolve(&self) -> Result<ClientDomainConfig> {
+        let (mut local, _via) =
+            Client::resolve_default_unix_domain(self.prefer_mux, &self.class_name)?;
+        local.name = self.name.clone();
+        Ok(ClientDomainConfig::Unix(local))
+    }
+}
+
+fn all_client_domain_configs(
+    config: &ConfigHandle,
+    class_name: &str,
+    prefer_mux: bool,
+) -> Result<DomainCatalog> {
     // Keep the default local entry on exactly the same resolver as `thinkterm
     // cli`: an explicit environment socket wins, then a published GUI socket,
     // and only then the configured daemon socket.  The resolver's synthetic
     // domains have an empty name because the ordinary CLI does not need one;
     // the TUI does, so preserve the configured default name (normally `unix`).
-    let mut local = Client::resolve_default_unix_domain(false, class_name)?;
-    let local_domain_name = config
-        .unix_domains
-        .first()
-        .map(|domain| domain.name.clone())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "unix".to_string());
-    local.name = local_domain_name.clone();
+    let local = LocalDomainResolver {
+        name: config
+            .unix_domains
+            .first()
+            .map(|domain| domain.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "unix".to_string()),
+        class_name: class_name.to_string(),
+        prefer_mux,
+    };
 
-    let mut domains = vec![ClientDomainConfig::Unix(local)];
+    let mut domains = vec![local.resolve()?];
     domains.extend(
         config
             .unix_domains
@@ -725,10 +757,7 @@ fn all_client_domain_configs(config: &ConfigHandle, class_name: &str) -> Result<
         }
         Err(err) => log::warn!("failed to read saved ThinkTerm SSH hosts: {err:#}"),
     }
-    Ok(DomainCatalog {
-        domains,
-        local_domain_name,
-    })
+    Ok(DomainCatalog { domains, local })
 }
 
 fn select_domain_configs(
@@ -872,6 +901,9 @@ fn check_nesting(origin: Option<&str>, inside_thinkterm_pane: bool, target: &str
 struct TuiState {
     model: AppModel,
     domain_configs: BTreeMap<String, ClientDomainConfig>,
+    /// Re-runs GUI-socket discovery for the local entry; `retry_domain` uses
+    /// it so a retry can reach the daemon after a published GUI died.
+    local_domain: LocalDomainResolver,
     domains: BTreeMap<String, Arc<ClientDomain>>,
     ui: UiState,
     dirty: bool,
@@ -995,6 +1027,7 @@ enum DragState {
 impl TuiState {
     fn new(
         domain_configs: BTreeMap<String, ClientDomainConfig>,
+        local_domain: LocalDomainResolver,
         connections: Vec<ConnectionItem>,
         domains: BTreeMap<String, Arc<ClientDomain>>,
         model: AppModel,
@@ -1016,6 +1049,7 @@ impl TuiState {
         let mut state = Self {
             model,
             domain_configs,
+            local_domain,
             domains,
             ui: {
                 let mut ui = UiState::new(status);
@@ -1267,6 +1301,7 @@ fn sync_connection_statuses(state: &mut TuiState) {
 
 async fn run_terminal(
     domain_configs: BTreeMap<String, ClientDomainConfig>,
+    local_domain: LocalDomainResolver,
     connections: Vec<ConnectionItem>,
     domains: BTreeMap<String, Arc<ClientDomain>>,
     receiver: Receiver<AppEvent>,
@@ -1287,6 +1322,7 @@ async fn run_terminal(
 
     let mut state = TuiState::new(
         domain_configs,
+        local_domain,
         connections,
         domains,
         model,
@@ -4995,11 +5031,31 @@ async fn retry_domain(state: &mut TuiState, name: &str) -> Result<()> {
     let domain = if let Some(domain) = state.domains.get(name).cloned() {
         domain
     } else {
-        let config = state
+        let cached = state
             .domain_configs
             .get(name)
             .cloned()
             .with_context(|| format!("unknown mux connection {name:?}"))?;
+        let config = if name == state.local_domain.name {
+            match state.local_domain.resolve() {
+                Ok(fresh) => {
+                    // A GUI that died since startup left a socket path that
+                    // will never answer again; re-running discovery is the
+                    // only way a retry can reach the daemon instead.
+                    state.domain_configs.insert(name.to_string(), fresh.clone());
+                    fresh
+                }
+                Err(err) => {
+                    log::warn!(
+                        "re-resolving the local mux domain failed: {err:#}; \
+                         retrying with the configuration from startup"
+                    );
+                    cached
+                }
+            }
+        } else {
+            cached
+        };
         let domain = Arc::new(ClientDomain::new(config));
         let mux_domain: Arc<dyn Domain> = domain.clone();
         Mux::get().add_domain(&mux_domain);
@@ -6958,6 +7014,17 @@ mod tests {
         ));
     }
 
+    /// TuiState wants to know how to re-resolve the local domain, but none
+    /// of these tests ever connects; `prefer_mux: true` keeps an accidental
+    /// resolve from touching GUI-socket discovery on the host.
+    fn unused_local_resolver() -> LocalDomainResolver {
+        LocalDomainResolver {
+            name: "unix".to_string(),
+            class_name: String::new(),
+            prefer_mux: true,
+        }
+    }
+
     fn model_for_reorder() -> AppModel {
         let mut model = AppModel::default();
         model.apply_snapshot(
@@ -7054,6 +7121,7 @@ mod tests {
         let model = model_for_reorder();
         let state = TuiState::new(
             BTreeMap::new(),
+            unused_local_resolver(),
             vec![],
             BTreeMap::new(),
             model,
@@ -7255,6 +7323,7 @@ mod tests {
         let model = model_for_reorder();
         let mut state = TuiState::new(
             BTreeMap::new(),
+            unused_local_resolver(),
             vec![],
             BTreeMap::new(),
             model,
@@ -7284,6 +7353,7 @@ mod tests {
         let model = model_for_reorder();
         let mut state = TuiState::new(
             BTreeMap::new(),
+            unused_local_resolver(),
             vec![],
             BTreeMap::new(),
             model,
@@ -7325,6 +7395,7 @@ mod tests {
         let model = model_for_reorder();
         let mut state = TuiState::new(
             BTreeMap::new(),
+            unused_local_resolver(),
             vec![],
             BTreeMap::new(),
             model,
@@ -7410,6 +7481,7 @@ mod tests {
     fn paste_is_blocked_by_non_prompt_overlays() {
         let mut state = TuiState::new(
             BTreeMap::new(),
+            unused_local_resolver(),
             vec![],
             BTreeMap::new(),
             AppModel::default(),

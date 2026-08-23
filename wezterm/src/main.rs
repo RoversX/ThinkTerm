@@ -273,6 +273,11 @@ struct TuiCommand {
     #[arg(long, default_value = wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS)]
     class: String,
 
+    /// Prefer connecting to a background mux server.
+    /// The default is to prefer connecting to a running ThinkTerm GUI instance.
+    #[arg(long = "prefer-mux")]
+    prefer_mux: bool,
+
     /// Override the independent ThinkTerm TUI settings file.
     #[arg(long, value_name = "PATH")]
     tui_config: Option<std::path::PathBuf>,
@@ -894,6 +899,7 @@ fn run() -> anyhow::Result<()> {
             thinkterm_tui::TuiOptions {
                 domains: cmd.domains,
                 class_name: cmd.class,
+                prefer_mux: cmd.prefer_mux,
                 tui_config_path: cmd.tui_config,
             },
         ),
