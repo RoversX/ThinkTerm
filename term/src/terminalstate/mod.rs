@@ -29,7 +29,7 @@ use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 mod image;
 mod iterm;
 mod keyboard;
-mod kitty;
+pub(crate) mod kitty;
 mod mouse;
 pub(crate) mod performer;
 mod sixel;
@@ -759,6 +759,17 @@ impl TerminalState {
         // we need to ensure that we increment the seqno in
         // order to correctly invalidate the display
         self.increment_seqno();
+
+        // Clear the placements first, while their rows still name real
+        // lines. The image data stays: applications transmit once and
+        // re-place on every redraw, and deleting the data breaks every a=p
+        // that follows (kitty keeps it too). The memory ask is served by the
+        // budget sweep — with the placements gone the images are
+        // unreferenced, and anything over the budget is reclaimed right now.
+        self.kitty_remove_all_placements(false);
+        self.kitty_img.prune_unreferenced();
+        self.kitty_reset_accumulator();
+
         self.erase_in_display(EraseInDisplay::EraseScrollback);
 
         let row_index = self.screen.phys_row(self.cursor.y);
@@ -1314,6 +1325,7 @@ impl TerminalState {
                 self.screen.activate_primary_screen(self.seqno);
                 self.screen.saved_cursor().take();
                 self.kitty_remove_all_placements(true);
+                self.kitty_reset_accumulator();
 
                 self.reverse_wraparound_mode = false;
                 self.reverse_video_mode = false;

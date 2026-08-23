@@ -69,8 +69,20 @@ impl TerminalState {
         let seqno = self.seqno;
         let physical_cols = self.screen().physical_cols;
         let physical_rows = self.screen().physical_rows;
-        let cell_pixel_width = self.pixel_width / physical_cols;
-        let cell_pixel_height = self.pixel_height / physical_rows;
+        // A pane can be asked to show an image before anything has told it how
+        // many pixels it has: the tmux and mux-server paths never report a pixel
+        // size at all, and the GUI only corrects one after the window has laid
+        // the pane out. Every division below would then be by zero.
+        let cell_pixel_width = self.pixel_width.checked_div(physical_cols).unwrap_or(0);
+        let cell_pixel_height = self.pixel_height.checked_div(physical_rows).unwrap_or(0);
+        anyhow::ensure!(
+            cell_pixel_width > 0 && cell_pixel_height > 0,
+            "no usable cell geometry: {}x{} pixels across {}x{} cells",
+            self.pixel_width,
+            self.pixel_height,
+            physical_cols,
+            physical_rows
+        );
         let cell_padding_left = params
             .cell_padding_left
             .min(cell_pixel_width.saturating_sub(1) as u16);
@@ -88,6 +100,18 @@ impl TerminalState {
             .source_height
             .unwrap_or(image_max_height)
             .min(image_max_height);
+        // w=0/h=0, or an x=/y= origin at or past the edge of the image, leaves
+        // nothing to draw and divides by zero further down.
+        anyhow::ensure!(
+            draw_width > 0 && draw_height > 0,
+            "source rectangle is empty: origin {},{} extent {:?}x{:?} within a {}x{} image",
+            params.source_origin_x,
+            params.source_origin_y,
+            params.source_width,
+            params.source_height,
+            params.image_width,
+            params.image_height
+        );
 
         let (fullcells_width, remainder_width_cell, x_delta_divisor) = params
             .columns
@@ -283,8 +307,10 @@ impl TerminalState {
     }
 }
 
+/// The largest decoded image we are willing to hold, in bytes of RGBA.
+pub(crate) const MAX_IMAGE_SIZE: u32 = 100_000_000;
+
 pub(crate) fn check_image_dimensions(width: u32, height: u32) -> anyhow::Result<()> {
-    const MAX_IMAGE_SIZE: u32 = 100_000_000;
     let size = width.saturating_mul(height).saturating_mul(4);
     if size > MAX_IMAGE_SIZE {
         anyhow::bail!(

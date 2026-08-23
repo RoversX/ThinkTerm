@@ -6,6 +6,7 @@ mod c0;
 use bitflags::bitflags;
 mod c1;
 mod csi;
+mod graphics;
 // mod selection; FIXME: port to render layer
 use crate::color::ColorPalette;
 use k9::assert_equal as assert_eq;

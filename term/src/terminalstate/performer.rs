@@ -717,6 +717,14 @@ impl<'a> Performer<'a> {
                 self.accumulating_title.take();
                 self.progress = Progress::default();
 
+                // Before the screen is torn down, while the placement rows
+                // still refer to real lines. The soft reset (DECSTR) already
+                // did this; leaving it out of the hard reset meant `reset`
+                // wiped the display but kept every image pinned in memory,
+                // with their ids still resolvable by a later `a=p`.
+                self.kitty_remove_all_placements(true);
+                self.kitty_reset_accumulator();
+
                 self.screen.full_reset();
                 self.screen.activate_alt_screen(seqno);
                 self.erase_in_display(EraseInDisplay::EraseDisplay);
