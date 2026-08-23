@@ -525,6 +525,12 @@ impl crate::TermWindow {
             if client.is_attaching() {
                 return SpaceConnectionState::Connecting;
             }
+            // The retry engine is between attempts. The backoff gap used to
+            // read as Disconnected, so a VPN that wakes on the first packet
+            // flashed a failure on every entry before attempt two succeeded.
+            if client.is_attach_retrying() {
+                return SpaceConnectionState::Connecting;
+            }
             // The retry loop parked itself after two minutes of failures;
             // it waits for the sidebar Reconnect button.
             if client.is_reconnect_suspended() {
@@ -721,9 +727,13 @@ impl crate::TermWindow {
         let space_menu_y = y;
         let space_menu_height = top_action_height + self.ui_px(6);
         y += space_menu_height + self.ui_px(SIDEBAR_INSET);
-        let reconnect_row_height = if self.space_connection_state(self.workspace_sidebar_space_id())
-            == SpaceConnectionState::Disconnected
-        {
+        // Connecting keeps the row (as a spinner) so the whole retry
+        // sequence paints one stable row instead of flickering between
+        // "row while disconnected" and "no row while an attempt runs".
+        let reconnect_row_height = if matches!(
+            self.space_connection_state(self.workspace_sidebar_space_id()),
+            SpaceConnectionState::Disconnected | SpaceConnectionState::Connecting
+        ) {
             ui_cell_height + self.ui_px(SIDEBAR_INSET)
         } else {
             0
@@ -912,8 +922,11 @@ impl crate::TermWindow {
         ui_cell_height: usize,
         register_ui_item: bool,
     ) -> anyhow::Result<()> {
-        let reconnect_in_flight =
-            workspace_threads::client_domain_for_space(self.workspace_sidebar_space_id())
+        // The domain-level retry flag covers every attach entry point; the
+        // local set still bridges the click-to-spawn gap for the button.
+        let reconnect_in_flight = self.space_connection_state(self.workspace_sidebar_space_id())
+            == SpaceConnectionState::Connecting
+            || workspace_threads::client_domain_for_space(self.workspace_sidebar_space_id())
                 .map_or(false, |name| {
                     self.space_reconnects_in_flight.contains(&name)
                 });
@@ -930,18 +943,28 @@ impl crate::TermWindow {
         let row_icon_size = ui_cell_height.min(row_height.saturating_sub(6));
         let row_icon_x = row_x + self.ui_px(SIDEBAR_INSET);
         let row_icon_y = y + ((row_height.saturating_sub(row_icon_size)) / 2);
-        self.paint_sidebar_icon(
-            layers,
-            if reconnect_in_flight {
-                SvgIcon::LoaderCircle
-            } else {
-                SvgIcon::RotateCcw
-            },
-            row_icon_x,
-            row_icon_y,
-            row_icon_size,
-            SPACE_DISCONNECTED_COLOR,
-        )?;
+        if reconnect_in_flight {
+            // The spinning painter also schedules the next repaint; the
+            // static one would freeze the loader on frame zero.
+            self.paint_spinning_ui_icon(
+                layers,
+                2,
+                SvgIcon::LoaderCircle,
+                row_icon_x,
+                row_icon_y,
+                row_icon_size,
+                SPACE_DISCONNECTED_COLOR,
+            )?;
+        } else {
+            self.paint_sidebar_icon(
+                layers,
+                SvgIcon::RotateCcw,
+                row_icon_x,
+                row_icon_y,
+                row_icon_size,
+                SPACE_DISCONNECTED_COLOR,
+            )?;
+        }
         let row_text_x = row_icon_x + row_icon_size + self.ui_px(SIDEBAR_ICON_GAP);
         let row_text_max =
             (row_x + row_width).saturating_sub(row_text_x + self.ui_px(SIDEBAR_INSET));
@@ -1306,14 +1329,26 @@ impl crate::TermWindow {
                 },
             ),
         };
-        self.paint_sidebar_icon(
-            layers,
-            space_icon,
-            space_icon_x,
-            space_icon_y,
-            space_icon_size,
-            space_icon_color,
-        )?;
+        if connection_state == SpaceConnectionState::Connecting {
+            self.paint_spinning_ui_icon(
+                layers,
+                2,
+                space_icon,
+                space_icon_x,
+                space_icon_y,
+                space_icon_size,
+                space_icon_color,
+            )?;
+        } else {
+            self.paint_sidebar_icon(
+                layers,
+                space_icon,
+                space_icon_x,
+                space_icon_y,
+                space_icon_size,
+                space_icon_color,
+            )?;
+        }
         self.paint_sidebar_text(
             layers,
             &ui_font,
@@ -2209,14 +2244,26 @@ impl crate::TermWindow {
                 )
                 .context("sidebar space menu button repaint")?;
             }
-            self.paint_sidebar_icon(
-                layers,
-                space_icon,
-                space_icon_x,
-                space_icon_y,
-                space_icon_size,
-                space_icon_color,
-            )?;
+            if connection_state == SpaceConnectionState::Connecting {
+                self.paint_spinning_ui_icon(
+                    layers,
+                    2,
+                    space_icon,
+                    space_icon_x,
+                    space_icon_y,
+                    space_icon_size,
+                    space_icon_color,
+                )?;
+            } else {
+                self.paint_sidebar_icon(
+                    layers,
+                    space_icon,
+                    space_icon_x,
+                    space_icon_y,
+                    space_icon_size,
+                    space_icon_color,
+                )?;
+            }
             self.paint_sidebar_text(
                 layers,
                 &ui_font,

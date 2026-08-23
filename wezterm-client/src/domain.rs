@@ -1228,6 +1228,11 @@ pub struct ClientDomain {
     /// True while an attach is in flight (state() stays Detached until
     /// finish_attach installs the inner, so state alone can't dedupe).
     attaching: std::sync::atomic::AtomicBool,
+    /// Count of attach retry loops currently running, backoff gaps included.
+    /// `attaching` covers only a single attempt; the UI needs to know the
+    /// engine has not given up between attempts, or every backoff gap paints
+    /// as a disconnect.
+    attach_retries: std::sync::atomic::AtomicUsize,
     local_domain_id: DomainId,
 }
 
@@ -1493,6 +1498,7 @@ impl ClientDomain {
             label,
             inner: Mutex::new(None),
             attaching: std::sync::atomic::AtomicBool::new(false),
+            attach_retries: std::sync::atomic::AtomicUsize::new(0),
             local_domain_id,
         }
     }
@@ -1556,6 +1562,13 @@ impl ClientDomain {
     /// state() still reads Detached until it completes.
     pub fn is_attaching(&self) -> bool {
         self.attaching.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// True for the whole of an attach retry sequence, backoff gaps
+    /// included; `is_attaching` is per-attempt and reads false while the
+    /// engine waits between attempts.
+    pub fn is_attach_retrying(&self) -> bool {
+        self.attach_retries.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
     pub fn perform_detach(&self) {
@@ -3834,6 +3847,16 @@ impl ClientDomain {
         keep_going: impl FnMut() -> bool,
         max_total: Option<Duration>,
     ) -> anyhow::Result<AttachRetryOutcome> {
+        struct RetryFlag<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for RetryFlag<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.attach_retries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _in_flight = RetryFlag(&self.attach_retries);
+
         let attempt_ui = ui.clone();
         attach_with_retry_loop(
             self.domain_name(),

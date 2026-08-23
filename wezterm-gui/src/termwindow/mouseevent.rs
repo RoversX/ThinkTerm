@@ -6031,6 +6031,10 @@ impl super::TermWindow {
                 };
                 let domain_name = domain_name.to_string();
                 let mux_window_id = self.mux_window_id;
+                // Bridge the frames between this switch and the retry engine
+                // raising its own in-flight flag: without it the sidebar
+                // paints "Disconnected — Reconnect" for the gap.
+                self.space_reconnects_in_flight.insert(domain_name.clone());
                 promise::spawn::spawn(async move {
                     let result = async {
                         let mux = Mux::get();
@@ -6060,6 +6064,7 @@ impl super::TermWindow {
                         anyhow::Ok(matches!(outcome, crate::AttachRetryOutcome::Attached))
                     }
                     .await;
+                    let cleanup_name = domain_name.clone();
                     match result {
                         // Cancelled (the hosting window went away mid-retry)
                         // leaves nothing to activate.
@@ -6080,6 +6085,12 @@ impl super::TermWindow {
                             log::error!("attaching {domain_name} for thread switch: {err:#}");
                         }
                     }
+                    window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        term_window.space_reconnects_in_flight.remove(&cleanup_name);
+                        if let Some(win) = term_window.window.as_ref() {
+                            win.invalidate();
+                        }
+                    })));
                 })
                 .detach();
                 context.invalidate();
