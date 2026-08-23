@@ -488,7 +488,10 @@ impl crate::TermWindow {
                                 gl_state,
                                 layers,
                                 0,
-                                visual_cell_idx + glyph_idx,
+                                // Same mirroring the z >= 0 pass applies below;
+                                // without it the two layers of a right-to-left
+                                // line land at opposite ends.
+                                phys(visual_cell_idx + glyph_idx, num_cols, direction),
                                 &params,
                                 hsv,
                                 item.fg_color,
