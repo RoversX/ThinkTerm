@@ -66,25 +66,57 @@ pub struct Space {
     /// layout locally (the remote mux server owns the layout truth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_domain: Option<String>,
-    /// A collection Space holds `thread_refs` instead of projects: references
-    /// to Threads that keep living in their own Spaces, possibly on other
-    /// machines. Purely local — no server ever learns about it, which is what
-    /// lets one Space mix threads from several mux domains without any
-    /// protocol change. Never claimed by startup windows, never auto-seeded
-    /// with a Home project.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Legacy marker of the retired "collection Space" prototype. Still
+    /// deserialized so old stores load, cleared by `normalize_after_load`
+    /// (the refs live on as ordinary `thread_refs` of a normal Space) and
+    /// never written back.
+    #[serde(default, skip_serializing)]
     pub is_collection: bool,
-    /// Thread ids referenced by a collection Space, in display order. Only
-    /// the id is stored; the origin project/Space is resolved live, so a
-    /// reference whose thread has vanished simply resolves to nothing and is
-    /// pruned on the next load.
+    /// Thread ids referenced by this Space, in display order: references to
+    /// Threads that keep living in their own Spaces, possibly on other
+    /// machines. Purely local — no server ever learns about them, which is
+    /// what lets one Space mix threads from several mux domains without any
+    /// protocol change. Only local Spaces (`client_domain == None`) may hold
+    /// refs: ingest rebuilds domain-owned Spaces with an empty list.
+    /// The origin project/Space is resolved live; an unresolvable ref is
+    /// rendered from `thread_ref_meta` instead of disappearing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thread_refs: Vec<String>,
-    /// The reference last opened from this collection, restored when the
-    /// window switches back — a collection's counterpart of a normal Space's
-    /// active project/thread pointers.
+    /// Last successfully resolved display data per ref, keyed by thread id.
+    /// This is what lets a ref survive its origin machine being offline or
+    /// its cached rows being dropped: the row paints greyed from this data,
+    /// and the ref is only pruned when the origin is attached and its tree
+    /// authoritatively lacks the thread.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub thread_ref_meta: HashMap<String, ThreadRefMeta>,
+    /// The reference last opened from this Space, restored when the window
+    /// switches back. Cleared when the user activates one of the Space's own
+    /// threads, so the restore follows whatever was used last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_thread_ref: Option<String>,
+}
+
+/// Cached display data for one thread ref, refreshed on every successful
+/// resolve. Purely presentational — activation always resolves live.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadRefMeta {
+    /// The thread's name as of the last successful resolve.
+    pub last_name: String,
+    /// The origin mux domain, or `None` for a local origin. Locality is
+    /// encoded structurally rather than via a "Local" sentinel string,
+    /// because domain names are user-controlled — a host literally named
+    /// "Local" must not have its refs treated as local and pruned.
+    #[serde(default)]
+    pub origin_domain: Option<String>,
+}
+
+impl ThreadRefMeta {
+    /// The badge/fallback label for this ref's origin machine.
+    pub fn machine_label(&self) -> String {
+        self.origin_domain
+            .clone()
+            .unwrap_or_else(|| "Local".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,6 +201,32 @@ pub struct TerminalSpawnSpec {
 pub struct WorkspaceThreadsView {
     pub pinned_threads: Vec<WorkspaceThreadView>,
     pub projects: Vec<ProjectView>,
+    /// Thread references this Space holds, grouped by origin machine so the
+    /// sidebar can render them as folder-style groups just like projects.
+    pub ref_groups: Vec<ThreadRefGroupView>,
+}
+
+/// One folder-style group of thread references sharing an origin Space.
+#[derive(Debug, Clone)]
+pub struct ThreadRefGroupView {
+    /// Stable group key: the origin Space id, or a machine-derived fallback
+    /// for dangling refs whose origin rows are gone from the cache.
+    pub key: String,
+    /// Header label: the origin Space's name (a machine hosts several
+    /// Spaces, so the machine alone would be ambiguous). Dangling groups
+    /// fall back to the cached machine label.
+    pub label: String,
+    /// The origin machine, shown as a small right-aligned badge on the
+    /// header (hidden when it would not fit, or when it just repeats the
+    /// label).
+    pub machine_label: String,
+    /// Whether the origin domain is currently attached; a detached group's
+    /// rows paint dimmed.
+    pub attached: bool,
+    /// Filled in by the sidebar from its runtime collapse state before
+    /// painting/geometry/hit-testing (never persisted here).
+    pub collapsed: bool,
+    pub threads: Vec<ThreadRefView>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,7 +273,13 @@ pub struct ThreadRefView {
     pub origin_domain_attached: bool,
     /// The workspace this reference resolves to; the paint side compares it
     /// against the window's current workspace to mark the active row.
+    /// Empty for a dangling ref.
     pub workspace_name: String,
+    /// True when the thread could not be resolved from the local store and
+    /// this row was rebuilt from `ThreadRefMeta`. Painted greyed; clicking
+    /// it should try to attach `machine_label`'s domain rather than
+    /// activate directly.
+    pub dangling: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -957,56 +1021,6 @@ pub fn create_space(name: Option<String>) -> SpaceId {
     id
 }
 
-/// Create a collection Space: a purely local Space that holds references to
-/// Threads living in other Spaces (possibly other machines). No server ever
-/// learns about it.
-pub fn create_collection_space(name: Option<String>) -> SpaceId {
-    let mut store = THREAD_STORE.lock();
-    store.normalize_after_load();
-    let name = name.unwrap_or_else(|| next_collection_space_name(&store.spaces));
-    let id = store.create_space_record(name);
-    if let Some(space) = store.spaces.iter_mut().find(|space| space.id == id) {
-        space.is_collection = true;
-    }
-    // last_active_space_id is left alone on purpose: the menu flow switches
-    // to the new Space explicitly (which records it), while "Add to
-    // Collection" creates one in the background without visiting it.
-    persist_locked(&store);
-    id
-}
-
-/// "Collection", "Collection 2", …: several collections would otherwise be
-/// indistinguishable in the "Add to …" menu.
-fn next_collection_space_name(spaces: &[Space]) -> String {
-    let mut index = 1;
-    loop {
-        let name = if index == 1 {
-            "Collection".to_string()
-        } else {
-            format!("Collection {index}")
-        };
-        if !spaces.iter().any(|space| space.name == name) {
-            return name;
-        }
-        index += 1;
-    }
-}
-
-pub fn is_collection_space(space_id: &str) -> bool {
-    THREAD_STORE.lock().is_collection_space(space_id)
-}
-
-/// (id, name) of every collection Space, for menu listings.
-pub fn collection_spaces() -> Vec<(SpaceId, String)> {
-    THREAD_STORE
-        .lock()
-        .spaces
-        .iter()
-        .filter(|space| space.is_collection)
-        .map(|space| (space.id.clone(), space.name.clone()))
-        .collect()
-}
-
 pub fn add_thread_ref(collection_space_id: &str, thread_id: &str) -> bool {
     let mut store = THREAD_STORE.lock();
     store.normalize_after_load();
@@ -1041,25 +1055,25 @@ pub fn move_thread_ref_before(
     moved
 }
 
-/// The reference list of a collection Space, in display order.
-pub fn collection_thread_refs(collection_space_id: &str) -> Vec<String> {
+/// The reference list of a Space, in display order.
+pub fn space_thread_refs(host_space_id: &str) -> Vec<String> {
     THREAD_STORE
         .lock()
         .spaces
         .iter()
-        .find(|space| space.id == collection_space_id && space.is_collection)
+        .find(|space| space.id == host_space_id)
         .map(|space| space.thread_refs.clone())
         .unwrap_or_default()
 }
 
-/// Remember which reference the user last opened from a collection, so the
+/// Remember which reference the user last opened from this Space, so the
 /// next switch back restores it.
-pub fn note_collection_active_ref(collection_space_id: &str, thread_id: &str) {
+pub fn note_thread_active_ref(host_space_id: &str, thread_id: &str) {
     let mut store = THREAD_STORE.lock();
     let Some(space) = store
         .spaces
         .iter_mut()
-        .find(|space| space.id == collection_space_id && space.is_collection)
+        .find(|space| space.id == host_space_id)
     else {
         return;
     };
@@ -1072,16 +1086,81 @@ pub fn note_collection_active_ref(collection_space_id: &str, thread_id: &str) {
     }
 }
 
-pub fn thread_ref_exists(collection_space_id: &str, thread_id: &str) -> bool {
-    THREAD_STORE
-        .lock()
+/// Forget the ref-restore pointer: the user activated one of the Space's own
+/// threads, so switching back should follow the normal project/thread
+/// pointers again instead of jumping to a reference.
+pub fn clear_thread_active_ref(host_space_id: &str) {
+    let mut store = THREAD_STORE.lock();
+    let Some(space) = store
+        .spaces
+        .iter_mut()
+        .find(|space| space.id == host_space_id)
+    else {
+        return;
+    };
+    if space.active_thread_ref.take().is_some() {
+        schedule_workspace_thread_store_persist();
+    }
+}
+
+pub fn thread_ref_exists(host_space_id: &str, thread_id: &str) -> bool {
+    THREAD_STORE.lock().spaces.iter().any(|space| {
+        space.id == host_space_id && space.thread_refs.iter().any(|id| id == thread_id)
+    })
+}
+
+/// Deliberate host deletion: drop every Space's references whose origin
+/// machine is one of `machines`, meta included. A mere disconnect keeps refs
+/// greyed (the machine can come back); deleting the host record removes the
+/// only way this device could ever resolve them again, so leaving grey rows
+/// behind would be permanent clutter with no path to recovery.
+pub fn purge_thread_refs_for_machines(machines: &[String]) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.purge_refs_for_machines(machines);
+    if changed {
+        persist_locked(&store);
+    }
+    changed
+}
+
+/// The origin project a reference group's "+" should create a thread in:
+/// the project of the first resolvable ref in `host_space_id`'s list whose
+/// origin Space is `origin_space_id`.
+pub fn ref_group_origin_project(host_space_id: &str, origin_space_id: &str) -> Option<ProjectId> {
+    let store = THREAD_STORE.lock();
+    let space = store.spaces.iter().find(|space| space.id == host_space_id)?;
+    space.thread_refs.iter().find_map(|thread_id| {
+        let project = store
+            .projects
+            .iter()
+            .find(|project| project.threads.iter().any(|t| &t.id == thread_id))?;
+        (project.space_id == origin_space_id).then(|| project.id.clone())
+    })
+}
+
+/// (id, name) of every Space eligible to host a ref to `thread_id`: local
+/// Spaces that are not the thread's own home and do not already hold it.
+/// Feeds the "Add to Space …" submenu.
+pub fn ref_host_candidates(thread_id: &str) -> Vec<(SpaceId, String)> {
+    let store = THREAD_STORE.lock();
+    let home = store
+        .projects
+        .iter()
+        .find(|project| project.threads.iter().any(|thread| thread.id == thread_id))
+        .map(|project| project.space_id.clone());
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    store
         .spaces
         .iter()
-        .any(|space| {
-            space.id == collection_space_id
-                && space.is_collection
-                && space.thread_refs.iter().any(|id| id == thread_id)
+        .filter(|space| {
+            space.client_domain.is_none()
+                && space.id != home
+                && !space.thread_refs.iter().any(|id| id == thread_id)
         })
+        .map(|space| (space.id.clone(), space.name.clone()))
+        .collect()
 }
 
 /// Add another Space to a remote server.
@@ -1239,12 +1318,15 @@ fn delete_space_for_window_local(
             .iter()
             .find(|space| space.is_default && !occupied_by_other.contains(&space.id))
             .or_else(|| {
-                // A collection cannot rehome a window: it has no thread for
-                // the window to adopt.
+                // A refs-only Space cannot rehome a window: it has no thread
+                // of its own for the window to adopt.
                 store
                     .spaces
                     .iter()
-                    .find(|space| !occupied_by_other.contains(&space.id) && !space.is_collection)
+                    .find(|space| {
+                        !occupied_by_other.contains(&space.id)
+                            && !store.is_refs_only_space(&space.id)
+                    })
             })
             .map(|space| space.id.clone())
             .unwrap_or_else(|| {
@@ -1403,12 +1485,15 @@ pub async fn delete_space_for_window(
             .iter()
             .find(|space| space.is_default && !occupied_by_other.contains(&space.id))
             .or_else(|| {
-                // A collection cannot rehome a window: it has no thread for
-                // the window to adopt.
+                // A refs-only Space cannot rehome a window: it has no thread
+                // of its own for the window to adopt.
                 store
                     .spaces
                     .iter()
-                    .find(|space| !occupied_by_other.contains(&space.id) && !space.is_collection)
+                    .find(|space| {
+                        !occupied_by_other.contains(&space.id)
+                            && !store.is_refs_only_space(&space.id)
+                    })
             })
             .map(|space| space.id.clone())
             .unwrap_or_else(|| {
@@ -1430,16 +1515,27 @@ pub fn ensure_active_thread_for_space(space_id: &str) -> Option<WorkspaceThreadI
     if !store.has_space(space_id) {
         return None;
     }
-    // A collection Space owns no projects and must not be seeded with a Home
-    // project; its rows are references into other Spaces. Switching to it
-    // restores the reference the user last opened here (or the first one),
-    // so the terminal follows the sidebar like it does in a normal Space.
-    if store.is_collection_space(space_id) {
-        let restore = store.collection_restore_ref(space_id);
+    // Ref restore: when the last thing opened from this Space was a thread
+    // reference, switching back restores it, so the terminal follows the
+    // sidebar. A Space with refs but no projects of its own (a migrated
+    // collection) restores its first ref rather than being seeded with a
+    // Home project it never asked for.
+    if let Some(restore) = store.thread_ref_to_restore(space_id) {
         if changed {
             persist_locked(&store);
         }
-        return restore;
+        return Some(restore);
+    }
+    // A refs-only Space whose refs are ALL currently dangling still must
+    // not fall through to seeding: merely switching to it would then
+    // permanently create a Home project and open a local shell, silently
+    // converting the Space. Better to activate nothing until a ref
+    // resolves again (or the user removes them).
+    if store.is_refs_only_space(space_id) {
+        if changed {
+            persist_locked(&store);
+        }
+        return None;
     }
     let project_id = store
         .active_project_id_for_space(space_id)
@@ -1494,19 +1590,13 @@ pub fn space_id_for_workspace(workspace: &str) -> Option<SpaceId> {
 }
 
 /// The origin Space of `workspace`, but only when the thread it is bound to
-/// is actually referenced by `collection_space_id`. A collection window that
-/// was just switched to (nothing clicked yet) still displays the previous
-/// Space's workspace — that one must NOT leak through, or Files/paste would
+/// is actually referenced by `host_space_id`. A window that was just
+/// switched to (nothing clicked yet) still displays the previous Space's
+/// workspace — that one must NOT leak through, or Files/paste would
 /// silently keep targeting the previous machine.
-pub fn origin_space_for_collection_workspace(
-    collection_space_id: &str,
-    workspace: &str,
-) -> Option<SpaceId> {
+pub fn origin_space_for_ref_workspace(host_space_id: &str, workspace: &str) -> Option<SpaceId> {
     let store = THREAD_STORE.lock();
-    let space = store
-        .spaces
-        .iter()
-        .find(|space| space.id == collection_space_id && space.is_collection)?;
+    let space = store.spaces.iter().find(|space| space.id == host_space_id)?;
     store.projects.iter().find_map(|project| {
         project
             .threads
@@ -1574,24 +1664,23 @@ pub fn view_for_current_project(
     if store.normalize_after_load() {
         persist_locked(&store);
     }
-    if store.is_collection_space(space_id) {
-        // A collection Space renders its references where the pinned section
-        // normally goes and owns no projects, so every existing geometry and
-        // row-painting path works on this view unchanged. The machine tag
-        // rides in the display name; the sidebar has no other per-row slot
-        // without new painting code.
-        let pinned_threads = store
-            .view_for_collection_space(space_id, live_workspaces, Some(active_workspace))
-            .into_iter()
-            .map(|r| {
-                let mut thread = r.thread;
-                thread.name = format!("{} · {}", thread.name, r.machine_label);
-                thread
-            })
-            .collect();
+    let ref_groups = group_thread_refs_by_origin(store.view_for_thread_refs(
+        space_id,
+        live_workspaces,
+        Some(active_workspace),
+    ));
+    // A Space with refs but no projects of its own (a migrated collection)
+    // must not be seeded with a synthetic current project just to have
+    // something to show — its ref rows are the content.
+    let has_own_projects = store
+        .projects
+        .iter()
+        .any(|project| project.space_id == space_id);
+    if !has_own_projects && !ref_groups.is_empty() {
         return WorkspaceThreadsView {
-            pinned_threads,
+            pinned_threads: Vec::new(),
             projects: Vec::new(),
+            ref_groups,
         };
     }
     if let Some(project_id) = store
@@ -1604,11 +1693,49 @@ pub fn view_for_current_project(
                 .any(|project| project.space_id == space_id && &project.id == project_id)
         })
     {
-        return store.view_for_project(space_id, &project_id, live_workspaces);
+        let mut view = store.view_for_project(space_id, &project_id, live_workspaces);
+        view.ref_groups = ref_groups;
+        return view;
     }
 
     let is_remote = store.is_client_domain_space(space_id);
-    current_project_for_workspace(space_id, active_workspace).view(live_workspaces, is_remote)
+    let mut view =
+        current_project_for_workspace(space_id, active_workspace).view(live_workspaces, is_remote);
+    view.ref_groups = ref_groups;
+    view
+}
+
+/// Fold resolved refs into folder-style groups keyed by origin Space, in
+/// first-appearance order of the Space's ref list. Dangling refs (origin
+/// rows gone) group under their cached machine label instead.
+fn group_thread_refs_by_origin(refs: Vec<ThreadRefView>) -> Vec<ThreadRefGroupView> {
+    let mut groups: Vec<ThreadRefGroupView> = Vec::new();
+    for reference in refs {
+        let key = if reference.origin_space_id.is_empty() {
+            format!("machine::{}", reference.machine_label)
+        } else {
+            reference.origin_space_id.clone()
+        };
+        match groups.iter_mut().find(|group| group.key == key) {
+            Some(group) => {
+                group.attached |= reference.origin_domain_attached;
+                group.threads.push(reference);
+            }
+            None => groups.push(ThreadRefGroupView {
+                key,
+                label: if reference.origin_space_name.is_empty() {
+                    reference.machine_label.clone()
+                } else {
+                    reference.origin_space_name.clone()
+                },
+                machine_label: reference.machine_label.clone(),
+                attached: reference.origin_domain_attached,
+                collapsed: false,
+                threads: vec![reference],
+            }),
+        }
+    }
+    groups
 }
 
 pub fn sync_current_project(space_id: &str, active_workspace: &str) -> bool {
@@ -3081,8 +3208,10 @@ fn tree_domain_for_thread(store: &WorkspaceThreadStore, thread_id: &str) -> Opti
 }
 
 fn remote_tree_domain_is_attached(domain_name: &str) -> bool {
-    Mux::get()
-        .get_domain_by_name(domain_name)
+    // try_get: unit tests and early startup have no Mux; "no mux" must read
+    // as "not attached" (the conservative answer that keeps refs alive).
+    Mux::try_get()
+        .and_then(|mux| mux.get_domain_by_name(domain_name))
         .is_some_and(|domain| {
             let Some(client) = domain.downcast_ref::<wezterm_client::domain::ClientDomain>() else {
                 return false;
@@ -3504,6 +3633,7 @@ impl Project {
                 is_remote,
                 distro: None,
             }],
+            ref_groups: Vec::new(),
         }
     }
 }
@@ -3521,6 +3651,7 @@ impl WorkspaceThreadStore {
                 client_domain: None,
                 is_collection: false,
                 thread_refs: Vec::new(),
+                thread_ref_meta: HashMap::new(),
                 active_thread_ref: None,
             });
             changed = true;
@@ -3597,29 +3728,134 @@ impl WorkspaceThreadStore {
         }
         changed |= self.repair_cross_space_local_workspace_bindings();
         changed |= self.ensure_unique_thread_names();
-        changed |= self.prune_dangling_thread_refs();
+        changed |= self.retire_collection_spaces();
+        changed |= self.groom_thread_refs();
         changed
     }
 
-    /// Drop collection references whose thread no longer exists anywhere.
-    /// Server-side deletions arrive silently through ingest, so this runs as
-    /// part of normalize (every store entry point) rather than only at the
-    /// local delete sites; between runs the view builder simply skips
-    /// unresolvable refs.
-    fn prune_dangling_thread_refs(&mut self) -> bool {
-        let known: std::collections::HashSet<&str> = self
-            .projects
-            .iter()
-            .flat_map(|project| project.threads.iter().map(|thread| thread.id.as_str()))
-            .collect();
+    /// The collection-Space prototype is retired: a Space that carried the
+    /// flag becomes an ordinary local Space and keeps its refs. The flag is
+    /// never written back, so this migration is idempotent and old binaries
+    /// can still read the store.
+    fn retire_collection_spaces(&mut self) -> bool {
         let mut changed = false;
-        for space in self.spaces.iter_mut().filter(|space| space.is_collection) {
-            let before = space.thread_refs.len();
-            space.thread_refs.retain(|id| known.contains(id.as_str()));
-            changed |= space.thread_refs.len() != before;
-            if let Some(active) = &space.active_thread_ref {
-                if !space.thread_refs.contains(active) {
-                    space.active_thread_ref = None;
+        for space in &mut self.spaces {
+            if space.is_collection {
+                space.is_collection = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// See [`purge_thread_refs_for_machines`].
+    fn purge_refs_for_machines(&mut self, machines: &[String]) -> bool {
+        if machines.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for space in &mut self.spaces {
+            if space.thread_refs.is_empty() {
+                continue;
+            }
+            let Space {
+                thread_refs,
+                thread_ref_meta,
+                active_thread_ref,
+                ..
+            } = space;
+            let before = thread_refs.len();
+            thread_refs.retain(|id| {
+                thread_ref_meta.get(id).is_none_or(|meta| {
+                    meta.origin_domain
+                        .as_ref()
+                        .is_none_or(|domain| !machines.contains(domain))
+                })
+            });
+            if thread_refs.len() != before {
+                changed = true;
+                thread_ref_meta.retain(|id, _| thread_refs.iter().any(|r| r == id));
+                if let Some(active) = active_thread_ref {
+                    if !thread_refs.contains(active) {
+                        *active_thread_ref = None;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Keep every Space's thread refs honest: refresh the cached display
+    /// meta for refs that resolve, and prune only refs whose absence is
+    /// authoritative. Server-side deletions arrive silently through ingest,
+    /// so this runs as part of normalize (every store entry point).
+    ///
+    /// A ref whose thread is missing from the store is NOT necessarily dead:
+    /// remote rows are only a cache, and a local "Disconnect" or a forgotten
+    /// host drops them while the thread lives on happily on its machine.
+    /// Such refs are kept and rendered greyed from `thread_ref_meta`; they
+    /// are dropped only when the origin domain is currently attached (its
+    /// tree just told us the thread is gone), the origin was local, or there
+    /// is no meta to render a row from (legacy pre-meta refs).
+    fn groom_thread_refs(&mut self) -> bool {
+        let mut resolved: HashMap<String, ThreadRefMeta> = HashMap::new();
+        if self.spaces.iter().any(|space| !space.thread_refs.is_empty()) {
+            for project in &self.projects {
+                let origin_domain = self
+                    .spaces
+                    .iter()
+                    .find(|space| space.id == project.space_id)
+                    .and_then(|space| space.client_domain.clone());
+                for thread in &project.threads {
+                    resolved.insert(
+                        thread.id.clone(),
+                        ThreadRefMeta {
+                            last_name: thread.name.clone(),
+                            origin_domain: origin_domain.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        let mut changed = false;
+        for space in &mut self.spaces {
+            if space.thread_refs.is_empty() && space.thread_ref_meta.is_empty() {
+                continue;
+            }
+            let Space {
+                thread_refs,
+                thread_ref_meta,
+                active_thread_ref,
+                ..
+            } = space;
+            thread_refs.retain(|id| {
+                if let Some(meta) = resolved.get(id.as_str()) {
+                    if thread_ref_meta.get(id) != Some(meta) {
+                        thread_ref_meta.insert(id.clone(), meta.clone());
+                        changed = true;
+                    }
+                    return true;
+                }
+                let keep = match thread_ref_meta.get(id) {
+                    // Legacy ref with no display data: nothing to render.
+                    None => false,
+                    // A local thread that is gone has no machine to come
+                    // back from; a remote one is only authoritatively gone
+                    // when its domain is attached to say so.
+                    Some(meta) => match &meta.origin_domain {
+                        None => false,
+                        Some(domain) => !remote_tree_domain_is_attached(domain),
+                    },
+                };
+                changed |= !keep;
+                keep
+            });
+            let before = thread_ref_meta.len();
+            thread_ref_meta.retain(|id, _| thread_refs.iter().any(|r| r == id));
+            changed |= thread_ref_meta.len() != before;
+            if let Some(active) = active_thread_ref {
+                if !thread_refs.contains(active) {
+                    *active_thread_ref = None;
                     changed = true;
                 }
             }
@@ -3650,6 +3886,7 @@ impl WorkspaceThreadStore {
             client_domain,
             is_collection: false,
             thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
         });
         id
@@ -3661,16 +3898,17 @@ impl WorkspaceThreadStore {
     ) -> SpaceId {
         // Mux-domain Spaces belong to `thinkterm connect`; startup and Dock
         // "New Window" must never claim them (they would materialize a local
-        // shell into a remote-owned workspace). Collection Spaces hold thread
-        // references rather than projects, so a startup window claiming one
-        // would immediately seed it with a Home project it must not have.
+        // shell into a remote-owned workspace). Refs-only Spaces (migrated
+        // collections) hold thread references rather than projects, so a
+        // startup window claiming one would immediately seed it with a Home
+        // project it must not have.
         self.last_active_space_id
             .clone()
             .filter(|space_id| {
                 self.has_space(space_id)
                     && !occupied.contains(space_id)
                     && !self.is_client_domain_space(space_id)
-                    && !self.is_collection_space(space_id)
+                    && !self.is_refs_only_space(space_id)
             })
             .or_else(|| {
                 self.spaces
@@ -3678,7 +3916,7 @@ impl WorkspaceThreadStore {
                     .find(|space| {
                         !occupied.contains(&space.id)
                             && space.client_domain.is_none()
-                            && !space.is_collection
+                            && !self.is_refs_only_space(&space.id)
                     })
                     .map(|space| space.id.clone())
             })
@@ -3739,35 +3977,79 @@ impl WorkspaceThreadStore {
             .any(|space| space.id == space_id && space.client_domain.is_some())
     }
 
-    fn is_collection_space(&self, space_id: &str) -> bool {
+    /// A Space whose only content is thread references (a migrated
+    /// collection): it holds refs and owns no projects. Such a Space must
+    /// never be auto-seeded with a Home project.
+    fn is_refs_only_space(&self, space_id: &str) -> bool {
         self.spaces
             .iter()
-            .any(|space| space.id == space_id && space.is_collection)
+            .any(|space| space.id == space_id && !space.thread_refs.is_empty())
+            && !self
+                .projects
+                .iter()
+                .any(|project| project.space_id == space_id)
     }
 
-    /// The reference a collection window should open on switch: the one the
-    /// user last opened here when it is still referenced, else the first.
-    fn collection_restore_ref(&self, space_id: &str) -> Option<WorkspaceThreadId> {
+    /// The reference to open when switching to this Space, if any: the one
+    /// the user last opened here (when still referenced), or — only for a
+    /// Space that has refs but no projects of its own, i.e. a migrated
+    /// collection — the first reference. A normal Space with both projects
+    /// and refs restores through its project/thread pointers unless a ref
+    /// was the last thing opened.
+    fn thread_ref_to_restore(&self, space_id: &str) -> Option<WorkspaceThreadId> {
         let space = self.spaces.iter().find(|space| space.id == space_id)?;
-        space
+        // A dangling ref (origin rows not in the local cache) cannot be
+        // activated, so it cannot be a restore target either.
+        let resolvable = |id: &String| {
+            self.projects
+                .iter()
+                .any(|project| project.threads.iter().any(|thread| &thread.id == id))
+        };
+        let last_opened = space
             .active_thread_ref
             .clone()
             .filter(|id| space.thread_refs.contains(id))
-            .or_else(|| space.thread_refs.first().cloned())
-    }
-
-    fn add_thread_ref(&mut self, collection_space_id: &str, thread_id: &str) -> bool {
-        let exists = self
+            .filter(resolvable);
+        if last_opened.is_some() {
+            return last_opened;
+        }
+        let has_own_projects = self
             .projects
             .iter()
-            .any(|project| project.threads.iter().any(|thread| thread.id == thread_id));
-        if !exists {
+            .any(|project| project.space_id == space_id);
+        if has_own_projects {
+            return None;
+        }
+        space.thread_refs.iter().find(|id| resolvable(*id)).cloned()
+    }
+
+    fn add_thread_ref(&mut self, host_space_id: &str, thread_id: &str) -> bool {
+        // The thread must exist, and its home Space determines both the
+        // cached machine label and the "no ref to your own Space" rule.
+        let Some((home_space_id, thread_name)) = self.projects.iter().find_map(|project| {
+            project
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .map(|thread| (project.space_id.clone(), thread.name.clone()))
+        }) else {
+            return false;
+        };
+        if home_space_id == host_space_id {
             return false;
         }
+        let origin_domain = self
+            .spaces
+            .iter()
+            .find(|space| space.id == home_space_id)
+            .and_then(|space| space.client_domain.clone());
+        // Only local Spaces can host refs: ingest rebuilds domain-owned
+        // Spaces from the server tree with an empty ref list, so a ref
+        // added to one would silently vanish on the next sync.
         let Some(space) = self
             .spaces
             .iter_mut()
-            .find(|space| space.id == collection_space_id && space.is_collection)
+            .find(|space| space.id == host_space_id && space.client_domain.is_none())
         else {
             return false;
         };
@@ -3775,14 +4057,21 @@ impl WorkspaceThreadStore {
             return false;
         }
         space.thread_refs.push(thread_id.to_string());
+        space.thread_ref_meta.insert(
+            thread_id.to_string(),
+            ThreadRefMeta {
+                last_name: thread_name,
+                origin_domain,
+            },
+        );
         true
     }
 
-    fn remove_thread_ref(&mut self, collection_space_id: &str, thread_id: &str) -> bool {
+    fn remove_thread_ref(&mut self, host_space_id: &str, thread_id: &str) -> bool {
         let Some(space) = self
             .spaces
             .iter_mut()
-            .find(|space| space.id == collection_space_id && space.is_collection)
+            .find(|space| space.id == host_space_id)
         else {
             return false;
         };
@@ -3798,14 +4087,14 @@ impl WorkspaceThreadStore {
     /// Purely local: reference order never travels to any server.
     fn move_thread_ref_before(
         &mut self,
-        collection_space_id: &str,
+        host_space_id: &str,
         thread_id: &str,
         before: Option<&str>,
     ) -> bool {
         let Some(space) = self
             .spaces
             .iter_mut()
-            .find(|space| space.id == collection_space_id && space.is_collection)
+            .find(|space| space.id == host_space_id)
         else {
             return false;
         };
@@ -3836,27 +4125,46 @@ impl WorkspaceThreadStore {
         true
     }
 
-    fn view_for_collection_space(
+    fn view_for_thread_refs(
         &self,
         space_id: &str,
         live_workspaces: &[String],
         active_workspace: Option<&str>,
     ) -> Vec<ThreadRefView> {
-        let Some(space) = self
-            .spaces
-            .iter()
-            .find(|space| space.id == space_id && space.is_collection)
-        else {
+        let Some(space) = self.spaces.iter().find(|space| space.id == space_id) else {
             return Vec::new();
         };
         space
             .thread_refs
             .iter()
             .filter_map(|thread_id| {
-                let project = self
+                let Some(project) = self
                     .projects
                     .iter()
-                    .find(|project| project.threads.iter().any(|t| &t.id == thread_id))?;
+                    .find(|project| project.threads.iter().any(|t| &t.id == thread_id))
+                else {
+                    // Unresolvable: the origin rows are gone from the local
+                    // cache (machine disconnected / host forgotten). Render a
+                    // greyed row from the cached meta instead of vanishing.
+                    let meta = space.thread_ref_meta.get(thread_id)?;
+                    return Some(ThreadRefView {
+                        thread: WorkspaceThreadView {
+                            id: thread_id.clone(),
+                            name: meta.last_name.clone(),
+                            is_active: false,
+                            is_materialized: false,
+                            is_pinned: false,
+                            is_unread: false,
+                            work_status: WorkspaceThreadWorkStatus::Idle,
+                        },
+                        origin_space_id: String::new(),
+                        origin_space_name: String::new(),
+                        machine_label: meta.machine_label(),
+                        origin_domain_attached: false,
+                        workspace_name: String::new(),
+                        dangling: true,
+                    });
+                };
                 let origin = self.spaces.iter().find(|s| s.id == project.space_id)?;
                 let session = project.threads.iter().find(|t| &t.id == thread_id)?;
                 let workspace_name = session
@@ -3888,6 +4196,7 @@ impl WorkspaceThreadStore {
                     machine_label,
                     origin_domain_attached,
                     workspace_name,
+                    dangling: false,
                 })
             })
             .collect()
@@ -4099,6 +4408,7 @@ impl WorkspaceThreadStore {
         WorkspaceThreadsView {
             pinned_threads,
             projects,
+            ref_groups: Vec::new(),
         }
     }
 
@@ -4162,11 +4472,11 @@ impl WorkspaceThreadStore {
 
     fn sync_current_project(&mut self, space_id: &str, active_workspace: &str) -> bool {
         let mut changed = self.normalize_after_load();
-        // A collection Space owns no projects: the workspace on display
-        // belongs to a reference's origin Space, and falling through to
-        // ensure_current_project would seed the collection with a Home
-        // project the views never show.
-        if self.is_collection_space(space_id) {
+        // A refs-only Space (a migrated collection) owns no projects: the
+        // workspace on display belongs to a reference's origin Space, and
+        // falling through to ensure_current_project would seed it with a
+        // Home project the views never show.
+        if self.is_refs_only_space(space_id) {
             return changed;
         }
         if self.workspace_belongs_to_other_space(space_id, active_workspace) {
@@ -5024,6 +5334,7 @@ impl WorkspaceThreadStore {
                     client_domain: Some(domain_name.to_string()),
                     is_collection: false,
                     thread_refs: Vec::new(),
+                    thread_ref_meta: HashMap::new(),
                     active_thread_ref: None,
                 }
             })
@@ -6992,14 +7303,21 @@ mod tests {
     }
 
     #[test]
-    fn collection_space_is_never_claimed_by_startup_windows() {
-        let (mut store, coll_id, _, _) = store_with_collection();
-        // Simulate the collection being the last thing the user looked at.
+    fn refs_only_space_is_never_claimed_by_startup_windows() {
+        let (mut store, coll_id, t1, _) = store_with_collection();
+        // A refs-only Space (holds references, owns no projects) must not be
+        // claimed: the startup window would seed it with a Home project.
+        assert!(store.add_thread_ref(&coll_id, &t1));
+        // Simulate it being the last thing the user looked at.
         store.last_active_space_id = Some(coll_id.clone());
         let mut occupied = std::collections::HashSet::new();
         occupied.insert(DEFAULT_SPACE_ID.to_string());
         let claimed = store.claim_available_space_id(&occupied);
-        assert_ne!(claimed, coll_id, "startup window must not claim a collection Space");
+        assert_ne!(claimed, coll_id, "startup window must not claim a refs-only Space");
+        // Once emptied of refs it is an ordinary empty Space and claimable.
+        assert!(store.remove_thread_ref(&coll_id, &t1));
+        let claimed = store.claim_available_space_id(&occupied);
+        assert_eq!(claimed, coll_id);
     }
 
     #[test]
@@ -7058,7 +7376,7 @@ mod tests {
             .thread_refs
             .push("thread-gone".to_string());
 
-        let views = store.view_for_collection_space(&coll, &[], None);
+        let views = store.view_for_thread_refs(&coll, &[], None);
         assert_eq!(views.len(), 1);
         let view = &views[0];
         assert_eq!(view.thread.id, t1);
@@ -7068,7 +7386,7 @@ mod tests {
         assert!(!view.thread.is_active);
 
         // Active-row detection keys off the resolved workspace name.
-        let active = store.view_for_collection_space(&coll, &[], Some(view.workspace_name.as_str()));
+        let active = store.view_for_thread_refs(&coll, &[], Some(view.workspace_name.as_str()));
         assert!(active[0].thread.is_active);
     }
 
@@ -7112,29 +7430,153 @@ mod tests {
     }
 
     #[test]
-    fn sync_current_project_never_seeds_collections() {
-        let (mut store, coll, _, _) = store_with_collection();
+    fn sync_current_project_never_seeds_refs_only_spaces() {
+        let (mut store, coll, t1, _) = store_with_collection();
+        assert!(store.add_thread_ref(&coll, &t1));
         // An unbound workspace (e.g. its thread binding was pruned by a
         // remote delete) used to fall through to ensure_current_project.
         store.sync_current_project(&coll, "some-unbound-workspace");
         assert!(
             store.projects.iter().all(|project| project.space_id != coll),
-            "a collection Space must never acquire a project"
+            "a refs-only Space must never acquire a project"
         );
     }
 
     #[test]
-    fn collection_names_stay_distinguishable() {
-        let (mut store, _, _, _) = store_with_collection();
-        assert_eq!(next_collection_space_name(&store.spaces), "Collection 2");
-        let id = store.create_space_record("Collection 2".to_string());
+    fn migration_retires_the_collection_flag_but_keeps_refs() {
+        let (mut store, coll, t1, _) = store_with_collection();
+        assert!(store.add_thread_ref(&coll, &t1));
+        assert!(store.spaces.iter().any(|s| s.id == coll && s.is_collection));
+        store.normalize_after_load();
+        let space = store.spaces.iter().find(|s| s.id == coll).unwrap();
+        assert!(!space.is_collection, "the flag is retired on normalize");
+        assert_eq!(space.thread_refs, vec![t1.clone()]);
+        assert_eq!(
+            space.thread_ref_meta.get(&t1).map(|m| m.origin_domain.clone()),
+            Some(None),
+            "normalize refreshes the cached meta for resolvable refs"
+        );
+    }
+
+    #[test]
+    fn refs_can_live_on_ordinary_spaces_but_not_remote_or_home_ones() {
+        let (mut store, _, t1, _) = store_with_collection();
+        // An ordinary local Space is a valid host.
+        let host = store.create_space_record("Studies".to_string());
+        assert!(store.add_thread_ref(&host, &t1));
+        // The thread's own home Space is not.
+        assert!(!store.add_thread_ref(DEFAULT_SPACE_ID, &t1));
+        // A domain-owned Space is not: ingest would wipe the ref.
+        let remote = store.create_space_record_for_domain("syd".to_string(), Some("syd".into()));
+        assert!(!store.add_thread_ref(&remote, &t1));
+    }
+
+    #[test]
+    fn dangling_remote_ref_is_kept_and_rendered_from_meta() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        let host = store.create_space_record("Studies".to_string());
+        let remote_thread = store.projects.iter().find(|p| p.id == "rp1").unwrap().threads[0]
+            .id
+            .clone();
+        let remote_name = store.projects.iter().find(|p| p.id == "rp1").unwrap().threads[0]
+            .name
+            .clone();
+        assert!(store.add_thread_ref(&host, &remote_thread));
+
+        // The machine disconnects locally: its cached rows are dropped, the
+        // way delete_space/forget_spaces_of_deleted_hosts drop them.
+        store.projects.retain(|p| p.id != "rp1");
+        store.normalize_after_load();
+
+        let space = store.spaces.iter().find(|s| s.id == host).unwrap();
+        assert_eq!(
+            space.thread_refs,
+            vec![remote_thread.clone()],
+            "a ref must survive its origin's cache being dropped"
+        );
+        let views = store.view_for_thread_refs(&host, &[], None);
+        assert_eq!(views.len(), 1);
+        assert!(views[0].dangling);
+        assert_eq!(views[0].thread.name, remote_name);
+        assert_eq!(views[0].machine_label, "syd");
+        assert!(!views[0].origin_domain_attached);
+    }
+
+    #[test]
+    fn local_thread_deletion_prunes_its_refs_authoritatively() {
+        let (mut store, coll, t1, _) = store_with_collection();
+        assert!(store.add_thread_ref(&coll, &t1));
+        store.normalize_after_load(); // meta records "Local"
+        for project in &mut store.projects {
+            project.threads.retain(|t| t.id != t1);
+        }
+        store.normalize_after_load();
+        let space = store.spaces.iter().find(|s| s.id == coll).unwrap();
+        assert!(
+            space.thread_refs.is_empty(),
+            "a deleted local thread's ref has no machine to come back from"
+        );
+        assert!(space.thread_ref_meta.is_empty(), "meta is groomed with it");
+    }
+
+    #[test]
+    fn deleting_a_host_purges_its_refs_but_keeps_other_machines() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        let host = store.create_space_record("Studies".to_string());
+        let remote_thread = store.projects.iter().find(|p| p.id == "rp1").unwrap().threads[0]
+            .id
+            .clone();
+        // One ref to the doomed machine, one local ref that must survive.
+        let mut local_project = default_project_for_space(DEFAULT_SPACE_ID);
+        let local_thread = WorkspaceThread::new(local_project.id.clone(), "keep".to_string(), None);
+        let local_id = local_thread.id.clone();
+        local_project.threads.push(local_thread);
+        store.projects.push(local_project);
+        assert!(store.add_thread_ref(&host, &remote_thread));
+        assert!(store.add_thread_ref(&host, &local_id));
         store
             .spaces
             .iter_mut()
-            .find(|space| space.id == id)
+            .find(|s| s.id == host)
             .unwrap()
-            .is_collection = true;
-        assert_eq!(next_collection_space_name(&store.spaces), "Collection 3");
+            .active_thread_ref = Some(remote_thread.clone());
+
+        assert!(store.purge_refs_for_machines(&["syd".to_string()]));
+        let space = store.spaces.iter().find(|s| s.id == host).unwrap();
+        assert_eq!(space.thread_refs, vec![local_id.clone()]);
+        assert!(!space.thread_ref_meta.contains_key(&remote_thread));
+        assert_eq!(space.active_thread_ref, None, "purged ref cannot stay active");
+        assert!(
+            !store.purge_refs_for_machines(&["syd".to_string()]),
+            "second purge is a no-op"
+        );
+    }
+
+    #[test]
+    fn ref_restore_yields_to_a_spaces_own_threads_unless_a_ref_was_last() {
+        let (mut store, _, t1, _) = store_with_collection();
+        let host = store.create_space_record("Studies".to_string());
+        // Give the host its own project so it is not refs-only.
+        let mut project = default_project_for_space(&host);
+        project.space_id = host.clone();
+        let own = WorkspaceThread::new(project.id.clone(), "own".to_string(), None);
+        project.threads.push(own);
+        store.projects.push(project);
+        assert!(store.add_thread_ref(&host, &t1));
+
+        // Nothing marked last-opened: the Space's own pointers win.
+        assert_eq!(store.thread_ref_to_restore(&host), None);
+
+        // A ref was last opened here: restore it.
+        store
+            .spaces
+            .iter_mut()
+            .find(|s| s.id == host)
+            .unwrap()
+            .active_thread_ref = Some(t1.clone());
+        assert_eq!(store.thread_ref_to_restore(&host).as_deref(), Some(t1.as_str()));
     }
 
     #[test]
@@ -7143,7 +7585,7 @@ mod tests {
         assert!(store.add_thread_ref(&coll, &t1));
         assert!(store.add_thread_ref(&coll, &t2));
         // Nothing opened yet: fall back to the first reference.
-        assert_eq!(store.collection_restore_ref(&coll).as_deref(), Some(t1.as_str()));
+        assert_eq!(store.thread_ref_to_restore(&coll).as_deref(), Some(t1.as_str()));
 
         store
             .spaces
@@ -7151,13 +7593,13 @@ mod tests {
             .find(|s| s.id == coll)
             .unwrap()
             .active_thread_ref = Some(t2.clone());
-        assert_eq!(store.collection_restore_ref(&coll).as_deref(), Some(t2.as_str()));
+        assert_eq!(store.thread_ref_to_restore(&coll).as_deref(), Some(t2.as_str()));
 
         // Removing the remembered reference clears it and falls back.
         assert!(store.remove_thread_ref(&coll, &t2));
         let space = store.spaces.iter().find(|s| s.id == coll).unwrap();
         assert_eq!(space.active_thread_ref, None);
-        assert_eq!(store.collection_restore_ref(&coll).as_deref(), Some(t1.as_str()));
+        assert_eq!(store.thread_ref_to_restore(&coll).as_deref(), Some(t1.as_str()));
     }
 
     #[test]
@@ -8337,6 +8779,7 @@ mod tests {
                 is_remote: false,
                 distro: None,
             }],
+            ref_groups: Vec::new(),
         };
         filter_threads_view_by_status(&mut view, &hidden);
         assert!(view.pinned_threads.is_empty());
@@ -9390,6 +9833,7 @@ mod tests {
             client_domain: Some(domain.to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
         });
         store
@@ -9847,6 +10291,7 @@ mod tests {
             client_domain: Some("ams".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
         });
 
@@ -9899,6 +10344,7 @@ mod tests {
             client_domain: Some("ssh:x@203.0.113.9".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
         });
         store.spaces.push(Space {
@@ -9910,6 +10356,7 @@ mod tests {
             client_domain: Some("DO AMS".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
         });
 
@@ -9944,6 +10391,7 @@ mod tests {
             client_domain: Some("syd".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
         });
         store.projects.push(Project {
@@ -9981,6 +10429,7 @@ mod tests {
             client_domain: Some("syd".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
         });
 
@@ -10048,6 +10497,7 @@ mod tests {
             client_domain: Some("syd".to_string()),
             is_collection: false,
             thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
         });
         // Once it is known, they are hands off.

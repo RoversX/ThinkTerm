@@ -1367,6 +1367,8 @@ impl super::TermWindow {
             | UIItemType::SpaceMenu
             | UIItemType::SpaceReconnect
             | UIItemType::ProjectToggleThreads(_)
+            | UIItemType::ThreadRefGroupToggle(_)
+            | UIItemType::ThreadRefGroupNewThread(_)
             | UIItemType::Project(_)
             | UIItemType::WorkspaceThread(_)
             | UIItemType::WorkspaceThreadPin(_)
@@ -1477,6 +1479,8 @@ impl super::TermWindow {
             | UIItemType::SpaceMenu
             | UIItemType::SpaceReconnect
             | UIItemType::ProjectToggleThreads(_)
+            | UIItemType::ThreadRefGroupToggle(_)
+            | UIItemType::ThreadRefGroupNewThread(_)
             | UIItemType::Project(_)
             | UIItemType::WorkspaceThread(_)
             | UIItemType::WorkspaceThreadPin(_)
@@ -2834,13 +2838,14 @@ impl super::TermWindow {
             .is_some_and(|bg| coords.x >= bg.x as isize && coords.x < (bg.x + bg.width) as isize);
         let rows: Vec<(String, isize, isize)> = match &kind {
             super::SidebarRowKind::Project(_) => project_block_extents(&self.ui_items),
-            super::SidebarRowKind::Thread { project_id, .. } => {
-                // In a collection Space the visible list is the reference
-                // list, not the origin project's threads.
-                let siblings = if crate::workspace_threads::is_collection_space(
-                    &self.active_space_id,
-                ) {
-                    crate::workspace_threads::collection_thread_refs(&self.active_space_id)
+            super::SidebarRowKind::Thread {
+                thread_id,
+                project_id,
+            } => {
+                // A dragged reference row reorders within the Space's ref
+                // list, not within the origin project's threads.
+                let siblings = if self.sidebar_row_is_thread_ref(thread_id) {
+                    crate::workspace_threads::space_thread_refs(&self.active_space_id)
                 } else {
                     crate::workspace_threads::unpinned_thread_ids(project_id)
                 };
@@ -2883,9 +2888,12 @@ impl super::TermWindow {
                     super::SidebarRowKind::Project(_) => {
                         crate::workspace_threads::ordered_project_ids(&self.active_space_id)
                     }
-                    super::SidebarRowKind::Thread { project_id, .. } => {
-                        if crate::workspace_threads::is_collection_space(&self.active_space_id) {
-                            crate::workspace_threads::collection_thread_refs(
+                    super::SidebarRowKind::Thread {
+                        thread_id,
+                        project_id,
+                    } => {
+                        if self.sidebar_row_is_thread_ref(thread_id) {
+                            crate::workspace_threads::space_thread_refs(
                                 &self.active_space_id,
                             )
                         } else {
@@ -2930,7 +2938,7 @@ impl super::TermWindow {
                 project_id,
             } => {
                 let space_id = self.active_space_id.clone();
-                if crate::workspace_threads::is_collection_space(&space_id) {
+                if self.sidebar_row_is_thread_ref(thread_id) {
                     // Reference order is purely local; nothing travels to
                     // any server.
                     crate::workspace_threads::move_thread_ref_before(
@@ -3383,6 +3391,21 @@ impl super::TermWindow {
             }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
+            }
+            UIItemType::ThreadRefGroupToggle(group_key) => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    if !self.thread_ref_groups_collapsed.remove(&group_key) {
+                        self.thread_ref_groups_collapsed.insert(group_key);
+                    }
+                    context.invalidate();
+                }
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
+            UIItemType::ThreadRefGroupNewThread(origin_space_id) => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    self.create_thread_in_ref_group(&origin_space_id, context);
+                }
+                context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::Project(ref project_id) => {
                 let project_id = project_id.clone();
@@ -3872,6 +3895,21 @@ impl super::TermWindow {
             }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
+            }
+            UIItemType::ThreadRefGroupToggle(group_key) => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    if !self.thread_ref_groups_collapsed.remove(&group_key) {
+                        self.thread_ref_groups_collapsed.insert(group_key);
+                    }
+                    context.invalidate();
+                }
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
+            UIItemType::ThreadRefGroupNewThread(origin_space_id) => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    self.create_thread_in_ref_group(&origin_space_id, context);
+                }
+                context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::Project(ref project_id) => {
                 let project_id = project_id.clone();
@@ -4808,11 +4846,10 @@ impl super::TermWindow {
                 else {
                     return;
                 };
-                // Collection rows reorder the local reference list, so the
+                // Reference rows reorder the local reference list, so the
                 // origin thread's pinned state is irrelevant there.
-                let draggable = crate::workspace_threads::is_collection_space(
-                    &self.active_space_id,
-                ) || !crate::workspace_threads::thread_is_pinned(&thread_id);
+                let draggable = self.sidebar_row_is_thread_ref(&thread_id)
+                    || !crate::workspace_threads::thread_is_pinned(&thread_id);
                 let title = crate::workspace_threads::thread_name(&thread_id)
                     .unwrap_or_else(|| thread_id.clone());
                 self.arm_sidebar_row_drag(
@@ -4863,10 +4900,10 @@ impl super::TermWindow {
     ) {
         match event.kind {
             WMEK::Press(MousePress::Left) => {
-                // In a collection Space the X removes the reference; the
+                // On a reference row the X removes the reference; the
                 // thread itself keeps living in its origin Space.
                 let space_id = self.active_space_id.clone();
-                if crate::workspace_threads::is_collection_space(&space_id) {
+                if self.sidebar_row_is_thread_ref(&thread_id) {
                     if crate::workspace_threads::remove_thread_ref(&space_id, &thread_id) {
                         context.invalidate();
                     }
@@ -5128,13 +5165,6 @@ impl super::TermWindow {
             ContextMenuIcon::New,
             KeyAssignment::CreateSpace,
         ));
-        let new_collection_item = self.context_menu_application_item_with_icon(
-            crate::i18n::tr("menu-new-collection-space"),
-            ContextMenuIcon::Pin,
-            crate::termwindow::ContextMenuApplicationAction::CreateCollectionSpace,
-            true,
-        );
-        items.push(new_collection_item);
         items.push(ContextMenuItem::item_with_icon(
             spaces
                 .iter()
@@ -5419,8 +5449,11 @@ impl super::TermWindow {
         let thread_id = thread_id.to_string();
         let is_pinned = crate::workspace_threads::thread_is_pinned(&thread_id);
         let active_space = self.active_space_id.clone();
-        let is_collection_ref = crate::workspace_threads::is_collection_space(&active_space)
-            && crate::workspace_threads::thread_ref_exists(&active_space, &thread_id);
+        // The row is a reference when this Space holds a ref to a thread
+        // whose home is elsewhere.
+        let is_thread_ref = crate::workspace_threads::thread_ref_exists(&active_space, &thread_id)
+            && crate::workspace_threads::thread_space_id(&thread_id).as_deref()
+                != Some(active_space.as_str());
         let live_workspaces = Mux::get().iter_workspaces();
         let connection =
             crate::workspace_threads::thread_connection_state(&thread_id, &live_workspaces);
@@ -5451,10 +5484,10 @@ impl super::TermWindow {
 
         // On a reference row the pin toggle and Delete would mutate the
         // origin thread while reading like row actions — the reference is
-        // removed via "Remove from Collection" below instead. Rename and
+        // removed via "Remove from This Space" below instead. Rename and
         // Mark Unread act on the real thread on purpose: a reference is a
         // shortcut to it, not a copy.
-        if !is_collection_ref {
+        if !is_thread_ref {
             items.push(ContextMenuItem::item_with_icon(
                 if is_pinned {
                     crate::i18n::tr("menu-unpin-thread")
@@ -5474,7 +5507,7 @@ impl super::TermWindow {
             ContextMenuIcon::Edit,
             KeyAssignment::PromptRenameWorkspaceThread(thread_id.clone()),
         ));
-        if !is_collection_ref {
+        if !is_thread_ref {
             items.push(ContextMenuItem::item_with_icon(
                 crate::i18n::tr("menu-delete-thread"),
                 ContextMenuIcon::Delete,
@@ -5487,13 +5520,14 @@ impl super::TermWindow {
             KeyAssignment::MarkWorkspaceThreadUnread(thread_id.clone()),
         ));
 
-        // Collection Space section. Inside a collection the row is a
-        // reference, so it can be removed here or traced back to its origin;
-        // everywhere else the thread can be added to a collection.
-        items.push(ContextMenuItem::Separator);
-        if is_collection_ref {
+        // Reference section. On a reference row the ref can be removed here
+        // or traced back to its origin; on a thread's own row it can be
+        // added to any eligible Space (local, not its home, not already
+        // holding it).
+        if is_thread_ref {
+            items.push(ContextMenuItem::Separator);
             let remove_item = self.context_menu_application_item_with_icon(
-                crate::i18n::tr("menu-remove-from-collection"),
+                crate::i18n::tr("menu-remove-thread-ref"),
                 ContextMenuIcon::Close,
                 crate::termwindow::ContextMenuApplicationAction::RemoveThreadFromCollection {
                     collection_space_id: active_space,
@@ -5515,30 +5549,18 @@ impl super::TermWindow {
                 items.push(origin_item);
             }
         } else {
-            let collections = crate::workspace_threads::collection_spaces();
-            if collections.is_empty() {
-                let add_item = self.context_menu_application_item_with_icon(
-                    crate::i18n::tr("menu-add-to-collection"),
-                    ContextMenuIcon::Pin,
-                    crate::termwindow::ContextMenuApplicationAction::AddThreadToCollection {
-                        collection_space_id: None,
-                        thread_id: thread_id.clone(),
-                    },
-                    true,
-                );
-                items.push(add_item);
-            } else {
-                for (space_id, name) in collections {
-                    let already =
-                        crate::workspace_threads::thread_ref_exists(&space_id, &thread_id);
+            let candidates = crate::workspace_threads::ref_host_candidates(&thread_id);
+            if !candidates.is_empty() {
+                items.push(ContextMenuItem::Separator);
+                for (space_id, name) in candidates {
                     let add_item = self.context_menu_application_item_with_icon(
-                        tr_with_name("menu-add-to-collection-named", &name),
+                        tr_with_name("menu-add-to-space-named", &name),
                         ContextMenuIcon::Pin,
                         crate::termwindow::ContextMenuApplicationAction::AddThreadToCollection {
                             collection_space_id: Some(space_id),
                             thread_id: thread_id.clone(),
                         },
-                        !already,
+                        true,
                     );
                     items.push(add_item);
                 }
@@ -5563,6 +5585,37 @@ impl super::TermWindow {
             None,
             workspaces_to_kill_after_adopt,
         );
+    }
+
+    /// The reference group "+": create a thread in the group's origin
+    /// project — exactly the project-"+" flow — and auto-add a reference to
+    /// it in the current Space so it appears (and activates) right here.
+    pub(crate) fn create_thread_in_ref_group(
+        &mut self,
+        origin_space_id: &str,
+        context: &dyn WindowOps,
+    ) {
+        let Some(project_id) = crate::workspace_threads::ref_group_origin_project(
+            &self.active_space_id,
+            origin_space_id,
+        ) else {
+            context.invalidate();
+            return;
+        };
+        let thread_id = match crate::workspace_threads::create_thread(&project_id, None) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                log::warn!("failed to create thread in reference group: {err:#}");
+                context.invalidate();
+                return;
+            }
+        };
+        // Reference it before activating: the activation gate only lets this
+        // window open threads its Space owns or references.
+        crate::workspace_threads::add_thread_ref(&self.active_space_id, &thread_id);
+        if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
+            self.activate_workspace_thread(thread_id, context);
+        }
     }
 
     pub(crate) fn create_workspace_thread(&mut self, project_id: &str, context: &dyn WindowOps) {
@@ -5615,27 +5668,15 @@ impl super::TermWindow {
 
         self.snapshot_active_workspace_thread_layout();
         let use_mosh = spec.use_mosh;
-        // A collection Space owns no projects, so the SSH-hosts view (whose
-        // footer button is reachable in a collection window too) must not
-        // create the host project there — it would be permanently invisible.
-        // The host lands in the default Space and the collection gets a
-        // reference, which is exactly how a collection displays anything.
-        let host_space_id =
-            if crate::workspace_threads::is_collection_space(&self.active_space_id) {
-                crate::workspace_threads::default_space_id()
-            } else {
-                self.active_space_id.clone()
-            };
+        // Any Space can own projects now (a migrated collection simply
+        // becomes a mixed Space), so the host project lands right here.
         let thread_id = crate::workspace_threads::create_disconnected_remote_host_thread(
-            &host_space_id,
+            &self.active_space_id,
             &host_id,
             &spec.label,
             crate::ssh_hosts::host_project_path(&spec),
             spec.default_workspace.clone(),
         );
-        if host_space_id != self.active_space_id {
-            crate::workspace_threads::add_thread_ref(&self.active_space_id, &thread_id);
-        }
         if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
             context.invalidate();
             return false;
@@ -5904,6 +5945,16 @@ impl super::TermWindow {
         );
     }
 
+    /// Whether this sidebar row shows a thread REFERENCE: the active Space
+    /// holds a ref to it and its home is elsewhere (or unknown — a dangling
+    /// ref). Row affordances differ: references are removed, own threads
+    /// are deleted.
+    fn sidebar_row_is_thread_ref(&self, thread_id: &str) -> bool {
+        crate::workspace_threads::thread_ref_exists(&self.active_space_id, thread_id)
+            && crate::workspace_threads::thread_space_id(thread_id).as_deref()
+                != Some(self.active_space_id.as_str())
+    }
+
     fn activate_workspace_thread_impl(
         &mut self,
         thread_id: String,
@@ -5913,23 +5964,27 @@ impl super::TermWindow {
     ) {
         let thread_home_space = crate::workspace_threads::thread_space_id(&thread_id);
         let in_this_space = thread_home_space.as_deref() == Some(self.active_space_id.as_str());
-        // A collection Space window may activate any thread it references:
-        // the reference opens in place while the thread keeps belonging to
-        // its origin Space.
-        let via_collection_ref = !in_this_space
+        // A window may activate any thread its Space references: the
+        // reference opens in place while the thread keeps belonging to its
+        // origin Space.
+        let via_thread_ref = !in_this_space
             && crate::workspace_threads::thread_ref_exists(&self.active_space_id, &thread_id);
-        if !in_this_space && !via_collection_ref {
+        if !in_this_space && !via_thread_ref {
             context.invalidate();
             return;
         }
-        if via_collection_ref {
-            // Remember the choice so switching back to the collection
-            // restores this reference, like a normal Space restores its
-            // active thread.
-            crate::workspace_threads::note_collection_active_ref(
+        if via_thread_ref {
+            // Remember the choice so switching back to this Space restores
+            // the reference, like a normal Space restores its active thread.
+            crate::workspace_threads::note_thread_active_ref(
                 &self.active_space_id,
                 &thread_id,
             );
+        } else {
+            // Activating one of the Space's own threads means the next
+            // switch back should follow the normal pointers, not jump to a
+            // previously opened reference.
+            crate::workspace_threads::clear_thread_active_ref(&self.active_space_id);
         }
 
         let mux = Mux::get();
@@ -5987,7 +6042,7 @@ impl super::TermWindow {
         let Some(plan) = crate::workspace_threads::activate_thread_record(
             &thread_id,
             &live_workspaces,
-            !via_collection_ref,
+            !via_thread_ref,
         ) else {
             context.invalidate();
             return;
@@ -6009,7 +6064,7 @@ impl super::TermWindow {
         // That requires the domain to be attached first. For a collection
         // reference the thread's own Space decides the domain — the
         // collection Space itself is local and has none.
-        let domain_space_id = if via_collection_ref {
+        let domain_space_id = if via_thread_ref {
             thread_home_space
                 .clone()
                 .unwrap_or_else(|| self.active_space_id.clone())

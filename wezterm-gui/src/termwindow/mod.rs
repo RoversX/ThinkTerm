@@ -447,19 +447,17 @@ pub(crate) enum ContextMenuApplicationAction {
     },
     /// Sidebar view-options: show/hide threads with this work status.
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
-    /// Add a thread reference to a collection Space; `None` creates the
-    /// first collection Space and adds there.
+    /// Add a thread reference to a Space (local, non-home, not already
+    /// holding it — the menu only offers eligible targets).
     AddThreadToCollection {
         collection_space_id: Option<String>,
         thread_id: String,
     },
-    /// Drop a thread reference from a collection Space.
+    /// Drop a thread reference from a Space.
     RemoveThreadFromCollection {
         collection_space_id: String,
         thread_id: String,
     },
-    /// Space menu: create a collection Space and switch to it.
-    CreateCollectionSpace,
     /// Fetch a file from the remote Files panel into the Downloads folder.
     DownloadRemoteFile {
         path: remote_files::RemotePath,
@@ -523,6 +521,14 @@ pub enum UIItemType {
     /// connected this session).
     SpaceReconnect,
     ProjectToggleThreads(String),
+    /// Collapse/expand a folder-style thread-reference group; the payload is
+    /// the group key (`"<space_id>::<machine_label>"`), tracked in runtime
+    /// state rather than the store.
+    ThreadRefGroupToggle(String),
+    /// The "+" on a reference group: create a thread in the group's origin
+    /// project (exactly like the project "+") and auto-add a ref to it in
+    /// the current Space. Payload is the group's origin Space id.
+    ThreadRefGroupNewThread(String),
     Project(String),
     WorkspaceThread(String),
     WorkspaceThreadPin(String),
@@ -1826,6 +1832,14 @@ pub struct TermWindow {
     /// touches `workspace_sidebar_collapsed` or `workspace_sidebar_width`:
     /// the terminal must not reflow for a hover.
     workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal,
+    /// The pointer is over the native macOS titlebar sidebar button (which
+    /// lives outside our view, so `current_mouse_event` cannot see it).
+    /// Feeds the hover-reveal as a hot zone.
+    titlebar_sidebar_button_hovered: bool,
+    /// Collapsed folder-style reference groups, keyed by
+    /// `"<space_id>::<machine_label>"`. Runtime-only: collapse state resets
+    /// with the window, like a disclosure and unlike project collapse.
+    thread_ref_groups_collapsed: std::collections::HashSet<String>,
     /// A native (AppKit) context menu is open. The fallback menu tracks
     /// itself in `context_menu`; the native path otherwise leaves no trace,
     /// and the hover machine must not retreat the panel a menu is anchored
@@ -2235,26 +2249,21 @@ impl TermWindow {
     }
 
     /// The Space whose projects/domain the right-sidebar features (Files,
-    /// remote connect, paste targets) should act on. A collection window
-    /// displays workspaces that belong to other Spaces, so resolve through
-    /// the displayed workspace there; everywhere else the window's Space is
-    /// the answer.
+    /// remote connect, paste targets) should act on. A window displaying a
+    /// thread reference shows a workspace that belongs to another Space, so
+    /// resolve through the displayed workspace; everywhere else the window's
+    /// Space is the answer.
     pub(crate) fn content_space_id(&self) -> String {
-        if crate::workspace_threads::is_collection_space(&self.active_space_id) {
-            if let Some(workspace) = self.current_mux_workspace() {
-                // Only resolve through the displayed workspace when it is a
-                // reference this collection actually holds. A freshly
-                // switched-to collection still shows the previous Space's
-                // terminal, and that must not leak the previous machine
-                // into Files/paste.
-                if let Some(space_id) =
-                    crate::workspace_threads::origin_space_for_collection_workspace(
-                        &self.active_space_id,
-                        &workspace,
-                    )
-                {
-                    return space_id;
-                }
+        if let Some(workspace) = self.current_mux_workspace() {
+            // Only resolve through the displayed workspace when it is a
+            // reference this Space actually holds. A freshly switched-to
+            // window still shows the previous Space's terminal, and that
+            // must not leak the previous machine into Files/paste.
+            if let Some(space_id) = crate::workspace_threads::origin_space_for_ref_workspace(
+                &self.active_space_id,
+                &workspace,
+            ) {
+                return space_id;
             }
         }
         self.active_space_id.clone()
@@ -2795,6 +2804,8 @@ impl TermWindow {
             workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
             workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
+            titlebar_sidebar_button_hovered: false,
+            thread_ref_groups_collapsed: std::collections::HashSet::new(),
             native_context_menu_open: false,
             workspace_notification_snapshot: None,
             workspace_notification_pulse_started_at: None,

@@ -357,6 +357,21 @@ impl crate::TermWindow {
                 .saturating_sub(1)
                 .saturating_mul(WORKSPACE_GROUP_EXTRA_GAP),
         );
+        if !view.ref_groups.is_empty() {
+            if !view.pinned_threads.is_empty() || !view.projects.is_empty() {
+                height = height.saturating_add(WORKSPACE_GROUP_EXTRA_GAP);
+            }
+            for (group_idx, group) in view.ref_groups.iter().enumerate() {
+                if group_idx > 0 {
+                    height = height.saturating_add(WORKSPACE_GROUP_EXTRA_GAP);
+                }
+                height = height.saturating_add(row_height + row_gap);
+                if !group.collapsed {
+                    height = height
+                        .saturating_add(group.threads.len().saturating_mul(row_height + row_gap));
+                }
+            }
+        }
         height.saturating_sub(row_gap)
     }
 
@@ -381,11 +396,18 @@ impl crate::TermWindow {
         &self,
         mut view: workspace_threads::WorkspaceThreadsView,
     ) -> workspace_threads::WorkspaceThreadsView {
-        // A collection is a hand-curated list; hiding rows by work status
-        // would blank it with no explanation.
-        if crate::workspace_threads::is_collection_space(self.workspace_sidebar_space_id()) {
-            return view;
+        // This is the single choke point every sidebar consumer of the view
+        // passes through (paint, scroll height, hit testing), so the runtime
+        // collapse state of reference groups is stamped here — the three
+        // row-math sites must all see the same collapsed flags.
+        let space_id = self.workspace_sidebar_space_id().to_string();
+        for group in &mut view.ref_groups {
+            group.collapsed = self
+                .thread_ref_groups_collapsed
+                .contains(&format!("{space_id}::{}", group.key));
         }
+        // Thread refs are a hand-curated list and are not filtered; the
+        // filter below only touches the Space's own pinned/project rows.
         let hidden = crate::native_settings::workspace_sidebar_hidden_statuses()
             .iter()
             .filter_map(|key| workspace_threads::WorkspaceThreadWorkStatus::from_settings_key(key))
@@ -1587,13 +1609,7 @@ impl crate::TermWindow {
                     label_icon_size,
                     muted_fg,
                 )?;
-                let section_label = if crate::workspace_threads::is_collection_space(
-                    self.workspace_sidebar_space_id(),
-                ) {
-                    crate::i18n::tr("sidebar-collection-threads")
-                } else {
-                    crate::i18n::tr("sidebar-pinned")
-                };
+                let section_label = crate::i18n::tr("sidebar-pinned");
                 self.paint_sidebar_text(
                     layers,
                     &ui_font,
@@ -1713,39 +1729,20 @@ impl crate::TermWindow {
                     )?;
 
                     if is_hovered && !is_renaming_session {
-                        // In a collection Space the pin toggle would mutate
-                        // the origin thread; only removal makes sense there.
-                        let in_collection = crate::workspace_threads::is_collection_space(
-                            self.workspace_sidebar_space_id(),
-                        );
-                        // An X, not a trash can: the affordance removes the
-                        // reference, the origin thread keeps running.
-                        let mut affordances = vec![if in_collection {
+                        let affordances = vec![
                             (
-                                delete_x,
-                                UIItemType::WorkspaceThreadDelete(session.id.clone()),
-                                SvgIcon::X,
-                                "sidebar remove collection reference button",
-                            )
-                        } else {
+                                pin_x,
+                                UIItemType::WorkspaceThreadPin(session.id.clone()),
+                                SvgIcon::PinOff,
+                                "sidebar unpin pinned thread button",
+                            ),
                             (
                                 delete_x,
                                 UIItemType::WorkspaceThreadDelete(session.id.clone()),
                                 SvgIcon::Trash2,
                                 "sidebar delete pinned thread button",
-                            )
-                        }];
-                        if !in_collection {
-                            affordances.insert(
-                                0,
-                                (
-                                    pin_x,
-                                    UIItemType::WorkspaceThreadPin(session.id.clone()),
-                                    SvgIcon::PinOff,
-                                    "sidebar unpin pinned thread button",
-                                ),
-                            );
-                        }
+                            ),
+                        ];
                         for (x, item_type, icon, _context_name) in affordances {
                             let hovered =
                                 self.is_pointer_over_ui_rect(x, action_y, action_size, action_size);
@@ -2171,6 +2168,408 @@ impl crate::TermWindow {
 
             if project_idx + 1 < view.projects.len() {
                 virtual_y += self.ui_px(WORKSPACE_GROUP_EXTRA_GAP);
+            }
+        }
+
+        if !view.ref_groups.is_empty() {
+            if !view.pinned_threads.is_empty() || !view.projects.is_empty() {
+                virtual_y += self.ui_px(WORKSPACE_GROUP_EXTRA_GAP);
+            }
+            // Reference groups render exactly like project folders: chevron,
+            // machine icon, machine name, then indented thread rows. The
+            // link icon in the header is what tells a reference group apart
+            // from a real project group with the same machine name.
+            let group_space_id = self.workspace_sidebar_space_id().to_string();
+            for (group_idx, group) in view.ref_groups.iter().enumerate() {
+                if group_idx > 0 {
+                    virtual_y += self.ui_px(WORKSPACE_GROUP_EXTRA_GAP);
+                }
+                let row_top = list_top_f + virtual_y as f32 - scroll_offset;
+                let row_bottom = row_top + session_row_height as f32;
+                let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
+                let y = row_top.floor().max(0.0) as usize;
+
+                let disclosure_size = icon_size.min(22);
+                let disclosure_x = item_x + self.ui_px(SIDEBAR_INSET);
+                let group_icon_x = disclosure_x + disclosure_size + 4;
+                let group_text_x = group_icon_x + icon_size + self.ui_px(SIDEBAR_ICON_GAP);
+                let icon_y = y + ((session_row_height.saturating_sub(icon_size)) / 2);
+                let disclosure_y = y + ((session_row_height.saturating_sub(disclosure_size)) / 2);
+                let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
+                let group_action_size =
+                    section_button_size.min(session_row_height.saturating_sub(8));
+                let group_action_x = item_x
+                    .saturating_add(item_width)
+                    .saturating_sub(group_action_size + self.ui_px(SIDEBAR_INSET));
+                if row_is_visible {
+                    let group_key = format!("{group_space_id}::{}", group.key);
+                    self.ui_items.push(UIItem {
+                        x: item_x,
+                        y,
+                        width: item_width,
+                        height: session_row_height,
+                        item_type: UIItemType::ThreadRefGroupToggle(group_key),
+                    });
+                    self.paint_sidebar_icon(
+                        layers,
+                        if group.collapsed {
+                            SvgIcon::ChevronRight
+                        } else {
+                            SvgIcon::ChevronDown
+                        },
+                        disclosure_x,
+                        disclosure_y,
+                        disclosure_size,
+                        muted_fg,
+                    )?;
+                    self.paint_sidebar_icon(
+                        layers,
+                        SvgIcon::Link2,
+                        group_icon_x,
+                        icon_y,
+                        icon_size,
+                        if group.attached {
+                            muted_fg
+                        } else {
+                            muted_fg.mul_alpha(0.6)
+                        },
+                    )?;
+                    // Header: origin-Space name, with the machine as a
+                    // right-aligned badge. The name is the primary info, so
+                    // when both cannot fit the badge is dropped first and
+                    // the name keeps the full width (ellipsized as needed).
+                    let header_fg = if group.attached {
+                        muted_fg
+                    } else {
+                        muted_fg.mul_alpha(0.6)
+                    };
+                    let text_avail =
+                        group_action_x.saturating_sub(group_text_x + self.ui_px(SIDEBAR_INSET));
+                    let badge_pad = self.ui_px(6);
+                    let badge_gap = self.ui_px(8);
+                    // Badge typography: clearly smaller than the header name
+                    // so it reads as metadata, matching the height of the
+                    // "+" button beside it.
+                    let badge_font = self
+                        .fonts
+                        .title_font_with_size(
+                            crate::native_settings::sidebar_font_size() * 0.82,
+                        )
+                        .ok();
+                    // Local needs no badge: the badge answers "which
+                    // machine", and this machine is the answer by default.
+                    let show_badge = group.machine_label != group.label
+                        && !group.machine_label.is_empty()
+                        && group.machine_label != "Local";
+                    let badge = match (&badge_font, show_badge) {
+                        (Some(badge_font), true) => {
+                            let badge_metrics =
+                                RenderMetrics::with_font_metrics(&badge_font.metrics());
+                            (|| {
+                                let text_w = self
+                                    .cached_ui_text_advance(
+                                        badge_font,
+                                        &badge_metrics,
+                                        &group.machine_label,
+                                    )
+                                    .ok()?
+                                    .ceil() as usize;
+                                let name_w = self
+                                    .cached_ui_text_advance(
+                                        &ui_font,
+                                        &ui_metrics,
+                                        &group.label,
+                                    )
+                                    .ok()?
+                                    .ceil() as usize;
+                                let badge_w = text_w + badge_pad * 2;
+                                (name_w + badge_gap + badge_w <= text_avail)
+                                    .then_some((badge_w, badge_metrics))
+                            })()
+                        }
+                        _ => None,
+                    };
+                    let name_avail = match &badge {
+                        Some((badge_w, _)) => {
+                            text_avail.saturating_sub(badge_w + badge_gap)
+                        }
+                        None => text_avail,
+                    };
+                    self.paint_sidebar_text(
+                        layers,
+                        &ui_font,
+                        ui_metrics,
+                        &group.label,
+                        group_text_x,
+                        text_y,
+                        name_avail,
+                        header_fg,
+                    )?;
+                    if let (Some((badge_w, badge_metrics)), Some(badge_font)) =
+                        (badge, &badge_font)
+                    {
+                        // Same height as the "+" button so the trailing
+                        // cluster reads as one aligned row of controls.
+                        let badge_h = group_action_size;
+                        let badge_x = group_action_x
+                            .saturating_sub(self.ui_px(SIDEBAR_INSET) / 2 + badge_w);
+                        let badge_y =
+                            y + ((session_row_height.saturating_sub(badge_h)) / 2);
+                        self.fill_rounded_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(
+                                badge_x as f32,
+                                badge_y as f32,
+                                badge_w as f32,
+                                badge_h as f32,
+                            ),
+                            chrome.sidebar_button_bg,
+                            self.ui_f32(SIDEBAR_ROW_RADIUS),
+                        )
+                        .context("sidebar ref group machine badge")?;
+                        let badge_cell_h = badge_metrics.cell_size.height as usize;
+                        self.paint_sidebar_text(
+                            layers,
+                            badge_font,
+                            badge_metrics,
+                            &group.machine_label,
+                            badge_x + badge_pad,
+                            badge_y + ((badge_h.saturating_sub(badge_cell_h)) / 2),
+                            badge_w.saturating_sub(badge_pad),
+                            header_fg,
+                        )?;
+                    }
+
+                    // The group "+": create a thread in the origin project
+                    // and auto-reference it here — same affordance as the
+                    // project "+", inert (and dimmed) while the origin
+                    // machine is unreachable.
+                    let group_action_y =
+                        y + ((session_row_height.saturating_sub(group_action_size)) / 2);
+                    let group_action_hovered = group.attached
+                        && !suppress_hover
+                        && self.is_pointer_over_ui_rect(
+                            group_action_x,
+                            group_action_y,
+                            group_action_size,
+                            group_action_size,
+                        );
+                    self.fill_rounded_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            group_action_x as f32,
+                            group_action_y as f32,
+                            group_action_size as f32,
+                            group_action_size as f32,
+                        ),
+                        if group_action_hovered {
+                            chrome.sidebar_button_hover_bg
+                        } else if group.attached {
+                            chrome.sidebar_button_bg
+                        } else {
+                            chrome.sidebar_button_bg.mul_alpha(0.4)
+                        },
+                        self.ui_f32(SIDEBAR_ROW_RADIUS),
+                    )
+                    .context("sidebar ref group new thread button")?;
+                    if group.attached {
+                        self.ui_items.push(UIItem {
+                            x: group_action_x,
+                            y: group_action_y,
+                            width: group_action_size,
+                            height: group_action_size,
+                            item_type: UIItemType::ThreadRefGroupNewThread(group.key.clone()),
+                        });
+                    }
+                    let action_icon_size = (header_icon_size + 4).min(
+                        group_action_size
+                            .saturating_sub(self.ui_px(SIDEBAR_SECTION_ACTION_ICON_INSET)),
+                    );
+                    self.paint_sidebar_icon(
+                        layers,
+                        SvgIcon::Plus,
+                        group_action_x
+                            + ((group_action_size.saturating_sub(action_icon_size)) / 2),
+                        group_action_y
+                            + ((group_action_size.saturating_sub(action_icon_size)) / 2),
+                        action_icon_size,
+                        if group_action_hovered {
+                            foreground
+                        } else if group.attached {
+                            muted_fg
+                        } else {
+                            muted_fg.mul_alpha(0.5)
+                        },
+                    )?;
+                }
+                virtual_y += session_row_height + row_gap;
+
+                if group.collapsed {
+                    continue;
+                }
+                let session_x =
+                    item_x + self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING);
+                let session_width = item_width.saturating_sub(
+                    self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING) * 2,
+                );
+                let session_status_x = session_x + self.ui_px(SIDEBAR_INSET) + 2;
+                let session_text_x = session_status_x
+                    + self.ui_px(SESSION_STATUS_ICON_SIZE)
+                    + self.ui_px(SIDEBAR_ICON_GAP)
+                    + 6;
+                for reference in &group.threads {
+                    let session = &reference.thread;
+                    let row_top = list_top_f + virtual_y as f32 - scroll_offset;
+                    let row_bottom = row_top + session_row_height as f32;
+                    let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
+                    let y = row_top.floor().max(0.0) as usize;
+                    let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
+                    let hit_bottom =
+                        row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
+                    let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
+
+                    if row_is_visible {
+                        // A dangling ref has nothing to activate; it paints
+                        // (greyed, removable) but registers no activation
+                        // target.
+                        if !reference.dangling {
+                            self.ui_items.push(UIItem {
+                                x: session_x,
+                                y: hit_y,
+                                width: session_width,
+                                height: hit_height,
+                                item_type: UIItemType::WorkspaceThread(session.id.clone()),
+                            });
+                        }
+                        let is_hovered = !suppress_hover
+                            && self.is_pointer_over_ui_rect(
+                                session_x,
+                                y,
+                                session_width,
+                                session_row_height,
+                            );
+                        let is_selected = self.is_workspace_sidebar_thread_selected(session);
+                        let dimmed = reference.dangling || !reference.origin_domain_attached;
+                        if is_selected {
+                            self.fill_rounded_rectangle_with_border(
+                                layers,
+                                0,
+                                euclid::rect(
+                                    session_x as f32,
+                                    y as f32,
+                                    session_width as f32,
+                                    session_row_height as f32,
+                                ),
+                                selected_bg,
+                                selected_border,
+                                self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                                CAPSULE_BORDER_WIDTH,
+                            )
+                            .context("sidebar selected thread ref")?;
+                        } else if is_hovered {
+                            self.fill_rounded_rectangle(
+                                layers,
+                                0,
+                                euclid::rect(
+                                    session_x as f32,
+                                    y as f32,
+                                    session_width as f32,
+                                    session_row_height as f32,
+                                ),
+                                chrome.sidebar_row_hover_bg,
+                                self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                            )
+                            .context("sidebar hovered thread ref")?;
+                        }
+
+                        let text_y =
+                            y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
+                        let action_size = session_row_height.saturating_sub(8).clamp(
+                            self.ui_px(SESSION_ACTION_MIN_SIZE),
+                            self.ui_px(SESSION_ACTION_MAX_SIZE),
+                        );
+                        let delete_x = session_x
+                            .saturating_add(session_width)
+                            .saturating_sub(self.ui_px(SIDEBAR_INSET) + action_size);
+                        let action_y =
+                            y + ((session_row_height.saturating_sub(action_size)) / 2);
+                        let text_right = if is_hovered {
+                            delete_x
+                        } else {
+                            session_x
+                                .saturating_add(session_width)
+                                .saturating_sub(self.ui_px(SIDEBAR_INSET))
+                        };
+                        if !dimmed {
+                            self.paint_sidebar_thread_status(
+                                layers,
+                                session,
+                                session_status_x,
+                                y,
+                                session_row_height,
+                                &chrome,
+                                foreground,
+                            )?;
+                        }
+                        let text_fg = if dimmed {
+                            muted_fg.mul_alpha(0.7)
+                        } else if is_selected {
+                            active_fg
+                        } else {
+                            foreground
+                        };
+                        self.paint_sidebar_text(
+                            layers,
+                            &ui_font,
+                            ui_metrics,
+                            &session.name,
+                            session_text_x,
+                            text_y,
+                            text_right
+                                .saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET)),
+                            text_fg,
+                        )?;
+
+                        if is_hovered {
+                            // An X, not a trash can: removing a reference
+                            // leaves the origin thread running untouched.
+                            let hovered = self.is_pointer_over_ui_rect(
+                                delete_x,
+                                action_y,
+                                action_size,
+                                action_size,
+                            );
+                            self.ui_items.push(UIItem {
+                                x: delete_x,
+                                y: action_y,
+                                width: action_size,
+                                height: action_size,
+                                item_type: UIItemType::WorkspaceThreadDelete(session.id.clone()),
+                            });
+                            let action_icon_size = action_size
+                                .saturating_sub(self.ui_px(SESSION_ACTION_ICON_INSET))
+                                .max(header_icon_size);
+                            self.paint_sidebar_icon(
+                                layers,
+                                SvgIcon::X,
+                                delete_x
+                                    + ((action_size.saturating_sub(action_icon_size)) / 2),
+                                action_y
+                                    + ((action_size.saturating_sub(action_icon_size)) / 2),
+                                action_icon_size,
+                                if hovered {
+                                    foreground
+                                } else {
+                                    muted_fg.mul_alpha(0.88)
+                                },
+                            )?;
+                        }
+                    }
+
+                    virtual_y += session_row_height + row_gap;
+                }
             }
         }
 
