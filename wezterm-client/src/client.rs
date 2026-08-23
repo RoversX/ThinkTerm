@@ -1052,6 +1052,16 @@ where
     }
 }
 
+/// Which rule produced the default unix domain.  Only the GUI-socket branch
+/// is a guess: it names whatever a GUI last published, which may have died
+/// between the liveness check and our connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedVia {
+    Env,
+    GuiSock,
+    ConfiguredDomain,
+}
+
 #[derive(Debug)]
 struct Reconnectable {
     config: ClientDomainConfig,
@@ -2001,34 +2011,43 @@ impl Client {
     pub fn resolve_default_unix_domain(
         prefer_mux: bool,
         class_name: &str,
-    ) -> anyhow::Result<config::UnixDomain> {
+    ) -> anyhow::Result<(config::UnixDomain, ResolvedVia)> {
         match std::env::var_os("WEZTERM_UNIX_SOCKET") {
-            Some(path) if !path.is_empty() => Ok(config::UnixDomain {
-                socket_path: Some(path.into()),
-                ..Default::default()
-            }),
+            Some(path) if !path.is_empty() => Ok((
+                config::UnixDomain {
+                    socket_path: Some(path.into()),
+                    ..Default::default()
+                },
+                ResolvedVia::Env,
+            )),
             Some(_) | None => {
                 if !prefer_mux {
                     if let Ok(gui) = crate::discovery::resolve_gui_sock_path(class_name) {
-                        return Ok(config::UnixDomain {
-                            socket_path: Some(gui),
-                            no_serve_automatically: true,
-                            ..Default::default()
-                        });
+                        return Ok((
+                            config::UnixDomain {
+                                socket_path: Some(gui),
+                                no_serve_automatically: true,
+                                ..Default::default()
+                            },
+                            ResolvedVia::GuiSock,
+                        ));
                     }
                 }
 
                 let config = configuration();
-                Ok(config
-                    .unix_domains
-                    .first()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "no default unix domain is configured and WEZTERM_UNIX_SOCKET \
-                             is not set in the environment"
-                        )
-                    })?
-                    .clone())
+                Ok((
+                    config
+                        .unix_domains
+                        .first()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "no default unix domain is configured and WEZTERM_UNIX_SOCKET \
+                                 is not set in the environment"
+                            )
+                        })?
+                        .clone(),
+                    ResolvedVia::ConfiguredDomain,
+                ))
             }
         }
     }
@@ -2040,8 +2059,29 @@ impl Client {
         prefer_mux: bool,
         class_name: &str,
     ) -> anyhow::Result<Self> {
-        let unix_dom = Self::resolve_default_unix_domain(prefer_mux, class_name)?;
-        Self::new_unix_domain(None, &unix_dom, initial, ui, no_auto_start)
+        let (unix_dom, via) = Self::resolve_default_unix_domain(prefer_mux, class_name)?;
+        let gui_err = match Self::new_unix_domain(None, &unix_dom, initial, ui, no_auto_start) {
+            Ok(client) => return Ok(client),
+            // An explicit WEZTERM_UNIX_SOCKET, or the domain the user
+            // configured, is the answer whether or not it answers: only the
+            // published GUI socket is a guess we are allowed to walk back.
+            Err(err) if via != ResolvedVia::GuiSock => return Err(err),
+            Err(err) => err,
+        };
+
+        log::warn!(
+            "the published GUI socket {:?} did not answer: {gui_err:#}; \
+             falling back to the configured mux server",
+            unix_dom.socket_path
+        );
+        ui.output_str(
+            "The published GUI socket did not answer; \
+             trying the configured mux server.\n",
+        );
+
+        let (fallback, _) = Self::resolve_default_unix_domain(true, class_name)?;
+        Self::new_unix_domain(None, &fallback, initial, ui, no_auto_start)
+            .with_context(|| format!("after the published GUI socket failed ({gui_err:#})"))
     }
 
     pub fn new_unix_domain(
