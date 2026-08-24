@@ -187,6 +187,34 @@ impl crate::TermWindow {
         }
     }
 
+    /// Is the window currently displaying `thread_id`'s workspace? Asked
+    /// BEFORE detaching a ref/thread, so the window knows to show something
+    /// else afterwards.
+    fn showing_workspace_of_thread(&mut self, thread_id: &str) -> bool {
+        let displayed = self.current_mux_workspace();
+        displayed.is_some()
+            && displayed == crate::workspace_threads::thread_workspace_name(thread_id)
+    }
+
+    /// The content on screen just stopped belonging to this Space (its ref
+    /// was removed or moved away): switch back to the Space's own recorded
+    /// thread rather than keeping foreign content up. NOT
+    /// `switch_space_to_thread(current, None)` — that call no-ops for the
+    /// Space the window is already on; the activation must be explicit.
+    fn leave_detached_ref_content(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let space = self.active_space_id.clone();
+        if let Some(thread_id) = crate::workspace_threads::ensure_active_thread_for_space(&space) {
+            if !self.open_remote_workspace_thread_without_connecting(&thread_id, &window) {
+                self.activate_workspace_thread(thread_id, &window);
+            }
+        } else {
+            window.invalidate();
+        }
+    }
+
     pub(crate) fn perform_context_menu_application_action(&mut self, action_id: u64) {
         let Some(action) = self
             .context_menu_application_actions
@@ -243,7 +271,64 @@ impl crate::TermWindow {
                 collection_space_id,
                 thread_id,
             } => {
+                let was_showing = self.showing_workspace_of_thread(&thread_id);
                 if crate::workspace_threads::remove_thread_ref(&collection_space_id, &thread_id) {
+                    if was_showing {
+                        self.leave_detached_ref_content();
+                    }
+                    self.invalidate_window();
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::MoveThreadToSpace {
+                space_id,
+                thread_id,
+            } => {
+                let displayed = self.current_mux_workspace();
+                if let Some(outcome) =
+                    crate::workspace_threads::move_thread_to_space(&thread_id, &space_id)
+                {
+                    // The mover was the workspace on screen: it now belongs
+                    // to another Space, so switch this window to a sibling
+                    // that still lives here (or let the Space restore/seed
+                    // one) instead of leaving foreign content up.
+                    if displayed.as_deref() == Some(outcome.previous_workspace.as_str()) {
+                        if let Some(window) = self.window.clone() {
+                            match outcome.next_thread_id {
+                                Some(next) => {
+                                    if !self
+                                        .open_remote_workspace_thread_without_connecting(
+                                            &next, &window,
+                                        )
+                                    {
+                                        self.activate_workspace_thread(next, &window);
+                                    }
+                                }
+                                None => self.leave_detached_ref_content(),
+                            }
+                        }
+                    }
+                    self.invalidate_window();
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::MoveThreadRefToSpace {
+                from_space_id,
+                space_id,
+                thread_id,
+            } => {
+                let was_showing = self.showing_workspace_of_thread(&thread_id);
+                if crate::workspace_threads::move_thread_ref_to_space(
+                    &from_space_id,
+                    &space_id,
+                    &thread_id,
+                ) {
+                    // The moved ref was the content on screen; this Space no
+                    // longer holds it, so fall back to the Space's own
+                    // recorded thread instead of leaving the (often remote)
+                    // workspace up with nothing in the sidebar pointing at
+                    // it.
+                    if was_showing {
+                        self.leave_detached_ref_content();
+                    }
                     self.invalidate_window();
                 }
             }

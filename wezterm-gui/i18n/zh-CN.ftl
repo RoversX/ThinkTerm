@@ -207,6 +207,7 @@ remote-tree-mutation-offline = { $name } 已断开。请重新连接后再试。
 menu-new-space-here = 在此服务器新建空间
 menu-add-to-space = 添加到空间
 menu-add-to-space-named = 添加到“{ $name }”
+menu-move-to-space = 移动到空间
 menu-remove-thread-ref = 从此空间移除
 menu-go-to-origin-space = 回到原空间
 menu-rename-space = 重命名空间…

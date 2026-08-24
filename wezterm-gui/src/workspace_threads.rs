@@ -1268,6 +1268,107 @@ pub fn ref_host_candidates(thread_id: &str) -> Vec<(SpaceId, String)> {
         .collect()
 }
 
+/// (id, name) of every Space `thread_id` could MOVE to: local Spaces other
+/// than its home that have a project to receive it. Empty for threads that
+/// cannot move at all — remote ones execute on their machine and can only
+/// be referenced. Feeds the "Move to Space …" submenu.
+pub fn move_host_candidates(thread_id: &str) -> Vec<(SpaceId, String)> {
+    let store = THREAD_STORE.lock();
+    let Some(project) = store
+        .projects
+        .iter()
+        .find(|project| project.threads.iter().any(|thread| thread.id == thread_id))
+    else {
+        return Vec::new();
+    };
+    if is_remote_project(project, &store.spaces) {
+        return Vec::new();
+    }
+    let home = project.space_id.clone();
+    store
+        .spaces
+        .iter()
+        .filter(|space| {
+            space.client_domain.is_none()
+                && space.id != home
+                && store.projects.iter().any(|candidate| {
+                    // Same test the move itself applies: a Space holding
+                    // only direct-SSH projects has nowhere local to put
+                    // the thread, and offering it would no-op silently.
+                    candidate.space_id == space.id
+                        && !is_remote_project(candidate, &store.spaces)
+                })
+        })
+        .map(|space| (space.id.clone(), space.name.clone()))
+        .collect()
+}
+
+/// What a completed thread move leaves the WINDOW to deal with: the mover
+/// may have been the very workspace on screen, and the window then needs to
+/// show something that still belongs to its Space.
+pub struct MovedThreadOutcome {
+    /// The workspace name the thread was displayed under BEFORE the move
+    /// (renames happen inside the move); compare against the window's
+    /// current workspace to learn whether the mover was on screen.
+    pub previous_workspace: String,
+    /// A sibling thread left behind in the source Space to switch to, if
+    /// any survive there.
+    pub next_thread_id: Option<String>,
+}
+
+/// Move a LOCAL thread to another local Space: it leaves its old project and
+/// joins the target Space's active (or first) project — a true re-home, as
+/// opposed to a reference. A live terminal follows: the mux workspace is
+/// renamed to the name the new project derives, so the running session stays
+/// bound instead of being orphaned by the cross-Space binding repair.
+/// Returns None when nothing moved.
+pub fn move_thread_to_space(thread_id: &str, target_space_id: &str) -> Option<MovedThreadOutcome> {
+    let mut store = THREAD_STORE.lock();
+    let outcome = store.move_thread_to_space(thread_id, target_space_id);
+    if outcome.is_some() {
+        persist_locked(&store);
+    }
+    outcome
+}
+
+/// The workspace `thread_id`'s terminal shows under right now — its
+/// materialized name, or the one its project derives. The window compares
+/// this against its own workspace to learn whether an action just detached
+/// the very content it is displaying.
+pub fn thread_workspace_name(thread_id: &str) -> Option<String> {
+    let store = THREAD_STORE.lock();
+    store.projects.iter().find_map(|project| {
+        project
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| {
+                thread
+                    .materialized_workspace_name
+                    .clone()
+                    .unwrap_or_else(|| workspace_name_for_thread(&project.id, &thread.id))
+            })
+    })
+}
+
+/// Move a thread REFERENCE from one Space's list to another's: gone here,
+/// present there. The origin thread itself never moves.
+pub fn move_thread_ref_to_space(
+    from_space_id: &str,
+    target_space_id: &str,
+    thread_id: &str,
+) -> bool {
+    let mut store = THREAD_STORE.lock();
+    // Add first: if the target refuses (remote Space, home Space, already
+    // holding), the ref must stay where it is rather than vanish.
+    if !store.add_thread_ref(target_space_id, thread_id) {
+        return false;
+    }
+    store.remove_thread_ref(from_space_id, thread_id);
+    persist_locked(&store);
+    true
+}
+
 /// Add another Space to a remote server.
 ///
 /// The Space lives on the server like any other, so it is created locally with
@@ -3716,6 +3817,144 @@ pub fn move_sidebar_folder_before(space_id: &str, key: &str, before: Option<&str
 }
 
 impl WorkspaceThreadStore {
+    /// See the public `move_thread_to_space`. Refuses remote threads, remote
+    /// or project-less targets, and no-op moves.
+    fn move_thread_to_space(
+        &mut self,
+        thread_id: &str,
+        target_space_id: &str,
+    ) -> Option<MovedThreadOutcome> {
+        let Some(from_index) = self
+            .projects
+            .iter()
+            .position(|project| project.threads.iter().any(|thread| thread.id == thread_id))
+        else {
+            return None;
+        };
+        if is_remote_project(&self.projects[from_index], &self.spaces)
+            || self.projects[from_index].space_id == target_space_id
+        {
+            return None;
+        }
+        if !self
+            .spaces
+            .iter()
+            .any(|space| space.id == target_space_id && space.client_domain.is_none())
+        {
+            return None;
+        }
+        let target_project_id = self
+            .active_project_id_for_space(target_space_id)
+            .filter(|id| {
+                self.projects.iter().any(|project| {
+                    project.space_id == target_space_id
+                        && &project.id == id
+                        && !is_remote_project(project, &self.spaces)
+                })
+            })
+            .or_else(|| {
+                self.projects
+                    .iter()
+                    .find(|project| {
+                        project.space_id == target_space_id
+                            && !is_remote_project(project, &self.spaces)
+                    })
+                    .map(|project| project.id.clone())
+            });
+        let Some(target_project_id) = target_project_id else {
+            return None;
+        };
+
+        let Some(position) = self.projects[from_index]
+            .threads
+            .iter()
+            .position(|thread| thread.id == thread_id)
+        else {
+            return None;
+        };
+        let source_space_id = self.projects[from_index].space_id.clone();
+        let mut thread = self.projects[from_index].threads.remove(position);
+        // The name the thread's terminal was showing under, captured before
+        // any rename: the window compares it against its own workspace to
+        // learn whether the mover was on screen.
+        let previous_workspace = thread
+            .materialized_workspace_name
+            .clone()
+            .unwrap_or_else(|| {
+                workspace_name_for_thread(&self.projects[from_index].id, &thread.id)
+            });
+        if self.projects[from_index].active_thread_id.as_deref() == Some(thread_id) {
+            self.projects[from_index].active_thread_id = self.projects[from_index]
+                .threads
+                .first()
+                .map(|thread| thread.id.clone());
+        }
+
+        // A live terminal follows its thread: local workspace names derive
+        // from the project id, and the cross-Space binding repair severs any
+        // thread pointing at another project's workspace — so rename the mux
+        // workspace to the name the new project derives. Without a live
+        // workspace the binding is stale; drop it (the layout snapshot still
+        // restores).
+        let expected = workspace_name_for_thread(&target_project_id, &thread.id);
+        if let Some(materialized) = thread.materialized_workspace_name.clone() {
+            if materialized != expected {
+                let renamed = Mux::try_get().is_some_and(|mux| {
+                    if mux
+                        .iter_workspaces()
+                        .iter()
+                        .any(|name| name == &materialized)
+                    {
+                        // Quietly: the announced rename queues a global
+                        // follow onto the renamed workspace, which would
+                        // undo the switch-away the window performs next.
+                        mux.rename_workspace_quietly(&materialized, &expected);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                thread.materialized_workspace_name = renamed.then(|| expected.clone());
+            }
+        }
+        thread.planned_workspace_name = None;
+        thread.project_id = target_project_id.clone();
+
+        let Some(target) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == target_project_id)
+        else {
+            // Unreachable (the id was just resolved from this list), but a
+            // thread must never be dropped on the floor: put it back.
+            thread.project_id = self.projects[from_index].id.clone();
+            self.projects[from_index].threads.insert(position, thread);
+            return None;
+        };
+        target.threads.push(thread);
+        // If the target Space was referencing this thread, it now owns it —
+        // a Space never references its own threads.
+        self.remove_thread_ref(target_space_id, thread_id);
+        // A sibling in the source Space for the window to fall back to when
+        // the mover was on screen: the source project's (updated) active
+        // thread, else any thread left in the Space.
+        let next_thread_id = self.projects[from_index]
+            .active_thread_id
+            .clone()
+            .or_else(|| {
+                self.projects
+                    .iter()
+                    .filter(|project| project.space_id == source_space_id)
+                    .flat_map(|project| project.threads.first())
+                    .map(|thread| thread.id.clone())
+                    .next()
+            });
+        Some(MovedThreadOutcome {
+            previous_workspace,
+            next_thread_id,
+        })
+    }
+
     fn move_sidebar_folder_before(
         &mut self,
         space_id: &str,
@@ -9662,6 +9901,224 @@ mod tests {
             Some("some-other-space's-workspace"),
         ));
         assert!(!view.ref_workspace_on_screen());
+    }
+
+    /// Sidebar folders — projects and ref groups — share one display order.
+    /// Empty order = the classic layout (projects, then groups); a partial
+    /// list puts the listed folders first and appends the rest classically;
+    /// unknown keys are ignored.
+    #[test]
+    fn merged_display_order_defaults_and_partial_lists() {
+        let projects = ["p1", "p2"];
+        let groups = ["g1"];
+        assert_eq!(
+            merged_display_order(&[], &projects, &groups),
+            vec![
+                SidebarFolder::Project(0),
+                SidebarFolder::Project(1),
+                SidebarFolder::RefGroup(0),
+            ]
+        );
+        let order = ["p1".to_string(), "g1".to_string(), "gone".to_string()];
+        assert_eq!(
+            merged_display_order(&order, &projects, &groups),
+            vec![
+                SidebarFolder::Project(0),
+                SidebarFolder::RefGroup(0),
+                SidebarFolder::Project(1),
+            ]
+        );
+    }
+
+    /// Dragging folders interleaves ref groups with projects, mirrors the
+    /// projects' relative order back into the store's Vec (Live Overview
+    /// reads it), and refuses domain-owned Spaces and unknown keys.
+    #[test]
+    fn folders_reorder_across_projects_and_ref_groups() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        let local_space = store.spaces[0].id.clone();
+        store.projects.push(test_project_in_space(
+            &local_space,
+            "local-2",
+            "beta",
+            PathBuf::from("/tmp/beta"),
+            vec![],
+        ));
+        assert!(store.add_thread_ref(&local_space, "rt1"));
+
+        assert_eq!(
+            ordered_folder_keys_locked(&store, &local_space),
+            ["local-1", "local-2", "rp1"],
+            "classic default: projects first, then the ref group"
+        );
+
+        // Drag the group between the two projects.
+        assert!(store.move_sidebar_folder_before(&local_space, "rp1", Some("local-2")));
+        assert_eq!(
+            ordered_folder_keys_locked(&store, &local_space),
+            ["local-1", "rp1", "local-2"]
+        );
+
+        // Drag a project to the end: merged order moves, and the projects'
+        // relative order is mirrored into the store's Vec.
+        assert!(store.move_sidebar_folder_before(&local_space, "local-1", None));
+        assert_eq!(
+            ordered_folder_keys_locked(&store, &local_space),
+            ["rp1", "local-2", "local-1"]
+        );
+        let vec_order: Vec<&str> = store
+            .projects
+            .iter()
+            .filter(|project| project.space_id == local_space)
+            .map(|project| project.id.as_str())
+            .collect();
+        assert_eq!(vec_order, ["local-2", "local-1"]);
+
+        // A drop that changes nothing reports no change.
+        assert!(!store.move_sidebar_folder_before(&local_space, "local-1", None));
+        // Unknown folder or anchor: refused.
+        assert!(!store.move_sidebar_folder_before(&local_space, "nope", None));
+        assert!(!store.move_sidebar_folder_before(&local_space, "rp1", Some("nope")));
+        // Domain-owned Spaces keep the server-synced project order.
+        assert!(!store.move_sidebar_folder_before("space-remote", "rp1", None));
+    }
+
+    /// A move is a re-home: the thread leaves its project, joins the target
+    /// Space's project, keeps its identity (refs elsewhere still resolve),
+    /// and a ref held by the TARGET Space dissolves — a Space never
+    /// references its own thread. A stale workspace binding (no live mux
+    /// workspace to rename) is dropped rather than left pointing at the old
+    /// project's name for the binding repair to sever later.
+    #[test]
+    fn moving_a_local_thread_re_homes_it() {
+        let mut store = remote_test_store("syd");
+        let space_a = store.spaces[0].id.clone();
+        store.spaces.push(Space {
+            id: "space-b".to_string(),
+            name: "B".to_string(),
+            active_project_id: None,
+            note_vault: None,
+            is_default: false,
+            client_domain: None,
+            is_collection: false,
+            thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
+            active_thread_ref: None,
+            folder_order: Vec::new(),
+        });
+        store.projects.push(test_project_in_space(
+            "space-b",
+            "proj-b",
+            "Home",
+            PathBuf::from("/tmp/b"),
+            vec![],
+        ));
+        let thread = WorkspaceThread::new("local-1".to_string(), "roamer".to_string(), None);
+        let thread_id = thread.id.clone();
+        {
+            let project = store
+                .projects
+                .iter_mut()
+                .find(|project| project.id == "local-1")
+                .unwrap();
+            project.threads.push(thread);
+            project.active_thread_id = Some(thread_id.clone());
+            project
+                .threads
+                .last_mut()
+                .unwrap()
+                .materialized_workspace_name =
+                Some(workspace_name_for_thread("local-1", &thread_id));
+        }
+        assert!(store.add_thread_ref("space-b", &thread_id));
+
+        let outcome = store.move_thread_to_space(&thread_id, "space-b").unwrap();
+        assert_eq!(
+            outcome.previous_workspace,
+            workspace_name_for_thread("local-1", &thread_id),
+            "the pre-rename name is what the window compares against"
+        );
+        assert_eq!(
+            outcome.next_thread_id, None,
+            "the mover was the source Space's only thread"
+        );
+
+        let new_home = store
+            .projects
+            .iter()
+            .find(|project| project.threads.iter().any(|thread| thread.id == thread_id))
+            .unwrap();
+        assert_eq!(new_home.id, "proj-b");
+        let moved = new_home
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .unwrap();
+        assert_eq!(moved.project_id, "proj-b");
+        assert_eq!(
+            moved.materialized_workspace_name, None,
+            "no live mux workspace to rename: the stale binding is dropped"
+        );
+        let space_b = store
+            .spaces
+            .iter()
+            .find(|space| space.id == "space-b")
+            .unwrap();
+        assert!(
+            !space_b.thread_refs.iter().any(|id| id == &thread_id),
+            "the target's ref dissolved into ownership"
+        );
+        let old_home = store
+            .projects
+            .iter()
+            .find(|project| project.id == "local-1")
+            .unwrap();
+        assert_ne!(
+            old_home.active_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        let _ = space_a;
+    }
+
+    /// Remote threads execute on their machine — only references travel.
+    /// Targets must be local and have a project to receive the thread.
+    #[test]
+    fn moves_refuse_remote_threads_and_unfit_targets() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        let local_space = store.spaces[0].id.clone();
+        let own = WorkspaceThread::new("local-1".to_string(), "own".to_string(), None);
+        let own_id = own.id.clone();
+        store
+            .projects
+            .iter_mut()
+            .find(|project| project.id == "local-1")
+            .unwrap()
+            .threads
+            .push(own);
+
+        // A remote thread cannot move.
+        assert!(store.move_thread_to_space("rt1", &local_space).is_none());
+        // A domain-owned Space cannot receive a move.
+        assert!(store
+            .move_thread_to_space(&own_id, "space-remote")
+            .is_none());
+        // Nor can a Space with no project to hold the thread.
+        store.spaces.push(Space {
+            id: "space-empty".to_string(),
+            name: "Empty".to_string(),
+            active_project_id: None,
+            note_vault: None,
+            is_default: false,
+            client_domain: None,
+            is_collection: false,
+            thread_refs: Vec::new(),
+            thread_ref_meta: HashMap::new(),
+            active_thread_ref: None,
+            folder_order: Vec::new(),
+        });
+        assert!(store.move_thread_to_space(&own_id, "space-empty").is_none());
     }
 
     /// Suppression lives in the paint-side selection, NOT in the view data:

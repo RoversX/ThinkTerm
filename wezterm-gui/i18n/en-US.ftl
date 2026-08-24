@@ -207,6 +207,7 @@ remote-tree-mutation-offline = { $name } is disconnected. Reconnect and try agai
 menu-new-space-here = New Space Here
 menu-add-to-space = Add to Space
 menu-add-to-space-named = Add to “{ $name }”
+menu-move-to-space = Move to Space
 menu-remove-thread-ref = Remove from This Space
 menu-go-to-origin-space = Go to Origin Space
 menu-rename-space = Rename Space…

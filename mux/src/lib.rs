@@ -1879,13 +1879,30 @@ impl Mux {
     }
 
     pub fn rename_workspace(&self, old_workspace: &str, new_workspace: &str) {
+        self.rename_workspace_impl(old_workspace, new_workspace, true);
+    }
+
+    /// Rename without announcing `WorkspaceRenamed`. The GUI follows that
+    /// announcement onto the renamed workspace — the right thing when a user
+    /// renames the workspace they are looking at, and exactly wrong for a
+    /// thread re-home that is about to switch the window elsewhere: the
+    /// queued follow would drag the window straight back to the moved
+    /// content. Windows still emit `WindowWorkspaceChanged` individually,
+    /// so per-window state keeps syncing.
+    pub fn rename_workspace_quietly(&self, old_workspace: &str, new_workspace: &str) {
+        self.rename_workspace_impl(old_workspace, new_workspace, false);
+    }
+
+    fn rename_workspace_impl(&self, old_workspace: &str, new_workspace: &str, announce: bool) {
         if old_workspace == new_workspace {
             return;
         }
-        self.notify(MuxNotification::WorkspaceRenamed {
-            old_workspace: old_workspace.to_string(),
-            new_workspace: new_workspace.to_string(),
-        });
+        if announce {
+            self.notify(MuxNotification::WorkspaceRenamed {
+                old_workspace: old_workspace.to_string(),
+                new_workspace: new_workspace.to_string(),
+            });
+        }
 
         for window in self.windows.write().values_mut() {
             if window.get_workspace() == old_workspace {

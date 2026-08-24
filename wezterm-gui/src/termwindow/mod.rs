@@ -457,6 +457,19 @@ pub(crate) enum ContextMenuApplicationAction {
         collection_space_id: String,
         thread_id: String,
     },
+    /// Re-home a LOCAL thread into another local Space's project — a true
+    /// move, unlike the reference the Add action creates.
+    MoveThreadToSpace {
+        space_id: String,
+        thread_id: String,
+    },
+    /// Move a thread reference from the Space whose sidebar the menu was
+    /// opened in over to another Space's ref list.
+    MoveThreadRefToSpace {
+        from_space_id: String,
+        space_id: String,
+        thread_id: String,
+    },
     /// Fetch a file from the remote Files panel into the Downloads folder.
     DownloadRemoteFile {
         path: remote_files::RemotePath,

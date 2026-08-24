@@ -207,6 +207,7 @@ remote-tree-mutation-offline = { $name } est déconnecté. Reconnectez-vous et r
 menu-new-space-here = Nouvel espace ici
 menu-add-to-space = Ajouter à l’espace
 menu-add-to-space-named = Ajouter à « { $name } »
+menu-move-to-space = Déplacer vers l’espace
 menu-remove-thread-ref = Retirer de cet espace
 menu-go-to-origin-space = Aller à l’espace d’origine
 menu-rename-space = Renommer l’espace…

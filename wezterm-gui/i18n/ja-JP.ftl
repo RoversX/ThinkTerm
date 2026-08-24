@@ -207,6 +207,7 @@ remote-tree-mutation-offline = { $name } は切断されています。再接続
 menu-new-space-here = このサーバーに新しいスペース
 menu-add-to-space = スペースに追加
 menu-add-to-space-named = “{ $name }”に追加
+menu-move-to-space = スペースへ移動
 menu-remove-thread-ref = このスペースから削除
 menu-go-to-origin-space = 元のスペースへ移動
 menu-rename-space = スペース名を変更…

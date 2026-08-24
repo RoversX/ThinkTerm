@@ -5464,7 +5464,7 @@ impl super::TermWindow {
         self.show_term_context_menu(context, coords, items);
     }
 
-    fn open_remote_workspace_thread_without_connecting(
+    pub(crate) fn open_remote_workspace_thread_without_connecting(
         &mut self,
         thread_id: &str,
         context: &dyn WindowOps,
@@ -5612,12 +5612,38 @@ impl super::TermWindow {
                 crate::i18n::tr("menu-remove-thread-ref"),
                 ContextMenuIcon::Close,
                 crate::termwindow::ContextMenuApplicationAction::RemoveThreadFromCollection {
-                    collection_space_id: active_space,
+                    collection_space_id: active_space.clone(),
                     thread_id: thread_id.clone(),
                 },
                 true,
             );
             items.push(remove_item);
+            // Move the REFERENCE elsewhere: gone from this Space's list,
+            // added to the target's. ref_host_candidates already excludes
+            // the origin and every Space holding it — this one included.
+            let move_targets: Vec<ContextMenuItem> =
+                crate::workspace_threads::ref_host_candidates(&thread_id)
+                    .into_iter()
+                    .map(|(space_id, name)| {
+                        self.context_menu_application_item_with_icon(
+                            name,
+                            ContextMenuIcon::ExternalLink,
+                            crate::termwindow::ContextMenuApplicationAction::MoveThreadRefToSpace {
+                                from_space_id: active_space.clone(),
+                                space_id,
+                                thread_id: thread_id.clone(),
+                            },
+                            true,
+                        )
+                    })
+                    .collect();
+            if !move_targets.is_empty() {
+                items.push(ContextMenuItem::submenu_with_icon(
+                    crate::i18n::tr("menu-move-to-space"),
+                    ContextMenuIcon::ExternalLink,
+                    move_targets,
+                ));
+            }
             if let Some(origin_space) = crate::workspace_threads::thread_space_id(&thread_id) {
                 let origin_item = self.context_menu_application_item_with_icon(
                     crate::i18n::tr("menu-go-to-origin-space"),
@@ -5631,21 +5657,56 @@ impl super::TermWindow {
                 items.push(origin_item);
             }
         } else {
-            let candidates = crate::workspace_threads::ref_host_candidates(&thread_id);
-            if !candidates.is_empty() {
+            // "Add to" references the thread elsewhere; "Move to" re-homes
+            // it (local threads only — a remote thread executes on its
+            // machine and can only be referenced). Each folds its Space
+            // list into one submenu so a long Space roster stays one row.
+            let add_targets: Vec<ContextMenuItem> =
+                crate::workspace_threads::ref_host_candidates(&thread_id)
+                    .into_iter()
+                    .map(|(space_id, name)| {
+                        self.context_menu_application_item_with_icon(
+                            name,
+                            ContextMenuIcon::Pin,
+                            crate::termwindow::ContextMenuApplicationAction::AddThreadToCollection {
+                                collection_space_id: Some(space_id),
+                                thread_id: thread_id.clone(),
+                            },
+                            true,
+                        )
+                    })
+                    .collect();
+            let move_targets: Vec<ContextMenuItem> =
+                crate::workspace_threads::move_host_candidates(&thread_id)
+                    .into_iter()
+                    .map(|(space_id, name)| {
+                        self.context_menu_application_item_with_icon(
+                            name,
+                            ContextMenuIcon::ExternalLink,
+                            crate::termwindow::ContextMenuApplicationAction::MoveThreadToSpace {
+                                space_id,
+                                thread_id: thread_id.clone(),
+                            },
+                            true,
+                        )
+                    })
+                    .collect();
+            if !add_targets.is_empty() || !move_targets.is_empty() {
                 items.push(ContextMenuItem::Separator);
-                for (space_id, name) in candidates {
-                    let add_item = self.context_menu_application_item_with_icon(
-                        tr_with_name("menu-add-to-space-named", &name),
-                        ContextMenuIcon::Pin,
-                        crate::termwindow::ContextMenuApplicationAction::AddThreadToCollection {
-                            collection_space_id: Some(space_id),
-                            thread_id: thread_id.clone(),
-                        },
-                        true,
-                    );
-                    items.push(add_item);
-                }
+            }
+            if !add_targets.is_empty() {
+                items.push(ContextMenuItem::submenu_with_icon(
+                    crate::i18n::tr("menu-add-to-space"),
+                    ContextMenuIcon::Pin,
+                    add_targets,
+                ));
+            }
+            if !move_targets.is_empty() {
+                items.push(ContextMenuItem::submenu_with_icon(
+                    crate::i18n::tr("menu-move-to-space"),
+                    ContextMenuIcon::ExternalLink,
+                    move_targets,
+                ));
             }
         }
         items
