@@ -1937,7 +1937,9 @@ impl super::TermWindow {
                     if completed_drag.as_ref().is_some_and(|(item, _)| {
                         matches!(
                             item.item_type,
-                            UIItemType::Project(_) | UIItemType::WorkspaceThread(_)
+                            UIItemType::Project(_)
+                                | UIItemType::WorkspaceThread(_)
+                                | UIItemType::ThreadRefGroupToggle { .. }
                         )
                     }) {
                         // Release coordinates can differ from the last move
@@ -1962,6 +1964,13 @@ impl super::TermWindow {
                                         crate::workspace_threads::toggle_project_threads_collapsed(
                                             &project_id,
                                         );
+                                    }
+                                    super::SidebarRowKind::RefGroup(raw_key) => {
+                                        let collapse_key =
+                                            format!("{}::{raw_key}", self.active_space_id);
+                                        if !self.thread_ref_groups_collapsed.remove(&collapse_key) {
+                                            self.thread_ref_groups_collapsed.insert(collapse_key);
+                                        }
                                     }
                                     super::SidebarRowKind::Thread { thread_id, .. } => {
                                         if !self.open_remote_workspace_thread_without_connecting(
@@ -2593,7 +2602,9 @@ impl super::TermWindow {
             UIItemType::PaneNav { .. } => {
                 self.drag_pane_nav_tab(item, start_event, event, context);
             }
-            UIItemType::Project(_) | UIItemType::WorkspaceThread(_) => {
+            UIItemType::Project(_)
+            | UIItemType::WorkspaceThread(_)
+            | UIItemType::ThreadRefGroupToggle { .. } => {
                 self.drag_sidebar_row(item, start_event, event, context);
             }
             UIItemType::RightSidebarFileRow(ref path) => {
@@ -2859,7 +2870,9 @@ impl super::TermWindow {
             .find(|candidate| candidate.item_type == UIItemType::WorkspaceSidebarBackground)
             .is_some_and(|bg| coords.x >= bg.x as isize && coords.x < (bg.x + bg.width) as isize);
         let rows: Vec<(String, isize, isize)> = match &kind {
-            super::SidebarRowKind::Project(_) => project_block_extents(&self.ui_items),
+            super::SidebarRowKind::Project(_) | super::SidebarRowKind::RefGroup(_) => {
+                folder_block_extents(&self.ui_items, &self.active_space_id)
+            }
             super::SidebarRowKind::Thread {
                 thread_id,
                 project_id,
@@ -2891,7 +2904,9 @@ impl super::TermWindow {
         // has no foreign list to stray into — the whole sidebar is its drop
         // zone, so anywhere below the last block simply means "the end".
         let within_span = match &kind {
-            super::SidebarRowKind::Project(_) => !rows.is_empty(),
+            super::SidebarRowKind::Project(_) | super::SidebarRowKind::RefGroup(_) => {
+                !rows.is_empty()
+            }
             super::SidebarRowKind::Thread { .. } => {
                 rows.first().zip(rows.last()).is_some_and(|(first, last)| {
                     let slack = (first.2 - first.1).max(0);
@@ -2907,17 +2922,15 @@ impl super::TermWindow {
                 // scrolled-away tail keeps its place; None remains reserved
                 // for the true end.
                 let logical = match &kind {
-                    super::SidebarRowKind::Project(_) => {
-                        crate::workspace_threads::ordered_project_ids(&self.active_space_id)
+                    super::SidebarRowKind::Project(_) | super::SidebarRowKind::RefGroup(_) => {
+                        crate::workspace_threads::ordered_sidebar_folder_keys(&self.active_space_id)
                     }
                     super::SidebarRowKind::Thread {
                         thread_id,
                         project_id,
                     } => {
                         if self.sidebar_row_is_thread_ref(thread_id) {
-                            crate::workspace_threads::space_thread_refs(
-                                &self.active_space_id,
-                            )
+                            crate::workspace_threads::space_thread_refs(&self.active_space_id)
                         } else {
                             crate::workspace_threads::unpinned_thread_ids(project_id)
                         }
@@ -2949,9 +2962,24 @@ impl super::TermWindow {
         let changed = match &state.kind {
             super::SidebarRowKind::Project(project_id) => {
                 let space_id = self.active_space_id.clone();
-                crate::workspace_threads::move_project_before(
+                // Local Spaces order projects and ref groups in one merged
+                // list; move_sidebar_folder_before refuses domain-owned
+                // Spaces, which keep the server-synced project path.
+                crate::workspace_threads::move_sidebar_folder_before(
                     &space_id,
                     project_id,
+                    target.before.as_deref(),
+                ) || crate::workspace_threads::move_project_before(
+                    &space_id,
+                    project_id,
+                    target.before.as_deref(),
+                )
+            }
+            super::SidebarRowKind::RefGroup(raw_key) => {
+                let space_id = self.active_space_id.clone();
+                crate::workspace_threads::move_sidebar_folder_before(
+                    &space_id,
+                    raw_key,
                     target.before.as_deref(),
                 )
             }
@@ -3414,12 +3442,28 @@ impl super::TermWindow {
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
-            UIItemType::ThreadRefGroupToggle { key: group_key, .. } => {
+            UIItemType::ThreadRefGroupToggle {
+                key: ref group_key, ..
+            } => {
+                let group_key = group_key.clone();
                 if let WMEK::Press(MousePress::Left) = event.kind {
-                    if !self.thread_ref_groups_collapsed.remove(&group_key) {
-                        self.thread_ref_groups_collapsed.insert(group_key);
-                    }
-                    context.invalidate();
+                    // Arm a potential folder-reorder drag; the collapse
+                    // toggle fires on release when the pointer never crossed
+                    // the drag threshold — same contract as project headers.
+                    let raw_key = group_key
+                        .strip_prefix(&format!("{}::", self.active_space_id))
+                        .unwrap_or(&group_key)
+                        .to_string();
+                    let title =
+                        crate::workspace_threads::ref_group_title(&self.active_space_id, &raw_key)
+                            .unwrap_or_else(|| raw_key.clone());
+                    self.arm_sidebar_row_drag(
+                        item,
+                        super::SidebarRowKind::RefGroup(raw_key),
+                        title,
+                        true,
+                        event,
+                    );
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
@@ -3918,12 +3962,28 @@ impl super::TermWindow {
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
-            UIItemType::ThreadRefGroupToggle { key: group_key, .. } => {
+            UIItemType::ThreadRefGroupToggle {
+                key: ref group_key, ..
+            } => {
+                let group_key = group_key.clone();
                 if let WMEK::Press(MousePress::Left) = event.kind {
-                    if !self.thread_ref_groups_collapsed.remove(&group_key) {
-                        self.thread_ref_groups_collapsed.insert(group_key);
-                    }
-                    context.invalidate();
+                    // Arm a potential folder-reorder drag; the collapse
+                    // toggle fires on release when the pointer never crossed
+                    // the drag threshold — same contract as project headers.
+                    let raw_key = group_key
+                        .strip_prefix(&format!("{}::", self.active_space_id))
+                        .unwrap_or(&group_key)
+                        .to_string();
+                    let title =
+                        crate::workspace_threads::ref_group_title(&self.active_space_id, &raw_key)
+                            .unwrap_or_else(|| raw_key.clone());
+                    self.arm_sidebar_row_drag(
+                        item,
+                        super::SidebarRowKind::RefGroup(raw_key),
+                        title,
+                        true,
+                        event,
+                    );
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
@@ -8044,14 +8104,28 @@ fn kill_workspace_windows(workspaces: &[String], skip_workspace: Option<&str>) {
 /// instead of between X's header and its threads. Relies on the sidebar
 /// pushing items in visual order: each Project row followed by its rows,
 /// with the cross-project pinned section preceding the first Project.
-pub(crate) fn project_block_extents(items: &[UIItem]) -> Vec<(String, isize, isize)> {
+pub(crate) fn folder_block_extents(
+    items: &[UIItem],
+    space_id: &str,
+) -> Vec<(String, isize, isize)> {
+    let collapse_prefix = format!("{space_id}::");
     let mut blocks: Vec<(String, isize, isize)> = vec![];
     for item in items {
         match &item.item_type {
             UIItemType::Project(id) => {
                 blocks.push((id.clone(), item.y as isize, (item.y + item.height) as isize))
             }
-            UIItemType::WorkspaceThread(_) | UIItemType::WorkspaceThreadNew(_) => {
+            UIItemType::ThreadRefGroupToggle { key, .. } => {
+                let raw = key.strip_prefix(&collapse_prefix).unwrap_or(key.as_str());
+                blocks.push((
+                    raw.to_string(),
+                    item.y as isize,
+                    (item.y + item.height) as isize,
+                ))
+            }
+            UIItemType::WorkspaceThread(_)
+            | UIItemType::WorkspaceThreadNew(_)
+            | UIItemType::ThreadRefGroupNewThread(_) => {
                 if let Some(block) = blocks.last_mut() {
                     block.2 = block.2.max((item.y + item.height) as isize);
                 }
@@ -8102,7 +8176,7 @@ pub(crate) fn sidebar_insert_position(
 #[cfg(test)]
 mod sidebar_drag_tests {
     use super::{
-        clamp_end_anchor_to_next_logical_sibling, project_block_extents, sidebar_insert_position,
+        clamp_end_anchor_to_next_logical_sibling, folder_block_extents, sidebar_insert_position,
     };
     use crate::termwindow::{UIItem, UIItemType};
 
@@ -8162,7 +8236,7 @@ mod sidebar_drag_tests {
             item(UIItemType::WorkspaceSidebarBackground, 0, 600),
         ];
         assert_eq!(
-            project_block_extents(&items),
+            folder_block_extents(&items, "space-x"),
             vec![
                 ("alpha".to_string(), 100, 168),
                 ("beta".to_string(), 176, 196),
@@ -8170,8 +8244,37 @@ mod sidebar_drag_tests {
         );
         // Below beta: the end, with the line under the last block.
         assert_eq!(
-            sidebar_insert_position(&project_block_extents(&items), 500),
+            sidebar_insert_position(&folder_block_extents(&items, "space-x"), 500),
             Some((None, 196))
+        );
+    }
+
+    /// A ref-group header opens a block exactly like a project header, its
+    /// key stripped of the collapse-state space prefix; the group's thread
+    /// rows and "+" extend the block just like a project's do.
+    #[test]
+    fn a_ref_group_block_interleaves_with_project_blocks() {
+        let items = vec![
+            item(UIItemType::Project("alpha".into()), 100, 20),
+            item(UIItemType::WorkspaceThread("a1".into()), 124, 20),
+            item(
+                UIItemType::ThreadRefGroupToggle {
+                    key: "space-x::origin-project".into(),
+                    origin: String::new(),
+                },
+                176,
+                20,
+            ),
+            item(UIItemType::WorkspaceThread("r1".into()), 200, 20),
+            item(UIItemType::Project("beta".into()), 252, 20),
+        ];
+        assert_eq!(
+            folder_block_extents(&items, "space-x"),
+            vec![
+                ("alpha".to_string(), 100, 144),
+                ("origin-project".to_string(), 176, 220),
+                ("beta".to_string(), 252, 272),
+            ]
         );
     }
 

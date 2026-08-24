@@ -94,6 +94,14 @@ pub struct Space {
     /// threads, so the restore follows whatever was used last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_thread_ref: Option<String>,
+    /// Sidebar display order of this Space's folders — local project ids and
+    /// thread-ref group keys, interleaved freely. Empty (the migration
+    /// default) means the classic order: projects first, then ref groups.
+    /// Folders not listed here append after the listed ones in classic
+    /// order; keys of folders that no longer exist are ignored, so the list
+    /// needs no grooming. Local-only, like the refs themselves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folder_order: Vec<String>,
 }
 
 /// Cached display data for one thread ref, refreshed on every successful
@@ -204,9 +212,68 @@ pub struct WorkspaceThreadsView {
     /// Thread references this Space holds, grouped by origin project so the
     /// sidebar can render them as folder-style groups just like projects.
     pub ref_groups: Vec<ThreadRefGroupView>,
+    /// The order the sidebar renders the folders above in — indices into
+    /// `projects` and `ref_groups`, interleaved per the Space's
+    /// `folder_order`. Paint, list-height, and hit-test row math must all
+    /// walk THIS, never the two Vecs directly, or their rows diverge.
+    pub display_order: Vec<SidebarFolder>,
+}
+
+/// One sidebar folder in display order: a local project or a thread-ref
+/// group, by index into the view's respective Vec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarFolder {
+    Project(usize),
+    RefGroup(usize),
+}
+
+/// Interleave projects and ref groups per `folder_order`: listed keys first,
+/// in list order; everything unlisted appends after in classic order
+/// (projects, then groups — which is exactly the whole result when the list
+/// is empty, i.e. the migration default). Unknown keys are skipped.
+fn merged_display_order(
+    folder_order: &[String],
+    project_keys: &[&str],
+    group_keys: &[&str],
+) -> Vec<SidebarFolder> {
+    let mut entries: Vec<(&str, SidebarFolder)> = project_keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (*key, SidebarFolder::Project(index)))
+        .chain(
+            group_keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| (*key, SidebarFolder::RefGroup(index))),
+        )
+        .collect();
+    entries.sort_by_key(|(key, _)| {
+        folder_order
+            .iter()
+            .position(|ordered| ordered == key)
+            .map_or((1, 0), |position| (0, position))
+    });
+    entries.into_iter().map(|(_, folder)| folder).collect()
 }
 
 impl WorkspaceThreadsView {
+    /// Recompute `display_order` from the current `projects`/`ref_groups`
+    /// against the Space's persisted folder order. Must run after either
+    /// Vec changes.
+    pub fn rebuild_display_order(&mut self, folder_order: &[String]) {
+        let project_keys: Vec<&str> = self
+            .projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect();
+        let group_keys: Vec<&str> = self
+            .ref_groups
+            .iter()
+            .map(|group| group.key.as_str())
+            .collect();
+        self.display_order = merged_display_order(folder_order, &project_keys, &group_keys);
+    }
+
     /// True when the workspace on screen is one of this Space's thread
     /// references. Activating a ref never repoints the Space's own
     /// active-thread pointer, so while this holds, the own rows' `is_active`
@@ -1702,6 +1769,12 @@ pub fn view_for_current_project(
         live_workspaces,
         Some(active_workspace),
     ));
+    let folder_order = store
+        .spaces
+        .iter()
+        .find(|space| space.id == space_id)
+        .map(|space| space.folder_order.clone())
+        .unwrap_or_default();
     // A Space with refs but no projects of its own (a migrated collection)
     // must not be seeded with a synthetic current project just to have
     // something to show — its ref rows are the content.
@@ -1710,11 +1783,14 @@ pub fn view_for_current_project(
         .iter()
         .any(|project| project.space_id == space_id);
     if !has_own_projects && !ref_groups.is_empty() {
-        return WorkspaceThreadsView {
+        let mut view = WorkspaceThreadsView {
             pinned_threads: Vec::new(),
             projects: Vec::new(),
             ref_groups,
+            display_order: Vec::new(),
         };
+        view.rebuild_display_order(&folder_order);
+        return view;
     }
     if let Some(project_id) = store
         .project_id_for_workspace(space_id, active_workspace)
@@ -1728,6 +1804,7 @@ pub fn view_for_current_project(
     {
         let mut view = store.view_for_project(space_id, &project_id, live_workspaces);
         view.ref_groups = ref_groups;
+        view.rebuild_display_order(&folder_order);
         return view;
     }
 
@@ -1735,6 +1812,7 @@ pub fn view_for_current_project(
     let mut view =
         current_project_for_workspace(space_id, active_workspace).view(live_workspaces, is_remote);
     view.ref_groups = ref_groups;
+    view.rebuild_display_order(&folder_order);
     view
 }
 
@@ -3572,6 +3650,140 @@ fn submit_thread_state(store: &WorkspaceThreadStore, thread_id: &str) {
     );
 }
 
+/// A ref group's display label (its origin project's name, or the machine
+/// for a dangling group) — the drag ghost shows it while the group header
+/// is being reordered.
+pub fn ref_group_title(host_space_id: &str, group_key: &str) -> Option<String> {
+    let store = THREAD_STORE.lock();
+    group_thread_refs_by_origin(store.view_for_thread_refs(host_space_id, &[], None))
+        .into_iter()
+        .find(|group| group.key == group_key)
+        .map(|group| group.label)
+}
+
+/// The sidebar's merged folder-key order for a Space — local project ids
+/// and ref-group keys, exactly as displayed. Feeds drag targeting (the
+/// logical-order end anchor) and reordering.
+pub fn ordered_sidebar_folder_keys(space_id: &str) -> Vec<String> {
+    let store = THREAD_STORE.lock();
+    ordered_folder_keys_locked(&store, space_id)
+}
+
+fn ordered_folder_keys_locked(store: &WorkspaceThreadStore, space_id: &str) -> Vec<String> {
+    let project_keys: Vec<String> = store
+        .projects
+        .iter()
+        .filter(|project| project.space_id == space_id)
+        .map(|project| project.id.clone())
+        .collect();
+    let group_keys: Vec<String> =
+        group_thread_refs_by_origin(store.view_for_thread_refs(space_id, &[], None))
+            .into_iter()
+            .map(|group| group.key)
+            .collect();
+    let folder_order = store
+        .spaces
+        .iter()
+        .find(|space| space.id == space_id)
+        .map(|space| space.folder_order.as_slice())
+        .unwrap_or(&[]);
+    let project_refs: Vec<&str> = project_keys.iter().map(String::as_str).collect();
+    let group_refs: Vec<&str> = group_keys.iter().map(String::as_str).collect();
+    merged_display_order(folder_order, &project_refs, &group_refs)
+        .into_iter()
+        .map(|folder| match folder {
+            SidebarFolder::Project(index) => project_keys[index].clone(),
+            SidebarFolder::RefGroup(index) => group_keys[index].clone(),
+        })
+        .collect()
+}
+
+/// Move a sidebar folder — a local project or a thread-ref group — before
+/// `before` (to the end when None) in the Space's merged display order.
+/// Local Spaces only: ref groups exist only there, and the mixed order is a
+/// purely local display concern (domain-owned Spaces keep syncing project
+/// order to their server through `move_project_before`). The relative order
+/// of the projects among themselves is mirrored back into the store's
+/// project list so every other project-order consumer stays consistent
+/// with what the sidebar shows.
+pub fn move_sidebar_folder_before(space_id: &str, key: &str, before: Option<&str>) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.move_sidebar_folder_before(space_id, key, before);
+    if changed {
+        persist_locked(&store);
+    }
+    changed
+}
+
+impl WorkspaceThreadStore {
+    fn move_sidebar_folder_before(
+        &mut self,
+        space_id: &str,
+        key: &str,
+        before: Option<&str>,
+    ) -> bool {
+        let store = self;
+        let is_local_space = store
+            .spaces
+            .iter()
+            .any(|space| space.id == space_id && space.client_domain.is_none());
+        if !is_local_space {
+            return false;
+        }
+        let previous = ordered_folder_keys_locked(&store, space_id);
+        let Some(from) = previous.iter().position(|entry| entry == key) else {
+            return false;
+        };
+        let mut order = previous.clone();
+        let moved = order.remove(from);
+        let to = match before {
+            Some(before) => match order.iter().position(|entry| entry == before) {
+                Some(index) => index,
+                // Unknown (or self) anchor: nothing sensible to do.
+                None => return false,
+            },
+            None => order.len(),
+        };
+        order.insert(to, moved);
+        if order == previous {
+            return false;
+        }
+
+        // Mirror the projects' relative order back into the store's Vec.
+        let project_positions: Vec<usize> = store
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, project)| project.space_id == space_id)
+            .map(|(index, _)| index)
+            .collect();
+        let mut wanted_project_order: Vec<usize> = Vec::new();
+        for entry in &order {
+            if let Some(position) = project_positions
+                .iter()
+                .find(|&&index| &store.projects[index].id == entry)
+            {
+                wanted_project_order.push(*position);
+            }
+        }
+        if wanted_project_order.len() == project_positions.len() {
+            let reordered: Vec<Project> = wanted_project_order
+                .iter()
+                .map(|&index| store.projects[index].clone())
+                .collect();
+            for (slot, project) in project_positions.iter().zip(reordered) {
+                store.projects[*slot] = project;
+            }
+        }
+
+        let Some(space) = store.spaces.iter_mut().find(|space| space.id == space_id) else {
+            return false;
+        };
+        space.folder_order = order;
+        true
+    }
+}
+
 pub fn move_project_before(space_id: &str, project_id: &str, before: Option<&str>) -> bool {
     let mut store = THREAD_STORE.lock();
     let domain = tree_domain_for_space(&store, space_id);
@@ -3670,6 +3882,7 @@ impl Project {
                 distro: None,
             }],
             ref_groups: Vec::new(),
+            display_order: vec![SidebarFolder::Project(0)],
         }
     }
 }
@@ -3689,6 +3902,7 @@ impl WorkspaceThreadStore {
                 thread_refs: Vec::new(),
                 thread_ref_meta: HashMap::new(),
                 active_thread_ref: None,
+                folder_order: Vec::new(),
             });
             changed = true;
         }
@@ -3928,6 +4142,7 @@ impl WorkspaceThreadStore {
             thread_refs: Vec::new(),
             thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
+            folder_order: Vec::new(),
         });
         id
     }
@@ -4420,7 +4635,7 @@ impl WorkspaceThreadStore {
                     .filter(|session| session.is_pinned)
             })
             .collect();
-        let projects = self
+        let projects: Vec<ProjectView> = self
             .projects
             .iter()
             .filter(|project| project.space_id == space_id)
@@ -4449,10 +4664,12 @@ impl WorkspaceThreadStore {
                 }
             })
             .collect();
+        let display_order = (0..projects.len()).map(SidebarFolder::Project).collect();
         WorkspaceThreadsView {
             pinned_threads,
             projects,
             ref_groups: Vec::new(),
+            display_order,
         }
     }
 
@@ -5380,6 +5597,7 @@ impl WorkspaceThreadStore {
                     thread_refs: Vec::new(),
                     thread_ref_meta: HashMap::new(),
                     active_thread_ref: None,
+                    folder_order: Vec::new(),
                 }
             })
             .collect();
@@ -8901,6 +9119,7 @@ mod tests {
                 distro: None,
             }],
             ref_groups: Vec::new(),
+            display_order: Vec::new(),
         };
         filter_threads_view_by_status(&mut view, &hidden);
         assert!(view.pinned_threads.is_empty());
@@ -9431,6 +9650,7 @@ mod tests {
                 &[],
                 Some(&ref_workspace),
             )),
+            display_order: Vec::new(),
         };
         assert!(view.ref_workspace_on_screen());
 
@@ -9472,6 +9692,7 @@ mod tests {
                 distro: None,
             }],
             ref_groups: Vec::new(),
+            display_order: Vec::new(),
         };
         filter_threads_view_by_status(&mut view, &[WorkspaceThreadWorkStatus::Idle]);
         let names: Vec<&str> = view.projects[0]
@@ -10039,6 +10260,7 @@ mod tests {
             thread_refs: Vec::new(),
             thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
+            folder_order: Vec::new(),
         });
         store
     }
@@ -10497,6 +10719,7 @@ mod tests {
             thread_refs: Vec::new(),
             thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
+            folder_order: Vec::new(),
         });
 
         let owned_by_syd = store.space_ids_for_domain("syd");
@@ -10550,6 +10773,7 @@ mod tests {
             thread_refs: Vec::new(),
             thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
+            folder_order: Vec::new(),
         });
         store.spaces.push(Space {
             id: "space-elsewhere".to_string(),
@@ -10562,6 +10786,7 @@ mod tests {
             thread_refs: Vec::new(),
             thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
+            folder_order: Vec::new(),
         });
 
         let names = vec!["ssh:x@203.0.113.9".to_string(), "DO SYD".to_string()];
@@ -10597,6 +10822,7 @@ mod tests {
             thread_refs: Vec::new(),
             thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
+            folder_order: Vec::new(),
         });
         store.projects.push(Project {
             id: "rp2".to_string(),
@@ -10635,6 +10861,7 @@ mod tests {
             thread_refs: Vec::new(),
             thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
+            folder_order: Vec::new(),
         });
 
         // With nothing remembered, connecting lands on the server's first.
@@ -10703,6 +10930,7 @@ mod tests {
             thread_refs: Vec::new(),
             thread_ref_meta: HashMap::new(),
             active_thread_ref: None,
+            folder_order: Vec::new(),
         });
         // Once it is known, they are hands off.
         assert!(space_id_from_remote_project_id(&sibling)

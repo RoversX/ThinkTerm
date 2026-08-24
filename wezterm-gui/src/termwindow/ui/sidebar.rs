@@ -352,37 +352,41 @@ impl crate::TermWindow {
                     .saturating_mul(row_height + row_gap),
             );
         }
+        // The "Workspaces" section label row precedes the folder list only
+        // when the Space has projects of its own (a refs-only Space renders
+        // just its ref folders).
         if !view.projects.is_empty() {
             if !view.pinned_threads.is_empty() {
                 height = height.saturating_add(section_gap);
             }
             height = height.saturating_add(row_height + row_gap);
         }
-        for project in &view.projects {
-            height = height.saturating_add(row_height + row_gap);
-            if !project.threads_collapsed {
-                height = height
-                    .saturating_add(project.threads.len().saturating_mul(row_height + row_gap));
-            }
-        }
-        height = height.saturating_add(
-            view.projects
-                .len()
-                .saturating_sub(1)
-                .saturating_mul(group_gap),
-        );
-        if !view.ref_groups.is_empty() {
-            if !view.pinned_threads.is_empty() || !view.projects.is_empty() {
+        // Folders — projects and ref groups interleaved — walk the SAME
+        // display order the paint loop walks, or scroll math diverges from
+        // the painted rows.
+        for (folder_idx, folder) in view.display_order.iter().enumerate() {
+            if folder_idx > 0 {
                 height = height.saturating_add(group_gap);
             }
-            for (group_idx, group) in view.ref_groups.iter().enumerate() {
-                if group_idx > 0 {
-                    height = height.saturating_add(group_gap);
+            height = height.saturating_add(row_height + row_gap);
+            match folder {
+                workspace_threads::SidebarFolder::Project(index) => {
+                    if let Some(project) = view.projects.get(*index) {
+                        if !project.threads_collapsed {
+                            height = height.saturating_add(
+                                project.threads.len().saturating_mul(row_height + row_gap),
+                            );
+                        }
+                    }
                 }
-                height = height.saturating_add(row_height + row_gap);
-                if !group.collapsed {
-                    height = height
-                        .saturating_add(group.threads.len().saturating_mul(row_height + row_gap));
+                workspace_threads::SidebarFolder::RefGroup(index) => {
+                    if let Some(group) = view.ref_groups.get(*index) {
+                        if !group.collapsed {
+                            height = height.saturating_add(
+                                group.threads.len().saturating_mul(row_height + row_gap),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1892,237 +1896,200 @@ impl crate::TermWindow {
             virtual_y += session_row_height + row_gap;
         }
 
-        for (project_idx, project) in view.projects.iter().enumerate() {
-            let row_top = list_top_f + virtual_y as f32 - scroll_offset;
-            let row_bottom = row_top + session_row_height as f32;
-            let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
-            let y = row_top.floor().max(0.0) as usize;
-            let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
-            let hit_bottom = row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
-            let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
-
-            let disclosure_size = icon_size.min(22);
-            let disclosure_x = item_x + self.ui_px(SIDEBAR_INSET);
-            let project_icon_x = disclosure_x + disclosure_size + 4;
-            let project_text_x = project_icon_x + icon_size + self.ui_px(SIDEBAR_ICON_GAP);
-            let project_action_size = section_button_size.min(session_row_height.saturating_sub(8));
-            let project_action_x = item_x
-                .saturating_add(item_width)
-                .saturating_sub(project_action_size + self.ui_px(SIDEBAR_INSET));
-            let project_text_right = project_action_x;
-
-            if row_is_visible {
-                self.ui_items.push(UIItem {
-                    x: item_x,
-                    y: hit_y,
-                    width: item_width,
-                    height: hit_height,
-                    item_type: UIItemType::Project(project.id.clone()),
-                });
+        // Folders — projects and thread-ref groups — render interleaved in
+        // the Space's display order, so a ref folder can sit anywhere among
+        // the local ones. The height calc walks the same order.
+        let group_space_id = self.workspace_sidebar_space_id().to_string();
+        for (folder_idx, folder) in view.display_order.iter().enumerate() {
+            if folder_idx > 0 {
+                virtual_y += self.ui_px(WORKSPACE_GROUP_EXTRA_GAP);
             }
-
-            let icon_y = y + ((session_row_height.saturating_sub(icon_size)) / 2);
-            let disclosure_y = y + ((session_row_height.saturating_sub(disclosure_size)) / 2);
-            let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
-            if row_is_visible {
-                self.ui_items.push(UIItem {
-                    x: disclosure_x,
-                    y: disclosure_y,
-                    width: disclosure_size,
-                    height: disclosure_size,
-                    item_type: UIItemType::ProjectToggleThreads(project.id.clone()),
-                });
-                self.paint_sidebar_icon(
-                    layers,
-                    if project.threads_collapsed {
-                        SvgIcon::ChevronRight
-                    } else {
-                        SvgIcon::ChevronDown
-                    },
-                    disclosure_x,
-                    disclosure_y,
-                    disclosure_size,
-                    muted_fg,
-                )?;
-                let remote_brand = if project.is_remote {
-                    project.distro.as_deref().and_then(distro_to_icon)
-                } else {
-                    None
+            if let workspace_threads::SidebarFolder::Project(folder_project_index) = folder {
+                let Some(project) = view.projects.get(*folder_project_index) else {
+                    continue;
                 };
-                if let Some(brand) = remote_brand {
-                    // Detected remote OS: show its brand logo in full color.
-                    self.paint_sidebar_brand_icon(
-                        layers,
-                        brand,
-                        project_icon_x,
-                        icon_y,
-                        icon_size,
-                    )?;
-                } else {
-                    let project_icon = if project.is_remote {
-                        // Remote host without a detected OS: a globe marks it as
-                        // distinct from local folder projects in the mixed list.
-                        SvgIcon::Globe
-                    } else if project.threads_collapsed {
-                        SvgIcon::Folder
-                    } else {
-                        SvgIcon::FolderOpen
-                    };
+                let row_top = list_top_f + virtual_y as f32 - scroll_offset;
+                let row_bottom = row_top + session_row_height as f32;
+                let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
+                let y = row_top.floor().max(0.0) as usize;
+                let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
+                let hit_bottom = row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
+                let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
+
+                let disclosure_size = icon_size.min(22);
+                let disclosure_x = item_x + self.ui_px(SIDEBAR_INSET);
+                let project_icon_x = disclosure_x + disclosure_size + 4;
+                let project_text_x = project_icon_x + icon_size + self.ui_px(SIDEBAR_ICON_GAP);
+                let project_action_size =
+                    section_button_size.min(session_row_height.saturating_sub(8));
+                let project_action_x = item_x
+                    .saturating_add(item_width)
+                    .saturating_sub(project_action_size + self.ui_px(SIDEBAR_INSET));
+                let project_text_right = project_action_x;
+
+                if row_is_visible {
+                    self.ui_items.push(UIItem {
+                        x: item_x,
+                        y: hit_y,
+                        width: item_width,
+                        height: hit_height,
+                        item_type: UIItemType::Project(project.id.clone()),
+                    });
+                }
+
+                let icon_y = y + ((session_row_height.saturating_sub(icon_size)) / 2);
+                let disclosure_y = y + ((session_row_height.saturating_sub(disclosure_size)) / 2);
+                let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
+                if row_is_visible {
+                    self.ui_items.push(UIItem {
+                        x: disclosure_x,
+                        y: disclosure_y,
+                        width: disclosure_size,
+                        height: disclosure_size,
+                        item_type: UIItemType::ProjectToggleThreads(project.id.clone()),
+                    });
                     self.paint_sidebar_icon(
                         layers,
-                        project_icon,
-                        project_icon_x,
-                        icon_y,
-                        icon_size,
+                        if project.threads_collapsed {
+                            SvgIcon::ChevronRight
+                        } else {
+                            SvgIcon::ChevronDown
+                        },
+                        disclosure_x,
+                        disclosure_y,
+                        disclosure_size,
+                        muted_fg,
+                    )?;
+                    let remote_brand = if project.is_remote {
+                        project.distro.as_deref().and_then(distro_to_icon)
+                    } else {
+                        None
+                    };
+                    if let Some(brand) = remote_brand {
+                        // Detected remote OS: show its brand logo in full color.
+                        self.paint_sidebar_brand_icon(
+                            layers,
+                            brand,
+                            project_icon_x,
+                            icon_y,
+                            icon_size,
+                        )?;
+                    } else {
+                        let project_icon = if project.is_remote {
+                            // Remote host without a detected OS: a globe marks it as
+                            // distinct from local folder projects in the mixed list.
+                            SvgIcon::Globe
+                        } else if project.threads_collapsed {
+                            SvgIcon::Folder
+                        } else {
+                            SvgIcon::FolderOpen
+                        };
+                        self.paint_sidebar_icon(
+                            layers,
+                            project_icon,
+                            project_icon_x,
+                            icon_y,
+                            icon_size,
+                            muted_fg,
+                        )?;
+                    }
+                    let project_title = self.sidebar_project_title(&project.id, &project.name);
+                    self.paint_sidebar_text(
+                        layers,
+                        &ui_font,
+                        ui_metrics,
+                        &project_title,
+                        project_text_x,
+                        text_y,
+                        project_text_right
+                            .saturating_sub(project_text_x + self.ui_px(SIDEBAR_INSET)),
                         muted_fg,
                     )?;
                 }
-                let project_title = self.sidebar_project_title(&project.id, &project.name);
-                self.paint_sidebar_text(
-                    layers,
-                    &ui_font,
-                    ui_metrics,
-                    &project_title,
-                    project_text_x,
-                    text_y,
-                    project_text_right.saturating_sub(project_text_x + self.ui_px(SIDEBAR_INSET)),
-                    muted_fg,
-                )?;
-            }
 
-            if row_is_visible {
-                let project_action_y =
-                    y + ((session_row_height.saturating_sub(project_action_size)) / 2);
-                let project_action_hovered = !suppress_hover
-                    && self.is_pointer_over_ui_rect(
-                        project_action_x,
-                        project_action_y,
-                        project_action_size,
-                        project_action_size,
-                    );
-                self.fill_rounded_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(
-                        project_action_x as f32,
-                        project_action_y as f32,
-                        project_action_size as f32,
-                        project_action_size as f32,
-                    ),
-                    if project_action_hovered {
-                        chrome.sidebar_button_hover_bg
-                    } else {
-                        chrome.sidebar_button_bg
-                    },
-                    self.ui_f32(SIDEBAR_ROW_RADIUS),
-                )
-                .context("sidebar new thread button")?;
-                self.ui_items.push(UIItem {
-                    x: project_action_x,
-                    y: project_action_y,
-                    width: project_action_size,
-                    height: project_action_size,
-                    item_type: UIItemType::WorkspaceThreadNew(project.id.clone()),
-                });
-                let action_icon_size = (header_icon_size + 4).min(
-                    project_action_size
-                        .saturating_sub(self.ui_px(SIDEBAR_SECTION_ACTION_ICON_INSET)),
-                );
-                self.paint_sidebar_icon(
-                    layers,
-                    SvgIcon::Plus,
-                    project_action_x + ((project_action_size.saturating_sub(action_icon_size)) / 2),
-                    project_action_y + ((project_action_size.saturating_sub(action_icon_size)) / 2),
-                    action_icon_size,
-                    if project.is_active || project_action_hovered {
-                        foreground
-                    } else {
-                        muted_fg
-                    },
-                )?;
-            }
-
-            virtual_y += session_row_height + row_gap;
-
-            if !project.threads_collapsed {
-                let session_x =
-                    item_x + self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING);
-                let session_width = item_width.saturating_sub(
-                    self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING) * 2,
-                );
-                let session_status_x = session_x + self.ui_px(SIDEBAR_INSET) + 2;
-                let session_text_x = session_status_x
-                    + self.ui_px(SESSION_STATUS_ICON_SIZE)
-                    + self.ui_px(SIDEBAR_ICON_GAP)
-                    + 6;
-
-                for session in &project.threads {
-                    let row_top = list_top_f + virtual_y as f32 - scroll_offset;
-                    let row_bottom = row_top + session_row_height as f32;
-                    let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
-                    let y = row_top.floor().max(0.0) as usize;
-                    let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
-                    let hit_bottom =
-                        row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
-                    let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
-
-                    let is_selected =
-                        self.is_workspace_sidebar_thread_selected(session, suppress_own_active);
-                    if row_is_visible && is_selected {
-                        self.fill_rounded_rectangle_with_border(
-                            layers,
-                            0,
-                            euclid::rect(
-                                session_x as f32,
-                                y as f32,
-                                session_width as f32,
-                                session_row_height as f32,
-                            ),
-                            selected_bg,
-                            selected_border,
-                            self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
-                            CAPSULE_BORDER_WIDTH,
-                        )
-                        .context("sidebar selected thread")?;
-                    }
-
-                    let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
-                    if row_is_visible {
-                        self.ui_items.push(UIItem {
-                            x: session_x,
-                            y: hit_y,
-                            width: session_width,
-                            height: hit_height,
-                            item_type: UIItemType::WorkspaceThread(session.id.clone()),
-                        });
-                        let is_hovered = !suppress_hover
-                            && self.is_pointer_over_ui_rect(
-                                session_x,
-                                y,
-                                session_width,
-                                session_row_height,
-                            );
-                        let is_renaming_session = self.is_renaming_sidebar_thread(&session.id);
-                        let action_size = session_row_height.saturating_sub(8).clamp(
-                            self.ui_px(SESSION_ACTION_MIN_SIZE),
-                            self.ui_px(SESSION_ACTION_MAX_SIZE),
+                if row_is_visible {
+                    let project_action_y =
+                        y + ((session_row_height.saturating_sub(project_action_size)) / 2);
+                    let project_action_hovered = !suppress_hover
+                        && self.is_pointer_over_ui_rect(
+                            project_action_x,
+                            project_action_y,
+                            project_action_size,
+                            project_action_size,
                         );
-                        let delete_x = session_x
-                            .saturating_add(session_width)
-                            .saturating_sub(self.ui_px(SIDEBAR_INSET) + action_size);
-                        let pin_x = delete_x.saturating_sub(action_size + 4);
-                        let action_y = y + ((session_row_height.saturating_sub(action_size)) / 2);
-                        let text_right = if is_hovered && !is_renaming_session {
-                            pin_x
+                    self.fill_rounded_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            project_action_x as f32,
+                            project_action_y as f32,
+                            project_action_size as f32,
+                            project_action_size as f32,
+                        ),
+                        if project_action_hovered {
+                            chrome.sidebar_button_hover_bg
                         } else {
-                            session_x
-                                .saturating_add(session_width)
-                                .saturating_sub(self.ui_px(SIDEBAR_INSET))
-                        };
-                        let text_width =
-                            text_right.saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET));
-                        if is_hovered && !is_selected && !is_renaming_session {
-                            self.fill_rounded_rectangle(
+                            chrome.sidebar_button_bg
+                        },
+                        self.ui_f32(SIDEBAR_ROW_RADIUS),
+                    )
+                    .context("sidebar new thread button")?;
+                    self.ui_items.push(UIItem {
+                        x: project_action_x,
+                        y: project_action_y,
+                        width: project_action_size,
+                        height: project_action_size,
+                        item_type: UIItemType::WorkspaceThreadNew(project.id.clone()),
+                    });
+                    let action_icon_size = (header_icon_size + 4).min(
+                        project_action_size
+                            .saturating_sub(self.ui_px(SIDEBAR_SECTION_ACTION_ICON_INSET)),
+                    );
+                    self.paint_sidebar_icon(
+                        layers,
+                        SvgIcon::Plus,
+                        project_action_x
+                            + ((project_action_size.saturating_sub(action_icon_size)) / 2),
+                        project_action_y
+                            + ((project_action_size.saturating_sub(action_icon_size)) / 2),
+                        action_icon_size,
+                        if project.is_active || project_action_hovered {
+                            foreground
+                        } else {
+                            muted_fg
+                        },
+                    )?;
+                }
+
+                virtual_y += session_row_height + row_gap;
+
+                if !project.threads_collapsed {
+                    let session_x = item_x
+                        + self.ui_px(SIDEBAR_INSET) * 3
+                        + self.ui_px(SESSION_ROW_SIDE_PADDING);
+                    let session_width = item_width.saturating_sub(
+                        self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING) * 2,
+                    );
+                    let session_status_x = session_x + self.ui_px(SIDEBAR_INSET) + 2;
+                    let session_text_x = session_status_x
+                        + self.ui_px(SESSION_STATUS_ICON_SIZE)
+                        + self.ui_px(SIDEBAR_ICON_GAP)
+                        + 6;
+
+                    for session in &project.threads {
+                        let row_top = list_top_f + virtual_y as f32 - scroll_offset;
+                        let row_bottom = row_top + session_row_height as f32;
+                        let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
+                        let y = row_top.floor().max(0.0) as usize;
+                        let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
+                        let hit_bottom =
+                            row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
+                        let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
+
+                        let is_selected =
+                            self.is_workspace_sidebar_thread_selected(session, suppress_own_active);
+                        if row_is_visible && is_selected {
+                            self.fill_rounded_rectangle_with_border(
                                 layers,
                                 0,
                                 euclid::rect(
@@ -2131,106 +2098,153 @@ impl crate::TermWindow {
                                     session_width as f32,
                                     session_row_height as f32,
                                 ),
-                                chrome.sidebar_row_hover_bg,
+                                selected_bg,
+                                selected_border,
                                 self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                                CAPSULE_BORDER_WIDTH,
                             )
-                            .context("sidebar hovered thread")?;
+                            .context("sidebar selected thread")?;
                         }
-                        self.paint_sidebar_thread_status(
-                            layers,
-                            session,
-                            session_status_x,
-                            y,
-                            session_row_height,
-                            &chrome,
-                            foreground,
-                            suppress_own_active,
-                        )?;
-                        let session_title = self.sidebar_thread_title(&session.id, &session.name);
-                        self.paint_sidebar_text(
-                            layers,
-                            &ui_font,
-                            ui_metrics,
-                            &session_title,
-                            session_text_x,
-                            text_y,
-                            text_width,
-                            if is_selected { active_fg } else { foreground },
-                        )?;
-                        if is_hovered && !is_renaming_session {
-                            let pin_icon = if session.is_pinned {
-                                SvgIcon::PinOff
-                            } else {
-                                SvgIcon::Pin
-                            };
-                            for (x, item_type, icon, _context_name) in [
-                                (
-                                    pin_x,
-                                    UIItemType::WorkspaceThreadPin(session.id.clone()),
-                                    pin_icon,
-                                    "sidebar pin thread button",
-                                ),
-                                (
-                                    delete_x,
-                                    UIItemType::WorkspaceThreadDelete(session.id.clone()),
-                                    SvgIcon::Trash2,
-                                    "sidebar delete thread button",
-                                ),
-                            ] {
-                                let hovered = self.is_pointer_over_ui_rect(
-                                    x,
-                                    action_y,
-                                    action_size,
-                                    action_size,
+
+                        let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
+                        if row_is_visible {
+                            self.ui_items.push(UIItem {
+                                x: session_x,
+                                y: hit_y,
+                                width: session_width,
+                                height: hit_height,
+                                item_type: UIItemType::WorkspaceThread(session.id.clone()),
+                            });
+                            let is_hovered = !suppress_hover
+                                && self.is_pointer_over_ui_rect(
+                                    session_x,
+                                    y,
+                                    session_width,
+                                    session_row_height,
                                 );
-                                self.ui_items.push(UIItem {
-                                    x,
-                                    y: action_y,
-                                    width: action_size,
-                                    height: action_size,
-                                    item_type,
-                                });
-                                let action_icon_size = action_size
-                                    .saturating_sub(self.ui_px(SESSION_ACTION_ICON_INSET))
-                                    .max(header_icon_size);
-                                self.paint_sidebar_icon(
+                            let is_renaming_session = self.is_renaming_sidebar_thread(&session.id);
+                            let action_size = session_row_height.saturating_sub(8).clamp(
+                                self.ui_px(SESSION_ACTION_MIN_SIZE),
+                                self.ui_px(SESSION_ACTION_MAX_SIZE),
+                            );
+                            let delete_x = session_x
+                                .saturating_add(session_width)
+                                .saturating_sub(self.ui_px(SIDEBAR_INSET) + action_size);
+                            let pin_x = delete_x.saturating_sub(action_size + 4);
+                            let action_y =
+                                y + ((session_row_height.saturating_sub(action_size)) / 2);
+                            let text_right = if is_hovered && !is_renaming_session {
+                                pin_x
+                            } else {
+                                session_x
+                                    .saturating_add(session_width)
+                                    .saturating_sub(self.ui_px(SIDEBAR_INSET))
+                            };
+                            let text_width = text_right
+                                .saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET));
+                            if is_hovered && !is_selected && !is_renaming_session {
+                                self.fill_rounded_rectangle(
                                     layers,
-                                    icon,
-                                    x + ((action_size.saturating_sub(action_icon_size)) / 2),
-                                    action_y + ((action_size.saturating_sub(action_icon_size)) / 2),
-                                    action_icon_size,
-                                    if hovered {
-                                        foreground
-                                    } else {
-                                        muted_fg.mul_alpha(0.88)
-                                    },
-                                )?;
+                                    0,
+                                    euclid::rect(
+                                        session_x as f32,
+                                        y as f32,
+                                        session_width as f32,
+                                        session_row_height as f32,
+                                    ),
+                                    chrome.sidebar_row_hover_bg,
+                                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                                )
+                                .context("sidebar hovered thread")?;
+                            }
+                            self.paint_sidebar_thread_status(
+                                layers,
+                                session,
+                                session_status_x,
+                                y,
+                                session_row_height,
+                                &chrome,
+                                foreground,
+                                suppress_own_active,
+                            )?;
+                            let session_title =
+                                self.sidebar_thread_title(&session.id, &session.name);
+                            self.paint_sidebar_text(
+                                layers,
+                                &ui_font,
+                                ui_metrics,
+                                &session_title,
+                                session_text_x,
+                                text_y,
+                                text_width,
+                                if is_selected { active_fg } else { foreground },
+                            )?;
+                            if is_hovered && !is_renaming_session {
+                                let pin_icon = if session.is_pinned {
+                                    SvgIcon::PinOff
+                                } else {
+                                    SvgIcon::Pin
+                                };
+                                for (x, item_type, icon, _context_name) in [
+                                    (
+                                        pin_x,
+                                        UIItemType::WorkspaceThreadPin(session.id.clone()),
+                                        pin_icon,
+                                        "sidebar pin thread button",
+                                    ),
+                                    (
+                                        delete_x,
+                                        UIItemType::WorkspaceThreadDelete(session.id.clone()),
+                                        SvgIcon::Trash2,
+                                        "sidebar delete thread button",
+                                    ),
+                                ] {
+                                    let hovered = self.is_pointer_over_ui_rect(
+                                        x,
+                                        action_y,
+                                        action_size,
+                                        action_size,
+                                    );
+                                    self.ui_items.push(UIItem {
+                                        x,
+                                        y: action_y,
+                                        width: action_size,
+                                        height: action_size,
+                                        item_type,
+                                    });
+                                    let action_icon_size = action_size
+                                        .saturating_sub(self.ui_px(SESSION_ACTION_ICON_INSET))
+                                        .max(header_icon_size);
+                                    self.paint_sidebar_icon(
+                                        layers,
+                                        icon,
+                                        x + ((action_size.saturating_sub(action_icon_size)) / 2),
+                                        action_y
+                                            + ((action_size.saturating_sub(action_icon_size)) / 2),
+                                        action_icon_size,
+                                        if hovered {
+                                            foreground
+                                        } else {
+                                            muted_fg.mul_alpha(0.88)
+                                        },
+                                    )?;
+                                }
                             }
                         }
+
+                        virtual_y += session_row_height + row_gap;
                     }
-
-                    virtual_y += session_row_height + row_gap;
                 }
             }
 
-            if project_idx + 1 < view.projects.len() {
-                virtual_y += self.ui_px(WORKSPACE_GROUP_EXTRA_GAP);
-            }
-        }
-
-        if !view.ref_groups.is_empty() {
-            if !view.pinned_threads.is_empty() || !view.projects.is_empty() {
-                virtual_y += self.ui_px(WORKSPACE_GROUP_EXTRA_GAP);
-            }
             // Reference groups render exactly like project folders: chevron,
-            // machine icon, machine name, then indented thread rows. The
+            // link icon, origin-project name, then indented thread rows. The
             // link icon in the header is what tells a reference group apart
-            // from a real project group with the same machine name.
-            let group_space_id = self.workspace_sidebar_space_id().to_string();
-            for (group_idx, group) in view.ref_groups.iter().enumerate() {
-                if group_idx > 0 {
-                    virtual_y += self.ui_px(WORKSPACE_GROUP_EXTRA_GAP);
-                }
+            // from a local project folder with the same name.
+            if let workspace_threads::SidebarFolder::RefGroup(folder_group_index) = folder {
+                let Some(group) = view.ref_groups.get(*folder_group_index) else {
+                    continue;
+                };
                 let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                 let row_bottom = row_top + session_row_height as f32;
                 let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
@@ -2269,7 +2283,12 @@ impl crate::TermWindow {
                         String::new()
                     } else if group.machine_is_local {
                         group.origin_space_name.clone()
-                    } else if group.origin_space_name.is_empty() {
+                    } else if group.origin_space_name.is_empty()
+                        // A remote Space often carries its host's name (the
+                        // default for single-Space servers); "X · X" says
+                        // nothing twice.
+                        || group.origin_space_name == group.machine_label
+                    {
                         group.machine_label.clone()
                     } else {
                         format!("{} · {}", group.machine_label, group.origin_space_name)

@@ -892,6 +892,9 @@ pub(crate) struct SidebarRowDragState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SidebarRowKind {
     Project(String),
+    /// A thread-ref group header, by its RAW group key (no space prefix);
+    /// reorders in the Space's merged folder order alongside projects.
+    RefGroup(String),
     Thread {
         thread_id: String,
         project_id: String,
