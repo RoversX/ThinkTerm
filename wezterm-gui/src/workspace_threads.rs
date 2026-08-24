@@ -201,25 +201,51 @@ pub struct TerminalSpawnSpec {
 pub struct WorkspaceThreadsView {
     pub pinned_threads: Vec<WorkspaceThreadView>,
     pub projects: Vec<ProjectView>,
-    /// Thread references this Space holds, grouped by origin machine so the
+    /// Thread references this Space holds, grouped by origin project so the
     /// sidebar can render them as folder-style groups just like projects.
     pub ref_groups: Vec<ThreadRefGroupView>,
+}
+
+impl WorkspaceThreadsView {
+    /// True when the workspace on screen is one of this Space's thread
+    /// references. Activating a ref never repoints the Space's own
+    /// active-thread pointer, so while this holds, the own rows' `is_active`
+    /// is stale for SELECTION purposes — the paint side suppresses their
+    /// highlight (and only their highlight: the flag stays true in the data,
+    /// keeping the status-filter exemption and every other consumer intact).
+    pub fn ref_workspace_on_screen(&self) -> bool {
+        self.ref_groups.iter().any(|group| {
+            group
+                .threads
+                .iter()
+                .any(|reference| reference.thread.is_active)
+        })
+    }
 }
 
 /// One folder-style group of thread references sharing an origin Space.
 #[derive(Debug, Clone)]
 pub struct ThreadRefGroupView {
-    /// Stable group key: the origin Space id, or a machine-derived fallback
-    /// for dangling refs whose origin rows are gone from the cache.
+    /// Stable group key: the origin project id, or a machine-derived
+    /// fallback for dangling refs whose origin rows are gone from the cache.
     pub key: String,
-    /// Header label: the origin Space's name (a machine hosts several
-    /// Spaces, so the machine alone would be ambiguous). Dangling groups
-    /// fall back to the cached machine label.
+    /// Header label: the origin project's name, so a ref folder reads
+    /// exactly like a local project folder. Dangling groups fall back to
+    /// the cached machine label.
     pub label: String,
-    /// The origin machine, shown as a small right-aligned badge on the
-    /// header (hidden when it would not fit, or when it just repeats the
-    /// label).
+    /// The origin machine. The header has no room for it, so it appears as
+    /// the row's hover tag.
     pub machine_label: String,
+    /// Whether the origin machine is this device. Tracked structurally
+    /// rather than by comparing `machine_label` to "Local", because domain
+    /// names are user-controlled.
+    pub machine_is_local: bool,
+    /// The Space the origin project belongs to. Part of the hover tag: the
+    /// header shows only the project name, and project names repeat across
+    /// Spaces (every Space starts with a "Home"), so without this a
+    /// local-to-local ref folder would carry no identifying information at
+    /// all. Empty for a dangling group.
+    pub origin_space_name: String,
     /// Whether the origin domain is currently attached; a detached group's
     /// rows paint dimmed.
     pub attached: bool,
@@ -258,16 +284,24 @@ pub struct WorkspaceThreadView {
 /// vanished simply produces no view.
 #[derive(Debug, Clone)]
 // The origin fields are asserted by the store tests and reserved for row
-// painting polish (offline dimming, origin tooltips); the bin target does
-// not read them yet.
+// Some fields are read only by tests or kept for menu/navigation follow-ups
+// (e.g. `origin_space_id` for a go-to-origin action).
 #[allow(dead_code)]
 pub struct ThreadRefView {
     pub thread: WorkspaceThreadView,
     pub origin_space_id: SpaceId,
     pub origin_space_name: String,
+    /// The project the thread lives in on its origin machine; the sidebar
+    /// groups refs under this name so ref folders read like local ones.
+    /// Empty for a dangling ref.
+    pub origin_project_id: ProjectId,
+    pub origin_project_name: String,
     /// Short machine tag for the row: the origin Space's mux domain name
     /// (which is the user's host label when one exists) or "Local".
     pub machine_label: String,
+    /// Whether the origin machine is this device, tracked structurally so no
+    /// user-controlled domain name can pass for "Local".
+    pub machine_is_local: bool,
     /// False when the origin Space's mux domain is currently detached; the
     /// sidebar dims such rows.
     pub origin_domain_attached: bool,
@@ -1123,18 +1157,22 @@ pub fn purge_thread_refs_for_machines(machines: &[String]) -> bool {
     changed
 }
 
-/// The origin project a reference group's "+" should create a thread in:
-/// the project of the first resolvable ref in `host_space_id`'s list whose
-/// origin Space is `origin_space_id`.
-pub fn ref_group_origin_project(host_space_id: &str, origin_space_id: &str) -> Option<ProjectId> {
+/// The origin project a reference group's "+" should create a thread in.
+/// Group keys are origin project ids, so this only confirms the key names
+/// the project of some resolvable ref in `host_space_id`'s list (a machine
+/// fallback key for dangling groups never matches).
+pub fn ref_group_origin_project(host_space_id: &str, group_key: &str) -> Option<ProjectId> {
     let store = THREAD_STORE.lock();
-    let space = store.spaces.iter().find(|space| space.id == host_space_id)?;
+    let space = store
+        .spaces
+        .iter()
+        .find(|space| space.id == host_space_id)?;
     space.thread_refs.iter().find_map(|thread_id| {
         let project = store
             .projects
             .iter()
             .find(|project| project.threads.iter().any(|t| &t.id == thread_id))?;
-        (project.space_id == origin_space_id).then(|| project.id.clone())
+        (project.id == group_key).then(|| project.id.clone())
     })
 }
 
@@ -1320,13 +1358,9 @@ fn delete_space_for_window_local(
             .or_else(|| {
                 // A refs-only Space cannot rehome a window: it has no thread
                 // of its own for the window to adopt.
-                store
-                    .spaces
-                    .iter()
-                    .find(|space| {
-                        !occupied_by_other.contains(&space.id)
-                            && !store.is_refs_only_space(&space.id)
-                    })
+                store.spaces.iter().find(|space| {
+                    !occupied_by_other.contains(&space.id) && !store.is_refs_only_space(&space.id)
+                })
             })
             .map(|space| space.id.clone())
             .unwrap_or_else(|| {
@@ -1487,13 +1521,9 @@ pub async fn delete_space_for_window(
             .or_else(|| {
                 // A refs-only Space cannot rehome a window: it has no thread
                 // of its own for the window to adopt.
-                store
-                    .spaces
-                    .iter()
-                    .find(|space| {
-                        !occupied_by_other.contains(&space.id)
-                            && !store.is_refs_only_space(&space.id)
-                    })
+                store.spaces.iter().find(|space| {
+                    !occupied_by_other.contains(&space.id) && !store.is_refs_only_space(&space.id)
+                })
             })
             .map(|space| space.id.clone())
             .unwrap_or_else(|| {
@@ -1596,7 +1626,10 @@ pub fn space_id_for_workspace(workspace: &str) -> Option<SpaceId> {
 /// silently keep targeting the previous machine.
 pub fn origin_space_for_ref_workspace(host_space_id: &str, workspace: &str) -> Option<SpaceId> {
     let store = THREAD_STORE.lock();
-    let space = store.spaces.iter().find(|space| space.id == host_space_id)?;
+    let space = store
+        .spaces
+        .iter()
+        .find(|space| space.id == host_space_id)?;
     store.projects.iter().find_map(|project| {
         project
             .threads
@@ -1705,16 +1738,17 @@ pub fn view_for_current_project(
     view
 }
 
-/// Fold resolved refs into folder-style groups keyed by origin Space, in
-/// first-appearance order of the Space's ref list. Dangling refs (origin
-/// rows gone) group under their cached machine label instead.
+/// Fold resolved refs into folder-style groups keyed by origin project, in
+/// first-appearance order of the Space's ref list — so ref folders carry
+/// the same names as local project folders, with the machine as a badge.
+/// Dangling refs (origin rows gone) group under their cached machine label.
 fn group_thread_refs_by_origin(refs: Vec<ThreadRefView>) -> Vec<ThreadRefGroupView> {
     let mut groups: Vec<ThreadRefGroupView> = Vec::new();
     for reference in refs {
-        let key = if reference.origin_space_id.is_empty() {
+        let key = if reference.origin_project_id.is_empty() {
             format!("machine::{}", reference.machine_label)
         } else {
-            reference.origin_space_id.clone()
+            reference.origin_project_id.clone()
         };
         match groups.iter_mut().find(|group| group.key == key) {
             Some(group) => {
@@ -1723,12 +1757,14 @@ fn group_thread_refs_by_origin(refs: Vec<ThreadRefView>) -> Vec<ThreadRefGroupVi
             }
             None => groups.push(ThreadRefGroupView {
                 key,
-                label: if reference.origin_space_name.is_empty() {
+                label: if reference.origin_project_name.is_empty() {
                     reference.machine_label.clone()
                 } else {
-                    reference.origin_space_name.clone()
+                    reference.origin_project_name.clone()
                 },
                 machine_label: reference.machine_label.clone(),
+                machine_is_local: reference.machine_is_local,
+                origin_space_name: reference.origin_space_name.clone(),
                 attached: reference.origin_domain_attached,
                 collapsed: false,
                 threads: vec![reference],
@@ -3799,7 +3835,11 @@ impl WorkspaceThreadStore {
     /// is no meta to render a row from (legacy pre-meta refs).
     fn groom_thread_refs(&mut self) -> bool {
         let mut resolved: HashMap<String, ThreadRefMeta> = HashMap::new();
-        if self.spaces.iter().any(|space| !space.thread_refs.is_empty()) {
+        if self
+            .spaces
+            .iter()
+            .any(|space| !space.thread_refs.is_empty())
+        {
             for project in &self.projects {
                 let origin_domain = self
                     .spaces
@@ -4159,7 +4199,10 @@ impl WorkspaceThreadStore {
                         },
                         origin_space_id: String::new(),
                         origin_space_name: String::new(),
+                        origin_project_id: String::new(),
+                        origin_project_name: String::new(),
                         machine_label: meta.machine_label(),
+                        machine_is_local: meta.origin_domain.is_none(),
                         origin_domain_attached: false,
                         workspace_name: String::new(),
                         dangling: true,
@@ -4180,10 +4223,8 @@ impl WorkspaceThreadStore {
                     is_unread: session.is_unread,
                     work_status: session.work_status(),
                 };
-                let machine_label = origin
-                    .client_domain
-                    .clone()
-                    .unwrap_or_else(|| "Local".to_string());
+                let (machine_label, machine_is_local) =
+                    origin_machine_for_project(project, &self.spaces);
                 let origin_domain_attached = origin
                     .client_domain
                     .as_deref()
@@ -4193,7 +4234,10 @@ impl WorkspaceThreadStore {
                     thread,
                     origin_space_id: origin.id.clone(),
                     origin_space_name: origin.name.clone(),
+                    origin_project_id: project.id.clone(),
+                    origin_project_name: project.name.clone(),
                     machine_label,
+                    machine_is_local,
                     origin_domain_attached,
                     workspace_name,
                     dangling: false,
@@ -6691,6 +6735,36 @@ fn is_remote_project(project: &Project, spaces: &[Space]) -> bool {
             .any(|space| space.id == project.space_id && space.client_domain.is_some())
 }
 
+/// Which machine a project's threads execute on, for display: the mux
+/// domain for a domain-owned Space, the SSH host for a direct-SSH project
+/// (which lives in a LOCAL Space, so the Space's `client_domain` alone
+/// misses it — same three-way test as `is_remote_project`), or this device.
+fn origin_machine_for_project(project: &Project, spaces: &[Space]) -> (String, bool) {
+    if let Some(domain) = spaces
+        .iter()
+        .find(|space| space.id == project.space_id)
+        .and_then(|space| space.client_domain.clone())
+    {
+        return (domain, false);
+    }
+    if is_remote_project(project, spaces) {
+        let host_id = remote_host_id_for_project_id(&project.id);
+        let label = crate::ssh_hosts::host_spec(host_id)
+            .map(|spec| spec.label)
+            .or_else(|| {
+                // `ssh://user@host/...` — the authority names the machine.
+                let path = project.path.to_string_lossy().into_owned();
+                let rest = path.strip_prefix("ssh://")?;
+                let authority = rest.split('/').next()?;
+                let host = authority.rsplit('@').next()?;
+                (!host.is_empty()).then(|| host.to_string())
+            })
+            .unwrap_or_else(|| project.name.clone());
+        return (label, false);
+    }
+    ("Local".to_string(), true)
+}
+
 fn thread_has_restorable_workspace(thread: &WorkspaceThread) -> bool {
     // Mux-domain threads have no local layout to restore: their content lives
     // on the remote mux server and only materializes through `thinkterm connect`.
@@ -7313,7 +7387,10 @@ mod tests {
         let mut occupied = std::collections::HashSet::new();
         occupied.insert(DEFAULT_SPACE_ID.to_string());
         let claimed = store.claim_available_space_id(&occupied);
-        assert_ne!(claimed, coll_id, "startup window must not claim a refs-only Space");
+        assert_ne!(
+            claimed, coll_id,
+            "startup window must not claim a refs-only Space"
+        );
         // Once emptied of refs it is an ordinary empty Space and claimable.
         assert!(store.remove_thread_ref(&coll_id, &t1));
         let claimed = store.claim_available_space_id(&occupied);
@@ -7324,7 +7401,10 @@ mod tests {
     fn collection_refs_add_remove_reorder_dedup() {
         let (mut store, coll, t1, t2) = store_with_collection();
         assert!(store.add_thread_ref(&coll, &t1));
-        assert!(!store.add_thread_ref(&coll, &t1), "duplicate ref must be refused");
+        assert!(
+            !store.add_thread_ref(&coll, &t1),
+            "duplicate ref must be refused"
+        );
         assert!(store.add_thread_ref(&coll, &t2));
         assert!(!store.add_thread_ref(&coll, "thread-nonexistent"));
 
@@ -7402,7 +7482,12 @@ mod tests {
             .unwrap()
             .is_collection = true;
         // Reference a remote thread from the ingested tree.
-        let remote_thread_id = store.projects.iter().find(|p| p.id == "rp1").unwrap().threads[0]
+        let remote_thread_id = store
+            .projects
+            .iter()
+            .find(|p| p.id == "rp1")
+            .unwrap()
+            .threads[0]
             .id
             .clone();
         assert!(store.add_thread_ref(&coll_id, &remote_thread_id));
@@ -7437,7 +7522,10 @@ mod tests {
         // remote delete) used to fall through to ensure_current_project.
         store.sync_current_project(&coll, "some-unbound-workspace");
         assert!(
-            store.projects.iter().all(|project| project.space_id != coll),
+            store
+                .projects
+                .iter()
+                .all(|project| project.space_id != coll),
             "a refs-only Space must never acquire a project"
         );
     }
@@ -7452,7 +7540,10 @@ mod tests {
         assert!(!space.is_collection, "the flag is retired on normalize");
         assert_eq!(space.thread_refs, vec![t1.clone()]);
         assert_eq!(
-            space.thread_ref_meta.get(&t1).map(|m| m.origin_domain.clone()),
+            space
+                .thread_ref_meta
+                .get(&t1)
+                .map(|m| m.origin_domain.clone()),
             Some(None),
             "normalize refreshes the cached meta for resolvable refs"
         );
@@ -7476,10 +7567,20 @@ mod tests {
         let mut store = remote_test_store("syd");
         assert!(store.ingest_remote_tree("syd", &sample_tree()));
         let host = store.create_space_record("Studies".to_string());
-        let remote_thread = store.projects.iter().find(|p| p.id == "rp1").unwrap().threads[0]
+        let remote_thread = store
+            .projects
+            .iter()
+            .find(|p| p.id == "rp1")
+            .unwrap()
+            .threads[0]
             .id
             .clone();
-        let remote_name = store.projects.iter().find(|p| p.id == "rp1").unwrap().threads[0]
+        let remote_name = store
+            .projects
+            .iter()
+            .find(|p| p.id == "rp1")
+            .unwrap()
+            .threads[0]
             .name
             .clone();
         assert!(store.add_thread_ref(&host, &remote_thread));
@@ -7525,7 +7626,12 @@ mod tests {
         let mut store = remote_test_store("syd");
         assert!(store.ingest_remote_tree("syd", &sample_tree()));
         let host = store.create_space_record("Studies".to_string());
-        let remote_thread = store.projects.iter().find(|p| p.id == "rp1").unwrap().threads[0]
+        let remote_thread = store
+            .projects
+            .iter()
+            .find(|p| p.id == "rp1")
+            .unwrap()
+            .threads[0]
             .id
             .clone();
         // One ref to the doomed machine, one local ref that must survive.
@@ -7547,7 +7653,10 @@ mod tests {
         let space = store.spaces.iter().find(|s| s.id == host).unwrap();
         assert_eq!(space.thread_refs, vec![local_id.clone()]);
         assert!(!space.thread_ref_meta.contains_key(&remote_thread));
-        assert_eq!(space.active_thread_ref, None, "purged ref cannot stay active");
+        assert_eq!(
+            space.active_thread_ref, None,
+            "purged ref cannot stay active"
+        );
         assert!(
             !store.purge_refs_for_machines(&["syd".to_string()]),
             "second purge is a no-op"
@@ -7576,7 +7685,10 @@ mod tests {
             .find(|s| s.id == host)
             .unwrap()
             .active_thread_ref = Some(t1.clone());
-        assert_eq!(store.thread_ref_to_restore(&host).as_deref(), Some(t1.as_str()));
+        assert_eq!(
+            store.thread_ref_to_restore(&host).as_deref(),
+            Some(t1.as_str())
+        );
     }
 
     #[test]
@@ -7585,7 +7697,10 @@ mod tests {
         assert!(store.add_thread_ref(&coll, &t1));
         assert!(store.add_thread_ref(&coll, &t2));
         // Nothing opened yet: fall back to the first reference.
-        assert_eq!(store.thread_ref_to_restore(&coll).as_deref(), Some(t1.as_str()));
+        assert_eq!(
+            store.thread_ref_to_restore(&coll).as_deref(),
+            Some(t1.as_str())
+        );
 
         store
             .spaces
@@ -7593,13 +7708,19 @@ mod tests {
             .find(|s| s.id == coll)
             .unwrap()
             .active_thread_ref = Some(t2.clone());
-        assert_eq!(store.thread_ref_to_restore(&coll).as_deref(), Some(t2.as_str()));
+        assert_eq!(
+            store.thread_ref_to_restore(&coll).as_deref(),
+            Some(t2.as_str())
+        );
 
         // Removing the remembered reference clears it and falls back.
         assert!(store.remove_thread_ref(&coll, &t2));
         let space = store.spaces.iter().find(|s| s.id == coll).unwrap();
         assert_eq!(space.active_thread_ref, None);
-        assert_eq!(store.thread_ref_to_restore(&coll).as_deref(), Some(t1.as_str()));
+        assert_eq!(
+            store.thread_ref_to_restore(&coll).as_deref(),
+            Some(t1.as_str())
+        );
     }
 
     #[test]
@@ -9280,6 +9401,89 @@ mod tests {
         assert!(!view.projects[0].threads[0].is_active);
         assert!(view.projects[1].is_active);
         assert!(view.projects[1].threads[0].is_active);
+    }
+
+    /// Activating a ref never repoints the space's own active-thread pointer,
+    /// so while the ref's workspace is on screen the own pointer is stale for
+    /// selection purposes. The paint side asks the built view whether that is
+    /// the case; the answer must key off the DISPLAYED workspace, not off
+    /// "some other Space owns it" — a swipe preview renders a neighbouring
+    /// Space against this window's workspace and must not blank the
+    /// neighbour's own highlight.
+    #[test]
+    fn ref_workspace_on_screen_tracks_the_displayed_workspace() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        let local_space = store.spaces[0].id.clone();
+        assert!(store.add_thread_ref(&local_space, "rt1"));
+
+        let ref_workspace = store.view_for_thread_refs(&local_space, &[], None)[0]
+            .workspace_name
+            .clone();
+
+        // The ref's workspace is on screen: the view reports it, so the
+        // paint side suppresses the own rows' highlight.
+        let mut view = WorkspaceThreadsView {
+            pinned_threads: Vec::new(),
+            projects: Vec::new(),
+            ref_groups: group_thread_refs_by_origin(store.view_for_thread_refs(
+                &local_space,
+                &[],
+                Some(&ref_workspace),
+            )),
+        };
+        assert!(view.ref_workspace_on_screen());
+
+        // Any other workspace on screen — including another Space's, as
+        // during a swipe preview — and the suppression must not engage.
+        view.ref_groups = group_thread_refs_by_origin(store.view_for_thread_refs(
+            &local_space,
+            &[],
+            Some("some-other-space's-workspace"),
+        ));
+        assert!(!view.ref_workspace_on_screen());
+    }
+
+    /// Suppression lives in the paint-side selection, NOT in the view data:
+    /// the status filter exempts the active thread from hiding, and that
+    /// exemption must survive a ref being on screen or the Space's own
+    /// active row vanishes from the list (shifting scroll height and
+    /// hit-test rows) whenever its status is hidden.
+    #[test]
+    fn status_filter_still_exempts_the_own_active_row_while_a_ref_is_open() {
+        let make = |name: &str, is_active| WorkspaceThreadView {
+            id: name.to_string(),
+            name: name.to_string(),
+            is_active,
+            is_materialized: false,
+            is_pinned: false,
+            is_unread: false,
+            work_status: WorkspaceThreadWorkStatus::Idle,
+        };
+        let mut view = WorkspaceThreadsView {
+            pinned_threads: Vec::new(),
+            projects: vec![ProjectView {
+                id: "p1".to_string(),
+                name: "Home".to_string(),
+                is_active: true,
+                threads_collapsed: false,
+                threads: vec![make("own-active", true), make("own-idle", false)],
+                is_remote: false,
+                distro: None,
+            }],
+            ref_groups: Vec::new(),
+        };
+        filter_threads_view_by_status(&mut view, &[WorkspaceThreadWorkStatus::Idle]);
+        let names: Vec<&str> = view.projects[0]
+            .threads
+            .iter()
+            .map(|thread| thread.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["own-active"],
+            "the active row is exempt from status hiding; is_active must stay in the data"
+        );
     }
 
     #[test]

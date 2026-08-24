@@ -1389,7 +1389,7 @@ impl super::TermWindow {
             | UIItemType::SpaceMenu
             | UIItemType::SpaceReconnect
             | UIItemType::ProjectToggleThreads(_)
-            | UIItemType::ThreadRefGroupToggle(_)
+            | UIItemType::ThreadRefGroupToggle { .. }
             | UIItemType::ThreadRefGroupNewThread(_)
             | UIItemType::Project(_)
             | UIItemType::WorkspaceThread(_)
@@ -1501,7 +1501,7 @@ impl super::TermWindow {
             | UIItemType::SpaceMenu
             | UIItemType::SpaceReconnect
             | UIItemType::ProjectToggleThreads(_)
-            | UIItemType::ThreadRefGroupToggle(_)
+            | UIItemType::ThreadRefGroupToggle { .. }
             | UIItemType::ThreadRefGroupNewThread(_)
             | UIItemType::Project(_)
             | UIItemType::WorkspaceThread(_)
@@ -3414,7 +3414,7 @@ impl super::TermWindow {
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
-            UIItemType::ThreadRefGroupToggle(group_key) => {
+            UIItemType::ThreadRefGroupToggle { key: group_key, .. } => {
                 if let WMEK::Press(MousePress::Left) = event.kind {
                     if !self.thread_ref_groups_collapsed.remove(&group_key) {
                         self.thread_ref_groups_collapsed.insert(group_key);
@@ -3423,9 +3423,9 @@ impl super::TermWindow {
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
-            UIItemType::ThreadRefGroupNewThread(origin_space_id) => {
+            UIItemType::ThreadRefGroupNewThread(group_key) => {
                 if let WMEK::Press(MousePress::Left) = event.kind {
-                    self.create_thread_in_ref_group(&origin_space_id, context);
+                    self.create_thread_in_ref_group(&group_key, context);
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
@@ -3918,7 +3918,7 @@ impl super::TermWindow {
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
-            UIItemType::ThreadRefGroupToggle(group_key) => {
+            UIItemType::ThreadRefGroupToggle { key: group_key, .. } => {
                 if let WMEK::Press(MousePress::Left) = event.kind {
                     if !self.thread_ref_groups_collapsed.remove(&group_key) {
                         self.thread_ref_groups_collapsed.insert(group_key);
@@ -3927,9 +3927,9 @@ impl super::TermWindow {
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
-            UIItemType::ThreadRefGroupNewThread(origin_space_id) => {
+            UIItemType::ThreadRefGroupNewThread(group_key) => {
                 if let WMEK::Press(MousePress::Left) = event.kind {
-                    self.create_thread_in_ref_group(&origin_space_id, context);
+                    self.create_thread_in_ref_group(&group_key, context);
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
@@ -5612,15 +5612,10 @@ impl super::TermWindow {
     /// The reference group "+": create a thread in the group's origin
     /// project — exactly the project-"+" flow — and auto-add a reference to
     /// it in the current Space so it appears (and activates) right here.
-    pub(crate) fn create_thread_in_ref_group(
-        &mut self,
-        origin_space_id: &str,
-        context: &dyn WindowOps,
-    ) {
-        let Some(project_id) = crate::workspace_threads::ref_group_origin_project(
-            &self.active_space_id,
-            origin_space_id,
-        ) else {
+    pub(crate) fn create_thread_in_ref_group(&mut self, group_key: &str, context: &dyn WindowOps) {
+        let Some(project_id) =
+            crate::workspace_threads::ref_group_origin_project(&self.active_space_id, group_key)
+        else {
             context.invalidate();
             return;
         };

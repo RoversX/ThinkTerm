@@ -2749,11 +2749,15 @@ impl crate::TermWindow {
         let window_w = self.dimensions.pixel_width as f32;
         let window_h = self.dimensions.pixel_height as f32;
 
-        // Above the button, centred on it. Beside it would sit on top of the
-        // neighbouring buttons in the same row — these are laid out
-        // horizontally, so the only free direction is up. Flip below when
-        // there is no room above.
-        let x = (bx + (bw - tip_w) / 2.0).clamp(0.0, (window_w - tip_w).max(0.0));
+        // Above the button. Beside it would sit on top of the neighbouring
+        // buttons in the same row — these are laid out horizontally, so the
+        // only free direction is up. Flip below when there is no room above.
+        // Full-width list rows left-align their tag; icon buttons centre it.
+        let left_align = matches!(
+            hover.item.item_type,
+            crate::termwindow::UIItemType::ThreadRefGroupToggle { .. }
+        );
+        let x = crate::termwindow::tooltip_anchor_x(bx, bw, tip_w, window_w, left_align);
         let y = if by - gap - tip_h >= 0.0 {
             by - gap - tip_h
         } else {

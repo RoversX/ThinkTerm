@@ -330,10 +330,18 @@ impl crate::TermWindow {
         )
     }
 
+    /// `section_gap`/`group_gap` arrive PRE-SCALED (`ui_px` of
+    /// `WORKSPACE_SECTION_LABEL_GAP`/`WORKSPACE_GROUP_EXTRA_GAP`): this is an
+    /// associated fn with no `&self` to scale with, and the paint loop adds
+    /// the scaled values — adding the raw constants here over-counts every
+    /// gap on any display whose ui scale is not exactly 1 (e.g. Linux 96dpi
+    /// at 0.5), inflating max_scroll past the painted content.
     fn workspace_sidebar_list_height(
         view: &workspace_threads::WorkspaceThreadsView,
         row_height: usize,
         row_gap: usize,
+        section_gap: usize,
+        group_gap: usize,
     ) -> usize {
         let mut height = 0usize;
         if !view.pinned_threads.is_empty() {
@@ -346,7 +354,7 @@ impl crate::TermWindow {
         }
         if !view.projects.is_empty() {
             if !view.pinned_threads.is_empty() {
-                height = height.saturating_add(WORKSPACE_SECTION_LABEL_GAP);
+                height = height.saturating_add(section_gap);
             }
             height = height.saturating_add(row_height + row_gap);
         }
@@ -361,15 +369,15 @@ impl crate::TermWindow {
             view.projects
                 .len()
                 .saturating_sub(1)
-                .saturating_mul(WORKSPACE_GROUP_EXTRA_GAP),
+                .saturating_mul(group_gap),
         );
         if !view.ref_groups.is_empty() {
             if !view.pinned_threads.is_empty() || !view.projects.is_empty() {
-                height = height.saturating_add(WORKSPACE_GROUP_EXTRA_GAP);
+                height = height.saturating_add(group_gap);
             }
             for (group_idx, group) in view.ref_groups.iter().enumerate() {
                 if group_idx > 0 {
-                    height = height.saturating_add(WORKSPACE_GROUP_EXTRA_GAP);
+                    height = height.saturating_add(group_gap);
                 }
                 height = height.saturating_add(row_height + row_gap);
                 if !group.collapsed {
@@ -385,9 +393,12 @@ impl crate::TermWindow {
         view: &workspace_threads::WorkspaceThreadsView,
         row_height: usize,
         row_gap: usize,
+        section_gap: usize,
+        group_gap: usize,
         viewport_height: usize,
     ) -> usize {
-        let height = Self::workspace_sidebar_list_height(view, row_height, row_gap);
+        let height =
+            Self::workspace_sidebar_list_height(view, row_height, row_gap, section_gap, group_gap);
         if height > viewport_height {
             height.saturating_add(SIDEBAR_LIST_BOTTOM_PADDING)
         } else {
@@ -590,14 +601,22 @@ impl crate::TermWindow {
         }
     }
 
+    /// `suppress_active` carries "a thread reference's workspace is on
+    /// screen": the Space's own active-thread pointer is then stale for
+    /// selection (ref activation never repoints it), so the Space's OWN rows
+    /// must not paint as active next to the ref row that actually is. Ref
+    /// rows always pass false. The suppression lives here, on the paint
+    /// side, because `is_active` in the view data feeds other consumers —
+    /// notably the status-filter exemption — that must keep seeing it.
     fn is_workspace_sidebar_thread_selected(
         &self,
         session: &workspace_threads::WorkspaceThreadView,
+        suppress_active: bool,
     ) -> bool {
         if let Some(thread_id) = self.workspace_sidebar_pending_thread_selection.as_deref() {
             thread_id == session.id.as_str()
         } else {
-            session.is_active
+            session.is_active && !suppress_active
         }
     }
 
@@ -606,8 +625,9 @@ impl crate::TermWindow {
         session: &workspace_threads::WorkspaceThreadView,
         chrome: &UiPalette,
         foreground: LinearRgba,
+        suppress_active: bool,
     ) -> LinearRgba {
-        if session.is_active {
+        if session.is_active && !suppress_active {
             LinearRgba::with_components(0.20, 0.78, 0.36, 1.0)
         } else if session.is_unread {
             chrome.selected_bg
@@ -626,13 +646,14 @@ impl crate::TermWindow {
         status: UiStatusKind,
         chrome: &UiPalette,
         foreground: LinearRgba,
+        suppress_active: bool,
     ) -> LinearRgba {
         if status == UiStatusKind::Done {
             SESSION_STATUS_DONE_COLOR
-        } else if session.is_active {
+        } else if session.is_active && !suppress_active {
             foreground
         } else {
-            self.sidebar_thread_dot_color(session, chrome, foreground)
+            self.sidebar_thread_dot_color(session, chrome, foreground, suppress_active)
         }
     }
 
@@ -653,6 +674,7 @@ impl crate::TermWindow {
         row_height: usize,
         chrome: &UiPalette,
         foreground: LinearRgba,
+        suppress_active: bool,
     ) -> anyhow::Result<()> {
         let icon_y = y + ((row_height.saturating_sub(self.ui_px(SESSION_STATUS_ICON_SIZE))) / 2);
         if let Some(status) = self.sidebar_thread_status_kind(session) {
@@ -668,7 +690,13 @@ impl crate::TermWindow {
                 centered_inner_start(x, self.ui_px(SESSION_STATUS_ICON_SIZE), status_size),
                 centered_inner_start(y, row_height, status_size),
                 status_size,
-                self.sidebar_thread_status_color(session, status, chrome, foreground),
+                self.sidebar_thread_status_color(
+                    session,
+                    status,
+                    chrome,
+                    foreground,
+                    suppress_active,
+                ),
             );
         }
 
@@ -687,7 +715,7 @@ impl crate::TermWindow {
                 self.ui_px(SESSION_STATUS_DOT_SIZE) as f32,
                 self.ui_px(SESSION_STATUS_DOT_SIZE) as f32,
             ),
-            self.sidebar_thread_dot_color(session, chrome, foreground),
+            self.sidebar_thread_dot_color(session, chrome, foreground, suppress_active),
             self.ui_px(SESSION_STATUS_DOT_SIZE) as f32 / 2.0,
         )
         .context("sidebar thread status dot")
@@ -843,6 +871,8 @@ impl crate::TermWindow {
             &view,
             layout.row_height,
             row_gap,
+            self.ui_px(WORKSPACE_SECTION_LABEL_GAP),
+            self.ui_px(WORKSPACE_GROUP_EXTRA_GAP),
             viewport_height,
         );
         total_height.saturating_sub(viewport_height) as f32
@@ -901,6 +931,8 @@ impl crate::TermWindow {
             &view,
             layout.row_height,
             row_gap,
+            self.ui_px(WORKSPACE_SECTION_LABEL_GAP),
+            self.ui_px(WORKSPACE_GROUP_EXTRA_GAP),
             viewport_height,
         );
         let max_scroll = total_height.saturating_sub(viewport_height) as f32;
@@ -1130,6 +1162,9 @@ impl crate::TermWindow {
                 &active_workspace,
                 &workspaces,
             ));
+        // A ref row is showing its workspace: the Space's own rows must not
+        // paint a second active highlight from their stale pointer.
+        let suppress_own_active = view.ref_workspace_on_screen();
 
         let header_icon_size = icon_size.min(self.ui_px(32));
         let button_size = (header_icon_size + self.ui_px(8)).clamp(self.ui_px(32), self.ui_px(40));
@@ -1571,6 +1606,8 @@ impl crate::TermWindow {
                 &view,
                 session_row_height,
                 row_gap,
+                self.ui_px(WORKSPACE_SECTION_LABEL_GAP),
+                self.ui_px(WORKSPACE_GROUP_EXTRA_GAP),
                 viewport_height,
             );
             total_height.saturating_sub(viewport_height) as f32
@@ -1663,7 +1700,8 @@ impl crate::TermWindow {
                             session_row_height,
                         );
                     let is_renaming_session = self.is_renaming_sidebar_thread(&session.id);
-                    let is_selected = self.is_workspace_sidebar_thread_selected(session);
+                    let is_selected =
+                        self.is_workspace_sidebar_thread_selected(session, suppress_own_active);
                     if is_selected {
                         self.fill_rounded_rectangle_with_border(
                             layers,
@@ -1721,6 +1759,7 @@ impl crate::TermWindow {
                         session_row_height,
                         &chrome,
                         foreground,
+                        suppress_own_active,
                     )?;
                     let title = self.sidebar_thread_title(&session.id, &session.name);
                     self.paint_sidebar_text(
@@ -2027,7 +2066,8 @@ impl crate::TermWindow {
                         row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
                     let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
 
-                    let is_selected = self.is_workspace_sidebar_thread_selected(session);
+                    let is_selected =
+                        self.is_workspace_sidebar_thread_selected(session, suppress_own_active);
                     if row_is_visible && is_selected {
                         self.fill_rounded_rectangle_with_border(
                             layers,
@@ -2104,6 +2144,7 @@ impl crate::TermWindow {
                             session_row_height,
                             &chrome,
                             foreground,
+                            suppress_own_active,
                         )?;
                         let session_title = self.sidebar_thread_title(&session.id, &session.name);
                         self.paint_sidebar_text(
@@ -2194,6 +2235,12 @@ impl crate::TermWindow {
                 let row_bottom = row_top + session_row_height as f32;
                 let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
                 let y = row_top.floor().max(0.0) as usize;
+                // Hit rect clamped to the list viewport, like every other
+                // full-width row: a header scrolled under the toolbar keeps
+                // painting (masked) but must not swallow toolbar clicks.
+                let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
+                let hit_bottom = row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
+                let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
 
                 let disclosure_size = icon_size.min(22);
                 let disclosure_x = item_x + self.ui_px(SIDEBAR_INSET);
@@ -2209,12 +2256,33 @@ impl crate::TermWindow {
                     .saturating_sub(group_action_size + self.ui_px(SIDEBAR_INSET));
                 if row_is_visible {
                     let group_key = format!("{group_space_id}::{}", group.key);
+                    // The hover tag carries the provenance the project-name
+                    // header cannot: project names repeat across Spaces, so
+                    // a local group names its origin Space, and a remote one
+                    // leads with the machine. A dangling group's header IS
+                    // the machine label already — nothing left to add.
+                    let dangling = group
+                        .threads
+                        .first()
+                        .is_some_and(|reference| reference.dangling);
+                    let origin_tag = if dangling {
+                        String::new()
+                    } else if group.machine_is_local {
+                        group.origin_space_name.clone()
+                    } else if group.origin_space_name.is_empty() {
+                        group.machine_label.clone()
+                    } else {
+                        format!("{} · {}", group.machine_label, group.origin_space_name)
+                    };
                     self.ui_items.push(UIItem {
                         x: item_x,
-                        y,
+                        y: hit_y,
                         width: item_width,
-                        height: session_row_height,
-                        item_type: UIItemType::ThreadRefGroupToggle(group_key),
+                        height: hit_height,
+                        item_type: UIItemType::ThreadRefGroupToggle {
+                            key: group_key,
+                            origin: origin_tag,
+                        },
                     });
                     self.paint_sidebar_icon(
                         layers,
@@ -2240,10 +2308,11 @@ impl crate::TermWindow {
                             muted_fg.mul_alpha(0.6)
                         },
                     )?;
-                    // Header: origin-Space name, with the machine as a
-                    // right-aligned badge. The name is the primary info, so
-                    // when both cannot fit the badge is dropped first and
-                    // the name keeps the full width (ellipsized as needed).
+                    // Header: the origin project's name, full width, exactly
+                    // like a local folder. The machine it lives on is the
+                    // row's hover tag — a permanent badge would eat the
+                    // name's width on every row to answer a question the
+                    // user asks once.
                     let header_fg = if group.attached {
                         muted_fg
                     } else {
@@ -2251,56 +2320,6 @@ impl crate::TermWindow {
                     };
                     let text_avail =
                         group_action_x.saturating_sub(group_text_x + self.ui_px(SIDEBAR_INSET));
-                    let badge_pad = self.ui_px(6);
-                    let badge_gap = self.ui_px(8);
-                    // Badge typography: clearly smaller than the header name
-                    // so it reads as metadata, matching the height of the
-                    // "+" button beside it.
-                    let badge_font = self
-                        .fonts
-                        .title_font_with_size(
-                            crate::native_settings::sidebar_font_size() * 0.82,
-                        )
-                        .ok();
-                    // Local needs no badge: the badge answers "which
-                    // machine", and this machine is the answer by default.
-                    let show_badge = group.machine_label != group.label
-                        && !group.machine_label.is_empty()
-                        && group.machine_label != "Local";
-                    let badge = match (&badge_font, show_badge) {
-                        (Some(badge_font), true) => {
-                            let badge_metrics =
-                                RenderMetrics::with_font_metrics(&badge_font.metrics());
-                            (|| {
-                                let text_w = self
-                                    .cached_ui_text_advance(
-                                        badge_font,
-                                        &badge_metrics,
-                                        &group.machine_label,
-                                    )
-                                    .ok()?
-                                    .ceil() as usize;
-                                let name_w = self
-                                    .cached_ui_text_advance(
-                                        &ui_font,
-                                        &ui_metrics,
-                                        &group.label,
-                                    )
-                                    .ok()?
-                                    .ceil() as usize;
-                                let badge_w = text_w + badge_pad * 2;
-                                (name_w + badge_gap + badge_w <= text_avail)
-                                    .then_some((badge_w, badge_metrics))
-                            })()
-                        }
-                        _ => None,
-                    };
-                    let name_avail = match &badge {
-                        Some((badge_w, _)) => {
-                            text_avail.saturating_sub(badge_w + badge_gap)
-                        }
-                        None => text_avail,
-                    };
                     self.paint_sidebar_text(
                         layers,
                         &ui_font,
@@ -2308,44 +2327,9 @@ impl crate::TermWindow {
                         &group.label,
                         group_text_x,
                         text_y,
-                        name_avail,
+                        text_avail,
                         header_fg,
                     )?;
-                    if let (Some((badge_w, badge_metrics)), Some(badge_font)) =
-                        (badge, &badge_font)
-                    {
-                        // Same height as the "+" button so the trailing
-                        // cluster reads as one aligned row of controls.
-                        let badge_h = group_action_size;
-                        let badge_x = group_action_x
-                            .saturating_sub(self.ui_px(SIDEBAR_INSET) / 2 + badge_w);
-                        let badge_y =
-                            y + ((session_row_height.saturating_sub(badge_h)) / 2);
-                        self.fill_rounded_rectangle(
-                            layers,
-                            1,
-                            euclid::rect(
-                                badge_x as f32,
-                                badge_y as f32,
-                                badge_w as f32,
-                                badge_h as f32,
-                            ),
-                            chrome.sidebar_button_bg,
-                            self.ui_f32(SIDEBAR_ROW_RADIUS),
-                        )
-                        .context("sidebar ref group machine badge")?;
-                        let badge_cell_h = badge_metrics.cell_size.height as usize;
-                        self.paint_sidebar_text(
-                            layers,
-                            badge_font,
-                            badge_metrics,
-                            &group.machine_label,
-                            badge_x + badge_pad,
-                            badge_y + ((badge_h.saturating_sub(badge_cell_h)) / 2),
-                            badge_w.saturating_sub(badge_pad),
-                            header_fg,
-                        )?;
-                    }
 
                     // The group "+": create a thread in the origin project
                     // and auto-reference it here — same affordance as the
@@ -2396,10 +2380,8 @@ impl crate::TermWindow {
                     self.paint_sidebar_icon(
                         layers,
                         SvgIcon::Plus,
-                        group_action_x
-                            + ((group_action_size.saturating_sub(action_icon_size)) / 2),
-                        group_action_y
-                            + ((group_action_size.saturating_sub(action_icon_size)) / 2),
+                        group_action_x + ((group_action_size.saturating_sub(action_icon_size)) / 2),
+                        group_action_y + ((group_action_size.saturating_sub(action_icon_size)) / 2),
                         action_icon_size,
                         if group_action_hovered {
                             foreground
@@ -2456,7 +2438,7 @@ impl crate::TermWindow {
                                 session_width,
                                 session_row_height,
                             );
-                        let is_selected = self.is_workspace_sidebar_thread_selected(session);
+                        let is_selected = self.is_workspace_sidebar_thread_selected(session, false);
                         let dimmed = reference.dangling || !reference.origin_domain_attached;
                         if is_selected {
                             self.fill_rounded_rectangle_with_border(
@@ -2490,8 +2472,7 @@ impl crate::TermWindow {
                             .context("sidebar hovered thread ref")?;
                         }
 
-                        let text_y =
-                            y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
+                        let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
                         let action_size = session_row_height.saturating_sub(8).clamp(
                             self.ui_px(SESSION_ACTION_MIN_SIZE),
                             self.ui_px(SESSION_ACTION_MAX_SIZE),
@@ -2499,8 +2480,7 @@ impl crate::TermWindow {
                         let delete_x = session_x
                             .saturating_add(session_width)
                             .saturating_sub(self.ui_px(SIDEBAR_INSET) + action_size);
-                        let action_y =
-                            y + ((session_row_height.saturating_sub(action_size)) / 2);
+                        let action_y = y + ((session_row_height.saturating_sub(action_size)) / 2);
                         let text_right = if is_hovered {
                             delete_x
                         } else {
@@ -2517,6 +2497,7 @@ impl crate::TermWindow {
                                 session_row_height,
                                 &chrome,
                                 foreground,
+                                false,
                             )?;
                         }
                         let text_fg = if dimmed {
@@ -2533,8 +2514,7 @@ impl crate::TermWindow {
                             &session.name,
                             session_text_x,
                             text_y,
-                            text_right
-                                .saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET)),
+                            text_right.saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET)),
                             text_fg,
                         )?;
 
@@ -2560,10 +2540,8 @@ impl crate::TermWindow {
                             self.paint_sidebar_icon(
                                 layers,
                                 SvgIcon::X,
-                                delete_x
-                                    + ((action_size.saturating_sub(action_icon_size)) / 2),
-                                action_y
-                                    + ((action_size.saturating_sub(action_icon_size)) / 2),
+                                delete_x + ((action_size.saturating_sub(action_icon_size)) / 2),
+                                action_y + ((action_size.saturating_sub(action_icon_size)) / 2),
                                 action_icon_size,
                                 if hovered {
                                     foreground
@@ -2932,9 +2910,7 @@ impl crate::TermWindow {
             let settings_label_fits = self
                 .cached_ui_text_advance(&ui_font, &ui_metrics, &settings_label)
                 .map(|advance| {
-                    settings_label_x_inset
-                        + (advance.ceil() as usize)
-                        + self.ui_px(SIDEBAR_INSET)
+                    settings_label_x_inset + (advance.ceil() as usize) + self.ui_px(SIDEBAR_INSET)
                         <= settings_body_width
                 })
                 .unwrap_or(false);

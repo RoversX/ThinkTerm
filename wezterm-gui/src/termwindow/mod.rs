@@ -520,13 +520,20 @@ pub enum UIItemType {
     /// connected this session).
     SpaceReconnect,
     ProjectToggleThreads(String),
-    /// Collapse/expand a folder-style thread-reference group; the payload is
-    /// the group key (`"<space_id>::<machine_label>"`), tracked in runtime
-    /// state rather than the store.
-    ThreadRefGroupToggle(String),
+    /// Collapse/expand a folder-style thread-reference group. `key` is the
+    /// collapse-state key (`"<space_id>::"` + the group key — the origin
+    /// project id, or a machine fallback for dangling groups), tracked in
+    /// runtime state rather than the store. `origin` is the group's
+    /// provenance — origin Space for a local group, machine (and Space) for
+    /// a remote one, empty for a dangling group whose header already names
+    /// the machine; the row has no room for it, so it is the hover tag.
+    ThreadRefGroupToggle {
+        key: String,
+        origin: String,
+    },
     /// The "+" on a reference group: create a thread in the group's origin
     /// project (exactly like the project "+") and auto-add a ref to it in
-    /// the current Space. Payload is the group's origin Space id.
+    /// the current Space. Payload is the group key (origin project id).
     ThreadRefGroupNewThread(String),
     Project(String),
     WorkspaceThread(String),
@@ -1113,6 +1120,46 @@ mod tooltip_tests {
             assert!(tooltip_label_for(&item_type).is_none(), "{:?}", item_type);
         }
     }
+
+    #[test]
+    fn a_tag_centres_on_a_button_but_starts_at_a_rows_left_edge() {
+        // Icon button: centred on it, regardless of relative widths.
+        assert_eq!(tooltip_anchor_x(100.0, 24.0, 80.0, 1000.0, false), 72.0);
+        // The nearly-row-wide Settings body still centres — alignment is
+        // by item kind, so it cannot flip while the sidebar is resized.
+        assert_eq!(tooltip_anchor_x(8.0, 300.0, 80.0, 1000.0, false), 118.0);
+        // A list row's tag begins where the row begins — even when the tag
+        // is wider than the row (narrow sidebar, long origin), where
+        // centring would shove it left of the row.
+        assert_eq!(tooltip_anchor_x(8.0, 300.0, 80.0, 1000.0, true), 8.0);
+        assert_eq!(tooltip_anchor_x(8.0, 246.0, 300.0, 1000.0, true), 8.0);
+        // Neither mode may push the tag off-window.
+        assert_eq!(tooltip_anchor_x(0.0, 24.0, 80.0, 1000.0, false), 0.0);
+        assert_eq!(tooltip_anchor_x(960.0, 24.0, 80.0, 1000.0, false), 920.0);
+        assert_eq!(tooltip_anchor_x(960.0, 40.0, 80.0, 1000.0, true), 920.0);
+    }
+
+    /// A reference folder looks like any other folder, so where its threads
+    /// actually live is only discoverable through the hover tag: the origin
+    /// Space for a local group, machine · Space for a remote one.
+    #[test]
+    fn a_reference_group_names_its_origin() {
+        assert_eq!(
+            tooltip_label_for(&UIItemType::ThreadRefGroupToggle {
+                key: "project-1".to_string(),
+                origin: "Lab Server · Studies".to_string(),
+            })
+            .as_deref(),
+            Some("Lab Server · Studies")
+        );
+        // A dangling group's header already names the machine; the paint
+        // side passes an empty tag and no tooltip may appear.
+        assert!(tooltip_label_for(&UIItemType::ThreadRefGroupToggle {
+            key: "project-1".to_string(),
+            origin: String::new(),
+        })
+        .is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1277,9 +1324,40 @@ pub struct HoverTooltip {
     pub since: Instant,
 }
 
+/// Where a hover tag's left edge goes, given the rect it names.
+///
+/// Alignment is decided by what KIND of item is tagged, never inferred from
+/// widths: a width heuristic silently re-anchors whichever control happens
+/// to cross the tag's width — the Settings row is nearly sidebar-wide while
+/// its label shows, then collapses to an icon pill, and its tag must not
+/// flip alignment mid-resize. Buttons centre (the tag reads as belonging to
+/// the icon); full-width list rows left-align to the row's start (they have
+/// no centre worth pointing at). Kept clear of the window edges either way.
+pub fn tooltip_anchor_x(
+    item_x: f32,
+    item_width: f32,
+    tip_width: f32,
+    window_width: f32,
+    left_align: bool,
+) -> f32 {
+    let x = if left_align {
+        item_x
+    } else {
+        item_x + (item_width - tip_width) / 2.0
+    };
+    x.clamp(0.0, (window_width - tip_width).max(0.0))
+}
+
 /// The name to show for an icon-only button, or `None` for everything that
 /// already carries its own label (or whose meaning is obvious from position).
 pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
+    // A reference group's header shows the origin project's name, exactly
+    // like a local folder. Where that project actually lives — which Space,
+    // which machine — has nowhere to go on a sidebar-width row, so the
+    // hover tag is where it appears.
+    if let UIItemType::ThreadRefGroupToggle { origin, .. } = item_type {
+        return (!origin.is_empty()).then(|| origin.clone());
+    }
     let key = match item_type {
         UIItemType::WorkspaceSidebarSettings => "tooltip-sidebar-settings",
         UIItemType::WorkspaceSidebarViewOptions => "tooltip-sidebar-view-options",
@@ -1836,7 +1914,9 @@ pub struct TermWindow {
     /// Feeds the hover-reveal as a hot zone.
     titlebar_sidebar_button_hovered: bool,
     /// Collapsed folder-style reference groups, keyed by
-    /// `"<space_id>::<machine_label>"`. Runtime-only: collapse state resets
+    /// `"<space_id>::<group_key>"`, where the group key is the origin
+    /// project id (or a machine fallback for dangling groups). Runtime-only:
+    /// collapse state resets
     /// with the window, like a disclosure and unlike project collapse.
     thread_ref_groups_collapsed: std::collections::HashSet<String>,
     /// A native (AppKit) context menu is open. The fallback menu tracks
