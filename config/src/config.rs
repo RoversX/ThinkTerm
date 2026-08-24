@@ -1872,11 +1872,11 @@ fn validate_scrollback_lines(value: &usize) -> Result<(), String> {
 }
 
 fn default_initial_rows() -> u16 {
-    24
+    32
 }
 
 fn default_initial_cols() -> u16 {
-    80
+    120
 }
 
 pub fn default_hyperlink_rules() -> Vec<hyperlink::Rule> {
