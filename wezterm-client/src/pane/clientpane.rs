@@ -406,7 +406,11 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
-            agent_status: Mutex::new(None),
+            // Seed from the domain's remote-keyed snapshot: this pane's
+            // status may have been fetched or pushed before the mirror
+            // existed, and nothing re-delivers it until the agent next
+            // changes state.
+            agent_status: Mutex::new(client.remote_agent_status(remote_pane_id)),
         }
     }
 

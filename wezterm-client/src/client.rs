@@ -420,6 +420,24 @@ async fn process_unilateral_inner_async(
         return Ok(());
     }
 
+    // Agent statuses routinely arrive before their pane's local mirror
+    // exists (all through an attach). Record every one into the domain's
+    // remote-keyed snapshot first — a mirror materializing later seeds
+    // itself from it — and then still deliver live to a mapped pane below.
+    // PaneRemoved must prune that snapshot here: the server deliberately
+    // never publishes an eviction status (its PaneRemoved handler is
+    // evict-only), and a retained entry would seed a *reused* remote pane
+    // id with the dead pane's agent.
+    match &decoded.pdu {
+        Pdu::AgentStatusChanged(codec::AgentStatusChanged { pane_id, status }) => {
+            client_domain.record_remote_agent_status(*pane_id, status.clone());
+        }
+        Pdu::PaneRemoved(_) => {
+            client_domain.record_remote_agent_status(pane_id, None);
+        }
+        _ => {}
+    }
+
     // If we get a push for a pane that we don't yet know about,
     // it means that some other client has manipulated the mux
     // topology; we need to re-sync.
@@ -427,11 +445,10 @@ async fn process_unilateral_inner_async(
         Some(p) => p,
         None => {
             // Not for agent status though: the server publishes those for
-            // every pane it owns (other workspaces included), and around a
-            // pane's removal the eviction push can land on either side of
-            // our own PaneRemoved handling — both orders are harmless.
-            // Neither implies a topology change worth a full resync; the
-            // cold-start fetch covers late mapping.
+            // every pane it owns, other workspaces included, so unmapped
+            // is routine and implies no topology change worth a resync.
+            // The status was recorded into the snapshot above; the mirror
+            // seeds from it whenever it materializes.
             if matches!(decoded.pdu, Pdu::AgentStatusChanged(_)) {
                 return Ok(());
             }

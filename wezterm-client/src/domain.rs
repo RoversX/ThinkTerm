@@ -460,6 +460,13 @@ pub struct ClientInner {
     remote_to_local_window: Mutex<HashMap<WindowId, WindowId>>,
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
+    /// The latest agent status the server pushed or served for each
+    /// *remote* pane id, retained whether or not a local mirror exists
+    /// yet. A mirror that materializes later seeds itself from here
+    /// (`ClientPane::new`), which closes the attach-time hole where the
+    /// cold-start fetch ran before the panes existed and the push path
+    /// had nothing to deliver to — each side assumed the other covered it.
+    remote_agent_statuses: Mutex<HashMap<PaneId, thinkterm_proto::AgentStatus>>,
     /// Authoritative per-remote-tab viewport ownership pushed by the server.
     remote_viewports: Mutex<HashMap<TabId, codec::ClientViewportState>>,
     /// Connection-wide A/B mode and exclusive handoff owner.
@@ -708,6 +715,39 @@ impl ClientInner {
         None
     }
 
+    /// Record one status into the remote-keyed snapshot (`None` clears).
+    /// Called for every AgentStatusChanged push, mapped or not, so a
+    /// mirror that materializes later can seed itself; the `None` path is
+    /// driven by PaneRemoved on the client side — the server never pushes
+    /// an eviction status of its own.
+    pub fn record_remote_agent_status(
+        &self,
+        remote_pane_id: PaneId,
+        status: Option<thinkterm_proto::AgentStatus>,
+    ) {
+        let mut map = self.remote_agent_statuses.lock().unwrap();
+        match status {
+            Some(status) => {
+                map.insert(remote_pane_id, status);
+            }
+            None => {
+                map.remove(&remote_pane_id);
+            }
+        }
+    }
+
+    /// The last status the server reported for a remote pane, if any.
+    pub fn remote_agent_status(
+        &self,
+        remote_pane_id: PaneId,
+    ) -> Option<thinkterm_proto::AgentStatus> {
+        self.remote_agent_statuses
+            .lock()
+            .unwrap()
+            .get(&remote_pane_id)
+            .cloned()
+    }
+
     pub fn remote_to_local_pane_id(&self, remote_pane_id: PaneId) -> Option<TabId> {
         let mut pane_map = self.remote_to_local_pane.lock().unwrap();
         let remote_server_id = self.client.remote_server_id();
@@ -898,6 +938,11 @@ impl ClientInner {
         self.remote_to_local_pane.lock().unwrap().clear();
         self.remote_to_local_stack.lock().unwrap().clear();
         self.reported_viewports.lock().unwrap().clear();
+        // The replacement server allocates pane ids from scratch, so the
+        // retained statuses describe panes that no longer exist. Left in
+        // place they would seed the replacement's mirrors (created before
+        // the post-replacement fetch) with the dead server's agents.
+        self.remote_agent_statuses.lock().unwrap().clear();
         mirrors
     }
 
@@ -1089,6 +1134,7 @@ impl ClientInner {
             remote_to_local_window: Mutex::new(HashMap::new()),
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
+            remote_agent_statuses: Mutex::new(HashMap::new()),
             remote_viewports: Mutex::new(HashMap::new()),
             remote_access: Mutex::new(None),
             reported_viewports: Mutex::new(HashMap::new()),
@@ -1581,6 +1627,17 @@ impl ClientDomain {
     pub fn remote_to_local_pane_id(&self, remote_pane_id: TabId) -> Option<TabId> {
         let inner = self.inner()?;
         inner.remote_to_local_pane_id(remote_pane_id)
+    }
+
+    /// See [`ClientInner::record_remote_agent_status`].
+    pub fn record_remote_agent_status(
+        &self,
+        remote_pane_id: PaneId,
+        status: Option<thinkterm_proto::AgentStatus>,
+    ) {
+        if let Some(inner) = self.inner() {
+            inner.record_remote_agent_status(remote_pane_id, status);
+        }
     }
 
     pub fn remote_to_local_window_id(&self, remote_window_id: WindowId) -> Option<WindowId> {
@@ -2165,16 +2222,25 @@ impl ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
         let response = inner.client.get_agent_statuses().await?;
-        let mut desired: std::collections::HashMap<PaneId, thinkterm_proto::AgentStatus> =
-            response
-                .statuses
-                .into_iter()
-                .filter_map(|entry| {
-                    inner
-                        .remote_to_local_pane_id(entry.pane_id)
-                        .map(|local| (local, entry.status))
-                })
-                .collect();
+        // Retain the snapshot keyed by *remote* pane id before any local
+        // mapping is attempted: on attach this fetch typically runs while
+        // the mirrors are still being materialized, and a status that
+        // cannot map yet must wait for its pane (`ClientPane::new` seeds
+        // from this map), not evaporate.
+        let remote: std::collections::HashMap<PaneId, thinkterm_proto::AgentStatus> = response
+            .statuses
+            .into_iter()
+            .map(|entry| (entry.pane_id, entry.status))
+            .collect();
+        *inner.remote_agent_statuses.lock().unwrap() = remote.clone();
+        let mut desired: std::collections::HashMap<PaneId, thinkterm_proto::AgentStatus> = remote
+            .into_iter()
+            .filter_map(|(remote_pane, status)| {
+                inner
+                    .remote_to_local_pane_id(remote_pane)
+                    .map(|local| (local, status))
+            })
+            .collect();
         let mux = Mux::get();
         let mut changed = Vec::new();
         for pane in mux.iter_panes() {
