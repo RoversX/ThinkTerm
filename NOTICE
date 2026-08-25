@@ -1,0 +1,8 @@
+This product bundles agent-detection manifest files under
+mux/src/agent_status/manifests/ that are sourced from the herdr
+project (https://github.com/herdrdev/herdr), copyright the herdr
+contributors, and licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). A copy of that license is
+included at mux/src/agent_status/manifests/LICENSE. Each bundled file
+carries an attribution header naming the upstream commit it was taken
+from.

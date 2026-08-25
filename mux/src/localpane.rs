@@ -482,6 +482,14 @@ impl Pane for LocalPane {
         self.terminal.lock().get_progress()
     }
 
+    fn agent_osc_evidence(&self) -> wezterm_term::AgentOscEvidence {
+        self.terminal.lock().agent_osc_evidence()
+    }
+
+    fn clear_agent_osc_evidence(&self) {
+        self.terminal.lock().clear_agent_osc_state();
+    }
+
     fn palette(&self) -> ColorPalette {
         self.terminal.lock().palette()
     }

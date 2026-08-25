@@ -200,6 +200,62 @@ impl DerefMut for TestTerm {
 }
 
 #[test]
+fn agent_osc_evidence_tracks_only_real_emissions() {
+    let mut term = TestTerm::new(4, 20, 0);
+
+    // A fresh terminal has a displayable title but zero evidence: the
+    // distinction is the whole point of the evidence channel.
+    let fresh = term.agent_osc_evidence();
+    assert_eq!(fresh.title, None);
+    assert_eq!(fresh.progress, None);
+    assert!(!term.get_title().is_empty());
+
+    term.print("\x1b]0;\u{25d0} fix the tests\x07");
+    assert_eq!(
+        term.agent_osc_evidence().title.as_deref(),
+        Some("\u{25d0} fix the tests")
+    );
+
+    // OSC 1 names only the icon and shells emit it freely: it must not
+    // create evidence, and an empty one must not erase what an agent
+    // said via OSC 0/2.
+    term.print("\x1b]1;shell-icon\x07");
+    assert_eq!(
+        term.agent_osc_evidence().title.as_deref(),
+        Some("\u{25d0} fix the tests")
+    );
+    term.print("\x1b]1;\x07");
+    assert_eq!(
+        term.agent_osc_evidence().title.as_deref(),
+        Some("\u{25d0} fix the tests")
+    );
+
+    term.print("\x1b]9;4;3\x07");
+    assert_eq!(term.agent_osc_evidence().progress.as_deref(), Some("4;3"));
+    // Explicit clear is retained as "4;0" — distinct from never-reported.
+    term.print("\x1b]9;4;0\x07");
+    assert_eq!(term.agent_osc_evidence().progress.as_deref(), Some("4;0"));
+    // A pause is retained pre-flattening even though the display path
+    // folds it into Progress::None.
+    term.print("\x1b]9;4;4\x07");
+    assert_eq!(term.agent_osc_evidence().progress.as_deref(), Some("4;4"));
+
+    // Clearing evidence leaves the display title alone.
+    let shown = term.get_title().to_string();
+    term.clear_agent_osc_state();
+    let cleared = term.agent_osc_evidence();
+    assert_eq!(cleared.title, None);
+    assert_eq!(cleared.progress, None);
+    assert_eq!(term.get_title(), shown);
+
+    // Hard reset drops evidence too.
+    term.print("\x1b]2;busy\x07\x1b]9;4;3\x07");
+    assert!(term.agent_osc_evidence().title.is_some());
+    term.print("\x1bc");
+    assert_eq!(term.agent_osc_evidence(), Default::default());
+}
+
+#[test]
 fn application_palette_override_tracks_osc_set_query_and_reset() {
     let mut term = TestTerm::new(4, 8, 0);
     assert!(term.palette_override().is_none());

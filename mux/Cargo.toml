@@ -35,6 +35,7 @@ portable-pty = { workspace=true, features = ["serde_support"]}
 procinfo.workspace = true
 promise.workspace = true
 rangeset.workspace = true
+regex.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serial2.workspace = true
 shell-words.workspace = true
@@ -45,6 +46,7 @@ termwiz.workspace = true
 textwrap.workspace = true
 thinkterm-proto = { workspace = true, features = ["lua"] }
 thiserror.workspace = true
+toml.workspace = true
 url.workspace = true
 wezterm-dynamic.workspace = true
 wezterm-ssh.workspace = true

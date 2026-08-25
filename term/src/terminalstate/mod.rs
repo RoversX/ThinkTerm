@@ -244,6 +244,18 @@ impl ScreenOrAlt {
     }
 }
 
+/// OSC signals retained verbatim for agent detection: `None` until the
+/// application actually emits them. See
+/// [`TerminalState::agent_osc_evidence`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentOscEvidence {
+    /// The raw OSC 0/1/2 title payload, or `None` if never set.
+    pub title: Option<String>,
+    /// The raw OSC 9;4 payload in `4;<state>[;<progress>]` shape, or
+    /// `None` if never set.
+    pub progress: Option<String>,
+}
+
 /// Manages the state for the terminal
 pub struct TerminalState {
     config: Arc<dyn TerminalConfiguration>,
@@ -337,6 +349,16 @@ pub struct TerminalState {
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     progress: Progress,
+    /// The raw OSC title payload the application most recently emitted,
+    /// retained for agent detection. Unlike `title`, this is never
+    /// synthesized from a default or a process name: `None` means the
+    /// app has not spoken.
+    agent_osc_title: Option<String>,
+    /// The raw OSC 9;4 progress payload most recently emitted, in the
+    /// `4;<state>[;<progress>]` shape agent manifests match, retained
+    /// before any display flattening (Paused stays distinct). `None`
+    /// means the app has not spoken.
+    agent_osc_progress: Option<String>,
 
     palette: Option<ColorPalette>,
 
@@ -611,6 +633,8 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            agent_osc_title: None,
+            agent_osc_progress: None,
         }
     }
 
@@ -674,6 +698,25 @@ impl TerminalState {
 
     pub fn get_progress(&self) -> Progress {
         self.progress.clone()
+    }
+
+    /// The OSC evidence retained for agent detection: what the app
+    /// actually emitted, or empty if it never spoke. Deliberately
+    /// separate from `get_title`/`get_progress`, which exist for
+    /// display and cannot distinguish "never reported" from defaults.
+    pub fn agent_osc_evidence(&self) -> AgentOscEvidence {
+        AgentOscEvidence {
+            title: self.agent_osc_title.clone(),
+            progress: self.agent_osc_progress.clone(),
+        }
+    }
+
+    /// Drop retained agent OSC evidence, e.g. when the foreground agent
+    /// changes so a new occupant does not inherit the old one's signals.
+    /// Display state (`title`, `progress`) is untouched.
+    pub fn clear_agent_osc_state(&mut self) {
+        self.agent_osc_title = None;
+        self.agent_osc_progress = None;
     }
 
     /// Returns the current working directory associated with the

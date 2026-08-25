@@ -12,6 +12,7 @@
 //! 32-bit peer (wasm) caps out at `u32::MAX` of them per session — accepted
 //! deliberately; they are per-session counters and never get near that.
 
+pub mod agent;
 pub mod client;
 pub mod command;
 pub mod keyassignment;
@@ -20,6 +21,7 @@ pub mod pane;
 pub mod renderable;
 pub mod split;
 
+pub use agent::{AgentEvidence, AgentState, AgentStatus};
 pub use client::{ClientId, ClientInfo};
 pub use command::{CommandSpec, EnvVar};
 pub use keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};

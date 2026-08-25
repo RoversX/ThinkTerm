@@ -716,6 +716,8 @@ impl<'a> Performer<'a> {
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
                 self.progress = Progress::default();
+                self.agent_osc_title = None;
+                self.agent_osc_progress = None;
 
                 // Before the screen is torn down, while the placement rows
                 // still refer to real lines. The soft reset (DECSTR) already
@@ -748,6 +750,11 @@ impl<'a> Performer<'a> {
         match osc {
             OperatingSystemCommand::SetIconNameSun(title)
             | OperatingSystemCommand::SetIconName(title) => {
+                // Deliberately not recorded as agent title evidence: OSC 1
+                // only names the icon, and shells emit it freely -- letting
+                // it overwrite (or, when empty, erase) the window-title
+                // evidence would wipe what an agent said via OSC 0/2 while
+                // the displayed title is untouched.
                 if title.is_empty() {
                     self.icon_title = None;
                 } else {
@@ -759,6 +766,11 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::SetIconNameAndWindowTitle(title) => {
+                self.agent_osc_title = if title.is_empty() {
+                    None
+                } else {
+                    Some(title.clone())
+                };
                 self.icon_title.take();
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
@@ -769,6 +781,11 @@ impl<'a> Performer<'a> {
 
             OperatingSystemCommand::SetWindowTitleSun(title)
             | OperatingSystemCommand::SetWindowTitle(title) => {
+                self.agent_osc_title = if title.is_empty() {
+                    None
+                } else {
+                    Some(title.clone())
+                };
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::WindowTitleChanged(title));
@@ -1085,6 +1102,17 @@ impl<'a> Performer<'a> {
             }
             OperatingSystemCommand::ConEmuProgress(prog) => {
                 use wezterm_escape_parser::osc::Progress as TProg;
+                // Retained before the display flattening below (which folds
+                // Paused into None) and before the no-change early-out: a
+                // repeated identical payload is still evidence that the app
+                // is speaking.
+                self.agent_osc_progress = Some(match &prog {
+                    TProg::None => "4;0".to_string(),
+                    TProg::SetPercentage(p) => format!("4;1;{p}"),
+                    TProg::SetError(p) => format!("4;2;{p}"),
+                    TProg::SetIndeterminate => "4;3".to_string(),
+                    TProg::Paused => "4;4".to_string(),
+                });
                 let prog = match prog {
                     TProg::None => Progress::None,
                     TProg::SetPercentage(p) => Progress::Percentage(p),

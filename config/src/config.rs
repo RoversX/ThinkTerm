@@ -855,6 +855,13 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub unzoom_on_switch_pane: bool,
 
+    /// Whether this process classifies its panes as running coding agents
+    /// (Claude Code, Codex, …). Turning it off stops all screen-rule and
+    /// contract evaluation here; a mux server and its clients each obey
+    /// their own setting, because detection happens where the pane lives.
+    #[dynamic(default = "default_true")]
+    pub agent_status_detection: bool,
+
     #[dynamic(default = "default_max_fps")]
     pub max_fps: u64,
 

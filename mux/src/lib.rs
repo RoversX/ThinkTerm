@@ -37,6 +37,7 @@ use wezterm_term::{
 use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
 pub mod activity;
+pub mod agent_status;
 pub mod client;
 pub mod command_spec;
 pub mod connui;
@@ -64,6 +65,9 @@ pub enum MuxNotification {
     PaneOutput(PaneId),
     PaneAdded(PaneId),
     PaneRemoved(PaneId),
+    /// The mux that owns this pane re-classified its agent status; read
+    /// the fresh value via `Pane::agent_status`.
+    AgentStatusChanged(PaneId),
     WindowCreated(WindowId),
     WindowRemoved(WindowId),
     WindowInvalidated(WindowId),
@@ -2067,6 +2071,31 @@ impl Mux {
     }
 
     fn notify_immediate(&self, notification: MuxNotification) {
+        thread_local! {
+            static NOTIFY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        // The subscriber map is held (exclusively) while callbacks run, and
+        // the lock is not re-entrant: a subscriber that calls notify()
+        // synchronously deadlocks in release builds. Turn that hang into a
+        // debug panic with a stack trace; the fix is always to defer the
+        // nested notify via spawn_into_main_thread.
+        NOTIFY_DEPTH.with(|depth| {
+            debug_assert_eq!(
+                depth.get(),
+                0,
+                "re-entrant Mux::notify: a subscriber called notify() while \
+                 the subscriber map was locked; defer the nested notify via \
+                 spawn_into_main_thread (in release this deadlocks)"
+            );
+            depth.set(depth.get() + 1);
+        });
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                NOTIFY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            }
+        }
+        let _guard = DepthGuard;
         let mut subscribers = self.subscribers.write();
         subscribers.retain(|_, notify| notify(notification.clone()));
     }
@@ -2190,7 +2219,11 @@ impl Mux {
         self.palette_advisories.lock().remove_pane(pane_id);
         crate::pane::set_frontend_cell_metrics(pane_id, None);
         let mut changed = false;
-        if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
+        // Bind the removal first: in edition 2018 the `if let` scrutinee's
+        // temporary (the panes write guard) would otherwise live across the
+        // notify below, deadlocking any subscriber that touches the pane map.
+        let removed = self.panes.write().remove(&pane_id);
+        if let Some(pane) = removed {
             log::debug!("killing pane {}", pane_id);
             pane.kill();
             self.notify(MuxNotification::PaneRemoved(pane_id));
@@ -2518,11 +2551,11 @@ impl Mux {
 
     pub fn resolve_pane_id(&self, pane_id: PaneId) -> Option<(DomainId, WindowId, TabId)> {
         let mut ids = None;
-        for tab in self.tabs.read().values() {
+        'tabs: for tab in self.tabs.read().values() {
             for pane in tab.iter_all_panes() {
                 if pane.pane_id() == pane_id {
                     ids = Some((tab.tab_id(), pane.domain_id()));
-                    break;
+                    break 'tabs;
                 }
             }
         }
@@ -4154,5 +4187,21 @@ mod tests {
 
         assert_eq!(context.size, requested_size);
         assert!(context.term_config.is_none());
+    }
+
+    /// A subscriber that calls notify() synchronously re-enters the
+    /// subscriber lock and would deadlock a release build; debug builds
+    /// turn it into this assertion.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "re-entrant Mux::notify")]
+    fn notify_is_not_reentrant() {
+        let mux = Arc::new(Mux::new(None));
+        let inner = Arc::clone(&mux);
+        mux.subscribe(move |_| {
+            inner.notify(MuxNotification::PaneRemoved(999_999));
+            true
+        });
+        mux.notify(MuxNotification::PaneRemoved(999_998));
     }
 }

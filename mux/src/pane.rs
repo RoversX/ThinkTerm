@@ -357,6 +357,27 @@ pub trait Pane: Downcast + Send + Sync {
     }
 
     fn get_current_working_dir(&self, policy: CachePolicy) -> Option<Url>;
+
+    /// The agent (if any) this pane is running, as classified by the mux
+    /// that owns it. Locally-owned panes answer from this process's
+    /// detector; ClientPane overrides with what the owning server pushed.
+    fn agent_status(&self) -> Option<thinkterm_proto::AgentStatus> {
+        crate::agent_status::status_for_pane(self.pane_id())
+    }
+
+    /// OSC title/progress the application actually emitted, retained for
+    /// agent detection. Deliberately not `get_title`/`get_progress`, which
+    /// exist for display and substitute defaults (process basename, "4;0")
+    /// that would make idle screen rules match unconditionally. The default
+    /// is empty: remote mirrors are never detected locally.
+    fn agent_osc_evidence(&self) -> wezterm_term::AgentOscEvidence {
+        Default::default()
+    }
+
+    /// Drop retained agent OSC evidence so a pane's next occupant does not
+    /// inherit the previous agent's signals. No-op by default.
+    fn clear_agent_osc_evidence(&self) {}
+
     fn get_foreground_process_name(&self, _policy: CachePolicy) -> Option<String> {
         None
     }

@@ -482,7 +482,10 @@ macro_rules! pdu {
 /// 60: Spawn PDUs carry a portable CommandSpec instead of CommandBuilder;
 ///     argv, env and cwd travel as byte strings rather than OsString, and
 ///     the umask field exists on every platform instead of only unix.
-pub const CODEC_VERSION: usize = 60;
+/// 61: Agent status is classified by the mux that owns the pane and pushed
+///     to clients (AgentStatusChanged), with a request/response pair for
+///     cold-start delivery and for `thinkterm cli agent list`.
+pub const CODEC_VERSION: usize = 61;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -560,6 +563,9 @@ pdu! {
     SetClientView: 77,
     SetFrontendAccessMode: 78,
     FrontendAccessState: 79,
+    AgentStatusChanged: 80,
+    GetAgentStatuses: 81,
+    GetAgentStatusesResponse: 82,
 }
 
 impl Pdu {
@@ -678,6 +684,7 @@ impl Pdu {
             | Pdu::NotifyAlert(NotifyAlert { pane_id, .. })
             | Pdu::SetClipboard(SetClipboard { pane_id, .. })
             | Pdu::PaneFocused(PaneFocused { pane_id })
+            | Pdu::AgentStatusChanged(AgentStatusChanged { pane_id, .. })
             | Pdu::PaneRemoved(PaneRemoved { pane_id }) => Some(*pane_id),
             _ => None,
         }
@@ -1016,6 +1023,36 @@ pub enum ThinkTermSessionWorkStatus {
 /// Ask a mux server for its authoritative ThinkTerm session view.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
 pub struct GetThinkTermSessionState {}
+
+/// Unilateral: the mux that owns `pane_id` re-classified its agent status.
+/// `None` means the pane is no longer running a recognized agent.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct AgentStatusChanged {
+    pub pane_id: PaneId,
+    pub status: Option<thinkterm_proto::AgentStatus>,
+}
+
+/// Ask a mux for the agent status of every pane it knows about — detected
+/// locally or mirrored from a chained server. Serves cold-start delivery
+/// on attach and `thinkterm cli agent list`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct GetAgentStatuses {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct AgentStatusEntry {
+    pub pane_id: PaneId,
+    pub status: thinkterm_proto::AgentStatus,
+    /// Server-side title and workspace, so a one-shot client (the CLI)
+    /// needs no second ListPanes round trip. The GUI ignores both: it
+    /// already mirrors the pane objects these were read from.
+    pub title: String,
+    pub workspace: String,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct GetAgentStatusesResponse {
+    pub statuses: Vec<AgentStatusEntry>,
+}
 
 /// Select an existing authoritative Thread, or create the canonical
 /// Default/Home/main landing when the server has no usable Thread, and make
@@ -2005,8 +2042,47 @@ mod test {
     }
 
     #[test]
-    fn thinkterm_session_viewport_and_landing_protocol_round_trip_at_version_60() {
-        assert_eq!(CODEC_VERSION, 60);
+    fn agent_status_protocol_round_trip_at_version_61() {
+        assert_eq!(CODEC_VERSION, 61);
+        use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
+
+        fn round_trip(pdu: Pdu) {
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 0x61).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.serial, 0x61);
+            assert_eq!(decoded.pdu, pdu);
+        }
+
+        let status = AgentStatus {
+            agent_id: "claude".to_string(),
+            state: AgentState::Blocked,
+            evidence: AgentEvidence::Screen,
+            session_id: Some("abc-123".to_string()),
+            since_unix: 1_756_000_000,
+            ended: false,
+        };
+        round_trip(Pdu::AgentStatusChanged(AgentStatusChanged {
+            pane_id: 7,
+            status: Some(status.clone()),
+        }));
+        round_trip(Pdu::AgentStatusChanged(AgentStatusChanged {
+            pane_id: 7,
+            status: None,
+        }));
+        round_trip(Pdu::GetAgentStatuses(GetAgentStatuses {}));
+        round_trip(Pdu::GetAgentStatusesResponse(GetAgentStatusesResponse {
+            statuses: vec![AgentStatusEntry {
+                pane_id: 7,
+                status,
+                title: "claude".to_string(),
+                workspace: "default".to_string(),
+            }],
+        }));
+    }
+
+    #[test]
+    fn thinkterm_session_viewport_and_landing_protocol_round_trip() {
         let size = TerminalSize {
             rows: 40,
             cols: 132,
