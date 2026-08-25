@@ -53,12 +53,23 @@ fn probe(pane: &dyn Pane) -> CachedIdent {
     } else {
         CachePolicy::FetchImmediate
     };
-    let leader_path = pane.get_foreground_process_name(policy);
+    let leader_path = pane
+        .get_foreground_process_name(policy)
+        .map(normalize_executable_path);
     let resolved = CachedIdent {
         at: now,
-        agent: leader_path
-            .as_deref()
-            .and_then(identify_from_process_path),
+        agent: leader_path.as_deref().and_then(|path| {
+            // argv is fetched only if the leader turns out to be a generic
+            // interpreter, and always AllowStale: the name probe one step
+            // up just refreshed the leader cache, so this reuses that same
+            // pid. Re-probing here could race a foreground change and pair
+            // this argv with the other probe's path — and on Windows a
+            // FetchImmediate would repeat a full process-table walk.
+            let mut argv = || pane.get_foreground_process_argv(CachePolicy::AllowStale);
+            super::proc_match::identify(path, &mut argv, &|name| {
+                super::engine::manifest_id_for_alias(name)
+            })
+        }),
         leader_path,
     };
 
@@ -110,98 +121,34 @@ pub fn forget_pane(pane_id: crate::pane::PaneId) {
     }
 }
 
-/// Match a foreground executable path to a manifest id: by basename, and
-/// failing that by the last few directory components. Version-managed
-/// launchers exec a binary named after the version — e.g. Claude Code runs
-/// as `~/.local/share/claude/versions/2.1.239` — so the agent's name only
-/// appears as a parent directory.
-fn identify_from_process_path(path: &str) -> Option<String> {
-    let name = basename(path).to_lowercase();
-    if let Some(id) = super::engine::manifest_id_for_alias(&name) {
-        return Some(id);
+/// On Linux, `/proc/<pid>/exe` reads as `/path/to/bin (deleted)` once the
+/// binary has been replaced on disk — routine for self-updating agents.
+/// Normalizing here, at the module's single entry point for the path,
+/// keeps both identification and the contract's leader-path equality
+/// working across an in-place update. macOS resolves via `proc_pidpath`,
+/// which never decorates the path, so this is a no-op there.
+fn normalize_executable_path(path: String) -> String {
+    match path.strip_suffix(" (deleted)") {
+        Some(stripped) => stripped.to_string(),
+        None => path,
     }
-    // Directory components only vouch for a *versioned launcher* layout
-    // (`~/.local/share/claude/versions/2.1.239`). Without the version-like
-    // basename gate, any executable under an alias-named directory would
-    // be misidentified — e.g. everything in `/home/pi/.local/bin`.
-    if !looks_like_version(&name) {
-        return None;
-    }
-    path.rsplit(['/', '\\'])
-        .skip(1)
-        .take(2)
-        .find_map(|component| super::engine::manifest_id_for_alias(&component.to_lowercase()))
-}
-
-/// A launcher-style version basename: starts with a digit, rest is
-/// digits/letters/dots/dashes ("2.1.239", "1.0.0-rc1").
-fn looks_like_version(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_digit())
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-}
-
-fn basename(path: &str) -> &str {
-    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    name.strip_suffix(".exe").unwrap_or(name)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::basename;
+    // Matching-rule behavior is covered in `proc_match`'s own tests
+    // against a fake alias table; this module only owns the path
+    // normalization and the cache.
 
     #[test]
-    fn basenames() {
-        assert_eq!(basename("/usr/local/bin/claude"), "claude");
-        assert_eq!(basename("codex"), "codex");
-        assert_eq!(basename("C:\\tools\\codex.exe"), "codex");
-    }
-
-    #[test]
-    fn versioned_launcher_paths_identify_by_parent_directory() {
+    fn replaced_binaries_lose_their_deleted_decoration() {
         assert_eq!(
-            super::identify_from_process_path("/Users/x/.local/share/claude/versions/2.1.239")
-                .as_deref(),
-            Some("claude")
+            super::normalize_executable_path("/usr/local/bin/claude (deleted)".to_string()),
+            "/usr/local/bin/claude"
         );
         assert_eq!(
-            super::identify_from_process_path("/usr/local/bin/claude").as_deref(),
-            Some("claude")
-        );
-        assert_eq!(super::identify_from_process_path("/bin/zsh"), None);
-        // The component match only looks at the trailing directories, so a
-        // deep unrelated prefix cannot misidentify.
-        assert_eq!(
-            super::identify_from_process_path("/home/claude/projects/tool/bin/node"),
-            None
-        );
-    }
-
-    /// Directory names vouch only for versioned launchers: an ordinary
-    /// binary living under an alias-named directory (a user named `pi`,
-    /// say) must not be misidentified.
-    #[test]
-    fn alias_named_directories_do_not_claim_ordinary_binaries() {
-        assert_eq!(
-            super::identify_from_process_path("/home/pi/.local/bin/htop"),
-            None
-        );
-        // Even a version-like basename doesn't help when the alias is a
-        // grandparent past the two-component window — `pi` here is the
-        // user's home, not a launcher directory.
-        assert_eq!(
-            super::identify_from_process_path("/home/pi/.local/bin/2.0.1"),
-            None
-        );
-        // A real launcher layout for the same agent still identifies.
-        assert_eq!(
-            super::identify_from_process_path("/home/x/pi/versions/2.0.1").as_deref(),
-            Some("pi")
-        );
-        // The gate also bounds the walk to the last two directories.
-        assert_eq!(
-            super::identify_from_process_path("/opt/claude/deep/nested/2.1.0"),
-            None
+            super::normalize_executable_path("/usr/local/bin/claude".to_string()),
+            "/usr/local/bin/claude"
         );
     }
 }

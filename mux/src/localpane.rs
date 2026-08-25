@@ -586,6 +586,27 @@ impl Pane for LocalPane {
         None
     }
 
+    fn get_foreground_process_argv(&self, policy: CachePolicy) -> Option<Vec<String>> {
+        #[cfg(unix)]
+        {
+            let leader = self.get_leader(policy);
+            if leader.pid > 0 {
+                return LocalProcessInfo::argv_for_pid(leader.pid);
+            }
+            return None;
+        }
+
+        #[cfg(windows)]
+        if let Some(fg) = self.divine_foreground_process(policy) {
+            if !fg.argv.is_empty() {
+                return Some(fg.argv);
+            }
+        }
+
+        #[allow(unreachable_code)]
+        None
+    }
+
     fn can_close_without_prompting(&self, _reason: CloseReason) -> bool {
         if let Some(info) = self.divine_process_list(CachePolicy::FetchImmediate) {
             log::trace!(

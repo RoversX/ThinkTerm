@@ -381,6 +381,14 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_foreground_process_name(&self, _policy: CachePolicy) -> Option<String> {
         None
     }
+    /// The argument vector of the foreground process-group leader, when
+    /// the platform can read it. Agent identification asks for this only
+    /// when the leader executable is a generic interpreter (node, python,
+    /// a shell), so implementations may fetch it on demand rather than
+    /// caching it alongside the leader path.
+    fn get_foreground_process_argv(&self, _policy: CachePolicy) -> Option<Vec<String>> {
+        None
+    }
     fn get_foreground_process_info(
         &self,
         _policy: CachePolicy,

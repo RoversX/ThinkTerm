@@ -24,6 +24,7 @@ pub mod contract;
 pub mod engine;
 mod hysteresis;
 pub mod identify;
+mod proc_match;
 
 use crate::pane::{Pane, PaneId};
 use crate::{Mux, MuxNotification};
@@ -268,9 +269,11 @@ fn mark_dirty(pane_id: PaneId) {
 /// since its last evaluation keeps serving a cached verdict (the
 /// seqno-equality reuse), which was computed under the *old* rules and
 /// would survive indefinitely. Safe to call from any thread; the caller
-/// may run it on a worker since loading reads manifest files.
-pub fn reload_rules() {
-    engine::reload_manifests();
+/// may run it on a worker since loading reads manifest files. Returns how
+/// many manifest files were rejected, so the caller can report a partial
+/// reload instead of unconditional success.
+pub fn reload_rules() -> usize {
+    let rejected = engine::reload_manifests();
     let panes: Vec<PaneId> = {
         let mut registry = REGISTRY.write();
         for record in registry.values_mut() {
@@ -281,6 +284,7 @@ pub fn reload_rules() {
     for pane_id in panes {
         mark_dirty(pane_id);
     }
+    rejected
 }
 
 /// Drop a pane's state without telling anyone. Returns whether a published
@@ -771,6 +775,8 @@ mod tests {
         user_vars: parking_lot::Mutex<HashMap<String, String>>,
         seqno: AtomicUsize,
         process: parking_lot::Mutex<Option<String>>,
+        argv: parking_lot::Mutex<Option<Vec<String>>>,
+        argv_probes: AtomicUsize,
         probes: AtomicUsize,
         remote_mirror: bool,
         dead: AtomicBool,
@@ -790,6 +796,8 @@ mod tests {
                 user_vars: parking_lot::Mutex::new(HashMap::new()),
                 seqno: AtomicUsize::new(1),
                 process: parking_lot::Mutex::new(process.map(|p| p.to_string())),
+                argv: parking_lot::Mutex::new(None),
+                argv_probes: AtomicUsize::new(0),
                 probes: AtomicUsize::new(0),
                 remote_mirror: false,
                 dead: AtomicBool::new(false),
@@ -832,6 +840,12 @@ mod tests {
             *self.process.lock() = process.map(|p| p.to_string());
             identify::forget_pane(self.id);
             self.seqno.fetch_add(1, Ordering::SeqCst);
+        }
+
+        /// The leader's argv, as identification sees it when the leader
+        /// executable is a generic interpreter.
+        fn set_argv(&self, argv: &[&str]) {
+            *self.argv.lock() = Some(argv.iter().map(|a| a.to_string()).collect());
         }
     }
 
@@ -915,6 +929,10 @@ mod tests {
             self.probes.fetch_add(1, Ordering::SeqCst);
             self.process.lock().clone()
         }
+        fn get_foreground_process_argv(&self, _policy: CachePolicy) -> Option<Vec<String>> {
+            self.argv_probes.fetch_add(1, Ordering::SeqCst);
+            self.argv.lock().clone()
+        }
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
             unimplemented!();
         }
@@ -990,6 +1008,79 @@ mod tests {
         let status = status_for_pane(pane.pane_id()).expect("classified");
         assert_eq!(status.agent_id, "claude");
         assert_eq!(status.state, AgentState::Working);
+        assert_eq!(status.evidence, AgentEvidence::Screen);
+        evict_pane(pane.pane_id());
+    }
+
+    /// An npm-installed agent runs as `node <shim>`: the leader executable
+    /// says only "node", and the agent's name rides in argv. This is the
+    /// installation style the basename-only identifier was blind to.
+    #[test]
+    fn interpreter_wrapped_agent_identifies_through_argv() {
+        let pane = FakeAgentPane::new(Some("/opt/homebrew/bin/node"));
+        pane.set_argv(&["node", "/opt/homebrew/bin/claude"]);
+        pane.set_screen("some output\n⏵⏵ Cooking… (esc to interrupt · 12s)\n");
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+        let status = status_for_pane(pane.pane_id()).expect("classified");
+        assert_eq!(status.agent_id, "claude");
+        assert_eq!(status.state, AgentState::Working);
+        assert_eq!(status.evidence, AgentEvidence::Screen);
+        evict_pane(pane.pane_id());
+
+        // A plain interpreter with no agent in its argv stays unidentified.
+        let plain = FakeAgentPane::new(Some("/opt/homebrew/bin/node"));
+        plain.set_argv(&["node", "/opt/tools/build.js"]);
+        plain.set_screen("some output\n⏵⏵ Cooking… (esc to interrupt · 12s)\n");
+        assert!(!evaluate_pane(plain.as_ref() as &dyn Pane));
+        assert!(status_for_pane(plain.pane_id()).is_none());
+        evict_pane(plain.pane_id());
+
+        // A retitled interpreter (`process.title = "claude"` clobbered the
+        // argv block) identifies by the surviving argv[0].
+        let retitled = FakeAgentPane::new(Some("/opt/homebrew/Cellar/node/26.7.0/bin/node"));
+        retitled.set_argv(&["claude"]);
+        retitled.set_screen("some output\n⏵⏵ Cooking… (esc to interrupt · 12s)\n");
+        assert!(evaluate_pane(retitled.as_ref() as &dyn Pane));
+        let status = status_for_pane(retitled.pane_id()).expect("classified");
+        assert_eq!(status.agent_id, "claude");
+        evict_pane(retitled.pane_id());
+    }
+
+    /// The argv read is lazy: a leader that names the agent directly must
+    /// never pay for it, and an interpreter leader pays exactly once per
+    /// identity-cache window, not once per evaluation.
+    #[test]
+    fn argv_is_fetched_only_for_interpreter_leaders() {
+        let direct = FakeAgentPane::new(Some("/usr/local/bin/claude"));
+        direct.set_screen("some output\n⏵⏵ Cooking… (esc to interrupt · 12s)\n");
+        assert!(evaluate_pane(direct.as_ref() as &dyn Pane));
+        assert_eq!(direct.argv_probes.load(Ordering::SeqCst), 0);
+        evict_pane(direct.pane_id());
+
+        let wrapped = FakeAgentPane::new(Some("/usr/bin/node"));
+        wrapped.set_argv(&["node", "/opt/homebrew/bin/claude"]);
+        wrapped.set_screen("some output\n⏵⏵ Cooking… (esc to interrupt · 12s)\n");
+        assert!(evaluate_pane(wrapped.as_ref() as &dyn Pane));
+        assert_eq!(wrapped.argv_probes.load(Ordering::SeqCst), 1);
+        // A second evaluation inside the identity TTL serves the cached
+        // identity without another argv read (the unchanged verdict means
+        // evaluate_pane reports no state change — irrelevant here).
+        wrapped.set_screen("more output\n⏵⏵ Cooking… (esc to interrupt · 13s)\n");
+        let _ = evaluate_pane(wrapped.as_ref() as &dyn Pane);
+        assert_eq!(wrapped.argv_probes.load(Ordering::SeqCst), 1);
+        evict_pane(wrapped.pane_id());
+    }
+
+    /// A self-updating agent replaces its own binary; Linux then reports
+    /// the leader as `/path/claude (deleted)`. Identification must survive
+    /// that, or detection silently dies right after every agent update.
+    #[test]
+    fn replaced_binary_still_identifies_as_its_agent() {
+        let pane = FakeAgentPane::new(Some("/usr/local/bin/claude (deleted)"));
+        pane.set_screen("some output\n⏵⏵ Cooking… (esc to interrupt · 12s)\n");
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+        let status = status_for_pane(pane.pane_id()).expect("classified");
+        assert_eq!(status.agent_id, "claude");
         assert_eq!(status.evidence, AgentEvidence::Screen);
         evict_pane(pane.pane_id());
     }
