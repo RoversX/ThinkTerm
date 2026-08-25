@@ -216,9 +216,17 @@ pub struct ClientPane {
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
+    agent_status: Mutex<Option<thinkterm_proto::AgentStatus>>,
 }
 
 impl ClientPane {
+    /// Store a status delivered outside the unilateral push path (the
+    /// cold-start fetch on attach/resync). Quiet: the caller decides
+    /// whether a repaint is warranted.
+    pub fn set_agent_status(&self, status: Option<thinkterm_proto::AgentStatus>) {
+        *self.agent_status.lock() = status;
+    }
+
     /// Ask the (single) sender worker to bring the server to `palette`.
     /// Starts the worker when none is running; a running worker picks the
     /// new target up by itself. Re-sends of identical palettes are
@@ -398,6 +406,7 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            agent_status: Mutex::new(None),
         }
     }
 
@@ -491,9 +500,35 @@ impl ClientPane {
                     alert,
                 });
             }
+            Pdu::AgentStatusChanged(codec::AgentStatusChanged { status, .. }) => {
+                // Read-at-send-time coalescing means a backlog of queued
+                // notifications all carry the same current value; only a
+                // real change is worth a re-notify (each one repaints and
+                // re-scans thread work downstream).
+                let changed = {
+                    let mut slot = self.agent_status.lock();
+                    if *slot == status {
+                        false
+                    } else {
+                        *slot = status;
+                        true
+                    }
+                };
+                if changed {
+                    // Re-notify locally: repaints this GUI, and when this
+                    // process is itself a mux server for further clients,
+                    // its dispatch forwards the status one hop on (same
+                    // reason the Progress alert above re-notifies).
+                    Mux::get().notify(MuxNotification::AgentStatusChanged(self.local_pane_id));
+                }
+            }
             Pdu::PaneRemoved(PaneRemoved { pane_id }) => {
                 log::trace!("remote pane {} has been removed", pane_id);
                 self.renderable.lock().inner.borrow_mut().dead = true;
+                // The prune below can be deferred (activity in flight, or
+                // the windows lock contended); the dead mirror must not
+                // keep reporting an agent to the panel meanwhile.
+                *self.agent_status.lock() = None;
                 let mux = Mux::get();
                 mux.prune_dead_windows();
 
@@ -832,6 +867,10 @@ impl Pane for ClientPane {
 
     fn get_progress(&self) -> Progress {
         self.progress.lock().clone()
+    }
+
+    fn agent_status(&self) -> Option<thinkterm_proto::AgentStatus> {
+        self.agent_status.lock().clone()
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {

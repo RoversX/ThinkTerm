@@ -112,6 +112,15 @@ where
                 handler.schedule_pane_push(pane_id);
             }
             Ok(Item::Notif(MuxNotification::PaneAdded(_pane_id))) => {}
+            Ok(Item::Notif(MuxNotification::AgentStatusChanged(pane_id))) => {
+                // Read the status at send time so the payload is always the
+                // freshest classification, never a queued stale value.
+                let status = Mux::get().get_pane(pane_id).and_then(|p| p.agent_status());
+                Pdu::AgentStatusChanged(codec::AgentStatusChanged { pane_id, status })
+                    .encode_async(&mut stream, 0)
+                    .await?;
+                stream.flush().await.context("flushing PDU to client")?;
+            }
             Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
                 Pdu::PaneRemoved(codec::PaneRemoved { pane_id })
                     .encode_async(&mut stream, 0)

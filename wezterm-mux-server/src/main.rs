@@ -270,6 +270,9 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     let mux = Mux::get();
     let config = config::configuration();
 
+    // async_run is entered through SimpleExecutor, so promise's schedulers
+    // are available before agent detection starts its safety tick.
+    mux::agent_status::initialize_mux(&mux);
     update_mux_domains_for_server(&config)?;
     let _config_subscription = config::subscribe_to_config_reload(move || {
         promise::spawn::spawn_into_main_thread(async move {

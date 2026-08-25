@@ -1973,6 +1973,14 @@ impl ClientDomain {
             Mux::get().prune_dead_windows();
         }
 
+        // Before the server-replaced early return below: both reconnect
+        // shapes must reconcile agent statuses, or everything that changed
+        // while disconnected (agent finished, exited, started) stays wrong
+        // until the pane next changes state.
+        if let Err(err) = client.fetch_agent_statuses().await {
+            log::warn!("failed to fetch agent statuses on reattach: {err:#}");
+        }
+
         if server_replaced {
             let active_remote_tabs = replacement_session
                 .as_ref()
@@ -2100,6 +2108,18 @@ impl ClientDomain {
                 return Ok(());
             }
             Self::process_pane_list(inner, panes, None, false, None)?;
+            // Catch-up only: steady-state updates arrive as pushed
+            // AgentStatusChanged PDUs. With detection off on this side
+            // there is no consumer for the answer, so skip the RPC --
+            // it walks the server's whole pane list on its main thread.
+            if mux::agent_status::detection_enabled() {
+                if let Err(err) = self.fetch_agent_statuses().await {
+                    log::warn!(
+                        "failed to refresh agent statuses from {}: {err:#}",
+                        self.config.name()
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -2123,6 +2143,59 @@ impl ClientDomain {
         let tree = response.tree;
         deliver_thinkterm_tree(self.config.name(), tree.clone());
         Ok(tree)
+    }
+
+    /// Reconcile the mirrored agent statuses with the server's. Late-
+    /// attaching clients would otherwise only learn of *future* status
+    /// changes; this closes the cold-start gap on attach, resync and
+    /// reconnect. The snapshot is authoritative in both directions: a
+    /// mirror the response does not mention is cleared, so an agent that
+    /// exited while this client was disconnected does not survive as a
+    /// phantom.
+    ///
+    /// Ordering caveat: this snapshot can interleave with live pushes in
+    /// either direction and briefly apply an older value. It converges
+    /// because every server-side mutation of a published status enqueues
+    /// its own trailing AgentStatusChanged on the same dispatch channel
+    /// (the one deliberate exception, the PaneRemoved eviction, is always
+    /// followed by the PaneRemoved PDU itself). Any future silent registry
+    /// mutation without a paired PDU would make a stale snapshot permanent.
+    pub async fn fetch_agent_statuses(&self) -> anyhow::Result<()> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let response = inner.client.get_agent_statuses().await?;
+        let mut desired: std::collections::HashMap<PaneId, thinkterm_proto::AgentStatus> =
+            response
+                .statuses
+                .into_iter()
+                .filter_map(|entry| {
+                    inner
+                        .remote_to_local_pane_id(entry.pane_id)
+                        .map(|local| (local, entry.status))
+                })
+                .collect();
+        let mux = Mux::get();
+        let mut changed = Vec::new();
+        for pane in mux.iter_panes() {
+            if pane.domain_id() != self.local_domain_id {
+                continue;
+            }
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            let target = desired.remove(&pane.pane_id());
+            if pane.agent_status() != target {
+                client_pane.set_agent_status(target);
+                changed.push(pane.pane_id());
+            }
+        }
+        // This runs in an ordinary spawned task, never inside a Mux
+        // subscriber callback, so notifying here is safe.
+        for pane_id in changed {
+            Mux::notify_from_any_thread(MuxNotification::AgentStatusChanged(pane_id));
+        }
+        Ok(())
     }
 
     /// Pull the server's tree and hand it to the sink. Used on attach and
@@ -3973,6 +4046,16 @@ impl ClientDomain {
         if let Err(err) = self.fetch_thinkterm_tree().await {
             log::warn!(
                 "failed to fetch the ThinkTerm tree from {}: {err:#}",
+                self.config.name()
+            );
+        }
+
+        // Same failure policy: agent statuses are a nicety, not worth
+        // failing an attach over; the push path catches us up on the
+        // next state change regardless.
+        if let Err(err) = self.fetch_agent_statuses().await {
+            log::warn!(
+                "failed to fetch agent statuses from {}: {err:#}",
                 self.config.name()
             );
         }

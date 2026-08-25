@@ -426,6 +426,15 @@ async fn process_unilateral_inner_async(
     let local_pane_id = match client_domain.remote_to_local_pane_id(pane_id) {
         Some(p) => p,
         None => {
+            // Not for agent status though: the server publishes those for
+            // every pane it owns (other workspaces included), and around a
+            // pane's removal the eviction push can land on either side of
+            // our own PaneRemoved handling — both orders are harmless.
+            // Neither implies a topology change worth a full resync; the
+            // cold-start fetch covers late mapping.
+            if matches!(decoded.pdu, Pdu::AgentStatusChanged(_)) {
+                return Ok(());
+            }
             log::debug!("got {decoded:?}, pane not found locally, resync");
             client_domain.resync().await?;
             if client_domain.connection_generation() != Some(connection_generation) {
@@ -2177,6 +2186,11 @@ impl Client {
 
     rpc!(ping, Ping = (), Pong);
     rpc!(list_panes, ListPanes = (), ListPanesResponse);
+    rpc!(
+        get_agent_statuses,
+        GetAgentStatuses = (),
+        GetAgentStatusesResponse
+    );
     rpc!(spawn_v2, SpawnV2, SpawnResponse);
     rpc!(split_pane, SplitPane, SpawnResponse);
     rpc!(spawn_pane_in_stack, SpawnPaneInStack, SpawnResponse);

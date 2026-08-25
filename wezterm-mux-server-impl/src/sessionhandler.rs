@@ -649,6 +649,70 @@ impl SessionHandler {
                 })
                 .detach();
             }
+            Pdu::GetAgentStatuses(GetAgentStatuses {}) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            // The flat pane list first: this query runs on
+                            // every client resync, and most rounds find no
+                            // agents at all -- the window/tab walk below
+                            // exists only to name their workspaces, so it
+                            // must not run before we know any are needed.
+                            // iter_panes + agent_status() rather than the
+                            // detector registry: a chained mux correctly
+                            // reports what it mirrors as well as what it
+                            // detected itself.
+                            let mut agents = vec![];
+                            for pane in mux.iter_panes() {
+                                let Some(status) = pane.agent_status() else {
+                                    continue;
+                                };
+                                agents.push((pane.pane_id(), status, pane.get_title()));
+                            }
+                            if agents.is_empty() {
+                                return Ok(Pdu::GetAgentStatusesResponse(
+                                    GetAgentStatusesResponse { statuses: vec![] },
+                                ));
+                            }
+                            // One pass over the window/tab topology:
+                            // resolve_pane_id per agent pane would rescan
+                            // every tab per entry.
+                            let mut workspace_by_pane =
+                                std::collections::HashMap::new();
+                            for window_id in mux.iter_windows() {
+                                let Some(window) = mux.get_window(window_id) else {
+                                    continue;
+                                };
+                                let workspace = window.get_workspace().to_string();
+                                for tab in window.iter() {
+                                    for pane in tab.iter_all_panes() {
+                                        workspace_by_pane
+                                            .insert(pane.pane_id(), workspace.clone());
+                                    }
+                                }
+                            }
+                            let statuses = agents
+                                .into_iter()
+                                .map(|(pane_id, status, title)| AgentStatusEntry {
+                                    pane_id,
+                                    status,
+                                    title,
+                                    workspace: workspace_by_pane
+                                        .get(&pane_id)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                })
+                                .collect();
+                            Ok(Pdu::GetAgentStatusesResponse(GetAgentStatusesResponse {
+                                statuses,
+                            }))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
             Pdu::GetClientList(GetClientList) => {
                 spawn_into_main_thread(async move {
                     catch(
@@ -1588,6 +1652,8 @@ impl SessionHandler {
 
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
+            | Pdu::AgentStatusChanged { .. }
+            | Pdu::GetAgentStatusesResponse { .. }
             | Pdu::ListPanesResponse { .. }
             | Pdu::SetApplicationPalette { .. }
             | Pdu::SetClipboard { .. }
