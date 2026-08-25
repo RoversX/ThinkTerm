@@ -478,14 +478,24 @@ settings-agent-panel-description = Detect coding agents (Claude Code, Codex, …
 settings-agent-panel-enabled = Agent panel enabled.
 settings-agent-panel-disabled = Agent panel disabled.
 right-mode-agents = Agents
-right-agents-empty = No agents detected
-right-agents-empty-hint = Panes running Claude Code, Codex and other agents appear here.
-right-agents-reload-rules = Reload detection rules
 right-agents-rules-reloaded = Detection rules reloaded.
+right-agents-rules-reload-errors = Rules reloaded; { $count ->
+        [one] 1 file was rejected
+       *[other] { $count } files were rejected
+    } — see the log.
 right-agents-state-working = Working
 right-agents-state-blocked = Needs input
 right-agents-state-idle = Idle
 right-agents-state-unknown = Unknown
+right-agents-none = No agents detected
+right-agents-detection-off = Agent detection is off — open settings
+right-agents-count-working = { $count } working
+right-agents-count-blocked = { $count ->
+        [one] 1 needs input
+       *[other] { $count } need input
+    }
+right-agents-count-idle = { $count } idle
+right-agents-count-unknown = { $count } unknown
 settings-section-agents = Agents
 settings-agents-integrations-heading = Integrations
 settings-integration-screen-active = Found on PATH; status is detected from its terminal UI (screen rules).

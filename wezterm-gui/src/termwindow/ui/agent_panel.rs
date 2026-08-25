@@ -4,13 +4,14 @@
 //! snapshots — the paint path never triggers detection or filesystem
 //! probes.
 
-use crate::agent_status::{self, AgentPanelAction, AgentState};
+use crate::agent_status::{self, AgentIcon, AgentPanelAction, AgentState};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{
     right_sidebar_file_row_metrics, sidebar_row_element_visible, FILE_SCROLL_FADE_HEIGHT,
+    SNIPPET_ROW_GAP,
 };
-use crate::termwindow::ui::tokens::{SIDEBAR_INSET, SIDEBAR_ROW_RADIUS};
+use crate::termwindow::ui::tokens::{SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_ROW_RADIUS};
 use crate::termwindow::{TermWindow, TermWindowNotif, UIItem, UIItemType};
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
@@ -23,20 +24,80 @@ use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{MouseEvent, MouseEventKind as WMEK, MousePress, WindowOps};
 
+/// An agent that is working, in the same blue the left sidebar uses for a
+/// live thread (`SESSION_STATUS_OPEN_COLOR`).
+const AGENT_WORKING_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
+/// An agent waiting on the user: amber, matching the sidebar's other
+/// "needs a human" signal. Deliberately not the notification red, which is
+/// reserved for something being wrong rather than something being asked.
+const AGENT_BLOCKED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
+
+/// What the toolbar line reports when the list is not empty.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AgentCounts {
+    total: usize,
+    working: usize,
+    blocked: usize,
+    idle: usize,
+    unknown: usize,
+}
+
+impl AgentCounts {
+    fn tally(agents: &[agent_status::AgentPaneStatus]) -> Self {
+        let mut counts = Self {
+            total: agents.len(),
+            ..Default::default()
+        };
+        for agent in agents {
+            match agent.state {
+                AgentState::Working => counts.working += 1,
+                AgentState::Blocked => counts.blocked += 1,
+                AgentState::Idle => counts.idle += 1,
+                AgentState::Unknown => counts.unknown += 1,
+            }
+        }
+        counts
+    }
+
+    fn count_text(id: &'static str, count: usize) -> String {
+        let mut args = fluent_bundle::FluentArgs::new();
+        args.set("count", count);
+        crate::i18n::tr_args(id, &args)
+    }
+
+    /// "2 working · 1 needs input", naming only what is actually happening;
+    /// with nothing running or waiting it falls back to the idle and
+    /// unknown counts — each labeled as what it is, so three Unknown panes
+    /// never read as "3 idle".
+    fn describe(self) -> String {
+        let mut parts = Vec::new();
+        if self.working > 0 {
+            parts.push(Self::count_text("right-agents-count-working", self.working));
+        }
+        if self.blocked > 0 {
+            parts.push(Self::count_text("right-agents-count-blocked", self.blocked));
+        }
+        if parts.is_empty() {
+            if self.idle > 0 || self.unknown == 0 {
+                parts.push(Self::count_text("right-agents-count-idle", self.idle));
+            }
+            if self.unknown > 0 {
+                parts.push(Self::count_text("right-agents-count-unknown", self.unknown));
+            }
+        }
+        parts.join(" \u{b7} ")
+    }
+}
+
 impl TermWindow {
     /// Height of the strip above the list: the reload button, the optional
     /// status line, and the gap before the first row. The scroll mask covers
     /// exactly this, so the two must be derived from the same numbers.
-    fn agents_toolbar_height(&self, cell_height: usize, has_status: bool) -> usize {
-        let status_height = if has_status {
-            self.ui_px(6) + cell_height
-        } else {
-            0
-        };
-        // This strip doubles as the top scroll mask, and it only has to
-        // swallow a single element's overflow -- the card behind them is
-        // clipped geometrically -- so the ordinary gap is already tall enough.
-        self.agents_toolbar_button_height(cell_height) + status_height + self.ui_px(8)
+    /// The strip above the list: one row holding the status line and the
+    /// reload button, plus the gap before the first row. It doubles as the
+    /// top scroll mask, so this is also how far overflow may be erased.
+    fn agents_toolbar_height(&self, cell_height: usize) -> usize {
+        self.agents_toolbar_button_height(cell_height) + self.ui_px(8)
     }
 
     /// Two lines -- identity, then state and place -- with the same share of
@@ -47,6 +108,9 @@ impl TermWindow {
         (cell_height * 2 + line_gap + padding, line_gap)
     }
 
+    /// The reload control is a compact icon button in the top-right, the
+    /// same shape the Files panel gives its refresh: a full-width pill for
+    /// a control this rarely used dominated the panel.
     fn agents_toolbar_button_height(&self, cell_height: usize) -> usize {
         (cell_height + self.ui_px(12)).max(self.ui_px(28))
     }
@@ -67,42 +131,71 @@ impl TermWindow {
         content_top: usize,
         content_width: usize,
         status: Option<&str>,
+        counts: AgentCounts,
     ) -> anyhow::Result<()> {
         let cell_height = ui_metrics.cell_size.height as usize;
         let button_height = self.agents_toolbar_button_height(cell_height);
-        self.paint_snippet_button(
+        let button_size = button_height.min(content_width);
+        self.paint_files_preview_header_icon_button(
             layers,
-            2,
-            ui_font,
-            ui_metrics,
             chrome,
             foreground,
             muted_fg,
-            content_x,
+            content_x + content_width.saturating_sub(button_size),
             content_top,
-            content_width,
-            button_height,
-            Some(SvgIcon::RotateCw),
-            &crate::i18n::tr("right-agents-reload-rules"),
+            button_size,
+            // The circular-arrow refresh glyph the Files panel also uses.
+            // (The tempting `Redo` variant is a hooked arrow that reads as
+            // half a glyph once there is no label beside it.)
+            SvgIcon::RotateCcw,
             UIItemType::RightSidebarAgent(AgentPanelAction::ReloadRules),
-            true,
         )?;
-        if let Some(status) = status {
+
+        // The line to the left of that button. A reload acknowledgement
+        // takes it over while it lives, because it is the answer to the
+        // click that just happened; otherwise it says what the panel is
+        // currently showing -- which is also the only place that explains
+        // an empty list.
+        let detection_on = agent_status::enabled();
+        let line = match status {
+            Some(status) => status.to_string(),
+            None if !detection_on => crate::i18n::tr("right-agents-detection-off"),
+            None if counts.total == 0 => crate::i18n::tr("right-agents-none"),
+            None => counts.describe(),
+        };
+        if status.is_some() {
             // The acknowledgement expires by TTL, but expiry alone paints
             // nothing; keep a lazy repaint scheduled while it is visible.
             self.update_next_frame_time(Some(
                 std::time::Instant::now() + std::time::Duration::from_millis(500),
             ));
-            self.paint_sidebar_text(
-                layers,
-                ui_font,
-                ui_metrics,
-                status,
-                content_x + self.ui_px(SIDEBAR_INSET),
-                content_top + button_height + self.ui_px(6),
-                content_width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2),
-                muted_fg,
-            )?;
+        }
+        let text_x = content_x + self.ui_px(SIDEBAR_INSET);
+        let text_y = content_top + (button_height.saturating_sub(cell_height)) / 2;
+        let text_width = content_x
+            .saturating_add(content_width)
+            .saturating_sub(button_size + self.ui_px(SIDEBAR_ICON_GAP))
+            .saturating_sub(text_x);
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            &line,
+            text_x,
+            text_y,
+            text_width,
+            muted_fg,
+        )?;
+        // Only the "detection is off" line is actionable: it names the
+        // switch that turns the panel back on, so it must lead there.
+        if status.is_none() && !detection_on {
+            self.ui_items.push(UIItem {
+                x: text_x,
+                y: content_top,
+                width: text_width,
+                height: button_height,
+                item_type: UIItemType::RightSidebarAgent(AgentPanelAction::OpenSettings),
+            });
         }
         Ok(())
     }
@@ -126,52 +219,17 @@ impl TermWindow {
         // Read once: the status expires on a TTL, and asking twice could size
         // the toolbar for one layout and paint another.
         let status = agent_status::panel_status();
-        let toolbar_height = self.agents_toolbar_height(cell_height, status.is_some());
+        let toolbar_height = self.agents_toolbar_height(cell_height);
         let list_top = content_top + toolbar_height;
         let inset = self.ui_px(SIDEBAR_INSET);
 
         let mut agents = agent_status::list_agent_panes();
+        let counts = AgentCounts::tally(&agents);
         if agents.is_empty() {
-            let card_height = (cell_height * 2 + self.ui_px(24))
-                .min(content_bottom.saturating_sub(list_top + inset));
-            if card_height > 0 {
-                self.fill_rounded_rectangle_with_border(
-                    layers,
-                    1,
-                    euclid::rect(
-                        content_x as f32,
-                        list_top as f32,
-                        content_width as f32,
-                        card_height as f32,
-                    ),
-                    chrome.sidebar_button_bg,
-                    chrome.control_border.mul_alpha(0.74),
-                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 6.0,
-                    1.0,
-                )
-                .context("agents empty state card")?;
-                let pad = inset * 2;
-                self.paint_sidebar_text(
-                    layers,
-                    ui_font,
-                    ui_metrics,
-                    &crate::i18n::tr("right-agents-empty"),
-                    content_x + pad,
-                    list_top + self.ui_px(10),
-                    content_width.saturating_sub(pad * 2),
-                    foreground,
-                )?;
-                self.paint_sidebar_text(
-                    layers,
-                    ui_font,
-                    ui_metrics,
-                    &crate::i18n::tr("right-agents-empty-hint"),
-                    content_x + pad,
-                    list_top + self.ui_px(12) + cell_height,
-                    content_width.saturating_sub(pad * 2),
-                    muted_fg,
-                )?;
-            }
+            // Nothing but the toolbar: an empty-state card here is a large
+            // bordered box explaining that a list is empty, which the
+            // toolbar line already says in one row. The panel reads as
+            // quiet rather than broken.
             return self.paint_agents_toolbar(
                 layers,
                 ui_font,
@@ -183,19 +241,11 @@ impl TermWindow {
                 content_top,
                 content_width,
                 status.as_deref(),
+                counts,
             );
         }
 
-        // Rows for the current window's workspace first, then stable order.
-        let current_workspace = Mux::get().active_workspace();
-        agents.sort_by(|a, b| {
-            let a_here = a.workspace == current_workspace;
-            let b_here = b.workspace == current_workspace;
-            b_here
-                .cmp(&a_here)
-                .then_with(|| a.agent_id.cmp(&b.agent_id))
-                .then_with(|| a.pane_id.cmp(&b.pane_id))
-        });
+        agent_status::sort_for_display(&mut agents);
 
         // Borrow the file tree's row chrome wholesale so the two lists read as
         // one control: same height, same icon size, same gaps, all derived from
@@ -232,13 +282,22 @@ impl TermWindow {
             sidebar_row_element_visible(elem_y, elem_height, content_top, list_top, overflow_bottom)
         };
         let visible_height = viewport_bottom.saturating_sub(list_top);
-        let total_height = agents.len().saturating_mul(row_height);
+        // Rows are spaced like snippet cards: the painted row is
+        // `row_height`, and each one starts a gap further down. The last
+        // row has no trailing gap, so it is not part of the scrollable
+        // height either.
+        let row_gap = self.ui_px(SNIPPET_ROW_GAP);
+        let row_pitch = row_height + row_gap;
+        let total_height = agents
+            .len()
+            .saturating_mul(row_pitch)
+            .saturating_sub(row_gap);
         let max_scroll = total_height.saturating_sub(visible_height) as f32;
         self.right_sidebar_agents_scroll = self.right_sidebar_agents_scroll.clamp(0.0, max_scroll);
         let scroll = self.right_sidebar_agents_scroll;
 
         for (idx, agent) in agents.iter().enumerate() {
-            let row_top = list_top as f32 + (idx * row_height) as f32 - scroll;
+            let row_top = list_top as f32 + (idx * row_pitch) as f32 - scroll;
             if row_top + row_height as f32 <= list_top as f32 {
                 continue;
             }
@@ -271,7 +330,9 @@ impl TermWindow {
                         band.visible_height as f32,
                     ),
                     chrome.sidebar_button_hover_bg,
-                    self.ui_f32(SIDEBAR_ROW_RADIUS),
+                    // Same corner as a snippet card, so the two lists read
+                    // as one control set rather than two designs.
+                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 10.0,
                 )
                 .context("agent row hover")?;
             }
@@ -291,14 +352,36 @@ impl TermWindow {
             let icon_x = content_x + inset;
             let icon_y = top + (row_height.saturating_sub(metrics.icon_size)) / 2;
             if visible(icon_y, metrics.icon_size) {
-                self.paint_sidebar_icon(
-                    layers,
-                    SvgIcon::Bot,
-                    icon_x,
-                    icon_y,
-                    metrics.icon_size,
-                    muted_fg,
-                )?;
+                // The brand mark when we have one; agents with no logo
+                // (and any id from a custom manifest) keep the generic bot.
+                match agent_status::brand_icon(
+                    &agent.agent_id,
+                    crate::native_settings::effective_appearance(),
+                ) {
+                    Some(AgentIcon::Color(brand)) => self.paint_sidebar_brand_icon(
+                        layers,
+                        brand,
+                        icon_x,
+                        icon_y,
+                        metrics.icon_size,
+                    )?,
+                    Some(AgentIcon::Mono(icon)) => self.paint_sidebar_icon(
+                        layers,
+                        icon,
+                        icon_x,
+                        icon_y,
+                        metrics.icon_size,
+                        muted_fg,
+                    )?,
+                    None => self.paint_sidebar_icon(
+                        layers,
+                        SvgIcon::Bot,
+                        icon_x,
+                        icon_y,
+                        metrics.icon_size,
+                        muted_fg,
+                    )?,
+                }
             }
 
             // State chip: spinner while working, alert while blocked. `None`
@@ -307,9 +390,17 @@ impl TermWindow {
             let state_size = metrics.icon_size;
             let state_x = content_x + content_width - inset - state_size;
             let state_y = top + (row_height.saturating_sub(state_size)) / 2;
+            // The same three status colors the left sidebar gives a thread,
+            // so "working" and "waiting on you" mean the same thing in both
+            // places: blue for in progress, amber for needs input, and a
+            // muted tick for idle, which must not compete for attention.
             let state_icon = match agent.state {
-                AgentState::Working => Some((SvgIcon::LoaderCircle, foreground, true)),
-                AgentState::Blocked => Some((SvgIcon::CircleAlert, foreground, false)),
+                AgentState::Working => {
+                    Some((SvgIcon::LoaderCircle, AGENT_WORKING_COLOR, true))
+                }
+                AgentState::Blocked => {
+                    Some((SvgIcon::CircleAlert, AGENT_BLOCKED_COLOR, false))
+                }
                 AgentState::Idle => Some((SvgIcon::CircleCheck, muted_fg, false)),
                 AgentState::Unknown => None,
             };
@@ -422,6 +513,7 @@ impl TermWindow {
             content_top,
             content_width,
             status.as_deref(),
+            counts,
         )?;
         if scrolled {
             let fade_height = self
@@ -458,17 +550,25 @@ impl TermWindow {
                 // The reload reads manifest files; keep that off the GUI
                 // thread and report completion when it lands.
                 std::thread::spawn(|| {
-                    mux::agent_status::reload_rules();
-                    promise::spawn::spawn_into_main_thread(async {
-                        agent_status::set_panel_status(crate::i18n::tr(
-                            "right-agents-rules-reloaded",
-                        ));
+                    let rejected = mux::agent_status::reload_rules();
+                    promise::spawn::spawn_into_main_thread(async move {
+                        let ack = if rejected == 0 {
+                            crate::i18n::tr("right-agents-rules-reloaded")
+                        } else {
+                            let mut args = fluent_bundle::FluentArgs::new();
+                            args.set("count", rejected);
+                            crate::i18n::tr_args("right-agents-rules-reload-errors", &args)
+                        };
+                        agent_status::set_panel_status(ack);
                         if let Some(front_end) = crate::frontend::try_front_end() {
                             front_end.invalidate_all_windows();
                         }
                     })
                     .detach();
                 });
+            }
+            AgentPanelAction::OpenSettings => {
+                crate::settings_window::show();
             }
             AgentPanelAction::Reveal(pane_id) => {
                 self.reveal_agent_pane(pane_id);
@@ -754,6 +854,62 @@ mod tests {
                 visible_y: 0,
                 visible_height: 52
             })
+        );
+    }
+
+    /// The toolbar line is the only thing explaining a quiet panel, so it
+    /// must never come back blank, and must name what is actually
+    /// happening rather than reciting every state.
+    #[test]
+    fn toolbar_line_reports_what_is_happening() {
+        use super::AgentCounts;
+
+        let all_idle = AgentCounts {
+            total: 3,
+            idle: 3,
+            ..Default::default()
+        };
+        let line = all_idle.describe();
+        assert!(line.contains('3'), "idle count should be named: {line}");
+
+        let busy = AgentCounts {
+            total: 4,
+            working: 2,
+            blocked: 1,
+            idle: 1,
+            ..Default::default()
+        };
+        let line = busy.describe();
+        assert!(line.contains('2') && line.contains('1'), "{line}");
+        assert!(
+            line.contains('\u{b7}'),
+            "working and waiting should be joined: {line}"
+        );
+        assert!(
+            !line.contains('4'),
+            "the idle fallback must not appear alongside live counts: {line}"
+        );
+
+        // Unknown panes must be reported as unknown — never rolled into
+        // the idle count ("3 idle" over three Unknown rows was a lie).
+        let unknown_only = AgentCounts {
+            total: 2,
+            unknown: 2,
+            ..Default::default()
+        };
+        let line = unknown_only.describe();
+        assert!(!line.is_empty());
+        assert!(line.contains('2'), "{line}");
+        let mixed = AgentCounts {
+            total: 3,
+            idle: 2,
+            unknown: 1,
+            ..Default::default()
+        };
+        let line = mixed.describe();
+        assert!(
+            line.contains('2') && line.contains('1') && line.contains('\u{b7}'),
+            "idle and unknown must be reported separately: {line}"
         );
     }
 }

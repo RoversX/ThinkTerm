@@ -9,9 +9,9 @@ use crate::termwindow::render::corners::{
 use crate::termwindow::render::draw::draw_webgpu_layers;
 use crate::termwindow::webgpu::WebGpuState;
 use crate::ui::{
-    rect, scale_ui_f32, scale_ui_usize, ButtonSpec, ControlState, EditModifiers, InputCaret,
-    InteractionState, ResizablePaneState, ScrollState, ScrollbarSpec, SettingsIcon, SvgIcon,
-    TextInputSpec, TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
+    rect, scale_ui_f32, scale_ui_usize, BrandIcon, ButtonSpec, ControlState, EditModifiers,
+    InputCaret, InteractionState, ResizablePaneState, ScrollState, ScrollbarSpec, SettingsIcon,
+    SvgIcon, TextInputSpec, TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::utilsprites::RenderMetrics;
 use anyhow::{Context, Error};
@@ -4808,23 +4808,50 @@ impl SettingsWindow {
                     row_width,
                 )?;
             }
+            // The brand mark leads the row; agents without a logo (and the
+            // expand arrow) still line up because the text column starts
+            // past a fixed icon slot either way.
+            let brand_size = (self.metrics.cell_size.height as f32)
+                .clamp(self.ui_px(14.0), self.ui_px(22.0));
+            let brand_gap = self.ui_px(10.0);
+            let text_x = row_x + brand_size + brand_gap;
+            let text_width = row_width - (brand_size + brand_gap);
+            let brand_y = row_y + (self.metrics.cell_size.height as f32 - brand_size) / 2.0;
+            // effective_appearance, not the raw OS appearance: the theme
+            // override decides which Kimi mark is legible here.
+            match crate::agent_status::brand_icon(agent_id, self.effective_appearance()) {
+                Some(crate::agent_status::AgentIcon::Color(brand)) => {
+                    self.draw_brand_icon(layers, brand, row_x, brand_y, brand_size)?
+                }
+                Some(crate::agent_status::AgentIcon::Mono(icon)) => {
+                    self.draw_svg_icon(layers, icon, row_x, brand_y, brand_size, palette.text)?
+                }
+                None => self.draw_svg_icon(
+                    layers,
+                    SvgIcon::Bot,
+                    row_x,
+                    brand_y,
+                    brand_size,
+                    palette.text,
+                )?,
+            }
             self.draw_text(
                 layers,
                 &ui_font,
-                row_x,
+                text_x,
                 row_y,
                 &label,
                 palette.text,
-                row_width,
+                text_width,
             )?;
             self.draw_text(
                 layers,
                 &ui_font,
-                row_x,
+                text_x,
                 self.settings_row_description_y(row_y),
                 &description,
                 palette.secondary_text,
-                row_width,
+                text_width,
             )?;
             self.ui_context.push(
                 rect(
@@ -8127,6 +8154,45 @@ impl SettingsWindow {
         quad.set_hsv(None);
         quad.set_has_color(false);
         quad.set_grayscale();
+        Ok(())
+    }
+
+    /// A brand mark in its own colors. Same geometry as
+    /// [`Self::draw_svg_icon`], but the sprite is sampled in full color
+    /// instead of being treated as an alpha mask to tint.
+    fn draw_brand_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        icon: BrandIcon,
+        x: f32,
+        y: f32,
+        size: f32,
+    ) -> anyhow::Result<()> {
+        if size <= 0.0 {
+            return Ok(());
+        }
+
+        let render_state = self.render_state.as_ref().unwrap();
+        let sprite = render_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_brand_icon(icon, size.round() as usize)?
+            .texture_coords();
+        let mut quad = layers.allocate(2)?;
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        quad.set_position(
+            x - left_offset,
+            y - top_offset,
+            x + size - left_offset,
+            y + size - top_offset,
+        );
+        quad.set_texture(sprite);
+        let white = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
+        quad.set_fg_color(white);
+        quad.set_alt_color_and_mix_value(white, 0.0);
+        quad.set_hsv(None);
+        quad.set_has_color(true);
         Ok(())
     }
 

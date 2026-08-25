@@ -1,4 +1,4 @@
-pub(crate) use crate::termwindow::ui::icons::SvgIcon;
+pub(crate) use crate::termwindow::ui::icons::{BrandIcon, SvgIcon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SettingsIcon {

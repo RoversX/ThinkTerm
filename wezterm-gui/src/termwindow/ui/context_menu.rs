@@ -1117,7 +1117,7 @@ fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
         ContextMenuIcon::Paste => Some(SvgIcon::ClipboardPaste),
         ContextMenuIcon::Pin => Some(SvgIcon::Pin),
         ContextMenuIcon::Refresh => Some(SvgIcon::RotateCcw),
-        ContextMenuIcon::Redo => Some(SvgIcon::RotateCw),
+        ContextMenuIcon::Redo => Some(SvgIcon::Redo),
         ContextMenuIcon::Save => Some(SvgIcon::Save),
         ContextMenuIcon::Search => Some(SvgIcon::Search),
         ContextMenuIcon::Server => Some(SvgIcon::Server),

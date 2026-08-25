@@ -14,7 +14,10 @@
 
 pub(crate) use thinkterm_proto::{AgentEvidence, AgentState};
 
+use crate::termwindow::ui::icons::BrandIcon;
+use crate::ui::icons::SvgIcon;
 use crate::workspace_threads::WorkspaceThreadWorkStatus;
+use ::window::Appearance;
 use mux::pane::{Pane, PaneId};
 use mux::Mux;
 use std::collections::HashMap;
@@ -27,6 +30,10 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentPanelAction {
     ReloadRules,
+    /// The toolbar line says detection is off; clicking it opens the
+    /// settings page that owns that switch, so the panel explains itself
+    /// instead of just sitting empty.
+    OpenSettings,
     /// Focus the pane running this agent (it lives in this window).
     Reveal(PaneId),
     /// The pane lives in another window: clicking deep-focuses its tab
@@ -49,7 +56,6 @@ pub(crate) struct AgentPaneStatus {
     pub session_id: Option<String>,
     /// Pane title with any leading progress marker stripped.
     pub title: String,
-    pub workspace: String,
     /// Mux window hosting the pane, resolved once per snapshot.
     pub window_id: Option<mux::window::WindowId>,
     /// Human place name ("Project · Thread"), falling back to the raw
@@ -183,7 +189,6 @@ pub(crate) fn list_agent_panes() -> Vec<AgentPaneStatus> {
                 evidence: status.evidence,
                 session_id: status.session_id,
                 title,
-                workspace,
                 window_id,
                 place,
                 since_unix: status.since_unix,
@@ -194,6 +199,21 @@ pub(crate) fn list_agent_panes() -> Vec<AgentPaneStatus> {
         *slot = Some((Instant::now(), panes.clone()));
     }
     panes
+}
+
+/// Display order for the Agents panel: stable, and independent of which
+/// Space is frontmost. An earlier version floated the active workspace's
+/// rows to the top, which meant every Space switch reshuffled the list —
+/// and rows trading places read as state changes. Group by the visible
+/// place name instead, then agent, then pane id as the final tiebreak.
+pub(crate) fn sort_for_display(agents: &mut [AgentPaneStatus]) {
+    agents.sort_by(|a, b| {
+        a.place
+            .to_lowercase()
+            .cmp(&b.place.to_lowercase())
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+            .then_with(|| a.pane_id.cmp(&b.pane_id))
+    });
 }
 
 pub(crate) fn display_name(agent_id: &str) -> String {
@@ -218,6 +238,46 @@ pub(crate) fn display_name(agent_id: &str) -> String {
         }
     }
     .to_string()
+}
+
+/// An agent's brand mark, in whichever form suits the current theme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentIcon {
+    /// A monochrome mark, tinted by the caller — so it inverts with the
+    /// theme like every other icon in the UI.
+    Mono(SvgIcon),
+    /// A mark with real brand colors, painted as-is.
+    Color(BrandIcon),
+}
+
+/// The brand mark for an agent, or `None` when we have no logo for it.
+///
+/// `agent_id` is not a closed set — a native contract or a user manifest
+/// can name any agent — so callers must have a fallback glyph rather than
+/// assuming a mark exists. OMP and Soul are known ids with no upstream
+/// logo and land in the same fallback.
+///
+/// Colored marks are only used where they read on both themes. Kimi's
+/// colored mark is a white glyph with a blue dot: fine on dark chrome,
+/// all but invisible on light, so it drops to its monochrome form there.
+/// Cursor, OpenCode, Pi and OpenAI (Codex) publish no colored mark at all
+/// — their logos are monochrome by design.
+pub(crate) fn brand_icon(agent_id: &str, appearance: Appearance) -> Option<AgentIcon> {
+    let dark = !matches!(
+        appearance,
+        Appearance::Light | Appearance::LightHighContrast
+    );
+    Some(match agent_id {
+        "claude" => AgentIcon::Color(BrandIcon::AgentClaude),
+        "copilot" => AgentIcon::Color(BrandIcon::AgentCopilot),
+        "kimi" if dark => AgentIcon::Color(BrandIcon::AgentKimi),
+        "kimi" => AgentIcon::Mono(SvgIcon::AgentKimi),
+        "codex" => AgentIcon::Mono(SvgIcon::AgentCodex),
+        "cursor" => AgentIcon::Mono(SvgIcon::AgentCursor),
+        "opencode" => AgentIcon::Mono(SvgIcon::AgentOpenCode),
+        "pi" => AgentIcon::Mono(SvgIcon::AgentPi),
+        _ => return None,
+    })
 }
 
 /// How each supported agent is covered, for the settings Integrations list.
@@ -436,6 +496,89 @@ pub(crate) fn refresh_path_probe() {
 #[cfg(test)]
 mod tests {
     use super::display_name;
+
+    fn row(place: &str, agent: &str, pane_id: mux::pane::PaneId) -> super::AgentPaneStatus {
+        super::AgentPaneStatus {
+            pane_id,
+            agent_id: agent.to_string(),
+            state: super::AgentState::Idle,
+            evidence: super::AgentEvidence::Screen,
+            session_id: None,
+            title: String::new(),
+            window_id: None,
+            place: place.to_string(),
+            since_unix: 0,
+        }
+    }
+
+    /// The panel order must not depend on which Space is frontmost:
+    /// switching Spaces used to float that workspace's rows to the top,
+    /// and the reshuffle read as agents changing state.
+    #[test]
+    fn display_order_is_stable_and_space_independent() {
+        let mut agents = vec![
+            row("Beta", "pi", 9),
+            row("alpha", "claude", 4),
+            row("Beta", "claude", 7),
+            row("alpha", "claude", 2),
+        ];
+        super::sort_for_display(&mut agents);
+        let order: Vec<_> = agents.iter().map(|a| a.pane_id).collect();
+        assert_eq!(order, vec![2, 4, 7, 9]);
+
+        // Same input in any order lands the same way.
+        let mut shuffled = vec![
+            row("alpha", "claude", 2),
+            row("Beta", "claude", 7),
+            row("Beta", "pi", 9),
+            row("alpha", "claude", 4),
+        ];
+        super::sort_for_display(&mut shuffled);
+        let again: Vec<_> = shuffled.iter().map(|a| a.pane_id).collect();
+        assert_eq!(again, order);
+    }
+
+    /// Every agent we ship a logo for must resolve in both themes, and
+    /// everything else must decline so the caller draws its fallback
+    /// instead of drawing the wrong brand.
+    #[test]
+    fn brand_icon_covers_the_logos_we_vendor() {
+        use super::{brand_icon, AgentIcon, Appearance};
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            for id in ["claude", "codex", "copilot", "cursor", "kimi", "opencode", "pi"] {
+                assert!(
+                    brand_icon(id, appearance).is_some(),
+                    "{id} should have a brand mark in {appearance:?}"
+                );
+            }
+            for id in ["omp", "soul", "some-custom-agent", ""] {
+                assert!(
+                    brand_icon(id, appearance).is_none(),
+                    "{id} should fall back in {appearance:?}"
+                );
+            }
+        }
+
+        // Kimi's colored mark is a white glyph: usable on dark chrome,
+        // invisible on light, so light must get the monochrome form.
+        assert!(matches!(
+            brand_icon("kimi", Appearance::Dark),
+            Some(AgentIcon::Color(_))
+        ));
+        assert!(matches!(
+            brand_icon("kimi", Appearance::Light),
+            Some(AgentIcon::Mono(_))
+        ));
+        // Claude and Copilot read on both, so they stay in color.
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            for id in ["claude", "copilot"] {
+                assert!(
+                    matches!(brand_icon(id, appearance), Some(AgentIcon::Color(_))),
+                    "{id} should stay colored in {appearance:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn display_name_falls_back_to_the_raw_id() {

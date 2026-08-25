@@ -108,6 +108,7 @@ const REMOTE_EMPTY_ICON_GAP: usize = 18;
 const REMOTE_EMPTY_DETAIL_GAP: usize = 6;
 const REMOTE_EMPTY_BUTTON_GAP: usize = 22;
 const REMOTE_EMPTY_BUTTON_HEIGHT: usize = 44;
+/// Toolbar control height.
 const SNIPPET_TOOLBAR_HEIGHT: usize = 58;
 const SNIPPET_SEARCH_HEIGHT: usize = 58;
 const SNIPPET_CARD_HEIGHT: usize = 116;
@@ -117,7 +118,9 @@ const SNIPPET_BODY_FIELD_HEIGHT: usize = 190;
 const SNIPPET_SAVE_BUTTON_HEIGHT: usize = 54;
 const SNIPPET_ACTION_BUTTON_MIN_WIDTH: usize = 92;
 const SNIPPET_ACTION_BUTTON_HEIGHT: usize = 46;
-const SNIPPET_ROW_GAP: usize = 16;
+/// Gap between snippet cards. Shared with the Agents list so the two
+/// panels space their rows identically rather than by coincidence.
+pub(crate) const SNIPPET_ROW_GAP: usize = 16;
 const SNIPPET_LIST_TOP_GAP: usize = 18;
 const SNIPPET_LIST_BOTTOM_PADDING: usize = 40;
 const RIGHT_SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
@@ -14340,7 +14343,7 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_files_preview_header_icon_button(
+    pub(crate) fn paint_files_preview_header_icon_button(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         chrome: UiPalette,

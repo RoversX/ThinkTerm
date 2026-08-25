@@ -55,7 +55,7 @@ pub enum SvgIcon {
     PinOff,
     Plus,
     RotateCcw,
-    RotateCw,
+    Redo,
     Save,
     Scissors,
     Search,
@@ -78,6 +78,17 @@ pub enum SvgIcon {
     Trash2,
     Unlink2,
     X,
+    // Coding-agent brand marks whose logo is monochrome by design, from
+    // lobe-icons rather than lucide (see third_party/lobe-icons/README).
+    // Being monochrome they take the caller's tint, so they invert with
+    // the theme for free. Agents whose logo is genuinely colored live in
+    // `BrandIcon` instead; Kimi is in both, because its colored mark is
+    // white and vanishes on a light background.
+    AgentCodex,
+    AgentCursor,
+    AgentKimi,
+    AgentOpenCode,
+    AgentPi,
 }
 
 impl SvgIcon {
@@ -185,7 +196,7 @@ impl SvgIcon {
             Self::RotateCcw => {
                 include_bytes!("../../../../third_party/lucide/icons/rotate-ccw.svg")
             }
-            Self::RotateCw => include_bytes!("../../../../third_party/lucide/icons/redo.svg"),
+            Self::Redo => include_bytes!("../../../../third_party/lucide/icons/redo.svg"),
             Self::Save => include_bytes!("../../../../third_party/lucide/icons/save.svg"),
             Self::Scissors => include_bytes!("../../../../third_party/lucide/icons/scissors.svg"),
             Self::Search => include_bytes!("../../../../third_party/lucide/icons/search.svg"),
@@ -229,6 +240,15 @@ impl SvgIcon {
             Self::Terminal => include_bytes!("../../../../third_party/lucide/icons/terminal.svg"),
             Self::Trash2 => include_bytes!("../../../../third_party/lucide/icons/trash-2.svg"),
             Self::X => include_bytes!("../../../../third_party/lucide/icons/x.svg"),
+            Self::AgentCodex => include_bytes!("../../../../third_party/lobe-icons/openai.svg"),
+            Self::AgentCursor => {
+                include_bytes!("../../../../third_party/lobe-icons/cursor.svg")
+            }
+            Self::AgentKimi => include_bytes!("../../../../third_party/lobe-icons/kimi.svg"),
+            Self::AgentOpenCode => {
+                include_bytes!("../../../../third_party/lobe-icons/opencode.svg")
+            }
+            Self::AgentPi => include_bytes!("../../../../third_party/lobe-icons/pi.svg"),
         }
     }
 
@@ -345,17 +365,25 @@ pub fn material_folder_icon_for_name(
     }
 }
 
-/// Brand / product logos sourced from the `simple-icons` submodule
-/// (`third_party/simple-icons/icons/<slug>.svg`).
+/// Brand / product logos painted in full color.
 ///
-/// Unlike Lucide, simple-icons SVGs are a single fill-less `<path>` that
-/// defaults to black, and each brand has an official color. We inject that
-/// color as the path fill. Because many brands are black/near-black (GitHub,
-/// Anthropic, Apple, Rust, Debian) and would vanish on the dark UI, a brand
-/// color darker than [`MIN_BRAND_LUMA`] is rendered white instead.
+/// Most come from the `simple-icons` submodule
+/// (`third_party/simple-icons/icons/<slug>.svg`): a single fill-less
+/// `<path>` that defaults to black, plus an official brand color which we
+/// inject as the path fill. Because many brands are black/near-black
+/// (GitHub, Anthropic, Apple, Rust, Debian) and would vanish on the dark
+/// UI, a brand color darker than [`MIN_BRAND_LUMA`] is rendered white
+/// instead.
+///
+/// The `Agent*` marks come from `third_party/lobe-icons` and are the
+/// exception: their SVGs already carry their own fills and gradients, so
+/// they are rasterized untouched — see [`BrandIcon::has_embedded_color`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BrandIcon {
+    AgentClaude,
+    AgentCopilot,
+    AgentKimi,
     Alpine,
     Anthropic,
     Apple,
@@ -382,6 +410,15 @@ const MIN_BRAND_LUMA: f32 = 40.0;
 impl BrandIcon {
     pub fn bytes(self) -> &'static [u8] {
         match self {
+            Self::AgentClaude => {
+                include_bytes!("../../../../third_party/lobe-icons/claude-color.svg")
+            }
+            Self::AgentCopilot => {
+                include_bytes!("../../../../third_party/lobe-icons/copilot-color.svg")
+            }
+            Self::AgentKimi => {
+                include_bytes!("../../../../third_party/lobe-icons/kimi-color.svg")
+            }
             Self::Alpine => {
                 include_bytes!("../../../../third_party/simple-icons/icons/alpinelinux.svg")
             }
@@ -412,9 +449,26 @@ impl BrandIcon {
         }
     }
 
+    /// Whether this mark's SVG already carries its own fills, so the
+    /// single-path color injection below must be skipped. Injecting onto a
+    /// path that already has a `fill` produces a duplicate XML attribute,
+    /// which usvg rejects outright — the icon would not merely look wrong,
+    /// it would fail to rasterize and take the frame down with it.
+    fn has_embedded_color(self) -> bool {
+        matches!(
+            self,
+            Self::AgentClaude | Self::AgentCopilot | Self::AgentKimi
+        )
+    }
+
     /// Official brand color (sRGB) from `simple-icons/data/simple-icons.json`.
+    /// Unused for [`Self::has_embedded_color`] marks, which keep their own;
+    /// the entries below are their dominant color, for reference.
     pub fn brand_color(self) -> (u8, u8, u8) {
         match self {
+            Self::AgentClaude => (0xD9, 0x77, 0x57),
+            Self::AgentCopilot => (0x24, 0x96, 0xED),
+            Self::AgentKimi => (0x17, 0x83, 0xFF),
             Self::Alpine => (0x0D, 0x59, 0x7F),
             Self::Anthropic => (0x19, 0x19, 0x19),
             Self::Apple => (0x00, 0x00, 0x00),
@@ -448,6 +502,9 @@ impl BrandIcon {
 
     pub fn rasterize(self, size: usize) -> Result<Image> {
         let svg = std::str::from_utf8(self.bytes()).context("brand SVG asset is not UTF-8")?;
+        if self.has_embedded_color() {
+            return rasterize_svg_str(svg, size, 0.0);
+        }
         let (r, g, b) = self.display_color();
         let fill = format!("#{r:02X}{g:02X}{b:02X}");
         // simple-icons paths carry no fill; inject the brand color on the
@@ -546,7 +603,7 @@ mod tests {
             SvgIcon::Plus,
             SvgIcon::Unlink2,
             SvgIcon::RotateCcw,
-            SvgIcon::RotateCw,
+            SvgIcon::Redo,
             SvgIcon::Search,
             SvgIcon::Settings,
             SvgIcon::SlidersHorizontal,
@@ -562,6 +619,14 @@ mod tests {
             SvgIcon::Terminal,
             SvgIcon::Trash2,
             SvgIcon::X,
+            // The agent marks come from a different upstream than the
+            // rest, sized in `em` rather than pixels: keep them covered so
+            // a re-vendored file that usvg cannot size fails here.
+            SvgIcon::AgentCodex,
+            SvgIcon::AgentCursor,
+            SvgIcon::AgentKimi,
+            SvgIcon::AgentOpenCode,
+            SvgIcon::AgentPi,
         ] {
             let data: Vec<u8> = icon.rasterize(24).unwrap().into();
             assert_eq!(data.len(), 24 * 24 * 4);
@@ -572,6 +637,12 @@ mod tests {
     #[test]
     fn brand_icons_rasterize() {
         for icon in [
+            // These three take the embedded-color path, where a stray
+            // fill injection would be a hard usvg parse error rather than
+            // a cosmetic bug — see BrandIcon::has_embedded_color.
+            BrandIcon::AgentClaude,
+            BrandIcon::AgentCopilot,
+            BrandIcon::AgentKimi,
             BrandIcon::Alpine,
             BrandIcon::Anthropic,
             BrandIcon::Apple,

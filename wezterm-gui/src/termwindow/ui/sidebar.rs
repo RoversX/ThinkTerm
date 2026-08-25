@@ -3516,7 +3516,7 @@ impl crate::TermWindow {
 
     /// Paint a full-color brand/OS logo (the brand color is baked into the
     /// sprite, so unlike [`Self::paint_sidebar_icon`] it is not tinted).
-    fn paint_sidebar_brand_icon(
+    pub(crate) fn paint_sidebar_brand_icon(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         icon: BrandIcon,

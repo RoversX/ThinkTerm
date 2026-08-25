@@ -1,0 +1,44 @@
+Lobe Icons
+==========
+
+This directory contains a vendored snapshot of eight brand mark SVGs from
+the Lobe Icons project.
+
+Repository: https://github.com/lobehub/lobe-icons
+Commit:     4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75
+Path:       packages/static-svg/icons/
+
+Only these files are used, one mark per coding agent the status panel can
+detect; the upstream repository is ~75 MB of React packages and raster
+exports that ThinkTerm has no use for, which is why this is a copied
+snapshot rather than a submodule.
+
+    claude-color.svg    Claude Code    colored
+    copilot-color.svg   Copilot CLI    colored
+    kimi-color.svg      Kimi Code      colored, dark theme only
+    kimi.svg            Kimi Code      monochrome, light theme
+    openai.svg          Codex          monochrome
+    cursor.svg          Cursor Agent   monochrome
+    opencode.svg        OpenCode       monochrome
+    pi.svg              Pi             monochrome
+
+The marks come in two forms, because the brands do. The monochrome ones
+carry `fill="currentColor"`, which `SvgIcon::rasterize` turns white so the
+shader can tint them with the surrounding UI color — so they invert with
+the theme for free. OpenAI, Cursor, OpenCode and Pi publish no colored
+mark at all; their logos are monochrome by design.
+
+The colored ones carry their own fills and gradients and are painted
+as-is through `BrandIcon`, which skips its usual fill injection for them
+(injecting onto a path that already has a fill is a hard usvg parse
+error, not a cosmetic bug). Kimi is the awkward case: its colored mark is
+a white glyph with a blue dot, which reads on dark chrome and all but
+disappears on light, so both forms are vendored and the resolver picks by
+appearance.
+
+To update a mark, copy the file again from the path above at a newer commit
+and record that commit here.
+
+Each logo is the trademark of its respective owner. They appear here to
+identify which agent is running in a pane; that is nominative use and
+implies no affiliation with or endorsement by those owners.
