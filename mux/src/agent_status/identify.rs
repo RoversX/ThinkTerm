@@ -53,23 +53,32 @@ fn probe(pane: &dyn Pane) -> CachedIdent {
     } else {
         CachePolicy::FetchImmediate
     };
-    let leader_path = pane
-        .get_foreground_process_name(policy)
-        .map(normalize_executable_path);
-    let resolved = CachedIdent {
-        at: now,
-        agent: leader_path.as_deref().and_then(|path| {
+    // Windows has no tty foreground group: identification walks the
+    // pane's process tree instead (falling back to the youngest-console
+    // heuristic when the tree names no agent).
+    #[cfg(windows)]
+    let (leader_path, agent) = super::windows_select::probe_pane(pane, policy);
+    #[cfg(not(windows))]
+    let (leader_path, agent) = {
+        let leader_path = pane
+            .get_foreground_process_name(policy)
+            .map(normalize_executable_path);
+        let agent = leader_path.as_deref().and_then(|path| {
             // argv is fetched only if the leader turns out to be a generic
             // interpreter, and always AllowStale: the name probe one step
             // up just refreshed the leader cache, so this reuses that same
             // pid. Re-probing here could race a foreground change and pair
-            // this argv with the other probe's path — and on Windows a
-            // FetchImmediate would repeat a full process-table walk.
+            // this argv with the other probe's path.
             let mut argv = || pane.get_foreground_process_argv(CachePolicy::AllowStale);
             super::proc_match::identify(path, &mut argv, &|name| {
                 super::engine::manifest_id_for_alias(name)
             })
-        }),
+        });
+        (leader_path, agent)
+    };
+    let resolved = CachedIdent {
+        at: now,
+        agent,
         leader_path,
     };
 
@@ -127,7 +136,7 @@ pub fn forget_pane(pane_id: crate::pane::PaneId) {
 /// keeps both identification and the contract's leader-path equality
 /// working across an in-place update. macOS resolves via `proc_pidpath`,
 /// which never decorates the path, so this is a no-op there.
-fn normalize_executable_path(path: String) -> String {
+pub(crate) fn normalize_executable_path(path: String) -> String {
     match path.strip_suffix(" (deleted)") {
         Some(stripped) => stripped.to_string(),
         None => path,

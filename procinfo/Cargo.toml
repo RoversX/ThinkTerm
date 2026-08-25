@@ -17,6 +17,9 @@ wezterm-dynamic = { workspace=true, optional = true, features=["std"]}
 
 [target."cfg(windows)".dependencies]
 ntapi.workspace = true
+# The full set this crate uses by itself: a bare `cargo check -p
+# procinfo --target x86_64-pc-windows-msvc` must build without another
+# workspace crate's features papering over a gap here.
 winapi = { workspace=true, features = [
     "handleapi",
     "memoryapi",
@@ -24,5 +27,6 @@ winapi = { workspace=true, features = [
     "processthreadsapi",
     "shellapi",
     "tlhelp32",
+    "winbase",
 ]}
 

@@ -607,6 +607,13 @@ impl Pane for LocalPane {
         None
     }
 
+    fn root_process_id(&self) -> Option<u32> {
+        match &*self.process.lock() {
+            ProcessState::Running { pid, .. } => *pid,
+            _ => None,
+        }
+    }
+
     fn can_close_without_prompting(&self, _reason: CloseReason) -> bool {
         if let Some(info) = self.divine_process_list(CachePolicy::FetchImmediate) {
             log::trace!(

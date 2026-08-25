@@ -389,6 +389,12 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_foreground_process_argv(&self, _policy: CachePolicy) -> Option<Vec<String>> {
         None
     }
+    /// The pane's root (pty child) process id, when the platform tracks
+    /// one. Windows agent identification walks the process tree from
+    /// here — there is no foreground-group concept to ask instead.
+    fn root_process_id(&self) -> Option<u32> {
+        None
+    }
     fn get_foreground_process_info(
         &self,
         _policy: CachePolicy,

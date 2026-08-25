@@ -342,6 +342,32 @@ impl Drop for ProcHandle {
     }
 }
 
+/// See [`crate::ProcessTableEntry`]: one Toolhelp32 pass, no per-process
+/// handles.
+pub fn process_table() -> Option<Vec<crate::ProcessTableEntry>> {
+    let entries = Snapshot::entries();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .map(|entry| {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                crate::ProcessTableEntry {
+                    pid: entry.th32ProcessID,
+                    ppid: entry.th32ParentProcessID,
+                    name: String::from_utf16_lossy(&entry.szExeFile[..len]),
+                }
+            })
+            .collect(),
+    )
+}
+
 impl LocalProcessInfo {
     pub fn current_working_dir(pid: u32) -> Option<PathBuf> {
         log::trace!("current_working_dir({})", pid);

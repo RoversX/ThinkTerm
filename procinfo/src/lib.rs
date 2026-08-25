@@ -25,6 +25,27 @@ pub enum LocalProcessStatus {
     Unknown,
 }
 
+/// One row of the system process table: ancestry facts only, gathered
+/// without opening a handle to any process (unlike `with_root_pid`,
+/// which opens every process it touches). Windows-only in practice;
+/// other platforms return `None` from [`process_table`].
+#[derive(Debug, Clone)]
+pub struct ProcessTableEntry {
+    pub pid: u32,
+    pub ppid: u32,
+    /// The executable image name as the snapshot reports it
+    /// (`szExeFile`, e.g. "node.exe").
+    pub name: String,
+}
+
+#[cfg(windows)]
+pub use windows::process_table;
+
+#[cfg(not(windows))]
+pub fn process_table() -> Option<Vec<ProcessTableEntry>> {
+    None
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "lua", derive(FromDynamic, ToDynamic))]
 pub struct LocalProcessInfo {
