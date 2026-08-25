@@ -356,6 +356,17 @@ impl LocalProcessInfo {
         proc.executable()
     }
 
+    /// The argument vector of one process, read from its PEB. `None` when
+    /// the process is gone or its parameters are unreadable.
+    pub fn argv_for_pid(pid: u32) -> Option<Vec<String>> {
+        log::trace!("argv_for_pid({})", pid);
+        let params = ProcHandle::new(pid)?.get_params()?;
+        if params.argv.is_empty() {
+            return None;
+        }
+        Some(params.argv)
+    }
+
     pub fn with_root_pid(pid: u32) -> Option<Self> {
         log::trace!("LocalProcessInfo::with_root_pid({}), getting snapshot", pid);
         let procs = Snapshot::entries();

@@ -129,34 +129,6 @@ impl LocalProcessInfo {
             LocalProcessInfo::current_working_dir(pid as _).unwrap_or_else(PathBuf::new)
         }
 
-        fn exe_and_args_for_pid_sysctl(pid: libc::pid_t) -> Option<(PathBuf, Vec<String>)> {
-            use libc::c_int;
-            let mut size = 64 * 1024;
-            let mut buf: Vec<u8> = Vec::with_capacity(size);
-            let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as c_int];
-
-            let res = unsafe {
-                libc::sysctl(
-                    mib.as_mut_ptr(),
-                    mib.len() as _,
-                    buf.as_mut_ptr() as *mut _,
-                    &mut size,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            if res == -1 {
-                return None;
-            }
-            if size < (std::mem::size_of::<c_int>() * 2) {
-                // Not big enough
-                return None;
-            }
-            unsafe { buf.set_len(size) };
-
-            parse_exe_and_argv_sysctl(buf)
-        }
-
         fn exe_for_pid(pid: libc::pid_t) -> PathBuf {
             LocalProcessInfo::executable_path(pid as _).unwrap_or_else(PathBuf::new)
         }
@@ -197,6 +169,42 @@ impl LocalProcessInfo {
             None
         }
     }
+
+    /// The argument vector of one process: a single sysctl, unlike
+    /// `with_root_pid` which enumerates the whole process table.
+    /// `KERN_PROCARGS2` reflects runtime argv rewrites, which is what
+    /// wrapper unwrapping wants to see.
+    pub fn argv_for_pid(pid: u32) -> Option<Vec<String>> {
+        exe_and_args_for_pid_sysctl(pid as libc::pid_t).map(|(_, argv)| argv)
+    }
+}
+
+fn exe_and_args_for_pid_sysctl(pid: libc::pid_t) -> Option<(PathBuf, Vec<String>)> {
+    use libc::c_int;
+    let mut size = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(size);
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as c_int];
+
+    let res = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as _,
+            buf.as_mut_ptr() as *mut _,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res == -1 {
+        return None;
+    }
+    if size < (std::mem::size_of::<c_int>() * 2) {
+        // Not big enough
+        return None;
+    }
+    unsafe { buf.set_len(size) };
+
+    parse_exe_and_argv_sysctl(buf)
 }
 
 fn parse_exe_and_argv_sysctl(buf: Vec<u8>) -> Option<(PathBuf, Vec<String>)> {

@@ -28,6 +28,22 @@ impl LocalProcessInfo {
         std::fs::read_link(format!("/proc/{}/exe", pid)).ok()
     }
 
+    /// The argument vector of one process: a single `/proc` file read,
+    /// unlike `with_root_pid` which scans the whole process table. `None`
+    /// when the process is gone or exposes no cmdline (kernel threads).
+    pub fn argv_for_pid(pid: u32) -> Option<Vec<String>> {
+        let data = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+        let data = data.strip_suffix(&[0]).unwrap_or(&data);
+        if data.is_empty() {
+            return None;
+        }
+        Some(
+            data.split(|&c| c == 0)
+                .map(|arg| String::from_utf8_lossy(arg).to_string())
+                .collect(),
+        )
+    }
+
     pub fn with_root_pid(pid: u32) -> Option<Self> {
         use libc::pid_t;
 
