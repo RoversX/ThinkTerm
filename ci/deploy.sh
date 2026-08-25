@@ -43,6 +43,9 @@ case $OSTYPE in
     cp assets/icon/ThinkTerm_simple.icns $zipdir/ThinkTerm.app/Contents/Resources/ThinkTerm_simple.icns
     cp -r assets/shell-integration/* $zipdir/ThinkTerm.app/Contents/Resources
     cp -r assets/shell-completion $zipdir/ThinkTerm.app/Contents/Resources
+    # Third-party attributions (icon sets, detection manifests); their
+    # licenses require the notice to ship with the binaries that embed them.
+    cp NOTICE $zipdir/ThinkTerm.app/Contents/Resources/NOTICE
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
 
     for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes ; do
@@ -153,6 +156,7 @@ case $OSTYPE in
       assets/windows/conhost/OpenConsole.exe \
       assets/windows/angle/libEGL.dll \
       assets/windows/angle/libGLESv2.dll \
+      NOTICE \
       $zipdir
 
     # `[profile.release]` leaves `debug` off, so no PDBs exist today and
@@ -296,6 +300,11 @@ install -Dm644 assets/icon/terminal.png %{buildroot}/usr/share/icons/hicolor/128
 install -Dm644 assets/wezterm.desktop %{buildroot}/usr/share/applications/com.roversx.thinkterm.desktop
 install -Dm644 assets/wezterm.appdata.xml %{buildroot}/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python/extensions/wezterm-nautilus.py
+install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm/NOTICE
+# A second copy owned by the standalone mux-server package: it links the
+# same third-party material and installs without thinkterm-common, and
+# one file owned by two packages would conflict on co-install.
+install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm-mux-server/NOTICE
 
 %files
 # Main package (metapackage) has no files
@@ -304,6 +313,7 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 /usr/bin/thinkterm
 /usr/bin/wezterm
 /usr/bin/strip-ansi-escapes
+/usr/share/licenses/thinkterm/NOTICE
 /usr/share/zsh/site-functions/_thinkterm
 /usr/share/fish/vendor_completions.d/thinkterm.fish
 /usr/share/fish/vendor_completions.d/wezterm.fish
@@ -322,6 +332,7 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 
 %files -n thinkterm-mux-server
 /usr/bin/thinkterm-mux-server
+/usr/share/licenses/thinkterm-mux-server/NOTICE
 
 %changelog
 * Mon Oct 2 2023 Wez Furlong
@@ -410,6 +421,7 @@ EOF
         ln -s thinkterm pkg/debian/usr/share/bash-completion/completions/wezterm
         ln -s thinkterm.fish pkg/debian/usr/share/fish/vendor_completions.d/wezterm.fish
         install -Dm644 assets/shell-integration/* -t pkg/debian/etc/profile.d
+        install -Dm644 NOTICE pkg/debian/usr/share/doc/$pkgname/NOTICE
 
         if [[ "$BUILD_REASON" == "Schedule" ]] ; then
           debname=thinkterm-nightly.$distro$distver
@@ -467,6 +479,7 @@ source="
   assets/icon/terminal.png
   assets/icon/wezterm-icon.svg
   termwiz/data/wezterm.terminfo
+  NOTICE
 "
 builddir="\$srcdir"
 
@@ -489,6 +502,7 @@ package() {
   install -Dm644 "\$srcdir"/terminal.png "\$pkgdir"/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
   install -Dm644 "\$srcdir"/wezterm-icon.svg "\$pkgdir"/usr/share/icons/hicolor/scalable/apps/com.roversx.thinkterm.svg
   install -Dm644 "\$builddir"/wezterm.terminfo "\$pkgdir"/usr/share/terminfo/w/wezterm
+  install -Dm644 "\$srcdir"/NOTICE "\$pkgdir"/usr/share/licenses/thinkterm/NOTICE
 }
 EOF
         abuild -F checksum

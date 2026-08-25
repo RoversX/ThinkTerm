@@ -14,6 +14,7 @@ install -Dm644 assets/icon/terminal.png AppDir/usr/share/icons/hicolor/128x128/a
 install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/com.roversx.thinkterm.desktop
 install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py AppDir/usr/share/nautilus-python/extensions/wezterm-nautilus.py
+install -Dm644 NOTICE AppDir/usr/share/doc/thinkterm/NOTICE
 
 # linuxdeploy publishes per-machine names (x86_64, aarch64); the rest of the
 # release labels the same machine arm64, so normalise for the output name.

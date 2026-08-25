@@ -56,6 +56,8 @@ package() {
   install -Dm755 squashfs-root/usr/bin/thinkterm-gui -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/thinkterm-mux-server -t "${pkgdir}/usr/bin/"
   install -Dm644 LICENSE -t "${pkgdir}/usr/share/licenses/${pkgname}"
+  install -Dm644 squashfs-root/usr/share/doc/thinkterm/NOTICE \
+                 -t "${pkgdir}/usr/share/licenses/${pkgname}"
   install -Dm644 squashfs-root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png \
                  "${pkgdir}/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png"
   install -Dm644 squashfs-root/usr/share/applications/com.roversx.thinkterm.desktop \
