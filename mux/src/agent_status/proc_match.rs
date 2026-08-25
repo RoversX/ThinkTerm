@@ -137,10 +137,96 @@ fn wrapped_agent(
         "bun" => script_arg_agent(argv, &["-e", "--eval", "-p", "--print"], &[], lookup),
         name if is_python_runtime(name) => script_arg_agent(argv, &["-c"], &["-m"], lookup),
         "sh" | "bash" | "zsh" | "fish" => script_arg_agent(argv, &["-c"], &[], lookup),
-        // tmux wraps a server, not an agent. cmd/powershell text
-        // unwrapping belongs to the deferred Windows identification work.
+        "cmd" => cmd_arg_agent(argv, lookup),
+        "powershell" | "pwsh" => powershell_arg_agent(argv, lookup),
+        // tmux wraps a server, not an agent.
         _ => None,
     }
+}
+
+/// npm on Windows installs `.cmd` batch shims run as
+/// `cmd /c C:\…\codex.cmd --model x`: the agent's name lives in the
+/// command *text* after `/c`, not in argv proper.
+fn cmd_arg_agent(argv: &[String], lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        let flag = arg.trim_matches('"').to_lowercase();
+        match flag.as_str() {
+            "/c" | "/k" => {
+                return args
+                    .next()
+                    .and_then(|command| command_text_agent(command, lookup));
+            }
+            "/d" | "/s" | "/q" | "/a" | "/u" | "/e:on" | "/e:off" | "/f:on" | "/f:off"
+            | "/v:on" | "/v:off" => continue,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn powershell_arg_agent(
+    argv: &[String],
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        let flag = arg.trim_matches('"').to_lowercase();
+        match flag.as_str() {
+            "-file" | "-f" | "/file" => {
+                return args.next().and_then(|path| agent_from_path_token(path, lookup));
+            }
+            "-command" | "-c" | "/command" | "/c" => {
+                return args
+                    .next()
+                    .and_then(|command| command_text_agent(command, lookup));
+            }
+            // Base64 payloads are opaque on purpose — never guess.
+            "-encodedcommand" | "-enc" | "/encodedcommand" | "/enc" => return None,
+            "-configurationname" | "-executionpolicy" | "-outputformat" | "-psconsolefile"
+            | "-version" | "-windowstyle" | "-workingdirectory" => {
+                let _ = args.next();
+            }
+            _ if flag.starts_with('-') || flag.starts_with('/') => {}
+            _ => return agent_from_path_token(arg, lookup),
+        }
+    }
+    None
+}
+
+/// First real token of a shell command string, skipping the call-forms
+/// (`&`, `.`, `call`) that prefix the actual program.
+fn command_text_agent(command: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let mut rest = command;
+    while let Some((token, next)) = command_text_token(rest) {
+        let token = token.trim();
+        if token.eq_ignore_ascii_case("&")
+            || token.eq_ignore_ascii_case(".")
+            || token.eq_ignore_ascii_case("call")
+        {
+            rest = next;
+            continue;
+        }
+        return agent_from_path_token(token, lookup);
+    }
+    None
+}
+
+/// Split one quote-aware token off the front of a command string.
+fn command_text_token(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let first = input.chars().next()?;
+    if first == '"' || first == '\'' {
+        let start = first.len_utf8();
+        if let Some(end) = input[start..].find(first) {
+            let end = start + end;
+            return Some((&input[start..end], &input[end + first.len_utf8()..]));
+        }
+        return Some((&input[start..], ""));
+    }
+
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    Some((&input[..end], &input[end..]))
 }
 
 /// Find the script path in an interpreter's argv: skip options (consuming
@@ -407,6 +493,66 @@ mod tests {
         // A bare runtime with no script stays unidentified.
         assert_eq!(identify_with_argv("/usr/bin/node", &["node"]), None);
         assert_eq!(identify_no_argv("/usr/bin/node"), None);
+    }
+
+    #[test]
+    fn cmd_and_powershell_command_lines_unwrap() {
+        // The npm .cmd shim shape.
+        assert_eq!(
+            identify_with_argv(
+                "C:\\Windows\\System32\\cmd.exe",
+                &["cmd", "/c", "C:\\Users\\x\\AppData\\Roaming\\npm\\codex.cmd --model gpt-5"]
+            )
+            .as_deref(),
+            Some("codex")
+        );
+        // Quoted path with spaces, and a leading `call`.
+        assert_eq!(
+            identify_with_argv(
+                "C:\\Windows\\System32\\cmd.exe",
+                &["cmd", "/d", "/c", "call \"C:\\Program Files\\agents\\claude.cmd\" --resume"]
+            )
+            .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            identify_with_argv(
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                &["pwsh", "-File", "C:\\tools\\claude.ps1"]
+            )
+            .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            identify_with_argv(
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                &["powershell", "-Command", "& 'C:\\agents\\pi.cmd' --serve"]
+            )
+            .as_deref(),
+            Some("pi")
+        );
+        // Encoded payloads are opaque; option values must not be mistaken
+        // for programs.
+        assert_eq!(
+            identify_with_argv(
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                &["pwsh", "-EncodedCommand", "YwBsAGEAdQBkAGUA"]
+            ),
+            None
+        );
+        assert_eq!(
+            identify_with_argv(
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                &["pwsh", "-ExecutionPolicy", "Bypass", "-File", "C:\\x\\kimi.ps1"]
+            )
+            .as_deref(),
+            Some("kimi")
+        );
+        // A bare cmd with no /c never identifies.
+        assert_eq!(
+            identify_with_argv("C:\\Windows\\System32\\cmd.exe", &["cmd"]),
+            None
+        );
     }
 
     #[test]
