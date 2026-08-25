@@ -25,6 +25,7 @@ pub mod engine;
 mod hysteresis;
 pub mod identify;
 mod proc_match;
+mod windows_select;
 
 use crate::pane::{Pane, PaneId};
 use crate::{Mux, MuxNotification};
@@ -422,6 +423,18 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
                     (Some(recorded), Some(current)) if recorded != current
                 );
                 if emitter_gone {
+                    return None;
+                }
+                // An unchanged *observed* leader is liveness — the soul
+                // case above depends on it. But when no emitter was ever
+                // observable (ssh/tmux/serial panes record no leader at
+                // all), the mismatch check can never fire, and the
+                // contract's own age becomes the only guard there is: a
+                // non-idle claim past CONTRACT_MAX_AGE with no re-emission
+                // is a dead agent, not a quiet one. Idle and ts-less
+                // contracts stay trusted (state_is_fresh), so a live agent
+                // sitting at its prompt is never aged out.
+                if record.contract_leader.is_none() && !contract::state_is_fresh(c, now_unix) {
                     return None;
                 }
             }
@@ -1382,6 +1395,58 @@ mod tests {
             status_for_pane(pane.pane_id()).is_none(),
             "a dead emitter's contract must not survive on freshness alone"
         );
+    }
+
+    /// On panes that can never observe an emitter (ssh/tmux/serial: no
+    /// leader is ever recorded), the leader-mismatch crash detector is
+    /// structurally unreachable — contract age is the only guard left. A
+    /// stale non-idle claim there is a dead agent; idle and ts-less
+    /// claims stay trusted so quiet-but-alive agents are not aged out.
+    #[test]
+    fn unverifiable_contracts_expire_instead_of_pinning_forever() {
+        // Established fresh, then the var re-states something ancient —
+        // the same aging proxy contract_survives_while_leader_is_unchanged
+        // uses, but with no leader for the mismatch check to ever consult.
+        let pane = FakeAgentPane::new(None);
+        pane.set_contract(&format!("v1;agent=soul;state=working;ts={}", now_unix()));
+        drain_step(pane.as_ref() as &dyn Pane);
+        assert!(status_for_pane(pane.pane_id()).is_some());
+        pane.set_contract(&format!(
+            "v1;agent=soul;state=working;ts={}",
+            now_unix() - 8 * 60 * 60
+        ));
+        drain_step(pane.as_ref() as &dyn Pane);
+        assert!(
+            status_for_pane(pane.pane_id()).is_none(),
+            "a stale working claim with no observable emitter must expire"
+        );
+
+        // Idle never expires: a crashed-while-idle agent staying pinned is
+        // the accepted cost of never evicting a live one at its prompt.
+        let idle = FakeAgentPane::new(None);
+        idle.set_contract(&format!("v1;agent=soul;state=idle;ts={}", now_unix()));
+        drain_step(idle.as_ref() as &dyn Pane);
+        idle.set_contract(&format!(
+            "v1;agent=soul;state=idle;ts={}",
+            now_unix() - 8 * 60 * 60
+        ));
+        drain_step(idle.as_ref() as &dyn Pane);
+        assert!(
+            status_for_pane(idle.pane_id()).is_some(),
+            "idle claims are trusted indefinitely"
+        );
+        evict_pane(idle.pane_id());
+
+        // No ts at all: trusted, per the documented contract grammar.
+        let tsless = FakeAgentPane::new(None);
+        tsless.set_contract("v1;agent=soul;state=working");
+        drain_step(tsless.as_ref() as &dyn Pane);
+        drain_step(tsless.as_ref() as &dyn Pane);
+        assert!(
+            status_for_pane(tsless.pane_id()).is_some(),
+            "a ts-less contract must not be aged out"
+        );
+        evict_pane(tsless.pane_id());
     }
 
     /// A transient probe failure (leader reads as None) must not evict:

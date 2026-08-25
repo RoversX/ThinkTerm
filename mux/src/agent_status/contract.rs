@@ -21,8 +21,12 @@ use thinkterm_proto::AgentState;
 pub const USER_VAR_NAME: &str = "THINKTERM_AGENT";
 
 /// How old a non-idle contract may be before it is disregarded. Long on
-/// purpose: it only exists to shed reports from long-dead sessions on
-/// mux-server panes that survive GUI restarts.
+/// purpose: it sheds reports from long-dead sessions on mux-server panes
+/// that survive GUI restarts, and — on panes whose foreground leader can
+/// never be observed (ssh/tmux/serial) — it is the only thing that ever
+/// retires the identity of an agent that crashed without `ended=1`.
+/// Integrations that may run under such panes should re-emit their state
+/// periodically if they want to outlive this window.
 pub(crate) const CONTRACT_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 /// Clock skew tolerated before a future timestamp stops counting as fresh.
 const FUTURE_SKEW_ALLOWANCE_SECS: u64 = 300;
