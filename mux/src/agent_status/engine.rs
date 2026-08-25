@@ -34,6 +34,10 @@ pub enum ScreenVerdict {
     NoMatch,
 }
 
+// No `deny_unknown_fields` at the file level, matching herdr: future
+// manifest revisions may add top-level metadata, and a drop-in herdr
+// file must keep loading. Rules and gates below stay strict — that is
+// where a typo'd key silently changes matching behavior.
 #[derive(Deserialize)]
 struct ManifestFile {
     id: String,
@@ -49,6 +53,7 @@ struct ManifestFile {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct ManifestRule {
     id: String,
     state: Option<ManifestState>,
@@ -84,6 +89,7 @@ struct ManifestRule {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct ManifestGate {
     #[serde(default)]
     all: Vec<ManifestGate>,
@@ -99,7 +105,7 @@ struct ManifestGate {
     line_regex: Vec<String>,
 }
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum ManifestState {
     Idle,
@@ -214,16 +220,13 @@ fn compile_manifest(text: &str, origin: &str) -> Option<CompiledManifest> {
             return None;
         }
     }
+    if let Err(err) = validate_manifest(&file) {
+        log::error!("agent manifest {origin} is invalid: {err}");
+        return None;
+    }
     let mut rules = Vec::with_capacity(file.rules.len());
     for rule in &file.rules {
-        let gate = match compile_gate(&ManifestGate {
-            all: rule.all.clone(),
-            any: rule.any.clone(),
-            not_gate: rule.not_gate.clone(),
-            contains: rule.contains.clone(),
-            regex: rule.regex.clone(),
-            line_regex: rule.line_regex.clone(),
-        }) {
+        let gate = match compile_gate(&manifest_gate_from_rule(rule)) {
             Ok(gate) => gate,
             Err(err) => {
                 log::error!(
@@ -280,11 +283,239 @@ fn compile_gate(gate: &ManifestGate) -> Result<CompiledGate, String> {
     })
 }
 
-fn load_all() -> HashMap<String, CompiledManifest> {
+// ---------------------------------------------------------------------------
+// Load-time validation. A manifest that fails here is dropped whole (for a
+// user override the bundled one keeps serving), so a typo'd field or region
+// surfaces as an error instead of a rule that silently never fires — or
+// worse, a rule that always fires because an unknown region evaluates
+// against "". Checks and limits mirror herdr's `validate_manifest`.
+// ---------------------------------------------------------------------------
+
+const MAX_RULES_PER_MANIFEST: usize = 128;
+const MAX_GATE_DEPTH: usize = 8;
+const MAX_TOTAL_GATES: usize = 512;
+const MAX_MATCHERS_PER_GATE: usize = 32;
+const MAX_TOTAL_MATCHERS: usize = 1024;
+const MAX_MATCHER_CHARS: usize = 512;
+/// `top_non_empty_lines` was added in engine v3; a rule using it under a
+/// lower `min_engine_version` banner would evaluate against "" on the older
+/// engines that banner admits.
+const TOP_NON_EMPTY_LINES_ENGINE_VERSION: u32 = 3;
+
+#[derive(Default)]
+struct ManifestComplexity {
+    total_gates: usize,
+    total_matchers: usize,
+}
+
+fn validate_manifest(file: &ManifestFile) -> Result<(), String> {
+    if file.rules.is_empty() {
+        return Err("manifest must contain at least one rule".to_string());
+    }
+    if file.rules.len() > MAX_RULES_PER_MANIFEST {
+        return Err(format!(
+            "manifest contains {} rules, max is {MAX_RULES_PER_MANIFEST}",
+            file.rules.len()
+        ));
+    }
+
+    let mut complexity = ManifestComplexity::default();
+    for rule in &file.rules {
+        if rule.id.trim().is_empty() {
+            return Err("manifest rule id must not be empty".to_string());
+        }
+        if rule.skip_state_update {
+            if rule.state != Some(ManifestState::Unknown) {
+                return Err(format!(
+                    "rule {} uses skip_state_update without state = \"unknown\"",
+                    rule.id
+                ));
+            }
+            if rule.visible_idle || rule.visible_blocker || rule.visible_working {
+                return Err(format!(
+                    "rule {} uses skip_state_update with visible state evidence",
+                    rule.id
+                ));
+            }
+        }
+        validate_region_name(&rule.region)
+            .map_err(|err| format!("rule {} uses invalid region: {err}", rule.id))?;
+        if rule.region.trim().starts_with("top_non_empty_lines(")
+            && file
+                .min_engine_version
+                .is_some_and(|version| version < TOP_NON_EMPTY_LINES_ENGINE_VERSION)
+        {
+            return Err(format!(
+                "rule {} uses top_non_empty_lines but min_engine_version is below {}",
+                rule.id, TOP_NON_EMPTY_LINES_ENGINE_VERSION
+            ));
+        }
+        validate_gate(&manifest_gate_from_rule(rule), "rule", 0, &mut complexity)
+            .map_err(|err| format!("rule {} has invalid matcher gates: {err}", rule.id))?;
+    }
+
+    Ok(())
+}
+
+fn validate_gate(
+    gate: &ManifestGate,
+    context: &str,
+    depth: usize,
+    complexity: &mut ManifestComplexity,
+) -> Result<(), String> {
+    if depth > MAX_GATE_DEPTH {
+        return Err(format!("{context} exceeds max gate depth {MAX_GATE_DEPTH}"));
+    }
+    complexity.total_gates += 1;
+    if complexity.total_gates > MAX_TOTAL_GATES {
+        return Err(format!("manifest exceeds max gate count {MAX_TOTAL_GATES}"));
+    }
+    validate_matcher_limits(gate, context, complexity)?;
+    if !gate_has_positive_matcher(gate) {
+        return Err(format!("{context} must contain a positive matcher"));
+    }
+    validate_regex_patterns(&gate.regex, context, "regex")?;
+    validate_regex_patterns(&gate.line_regex, context, "line_regex")?;
+    for nested in &gate.all {
+        validate_gate(nested, "all gate", depth + 1, complexity)?;
+    }
+    for nested in &gate.any {
+        validate_gate(nested, "any gate", depth + 1, complexity)?;
+    }
+    for nested in &gate.not_gate {
+        if !gate_has_any_matcher(nested) {
+            return Err(format!("{context} contains an empty not gate"));
+        }
+        validate_not_gate(nested, depth + 1, complexity)?;
+    }
+    Ok(())
+}
+
+/// A `not` gate needs no positive matcher of its own — its job is to name
+/// what must be absent — so it gets looser structural checks than
+/// `validate_gate`.
+fn validate_not_gate(
+    gate: &ManifestGate,
+    depth: usize,
+    complexity: &mut ManifestComplexity,
+) -> Result<(), String> {
+    if depth > MAX_GATE_DEPTH {
+        return Err(format!("not gate exceeds max gate depth {MAX_GATE_DEPTH}"));
+    }
+    complexity.total_gates += 1;
+    if complexity.total_gates > MAX_TOTAL_GATES {
+        return Err(format!("manifest exceeds max gate count {MAX_TOTAL_GATES}"));
+    }
+    validate_matcher_limits(gate, "not gate", complexity)?;
+    if !gate_has_any_matcher(gate) {
+        return Err("not gate must contain a matcher".to_string());
+    }
+    validate_regex_patterns(&gate.regex, "not gate", "regex")?;
+    validate_regex_patterns(&gate.line_regex, "not gate", "line_regex")?;
+    for nested in &gate.all {
+        validate_gate(nested, "not all gate", depth + 1, complexity)?;
+    }
+    for nested in &gate.any {
+        validate_gate(nested, "not any gate", depth + 1, complexity)?;
+    }
+    for nested in &gate.not_gate {
+        validate_not_gate(nested, depth + 1, complexity)?;
+    }
+    Ok(())
+}
+
+fn validate_matcher_limits(
+    gate: &ManifestGate,
+    context: &str,
+    complexity: &mut ManifestComplexity,
+) -> Result<(), String> {
+    let matcher_count = gate.contains.len() + gate.regex.len() + gate.line_regex.len();
+    if matcher_count > MAX_MATCHERS_PER_GATE {
+        return Err(format!(
+            "{context} has {matcher_count} direct matchers, max is {MAX_MATCHERS_PER_GATE}"
+        ));
+    }
+    complexity.total_matchers += matcher_count;
+    if complexity.total_matchers > MAX_TOTAL_MATCHERS {
+        return Err(format!(
+            "manifest exceeds max matcher count {MAX_TOTAL_MATCHERS}"
+        ));
+    }
+    for value in gate
+        .contains
+        .iter()
+        .chain(gate.regex.iter())
+        .chain(gate.line_regex.iter())
+    {
+        if value.chars().count() > MAX_MATCHER_CHARS {
+            return Err(format!(
+                "{context} matcher exceeds max length {MAX_MATCHER_CHARS}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_regex_patterns(patterns: &[String], context: &str, field: &str) -> Result<(), String> {
+    for pattern in patterns {
+        Regex::new(pattern).map_err(|err| {
+            format!("{context} contains invalid {field} pattern {pattern:?}: {err}")
+        })?;
+    }
+    Ok(())
+}
+
+fn gate_has_positive_matcher(gate: &ManifestGate) -> bool {
+    !gate.contains.is_empty()
+        || !gate.regex.is_empty()
+        || !gate.line_regex.is_empty()
+        || !gate.all.is_empty()
+        || !gate.any.is_empty()
+}
+
+fn gate_has_any_matcher(gate: &ManifestGate) -> bool {
+    gate_has_positive_matcher(gate) || !gate.not_gate.is_empty()
+}
+
+/// Whatever `resolve_region` can dispatch is valid — probing it with an
+/// empty input keeps the validator and the dispatcher from drifting apart.
+fn validate_region_name(spec: &str) -> Result<(), String> {
+    let probe = DetectionInput {
+        screen: "",
+        osc_title: "",
+        osc_progress: "",
+    };
+    match resolve_region(&probe, spec.trim()) {
+        Some(_) => Ok(()),
+        None => Err(spec.trim().to_string()),
+    }
+}
+
+/// A rule's top-level matchers form a gate of their own; validation and
+/// compilation both see the rule through this lens.
+fn manifest_gate_from_rule(rule: &ManifestRule) -> ManifestGate {
+    ManifestGate {
+        all: rule.all.clone(),
+        any: rule.any.clone(),
+        not_gate: rule.not_gate.clone(),
+        contains: rule.contains.clone(),
+        regex: rule.regex.clone(),
+        line_regex: rule.line_regex.clone(),
+    }
+}
+
+/// Load bundled + override manifests. The second value counts files that
+/// were rejected (unreadable, unparseable, or invalid) — the details are
+/// already in the log by the time this returns.
+fn load_all() -> (HashMap<String, CompiledManifest>, usize) {
     let mut map = HashMap::new();
+    let mut rejected = 0usize;
     for text in BUNDLED_MANIFESTS {
-        if let Some(compiled) = compile_manifest(text, "bundled") {
-            map.insert(compiled.id.clone(), compiled);
+        match compile_manifest(text, "bundled") {
+            Some(compiled) => {
+                map.insert(compiled.id.clone(), compiled);
+            }
+            None => rejected += 1,
         }
     }
     let dir = override_dir();
@@ -294,22 +525,33 @@ fn load_all() -> HashMap<String, CompiledManifest> {
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => {
+                    log::error!(
+                        "agent manifest {} could not be read: {err:#}",
+                        path.display()
+                    );
+                    rejected += 1;
+                    continue;
+                }
             };
-            if let Some(compiled) = compile_manifest(&text, &path.display().to_string()) {
-                log::info!("agent detection override loaded for {}", compiled.id);
-                map.insert(compiled.id.clone(), compiled);
+            match compile_manifest(&text, &path.display().to_string()) {
+                Some(compiled) => {
+                    log::info!("agent detection override loaded for {}", compiled.id);
+                    map.insert(compiled.id.clone(), compiled);
+                }
+                None => rejected += 1,
             }
         }
     }
-    map
+    (map, rejected)
 }
 
 fn ensure_loaded() {
     let loaded = MANIFESTS.read().is_some();
     if !loaded {
-        let map = load_all();
+        let (map, _rejected) = load_all();
         let mut slot = MANIFESTS.write();
         if slot.is_none() {
             *slot = Some(map);
@@ -326,11 +568,14 @@ pub(crate) fn warm() {
 
 /// Reload bundled + override files. Builds the replacement map before
 /// swapping it in, so concurrent evaluations never observe an empty
-/// window and the caller can run this on a worker thread.
-pub(crate) fn reload_manifests() {
-    let map = load_all();
+/// window and the caller can run this on a worker thread. Returns how
+/// many manifest files were rejected, so the UI that triggered the
+/// reload can say so instead of reporting unconditional success.
+pub(crate) fn reload_manifests() -> usize {
+    let (map, rejected) = load_all();
     *MANIFESTS.write() = Some(map);
     MANIFEST_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    rejected
 }
 
 pub(crate) fn with_manifests<R>(f: impl FnOnce(&HashMap<String, CompiledManifest>) -> R) -> R {
@@ -444,16 +689,41 @@ fn gate_matches(gate: &CompiledGate, text: &str, lower_text: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn region<'a>(input: &DetectionInput<'a>, spec: &str) -> &'a str {
+    resolve_region(input, spec).unwrap_or_else(|| {
+        // Unreachable for loaded manifests — validation rejects unknown
+        // regions at load time — but stay fail-soft like herdr rather
+        // than turning a future gap into an evaluation-time panic.
+        log::debug!("unknown agent manifest region {spec:?}");
+        ""
+    })
+}
+
+/// `None` means the spec names no region this engine knows. The validator
+/// probes this with an empty input, so "validated" and "dispatchable" are
+/// the same predicate by construction. Trimmed here as well as at compile
+/// time (herdr trims at dispatch): two reviews independently flagged how
+/// easily those two sites could drift apart.
+fn resolve_region<'a>(input: &DetectionInput<'a>, spec: &str) -> Option<&'a str> {
+    let spec = spec.trim();
     match spec {
-        "osc_title" => return input.osc_title,
-        "osc_progress" => return input.osc_progress,
+        "osc_title" => return Some(input.osc_title),
+        "osc_progress" => return Some(input.osc_progress),
         _ => {}
     }
     let content = input.screen;
-    match spec {
+    Some(match spec {
         "whole_recent" => content,
         "after_last_prompt_marker" => after_last_prompt_marker(content),
+        "before_current_prompt_marker" => before_current_prompt_marker(content),
+        "whole_recent_without_current_prompt_marker" => {
+            whole_recent_without_current_prompt_marker(content)
+        }
+        "current_prompt_block_marker" => current_prompt_block_marker(content).unwrap_or(""),
+        "after_current_prompt_block_marker" => {
+            after_current_prompt_block_marker(content).unwrap_or("")
+        }
         "prompt_box_body" => prompt_box_body(content).unwrap_or(""),
+        "above_prompt_box" => above_prompt_box(content),
         "last_non_empty_above_prompt_box" => last_non_empty_line(above_prompt_box(content)),
         "after_last_horizontal_rule" => after_last_horizontal_rule(content),
         _ => {
@@ -461,19 +731,33 @@ fn region<'a>(input: &DetectionInput<'a>, spec: &str) -> &'a str {
                 bottom_non_empty_lines(content, count)
             } else if let Some(count) = region_count(spec, "bottom_lines") {
                 bottom_lines(content, count)
-            } else if let Some(count) = region_count(spec, "top_non_empty_lines") {
+            } else if let Some(count) = top_region_count(spec) {
                 top_non_empty_lines(content, count)
             } else {
-                log::warn!("unknown agent manifest region {spec:?}");
-                ""
+                return None;
             }
         }
-    }
+    })
 }
 
+/// Lenient count parser for the `bottom_*` regions, matching herdr's
+/// `region_count`: any `usize` parses, `0` and leading zeros included —
+/// the slicers degrade to "" safely. Only `top_non_empty_lines` gets the
+/// strict form below.
 fn region_count(spec: &str, name: &str) -> Option<usize> {
     let count = spec
         .strip_prefix(name)?
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    count.parse::<usize>().ok()
+}
+
+/// Strict parser for `top_non_empty_lines(N)`, matching herdr's
+/// `top_region_count`: rejects 0, leading zeros, signs, and counts above
+/// `u16::MAX`.
+fn top_region_count(spec: &str) -> Option<usize> {
+    let count = spec
+        .strip_prefix("top_non_empty_lines")?
         .strip_prefix('(')?
         .strip_suffix(')')?;
     if count.is_empty() || count.starts_with('0') || !count.bytes().all(|b| b.is_ascii_digit()) {
@@ -536,16 +820,82 @@ fn top_non_empty_lines(content: &str, count: usize) -> &str {
 }
 
 /// Codex draws its prompt as a `›` line; the region is everything after the
-/// last one.
+/// last one. No marker on screen → the whole content, not "".
 fn after_last_prompt_marker(content: &str) -> &str {
     let lines: Vec<&str> = content.lines().collect();
-    let Some(index) = lines
-        .iter()
-        .rposition(|line| *line == "›" || line.starts_with("› "))
-    else {
+    let Some(index) = lines.iter().rposition(|line| codex_prompt_line(line)) else {
         return content;
     };
     slice_from_line_index(content, &lines, index + 1)
+}
+
+/// Everything above the *current* prompt marker (see
+/// [`current_codex_prompt_index`]). No current prompt → the whole content.
+fn before_current_prompt_marker(content: &str) -> &str {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(index) = current_codex_prompt_index(&lines) else {
+        return content;
+    };
+    let end = line_start_offset(content, &lines, index);
+    &content[..end]
+}
+
+/// A gate rather than a slice: "" while a current prompt marker is on
+/// screen, the whole content otherwise.
+fn whole_recent_without_current_prompt_marker(content: &str) -> &str {
+    let lines: Vec<&str> = content.lines().collect();
+    if current_codex_prompt_index(&lines).is_some() {
+        ""
+    } else {
+        content
+    }
+}
+
+/// The last block-marker line above the current prompt, as a single line
+/// without its trailing newline. `None` when there is no current prompt or
+/// no marker above it.
+fn current_prompt_block_marker(content: &str) -> Option<&str> {
+    let lines: Vec<&str> = content.lines().collect();
+    let prompt_index = current_codex_prompt_index(&lines)?;
+    lines[..prompt_index]
+        .iter()
+        .rev()
+        .find(|line| codex_block_marker_line(line))
+        .copied()
+}
+
+/// From that same block-marker line — inclusive — to the end of content.
+fn after_current_prompt_block_marker(content: &str) -> Option<&str> {
+    let lines: Vec<&str> = content.lines().collect();
+    let prompt_index = current_codex_prompt_index(&lines)?;
+    let block_index = lines[..prompt_index]
+        .iter()
+        .rposition(|line| codex_block_marker_line(line))?;
+    Some(slice_from_line_index(content, &lines, block_index))
+}
+
+/// The last `›` line, but only while it is the *live* prompt: a block
+/// marker anywhere below it means the agent produced output after that
+/// prompt, so it is scrollback, not the prompt the user is looking at.
+fn current_codex_prompt_index(lines: &[&str]) -> Option<usize> {
+    let prompt_index = lines.iter().rposition(|line| codex_prompt_line(line))?;
+    if lines[prompt_index + 1..]
+        .iter()
+        .any(|line| codex_block_marker_line(line))
+    {
+        return None;
+    }
+    Some(prompt_index)
+}
+
+/// Deliberately untrimmed, matching herdr: an indented `›` is quoted
+/// output, not the prompt.
+fn codex_prompt_line(line: &str) -> bool {
+    line == "›" || line.starts_with("› ")
+}
+
+fn codex_block_marker_line(line: &str) -> bool {
+    line.starts_with('•') || line.starts_with('■') || line.starts_with('✗') || line.starts_with('✓')
 }
 
 /// The body of the bottom prompt box: between the second-to-last and last
@@ -640,6 +990,8 @@ mod tests {
                 "bundled manifest {} demands a newer engine",
                 raw_file.id
             );
+            validate_manifest(&raw_file)
+                .unwrap_or_else(|err| panic!("bundled manifest {} is invalid: {err}", raw_file.id));
             let compiled = compile_manifest(text, "test").expect("manifest parses");
             assert!(!compiled.id.is_empty());
             assert!(!compiled.rules.is_empty(), "{} has rules", compiled.id);
@@ -775,5 +1127,196 @@ ctrl+o to toggle
         assert!(is_horizontal_rule("──────"));
         assert!(is_horizontal_rule("─── hint"));
         assert!(!is_horizontal_rule("- - -"));
+    }
+
+    #[test]
+    fn codex_marker_regions_slice_as_documented() {
+        // Only an unindented "›" (bare, or followed by a space) is the
+        // prompt; anything else is quoted output.
+        assert!(codex_prompt_line("›"));
+        assert!(codex_prompt_line("› run tests"));
+        assert!(!codex_prompt_line("›run"));
+        assert!(!codex_prompt_line("  › run"));
+
+        // A live prompt with a finished block above it.
+        let live = "• first\n✗ second\n› \ntail\n";
+        assert_eq!(before_current_prompt_marker(live), "• first\n✗ second\n");
+        assert_eq!(whole_recent_without_current_prompt_marker(live), "");
+        assert_eq!(current_prompt_block_marker(live), Some("✗ second"));
+        assert_eq!(
+            after_current_prompt_block_marker(live),
+            Some("✗ second\n› \ntail\n")
+        );
+
+        // A block marker below the prompt means the prompt is scrollback:
+        // the "current prompt" family must treat the screen as promptless.
+        let stale = "› run\n• working\n";
+        assert_eq!(before_current_prompt_marker(stale), stale);
+        assert_eq!(whole_recent_without_current_prompt_marker(stale), stale);
+        assert_eq!(current_prompt_block_marker(stale), None);
+        assert_eq!(after_current_prompt_block_marker(stale), None);
+
+        // No prompt at all.
+        assert_eq!(before_current_prompt_marker("hello\n"), "hello\n");
+        assert_eq!(whole_recent_without_current_prompt_marker("hello\n"), "hello\n");
+        assert_eq!(after_last_prompt_marker("hello\n"), "hello\n");
+        assert_eq!(after_last_prompt_marker("› go\nout\n"), "out\n");
+
+        // All five are reachable as region specs, not just as helpers.
+        let input = DetectionInput {
+            screen: live,
+            osc_title: "",
+            osc_progress: "",
+        };
+        assert_eq!(region(&input, "before_current_prompt_marker"), "• first\n✗ second\n");
+        assert_eq!(region(&input, "whole_recent_without_current_prompt_marker"), "");
+        assert_eq!(region(&input, "current_prompt_block_marker"), "✗ second");
+        assert_eq!(
+            region(&input, "after_current_prompt_block_marker"),
+            "✗ second\n› \ntail\n"
+        );
+        assert_eq!(region(&input, "above_prompt_box"), live);
+    }
+
+    fn validate_error(text: &str) -> String {
+        let file: ManifestFile = toml::from_str(text).expect("manifest must parse");
+        validate_manifest(&file).expect_err("manifest must be rejected")
+    }
+
+    #[test]
+    fn unknown_manifest_fields_are_rejected() {
+        // "contain" for "contains" — the classic typo, caught by serde.
+        let text = "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"working\"\ncontain = [\"x\"]\n";
+        let err = match toml::from_str::<ManifestFile>(text) {
+            Ok(_) => panic!("the unknown field must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("contain"), "{err}");
+        assert!(compile_manifest(text, "test").is_none());
+    }
+
+    /// The file level stays open like herdr's: a future manifest revision
+    /// adding top-level metadata must still drop in unchanged.
+    #[test]
+    fn unknown_top_level_keys_are_tolerated() {
+        let text = "id = \"t\"\ndescription = \"future metadata\"\n\
+                    [[rules]]\nid = \"r\"\nstate = \"working\"\ncontains = [\"x\"]\n";
+        let compiled = compile_manifest(text, "test").expect("loads despite the unknown key");
+        assert_eq!(compiled.rules.len(), 1);
+    }
+
+    #[test]
+    fn invalid_manifests_are_rejected_with_reasons() {
+        assert!(validate_error("id = \"t\"\n").contains("at least one rule"));
+        assert!(validate_error(
+            "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\nregion = \"after_last_promt_marker\"\ncontains = [\"x\"]\n"
+        )
+        .contains("uses invalid region"));
+        assert!(validate_error(
+            "id = \"t\"\n[[rules]]\nid = \" \"\nstate = \"idle\"\ncontains = [\"x\"]\n"
+        )
+        .contains("rule id must not be empty"));
+        assert!(validate_error(
+            "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"working\"\nskip_state_update = true\ncontains = [\"x\"]\n"
+        )
+        .contains("skip_state_update without state"));
+        assert!(validate_error(
+            "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"unknown\"\nskip_state_update = true\nvisible_working = true\ncontains = [\"x\"]\n"
+        )
+        .contains("visible state evidence"));
+        // A rule whose only matcher is a `not` gate matches everything the
+        // gate doesn't name — reject it like herdr does.
+        assert!(validate_error(
+            "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\nnot = [{ contains = [\"x\"] }]\n"
+        )
+        .contains("must contain a positive matcher"));
+        assert!(validate_error(
+            "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\nregex = [\"[\"]\n"
+        )
+        .contains("invalid regex pattern"));
+        assert!(validate_error(
+            "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\nany = [{ line_regex = [\"[\"] }]\n"
+        )
+        .contains("invalid line_regex pattern"));
+        assert!(validate_error(
+            "id = \"t\"\nmin_engine_version = 1\n[[rules]]\nid = \"r\"\nstate = \"idle\"\nregion = \"top_non_empty_lines(1)\"\ncontains = [\"x\"]\n"
+        )
+        .contains("min_engine_version is below"));
+        let long = "x".repeat(MAX_MATCHER_CHARS + 1);
+        assert!(
+            validate_error(&format!(
+                "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\ncontains = [\"{long}\"]\n"
+            ))
+            .contains("max length")
+        );
+        let mut many_rules = String::from("id = \"t\"\n");
+        for i in 0..=MAX_RULES_PER_MANIFEST {
+            many_rules.push_str(&format!(
+                "[[rules]]\nid = \"r{i}\"\nstate = \"idle\"\ncontains = [\"x\"]\n"
+            ));
+        }
+        assert!(validate_error(&many_rules).contains("max is 128"));
+    }
+
+    fn nested_all_manifest(extra_depth: usize) -> String {
+        let mut gate = String::from("{ contains = [\"x\"] }");
+        for _ in 0..extra_depth {
+            gate = format!("{{ all = [{gate}] }}");
+        }
+        format!(
+            "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\ncontains = [\"x\"]\nall = [{gate}]\n"
+        )
+    }
+
+    #[test]
+    fn gate_depth_limit_binds_at_the_documented_boundary() {
+        // The rule's own gate sits at depth 0 and the check is `>`, so the
+        // innermost inline gate may sit at depth 8 but not 9.
+        let file: ManifestFile = toml::from_str(&nested_all_manifest(7)).expect("parses");
+        validate_manifest(&file).expect("depth 8 is within the limit");
+        assert!(validate_error(&nested_all_manifest(8)).contains("max gate depth"));
+    }
+
+    #[test]
+    fn padded_and_versioned_regions_validate() {
+        assert!(validate_region_name(" top_non_empty_lines(1) ").is_ok());
+        assert!(validate_region_name("bottom_non_empty_lines(12)").is_ok());
+        // The bottom_* parsers are deliberately lenient like herdr's:
+        // degenerate counts slice to "" rather than rejecting a manifest.
+        assert!(validate_region_name("bottom_lines(0)").is_ok());
+        assert!(validate_region_name("bottom_non_empty_lines(70000)").is_ok());
+        assert!(validate_region_name("bottom_non_empty_lines(007)").is_ok());
+        // Only top_non_empty_lines is strict (herdr's top_region_count).
+        assert!(validate_region_name("top_non_empty_lines(0)").is_err());
+        assert!(validate_region_name("top_non_empty_lines(01)").is_err());
+        assert!(validate_region_name("top_non_empty_lines(65536)").is_err());
+        assert!(validate_region_name("after_last_promt_marker").is_err());
+        // The dispatcher must accept exactly what the validator accepts,
+        // padding included.
+        let input = DetectionInput {
+            screen: "a\nb\n",
+            osc_title: "",
+            osc_progress: "",
+        };
+        assert_eq!(
+            region(&input, " top_non_empty_lines(1) "),
+            region(&input, "top_non_empty_lines(1)")
+        );
+        for name in [
+            "whole_recent",
+            "after_last_prompt_marker",
+            "before_current_prompt_marker",
+            "whole_recent_without_current_prompt_marker",
+            "current_prompt_block_marker",
+            "after_current_prompt_block_marker",
+            "prompt_box_body",
+            "above_prompt_box",
+            "last_non_empty_above_prompt_box",
+            "after_last_horizontal_rule",
+            "osc_title",
+            "osc_progress",
+        ] {
+            assert!(validate_region_name(name).is_ok(), "{name} must validate");
+        }
     }
 }
