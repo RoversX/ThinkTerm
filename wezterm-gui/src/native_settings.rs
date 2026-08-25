@@ -237,6 +237,9 @@ pub(crate) struct NativeChromeSettings {
     /// Workspace-thread statuses hidden by the sidebar view-options filter,
     /// as stable keys ("idle", "running", "needs-attention", "finished").
     pub(crate) workspace_sidebar_hidden_statuses: Vec<String>,
+    /// Feature toggle for agent status detection and the right-sidebar
+    /// Agents panel. Off by default; absent in settings.json means off.
+    pub(crate) agent_panel_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -650,6 +653,12 @@ pub(crate) fn workspace_sidebar_hover_reveal_enabled() -> bool {
         .chrome
         .workspace_sidebar_hover_reveal
         .unwrap_or(true)
+}
+
+/// Agent status detection + Agents panel feature toggle. Default off.
+/// `load_shared`: asked once per work-status scan and once per sidebar frame.
+pub(crate) fn agent_panel_enabled() -> bool {
+    load_shared().chrome.agent_panel_enabled
 }
 
 pub(crate) fn right_sidebar_width() -> Option<usize> {

@@ -35,6 +35,7 @@ use wezterm_gui_subcommands::*;
 use wezterm_mux_server_impl::update_mux_domains;
 use wezterm_toast_notification::*;
 
+mod agent_status;
 mod bottom_quotes;
 mod colorease;
 mod commands;
@@ -1143,6 +1144,11 @@ fn setup_mux(
 ) -> anyhow::Result<Arc<Mux>> {
     let mux = Arc::new(mux::Mux::new(Some(local_domain.clone())));
     Mux::set_mux(&mux);
+    // The user-facing Agents toggle governs this process's own detector as
+    // well as the panel; headless mux servers follow the Lua option alone.
+    mux::agent_status::set_process_preference(|| {
+        crate::native_settings::agent_panel_enabled()
+    });
     let client_id = Arc::new(mux::client::generate_client_id());
     mux.register_client(client_id.clone());
     mux.replace_identity(Some(client_id));

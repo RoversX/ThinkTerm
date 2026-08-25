@@ -158,7 +158,7 @@ const FILE_FONT_MIN_SIZE: f64 = if cfg!(target_os = "macos") {
 };
 const FILE_FILTER_HEIGHT: usize = 66;
 const FILE_TREE_TOP_GAP: usize = 14;
-const FILE_SCROLL_FADE_HEIGHT: usize = 32;
+pub(crate) const FILE_SCROLL_FADE_HEIGHT: usize = 32;
 const FILE_PREVIEW_HEADER_HEIGHT: usize = 64;
 /// How many transfer rows the strip shows before it starts dropping the
 /// oldest finished ones. The strip eats into the tree, so it stays small;
@@ -1098,12 +1098,12 @@ struct RightSidebarFileRoot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RightSidebarFileRowMetrics {
-    row_height: usize,
-    icon_size: usize,
+pub(crate) struct RightSidebarFileRowMetrics {
+    pub(crate) row_height: usize,
+    pub(crate) icon_size: usize,
     chevron_size: usize,
     indent_step: usize,
-    icon_gap: usize,
+    pub(crate) icon_gap: usize,
 }
 
 impl RightSidebarMode {
@@ -1112,6 +1112,7 @@ impl RightSidebarMode {
             Self::Chat => SvgIcon::FolderTree,
             Self::Tasks => SvgIcon::NotebookTabs,
             Self::Snippets => SvgIcon::CodeXml,
+            Self::Agents => SvgIcon::Bot,
         }
     }
 
@@ -1120,6 +1121,7 @@ impl RightSidebarMode {
             Self::Chat => crate::i18n::tr("right-mode-files"),
             Self::Tasks => crate::i18n::tr("right-mode-notes"),
             Self::Snippets => crate::i18n::tr("right-mode-snippets"),
+            Self::Agents => crate::i18n::tr("right-mode-agents"),
         }
     }
 }
@@ -1667,6 +1669,7 @@ impl crate::TermWindow {
             RightSidebarMode::Chat => self.right_sidebar_file_focus.is_some(),
             RightSidebarMode::Snippets => self.right_sidebar_snippet_focus.is_some(),
             RightSidebarMode::Tasks => self.right_sidebar_note.view.focused,
+            RightSidebarMode::Agents => false,
         }
     }
 
@@ -4113,7 +4116,7 @@ impl crate::TermWindow {
                     self.right_sidebar_snippet_scroll_offset = 0.0;
                 }
             }
-            RightSidebarMode::Tasks => {}
+            RightSidebarMode::Tasks | RightSidebarMode::Agents => {}
         }
     }
 
@@ -5275,7 +5278,7 @@ impl crate::TermWindow {
                 Some(RightSidebarSnippetField::Body) => Some(&self.right_sidebar_snippet_body),
                 None => None,
             },
-            RightSidebarMode::Tasks => None,
+            RightSidebarMode::Tasks | RightSidebarMode::Agents => None,
         }
     }
 
@@ -5295,7 +5298,7 @@ impl crate::TermWindow {
                 Some(RightSidebarSnippetField::Body) => Some(&mut self.right_sidebar_snippet_body),
                 None => None,
             },
-            RightSidebarMode::Tasks => None,
+            RightSidebarMode::Tasks | RightSidebarMode::Agents => None,
         }
     }
 
@@ -6174,11 +6177,14 @@ impl crate::TermWindow {
         )
         .context("right sidebar mode selector")?;
 
-        let modes = [
+        let mut modes = vec![
             RightSidebarMode::Chat,
             RightSidebarMode::Tasks,
             RightSidebarMode::Snippets,
         ];
+        if crate::agent_status::enabled() {
+            modes.push(RightSidebarMode::Agents);
+        }
         const MODE_LABEL_CLIP_SLOP: usize = 4;
         let mode_icon_size = (ui_cell_height + self.ui_px(12))
             .clamp(self.ui_px(24), self.ui_px(30))
@@ -6385,6 +6391,32 @@ impl crate::TermWindow {
                 );
                 stage.finish(result.is_ok());
                 result?;
+                return Ok(());
+            }
+            RightSidebarMode::Agents => {
+                if !crate::agent_status::enabled() {
+                    // The toggle went off while the panel was open; fall
+                    // back rather than painting a stranded mode. This
+                    // frame's selector already painted for the old mode,
+                    // so request another paint or the body stays blank.
+                    self.right_sidebar_mode = RightSidebarMode::Chat;
+                    if let Some(win) = self.window.as_ref() {
+                        win.invalidate();
+                    }
+                    return Ok(());
+                }
+                self.paint_agents_sidebar(
+                    layers,
+                    &ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    content_top,
+                    content_width,
+                    rect.y.saturating_add(rect.height),
+                )?;
                 return Ok(());
             }
         }
@@ -6753,6 +6785,7 @@ impl crate::TermWindow {
                 let first_y = content_top + ui_metrics.cell_size.height as usize + self.ui_px(20);
                 self.paint_snippet_button(
                     layers,
+                    1,
                     ui_font,
                     ui_metrics,
                     chrome,
@@ -6769,6 +6802,7 @@ impl crate::TermWindow {
                 )?;
                 self.paint_snippet_button(
                     layers,
+                    1,
                     ui_font,
                     ui_metrics,
                     chrome,
@@ -9659,10 +9693,11 @@ impl crate::TermWindow {
                     muted_fg,
                 )?;
             }
-            let fade_top = tree_top.saturating_sub(self.ui_px(FILE_TREE_TOP_GAP));
+            // Full opacity exactly at the mask's bottom edge; see the
+            // local tree above for why starting higher reads as a cut.
+            let fade_top = tree_top;
             let fade_height = self
-                .ui_px(FILE_TREE_TOP_GAP)
-                .saturating_add(self.ui_px(FILE_SCROLL_FADE_HEIGHT))
+                .ui_px(FILE_SCROLL_FADE_HEIGHT)
                 .min(viewport_bottom.saturating_sub(fade_top));
             self.paint_right_sidebar_file_top_fade(
                 layers,
@@ -13505,15 +13540,54 @@ impl crate::TermWindow {
         let row_metrics = right_sidebar_file_row_metrics(ui_metrics);
         // A copy started here must report itself here; the strip is shared
         // with the remote tree, so reserve its space the same way.
+        // The transfer strip is the one thing that can sit under this list, and
+        // it paints no background of its own, so rows must not run onto it.
+        // With no strip there is nothing below at all: the panel ends at the
+        // window edge, which cuts the overflow for free.
         let strip_rows = self.transfer_strip_rows(
             content_bottom
                 .saturating_sub(tree_top)
                 .saturating_sub(self.ui_px(SIDEBAR_INSET)),
             row_metrics.row_height,
         );
-        let viewport_bottom = content_bottom
+        let strip_top = content_bottom
             .saturating_sub(self.ui_px(SIDEBAR_INSET))
             .saturating_sub(strip_rows.saturating_mul(row_metrics.row_height));
+        // The panel's bottom padding, which is also the mask that keeps rows
+        // out of it. With a transfer strip below it has to swallow the row's
+        // tallest element -- the inline rename box, `row_height - 4px` --
+        // since anything it misses lands on the strip; without one the
+        // window edge catches the rest, so plain padding is enough.
+        let bottom_reserve = if strip_rows > 0 {
+            (self.ui_px(SIDEBAR_INSET) * 2)
+                .max(row_metrics.icon_size)
+                .max(row_metrics.row_height.saturating_sub(self.ui_px(4)))
+        } else {
+            self.ui_px(SIDEBAR_INSET) * 2
+        };
+        let viewport_bottom = strip_top.saturating_sub(bottom_reserve);
+        // How far a row may hang below the list: into the mask band while a
+        // transfer strip is showing; otherwise as far as it likes -- unless
+        // a bottom tab bar sits under the panel, whose layer-0 background
+        // cannot cover these layer-2 glyphs, so the panel bottom must bound
+        // them instead.
+        let row_overflow_bottom = if strip_rows > 0 {
+            strip_top
+        } else if self.show_tab_bar && self.config.tab_bar_at_bottom {
+            content_bottom
+        } else {
+            usize::MAX
+        };
+        // Whether anything below the list needs protecting from overflow.
+        // Decides both the bottom mask and how far row chrome may extend:
+        // unprotected, rows run to the window edge and are cut there.
+        let masked_below =
+            strip_rows > 0 || (self.show_tab_bar && self.config.tab_bar_at_bottom);
+        let row_clip_bottom = if masked_below {
+            viewport_bottom
+        } else {
+            content_bottom
+        };
         let visible_height = viewport_bottom.saturating_sub(tree_top);
         let total_height = row_count.saturating_mul(row_metrics.row_height);
         let max_scroll = total_height.saturating_sub(visible_height) as f32;
@@ -13568,16 +13642,21 @@ impl crate::TermWindow {
                 &row,
                 selected.as_ref(),
                 tree_top,
-                viewport_bottom,
+                row_clip_bottom,
+                content_top,
+                row_overflow_bottom,
                 row_metrics,
             )?;
         }
 
         if max_scroll > 0.0 && scroll_offset > 0.0 {
-            let fade_top = content_top + self.ui_px(FILE_FILTER_HEIGHT);
+            // The fade must take over exactly where the opaque mask ends
+            // (tree_top), at full opacity. Starting it higher makes it
+            // arrive at the mask edge already part-faded, which shows as
+            // an alpha step -- a hard cut -- instead of a gradient.
+            let fade_top = tree_top;
             let fade_height = self
-                .ui_px(FILE_TREE_TOP_GAP)
-                .saturating_add(self.ui_px(FILE_SCROLL_FADE_HEIGHT))
+                .ui_px(FILE_SCROLL_FADE_HEIGHT)
                 .min(viewport_bottom.saturating_sub(fade_top));
             self.paint_right_sidebar_file_mask(
                 layers,
@@ -13626,6 +13705,22 @@ impl crate::TermWindow {
             )?;
         }
 
+        // The bottom mask exists to keep overflow off whatever sits under
+        // the list -- the transfer strip or a bottom tab bar. With neither
+        // there is only the window edge below, and rows should run to it
+        // and be cut there: slicing glyphs short of the edge and leaving a
+        // dead band under the cut reads as a rendering bug, not padding.
+        if max_scroll > 0.0 && masked_below {
+            self.paint_right_sidebar_file_mask(
+                layers,
+                chrome,
+                content_x,
+                viewport_bottom,
+                content_width,
+                bottom_reserve,
+            )?;
+        }
+
         self.paint_transfer_strip(
             layers,
             ui_font,
@@ -13634,7 +13729,7 @@ impl crate::TermWindow {
             foreground,
             muted_fg,
             content_x,
-            viewport_bottom,
+            strip_top,
             content_width,
             strip_rows,
             row_metrics,
@@ -13726,7 +13821,7 @@ impl crate::TermWindow {
         )
     }
 
-    fn paint_right_sidebar_file_mask(
+    pub(crate) fn paint_right_sidebar_file_mask(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         chrome: UiPalette,
@@ -13749,7 +13844,7 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    fn paint_right_sidebar_file_top_fade(
+    pub(crate) fn paint_right_sidebar_file_top_fade(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         chrome: UiPalette,
@@ -13793,6 +13888,11 @@ impl crate::TermWindow {
         selected: Option<&PathBuf>,
         clip_top: usize,
         clip_bottom: usize,
+        // Bounds of the two opaque scroll masks. Row contents are quads that
+        // cannot be scissored, so they are painted while they straddle an edge
+        // and the mask cuts them; these say how far that is allowed to go.
+        mask_top: usize,
+        panel_bottom: usize,
         row_metrics: RightSidebarFileRowMetrics,
     ) -> anyhow::Result<()> {
         let row_bottom = y.saturating_add(row_metrics.row_height);
@@ -13836,6 +13936,9 @@ impl crate::TermWindow {
             item_type: UIItemType::RightSidebarFileRow(row.path.clone()),
         });
 
+        let visible = |elem_y: usize, elem_height: usize| {
+            sidebar_row_element_visible(elem_y, elem_height, mask_top, clip_top, panel_bottom)
+        };
         let row_icon_size = row_metrics.icon_size;
         let chevron_size = row_metrics.chevron_size;
         let indent = row
@@ -13845,7 +13948,7 @@ impl crate::TermWindow {
         let chevron_x = x + self.ui_px(SIDEBAR_INSET) + indent;
         let icon_y = y + (row_metrics.row_height.saturating_sub(row_icon_size)) / 2;
         let chevron_y = y + (row_metrics.row_height.saturating_sub(chevron_size)) / 2;
-        if row.is_dir {
+        if row.is_dir && visible(chevron_y, chevron_size) {
             self.paint_sidebar_icon(
                 layers,
                 if row.is_expanded {
@@ -13861,19 +13964,27 @@ impl crate::TermWindow {
         }
 
         let file_icon_x = chevron_x + chevron_size + row_metrics.icon_gap;
-        match file_icon_for_row(row) {
-            RightSidebarFileIcon::Material(icon) => {
-                self.paint_sidebar_material_icon(layers, icon, file_icon_x, icon_y, row_icon_size)?;
-            }
-            RightSidebarFileIcon::Svg(icon) => {
-                self.paint_sidebar_icon(
-                    layers,
-                    icon,
-                    file_icon_x,
-                    icon_y,
-                    row_icon_size,
-                    if row.is_dir { muted_fg } else { foreground },
-                )?;
+        if visible(icon_y, row_icon_size) {
+            match file_icon_for_row(row) {
+                RightSidebarFileIcon::Material(icon) => {
+                    self.paint_sidebar_material_icon(
+                        layers,
+                        icon,
+                        file_icon_x,
+                        icon_y,
+                        row_icon_size,
+                    )?;
+                }
+                RightSidebarFileIcon::Svg(icon) => {
+                    self.paint_sidebar_icon(
+                        layers,
+                        icon,
+                        file_icon_x,
+                        icon_y,
+                        row_icon_size,
+                        if row.is_dir { muted_fg } else { foreground },
+                    )?;
+                }
             }
         }
         let text_x = file_icon_x + row_icon_size + row_metrics.icon_gap;
@@ -13881,42 +13992,49 @@ impl crate::TermWindow {
             .saturating_add(width)
             .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET));
         if let Some(input) = self.sidebar_file_rename_input(&row.path).cloned() {
-            self.paint_snippet_text_box(
-                layers,
-                1,
-                ui_font,
-                ui_metrics,
-                chrome,
-                muted_fg,
-                text_x,
-                y + self.ui_px(2),
-                text_width,
-                row_metrics.row_height.saturating_sub(self.ui_px(4)),
-                None,
-                "",
-                &input,
-                true,
-                UIItemType::RightSidebarFileRow(row.path.clone()),
-                false,
-            )
+            let box_y = y + self.ui_px(2);
+            let box_height = row_metrics.row_height.saturating_sub(self.ui_px(4));
+            if visible(box_y, box_height) {
+                self.paint_snippet_text_box(
+                    layers,
+                    1,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    muted_fg,
+                    text_x,
+                    box_y,
+                    text_width,
+                    box_height,
+                    None,
+                    "",
+                    &input,
+                    true,
+                    UIItemType::RightSidebarFileRow(row.path.clone()),
+                    false,
+                )?;
+            }
+            Ok(())
         } else {
-            self.paint_sidebar_text(
-                layers,
-                ui_font,
-                ui_metrics,
-                &row.name,
-                text_x,
-                y + (row_metrics
-                    .row_height
-                    .saturating_sub(ui_metrics.cell_size.height as usize))
-                    / 2,
-                text_width,
-                if row.is_dir || is_selected {
-                    foreground
-                } else {
-                    muted_fg
-                },
-            )
+            let cell_height = ui_metrics.cell_size.height as usize;
+            let text_y = y + (row_metrics.row_height.saturating_sub(cell_height)) / 2;
+            if visible(text_y, cell_height) {
+                self.paint_sidebar_text(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    &row.name,
+                    text_x,
+                    text_y,
+                    text_width,
+                    if row.is_dir || is_selected {
+                        foreground
+                    } else {
+                        muted_fg
+                    },
+                )?;
+            }
+            Ok(())
         }
     }
 
@@ -14997,7 +15115,10 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_snippets_list(
+    /// The snippet list's fixed header. Painted on layer 2 *after* the cards,
+    /// so it lands on top of the mask that erases their scroll overflow.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_snippets_toolbar(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
@@ -15008,8 +15129,6 @@ impl crate::TermWindow {
         content_x: usize,
         content_top: usize,
         content_width: usize,
-        content_bottom: usize,
-        icon_size: usize,
     ) -> anyhow::Result<()> {
         let toolbar_y = content_top;
         let new_snippet_label = crate::i18n::tr("right-new-snippet");
@@ -15040,6 +15159,7 @@ impl crate::TermWindow {
         };
         self.paint_snippet_button(
             layers,
+            2,
             ui_font,
             ui_metrics,
             chrome,
@@ -15064,7 +15184,7 @@ impl crate::TermWindow {
             let search_input = self.right_sidebar_snippet_search.clone();
             self.paint_snippet_text_box(
                 layers,
-                1,
+                2,
                 ui_font,
                 ui_metrics,
                 chrome,
@@ -15082,7 +15202,24 @@ impl crate::TermWindow {
             )?;
         }
 
-        let list_top = toolbar_y
+        Ok(())
+    }
+
+    fn paint_snippets_list(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+        icon_size: usize,
+    ) -> anyhow::Result<()> {
+        let list_top = content_top
             + self
                 .ui_px(SNIPPET_TOOLBAR_HEIGHT)
                 .max(self.ui_px(SNIPPET_SEARCH_HEIGHT))
@@ -15101,7 +15238,11 @@ impl crate::TermWindow {
             })
             .collect();
         let row_height = self.ui_px(SNIPPET_CARD_HEIGHT) + self.ui_px(SNIPPET_ROW_GAP);
-        let visible_height = content_bottom.saturating_sub(list_top + self.ui_px(SIDEBAR_INSET));
+        // The panel's bottom padding, which doubles as the mask that keeps
+        // cards out of it; whatever overshoots it is cut by the window edge.
+        // Matches the panel's own left and right margin.
+        let bottom_reserve = self.ui_px(SIDEBAR_INSET) * 2;
+        let visible_height = content_bottom.saturating_sub(list_top + bottom_reserve);
         let total_height = self.right_sidebar_snippet_scroll_height(snippets.len(), visible_height);
         let max_scroll = total_height.saturating_sub(visible_height) as f32;
         self.right_sidebar_snippet_scroll_offset = self
@@ -15114,7 +15255,20 @@ impl crate::TermWindow {
                 .ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT)
                 .min(content_bottom.saturating_sub(list_top + self.ui_px(SIDEBAR_INSET)));
             if empty_height == 0 {
-                return Ok(());
+                // No room for the empty-state card, but the toolbar must
+                // still paint: it holds the search box, and losing it here
+                // would leave a non-matching filter impossible to clear.
+                return self.paint_snippets_toolbar(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    content_top,
+                    content_width,
+                );
             }
             self.fill_rounded_rectangle_with_border(
                 layers,
@@ -15162,19 +15316,45 @@ impl crate::TermWindow {
                 ),
                 muted_fg,
             )?;
-            return Ok(());
+            return self.paint_snippets_toolbar(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+            );
         }
 
         let list_top_f = list_top as f32;
-        let content_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
-        let content_bottom_f = content_bottom as f32;
+        let viewport_bottom = content_bottom.saturating_sub(bottom_reserve);
+        let viewport_bottom_f = viewport_bottom as f32;
+        // Downward overflow past the panel is cut by the window edge --
+        // except with a bottom tab bar, whose background lives on layer 0
+        // under these layer-2 glyphs; then the panel bottom must bound it.
+        let masked_below = self.show_tab_bar && self.config.tab_bar_at_bottom;
+        let overflow_bottom = if masked_below {
+            content_bottom
+        } else {
+            usize::MAX
+        };
+        // Unmasked, cards run to the window edge and are cut there; their
+        // chrome must be allowed as far, or text outruns its card.
+        let card_clip_bottom = if masked_below {
+            viewport_bottom
+        } else {
+            content_bottom
+        };
         for (idx, snippet) in snippets.into_iter().enumerate() {
             let row_top = list_top_f + (idx * row_height) as f32 - scroll_offset;
             let row_bottom = row_top + self.ui_px(SNIPPET_CARD_HEIGHT) as f32;
             if row_bottom <= list_top_f {
                 continue;
             }
-            if row_top >= content_bottom_f {
+            if row_top >= viewport_bottom_f {
                 break;
             }
             let y = row_top.floor().max(0.0) as usize;
@@ -15190,7 +15370,58 @@ impl crate::TermWindow {
                 content_width,
                 &snippet,
                 list_top,
-                content_bottom,
+                card_clip_bottom,
+                content_top,
+                overflow_bottom,
+            )?;
+        }
+
+        // Only a bottom tab bar needs protecting from card overflow; with
+        // the window edge below, cards run to it and are cut there.
+        if max_scroll > 0.0 && masked_below {
+            self.paint_right_sidebar_file_mask(
+                layers,
+                chrome,
+                content_x,
+                viewport_bottom,
+                content_width,
+                bottom_reserve,
+            )?;
+        }
+        // Erase the overflow the cards were allowed to paint above the list,
+        // then put the toolbar back on top of that mask.
+        if max_scroll > 0.0 && scroll_offset > 0.0 {
+            self.paint_right_sidebar_file_mask(
+                layers,
+                chrome,
+                content_x,
+                content_top,
+                content_width,
+                list_top.saturating_sub(content_top),
+            )?;
+        }
+        self.paint_snippets_toolbar(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x,
+            content_top,
+            content_width,
+        )?;
+        if max_scroll > 0.0 && scroll_offset > 0.0 {
+            let fade_height = self
+                .ui_px(FILE_SCROLL_FADE_HEIGHT)
+                .min(viewport_bottom.saturating_sub(list_top));
+            self.paint_right_sidebar_file_top_fade(
+                layers,
+                chrome,
+                content_x,
+                list_top,
+                content_width,
+                fade_height,
             )?;
         }
         self.paint_right_sidebar_snippet_scrollbar(layers, chrome)?;
@@ -15328,6 +15559,7 @@ impl crate::TermWindow {
 
         self.paint_snippet_button(
             layers,
+            1,
             ui_font,
             ui_metrics,
             chrome,
@@ -15433,6 +15665,11 @@ impl crate::TermWindow {
         snippet: &crate::snippets::SnippetRecord,
         clip_top: usize,
         clip_bottom: usize,
+        // Bounds of the two opaque scroll masks. Text is a quad the sidebar
+        // cannot scissor, so a line is painted while it straddles an edge and
+        // the mask cuts it; these say how far that may go.
+        mask_top: usize,
+        panel_bottom: usize,
     ) -> anyhow::Result<()> {
         let card_bottom = y.saturating_add(self.ui_px(SNIPPET_CARD_HEIGHT));
         let visible_y = y.max(clip_top);
@@ -15474,6 +15711,10 @@ impl crate::TermWindow {
             item_type: UIItemType::RightSidebarSnippetEdit(snippet.id.clone()),
         });
 
+        let visible = |elem_y: usize, elem_height: usize| {
+            sidebar_row_element_visible(elem_y, elem_height, mask_top, clip_top, panel_bottom)
+        };
+        let cell_height = ui_metrics.cell_size.height as usize;
         let card_pad = self.ui_px(SIDEBAR_INSET) * 2;
         let text_x = x + card_pad;
         let run_label = crate::i18n::tr("right-run");
@@ -15494,7 +15735,7 @@ impl crate::TermWindow {
             0
         };
         let title_y = y + self.ui_px(SIDEBAR_INSET) * 2;
-        if title_y >= clip_top && title_y < clip_bottom {
+        if visible(title_y, cell_height) {
             self.paint_sidebar_text(
                 layers,
                 ui_font,
@@ -15507,9 +15748,8 @@ impl crate::TermWindow {
             )?;
         }
         let preview = snippet_preview(&snippet.body);
-        let preview_y =
-            y + self.ui_px(SIDEBAR_INSET) * 2 + ui_metrics.cell_size.height as usize + 8;
-        if preview_y >= clip_top && preview_y < clip_bottom {
+        let preview_y = y + self.ui_px(SIDEBAR_INSET) * 2 + cell_height + 8;
+        if visible(preview_y, cell_height) {
             self.paint_sidebar_text(
                 layers,
                 ui_font,
@@ -15530,6 +15770,7 @@ impl crate::TermWindow {
             let action_y = y + self.ui_px(SIDEBAR_INSET) * 2 - 4;
             self.paint_snippet_button(
                 layers,
+                1,
                 ui_font,
                 ui_metrics,
                 chrome,
@@ -15546,6 +15787,7 @@ impl crate::TermWindow {
             )?;
             self.paint_snippet_button(
                 layers,
+                1,
                 ui_font,
                 ui_metrics,
                 chrome,
@@ -15811,9 +16053,12 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_snippet_button(
+    pub(crate) fn paint_snippet_button(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
+        // Background layer. Callers that re-draw the button above a scroll
+        // mask pass 2; everything else passes 1.
+        layer: usize,
         ui_font: &Rc<LoadedFont>,
         ui_metrics: RenderMetrics,
         chrome: UiPalette,
@@ -15842,7 +16087,7 @@ impl crate::TermWindow {
         };
         self.fill_rounded_rectangle_with_border(
             layers,
-            1,
+            layer,
             euclid::rect(x as f32, y as f32, width as f32, height as f32),
             fill,
             if hovered {
@@ -16463,7 +16708,7 @@ fn preview_visible_line_range(
     start..end
 }
 
-fn right_sidebar_file_row_metrics(ui_metrics: RenderMetrics) -> RightSidebarFileRowMetrics {
+pub(crate) fn right_sidebar_file_row_metrics(ui_metrics: RenderMetrics) -> RightSidebarFileRowMetrics {
     // Font metrics already follow the window DPI. Derive the row chrome from
     // those metrics so the file tree keeps the same logical size across
     // displays instead of being pinned by physical-pixel clamps.
@@ -16604,6 +16849,29 @@ fn open_with_candidate_rank(candidate: &wezterm_open_url::OpenWithCandidate) -> 
         3
     };
     (rank, candidate.label.to_lowercase())
+}
+
+/// Whether one element of a scrolling row -- an icon, a line of text -- may be
+/// painted right now.
+///
+/// These are quads the sidebar cannot scissor, so a list hides their overflow
+/// with opaque masks instead: one covering the strip above `list_top`, one
+/// covering `panel_bottom` upwards. An element is therefore painted whenever
+/// part of it is inside the list *and* whatever hangs outside lands in a mask.
+/// That is what makes a list scroll steplessly: an element straddling an edge
+/// is drawn and then cut, rather than withheld until it fits.
+///
+/// The two mask bands must each be at least as tall as the tallest element, or
+/// the caller silently goes back to withholding elements near the edges.
+pub(crate) fn sidebar_row_element_visible(
+    elem_y: usize,
+    elem_height: usize,
+    mask_top: usize,
+    list_top: usize,
+    panel_bottom: usize,
+) -> bool {
+    let elem_bottom = elem_y.saturating_add(elem_height);
+    elem_y >= mask_top && elem_bottom > list_top && elem_bottom <= panel_bottom
 }
 
 /// Where a tree row lands once the viewport is scrolled, or that it is outside
@@ -18439,6 +18707,7 @@ mod tests {
         copy_entries_blocking, copy_file_chunked, download_name_candidates,
         encode_pasted_image_png, failed_folder_download, file_preview_close_requires_reflow,
         file_release_action, file_row_placement, full_line_colors_by_byte,
+        sidebar_row_element_visible,
         image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
         naturalish_cmp, note_code_highlight_key, note_code_highlight_lines, note_code_row_height,
         note_image_display_size, note_open_pending_for_vault, note_release_action,
@@ -19866,6 +20135,21 @@ mod tests {
             file_row_placement(0, 30, 100.0, 400.0, 0.0),
             FileRowPlacement::Visible(100.0)
         );
+    }
+
+    #[test]
+    fn sidebar_row_elements_are_drawn_while_they_straddle_an_edge() {
+        // mask strip 100..160, list 160..400, panel bottom 440 (a 40px bottom
+        // mask). Elements are 30 tall.
+        let vis = |y| sidebar_row_element_visible(y, 30, 100, 160, 440);
+        assert!(vis(160), "fully inside");
+        assert!(vis(140), "half out of the top -- drawn, then cut by the mask");
+        assert!(vis(131), "one pixel of it still below list_top");
+        assert!(!vis(130), "entirely above the list: nothing to show");
+        assert!(vis(399), "half out of the bottom -- drawn, then cut");
+        assert!(vis(410), "wholly inside the bottom mask, still safe to draw");
+        assert!(!vis(411), "would cross the panel edge and escape the mask");
+        assert!(!vis(99), "would escape above the top mask");
     }
 
     #[test]

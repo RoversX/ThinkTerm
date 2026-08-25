@@ -52,9 +52,12 @@ pub fn split_leading_legacy_progress_marker(title: &str) -> Option<&str> {
 }
 
 fn is_legacy_progress_marker_char(ch: char) -> bool {
+    // 0x25d0-0x25d3 are the half-circle busy spinner frames Claude Code
+    // switched to in 2.1.228 (Braille before that). U+2733 ✳ is deliberately
+    // absent: Claude uses it as the *idle* title marker.
     matches!(
         ch as u32,
-        0x2800..=0x28ff | 0xf0130 | 0xf0a9e..=0xf0aa5 | 0xee00..=0xee0b
+        0x2800..=0x28ff | 0x25d0..=0x25d3 | 0xf0130 | 0xf0a9e..=0xf0aa5 | 0xee00..=0xee0b
     )
 }
 
@@ -153,5 +156,49 @@ impl TermWindow {
         quad.set_grayscale();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_leading_legacy_progress_marker;
+
+    #[test]
+    fn braille_spinner_splits() {
+        assert_eq!(split_leading_legacy_progress_marker("⠋ build"), Some("build"));
+    }
+
+    #[test]
+    fn half_circle_spinner_splits() {
+        // Claude Code >= 2.1.228 busy spinner frames.
+        for frame in ['◐', '◑', '◒', '◓'] {
+            let title = format!("{frame} fix the tests");
+            assert_eq!(
+                split_leading_legacy_progress_marker(&title),
+                Some("fix the tests"),
+                "frame {frame:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nerd_font_and_private_use_markers_split() {
+        assert_eq!(
+            split_leading_legacy_progress_marker("\u{f0130} task"),
+            Some("task")
+        );
+        assert_eq!(
+            split_leading_legacy_progress_marker("\u{ee03} task"),
+            Some("task")
+        );
+    }
+
+    #[test]
+    fn idle_marker_and_plain_text_do_not_split() {
+        // ✳ is Claude's *idle* title marker; treating it as a busy spinner
+        // would invert the state.
+        assert_eq!(split_leading_legacy_progress_marker("✳ done"), None);
+        assert_eq!(split_leading_legacy_progress_marker("zsh"), None);
+        assert_eq!(split_leading_legacy_progress_marker(""), None);
     }
 }

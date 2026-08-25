@@ -178,6 +178,17 @@ pub struct WorkspaceThread {
     pub work_is_running: bool,
     #[serde(skip)]
     pub work_needs_attention: bool,
+    /// The user acknowledged the *current* waiting episode (any keypress in
+    /// the active workspace does). The badge may relight silently while the
+    /// agent is still waiting, but the needs-input sound must not replay
+    /// until the state genuinely leaves and re-enters attention.
+    #[serde(skip)]
+    pub work_attention_acknowledged: bool,
+    /// Panes whose waiting has already rung this episode. A pane newly
+    /// joining the waiting set is a new question and rings even while
+    /// others are still waiting; a pane merely re-observed stays quiet.
+    #[serde(skip)]
+    pub work_waiting_panes: std::collections::HashSet<PaneId>,
     #[serde(default)]
     pub work_finished_unseen: bool,
 }
@@ -874,7 +885,32 @@ fn preserve_unreadable_workspace_thread_store() {
 }
 
 pub fn save_workspace_thread_store(store: &WorkspaceThreadStore) -> Result<()> {
-    save_workspace_thread_store_to_path(&workspace_thread_store_path(), store)
+    let path = workspace_thread_store_path();
+    // Once per process, preserve the store as it was before this session's
+    // first write. A broken session (a launch that dies mid-restore, say)
+    // must never be able to clobber the only copy of good data — that
+    // once cost every open thread its working directory, unrecoverably.
+    static BACKUP_ONCE: std::sync::Once = std::sync::Once::new();
+    BACKUP_ONCE.call_once(|| rotate_store_backups(&path));
+    save_workspace_thread_store_to_path(&path, store)
+}
+
+/// Keep the last few pre-session generations as `.json.bak1` (newest)
+/// through `.json.bak5`. Failures are non-fatal: a backup must never
+/// block the save itself.
+fn rotate_store_backups(path: &Path) {
+    const GENERATIONS: u32 = 5;
+    if !path.exists() {
+        return;
+    }
+    for i in (1..GENERATIONS).rev() {
+        let from = path.with_extension(format!("json.bak{i}"));
+        let to = path.with_extension(format!("json.bak{}", i + 1));
+        if from.exists() {
+            let _ = fs::rename(&from, &to);
+        }
+    }
+    let _ = fs::copy(path, path.with_extension("json.bak1"));
 }
 
 pub fn save_workspace_thread_store_to_path(
@@ -1811,6 +1847,40 @@ pub fn origin_space_for_ref_workspace(host_space_id: &str, workspace: &str) -> O
     })
 }
 
+/// The human name for a thread-backed workspace ("Project · Thread"), or
+/// `None` for workspaces no thread claims. Used wherever an internal
+/// workspace id would otherwise leak into the UI (e.g. the Agents panel).
+pub fn thread_display_name_for_workspace(workspace: &str) -> Option<String> {
+    let store = THREAD_STORE.lock();
+    store.projects.iter().find_map(|project| {
+        project.threads.iter().find_map(|thread| {
+            let matches = thread.materialized_workspace_name.as_deref() == Some(workspace)
+                || workspace_name_for_thread(&project.id, &thread.id) == workspace;
+            matches.then(|| {
+                if project.name.is_empty() || project.name == thread.name {
+                    thread.name.clone()
+                } else {
+                    format!("{} \u{b7} {}", project.name, thread.name)
+                }
+            })
+        })
+    })
+}
+
+/// The thread backing a workspace, searched across all Spaces. Used by
+/// surfaces that list panes globally (the Agents panel) and need to jump
+/// to the owning thread.
+pub fn thread_id_for_workspace_any(workspace: &str) -> Option<WorkspaceThreadId> {
+    let store = THREAD_STORE.lock();
+    store.projects.iter().find_map(|project| {
+        project.threads.iter().find_map(|thread| {
+            let matches = thread.materialized_workspace_name.as_deref() == Some(workspace)
+                || workspace_name_for_thread(&project.id, &thread.id) == workspace;
+            matches.then(|| thread.id.clone())
+        })
+    })
+}
+
 pub fn workspace_has_thread_binding(workspace: &str) -> bool {
     let mut store = THREAD_STORE.lock();
     if store.normalize_after_load() {
@@ -2299,11 +2369,13 @@ fn announce_work(announcement: WorkAnnouncement, finished_after: Option<Duration
 }
 
 pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
-    let raw_observed = scan_workspace_work_status(workspace);
+    let (raw_observed, waiting_panes) = scan_workspace_work_status(workspace);
     let observed = debounce_work_status(workspace, raw_observed);
     let change = {
         let mut store = THREAD_STORE.lock();
-        let Some(change) = store.observe_thread_work_for_workspace(workspace, observed) else {
+        let Some(change) =
+            store.observe_thread_work_for_workspace(workspace, observed, &waiting_panes)
+        else {
             return false;
         };
         change
@@ -5789,6 +5861,8 @@ impl WorkspaceThreadStore {
             remote_font_scales: HashMap<PaneId, f64>,
             work_is_running: bool,
             work_needs_attention: bool,
+            work_attention_acknowledged: bool,
+            work_waiting_panes: std::collections::HashSet<PaneId>,
             work_finished_unseen: bool,
         }
 
@@ -5813,6 +5887,8 @@ impl WorkspaceThreadStore {
                         remote_font_scales: thread.remote_font_scales.clone(),
                         work_is_running: thread.work_is_running,
                         work_needs_attention: thread.work_needs_attention,
+                        work_attention_acknowledged: thread.work_attention_acknowledged,
+                        work_waiting_panes: thread.work_waiting_panes.clone(),
                         work_finished_unseen: thread.work_finished_unseen,
                     },
                 );
@@ -5869,6 +5945,13 @@ impl WorkspaceThreadStore {
                             work_is_running: state.map_or(false, |state| state.work_is_running),
                             work_needs_attention: state
                                 .map_or(false, |state| state.work_needs_attention),
+                            work_attention_acknowledged: state
+                                .map_or(false, |state| state.work_attention_acknowledged),
+                            // Carried so a store rebuild does not make every
+                            // still-waiting pane look newly waiting and ring.
+                            work_waiting_panes: state
+                                .map(|state| state.work_waiting_panes.clone())
+                                .unwrap_or_default(),
                             work_finished_unseen: state
                                 .map_or(false, |state| state.work_finished_unseen),
                         }
@@ -6000,6 +6083,7 @@ impl WorkspaceThreadStore {
         &mut self,
         workspace: &str,
         observed: WorkspaceThreadWorkStatus,
+        waiting_panes: &[PaneId],
     ) -> Option<WorkspaceThreadWorkChange> {
         for project in &mut self.projects {
             let project_id = project.id.clone();
@@ -6009,7 +6093,7 @@ impl WorkspaceThreadStore {
                     .clone()
                     .unwrap_or_else(|| workspace_name_for_thread(&project_id, &session.id));
                 if session_workspace == workspace {
-                    return Some(session.observe_work_status(observed));
+                    return Some(session.observe_work_status(observed, waiting_panes));
                 }
             }
         }
@@ -6033,6 +6117,12 @@ impl WorkspaceThreadStore {
                         || session.work_needs_attention
                         || session.work_finished_unseen;
                     session.work_is_running = false;
+                    // The episode may still be live (an agent mid-question);
+                    // remember the acknowledgement so the badge can relight
+                    // without replaying the sound.
+                    if session.work_needs_attention {
+                        session.work_attention_acknowledged = true;
+                    }
                     session.work_needs_attention = false;
                     session.work_finished_unseen = false;
                     return WorkspaceThreadWorkChange {
@@ -6056,6 +6146,9 @@ impl WorkspaceThreadStore {
                 if session.id == thread_id {
                     let should_persist = session.work_finished_unseen;
                     let changed = session.work_needs_attention || session.work_finished_unseen;
+                    if session.work_needs_attention {
+                        session.work_attention_acknowledged = true;
+                    }
                     session.work_needs_attention = false;
                     session.work_finished_unseen = false;
                     return WorkspaceThreadWorkChange {
@@ -6503,6 +6596,8 @@ impl WorkspaceThread {
             is_unread: false,
             work_is_running: false,
             work_needs_attention: false,
+            work_attention_acknowledged: false,
+            work_waiting_panes: Default::default(),
             work_finished_unseen: false,
         }
     }
@@ -6525,6 +6620,8 @@ impl WorkspaceThread {
             is_unread: false,
             work_is_running: false,
             work_needs_attention: false,
+            work_attention_acknowledged: false,
+            work_waiting_panes: Default::default(),
             work_finished_unseen: false,
         }
     }
@@ -6544,6 +6641,7 @@ impl WorkspaceThread {
     fn observe_work_status(
         &mut self,
         observed: WorkspaceThreadWorkStatus,
+        waiting_panes: &[PaneId],
     ) -> WorkspaceThreadWorkChange {
         match observed {
             WorkspaceThreadWorkStatus::Running => {
@@ -6552,6 +6650,10 @@ impl WorkspaceThread {
                     !self.work_is_running || self.work_needs_attention || self.work_finished_unseen;
                 self.work_is_running = true;
                 self.work_needs_attention = false;
+                // A real state change ends the waiting episode: the next
+                // NeedsAttention is a new question and may ring again.
+                self.work_attention_acknowledged = false;
+                self.work_waiting_panes.clear();
                 self.work_finished_unseen = false;
                 WorkspaceThreadWorkChange {
                     changed,
@@ -6562,12 +6664,21 @@ impl WorkspaceThread {
             WorkspaceThreadWorkStatus::NeedsAttention => {
                 let changed = !self.work_needs_attention;
                 self.work_needs_attention = true;
+                // One ring per pane per waiting episode: a pane newly
+                // joining the waiting set is a new question and rings even
+                // while other agents are still waiting; a pane merely
+                // re-observed stays quiet. That last part is load-bearing —
+                // typing an answer into the agent's own question form
+                // acknowledges and re-observes the same pane every scan,
+                // and ringing there would ring on every keystroke.
+                let new_waiter = waiting_panes
+                    .iter()
+                    .any(|pane| !self.work_waiting_panes.contains(pane));
+                self.work_waiting_panes = waiting_panes.iter().copied().collect();
                 WorkspaceThreadWorkChange {
                     changed,
                     should_persist: false,
-                    // `changed` is already "this is the first time we have seen
-                    // it waiting", which is exactly when it is worth saying.
-                    announce: changed.then_some(WorkAnnouncement::NeedsInput),
+                    announce: new_waiter.then_some(WorkAnnouncement::NeedsInput),
                 }
             }
             WorkspaceThreadWorkStatus::Idle | WorkspaceThreadWorkStatus::FinishedUnseen => {
@@ -6585,6 +6696,8 @@ impl WorkspaceThread {
                 }
                 self.work_is_running = false;
                 self.work_needs_attention = false;
+                self.work_attention_acknowledged = false;
+                self.work_waiting_panes.clear();
                 WorkspaceThreadWorkChange {
                     changed: was_running || had_attention,
                     should_persist,
@@ -7097,6 +7210,11 @@ fn working_dir_for_entry(
         .get(&entry.pane_id)
         .and_then(|spec| spec.cwd.clone())
         .or_else(|| working_dir_from_entry(entry))
+        // A stored cwd whose directory no longer exists (renamed project,
+        // corrupted save) must not reach spawn: the callers' fallbacks —
+        // the project path at the tab level, the neighboring pane's cwd
+        // for splits — are all better answers than a failed chdir.
+        .filter(|cwd| Path::new(cwd).is_dir())
 }
 
 fn spawn_domain_for_entry(
@@ -7143,10 +7261,34 @@ fn initial_thread_id_for_workspace(project_id: &str, workspace: &str) -> Workspa
     format!("thread-{hash:x}")
 }
 
-fn scan_workspace_work_status(workspace: &str) -> WorkspaceThreadWorkStatus {
+/// Work status derived from a pane's own escape-sequence signals (OSC 9;4
+/// progress and the leading title spinner marker) with no knowledge of what
+/// runs inside. NeedsAttention dominates at the workspace level, so folding
+/// the signals into a single per-pane value is equivalent to the old
+/// two-flag accumulation.
+pub(crate) fn native_pane_work_status(pane: &dyn mux::pane::Pane) -> WorkspaceThreadWorkStatus {
+    match pane.get_progress() {
+        Progress::Error(_) => return WorkspaceThreadWorkStatus::NeedsAttention,
+        Progress::Percentage(_) | Progress::Indeterminate => {
+            return WorkspaceThreadWorkStatus::Running;
+        }
+        Progress::None => {}
+    }
+    if crate::termwindow::ui::status_icon::split_leading_legacy_progress_marker(&pane.get_title())
+        .is_some()
+    {
+        return WorkspaceThreadWorkStatus::Running;
+    }
+    WorkspaceThreadWorkStatus::Idle
+}
+
+fn scan_workspace_work_status(workspace: &str) -> (WorkspaceThreadWorkStatus, Vec<PaneId>) {
     let mux = Mux::get();
     let mut running = false;
-    let mut needs_attention = false;
+    // Which panes are waiting, not just whether any is: a pane newly
+    // joining this set is a fresh question and earns its own ring.
+    let mut waiting_panes = Vec::new();
+    let agents_enabled = crate::agent_status::enabled();
     for window_id in mux.iter_windows_in_workspace(workspace) {
         let Some(window) = mux.get_window(window_id) else {
             continue;
@@ -7158,29 +7300,29 @@ fn scan_workspace_work_status(workspace: &str) -> WorkspaceThreadWorkStatus {
 
         for tab in tabs {
             for pane in tab.iter_all_panes() {
-                match pane.get_progress() {
-                    Progress::None => {}
-                    Progress::Percentage(_) | Progress::Indeterminate => running = true,
-                    Progress::Error(_) => needs_attention = true,
-                }
-                if crate::termwindow::ui::status_icon::split_leading_legacy_progress_marker(
-                    &pane.get_title(),
-                )
-                .is_some()
-                {
-                    running = true;
+                let observed = agents_enabled
+                    .then(|| crate::agent_status::agent_work_status(pane.as_ref()))
+                    .flatten()
+                    .unwrap_or_else(|| native_pane_work_status(pane.as_ref()));
+                match observed {
+                    WorkspaceThreadWorkStatus::NeedsAttention => {
+                        waiting_panes.push(pane.pane_id())
+                    }
+                    WorkspaceThreadWorkStatus::Running => running = true,
+                    _ => {}
                 }
             }
         }
     }
 
-    if needs_attention {
+    let status = if !waiting_panes.is_empty() {
         WorkspaceThreadWorkStatus::NeedsAttention
     } else if running {
         WorkspaceThreadWorkStatus::Running
     } else {
         WorkspaceThreadWorkStatus::Idle
-    }
+    };
+    (status, waiting_panes)
 }
 
 fn is_remote_project(project: &Project, spaces: &[Space]) -> bool {
@@ -9066,6 +9208,60 @@ mod tests {
         assert_eq!(plan.workspace_name, expected_workspace);
     }
 
+    /// Typing an answer into an agent's question must not ring per key:
+    /// each keypress acknowledges the active workspace and the next scan
+    /// re-observes the same still-waiting pane. Only a pane newly joining
+    /// the waiting set may ring.
+    #[test]
+    fn acknowledged_waiting_episode_relights_silently() {
+        let mut thread = WorkspaceThread::new(
+            "project-1".to_string(),
+            "main".to_string(),
+            Some("workspace-1".to_string()),
+        );
+        let first = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[7]);
+        assert_eq!(first.announce, Some(WorkAnnouncement::NeedsInput));
+        // Keypress: acknowledge clears the badge and marks the episode.
+        if thread.work_needs_attention {
+            thread.work_attention_acknowledged = true;
+        }
+        thread.work_needs_attention = false;
+        // The agent is still waiting: badge relights, sound stays quiet.
+        let relight = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[7]);
+        assert!(relight.changed);
+        assert_eq!(relight.announce, None, "same pane must not re-ring");
+        // The question is answered and a new one appears: rings again.
+        thread.observe_work_status(WorkspaceThreadWorkStatus::Running, &[]);
+        let next = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[7]);
+        assert_eq!(next.announce, Some(WorkAnnouncement::NeedsInput));
+    }
+
+    /// Two agents in one thread each earn a ring: the second question is
+    /// as real as the first even though the thread is already waiting.
+    #[test]
+    fn each_newly_waiting_pane_rings_once() {
+        let mut thread = WorkspaceThread::new(
+            "project-1".to_string(),
+            "main".to_string(),
+            Some("workspace-1".to_string()),
+        );
+        let a = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[1]);
+        assert_eq!(a.announce, Some(WorkAnnouncement::NeedsInput));
+        // A second agent starts waiting while the first still is.
+        let b = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[1, 2]);
+        assert_eq!(b.announce, Some(WorkAnnouncement::NeedsInput));
+        // Both merely still waiting: quiet.
+        let held = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[1, 2]);
+        assert_eq!(held.announce, None);
+        // One is answered while the other still waits: quiet.
+        let fewer = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[2]);
+        assert_eq!(fewer.announce, None);
+        // The answered one asks a new question: it left and re-joined the
+        // waiting set, so it rings again.
+        let again = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[1, 2]);
+        assert_eq!(again.announce, Some(WorkAnnouncement::NeedsInput));
+    }
+
     #[test]
     fn workspace_work_observation_transitions_to_finished_unseen() {
         let mut store = test_store();
@@ -9082,7 +9278,11 @@ mod tests {
         ));
 
         let change = store
-            .observe_thread_work_for_workspace("workspace-1", WorkspaceThreadWorkStatus::Running)
+            .observe_thread_work_for_workspace(
+                "workspace-1",
+                WorkspaceThreadWorkStatus::Running,
+                &[],
+            )
             .unwrap();
         assert!(change.changed);
         assert!(!change.should_persist);
@@ -9092,7 +9292,11 @@ mod tests {
         );
 
         let change = store
-            .observe_thread_work_for_workspace("workspace-1", WorkspaceThreadWorkStatus::Idle)
+            .observe_thread_work_for_workspace(
+                "workspace-1",
+                WorkspaceThreadWorkStatus::Idle,
+                &[],
+            )
             .unwrap();
         assert!(change.changed);
         assert!(change.should_persist);
@@ -9122,8 +9326,14 @@ mod tests {
         store: &mut WorkspaceThreadStore,
         status: WorkspaceThreadWorkStatus,
     ) -> Option<WorkAnnouncement> {
+        // NeedsAttention always arrives with the waiting panes in
+        // production (the status IS "some pane waits"); mirror that.
+        let waiting: &[PaneId] = match status {
+            WorkspaceThreadWorkStatus::NeedsAttention => &[1],
+            _ => &[],
+        };
         store
-            .observe_thread_work_for_workspace("workspace-1", status)
+            .observe_thread_work_for_workspace("workspace-1", status, waiting)
             .unwrap()
             .announce
     }

@@ -8,6 +8,7 @@ pub enum SvgIcon {
     ArrowLeft,
     ArrowRight,
     Bell,
+    Bot,
     Braces,
     Check,
     ChevronDown,
@@ -90,6 +91,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/arrow-right.svg")
             }
             Self::Bell => include_bytes!("../../../../third_party/lucide/icons/bell.svg"),
+            Self::Bot => include_bytes!("../../../../third_party/lucide/icons/bot.svg"),
             Self::Braces => include_bytes!("../../../../third_party/lucide/icons/braces.svg"),
             Self::Check => include_bytes!("../../../../third_party/lucide/icons/check.svg"),
             Self::ChevronDown => {

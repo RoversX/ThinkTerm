@@ -113,6 +113,22 @@ fn next_settings_window_id() -> u64 {
     })
 }
 
+/// Repaint the open settings window, if any. Worker-thread completion
+/// callbacks (the agents PATH probe) need this because the settings
+/// window is standalone — it is not in the frontend's known-windows
+/// list, so `invalidate_all_windows` never reaches it. Main thread only.
+pub(crate) fn invalidate_open_settings_window() {
+    SETTINGS_WINDOW.with(|slot| {
+        if let SettingsWindowSlot::Open { settings, .. } = &*slot.borrow() {
+            if let Ok(settings) = settings.try_borrow() {
+                if let Some(window) = settings.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+        }
+    });
+}
+
 fn settings_window_for_instance(instance_id: u64) -> Option<Rc<RefCell<SettingsWindow>>> {
     SETTINGS_WINDOW.with(|slot| match &*slot.borrow() {
         SettingsWindowSlot::Open {
@@ -145,6 +161,7 @@ enum SettingsSection {
     Appearance,
     Terminal,
     Workspaces,
+    Agents,
     Keymap,
     Compatibility,
     Developer,
@@ -158,6 +175,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Appearance,
     SettingsSection::Terminal,
     SettingsSection::Workspaces,
+    SettingsSection::Agents,
     SettingsSection::Keymap,
     SettingsSection::Compatibility,
     SettingsSection::Developer,
@@ -166,6 +184,70 @@ const BASE_SECTIONS: &[SettingsSection] = &[
 
 const DEVELOPER_SECTIONS: &[SettingsSection] = &[SettingsSection::UiKit, SettingsSection::Memory];
 
+/// The expandable per-agent explanation in the Integrations list.
+fn agent_detail_lines(
+    agent_id: &str,
+    kind: crate::agent_status::IntegrationKind,
+) -> Vec<String> {
+    use crate::agent_status::IntegrationKind;
+    match kind {
+        IntegrationKind::ScreenRules => vec![
+            crate::i18n::tr("settings-agent-details-screen-detect"),
+            settings_tr(
+                "settings-agent-details-screen-override",
+                &[(
+                    "path",
+                    format!("~/.config/thinkterm/agent-detection/{agent_id}.toml"),
+                )],
+            ),
+            crate::i18n::tr("settings-agent-details-states"),
+        ],
+        IntegrationKind::Native => vec![
+            crate::i18n::tr("settings-agent-details-native"),
+            crate::i18n::tr("settings-agent-details-native-doc"),
+        ],
+        IntegrationKind::Pending => vec![
+            crate::i18n::tr("settings-agent-details-pending"),
+        ],
+    }
+}
+
+/// Debug affordance companion to `THINKTERM_SETTINGS_SECTION`: pre-expands
+/// one Integrations row (e.g. for unattended UI captures).
+fn initial_expanded_agent() -> Option<&'static str> {
+    let name = std::env::var("THINKTERM_SETTINGS_EXPAND").ok()?;
+    crate::agent_status::SUPPORTED_AGENTS
+        .iter()
+        .find(|(id, _, _)| *id == name)
+        .map(|(id, _, _)| *id)
+}
+
+/// Debug affordance: `THINKTERM_SETTINGS_SECTION=<name>` selects that section
+/// when the settings window opens (e.g. for unattended UI captures with
+/// `THINKTERM_FRAME_DUMP`). Names match the enum variants, case-insensitive.
+fn initial_section() -> SettingsSection {
+    let Some(name) = std::env::var_os("THINKTERM_SETTINGS_SECTION") else {
+        return SettingsSection::Appearance;
+    };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    let section = match name.as_str() {
+        "general" => SettingsSection::General,
+        "appearance" => SettingsSection::Appearance,
+        "terminal" => SettingsSection::Terminal,
+        "workspaces" => SettingsSection::Workspaces,
+        "agents" => SettingsSection::Agents,
+        "keymap" => SettingsSection::Keymap,
+        "compatibility" => SettingsSection::Compatibility,
+        "developer" => SettingsSection::Developer,
+        "about" => SettingsSection::About,
+        _ => SettingsSection::Appearance,
+    };
+    if section == SettingsSection::Agents {
+        crate::agent_status::refresh_path_probe();
+    }
+    section
+}
+
 impl SettingsSection {
     fn label(self) -> String {
         match self {
@@ -173,6 +255,7 @@ impl SettingsSection {
             Self::Appearance => crate::i18n::tr("settings-section-appearance"),
             Self::Terminal => crate::i18n::tr("settings-section-terminal"),
             Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
+            Self::Agents => crate::i18n::tr("settings-section-agents"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
             Self::Compatibility => crate::i18n::tr("settings-section-compatibility"),
             Self::Developer => crate::i18n::tr("settings-section-developer"),
@@ -188,6 +271,7 @@ impl SettingsSection {
             Self::Appearance => SettingsIcon::Appearance,
             Self::Terminal => SettingsIcon::Terminal,
             Self::Workspaces => SettingsIcon::Workspaces,
+            Self::Agents => SettingsIcon::Agents,
             Self::Keymap => SettingsIcon::Keymap,
             Self::Compatibility => SettingsIcon::Sync,
             Self::Developer => SettingsIcon::Developer,
@@ -252,6 +336,19 @@ impl SettingsSection {
                 "Remote Files",
                 "SFTP",
                 "Idle Timeout",
+            ],
+            Self::Agents => &[
+                "Agent",
+                "Agents",
+                "Agent Panel",
+                "Integration",
+                "Integrations",
+                "Claude",
+                "Claude Code",
+                "Codex",
+                "Copilot",
+                "Cursor",
+                "Detection Rules",
             ],
             Self::Keymap => &["Keymap", "Keyboard", "Shortcut", "Command Palette"],
             Self::Compatibility => &[
@@ -388,6 +485,8 @@ enum SettingsAction {
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
     ToggleNotificationSounds,
+    ToggleAgentPanel,
+    ToggleAgentDetails(&'static str),
     ToggleDeveloperMode,
     ToggleFallbackContextMenu,
     ShowOnboardingNow,
@@ -1384,6 +1483,7 @@ struct SettingsWindow {
     webgpu: Option<Rc<WebGpuState>>,
     appearance: Appearance,
     selected: SettingsSection,
+    agents_expanded: Option<&'static str>,
     native_settings: ThinkTermNativeSettings,
     active_main_renderer: NativeRendererBackend,
     ui: SettingsUiState,
@@ -1501,7 +1601,8 @@ impl SettingsWindow {
             render_state: None,
             webgpu: None,
             appearance,
-            selected: SettingsSection::Appearance,
+            selected: initial_section(),
+            agents_expanded: initial_expanded_agent(),
             native_settings,
             active_main_renderer,
             ui,
@@ -2913,6 +3014,11 @@ impl SettingsWindow {
                 self.selected = section;
                 self.ui.content_scroll.reset();
                 self.ui.open_dropdown = None;
+                if section == SettingsSection::Agents {
+                    // Probe PATH on entry so painting never touches the
+                    // filesystem.
+                    crate::agent_status::refresh_path_probe();
+                }
             }
             SettingsAction::OpenThinkTermConfigFile => {
                 self.ui.open_dropdown = None;
@@ -3238,6 +3344,38 @@ impl SettingsWindow {
                         self.status = format!("Unable to save context menu setting: {err:#}");
                     }
                 }
+            }
+            SettingsAction::ToggleAgentPanel => {
+                self.ui.open_dropdown = None;
+                self.native_settings.chrome.agent_panel_enabled =
+                    !self.native_settings.chrome.agent_panel_enabled;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        // After the save so the detector's preference
+                        // closure reads the new shared value; without this
+                        // the gate waits for the next safety tick.
+                        mux::agent_status::refresh_enabled();
+                        self.status = if self.native_settings.chrome.agent_panel_enabled {
+                            crate::i18n::tr("settings-agent-panel-enabled")
+                        } else {
+                            crate::i18n::tr("settings-agent-panel-disabled")
+                        };
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.invalidate_all_windows();
+                        }
+                    }
+                    Err(err) => {
+                        self.status = format!("Unable to save agent panel setting: {err:#}");
+                    }
+                }
+            }
+            SettingsAction::ToggleAgentDetails(agent_id) => {
+                self.ui.open_dropdown = None;
+                self.agents_expanded = if self.agents_expanded == Some(agent_id) {
+                    None
+                } else {
+                    Some(agent_id)
+                };
             }
             SettingsAction::ShowOnboardingNow => {
                 self.ui.open_dropdown = None;
@@ -4105,6 +4243,7 @@ impl SettingsWindow {
             SettingsSection::General => self.paint_general(layers, x, max_width)?,
             SettingsSection::Terminal => self.paint_terminal(layers, x, max_width)?,
             SettingsSection::Workspaces => self.paint_workspaces(layers, x, max_width)?,
+            SettingsSection::Agents => self.paint_agents(layers, x, max_width)?,
             SettingsSection::Keymap => self.paint_placeholder(
                 layers,
                 &ui_font,
@@ -4500,6 +4639,239 @@ impl SettingsWindow {
             SettingsAction::ToggleNotificationSounds,
             true,
         )
+    }
+
+    fn paint_agents(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+
+        // Card 1: the panel/detection feature toggle.
+        let toggle_row_count = 1;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, toggle_row_count);
+        let card_height = self.settings_card_height(toggle_row_count);
+        // Card 2: one row per supported agent. Clicking a row expands an
+        // inset card explaining how that agent is covered; the outer card
+        // grows by the detail block's height.
+        let integrations_row_count = crate::agent_status::SUPPORTED_AGENTS.len();
+        let padding = 36.0;
+        let row_x = x + padding;
+        let row_width = max_width - padding * 2.0;
+        let cell_height = self.metrics.cell_size.height as f32;
+        let row_step = self.settings_row_step();
+        let detail_line_step = (cell_height + self.ui_px(8.0)).max(self.ui_px(24.0));
+        let detail_text_inset = self.ui_px(16.0);
+        // Wrapped detail lines for the expanded row, computed up front so
+        // the card height is known before anything paints.
+        let expanded_detail: Option<Vec<String>> = self.agents_expanded.and_then(|expanded| {
+            crate::agent_status::SUPPORTED_AGENTS
+                .iter()
+                .find(|(id, _, _)| *id == expanded)
+                .map(|(id, _, kind)| {
+                    agent_detail_lines(id, *kind)
+                        .iter()
+                        .flat_map(|text| {
+                            self.wrap_settings_text(
+                                &ui_font,
+                                text,
+                                row_width - detail_text_inset * 2.0,
+                            )
+                        })
+                        .collect()
+                })
+        });
+        // Where the inset card sits relative to its row's top, and how much
+        // taller the row becomes.
+        let desc_offset = (cell_height + self.ui_px(8.0)).max(self.ui_px(34.0));
+        let detail_block_rel_y = desc_offset + cell_height + self.ui_px(12.0);
+        let detail_block_height = expanded_detail
+            .as_ref()
+            .map(|lines| lines.len() as f32 * detail_line_step + self.ui_px(22.0))
+            .unwrap_or(0.0);
+        let expanded_extra = expanded_detail
+            .as_ref()
+            .map(|_| {
+                (detail_block_rel_y + detail_block_height + self.ui_px(18.0) - row_step).max(0.0)
+            })
+            .unwrap_or(0.0);
+        let integrations_title_y = card_y + card_height + self.settings_section_card_gap();
+        let integrations_card_y =
+            integrations_title_y + self.settings_section_card_gap().min(54.0);
+        let integrations_first_row_y = integrations_card_y + self.settings_card_top_padding();
+        let mut integrations_card_height =
+            self.settings_card_height(integrations_row_count) + expanded_extra;
+        // The card budgets less than a full row_step for its final row, so
+        // an expansion of the *last* row would overhang the card's bottom
+        // border; grow the card to contain the block plus breathing room.
+        let last_agent_expanded = self.agents_expanded.is_some()
+            && self.agents_expanded
+                == crate::agent_status::SUPPORTED_AGENTS
+                    .last()
+                    .map(|(id, _, _)| *id);
+        if last_agent_expanded && expanded_detail.is_some() {
+            let block_bottom = self.settings_card_top_padding()
+                + integrations_row_count.saturating_sub(1) as f32 * row_step
+                + detail_block_rel_y
+                + detail_block_height;
+            integrations_card_height =
+                integrations_card_height.max(block_bottom + self.ui_px(18.0));
+        }
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(integrations_card_y + scroll + integrations_card_height),
+        );
+
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-agents-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            first_row_y,
+            row_width,
+            &crate::i18n::tr("settings-agent-panel"),
+            &crate::i18n::tr("settings-agent-panel-description"),
+            self.native_settings.chrome.agent_panel_enabled,
+            SettingsAction::ToggleAgentPanel,
+            // Sole row in its card: a top rule would just underline the
+            // group heading for no reason.
+            false,
+        )?;
+
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            integrations_title_y,
+            &crate::i18n::tr("settings-agents-integrations-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        self.paint_group_card(
+            layers,
+            x,
+            integrations_card_y,
+            max_width,
+            integrations_card_height,
+        )?;
+
+        // One row per supported agent; every row expands on click with an
+        // explanation of how that agent is covered. Nothing here is
+        // installable: detection is screen-rule driven for everyone.
+        use crate::agent_status::IntegrationKind;
+        let mut row_y = integrations_first_row_y;
+        let mut draw_top_rule = false;
+        let mut prev_expanded = false;
+        for (agent_id, _names, kind) in crate::agent_status::SUPPORTED_AGENTS {
+            let expanded = self.agents_expanded == Some(*agent_id);
+            let arrow = if expanded { "\u{25be}" } else { "\u{25b8}" };
+            let label = format!(
+                "{arrow}  {}",
+                crate::agent_status::display_name(agent_id)
+            );
+            let on_path = crate::agent_status::agent_on_path(agent_id);
+            let description = match kind {
+                IntegrationKind::Native => {
+                    crate::i18n::tr("settings-integration-native")
+                }
+                IntegrationKind::Pending => {
+                    crate::i18n::tr("settings-integration-pending")
+                }
+                IntegrationKind::ScreenRules if on_path => {
+                    crate::i18n::tr("settings-integration-screen-active")
+                }
+                IntegrationKind::ScreenRules => {
+                    crate::i18n::tr("settings-integration-screen-missing")
+                }
+            };
+            // No separator right after an expanded row: `row_y` includes
+            // the detail block, so the rule would cut across its card; the
+            // frame itself already separates.
+            if draw_top_rule && !prev_expanded {
+                self.paint_separator(
+                    layers,
+                    row_x,
+                    row_y - self.ui_px(28.0),
+                    row_width,
+                )?;
+            }
+            self.draw_text(
+                layers,
+                &ui_font,
+                row_x,
+                row_y,
+                &label,
+                palette.text,
+                row_width,
+            )?;
+            self.draw_text(
+                layers,
+                &ui_font,
+                row_x,
+                self.settings_row_description_y(row_y),
+                &description,
+                palette.secondary_text,
+                row_width,
+            )?;
+            self.ui_context.push(
+                rect(
+                    row_x,
+                    row_y - self.ui_px(6.0),
+                    row_width,
+                    self.ui_px(56.0),
+                ),
+                crate::ui::WidgetKind::Button,
+                SettingsAction::ToggleAgentDetails(agent_id),
+            );
+            let row_top = row_y;
+            row_y += row_step;
+            if expanded {
+                if let Some(lines) = &expanded_detail {
+                    let block_y = row_top + detail_block_rel_y;
+                    self.draw_rounded_frame(
+                        layers,
+                        0,
+                        row_x,
+                        block_y,
+                        row_width,
+                        detail_block_height,
+                        palette.control_bg,
+                        palette.rule,
+                        self.ui_px(10.0),
+                    )?;
+                    let mut detail_y = block_y + self.ui_px(12.0);
+                    for line in lines {
+                        self.draw_text(
+                            layers,
+                            &ui_font,
+                            row_x + detail_text_inset,
+                            detail_y,
+                            line,
+                            palette.secondary_text,
+                            row_width - detail_text_inset * 2.0,
+                        )?;
+                        detail_y += detail_line_step;
+                    }
+                }
+                row_y += expanded_extra;
+            }
+            draw_top_rule = true;
+            prev_expanded = expanded;
+        }
+        Ok(())
     }
 
     fn paint_terminal(
@@ -7880,6 +8252,55 @@ impl SettingsWindow {
     /// current when they were rasterized.
     fn invalidate_shaped_text(&self) {
         self.shape_cache.borrow_mut().clear();
+    }
+
+    /// Greedy word wrap against the shaped width; falls back to char-level
+    /// breaking for unspaced (CJK) text or overlong tokens.
+    fn wrap_settings_text(
+        &self,
+        font: &Rc<LoadedFont>,
+        text: &str,
+        max_width: f32,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        let push_wrapped_word = |word: &str, current: &mut String, lines: &mut Vec<String>| {
+            let mut piece = String::new();
+            for ch in word.chars() {
+                let mut candidate = piece.clone();
+                candidate.push(ch);
+                if !piece.is_empty() && self.measure_text_width(font, &candidate) > max_width {
+                    lines.push(std::mem::take(&mut piece));
+                    piece.push(ch);
+                } else {
+                    piece = candidate;
+                }
+            }
+            *current = piece;
+        };
+        for word in text.split_whitespace() {
+            let candidate = if current.is_empty() {
+                word.to_string()
+            } else {
+                format!("{current} {word}")
+            };
+            if self.measure_text_width(font, &candidate) <= max_width {
+                current = candidate;
+            } else if current.is_empty() {
+                push_wrapped_word(word, &mut current, &mut lines);
+            } else {
+                lines.push(std::mem::take(&mut current));
+                if self.measure_text_width(font, word) <= max_width {
+                    current = word.to_string();
+                } else {
+                    push_wrapped_word(word, &mut current, &mut lines);
+                }
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+        lines
     }
 
     fn measure_text_width(&self, font: &Rc<LoadedFont>, text: &str) -> f32 {

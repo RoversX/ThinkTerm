@@ -38,6 +38,8 @@ done
 
 for cmd in \
     activate-pane \
+    agent \
+    "agent list" \
     activate-pane-direction \
     adjust-pane-size \
     activate-tab \
@@ -55,6 +57,7 @@ for cmd in \
     split-pane \
     zoom-pane \
     ; do
-  fname="docs/examples/cmd-synopsis-wezterm-cli-${cmd}--help.txt"
-  cargo run --example narrow "$DEBUG_DIR/thinkterm" cli $cmd --help | "$DEBUG_DIR/strip-ansi-escapes" | trim_file > $fname
+  # Nested subcommand groups ("agent list") hyphenate into the filename.
+  fname="docs/examples/cmd-synopsis-wezterm-cli-${cmd// /-}--help.txt"
+  cargo run --example narrow "$DEBUG_DIR/thinkterm" cli $cmd --help | "$DEBUG_DIR/strip-ansi-escapes" | trim_file > "$fname"
 done

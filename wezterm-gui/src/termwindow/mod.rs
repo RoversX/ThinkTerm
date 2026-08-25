@@ -581,6 +581,8 @@ pub enum UIItemType {
     RightSidebarSnippetDelete(String),
     RightSidebarSnippetScrollTrack,
     RightSidebarSnippetScrollThumb,
+    /// A control in the Agents panel.
+    RightSidebarAgent(crate::agent_status::AgentPanelAction),
     RightSidebarNoteMenu,
     RightSidebarNoteChooseVault,
     RightSidebarNoteCreateVault,
@@ -628,6 +630,9 @@ pub enum RightSidebarMode {
     Chat,
     Tasks,
     Snippets,
+    /// Agent status panel; only offered while the agent-panel feature
+    /// toggle is on (`crate::agent_status::enabled`).
+    Agents,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1949,6 +1954,7 @@ pub struct TermWindow {
     right_sidebar_width: usize,
     right_sidebar_collapsed: bool,
     right_sidebar_mode: RightSidebarMode,
+    right_sidebar_agents_scroll: f32,
     right_sidebar_snippet_view: RightSidebarSnippetView,
     right_sidebar_snippet_focus: Option<RightSidebarSnippetField>,
     right_sidebar_snippet_search: TextInputState,
@@ -2907,6 +2913,7 @@ impl TermWindow {
             right_sidebar_width: ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize),
             right_sidebar_collapsed: true,
             right_sidebar_mode: RightSidebarMode::Snippets,
+            right_sidebar_agents_scroll: 0.0,
             right_sidebar_snippet_view: RightSidebarSnippetView::List,
             right_sidebar_snippet_focus: None,
             right_sidebar_snippet_search: TextInputState::new(),
@@ -3795,6 +3802,20 @@ impl TermWindow {
                 MuxNotification::PaneOutput(pane_id) => {
                     self.mux_pane_output_event(pane_id);
                 }
+                MuxNotification::AgentStatusChanged(pane_id) => {
+                    // The panel snapshot is cached briefly; a real change
+                    // must not wait out that TTL.
+                    crate::agent_status::invalidate_agent_pane_cache();
+                    self.refresh_thread_work_for_pane(pane_id);
+                    if self.right_sidebar_mode == RightSidebarMode::Agents {
+                        // The thread status may be unchanged while the
+                        // per-pane chip flipped (e.g. Idle→Working inside an
+                        // already-Running thread); repaint the open panel.
+                        if let Some(win) = self.window.as_ref() {
+                            win.invalidate();
+                        }
+                    }
+                }
                 MuxNotification::WindowInvalidated(_) => {
                     window.invalidate();
                     self.update_title_post_status();
@@ -4235,6 +4256,7 @@ impl TermWindow {
             }
             | MuxNotification::PaneFocused(pane_id)
             | MuxNotification::PaneRemoved(pane_id)
+            | MuxNotification::AgentStatusChanged(pane_id)
             | MuxNotification::PaneOutput(pane_id) => {
                 // Ideally we'd check to see if pane_id is part of this window,
                 // but overlays may not be 100% associated with the window

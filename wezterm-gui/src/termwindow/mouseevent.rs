@@ -1364,6 +1364,14 @@ impl super::TermWindow {
                     context.invalidate();
                 }
             }
+            super::RightSidebarMode::Agents => {
+                let old = self.right_sidebar_agents_scroll;
+                self.right_sidebar_agents_scroll =
+                    (self.right_sidebar_agents_scroll + delta).max(0.0);
+                if (old - self.right_sidebar_agents_scroll).abs() > f32::EPSILON {
+                    context.invalidate();
+                }
+            }
         }
         true
     }
@@ -1414,6 +1422,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFilePreviewResize
             | UIItemType::RightSidebarNotePaneResize
             | UIItemType::RightSidebarNotePaneToggle
+            | UIItemType::RightSidebarAgent(_)
             | UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -1526,6 +1535,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFilePreviewResize
             | UIItemType::RightSidebarNotePaneResize
             | UIItemType::RightSidebarNotePaneToggle
+            | UIItemType::RightSidebarAgent(_)
             | UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -3567,6 +3577,9 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetDelete(_) => {
                 self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
             }
+            UIItemType::RightSidebarAgent(_) => {
+                self.mouse_event_right_sidebar_agent(item.clone(), event, context);
+            }
             UIItemType::RightSidebarNoteMenu
             | UIItemType::RightSidebarNoteChooseVault
             | UIItemType::RightSidebarNoteCreateVault
@@ -4107,6 +4120,9 @@ impl super::TermWindow {
             | UIItemType::RightSidebarSnippetRun(_)
             | UIItemType::RightSidebarSnippetDelete(_) => {
                 self.mouse_event_right_sidebar_snippet(item.clone(), event, context);
+            }
+            UIItemType::RightSidebarAgent(_) => {
+                self.mouse_event_right_sidebar_agent(item.clone(), event, context);
             }
             UIItemType::RightSidebarNoteMenu
             | UIItemType::RightSidebarNoteChooseVault

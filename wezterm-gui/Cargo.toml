@@ -105,6 +105,7 @@ sys-locale.workspace = true
 termwiz-funcs.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true
+thinkterm-proto.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
 thinkterm-syntax = { path = "../thinkterm-syntax" }
