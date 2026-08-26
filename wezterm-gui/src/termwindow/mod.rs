@@ -2190,14 +2190,34 @@ impl TermWindow {
         }
 
         lines.push(format!(
-            "{label}: caches shape={} line_state={} line_quad={} line_to_element_shape={} pane_font={} semantic_zones={}",
+            "{label}: caches shape={} ({}KiB) line_state={} ({}KiB) line_quad={} ({}KiB) line_to_element_shape={} ({}KiB) pane_font={} semantic_zones={}",
             self.shape_cache.borrow().len(),
+            self.shape_cache.borrow().total_weight() / 1024,
             self.line_state_cache.borrow().len(),
+            self.line_state_cache.borrow().total_weight() / 1024,
             self.line_quad_cache.borrow().len(),
+            self.line_quad_cache.borrow().total_weight() / 1024,
             self.line_to_ele_shape_cache.borrow().len(),
+            self.line_to_ele_shape_cache.borrow().total_weight() / 1024,
             self.pane_font_cache.borrow().len(),
             self.semantic_zones.len(),
         ));
+        {
+            let ui = self.ui_shape_caches.borrow();
+            lines.push(format!(
+                "{label}: ui_shape_caches chrome={} ({}KiB) note={} ({}KiB) file_preview={} ({}KiB)",
+                ui.domain(crate::shapecache::UiTextDomain::Chrome).len(),
+                ui.domain(crate::shapecache::UiTextDomain::Chrome)
+                    .total_weight()
+                    / 1024,
+                ui.domain(crate::shapecache::UiTextDomain::Note).len(),
+                ui.domain(crate::shapecache::UiTextDomain::Note).total_weight() / 1024,
+                ui.domain(crate::shapecache::UiTextDomain::FilePreview).len(),
+                ui.domain(crate::shapecache::UiTextDomain::FilePreview)
+                    .total_weight()
+                    / 1024,
+            ));
+        }
         lines
     }
 
@@ -3118,7 +3138,9 @@ impl TermWindow {
                 Ok(state) => webgpu = Some(Rc::new(state)),
                 Err(err) => {
                     log::error!("WebGpu is unavailable ({err:#}); falling back to OpenGL");
-                    gpu_debug(format!("WebGpu unavailable: {err:#}; falling back to OpenGL"));
+                    gpu_debug(format!(
+                        "WebGpu unavailable: {err:#}; falling back to OpenGL"
+                    ));
                     effective_renderer = crate::native_settings::NativeRendererBackend::OpenGL;
                 }
             }

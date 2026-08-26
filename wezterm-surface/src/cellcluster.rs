@@ -45,6 +45,16 @@ impl CellCluster {
         }
     }
 
+    /// Estimated heap bytes owned by this cluster beyond its inline size.
+    /// Any heap held behind `attrs` (fat attributes) is not visible from
+    /// here and is not counted.
+    pub fn resident_heap_bytes(&self) -> usize {
+        self.text
+            .capacity()
+            .saturating_add(self.byte_to_cell_idx.capacity() * core::mem::size_of::<usize>())
+            .saturating_add(self.byte_to_cell_width.capacity())
+    }
+
     /// Compute the list of CellClusters from a set of visible cells.
     /// The input is typically the result of calling `Line::visible_cells()`.
     pub fn make_cluster<'a>(

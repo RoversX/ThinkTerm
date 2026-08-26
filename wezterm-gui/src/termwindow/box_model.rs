@@ -607,7 +607,11 @@ impl super::TermWindow {
                 let direction = wezterm_bidi::Direction::LeftToRight;
                 let infos = element.font.shape(
                     &s,
-                    move |chars: &[char]| window.notify(TermWindowNotif::InvalidateShapeCacheForChars(chars.to_vec())),
+                    move |chars: &[char]| {
+                        window.notify(TermWindowNotif::InvalidateShapeCacheForChars(
+                            chars.to_vec(),
+                        ))
+                    },
                     BlockKey::filter_out_synthetic,
                     element.presentation,
                     direction,

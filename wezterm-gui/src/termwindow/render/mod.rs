@@ -138,6 +138,56 @@ pub struct RenderScreenLineResult {
     pub invalidate_on_hover_change: bool,
 }
 
+/// Per-entry bookkeeping cost of the LFU cache itself (the shared `Rc`
+/// entry holding the intrusive links), matching the constant used by the
+/// UI shape caches in `shapecache.rs`.
+const CACHE_ENTRY_FIXED_OVERHEAD: usize = 128;
+
+/// Estimated resident bytes for one `line_state_cache` entry: the
+/// `Arc<CachedLineState>` allocation plus the u64 key.
+pub const LINE_STATE_ENTRY_BYTES: usize =
+    CACHE_ENTRY_FIXED_OVERHEAD + std::mem::size_of::<CachedLineState>() + 24;
+
+/// Estimated resident bytes for one `line_quad_cache` entry. The dominant
+/// term is the `HeapQuadAllocator` capacity.
+pub fn estimate_line_quad_entry_bytes(key: &LineQuadCacheKey, value: &LineQuadCacheValue) -> usize {
+    CACHE_ENTRY_FIXED_OVERHEAD
+        .saturating_add(std::mem::size_of::<LineQuadCacheKey>())
+        .saturating_add(key.composing.as_ref().map_or(0, |s| s.capacity()))
+        .saturating_add(std::mem::size_of::<LineQuadCacheValue>())
+        .saturating_add(value.layers.resident_bytes())
+}
+
+/// Estimated resident bytes for one `line_to_ele_shape_cache` entry. The
+/// `glyph_info` Rc inside each shape is shared with (and counted by) the
+/// `shape_cache` entry that minted it, so only each shape's inline size and
+/// its cluster's own heap are counted here.
+pub fn estimate_line_to_ele_entry_bytes(
+    key: &LineToEleShapeCacheKey,
+    value: &LineToElementShapeItem,
+) -> usize {
+    let key_bytes = std::mem::size_of::<LineToEleShapeCacheKey>()
+        .saturating_add(key.composing.as_ref().map_or(0, |(_, s)| s.capacity()));
+    let shaped_bytes = std::mem::size_of::<Vec<LineToElementShape>>()
+        .saturating_add(
+            value
+                .shaped
+                .capacity()
+                .saturating_mul(std::mem::size_of::<LineToElementShape>()),
+        )
+        .saturating_add(
+            value
+                .shaped
+                .iter()
+                .map(|shape| shape.cluster.resident_heap_bytes())
+                .sum(),
+        );
+    CACHE_ENTRY_FIXED_OVERHEAD
+        .saturating_add(key_bytes)
+        .saturating_add(std::mem::size_of::<LineToElementShapeItem>())
+        .saturating_add(shaped_bytes)
+}
+
 pub struct RenderScreenLineParams<'a> {
     /// zero-based offset from top of the window viewport to the line that
     /// needs to be rendered, measured in pixels
@@ -888,7 +938,11 @@ impl crate::TermWindow {
                 let hb_started = crate::perf::now();
                 match font.shape(
                     &cluster.text,
-                    move |chars: &[char]| window.notify(TermWindowNotif::InvalidateShapeCacheForChars(chars.to_vec())),
+                    move |chars: &[char]| {
+                        window.notify(TermWindowNotif::InvalidateShapeCacheForChars(
+                            chars.to_vec(),
+                        ))
+                    },
                     BlockKey::filter_out_synthetic,
                     Some(cluster.presentation),
                     cluster.direction,
@@ -908,9 +962,12 @@ impl crate::TermWindow {
                         crate::perf::accum("glyph_raster", raster_started);
                         let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
 
+                        let key = key.to_owned();
+                        let value = Ok(Rc::clone(&shaped));
+                        let weight = crate::shapecache::estimate_shaped_entry_bytes(&key, &value);
                         self.shape_cache
                             .borrow_mut()
-                            .put(key.to_owned(), Ok(Rc::clone(&shaped)));
+                            .put_weighted(key, value, weight);
                         shaped
                     }
                     Err(err) => {
@@ -919,7 +976,12 @@ impl crate::TermWindow {
                         }
 
                         let res = anyhow!("shaper error: {}", err);
-                        self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
+                        let key = key.to_owned();
+                        let value = Err(err);
+                        let weight = crate::shapecache::estimate_shaped_entry_bytes(&key, &value);
+                        self.shape_cache
+                            .borrow_mut()
+                            .put_weighted(key, value, weight);
                         return Err(res);
                     }
                 }
@@ -1008,7 +1070,11 @@ impl crate::TermWindow {
                     let hb_started = crate::perf::now();
                     match font.shape(
                         seg,
-                        move |chars: &[char]| window.notify(TermWindowNotif::InvalidateShapeCacheForChars(chars.to_vec())),
+                        move |chars: &[char]| {
+                            window.notify(TermWindowNotif::InvalidateShapeCacheForChars(
+                                chars.to_vec(),
+                            ))
+                        },
                         BlockKey::filter_out_synthetic,
                         Some(cluster.presentation),
                         cluster.direction,
@@ -1027,9 +1093,13 @@ impl crate::TermWindow {
                             )?;
                             crate::perf::accum("glyph_raster", raster_started);
                             let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
+                            let key = key.to_owned();
+                            let value = Ok(Rc::clone(&shaped));
+                            let weight =
+                                crate::shapecache::estimate_shaped_entry_bytes(&key, &value);
                             self.shape_cache
                                 .borrow_mut()
-                                .put(key.to_owned(), Ok(Rc::clone(&shaped)));
+                                .put_weighted(key, value, weight);
                             shaped
                         }
                         Err(err) => {
@@ -1037,7 +1107,13 @@ impl crate::TermWindow {
                                 return Err(err);
                             }
                             let res = anyhow!("shaper error: {}", err);
-                            self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
+                            let key = key.to_owned();
+                            let value = Err(err);
+                            let weight =
+                                crate::shapecache::estimate_shaped_entry_bytes(&key, &value);
+                            self.shape_cache
+                                .borrow_mut()
+                                .put_weighted(key, value, weight);
                             return Err(res);
                         }
                     }
@@ -1116,7 +1192,9 @@ impl crate::TermWindow {
 
         line.set_appdata(Arc::clone(&state));
 
-        self.line_state_cache.borrow_mut().put(id, state);
+        self.line_state_cache
+            .borrow_mut()
+            .put_weighted(id, state, LINE_STATE_ENTRY_BYTES);
         shape_hash
     }
 }

@@ -88,7 +88,9 @@ const PREVIEW_CONTENT_FADE: Duration = Duration::from_millis(120);
 pub(crate) enum PreviewContentFade {
     /// Still blank. `snapshot` is the address of the snapshot last scanned,
     /// so each snapshot is scanned for content at most once.
-    Blank { snapshot: usize },
+    Blank {
+        snapshot: usize,
+    },
     ContentSince(Instant),
 }
 
@@ -1524,8 +1526,8 @@ impl crate::TermWindow {
             // card's (invisible) quads out of the blending special cases.
             PreviewContentFade::Blank { .. } => 1.0,
             PreviewContentFade::ContentSince(since) => {
-                let t = now.duration_since(*since).as_secs_f32()
-                    / PREVIEW_CONTENT_FADE.as_secs_f32();
+                let t =
+                    now.duration_since(*since).as_secs_f32() / PREVIEW_CONTENT_FADE.as_secs_f32();
                 if t >= 1.0 {
                     1.0
                 } else {
@@ -3839,8 +3841,7 @@ impl crate::TermWindow {
         self.paint_file_drag_ghost()
             .context("paint_file_drag_ghost")?;
         // Last, so the tag sits above every chrome surface it might overhang.
-        self.paint_hover_tooltip()
-            .context("paint_hover_tooltip")?;
+        self.paint_hover_tooltip().context("paint_hover_tooltip")?;
 
         Ok(())
     }

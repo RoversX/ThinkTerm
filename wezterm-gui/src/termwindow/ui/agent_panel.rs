@@ -177,14 +177,7 @@ impl TermWindow {
             .saturating_sub(button_size + self.ui_px(SIDEBAR_ICON_GAP))
             .saturating_sub(text_x);
         self.paint_sidebar_text(
-            layers,
-            ui_font,
-            ui_metrics,
-            &line,
-            text_x,
-            text_y,
-            text_width,
-            muted_fg,
+            layers, ui_font, ui_metrics, &line, text_x, text_y, text_width, muted_fg,
         )?;
         // Only the "detection is off" line is actionable: it names the
         // switch that turns the panel back on, so it must lead there.
@@ -305,8 +298,7 @@ impl TermWindow {
                 // Rows are laid out top-down, so nothing below is visible.
                 break;
             }
-            let Some(band) =
-                agent_row_visible_band(row_top, row_height, list_top, row_clip_bottom)
+            let Some(band) = agent_row_visible_band(row_top, row_height, list_top, row_clip_bottom)
             else {
                 continue;
             };
@@ -395,27 +387,18 @@ impl TermWindow {
             // places: blue for in progress, amber for needs input, and a
             // muted tick for idle, which must not compete for attention.
             let state_icon = match agent.state {
-                AgentState::Working => {
-                    Some((SvgIcon::LoaderCircle, AGENT_WORKING_COLOR, true))
-                }
-                AgentState::Blocked => {
-                    Some((SvgIcon::CircleAlert, AGENT_BLOCKED_COLOR, false))
-                }
+                AgentState::Working => Some((SvgIcon::LoaderCircle, AGENT_WORKING_COLOR, true)),
+                AgentState::Blocked => Some((SvgIcon::CircleAlert, AGENT_BLOCKED_COLOR, false)),
                 AgentState::Idle => Some((SvgIcon::CircleCheck, muted_fg, false)),
                 AgentState::Unknown => None,
             };
             let has_state_icon = state_icon.is_some();
-            if let Some((icon, color, spinning)) = state_icon.filter(|_| visible(state_y, state_size))
+            if let Some((icon, color, spinning)) =
+                state_icon.filter(|_| visible(state_y, state_size))
             {
                 if spinning {
                     self.paint_spinning_ui_icon(
-                        layers,
-                        2,
-                        icon,
-                        state_x,
-                        state_y,
-                        state_size,
-                        color,
+                        layers, 2, icon, state_x, state_y, state_size, color,
                     )?;
                 } else {
                     self.paint_sidebar_icon(layers, icon, state_x, state_y, state_size, color)?;
@@ -612,20 +595,14 @@ impl TermWindow {
         else {
             return;
         };
-        if let Some(thread_id) =
-            crate::workspace_threads::thread_id_for_workspace_any(&workspace)
-        {
+        if let Some(thread_id) = crate::workspace_threads::thread_id_for_workspace_any(&workspace) {
             // Only a thread of this Space (or one it references) can be
             // activated here; activate_workspace_thread's guard silently
             // drops anything else, which used to make these clicks no-ops.
             let home_space = crate::workspace_threads::thread_space_id(&thread_id);
-            let in_this_space =
-                home_space.as_deref() == Some(self.active_space_id.as_str());
+            let in_this_space = home_space.as_deref() == Some(self.active_space_id.as_str());
             let referenced = !in_this_space
-                && crate::workspace_threads::thread_ref_exists(
-                    &self.active_space_id,
-                    &thread_id,
-                );
+                && crate::workspace_threads::thread_ref_exists(&self.active_space_id, &thread_id);
             if in_this_space || referenced {
                 self.activate_workspace_thread(thread_id, context);
                 return;
@@ -643,9 +620,7 @@ impl TermWindow {
                 crate::workspace_threads::window_owner_for_space(&home_space)
             {
                 let Some(target) = crate::frontend::front_end()
-                    .gui_window_for_recovery_slot(FrontendRecoverySlot::Window(
-                        target_owner_id,
-                    ))
+                    .gui_window_for_recovery_slot(FrontendRecoverySlot::Window(target_owner_id))
                 else {
                     return;
                 };
@@ -661,8 +636,7 @@ impl TermWindow {
                         {
                             return;
                         }
-                        target_term_window
-                            .activate_workspace_thread(thread_id, &target_window);
+                        target_term_window.activate_workspace_thread(thread_id, &target_window);
                         target_window.focus();
                     },
                 )));

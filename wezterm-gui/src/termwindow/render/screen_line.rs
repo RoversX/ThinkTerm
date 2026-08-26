@@ -875,9 +875,7 @@ impl crate::TermWindow {
 
             let style_params = last_style.as_ref().expect("we just set it up").clone();
 
-            let glyph_info = if params.simple_shaping
-                || cluster_is_tui_graphics(&cluster.text)
-            {
+            let glyph_info = if params.simple_shaping || cluster_is_tui_graphics(&cluster.text) {
                 self.cached_cluster_shape_by_cell(
                     style_params.style,
                     &cluster,
@@ -920,19 +918,21 @@ impl crate::TermWindow {
         let shaped = Rc::new(shaped);
 
         if let Some(shape_key) = params.shape_key {
-            self.line_to_ele_shape_cache.borrow_mut().put(
-                shape_key.clone(),
-                LineToElementShapeItem {
-                    expires,
-                    shaped: Rc::clone(&shaped),
-                    invalidate_on_hover_change,
-                    current_highlight: if invalidate_on_hover_change {
-                        self.current_highlight.clone()
-                    } else {
-                        None
-                    },
+            let item = LineToElementShapeItem {
+                expires,
+                shaped: Rc::clone(&shaped),
+                invalidate_on_hover_change,
+                current_highlight: if invalidate_on_hover_change {
+                    self.current_highlight.clone()
+                } else {
+                    None
                 },
-            );
+            };
+            let weight =
+                crate::termwindow::render::estimate_line_to_ele_entry_bytes(&shape_key, &item);
+            self.line_to_ele_shape_cache
+                .borrow_mut()
+                .put_weighted(shape_key.clone(), item, weight);
         }
 
         Ok((shaped, invalidate_on_hover_change))

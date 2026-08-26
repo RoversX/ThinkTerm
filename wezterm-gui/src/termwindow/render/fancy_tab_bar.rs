@@ -1353,7 +1353,11 @@ impl crate::TermWindow {
         let miss_stage = crate::input_diagnostics::StageTimer::begin(domain.miss_stage_name());
         let infos = match font.shape(
             text,
-            move |chars: &[char]| window.notify(TermWindowNotif::InvalidateShapeCacheForChars(chars.to_vec())),
+            move |chars: &[char]| {
+                window.notify(TermWindowNotif::InvalidateShapeCacheForChars(
+                    chars.to_vec(),
+                ))
+            },
             BlockKey::filter_out_synthetic,
             None,
             Direction::LeftToRight,

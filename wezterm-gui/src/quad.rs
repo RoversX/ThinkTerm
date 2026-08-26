@@ -768,6 +768,15 @@ impl HeapQuadAllocator {
         self.position_transform = None;
     }
 
+    /// Estimated resident heap bytes for the recorded quads. Counts vector
+    /// capacity, not length: a buffer that grew during recording keeps that
+    /// allocation until it is dropped, and capacity is what a byte-accounted
+    /// cache needs to know about.
+    pub fn resident_bytes(&self) -> usize {
+        (self.layer0.capacity() + self.layer1.capacity() + self.layer2.capacity())
+            .saturating_mul(std::mem::size_of::<BoxedQuad>())
+    }
+
     /// Where the next quad will land, for later use with [`Self::apply_before`],
     /// [`Self::apply_between`] and [`Self::apply_after`].
     pub fn mark(&self) -> HeapQuadMark {

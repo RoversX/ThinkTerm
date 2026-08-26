@@ -165,7 +165,10 @@ mod tests {
 
     #[test]
     fn braille_spinner_splits() {
-        assert_eq!(split_leading_legacy_progress_marker("⠋ build"), Some("build"));
+        assert_eq!(
+            split_leading_legacy_progress_marker("⠋ build"),
+            Some("build")
+        );
     }
 
     #[test]

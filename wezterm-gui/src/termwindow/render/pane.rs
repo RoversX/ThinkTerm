@@ -1646,10 +1646,14 @@ impl crate::TermWindow {
                         },
                     };
 
+                    let weight = crate::termwindow::render::estimate_line_quad_entry_bytes(
+                        &quad_key,
+                        &quad_value,
+                    );
                     self.term_window
                         .line_quad_cache
                         .borrow_mut()
-                        .put(quad_key, quad_value);
+                        .put_weighted(quad_key, quad_value, weight);
 
                     Ok(())
                 }

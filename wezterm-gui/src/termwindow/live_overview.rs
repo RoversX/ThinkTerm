@@ -369,7 +369,8 @@ impl LiveOverviewView {
             // Extremely narrow/tall terminals still need a useful overview;
             // within this safety range every card keeps the exact same host
             // aspect instead of inheriting a source mux tab's split geometry.
-            host_preview_aspect: host_preview_aspect.clamp(HOST_PREVIEW_ASPECT_MIN, HOST_PREVIEW_ASPECT_MAX),
+            host_preview_aspect: host_preview_aspect
+                .clamp(HOST_PREVIEW_ASPECT_MIN, HOST_PREVIEW_ASPECT_MAX),
             scroll: ScrollState::new(),
             revealed_active: false,
             last_ui_scale: 1.0,
@@ -754,12 +755,12 @@ impl LiveOverviewView {
                         gap,
                     );
                     seen_keys.insert(card.key.clone());
-                    let rect = self
-                        .settle_card_rect(&card.key, target, now)
-                        .translate(euclid::vec2(
-                            0.0,
-                            self.viewport.origin.y - self.scroll.offset,
-                        ));
+                    let rect =
+                        self.settle_card_rect(&card.key, target, now)
+                            .translate(euclid::vec2(
+                                0.0,
+                                self.viewport.origin.y - self.scroll.offset,
+                            ));
 
                     // Keep one complete row warm above and below the viewport
                     // so a scroll does not reveal an uncaptured thumbnail. All
@@ -881,8 +882,9 @@ impl LiveOverviewView {
                             // Only once the name of the thread has been given
                             // its space: which terminal this is comes first,
                             // what it is doing second.
-                            let title_width =
-                                ctx.measure_text_width(card_font, &card.title).min(text_limit);
+                            let title_width = ctx
+                                .measure_text_width(card_font, &card.title)
+                                .min(text_limit);
                             let running_x = text_x + title_width + ctx.px(RUNNING_LABEL_GAP);
                             let running_limit = text_x + text_limit - running_x;
                             if running_limit >= ctx.px(RUNNING_LABEL_MIN_WIDTH) {
@@ -1592,7 +1594,8 @@ impl ContentView for LiveOverviewView {
 
     fn set_host_preview_aspect(&mut self, aspect: f32) {
         if aspect.is_finite() && aspect > 0.0 {
-            self.host_preview_aspect = aspect.clamp(HOST_PREVIEW_ASPECT_MIN, HOST_PREVIEW_ASPECT_MAX);
+            self.host_preview_aspect =
+                aspect.clamp(HOST_PREVIEW_ASPECT_MIN, HOST_PREVIEW_ASPECT_MAX);
         }
     }
 
@@ -2590,7 +2593,8 @@ mod tests {
         let layouts = reveal_layout(2, 3, 300.0);
         let groups = vec![live_group_with_active(6, 5)];
         // Three rows of 300 separated by a 16 gap, below a 40px heading.
-        view.scroll.set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
+        view.scroll
+            .set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
 
         let offset = view
             .offset_revealing_active(&groups, &layouts, 0.0, 1000.0, 16.0)
@@ -2605,7 +2609,8 @@ mod tests {
         view.viewport = euclid::rect(0.0, 0.0, 1000.0, 400.0);
         let layouts = reveal_layout(1, 10, 100.0);
         let groups = vec![live_group_with_active(10, 4)];
-        view.scroll.set_extents(400.0, 40.0 + 10.0 * 100.0 + 9.0 * 16.0);
+        view.scroll
+            .set_extents(400.0, 40.0 + 10.0 * 100.0 + 9.0 * 16.0);
 
         let offset = view
             .offset_revealing_active(&groups, &layouts, 0.0, 1000.0, 16.0)
@@ -2621,7 +2626,8 @@ mod tests {
         view.viewport = euclid::rect(0.0, 0.0, 1000.0, 400.0);
         let layouts = reveal_layout(2, 3, 300.0);
         let groups = vec![live_group_with_active(6, 0)];
-        view.scroll.set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
+        view.scroll
+            .set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
 
         assert!(view
             .offset_revealing_active(&groups, &layouts, 0.0, 1000.0, 16.0)
@@ -2635,7 +2641,8 @@ mod tests {
         let layouts = reveal_layout(2, 3, 300.0);
         let mut groups = vec![live_group_with_active(6, 0)];
         groups[0].cards[0].active = false;
-        view.scroll.set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
+        view.scroll
+            .set_extents(400.0, 40.0 + 3.0 * 300.0 + 2.0 * 16.0);
 
         assert!(view
             .offset_revealing_active(&groups, &layouts, 0.0, 1000.0, 16.0)
@@ -2910,20 +2917,21 @@ mod tests {
         let now = Instant::now();
         let mut budget = usize::MAX;
         let mut captures = 0;
-        let mut capture = |cache: &mut HashMap<_, _>, at: Instant, seq: usize, budget: &mut usize| {
-            resolve_snapshot(
-                cache,
-                &key,
-                Some(test_fingerprint(seq)),
-                at,
-                Some(preview_refresh_interval()),
-                budget,
-                || {
-                    captures += 1;
-                    Some(seq as u8)
-                },
-            )
-        };
+        let mut capture =
+            |cache: &mut HashMap<_, _>, at: Instant, seq: usize, budget: &mut usize| {
+                resolve_snapshot(
+                    cache,
+                    &key,
+                    Some(test_fingerprint(seq)),
+                    at,
+                    Some(preview_refresh_interval()),
+                    budget,
+                    || {
+                        captures += 1;
+                        Some(seq as u8)
+                    },
+                )
+            };
 
         // A frame every 8ms for a second, with the content different every
         // time. What comes out is one capture per refresh interval, not the
@@ -2941,7 +2949,10 @@ mod tests {
         }
         let interval_ms = preview_refresh_interval().as_millis() as u64;
         assert_eq!(captures, 1 + (FRAMES * FRAME_MS / interval_ms) as usize);
-        assert!(captures < 12, "{captures} captures in a second is not a throttle");
+        assert!(
+            captures < 12,
+            "{captures} captures in a second is not a throttle"
+        );
     }
 
     /// Opening the overview used to capture every card in the frame that

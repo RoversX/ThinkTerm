@@ -304,13 +304,7 @@ impl SidebarSpaceSwipeState {
                     source_scroll_offset: gesture.source_scroll_offset,
                     // The pages are already where the finger left them, so
                     // there is nothing new to draw before travelling back.
-                    travel: Timeline::running(
-                        now,
-                        from,
-                        0.0,
-                        SETTLE_DURATION,
-                        Easing::OutCubic,
-                    ),
+                    travel: Timeline::running(now, from, 0.0, SETTLE_DURATION, Easing::OutCubic),
                     committed: false,
                 });
                 SidebarSpaceSwipeFinish::AnimateBack
