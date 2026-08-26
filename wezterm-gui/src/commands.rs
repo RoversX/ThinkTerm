@@ -1020,6 +1020,44 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_delete"),
         },
+        ArchiveProject(_) => CommandDef {
+            brief: "Archive Workspace".into(),
+            doc: "Closes the workspace's panes and hides it from the sidebar; \
+                  its threads and layouts are kept for unarchiving"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
+        UnarchiveProject(_) => CommandDef {
+            brief: "Unarchive Workspace".into(),
+            doc: "Restores an archived workspace to the sidebar".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
+        ArchiveActiveProject => CommandDef {
+            brief: "Archive Active Workspace".into(),
+            doc: "Closes the active workspace's panes and hides it from the \
+                  sidebar; its threads and layouts are kept for unarchiving"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
+        ToggleShowArchivedProjects => CommandDef {
+            brief: "Show Archived Workspaces".into(),
+            doc: "Reveals archived workspaces at the bottom of the sidebar \
+                  until toggled off or the window closes"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
         ConnectWorkspaceThread(_) => CommandDef {
             brief: "Connect Thread".into(),
             doc: "Connects or reconnects the ThinkTerm remote thread".into(),
@@ -2275,6 +2313,8 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         // ----------------- Shell
         ToggleLiveOverview,
         OpenSshHosts,
+        ArchiveActiveProject,
+        ToggleShowArchivedProjects,
         SpawnTab(SpawnTabDomain::CurrentPaneDomain),
         SpawnWindow,
         SplitVertical(SpawnCommand {

@@ -155,6 +155,22 @@ fn settings_window_pixel_size(
     (width, height)
 }
 
+/// "today" / "yesterday" / a local date, for the Archived list's second
+/// line. Recency is what the user reasons about there, so the two recent
+/// cases get words instead of a date they have to decode.
+fn format_archived_when(archived_at: i64) -> String {
+    let Some(when) = chrono::DateTime::from_timestamp(archived_at, 0) else {
+        return String::new();
+    };
+    let when = when.with_timezone(&chrono::Local).date_naive();
+    let today = chrono::Local::now().date_naive();
+    match (today - when).num_days() {
+        0 => crate::i18n::tr("settings-archived-when-today"),
+        1 => crate::i18n::tr("settings-archived-when-yesterday"),
+        _ => when.format("%Y-%m-%d").to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsSection {
     General,
@@ -162,6 +178,7 @@ enum SettingsSection {
     Terminal,
     Workspaces,
     Agents,
+    Archived,
     Keymap,
     Compatibility,
     Developer,
@@ -176,6 +193,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Terminal,
     SettingsSection::Workspaces,
     SettingsSection::Agents,
+    SettingsSection::Archived,
     SettingsSection::Keymap,
     SettingsSection::Compatibility,
     SettingsSection::Developer,
@@ -185,10 +203,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
 const DEVELOPER_SECTIONS: &[SettingsSection] = &[SettingsSection::UiKit, SettingsSection::Memory];
 
 /// The expandable per-agent explanation in the Integrations list.
-fn agent_detail_lines(
-    agent_id: &str,
-    kind: crate::agent_status::IntegrationKind,
-) -> Vec<String> {
+fn agent_detail_lines(agent_id: &str, kind: crate::agent_status::IntegrationKind) -> Vec<String> {
     use crate::agent_status::IntegrationKind;
     match kind {
         IntegrationKind::ScreenRules => vec![
@@ -206,9 +221,7 @@ fn agent_detail_lines(
             crate::i18n::tr("settings-agent-details-native"),
             crate::i18n::tr("settings-agent-details-native-doc"),
         ],
-        IntegrationKind::Pending => vec![
-            crate::i18n::tr("settings-agent-details-pending"),
-        ],
+        IntegrationKind::Pending => vec![crate::i18n::tr("settings-agent-details-pending")],
     }
 }
 
@@ -236,6 +249,7 @@ fn initial_section() -> SettingsSection {
         "terminal" => SettingsSection::Terminal,
         "workspaces" => SettingsSection::Workspaces,
         "agents" => SettingsSection::Agents,
+        "archived" => SettingsSection::Archived,
         "keymap" => SettingsSection::Keymap,
         "compatibility" => SettingsSection::Compatibility,
         "developer" => SettingsSection::Developer,
@@ -256,6 +270,7 @@ impl SettingsSection {
             Self::Terminal => crate::i18n::tr("settings-section-terminal"),
             Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
             Self::Agents => crate::i18n::tr("settings-section-agents"),
+            Self::Archived => crate::i18n::tr("settings-section-archived"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
             Self::Compatibility => crate::i18n::tr("settings-section-compatibility"),
             Self::Developer => crate::i18n::tr("settings-section-developer"),
@@ -272,6 +287,7 @@ impl SettingsSection {
             Self::Terminal => SettingsIcon::Terminal,
             Self::Workspaces => SettingsIcon::Workspaces,
             Self::Agents => SettingsIcon::Agents,
+            Self::Archived => SettingsIcon::Archived,
             Self::Keymap => SettingsIcon::Keymap,
             Self::Compatibility => SettingsIcon::Sync,
             Self::Developer => SettingsIcon::Developer,
@@ -349,6 +365,14 @@ impl SettingsSection {
                 "Copilot",
                 "Cursor",
                 "Detection Rules",
+            ],
+            Self::Archived => &[
+                "Archive",
+                "Archived",
+                "Unarchive",
+                "Restore",
+                "Hidden",
+                "Archived Workspaces",
             ],
             Self::Keymap => &["Keymap", "Keyboard", "Shortcut", "Command Palette"],
             Self::Compatibility => &[
@@ -487,6 +511,9 @@ enum SettingsAction {
     ToggleNotificationSounds,
     ToggleAgentPanel,
     ToggleAgentDetails(&'static str),
+    /// Index into the archived rows cached at paint time.
+    UnarchiveArchivedRow(usize),
+    DeleteArchivedRow(usize),
     ToggleDeveloperMode,
     ToggleFallbackContextMenu,
     ShowOnboardingNow,
@@ -962,6 +989,12 @@ struct SettingsUiState {
     memory_snapshot: Option<MemorySnapshot>,
     main_window_resource_lines: Vec<String>,
     memory_snapshot_copied_until: Option<Instant>,
+    /// The archived rows as last painted; row-action indices resolve here
+    /// so a click acts on exactly what the user saw.
+    archived_rows: Vec<crate::workspace_threads::ArchivedProjectRow>,
+    /// Two-step delete: the project id whose Delete button was clicked
+    /// once. A second click executes; any other action clears it.
+    confirm_delete_archived: Option<String>,
     input_diagnostics_copied_until: Option<Instant>,
     sidebar_scrollbar_visible_until: Option<Instant>,
     content_scrollbar_visible_until: Option<Instant>,
@@ -993,6 +1026,8 @@ impl SettingsUiState {
             memory_snapshot: None,
             main_window_resource_lines: Vec::new(),
             memory_snapshot_copied_until: None,
+            archived_rows: Vec::new(),
+            confirm_delete_archived: None,
             input_diagnostics_copied_until: None,
             sidebar_scrollbar_visible_until: None,
             content_scrollbar_visible_until: None,
@@ -3345,6 +3380,48 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::UnarchiveArchivedRow(index) => {
+                self.ui.open_dropdown = None;
+                self.ui.confirm_delete_archived = None;
+                if let Some(row) = self.ui.archived_rows.get(index).cloned() {
+                    if crate::workspace_threads::unarchive_project(&row.id) {
+                        let mut args = FluentArgs::new();
+                        args.set("name", row.name.clone());
+                        self.status = crate::i18n::tr_args("settings-archived-unarchived", &args);
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.invalidate_all_windows();
+                        }
+                    } else {
+                        // The only refusal for a row that still exists is a
+                        // detached remote domain.
+                        self.status = crate::i18n::tr("settings-archived-remote-offline");
+                    }
+                }
+                window.invalidate();
+            }
+            SettingsAction::DeleteArchivedRow(index) => {
+                self.ui.open_dropdown = None;
+                if let Some(row) = self.ui.archived_rows.get(index).cloned() {
+                    if self.ui.confirm_delete_archived.as_deref() == Some(&row.id) {
+                        self.ui.confirm_delete_archived = None;
+                        if crate::workspace_threads::remove_project(&row.id).is_some() {
+                            let mut args = FluentArgs::new();
+                            args.set("name", row.name.clone());
+                            self.status = crate::i18n::tr_args("settings-archived-deleted", &args);
+                            if let Some(front_end) = crate::frontend::try_front_end() {
+                                front_end.invalidate_all_windows();
+                            }
+                        } else {
+                            self.status = crate::i18n::tr("settings-archived-remote-offline");
+                        }
+                    } else {
+                        // First click arms; the second one, on the relabeled
+                        // button, deletes for good.
+                        self.ui.confirm_delete_archived = Some(row.id.clone());
+                    }
+                }
+                window.invalidate();
+            }
             SettingsAction::ToggleAgentPanel => {
                 self.ui.open_dropdown = None;
                 self.native_settings.chrome.agent_panel_enabled =
@@ -4244,6 +4321,7 @@ impl SettingsWindow {
             SettingsSection::Terminal => self.paint_terminal(layers, x, max_width)?,
             SettingsSection::Workspaces => self.paint_workspaces(layers, x, max_width)?,
             SettingsSection::Agents => self.paint_agents(layers, x, max_width)?,
+            SettingsSection::Archived => self.paint_archived(layers, x, max_width)?,
             SettingsSection::Keymap => self.paint_placeholder(
                 layers,
                 &ui_font,
@@ -4522,6 +4600,200 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn paint_archived(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+
+        // Snapshot the rows once per paint; the row-action indices the
+        // buttons register resolve against exactly this list.
+        let rows = crate::workspace_threads::archived_projects_overview();
+        if self
+            .ui
+            .confirm_delete_archived
+            .as_ref()
+            .is_some_and(|id| !rows.iter().any(|row| &row.id == id))
+        {
+            self.ui.confirm_delete_archived = None;
+        }
+        self.ui.archived_rows = rows.clone();
+
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-archived-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+
+        let row_count = rows.len().max(1);
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
+        let card_height = self.settings_card_height(row_count);
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(card_y + scroll + card_height),
+        );
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+
+        let padding = 36.0;
+        let row_x = x + padding;
+        let row_width = max_width - padding * 2.0;
+        let row_step = self.settings_row_step();
+
+        if rows.is_empty() {
+            let tile = self.settings_row_description_y(first_row_y) - first_row_y
+                + self.metrics.cell_size.height as f32;
+            let icon_gap = self.ui_px(12.0);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                row_x,
+                first_row_y,
+                tile,
+                tile,
+                palette.control_bg,
+                palette.rule,
+                self.ui_px(8.0),
+            )?;
+            let mark = tile * 0.62;
+            self.draw_svg_icon(
+                layers,
+                SvgIcon::Archive,
+                row_x + (tile - mark) / 2.0,
+                first_row_y + (tile - mark) / 2.0,
+                mark,
+                palette.muted_text,
+            )?;
+            self.draw_text(
+                layers,
+                &ui_font,
+                row_x + tile + icon_gap,
+                first_row_y,
+                &crate::i18n::tr("settings-archived-empty"),
+                palette.muted_text,
+                row_width - tile - icon_gap,
+            )?;
+            return Ok(());
+        }
+
+        let delete_label = crate::i18n::tr("settings-archived-delete");
+        let confirm_label = crate::i18n::tr("settings-archived-delete-confirm");
+        let unarchive_label = crate::i18n::tr("settings-archived-unarchive");
+        // Wider than the usual control gap: these two do opposite things,
+        // and the destructive one must not read as adjacent-by-accident.
+        let button_gap = self.ui_px(18.0);
+        let unarchive_width = self.button_width_for_label(&unarchive_label, 0.0);
+
+        for (index, row) in rows.iter().enumerate() {
+            let y = first_row_y + row_step * index as f32;
+            // Same two-line shape as every other settings row: name on top,
+            // muted provenance underneath, controls right-aligned.
+            if index > 0 {
+                self.paint_separator(layers, row_x, y - self.ui_px(28.0), row_width)?;
+            }
+            // Each button is only as wide as the words it is showing --
+            // reserving room for the confirm label would leave "Delete"
+            // rattling around in an oversized frame. The group is anchored
+            // by its right edge, so arming grows the button leftward and
+            // that movement is itself the state feedback.
+            let delete_is_armed = self.ui.confirm_delete_archived.as_deref() == Some(&row.id);
+            let delete_label = if delete_is_armed {
+                &confirm_label
+            } else {
+                &delete_label
+            };
+            let delete_width = self.button_width_for_label(delete_label, 0.0);
+            let controls_x = row_x + row_width - (unarchive_width + button_gap + delete_width);
+            // Same leading-mark treatment as the Integrations rows: a
+            // rounded tile spanning the two-line block with the glyph
+            // centered at 62%. A bare icon sized to one text line reads as
+            // a speck beside a row this tall.
+            let tile =
+                self.settings_row_description_y(y) - y + self.metrics.cell_size.height as f32;
+            let icon_gap = self.ui_px(12.0);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                row_x,
+                y,
+                tile,
+                tile,
+                palette.control_bg,
+                palette.rule,
+                self.ui_px(8.0),
+            )?;
+            let mark = tile * 0.62;
+            self.draw_svg_icon(
+                layers,
+                if row.is_remote {
+                    SvgIcon::Server
+                } else {
+                    SvgIcon::Archive
+                },
+                row_x + (tile - mark) / 2.0,
+                y + (tile - mark) / 2.0,
+                mark,
+                palette.text,
+            )?;
+            let text_x = row_x + tile + icon_gap;
+            let text_width = (controls_x - text_x - self.ui_px(24.0)).max(row_width * 0.3);
+
+            self.draw_text(
+                layers,
+                &ui_font,
+                text_x,
+                y,
+                &row.name,
+                palette.text,
+                text_width,
+            )?;
+
+            let mut meta_args = FluentArgs::new();
+            meta_args.set("space", row.space_name.clone());
+            meta_args.set("threads", row.thread_count as i64);
+            meta_args.set("when", format_archived_when(row.archived_at));
+            self.draw_text(
+                layers,
+                &ui_font,
+                text_x,
+                self.settings_row_description_y(y),
+                &crate::i18n::tr_args("settings-archived-meta", &meta_args),
+                palette.secondary_text,
+                text_width,
+            )?;
+
+            // Centered on the two-line block, not top-aligned to the first
+            // line: the tile defines the row's visual height here, and a
+            // top-biased control reads as misaligned against it.
+            let control_y = y + (tile - self.ui_px(CONTROL_HEIGHT)) / 2.0;
+            self.draw_button(
+                layers,
+                controls_x,
+                control_y,
+                unarchive_width,
+                &unarchive_label,
+                SettingsAction::UnarchiveArchivedRow(index),
+            )?;
+            self.draw_button(
+                layers,
+                controls_x + unarchive_width + button_gap,
+                control_y,
+                delete_width,
+                delete_label,
+                SettingsAction::DeleteArchivedRow(index),
+            )?;
+        }
+        Ok(())
+    }
+
     fn paint_workspaces(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -4701,8 +4973,7 @@ impl SettingsWindow {
             })
             .unwrap_or(0.0);
         let integrations_title_y = card_y + card_height + self.settings_section_card_gap();
-        let integrations_card_y =
-            integrations_title_y + self.settings_section_card_gap().min(54.0);
+        let integrations_card_y = integrations_title_y + self.settings_section_card_gap().min(54.0);
         let integrations_first_row_y = integrations_card_y + self.settings_card_top_padding();
         let mut integrations_card_height =
             self.settings_card_height(integrations_row_count) + expanded_extra;
@@ -4778,18 +5049,11 @@ impl SettingsWindow {
         for (agent_id, _names, kind) in crate::agent_status::SUPPORTED_AGENTS {
             let expanded = self.agents_expanded == Some(*agent_id);
             let arrow = if expanded { "\u{25be}" } else { "\u{25b8}" };
-            let label = format!(
-                "{arrow}  {}",
-                crate::agent_status::display_name(agent_id)
-            );
+            let label = format!("{arrow}  {}", crate::agent_status::display_name(agent_id));
             let on_path = crate::agent_status::agent_on_path(agent_id);
             let description = match kind {
-                IntegrationKind::Native => {
-                    crate::i18n::tr("settings-integration-native")
-                }
-                IntegrationKind::Pending => {
-                    crate::i18n::tr("settings-integration-pending")
-                }
+                IntegrationKind::Native => crate::i18n::tr("settings-integration-native"),
+                IntegrationKind::Pending => crate::i18n::tr("settings-integration-pending"),
                 IntegrationKind::ScreenRules if on_path => {
                     crate::i18n::tr("settings-integration-screen-active")
                 }
@@ -4801,12 +5065,7 @@ impl SettingsWindow {
             // the detail block, so the rule would cut across its card; the
             // frame itself already separates.
             if draw_top_rule && !prev_expanded {
-                self.paint_separator(
-                    layers,
-                    row_x,
-                    row_y - self.ui_px(28.0),
-                    row_width,
-                )?;
+                self.paint_separator(layers, row_x, row_y - self.ui_px(28.0), row_width)?;
             }
             // The brand mark leads the row; agents without a logo (and the
             // expand arrow) still line up because the text column starts
@@ -4847,14 +5106,9 @@ impl SettingsWindow {
                 Some(crate::agent_status::AgentIcon::Mono(icon)) => {
                     self.draw_svg_icon(layers, icon, mark_x, mark_y, mark, palette.text)?
                 }
-                None => self.draw_svg_icon(
-                    layers,
-                    SvgIcon::Bot,
-                    mark_x,
-                    mark_y,
-                    mark,
-                    palette.text,
-                )?,
+                None => {
+                    self.draw_svg_icon(layers, SvgIcon::Bot, mark_x, mark_y, mark, palette.text)?
+                }
             }
             self.draw_text(
                 layers,
@@ -4875,12 +5129,7 @@ impl SettingsWindow {
                 text_width,
             )?;
             self.ui_context.push(
-                rect(
-                    row_x,
-                    row_y - self.ui_px(6.0),
-                    row_width,
-                    self.ui_px(56.0),
-                ),
+                rect(row_x, row_y - self.ui_px(6.0), row_width, self.ui_px(56.0)),
                 crate::ui::WidgetKind::Button,
                 SettingsAction::ToggleAgentDetails(agent_id),
             );
@@ -7890,14 +8139,21 @@ impl SettingsWindow {
             border,
             self.ui_px(CONTROL_RADIUS),
         )?;
+        // Center the label in the frame. A fixed left inset left every
+        // button's text biased toward the left edge -- button_width_for_label
+        // adds 44px of padding, so a 14px inset left 30px on the right --
+        // which is most visible on short labels in a wide frame.
+        let font = Rc::clone(&self.ui_font);
+        let label_width = self.measure_text_width(&font, button.label);
+        let text_x = x + ((width - label_width) / 2.0).max(self.ui_px(12.0));
         self.draw_text(
             layers,
-            &Rc::clone(&self.ui_font),
-            x + self.ui_px(14.0),
+            &font,
+            text_x,
             self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             button.label,
             palette.text,
-            width - self.ui_px(36.0),
+            (x + width - self.ui_px(12.0) - text_x).max(0.0),
         )?;
         Ok(())
     }
@@ -8343,12 +8599,7 @@ impl SettingsWindow {
 
     /// Greedy word wrap against the shaped width; falls back to char-level
     /// breaking for unspaced (CJK) text or overlong tokens.
-    fn wrap_settings_text(
-        &self,
-        font: &Rc<LoadedFont>,
-        text: &str,
-        max_width: f32,
-    ) -> Vec<String> {
+    fn wrap_settings_text(&self, font: &Rc<LoadedFont>, text: &str, max_width: f32) -> Vec<String> {
         let mut lines = Vec::new();
         let mut current = String::new();
         let push_wrapped_word = |word: &str, current: &mut String, lines: &mut Vec<String>| {

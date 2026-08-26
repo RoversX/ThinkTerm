@@ -446,6 +446,8 @@ pub(crate) enum ContextMenuApplicationAction {
     },
     /// Sidebar view-options: show/hide threads with this work status.
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
+    /// Sidebar view-options: transiently reveal archived projects.
+    ToggleWorkspaceShowArchived,
     /// Add a thread reference to a Space (local, non-home, not already
     /// holding it — the menu only offers eligible targets).
     AddThreadToCollection {
@@ -549,6 +551,10 @@ pub enum UIItemType {
     /// the current Space. Payload is the group key (origin project id).
     ThreadRefGroupNewThread(String),
     Project(String),
+    /// A revealed archived project row: inert except for its context menu,
+    /// so it stays invisible to the drag, rename and reorder paths that
+    /// match on `Project`.
+    ArchivedProject(String),
     WorkspaceThread(String),
     WorkspaceThreadPin(String),
     WorkspaceThreadDelete(String),
@@ -1940,6 +1946,10 @@ pub struct TermWindow {
     /// collapse state resets
     /// with the window, like a disclosure and unlike project collapse.
     thread_ref_groups_collapsed: std::collections::HashSet<String>,
+    /// Transient reveal of archived projects in the sidebar. Deliberately
+    /// NOT persisted: "archived" means hidden, and a setting left on would
+    /// quietly un-implement the feature. Resets with the window.
+    pub(crate) workspace_sidebar_show_archived: bool,
     /// A native (AppKit) context menu is open. The fallback menu tracks
     /// itself in `context_menu`; the native path otherwise leaves no trace,
     /// and the hover machine must not retreat the panel a menu is anchored
@@ -2907,6 +2917,7 @@ impl TermWindow {
             workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
             titlebar_sidebar_button_hovered: false,
             thread_ref_groups_collapsed: std::collections::HashSet::new(),
+            workspace_sidebar_show_archived: false,
             native_context_menu_open: false,
             workspace_notification_snapshot: None,
             workspace_notification_pulse_started_at: None,
@@ -4514,6 +4525,112 @@ impl TermWindow {
         removal: crate::workspace_threads::SpaceRemoval,
     ) {
         self.start_delete_space(space_id, removal, false);
+    }
+
+    /// Archive a project off the sidebar: snapshot the on-screen layout,
+    /// close the project's panes (remote ones die on the server first), and
+    /// land the window on the next live project. Async because the remote
+    /// path must await pane kills and the server's verdict.
+    pub(crate) fn start_archive_project(&mut self, project_id: &str) {
+        // The workspace currently on screen deserves a fresh snapshot so
+        // unarchiving restores what the user last saw, not an older save.
+        self.snapshot_active_workspace_thread_layout();
+        let project_id = project_id.to_string();
+        let gui_window = self.window.clone();
+        promise::spawn::spawn_into_main_thread(async move {
+            let result = crate::workspace_threads::archive_project(&project_id).await;
+            if let Some(gui_window) = gui_window {
+                gui_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.finish_archive_project(result);
+                })));
+            }
+        })
+        .detach();
+    }
+
+    fn finish_archive_project(
+        &mut self,
+        result: Result<
+            crate::workspace_threads::ArchivedProject,
+            crate::workspace_threads::ArchiveProjectError,
+        >,
+    ) {
+        let window = self.window.clone();
+        match result {
+            Ok(archived) => {
+                let cleanup_workspaces = archived.materialized_workspace_names;
+                if archived.was_active {
+                    if let (Some(next_thread_id), Some(window)) =
+                        (archived.next_thread_id.clone(), window.as_ref())
+                    {
+                        // The successor may still need materializing, in
+                        // which case adoption is deferred -- killing the
+                        // workspaces synchronously here would take down this
+                        // window's own mux window. Route the cleanup through
+                        // the activation, like finish_removed_project does.
+                        self.activate_workspace_thread_with_cleanup(
+                            next_thread_id,
+                            window,
+                            cleanup_workspaces,
+                        );
+                        return;
+                    }
+                }
+                // Local mirrors of the archived workspaces; remote panes are
+                // already gone by the time the store call returns, so any
+                // mirror still present must not send a duplicate KillPane
+                // while its window is torn down.
+                let mux = Mux::get();
+                for workspace in cleanup_workspaces {
+                    for window_id in mux.iter_windows_in_workspace(&workspace) {
+                        let panes = mux
+                            .get_window(window_id)
+                            .map(|window| {
+                                window
+                                    .iter()
+                                    .flat_map(|tab| tab.iter_all_panes())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        for pane in panes {
+                            if let Some(client) =
+                                pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                            {
+                                client.ignore_next_kill();
+                            }
+                        }
+                        mux.kill_window(window_id);
+                    }
+                }
+            }
+            Err(err) => {
+                let text = match err {
+                    crate::workspace_threads::ArchiveProjectError::LastLiveProject => {
+                        crate::i18n::tr("archive-project-last-live-project")
+                    }
+                    crate::workspace_threads::ArchiveProjectError::ServerRejected => {
+                        crate::i18n::tr("archive-project-server-rejected")
+                    }
+                    crate::workspace_threads::ArchiveProjectError::TeardownIncomplete => {
+                        crate::i18n::tr("archive-project-teardown-incomplete")
+                    }
+                    // RemoteUnavailable already raised its own toast via
+                    // notify_remote_tree_mutation_unavailable; the rest are
+                    // benign races (row already gone / already archived).
+                    _ => {
+                        if let Some(window) = window.as_ref() {
+                            window.invalidate();
+                        }
+                        return;
+                    }
+                };
+                log::error!("archive project failed: {text}");
+                wezterm_toast_notification::persistent_toast_notification("ThinkTerm", &text);
+            }
+        }
+        if let Some(window) = window.as_ref() {
+            window.invalidate();
+        }
     }
 
     pub(crate) fn start_delete_space(
@@ -7274,6 +7391,28 @@ impl TermWindow {
                     if let Some(window) = window.as_ref() {
                         window.invalidate();
                     }
+                }
+            }
+            ArchiveProject(project_id) => {
+                self.start_archive_project(project_id);
+            }
+            UnarchiveProject(project_id) => {
+                crate::workspace_threads::unarchive_project(project_id);
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            ArchiveActiveProject => {
+                if let Some(project_id) = crate::workspace_threads::active_project_id_for_space(
+                    self.workspace_sidebar_space_id(),
+                ) {
+                    self.start_archive_project(&project_id);
+                }
+            }
+            ToggleShowArchivedProjects => {
+                self.workspace_sidebar_show_archived = !self.workspace_sidebar_show_archived;
+                if let Some(window) = window.as_ref() {
+                    window.invalidate();
                 }
             }
             ConnectWorkspaceThread(thread_id) => {

@@ -554,6 +554,15 @@ pub enum KeyAssignment {
     CreateWorkspaceThread(String),
     ToggleWorkspaceThreadsCollapsed(String),
     RemoveProject(String),
+    /// Archive a project: close its panes, keep its rows and layouts, hide
+    /// it from the sidebar until unarchived.
+    ArchiveProject(String),
+    UnarchiveProject(String),
+    /// Palette entries cannot carry a project id; this archives the active
+    /// Space's active project.
+    ArchiveActiveProject,
+    /// Transiently reveal archived projects at the tail of the sidebar.
+    ToggleShowArchivedProjects,
     ConnectWorkspaceThread(String),
     DisconnectWorkspaceThread(String),
     ToggleWorkspaceThreadPinned(String),

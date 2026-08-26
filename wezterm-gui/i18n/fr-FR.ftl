@@ -29,6 +29,21 @@ settings-section-general = Général
 settings-section-appearance = Apparence
 settings-section-terminal = Terminal
 settings-section-workspaces = Espaces de travail
+settings-section-archived = Archivés
+settings-archived-heading = Masqués de la barre latérale
+settings-archived-empty = Rien d'archivé. Clic droit sur un projet dans la barre latérale puis « Archiver le projet… ».
+settings-archived-meta = { $space } · { $threads ->
+        [one] 1 session
+       *[other] { $threads } sessions
+    } · archivé { $when }
+settings-archived-when-today = aujourd'hui
+settings-archived-when-yesterday = hier
+settings-archived-unarchive = Désarchiver
+settings-archived-delete = Supprimer
+settings-archived-delete-confirm = Confirmer
+settings-archived-unarchived = « { $name } » restauré dans la barre latérale
+settings-archived-deleted = « { $name } » supprimé définitivement
+settings-archived-remote-offline = Ce projet vit sur un serveur déconnecté ; reconnectez-vous d'abord
 settings-section-keymap = Raccourcis clavier
 settings-section-compatibility = Importer depuis WezTerm
 settings-section-developer = Développeur
@@ -196,6 +211,25 @@ menu-rename-project = Renommer le projet…
 menu-new-thread = Nouvelle session
 menu-toggle-threads = Réduire / développer les sessions
 menu-remove-project = Supprimer le projet
+menu-archive-project = Archiver le projet…
+menu-archive-project-quiet = Archiver le projet
+menu-archive-project-explain = Ferme { $panes ->
+        [one] 1 panneau actif
+       *[other] { $panes } panneaux actifs
+    } ; les dispositions sont conservées
+menu-archive-project-confirm = Archiver et fermer les panneaux
+menu-unarchive-project = Désarchiver le projet
+menu-delete-project-permanently = Supprimer définitivement…
+menu-delete-project-permanently-explain = Supprime { $threads ->
+        [one] 1 session
+       *[other] { $threads } sessions
+    } définitivement ; action irréversible
+menu-delete-project-permanently-confirm = Supprimer le projet et ses sessions
+menu-show-archived = Archivés
+menu-show-archived-count = Archivés ({ $count })
+archive-project-last-live-project = L'espace doit garder au moins un projet actif ; désarchivez ou ajoutez-en un d'abord
+archive-project-server-rejected = Le serveur a refusé l'archivage de ce projet
+archive-project-teardown-incomplete = Archivé, mais certaines sessions distantes n'ont pas pu être fermées. Reconnectez-vous, puis désarchivez et archivez de nouveau pour terminer le nettoyage
 menu-space-occupied = { $name } (occupé)
 menu-space-remote = { $name } (distant)
 menu-new-space = Nouvel espace

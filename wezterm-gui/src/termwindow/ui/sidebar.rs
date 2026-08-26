@@ -869,6 +869,7 @@ impl crate::TermWindow {
                 self.workspace_sidebar_space_id(),
                 &active_workspace,
                 &workspaces,
+                self.workspace_sidebar_show_archived,
             ));
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
@@ -929,6 +930,7 @@ impl crate::TermWindow {
                 self.workspace_sidebar_space_id(),
                 &active_workspace,
                 &workspaces,
+                self.workspace_sidebar_show_archived,
             ));
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
@@ -1165,6 +1167,7 @@ impl crate::TermWindow {
                 self.workspace_sidebar_space_id(),
                 &active_workspace,
                 &workspaces,
+                self.workspace_sidebar_show_archived,
             ));
         // A ref row is showing its workspace: the Space's own rows must not
         // paint a second active highlight from their stale pointer.
@@ -1926,6 +1929,45 @@ impl crate::TermWindow {
                     .saturating_add(item_width)
                     .saturating_sub(project_action_size + self.ui_px(SIDEBAR_INSET));
                 let project_text_right = project_action_x;
+
+                if project.is_archived {
+                    // A revealed archived row: dimmed, inert, no chevron and
+                    // no "+" button. Its own UIItemType keeps it invisible
+                    // to drag targeting, inline rename and folder reorder.
+                    if row_is_visible {
+                        self.ui_items.push(UIItem {
+                            x: item_x,
+                            y: hit_y,
+                            width: item_width,
+                            height: hit_height,
+                            item_type: UIItemType::ArchivedProject(project.id.clone()),
+                        });
+                        let icon_y = y + ((session_row_height.saturating_sub(icon_size)) / 2);
+                        let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
+                        self.paint_sidebar_icon(
+                            layers,
+                            SvgIcon::Archive,
+                            project_icon_x,
+                            icon_y,
+                            icon_size,
+                            muted_fg,
+                        )?;
+                        let project_title = self.sidebar_project_title(&project.id, &project.name);
+                        self.paint_sidebar_text(
+                            layers,
+                            &ui_font,
+                            ui_metrics,
+                            &project_title,
+                            project_text_x,
+                            text_y,
+                            project_text_right
+                                .saturating_sub(project_text_x + self.ui_px(SIDEBAR_INSET)),
+                            muted_fg,
+                        )?;
+                    }
+                    virtual_y += session_row_height + row_gap;
+                    continue;
+                }
 
                 if row_is_visible {
                     self.ui_items.push(UIItem {

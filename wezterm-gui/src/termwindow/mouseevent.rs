@@ -1400,6 +1400,7 @@ impl super::TermWindow {
             | UIItemType::ThreadRefGroupToggle { .. }
             | UIItemType::ThreadRefGroupNewThread(_)
             | UIItemType::Project(_)
+            | UIItemType::ArchivedProject(_)
             | UIItemType::WorkspaceThread(_)
             | UIItemType::WorkspaceThreadPin(_)
             | UIItemType::WorkspaceThreadDelete(_)
@@ -1513,6 +1514,7 @@ impl super::TermWindow {
             | UIItemType::ThreadRefGroupToggle { .. }
             | UIItemType::ThreadRefGroupNewThread(_)
             | UIItemType::Project(_)
+            | UIItemType::ArchivedProject(_)
             | UIItemType::WorkspaceThread(_)
             | UIItemType::WorkspaceThreadPin(_)
             | UIItemType::WorkspaceThreadDelete(_)
@@ -3487,6 +3489,10 @@ impl super::TermWindow {
                 let project_id = project_id.clone();
                 self.mouse_event_project(item, project_id, event, context);
             }
+            UIItemType::ArchivedProject(ref project_id) => {
+                let project_id = project_id.clone();
+                self.mouse_event_archived_project(project_id, event, context);
+            }
             UIItemType::WorkspaceThread(ref thread_id) => {
                 let thread_id = thread_id.clone();
                 self.mouse_event_workspace_thread(item, thread_id, event, context);
@@ -4009,6 +4015,10 @@ impl super::TermWindow {
             UIItemType::Project(ref project_id) => {
                 let project_id = project_id.clone();
                 self.mouse_event_project(item, project_id, event, context);
+            }
+            UIItemType::ArchivedProject(ref project_id) => {
+                let project_id = project_id.clone();
+                self.mouse_event_archived_project(project_id, event, context);
             }
             UIItemType::WorkspaceThread(ref thread_id) => {
                 let thread_id = thread_id.clone();
@@ -4871,6 +4881,21 @@ impl super::TermWindow {
         }
     }
 
+    /// A revealed archived row is inert on purpose: the only ways out are
+    /// the explicit menu items, so a stray click cannot half-restore it.
+    pub fn mouse_event_archived_project(
+        &mut self,
+        project_id: String,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Arrow));
+        if let WMEK::Press(MousePress::Right) = event.kind {
+            let items = self.archived_project_context_menu_items(&project_id);
+            self.show_term_context_menu(context, event.coords, items);
+        }
+    }
+
     pub fn mouse_event_project(
         &mut self,
         item: UIItem,
@@ -5162,10 +5187,87 @@ impl super::TermWindow {
                 KeyAssignment::ToggleWorkspaceThreadsCollapsed(project_id.clone()),
             ),
             ContextMenuItem::Separator,
+            {
+                // The only unrecoverable part of archiving is killing live
+                // panes, so the second-gesture gate (the submenu standing in
+                // for a confirm dialog, like Space delete's) appears only
+                // when panes would actually die. A quiet project archives in
+                // one click -- unarchiving is lossless.
+                let mux = Mux::get();
+                let live_panes: usize =
+                    crate::workspace_threads::materialized_workspace_names_for_project(&project_id)
+                        .iter()
+                        .flat_map(|workspace| mux.iter_windows_in_workspace(workspace))
+                        .filter_map(|window_id| mux.get_window(window_id))
+                        .flat_map(|window| {
+                            window
+                                .iter()
+                                .map(|tab| tab.iter_all_panes().len())
+                                .collect::<Vec<_>>()
+                        })
+                        .sum();
+                if live_panes == 0 {
+                    ContextMenuItem::item_with_icon(
+                        crate::i18n::tr("menu-archive-project-quiet"),
+                        ContextMenuIcon::Archive,
+                        KeyAssignment::ArchiveProject(project_id.clone()),
+                    )
+                } else {
+                    ContextMenuItem::submenu_with_icon(
+                        crate::i18n::tr("menu-archive-project"),
+                        ContextMenuIcon::Archive,
+                        vec![
+                            ContextMenuItem::section_header({
+                                let mut args = FluentArgs::new();
+                                args.set("panes", live_panes as i64);
+                                crate::i18n::tr_args("menu-archive-project-explain", &args)
+                            }),
+                            ContextMenuItem::item_with_icon(
+                                crate::i18n::tr("menu-archive-project-confirm"),
+                                ContextMenuIcon::Archive,
+                                KeyAssignment::ArchiveProject(project_id.clone()),
+                            ),
+                        ],
+                    )
+                }
+            },
             ContextMenuItem::item_with_icon(
                 crate::i18n::tr("menu-remove-project"),
                 ContextMenuIcon::FolderRemove,
                 KeyAssignment::RemoveProject(project_id),
+            ),
+        ]
+    }
+
+    /// The menu for a revealed archived row: restore it, or delete it for
+    /// good through the same second-gesture gate the live menu uses.
+    fn archived_project_context_menu_items(&self, project_id: &str) -> Vec<ContextMenuItem> {
+        let project_id = project_id.to_string();
+        vec![
+            ContextMenuItem::item_with_icon(
+                crate::i18n::tr("menu-unarchive-project"),
+                ContextMenuIcon::ArchiveRestore,
+                KeyAssignment::UnarchiveProject(project_id.clone()),
+            ),
+            ContextMenuItem::Separator,
+            ContextMenuItem::submenu_with_icon(
+                crate::i18n::tr("menu-delete-project-permanently"),
+                ContextMenuIcon::Delete,
+                vec![
+                    ContextMenuItem::section_header({
+                        let mut args = FluentArgs::new();
+                        args.set(
+                            "threads",
+                            crate::workspace_threads::ordered_thread_ids(&project_id).len() as i64,
+                        );
+                        crate::i18n::tr_args("menu-delete-project-permanently-explain", &args)
+                    }),
+                    ContextMenuItem::item_with_icon(
+                        crate::i18n::tr("menu-delete-project-permanently-confirm"),
+                        ContextMenuIcon::Delete,
+                        KeyAssignment::RemoveProject(project_id),
+                    ),
+                ],
             ),
         ]
     }
@@ -5391,6 +5493,28 @@ impl super::TermWindow {
                 ContextMenuIcon::Check,
                 status_items,
             ),
+            {
+                let archived_count = crate::workspace_threads::archived_project_count(
+                    self.workspace_sidebar_space_id(),
+                );
+                let label = if archived_count > 0 {
+                    let mut args = FluentArgs::new();
+                    args.set("count", archived_count as i64);
+                    crate::i18n::tr_args("menu-show-archived-count", &args)
+                } else {
+                    crate::i18n::tr("menu-show-archived")
+                };
+                // Disabled at zero -- an inert toggle would look broken --
+                // but never while the reveal is on, or the flag could latch
+                // with no way to untoggle it.
+                self.context_menu_application_item_with_icon(
+                    label,
+                    ContextMenuIcon::Archive,
+                    crate::termwindow::ContextMenuApplicationAction::ToggleWorkspaceShowArchived,
+                    archived_count > 0 || self.workspace_sidebar_show_archived,
+                )
+                .checked(self.workspace_sidebar_show_archived)
+            },
         ]
     }
 
@@ -5732,7 +5856,7 @@ impl super::TermWindow {
         self.activate_workspace_thread_impl(thread_id, context, None, Vec::new());
     }
 
-    fn activate_workspace_thread_with_cleanup(
+    pub(crate) fn activate_workspace_thread_with_cleanup(
         &mut self,
         thread_id: String,
         context: &dyn WindowOps,
@@ -6130,10 +6254,7 @@ impl super::TermWindow {
         if via_thread_ref {
             // Remember the choice so switching back to this Space restores
             // the reference, like a normal Space restores its active thread.
-            crate::workspace_threads::note_thread_active_ref(
-                &self.active_space_id,
-                &thread_id,
-            );
+            crate::workspace_threads::note_thread_active_ref(&self.active_space_id, &thread_id);
         } else {
             // Activating one of the Space's own threads means the next
             // switch back should follow the normal pointers, not jump to a

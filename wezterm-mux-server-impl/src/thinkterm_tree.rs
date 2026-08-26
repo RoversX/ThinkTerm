@@ -128,11 +128,15 @@ fn ensure_landing_in_tree(
     preferred_thread_id: Option<&str>,
 ) -> (LandingRecord, bool) {
     let mut changed = false;
+    // Archived projects never serve as a landing target: a fresh attach
+    // must not silently resurrect a project the user put away. When every
+    // project is archived the None branch below mints a live Home instead.
     let selected = preferred_thread_id
         .and_then(|preferred| {
             tree.projects
                 .iter()
                 .enumerate()
+                .filter(|(_, project)| project.archived_at.is_none())
                 .find_map(|(project_index, project)| {
                     project
                         .threads
@@ -145,6 +149,7 @@ fn ensure_landing_in_tree(
             tree.projects
                 .iter()
                 .enumerate()
+                .filter(|(_, project)| project.archived_at.is_none())
                 .find_map(|(project_index, project)| {
                     (!project.threads.is_empty()).then_some((project_index, 0))
                 })
@@ -160,10 +165,10 @@ fn ensure_landing_in_tree(
                 });
             }
 
-            let project_index = tree
-                .projects
-                .iter()
-                .position(|project| tree.spaces.iter().any(|space| space.id == project.space_id));
+            let project_index = tree.projects.iter().position(|project| {
+                project.archived_at.is_none()
+                    && tree.spaces.iter().any(|space| space.id == project.space_id)
+            });
             let project_index = match project_index {
                 Some(index) => index,
                 None => {
@@ -174,6 +179,7 @@ fn ensure_landing_in_tree(
                         name: "Home".to_string(),
                         path: "~".to_string(),
                         threads: vec![],
+                        archived_at: None,
                     });
                     tree.projects.len() - 1
                 }
@@ -277,6 +283,25 @@ fn apply_and_persist(
 /// nor the other clients are touched; the caller still gets the current tree
 /// so its own RPC can reconcile.
 pub fn mutate(ops: &[TreeOp]) -> Result<ThinkTermTree> {
+    // Archiving freezes the project's stored layouts, so capture the live
+    // topology while its panes are still running -- the client tears them
+    // down only after this mutation returns. Without this, a change still
+    // inside the snapshot debounce would never be persisted and unarchiving
+    // would restore a stale arrangement. Must run before the TREE lock:
+    // the snapshot reads the tree itself.
+    if ops.iter().any(|op| {
+        matches!(
+            op,
+            TreeOp::SetProjectArchived {
+                archived_at: Some(_),
+                ..
+            }
+        )
+    }) {
+        if let Err(err) = crate::thinkterm_layout::flush_now() {
+            log::error!("flushing layouts before archiving a project: {err:#}");
+        }
+    }
     // The file is written while the lock is still held. Dropping it first and
     // saving afterwards lets two connections race: the one that applied the
     // *older* revision can reach the disk last and leave the file behind what
@@ -482,5 +507,67 @@ mod test {
         assert!(landing.thread_id.starts_with("thread-"));
         assert!(tree.spaces[0].id.starts_with("space-"));
         assert!(tree.projects[0].id.starts_with("project-"));
+    }
+
+    #[test]
+    fn landing_skips_archived_projects() {
+        // An archived first project must not host the landing, even when it
+        // is the preferred thread's home.
+        let mut tree = sample();
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::CreateProject {
+                project_id: "p2".into(),
+                space_id: "s1".into(),
+                name: "second".into(),
+                path: "/srv/projects/second".into(),
+            }
+        ));
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::CreateThread {
+                thread_id: "t2".into(),
+                project_id: "p2".into(),
+                name: "main".into(),
+                workspace: Some("thinkterm:p2:t2".into()),
+                created_at: 43,
+            }
+        ));
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: Some(100),
+            }
+        ));
+
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("t1"));
+        assert!(!changed);
+        assert_eq!(
+            landing.thread_id, "t2",
+            "preferred thread lives in an archived project"
+        );
+
+        // With every project archived, a fresh live Home is minted rather
+        // than landing inside an archived one. apply_op refuses to archive
+        // the last live project, so force the state directly -- external
+        // edits and older writers can still produce it.
+        tree.projects
+            .iter_mut()
+            .find(|project| project.id == "p2")
+            .unwrap()
+            .archived_at = Some(101);
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, None);
+        assert!(changed);
+        let host = tree
+            .projects
+            .iter()
+            .find(|project| project.threads.iter().any(|t| t.id == landing.thread_id))
+            .unwrap();
+        assert_eq!(host.archived_at, None);
+        assert_eq!(host.name, "Home");
+        // The archived projects themselves are untouched.
+        assert!(tree.project("p1").unwrap().archived_at.is_some());
+        assert!(tree.project("p2").unwrap().archived_at.is_some());
     }
 }

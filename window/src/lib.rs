@@ -211,6 +211,8 @@ pub enum ContextMenuItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContextMenuIcon {
     Application,
+    Archive,
+    ArchiveRestore,
     Back,
     Check,
     Close,
@@ -274,6 +276,10 @@ impl ContextMenuIcon {
     pub fn sf_symbol_name(self) -> &'static str {
         match self {
             Self::Application => "app",
+            Self::Archive => "archivebox",
+            // The oldest widely-available "take back out of the bin" glyph;
+            // newer restore symbols are too recent to rely on.
+            Self::ArchiveRestore => "tray.and.arrow.up",
             Self::Back => "chevron.left",
             Self::Check => "checkmark.circle",
             Self::Close => "xmark",
@@ -325,6 +331,10 @@ impl ContextMenuIcon {
     pub fn lucide_svg(self) -> &'static [u8] {
         match self {
             Self::Application => include_bytes!("../../third_party/lucide/icons/app-window.svg"),
+            Self::Archive => include_bytes!("../../third_party/lucide/icons/archive.svg"),
+            Self::ArchiveRestore => {
+                include_bytes!("../../third_party/lucide/icons/archive-restore.svg")
+            }
             Self::Back | Self::MoveLeft => {
                 include_bytes!("../../third_party/lucide/icons/arrow-left.svg")
             }

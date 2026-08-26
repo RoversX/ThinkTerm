@@ -32,6 +32,10 @@ pub fn snapshot() -> anyhow::Result<ThinkTermSessionState> {
     let projects = tree
         .projects
         .iter()
+        // Archived projects are hidden everywhere; the session projection
+        // (TUI sidebar, CLI listings, attach pickers) must not resurface
+        // them. Their panes are gone, so nothing live is lost.
+        .filter(|project| project.archived_at.is_none())
         .map(|project| ThinkTermSessionProject {
             id: project.id.clone(),
             space_id: project.space_id.clone(),

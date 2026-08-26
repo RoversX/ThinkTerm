@@ -35,12 +35,11 @@ use crate::termwindow::ui::tokens::{
 use crate::termwindow::{
     NoteEditorCommand, PendingLocalCopy, PendingRemoteConfirm, RightSidebarFileCharBag,
     RightSidebarFileDirCache, RightSidebarFileDirEntry, RightSidebarFileField,
-    RightSidebarFileIndex, RightSidebarFileIndexEntry,
-    RightSidebarFileIndexStatus, RightSidebarFilePreviewImage, RightSidebarFilePreviewLine,
-    RightSidebarFilePreviewSelection, RightSidebarFilePreviewSelectionPoint,
-    RightSidebarFilePreviewSliceCacheKey, RightSidebarFilePreviewSliceCacheValue,
-    RightSidebarFilePreviewSpan, RightSidebarFileTreeRow, RightSidebarFileView,
-    RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
+    RightSidebarFileIndex, RightSidebarFileIndexEntry, RightSidebarFileIndexStatus,
+    RightSidebarFilePreviewImage, RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
+    RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSliceCacheKey,
+    RightSidebarFilePreviewSliceCacheValue, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
+    RightSidebarFileView, RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
     RightSidebarNoteImageSource, RightSidebarNoteTableLayout, RightSidebarNoteView,
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
     TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup,
@@ -51,6 +50,7 @@ use crate::workspace_threads;
 use anyhow::Context;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment};
 use fluent_bundle::FluentArgs;
+use ignore::{DirEntry as IgnoreDirEntry, WalkBuilder};
 use mux::pane::{Pane, PaneId};
 use mux::Mux;
 use std::borrow::Cow;
@@ -68,7 +68,6 @@ use termwiz::image::{ImageData, ImageDataType};
 use termwiz::input::{KeyCode as TermKeyCode, Modifiers as TermModifiers};
 use thinkterm_syntax::{HighlightKind, HighlightResult, HighlightSpan, LanguageId};
 use unicode_segmentation::UnicodeSegmentation;
-use ignore::{DirEntry as IgnoreDirEntry, WalkBuilder};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{
@@ -3051,7 +3050,10 @@ impl crate::TermWindow {
     fn spawn_right_sidebar_dir_reads(&mut self, dirs: Vec<PathBuf>) {
         let dirs: Vec<PathBuf> = dirs
             .into_iter()
-            .filter(|dir| self.right_sidebar_file_dir_loads_in_flight.insert(dir.clone()))
+            .filter(|dir| {
+                self.right_sidebar_file_dir_loads_in_flight
+                    .insert(dir.clone())
+            })
             .collect();
         if dirs.is_empty() {
             return;
@@ -4691,12 +4693,15 @@ impl crate::TermWindow {
         visual: &Arc<VisualDocument>,
         fonts: NotePrewarmFonts,
     ) {
-        let same_target = self.right_sidebar_note_prewarm.as_ref().is_some_and(|state| {
-            state.visual.as_ptr() == Arc::as_ptr(visual)
+        let same_target = self
+            .right_sidebar_note_prewarm
+            .as_ref()
+            .is_some_and(|state| {
+                state.visual.as_ptr() == Arc::as_ptr(visual)
                 // A config/appearance change mints new LoadedFonts (new ids,
                 // new cache keys); restart so the warm entries match paint.
                 && Rc::ptr_eq(&state.fonts.ui.0, &fonts.ui.0)
-        });
+            });
         if !same_target {
             self.right_sidebar_note_prewarm = Some(NotePrewarmState {
                 visual: Arc::downgrade(visual),
@@ -4748,7 +4753,12 @@ impl crate::TermWindow {
                 self.right_sidebar_note_prewarm = None;
                 return;
             };
-            (visual, state.fonts.clone(), state.next_line, state.shaped_runs)
+            (
+                visual,
+                state.fonts.clone(),
+                state.next_line,
+                state.shaped_runs,
+            )
         };
         if self.render_state.is_none() {
             // No GPU state to rasterize into yet; the next paint re-arms us.
@@ -10157,8 +10167,12 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view =
-            workspace_threads::view_for_current_project(&space_id, &active_workspace, &workspaces);
+        let view = workspace_threads::view_for_current_project(
+            &space_id,
+            &active_workspace,
+            &workspaces,
+            false,
+        );
         let project = view
             .projects
             .iter()
@@ -13365,8 +13379,12 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view =
-            workspace_threads::view_for_current_project(&space_id, &active_workspace, &workspaces);
+        let view = workspace_threads::view_for_current_project(
+            &space_id,
+            &active_workspace,
+            &workspaces,
+            false,
+        );
         let project = view
             .projects
             .iter()
@@ -13584,8 +13602,7 @@ impl crate::TermWindow {
         // Whether anything below the list needs protecting from overflow.
         // Decides both the bottom mask and how far row chrome may extend:
         // unprotected, rows run to the window edge and are cut there.
-        let masked_below =
-            strip_rows > 0 || (self.show_tab_bar && self.config.tab_bar_at_bottom);
+        let masked_below = strip_rows > 0 || (self.show_tab_bar && self.config.tab_bar_at_bottom);
         let row_clip_bottom = if masked_below {
             viewport_bottom
         } else {
@@ -16711,7 +16728,9 @@ fn preview_visible_line_range(
     start..end
 }
 
-pub(crate) fn right_sidebar_file_row_metrics(ui_metrics: RenderMetrics) -> RightSidebarFileRowMetrics {
+pub(crate) fn right_sidebar_file_row_metrics(
+    ui_metrics: RenderMetrics,
+) -> RightSidebarFileRowMetrics {
     // Font metrics already follow the window DPI. Derive the row chrome from
     // those metrics so the file tree keeps the same logical size across
     // displays instead of being pinned by physical-pixel clamps.
@@ -18710,20 +18729,20 @@ mod tests {
         copy_entries_blocking, copy_file_chunked, download_name_candidates,
         encode_pasted_image_png, failed_folder_download, file_preview_close_requires_reflow,
         file_release_action, file_row_placement, full_line_colors_by_byte,
-        sidebar_row_element_visible,
-        image_pixels_within_preview_budget, load_file_preview, load_file_preview_image,
-        naturalish_cmp, note_code_highlight_key, note_code_highlight_lines, note_code_row_height,
-        note_image_display_size, note_open_pending_for_vault, note_release_action,
-        open_with_candidate_allowed, pasted_image_file_name, path_key, pick_free_remote_name,
-        preflight_local_copy, preview_line_count, preview_lines_from_text,
-        preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
-        preview_visible_line_range, remote_lease_failure_disposition, resolve_drop_destination,
-        load_dir_cache_for_test, rescan_plan, resolve_local_drop_target, resolve_remote_drop_target,
+        image_pixels_within_preview_budget, load_dir_cache_for_test, load_file_preview,
+        load_file_preview_image, naturalish_cmp, note_code_highlight_key,
+        note_code_highlight_lines, note_code_row_height, note_image_display_size,
+        note_open_pending_for_vault, note_release_action, open_with_candidate_allowed,
+        pasted_image_file_name, path_key, pick_free_remote_name, preflight_local_copy,
+        preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
+        preview_text_range, preview_visible_colored, preview_visible_line_range,
+        remote_lease_failure_disposition, rescan_plan, resolve_drop_destination,
+        resolve_local_drop_target, resolve_remote_drop_target,
         right_sidebar_file_browse_rows_from_dir_cache, right_sidebar_file_row_metrics,
         right_sidebar_open_with_cache_key, sanitize_preview_text, scrollable_note_table_columns,
-        search_right_sidebar_file_index, snippet_cursor_visible, snippet_run_buffer,
-        sorted_open_with_candidates, spawn_pasted_image_staging, stage_pasted_image,
-        terminal_paste_snapshot_mismatch, virtual_note_line_range,
+        search_right_sidebar_file_index, sidebar_row_element_visible, snippet_cursor_visible,
+        snippet_run_buffer, sorted_open_with_candidates, spawn_pasted_image_staging,
+        stage_pasted_image, terminal_paste_snapshot_mismatch, virtual_note_line_range,
         visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
         FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
         NoteCodeHighlightState, NoteReleaseAction, RemoteLeaseFailureDisposition,
@@ -20146,11 +20165,17 @@ mod tests {
         // mask). Elements are 30 tall.
         let vis = |y| sidebar_row_element_visible(y, 30, 100, 160, 440);
         assert!(vis(160), "fully inside");
-        assert!(vis(140), "half out of the top -- drawn, then cut by the mask");
+        assert!(
+            vis(140),
+            "half out of the top -- drawn, then cut by the mask"
+        );
         assert!(vis(131), "one pixel of it still below list_top");
         assert!(!vis(130), "entirely above the list: nothing to show");
         assert!(vis(399), "half out of the bottom -- drawn, then cut");
-        assert!(vis(410), "wholly inside the bottom mask, still safe to draw");
+        assert!(
+            vis(410),
+            "wholly inside the bottom mask, still safe to draw"
+        );
         assert!(!vis(411), "would cross the panel edge and escape the mask");
         assert!(!vis(99), "would escape above the top mask");
     }

@@ -255,6 +255,10 @@ impl crate::TermWindow {
             ) => {
                 self.toggle_workspace_sidebar_status_filter(status);
             }
+            crate::termwindow::ContextMenuApplicationAction::ToggleWorkspaceShowArchived => {
+                self.workspace_sidebar_show_archived = !self.workspace_sidebar_show_archived;
+                self.invalidate_window();
+            }
             crate::termwindow::ContextMenuApplicationAction::AddThreadToCollection {
                 collection_space_id,
                 thread_id,
@@ -295,11 +299,9 @@ impl crate::TermWindow {
                         if let Some(window) = self.window.clone() {
                             match outcome.next_thread_id {
                                 Some(next) => {
-                                    if !self
-                                        .open_remote_workspace_thread_without_connecting(
-                                            &next, &window,
-                                        )
-                                    {
+                                    if !self.open_remote_workspace_thread_without_connecting(
+                                        &next, &window,
+                                    ) {
                                         self.activate_workspace_thread(next, &window);
                                     }
                                 }
@@ -1094,6 +1096,8 @@ fn context_menu_palette(appearance: Appearance) -> UiPalette {
 fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
     match icon {
         ContextMenuIcon::Application | ContextMenuIcon::ExternalLink => Some(SvgIcon::ExternalLink),
+        ContextMenuIcon::Archive => Some(SvgIcon::Archive),
+        ContextMenuIcon::ArchiveRestore => Some(SvgIcon::ArchiveRestore),
         ContextMenuIcon::Back | ContextMenuIcon::MoveLeft => Some(SvgIcon::ArrowLeft),
         ContextMenuIcon::Check => Some(SvgIcon::CircleCheck),
         ContextMenuIcon::Close => Some(SvgIcon::X),

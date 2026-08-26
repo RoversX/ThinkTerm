@@ -5,6 +5,7 @@ use window::Image;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SvgIcon {
     Archive,
+    ArchiveRestore,
     ArrowLeft,
     ArrowRight,
     Bell,
@@ -95,6 +96,9 @@ impl SvgIcon {
     pub fn bytes(self) -> &'static [u8] {
         match self {
             Self::Archive => include_bytes!("../../../../third_party/lucide/icons/archive.svg"),
+            Self::ArchiveRestore => {
+                include_bytes!("../../../../third_party/lucide/icons/archive-restore.svg")
+            }
             Self::ArrowLeft => {
                 include_bytes!("../../../../third_party/lucide/icons/arrow-left.svg")
             }
@@ -566,6 +570,7 @@ mod tests {
     fn svg_icons_rasterize() {
         for icon in [
             SvgIcon::Archive,
+            SvgIcon::ArchiveRestore,
             SvgIcon::ArrowLeft,
             SvgIcon::Bell,
             SvgIcon::Braces,

@@ -41,6 +41,13 @@ pub struct TtProject {
     pub name: String,
     pub path: String,
     pub threads: Vec<TtThread>,
+    /// When this project was archived, or `None` while it is live. A
+    /// timestamp rather than a bool so the archived list can sort
+    /// most-recent-first without a second field, and so it can never be
+    /// confused with the retired thread-level `archived` flag that
+    /// `drop_legacy_archived_threads` still cleans up.
+    #[serde(default)]
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
@@ -164,6 +171,17 @@ pub enum TreeOp {
         thread_id: TtThreadId,
         at: i64,
     },
+    /// Archive or restore a whole project. Threads, their names, order,
+    /// pins and workspace bindings all stay in the tree: archiving is a
+    /// visibility and lifecycle state, not a deletion, and unarchiving
+    /// must be able to rebuild the shells from the layouts the server
+    /// still holds.
+    SetProjectArchived {
+        project_id: TtProjectId,
+        /// The archive time, or `None` to restore. Timestamps travel in
+        /// the op like `RenameThread`'s; the server does not mint them.
+        archived_at: Option<i64>,
+    },
 }
 
 impl ThinkTermTree {
@@ -264,6 +282,7 @@ pub fn ensure_unique_thread_names(tree: &mut ThinkTermTree) -> bool {
             name: project.name.clone(),
             path: project.path.clone(),
             threads: Vec::with_capacity(project.threads.len()),
+            archived_at: project.archived_at,
         };
         for mut thread in std::mem::take(&mut project.threads) {
             let name = unique_thread_name(&settled, None, &thread.name);
@@ -335,6 +354,7 @@ pub fn apply_op(tree: &mut ThinkTermTree, op: &TreeOp) -> bool {
                 name: name.clone(),
                 path: path.clone(),
                 threads: vec![],
+                archived_at: None,
             });
             true
         }
@@ -577,6 +597,48 @@ pub fn apply_op(tree: &mut ThinkTermTree, op: &TreeOp) -> bool {
             }
             _ => false,
         },
+
+        TreeOp::SetProjectArchived {
+            project_id,
+            archived_at,
+        } => {
+            // A Space must keep at least one live project. Each client
+            // checks this before sending, but two clients can archive the
+            // last two live projects concurrently -- only this check,
+            // against the authoritative tree, is atomic. The refusal
+            // converges like every other one here: the optimistic local
+            // apply refuses by the same rule, and where the caches
+            // disagreed the server's next push corrects the loser.
+            if archived_at.is_some() {
+                let Some(space_id) = tree
+                    .project(project_id)
+                    .map(|project| project.space_id.clone())
+                else {
+                    return false;
+                };
+                let another_live = tree.projects.iter().any(|project| {
+                    project.space_id == space_id
+                        && project.id != *project_id
+                        && project.archived_at.is_none()
+                });
+                if !another_live {
+                    return false;
+                }
+            }
+            match tree
+                .projects
+                .iter_mut()
+                .find(|project| project.id == *project_id)
+            {
+                // A re-archive with a fresh timestamp is a legitimate
+                // touch; only the exact same state is a no-op.
+                Some(project) if project.archived_at != *archived_at => {
+                    project.archived_at = *archived_at;
+                    true
+                }
+                _ => false,
+            }
+        }
 
         TreeOp::TouchThread { thread_id, at } => match tree.thread_mut(thread_id) {
             Some(thread) if thread.last_active_at != *at => {
@@ -976,6 +1038,10 @@ mod test {
             TreeOp::DeleteThread {
                 thread_id: "t2".into(),
             },
+            TreeOp::SetProjectArchived {
+                project_id: "p3".into(),
+                archived_at: Some(9),
+            },
         ];
 
         let mut client = seeded();
@@ -989,5 +1055,96 @@ mod test {
             );
         }
         assert_eq!(client, server);
+    }
+
+    #[test]
+    fn archiving_a_project_is_idempotent_and_keeps_its_threads() {
+        let mut tree = seeded();
+        let threads_before = thread_ids(&tree, "p1");
+
+        // Archive, re-archive with the same stamp, re-archive with a fresh
+        // stamp, restore. Only the exact-same-state applications are no-ops.
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: Some(100),
+            }
+        ));
+        assert_eq!(tree.project("p1").unwrap().archived_at, Some(100));
+        assert!(!apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: Some(100),
+            }
+        ));
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: Some(200),
+            }
+        ));
+
+        // Archiving is a visibility state: every thread survives it.
+        assert_eq!(thread_ids(&tree, "p1"), threads_before);
+
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: None,
+            }
+        ));
+        assert_eq!(tree.project("p1").unwrap().archived_at, None);
+        assert_eq!(thread_ids(&tree, "p1"), threads_before);
+
+        // Unknown ids race concurrent deletes and must not error.
+        assert!(!apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "nope".into(),
+                archived_at: Some(1),
+            }
+        ));
+    }
+
+    #[test]
+    fn the_spaces_last_live_project_cannot_be_archived() {
+        // Two clients can pass their local guards concurrently; the
+        // authoritative tree is where the invariant actually holds.
+        let mut tree = seeded();
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: Some(1),
+            }
+        ));
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p2".into(),
+                archived_at: Some(2),
+            }
+        ));
+        // p3 is the last live project in s1: refused, tree unchanged.
+        assert!(!apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p3".into(),
+                archived_at: Some(3),
+            }
+        ));
+        assert_eq!(tree.project("p3").unwrap().archived_at, None);
+        // Restoring is never gated.
+        assert!(apply_op(
+            &mut tree,
+            &TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: None,
+            }
+        ));
     }
 }

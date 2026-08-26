@@ -255,6 +255,16 @@ fn thread_records(tree: &codec::ThinkTermTree) -> Vec<(String, String)> {
 fn snapshot_live_layouts(_generation: u64) -> Result<()> {
     let tree = crate::thinkterm_tree::snapshot();
     let records = thread_records(&tree);
+    // An archived project's stored layouts are frozen: archiving kills its
+    // panes on purpose, and the stored layout is exactly what unarchiving
+    // restores from. Neither the live-empty prune nor a mid-teardown
+    // partial snapshot may touch them.
+    let archived_thread_ids: HashSet<String> = tree
+        .projects
+        .iter()
+        .filter(|project| project.archived_at.is_some())
+        .flat_map(|project| project.threads.iter().map(|thread| thread.id.clone()))
+        .collect();
     let valid_thread_ids = records
         .iter()
         .map(|(thread_id, _)| thread_id.clone())
@@ -285,6 +295,9 @@ fn snapshot_live_layouts(_generation: u64) -> Result<()> {
     let mut candidate = prune_orphaned_layouts(&store.stored, &valid_thread_ids);
 
     for (thread_id, workspace) in &records {
+        if archived_thread_ids.contains(thread_id) {
+            continue;
+        }
         if store.restoring_workspaces.contains(workspace) {
             continue;
         }
@@ -417,6 +430,9 @@ fn working_dir_from_entry(entry: &PaneEntry) -> Option<String> {
 }
 
 pub(crate) fn reconcile_with_tree(tree: &codec::ThinkTermTree) -> Result<()> {
+    // Archived projects deliberately keep their layouts: their threads stay
+    // in the tree, so `valid` still covers them and unarchiving can rebuild
+    // the shells from what is stored here.
     let valid = tree
         .projects
         .iter()

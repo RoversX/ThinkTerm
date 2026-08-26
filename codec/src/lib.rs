@@ -11,13 +11,13 @@
 #![allow(dead_code)]
 #![allow(clippy::range_plus_one)]
 
-use anyhow::{Context as _, Error, bail};
+use anyhow::{bail, Context as _, Error};
+use rangeset::*;
+use serde::{Deserialize, Serialize};
 use thinkterm_proto::{
     ClientId, ClientInfo, CommandSpec, PaneDirection, PaneId, PaneNode, RenderableDimensions,
     ScrollbackEraseMode, SerdeUrl, SplitRequest, StableCursorPosition, TabId, WindowId,
 };
-use rangeset::*;
-use serde::{Deserialize, Serialize};
 // smol's io/prelude are pure re-exports of these futures-lite modules, so
 // this is the same set of traits -- minus smol's runtime (async-io, polling),
 // which does not build for wasm and which nothing in this crate uses.
@@ -38,8 +38,8 @@ use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 
 pub mod thinkterm_tree;
 pub use thinkterm_tree::{
-    ThinkTermTree, TreeOp, TtProject, TtProjectId, TtSpace, TtSpaceId, TtThread, TtThreadId,
-    apply_op, ensure_unique_thread_names,
+    apply_op, ensure_unique_thread_names, ThinkTermTree, TreeOp, TtProject, TtProjectId, TtSpace,
+    TtSpaceId, TtThread, TtThreadId,
 };
 
 #[derive(Error, Debug)]
@@ -485,7 +485,9 @@ macro_rules! pdu {
 /// 61: Agent status is classified by the mux that owns the pane and pushed
 ///     to clients (AgentStatusChanged), with a request/response pair for
 ///     cold-start delivery and for `thinkterm cli agent list`.
-pub const CODEC_VERSION: usize = 61;
+/// 62: Projects carry an archived state in the shared ThinkTerm tree
+///     (TtProject.archived_at, TreeOp::SetProjectArchived).
+pub const CODEC_VERSION: usize = 62;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1717,17 +1719,17 @@ mod golden {
         116, 0, 0, 0, 1, 125, 0, 0, 1, 12, 47, 100, 101, 118, 47, 116, 116, 121, 115, 48, 48, 49,
         3, 0, 1, 1, 2, 4, 7, 115, 116, 97, 99, 107, 101, 100, 24, 80, 128, 5, 128, 3, 96, 1, 13,
         102, 105, 108, 101, 58, 47, 47, 47, 116, 109, 112, 47, 120, 1, 0, 1, 7, 100, 101, 102, 97,
-        117, 108, 116, 0, 0, 0, 1, 125, 0, 0, 1, 12, 47, 100, 101, 118, 47, 116, 116, 121, 115,
-        48, 48, 49, 1, 7, 0, 24, 40, 192, 2, 128, 3, 96, 24, 39, 184, 2, 128, 3, 96, 1, 4, 109,
-        97, 105, 110, 1, 1, 3, 119, 105, 110,
+        117, 108, 116, 0, 0, 0, 1, 125, 0, 0, 1, 12, 47, 100, 101, 118, 47, 116, 116, 121, 115, 48,
+        48, 49, 1, 7, 0, 24, 40, 192, 2, 128, 3, 96, 24, 39, 184, 2, 128, 3, 96, 1, 4, 109, 97,
+        105, 110, 1, 1, 3, 119, 105, 110,
     ];
     const SPLIT_PANE: &[u8] = &[
         5, 1, 1, 0, 1, 30, 0, 1, 5, 47, 104, 111, 109, 101, 2, 3, 100, 111, 109, 1, 2,
     ];
     const SEARCH: &[u8] = &[3, 2, 2, 97, 43, 123, 10, 1, 100];
     const CLIENT_LIST: &[u8] = &[
-        1, 4, 104, 111, 115, 116, 4, 117, 115, 101, 114, 100, 2, 3, 0, 128, 226, 207, 170, 6, 1,
-        7, 100, 101, 102, 97, 117, 108, 116, 128, 226, 207, 170, 6, 1, 4,
+        1, 4, 104, 111, 115, 116, 4, 117, 115, 101, 114, 100, 2, 3, 0, 128, 226, 207, 170, 6, 1, 7,
+        100, 101, 102, 97, 117, 108, 116, 128, 226, 207, 170, 6, 1, 4,
     ];
     const RENDER_CHANGES: &[u8] = &[
         1, 0, 1, 0, 0, 0, 1, 80, 24, 100, 121, 180, 127, 96, 128, 5, 128, 3, 0, 2, 0, 2, 5, 6, 5,
@@ -1761,8 +1763,8 @@ mod golden {
     // introduced. The other literals guard against changing an old format;
     // this one guards against accidentally changing the new one.
     const COMMAND_SPEC: &[u8] = &[
-        2, 4, 112, 114, 111, 103, 3, 102, 128, 111, 2, 4, 80, 65, 84, 72, 8, 47, 117, 115, 114,
-        47, 98, 105, 110, 1, 3, 70, 79, 79, 3, 98, 97, 114, 0, 1, 4, 47, 116, 109, 112, 1, 18, 0,
+        2, 4, 112, 114, 111, 103, 3, 102, 128, 111, 2, 4, 80, 65, 84, 72, 8, 47, 117, 115, 114, 47,
+        98, 105, 110, 1, 3, 70, 79, 79, 3, 98, 97, 114, 0, 1, 4, 47, 116, 109, 112, 1, 18, 0,
     ];
 
     #[test]
@@ -2001,6 +2003,18 @@ mod test {
                 pinned: true,
                 last_active_at: 1_700_000_001,
             },
+            // A second live project so archiving p1 passes the Space's
+            // last-live-project guard.
+            TreeOp::CreateProject {
+                project_id: "p2".into(),
+                space_id: "s1".into(),
+                name: "notes".into(),
+                path: "/srv/projects/notes".into(),
+            },
+            TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: Some(1_700_000_002),
+            },
         ] {
             assert!(apply_op(&mut tree, &op));
         }
@@ -2024,6 +2038,10 @@ mod test {
                 thread_id: "t2".into(),
                 before: None,
             },
+            TreeOp::SetProjectArchived {
+                project_id: "p1".into(),
+                archived_at: None,
+            },
             TreeOp::DeleteSpace {
                 space_id: "s1".into(),
             },
@@ -2043,7 +2061,11 @@ mod test {
 
     #[test]
     fn agent_status_protocol_round_trip_at_version_61() {
-        assert_eq!(CODEC_VERSION, 61);
+        // The agent-status protocol arrived at 61 and is unchanged since.
+        // The exact assertion is the tripwire: whoever bumps the codec must
+        // come here, confirm the round-trips still cover the new version,
+        // and advance it deliberately.
+        assert_eq!(CODEC_VERSION, 62);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {

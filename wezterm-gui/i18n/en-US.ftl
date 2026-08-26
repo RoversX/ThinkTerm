@@ -29,6 +29,21 @@ settings-section-general = General
 settings-section-appearance = Appearance
 settings-section-terminal = Terminal
 settings-section-workspaces = Workspaces
+settings-section-archived = Archived
+settings-archived-heading = Hidden from the sidebar
+settings-archived-empty = Nothing archived. Right-click a workspace in the sidebar and choose "Archive Project…" to put it away.
+settings-archived-meta = { $space } · { $threads ->
+        [one] 1 thread
+       *[other] { $threads } threads
+    } · archived { $when }
+settings-archived-when-today = today
+settings-archived-when-yesterday = yesterday
+settings-archived-unarchive = Unarchive
+settings-archived-delete = Delete
+settings-archived-delete-confirm = Confirm
+settings-archived-unarchived = Restored "{ $name }" to the sidebar
+settings-archived-deleted = Deleted "{ $name }" permanently
+settings-archived-remote-offline = That workspace lives on a disconnected server; reconnect first
 settings-section-keymap = Keymap
 settings-section-compatibility = Import from WezTerm
 settings-section-developer = Developer
@@ -196,6 +211,25 @@ menu-rename-project = Rename Project…
 menu-new-thread = New Thread
 menu-toggle-threads = Collapse / Expand Threads
 menu-remove-project = Remove Project
+menu-archive-project = Archive Project…
+menu-archive-project-quiet = Archive Project
+menu-archive-project-explain = Closes { $panes ->
+        [one] 1 running pane
+       *[other] { $panes } running panes
+    }; layouts are kept
+menu-archive-project-confirm = Archive and Close Panes
+menu-unarchive-project = Unarchive Project
+menu-delete-project-permanently = Delete Permanently…
+menu-delete-project-permanently-explain = Deletes { $threads ->
+        [one] 1 thread
+       *[other] { $threads } threads
+    } for good; this cannot be undone
+menu-delete-project-permanently-confirm = Delete Project and Threads
+menu-show-archived = Archived
+menu-show-archived-count = Archived ({ $count })
+archive-project-last-live-project = The Space needs at least one live project; unarchive or add another first
+archive-project-server-rejected = The server rejected archiving this project
+archive-project-teardown-incomplete = Archived, but some remote sessions could not be closed. Reconnect, then unarchive and archive again to finish the cleanup
 menu-space-occupied = { $name } (occupied)
 menu-space-remote = { $name } (Remote)
 menu-new-space = New Space

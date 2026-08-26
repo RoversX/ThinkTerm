@@ -151,6 +151,12 @@ pub struct Project {
     /// active notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_note_path: Option<String>,
+    /// When this project was archived, or `None` while it is live. A
+    /// timestamp, not a bool: it sorts the archived list, and it can never
+    /// be confused with the retired thread-level `archived` flag that
+    /// `drop_legacy_archived_threads` still deletes on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -285,6 +291,27 @@ impl WorkspaceThreadsView {
         self.display_order = merged_display_order(folder_order, &project_keys, &group_keys);
     }
 
+    /// Move archived projects to the tail of `display_order`, newest
+    /// archive first, keeping every other folder in place. The Space's
+    /// persisted `folder_order` predates archiving and would otherwise
+    /// interleave archived rows back among the live ones.
+    pub fn partition_archived_last(&mut self) {
+        let order = std::mem::take(&mut self.display_order);
+        let (live, mut archived): (Vec<SidebarFolder>, Vec<SidebarFolder>) =
+            order.into_iter().partition(|folder| match folder {
+                SidebarFolder::Project(index) => !self.projects[*index].is_archived,
+                SidebarFolder::RefGroup(_) => true,
+            });
+        archived.sort_by_key(|folder| match folder {
+            SidebarFolder::Project(index) => {
+                std::cmp::Reverse(self.projects[*index].archived_at.unwrap_or(0))
+            }
+            SidebarFolder::RefGroup(_) => std::cmp::Reverse(0),
+        });
+        self.display_order = live;
+        self.display_order.extend(archived);
+    }
+
     /// True when the workspace on screen is one of this Space's thread
     /// references. Activating a ref never repoints the Space's own
     /// active-thread pointer, so while this holds, the own rows' `is_active`
@@ -344,6 +371,11 @@ pub struct ProjectView {
     pub is_remote: bool,
     /// Detected `/etc/os-release` `ID` for remote hosts, used to pick an OS icon.
     pub distro: Option<String>,
+    /// Painted dimmed with no thread rows; only present when the sidebar's
+    /// transient reveal is on.
+    pub is_archived: bool,
+    /// Sort key for the archived tail of the sidebar (newest first).
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -534,6 +566,28 @@ pub enum DeleteSpaceError {
     Occupied,
     RemoteUnavailable,
     ServerRejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedProject {
+    pub was_active: bool,
+    pub next_thread_id: Option<WorkspaceThreadId>,
+    pub materialized_workspace_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveProjectError {
+    NotFound,
+    AlreadyArchived,
+    /// Archiving would leave the Space with no live project to land on.
+    LastLiveProject,
+    RemoteUnavailable,
+    ServerRejected,
+    /// The archive flag landed but some remote panes could not be killed
+    /// (usually the connection died mid-teardown). Rolling the flag back
+    /// over the same dead connection cannot work; the recovery is to
+    /// unarchive and archive again, whose retry path finishes the kills.
+    TeardownIncomplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1331,8 +1385,7 @@ pub fn move_host_candidates(thread_id: &str) -> Vec<(SpaceId, String)> {
                     // Same test the move itself applies: a Space holding
                     // only direct-SSH projects has nowhere local to put
                     // the thread, and offering it would no-op silently.
-                    candidate.space_id == space.id
-                        && !is_remote_project(candidate, &store.spaces)
+                    candidate.space_id == space.id && !is_remote_project(candidate, &store.spaces)
                 })
         })
         .map(|space| (space.id.clone(), space.name.clone()))
@@ -1434,6 +1487,7 @@ pub fn create_space_on_domain(domain_name: &str, name: Option<String>) -> Result
         active_thread_id: Some(thread_id),
         threads_collapsed: false,
         active_note_path: None,
+        archived_at: None,
     });
     if let Some(space) = store.spaces.iter_mut().find(|space| space.id == space_id) {
         space.active_project_id = Some(project_id);
@@ -1911,6 +1965,7 @@ pub fn default_project_for_space(space_id: &str) -> Project {
         active_thread_id: None,
         threads_collapsed: false,
         active_note_path: None,
+        archived_at: None,
     }
 }
 
@@ -1930,6 +1985,7 @@ pub fn view_for_current_project(
     space_id: &str,
     active_workspace: &str,
     live_workspaces: &[String],
+    include_archived: bool,
 ) -> WorkspaceThreadsView {
     let mut store = THREAD_STORE.lock();
     if store.normalize_after_load() {
@@ -1952,7 +2008,7 @@ pub fn view_for_current_project(
     let has_own_projects = store
         .projects
         .iter()
-        .any(|project| project.space_id == space_id);
+        .any(|project| project.space_id == space_id && !project.is_archived());
     if !has_own_projects && !ref_groups.is_empty() {
         let mut view = WorkspaceThreadsView {
             pinned_threads: Vec::new(),
@@ -1973,9 +2029,11 @@ pub fn view_for_current_project(
                 .any(|project| project.space_id == space_id && &project.id == project_id)
         })
     {
-        let mut view = store.view_for_project(space_id, &project_id, live_workspaces);
+        let mut view =
+            store.view_for_project(space_id, &project_id, live_workspaces, include_archived);
         view.ref_groups = ref_groups;
         view.rebuild_display_order(&folder_order);
+        view.partition_archived_last();
         return view;
     }
 
@@ -2083,7 +2141,12 @@ pub fn thread_to_recover_after_window_death(space_id: &str) -> Option<WorkspaceT
         .and_then(|project| project.active_thread_id.clone());
 
     let mut best: Option<(i64, WorkspaceThreadId)> = None;
-    for project in store.projects.iter().filter(|p| p.space_id == space_id) {
+    // A dying window must never resurrect an archived project.
+    for project in store
+        .projects
+        .iter()
+        .filter(|p| p.space_id == space_id && !p.is_archived())
+    {
         for thread in &project.threads {
             if dead_thread_id.as_deref() == Some(thread.id.as_str()) {
                 continue;
@@ -2105,13 +2168,13 @@ pub fn thread_to_recover_after_window_death(space_id: &str) -> Option<WorkspaceT
             store
                 .projects
                 .iter()
-                .any(|p| p.space_id == space_id && &p.id == project_id)
+                .any(|p| p.space_id == space_id && &p.id == project_id && !p.is_archived())
         })
         .or_else(|| {
             store
                 .projects
                 .iter()
-                .find(|p| p.space_id == space_id)
+                .find(|p| p.space_id == space_id && !p.is_archived())
                 .map(|p| p.id.clone())
         })?;
     let thread_id = store.create_thread(&project_id, None);
@@ -2881,7 +2944,7 @@ pub fn ordered_project_ids(space_id: &str) -> Vec<ProjectId> {
     store
         .projects
         .iter()
-        .filter(|project| project.space_id == space_id)
+        .filter(|project| project.space_id == space_id && !project.is_archived())
         .map(|project| project.id.clone())
         .collect()
 }
@@ -2913,7 +2976,7 @@ pub fn unpinned_thread_ids(project_id: &str) -> Vec<WorkspaceThreadId> {
     store
         .projects
         .iter()
-        .find(|project| project.id == project_id)
+        .find(|project| project.id == project_id && !project.is_archived())
         .map(|project| {
             project
                 .threads
@@ -3141,6 +3204,253 @@ pub fn remove_project(project_id: &str) -> Option<RemovedProject> {
         persist_locked(&store);
     }
     removed
+}
+
+/// Archive a project, killing its remote panes first when it lives on a mux
+/// server. Local projects resolve synchronously inside; the caller kills the
+/// returned materialized workspaces' local (mirror) windows afterwards, the
+/// same division of labor `remove_project` uses.
+pub async fn archive_project(project_id: &str) -> Result<ArchivedProject, ArchiveProjectError> {
+    let domain_name = {
+        let store = THREAD_STORE.lock();
+        tree_domain_for_project(&store, project_id)
+    };
+
+    let Some(domain_name) = domain_name else {
+        // Local: no server involved, commit directly.
+        let mut store = THREAD_STORE.lock();
+        let archived = store.archive_project(project_id, now_ts())?;
+        persist_locked(&store);
+        return Ok(archived);
+    };
+
+    // Stage against a clone: validate the guards and capture the workspace
+    // names while nothing has been destroyed yet. AlreadyArchived is not an
+    // error here but a cleanup retry: the flag landed on a previous attempt
+    // whose pane teardown did not finish, so skip the mutate and finish the
+    // teardown below.
+    let (archived_at, materialized_workspace_names, is_retry) = {
+        let store = THREAD_STORE.lock();
+        let mut staged = store.clone();
+        let archived_at = now_ts();
+        match staged.archive_project(project_id, archived_at) {
+            Ok(archived) => (archived_at, archived.materialized_workspace_names, false),
+            Err(ArchiveProjectError::AlreadyArchived) => {
+                let names = store
+                    .projects
+                    .iter()
+                    .find(|project| project.id == project_id)
+                    .map(|project| {
+                        project
+                            .threads
+                            .iter()
+                            .filter_map(|session| session.materialized_workspace_name.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .ok_or(ArchiveProjectError::NotFound)?;
+                (archived_at, names, true)
+            }
+            Err(err) => return Err(err),
+        }
+    };
+
+    if !remote_tree_domain_is_attached(&domain_name) {
+        notify_remote_tree_mutation_unavailable(&domain_name);
+        return Err(ArchiveProjectError::RemoteUnavailable);
+    }
+    let domain = Mux::get()
+        .get_domain_by_name(&domain_name)
+        .ok_or(ArchiveProjectError::RemoteUnavailable)?;
+    let client = domain
+        .downcast_ref::<wezterm_client::domain::ClientDomain>()
+        .ok_or(ArchiveProjectError::RemoteUnavailable)?;
+    // Keep empty mirror windows from being pruned while the remote panes
+    // die; without this the last KillPane notification can detach the
+    // domain mid-teardown.
+    let _archive_activity = mux::activity::Activity::new();
+
+    // The flag must land BEFORE any pane dies: the server freezes an
+    // archived project's stored layouts, and its snapshotter would
+    // otherwise prune them the moment the workspaces go pane-less. A
+    // mutate that succeeds but whose teardown fails below leaves an
+    // archived project with leftover panes; re-running the archive takes
+    // the retry path above and finishes the job.
+    if !is_retry {
+        let tree = match client
+            .mutate_thinkterm_tree(vec![codec::TreeOp::SetProjectArchived {
+                project_id: project_id.to_string(),
+                archived_at: Some(archived_at),
+            }])
+            .await
+        {
+            Ok(tree) => tree,
+            Err(err) => {
+                log::error!("failed to archive project {project_id} on {domain_name}: {err:#}");
+                notify_remote_tree_mutation_unavailable(&domain_name);
+                return Err(ArchiveProjectError::RemoteUnavailable);
+            }
+        };
+        if tree
+            .project(project_id)
+            .map_or(false, |project| project.archived_at.is_none())
+        {
+            log::error!("{domain_name} rejected archiving ThinkTerm project {project_id}");
+            return Err(ArchiveProjectError::ServerRejected);
+        }
+    }
+
+    let mut panes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for workspace in &materialized_workspace_names {
+        for window_id in Mux::get().iter_windows_in_workspace(workspace) {
+            if let Some(window) = Mux::get().get_window(window_id) {
+                for pane in window.iter().flat_map(|tab| tab.iter_all_panes()) {
+                    if pane.domain_id() == domain.domain_id()
+                        && pane
+                            .downcast_ref::<wezterm_client::pane::ClientPane>()
+                            .is_some()
+                        && seen.insert(pane.pane_id())
+                    {
+                        panes.push(pane);
+                    }
+                }
+            }
+        }
+    }
+    for pane in panes {
+        let remote = pane
+            .downcast_ref::<wezterm_client::pane::ClientPane>()
+            .expect("filtered ClientPane");
+        if let Err(err) = remote.kill_remote_and_wait().await {
+            log::error!(
+                "failed to end pane {} while archiving project {project_id} on {domain_name}: {err:#}",
+                pane.pane_id()
+            );
+            // The flag already landed; this is a half-finished teardown,
+            // not an unreachable server per se, and the caller's toast
+            // explains the unarchive-then-archive cleanup.
+            return Err(ArchiveProjectError::TeardownIncomplete);
+        }
+    }
+
+    // The mutate reply already flowed through ingest_remote_tree, so the
+    // shared flag is in the local cache. Commit only per-device state, and
+    // do the pointer landing against the REAL store: the staged run's
+    // choice may have minted its landing thread only inside the discarded
+    // clone.
+    {
+        let mut store = THREAD_STORE.lock();
+        let space_id = store
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.space_id.clone());
+        let mut landed = None;
+        if let Some(space_id) = space_id {
+            let still_active =
+                store.active_project_id_for_space(&space_id).as_deref() == Some(project_id);
+            if still_active {
+                landed = store.land_active_off_project(&space_id, project_id);
+            }
+        }
+        persist_locked(&store);
+        Ok(ArchivedProject {
+            was_active: landed.is_some(),
+            next_thread_id: landed,
+            materialized_workspace_names,
+        })
+    }
+}
+
+/// Restore an archived project. Nothing was destroyed, so nothing needs
+/// staging or verification: remote domains take the ordinary optimistic op
+/// path, and a failure is put right by the next authoritative push.
+pub fn unarchive_project(project_id: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let domain = tree_domain_for_project(&store, project_id);
+    if !remote_tree_mutation_allowed(domain.as_deref()) {
+        return false;
+    }
+    let changed = store.unarchive_project(project_id);
+    if changed {
+        if let Some(domain) = domain {
+            submit_tree_op(
+                domain,
+                codec::TreeOp::SetProjectArchived {
+                    project_id: project_id.to_string(),
+                    archived_at: None,
+                },
+            );
+        }
+        persist_locked(&store);
+    }
+    changed
+}
+
+/// The materialized workspace names of a project's threads, for callers
+/// that need to count live panes before offering a destructive action.
+pub fn materialized_workspace_names_for_project(project_id: &str) -> Vec<String> {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| {
+            project
+                .threads
+                .iter()
+                .filter_map(|session| session.materialized_workspace_name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One row of the Settings window's Archived page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedProjectRow {
+    pub id: ProjectId,
+    pub name: String,
+    pub space_name: String,
+    pub thread_count: usize,
+    pub archived_at: i64,
+    pub is_remote: bool,
+}
+
+/// Every archived project across every Space, newest archive first --
+/// the Settings window's Archived page.
+pub fn archived_projects_overview() -> Vec<ArchivedProjectRow> {
+    let store = THREAD_STORE.lock();
+    let mut rows: Vec<ArchivedProjectRow> = store
+        .projects
+        .iter()
+        .filter(|project| project.is_archived())
+        .map(|project| ArchivedProjectRow {
+            id: project.id.clone(),
+            name: project.name.clone(),
+            space_name: store
+                .spaces
+                .iter()
+                .find(|space| space.id == project.space_id)
+                .map(|space| space.name.clone())
+                .unwrap_or_default(),
+            thread_count: project.threads.len(),
+            archived_at: project.archived_at.unwrap_or(0),
+            is_remote: is_remote_project(project, &store.spaces),
+        })
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.archived_at));
+    rows
+}
+
+/// Sorted ids+names of the current Space's archived projects, for the
+/// view-options row's count and the disabled state.
+pub fn archived_project_count(space_id: &str) -> usize {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .filter(|project| project.space_id == space_id && project.is_archived())
+        .count()
 }
 
 pub fn rename_thread(thread_id: &str, name: String) -> bool {
@@ -3846,7 +4156,7 @@ fn ordered_folder_keys_locked(store: &WorkspaceThreadStore, space_id: &str) -> V
     let project_keys: Vec<String> = store
         .projects
         .iter()
-        .filter(|project| project.space_id == space_id)
+        .filter(|project| project.space_id == space_id && !project.is_archived())
         .map(|project| project.id.clone())
         .collect();
     let group_keys: Vec<String> =
@@ -4061,11 +4371,14 @@ impl WorkspaceThreadStore {
         }
 
         // Mirror the projects' relative order back into the store's Vec.
+        // Must mirror ordered_folder_keys_locked's archived filter, or the
+        // len-equality guard below never holds and reorders stop syncing
+        // into the projects Vec.
         let project_positions: Vec<usize> = store
             .projects
             .iter()
             .enumerate()
-            .filter(|(_, project)| project.space_id == space_id)
+            .filter(|(_, project)| project.space_id == space_id && !project.is_archived())
             .map(|(index, _)| index)
             .collect();
         let mut wanted_project_order: Vec<usize> = Vec::new();
@@ -4180,6 +4493,10 @@ fn thread_views_for_project(
 }
 
 impl Project {
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
+    }
+
     fn view(&self, live_workspaces: &[String], is_remote: bool) -> WorkspaceThreadsView {
         WorkspaceThreadsView {
             pinned_threads: vec![],
@@ -4191,6 +4508,8 @@ impl Project {
                 threads: thread_views_for_project(self, Some(&self.id), live_workspaces),
                 is_remote,
                 distro: None,
+                is_archived: false,
+                archived_at: None,
             }],
             ref_groups: Vec::new(),
             display_order: vec![SidebarFolder::Project(0)],
@@ -4261,17 +4580,29 @@ impl WorkspaceThreadStore {
         for index in 0..self.spaces.len() {
             let space_id = self.spaces[index].id.clone();
             let active_project_id = self.spaces[index].active_project_id.clone();
+            // An archived project cannot stay the Space's active pointer:
+            // the sidebar would open onto a hidden row.
             let active_is_valid = active_project_id.as_ref().is_some_and(|project_id| {
-                self.projects
-                    .iter()
-                    .any(|project| project.space_id == space_id && &project.id == project_id)
+                self.projects.iter().any(|project| {
+                    project.space_id == space_id
+                        && &project.id == project_id
+                        && !project.is_archived()
+                })
             });
             if !active_is_valid {
                 let next_active_project_id = self
                     .projects
                     .iter()
-                    .find(|project| project.space_id == space_id)
-                    .map(|project| project.id.clone());
+                    .find(|project| project.space_id == space_id && !project.is_archived())
+                    .map(|project| project.id.clone())
+                    .or_else(|| {
+                        // Every project archived: keep any pointer rather
+                        // than none, so the Space still resolves.
+                        self.projects
+                            .iter()
+                            .find(|project| project.space_id == space_id)
+                            .map(|project| project.id.clone())
+                    });
                 if self.spaces[index].active_project_id != next_active_project_id {
                     self.spaces[index].active_project_id = next_active_project_id;
                     changed = true;
@@ -4566,10 +4897,12 @@ impl WorkspaceThreadStore {
         let space = self.spaces.iter().find(|space| space.id == space_id)?;
         // A dangling ref (origin rows not in the local cache) cannot be
         // activated, so it cannot be a restore target either.
+        // A ref whose origin project is archived is hidden from the view,
+        // so restoring it would activate a thread with no visible row.
         let resolvable = |id: &String| {
-            self.projects
-                .iter()
-                .any(|project| project.threads.iter().any(|thread| &thread.id == id))
+            self.projects.iter().any(|project| {
+                !project.is_archived() && project.threads.iter().any(|thread| &thread.id == id)
+            })
         };
         let last_opened = space
             .active_thread_ref
@@ -4734,6 +5067,12 @@ impl WorkspaceThreadStore {
                         dangling: true,
                     });
                 };
+                // A ref into an archived project is hidden, not pruned:
+                // the row (and groom's resolution above it) survives, so
+                // unarchiving brings the ref back verbatim.
+                if project.is_archived() {
+                    return None;
+                }
                 let origin = self.spaces.iter().find(|s| s.id == project.space_id)?;
                 let session = project.threads.iter().find(|t| &t.id == thread_id)?;
                 let workspace_name = session
@@ -4909,6 +5248,14 @@ impl WorkspaceThreadStore {
             .iter()
             .find(|p| p.space_id == space_id && p.path == current.path)
         {
+            if project.is_archived() {
+                // This is a background sync fallback, not an open-folder
+                // gesture: it must neither resurrect the archived project
+                // nor point the Space at a hidden row. (Explicitly opening
+                // the folder goes through create_project_from_path, which
+                // does unarchive.)
+                return (project.id.clone(), false);
+            }
             (project.id.clone(), false)
         } else {
             let mut project = current;
@@ -4932,14 +5279,18 @@ impl WorkspaceThreadStore {
         space_id: &str,
         project_id: &str,
         live_workspaces: &[String],
+        include_archived: bool,
     ) -> WorkspaceThreadsView {
         let active_project_id = self
             .active_project_id_for_space(space_id)
             .unwrap_or_else(|| project_id.to_string());
+        // An archived project's pinned threads never surface in Pinned --
+        // unconditionally, even while the transient reveal is showing the
+        // archived rows themselves.
         let pinned_threads = self
             .projects
             .iter()
-            .filter(|project| project.space_id == space_id)
+            .filter(|project| project.space_id == space_id && !project.is_archived())
             .flat_map(|project| {
                 thread_views_for_project(project, Some(&active_project_id), live_workspaces)
                     .into_iter()
@@ -4949,22 +5300,28 @@ impl WorkspaceThreadStore {
         let projects: Vec<ProjectView> = self
             .projects
             .iter()
-            .filter(|project| project.space_id == space_id)
+            .filter(|project| {
+                project.space_id == space_id && (include_archived || !project.is_archived())
+            })
             .map(|project| {
                 let is_remote = is_remote_project(project, &self.spaces);
+                let is_archived = project.is_archived();
                 ProjectView {
                     id: project.id.clone(),
                     name: project.name.clone(),
-                    is_active: project.id == active_project_id,
-                    threads_collapsed: project.threads_collapsed,
-                    threads: thread_views_for_project(
-                        project,
-                        Some(&active_project_id),
-                        live_workspaces,
-                    )
-                    .into_iter()
-                    .filter(|session| !session.is_pinned)
-                    .collect(),
+                    is_active: !is_archived && project.id == active_project_id,
+                    // Archived rows paint as a single collapsed line: no
+                    // thread rows means every downstream height/scroll walk
+                    // is already correct with no edits.
+                    threads_collapsed: is_archived || project.threads_collapsed,
+                    threads: if is_archived {
+                        Vec::new()
+                    } else {
+                        thread_views_for_project(project, Some(&active_project_id), live_workspaces)
+                            .into_iter()
+                            .filter(|session| !session.is_pinned)
+                            .collect()
+                    },
                     is_remote,
                     distro: if is_remote {
                         crate::ssh_hosts::host_spec(remote_host_id_for_project_id(&project.id))
@@ -4972,6 +5329,8 @@ impl WorkspaceThreadStore {
                     } else {
                         None
                     },
+                    is_archived,
+                    archived_at: project.archived_at,
                 }
             })
             .collect();
@@ -5054,31 +5413,42 @@ impl WorkspaceThreadStore {
         if self.workspace_belongs_to_other_space(space_id, active_workspace) {
             return changed;
         }
-        let (project_id, project_changed) =
-            if let Some(project_id) = self.project_id_for_workspace(space_id, active_workspace) {
-                if self.set_active_project_for_space(space_id, project_id.clone()) {
-                    (project_id, true)
-                } else {
-                    (project_id, false)
-                }
-            } else if self.is_client_domain_space(space_id) {
-                // A mux-domain Space's connect window lives in the default
-                // mux workspace, which is not bound to any thread. Resolve to
-                // the Space's mux project instead of manufacturing a local
-                // Home project.
-                let Some(project_id) = self
-                    .projects
-                    .iter()
-                    .find(|p| p.space_id == space_id && is_mux_domain_project_id(&p.id))
-                    .map(|p| p.id.clone())
-                else {
-                    return changed;
-                };
-                let set = self.set_active_project_for_space(space_id, project_id.clone());
-                (project_id, set)
+        let (project_id, project_changed) = if let Some(project_id) =
+            self.project_id_for_workspace(space_id, active_workspace)
+        {
+            // A window can outlive its project's archiving (e.g. the
+            // archive ran on another device). Never point the Space at
+            // the hidden row: normalize would repoint it right back,
+            // and the two would churn the store on every notification.
+            let archived = self
+                .projects
+                .iter()
+                .any(|project| project.id == project_id && project.is_archived());
+            if !archived && self.set_active_project_for_space(space_id, project_id.clone()) {
+                (project_id, true)
             } else {
-                self.ensure_current_project(space_id, active_workspace)
+                (project_id, false)
+            }
+        } else if self.is_client_domain_space(space_id) {
+            // A mux-domain Space's connect window lives in the default
+            // mux workspace, which is not bound to any thread. Resolve to
+            // the Space's mux project instead of manufacturing a local
+            // Home project.
+            let Some(project_id) = self
+                .projects
+                .iter()
+                .find(|p| {
+                    p.space_id == space_id && is_mux_domain_project_id(&p.id) && !p.is_archived()
+                })
+                .map(|p| p.id.clone())
+            else {
+                return changed;
             };
+            let set = self.set_active_project_for_space(space_id, project_id.clone());
+            (project_id, set)
+        } else {
+            self.ensure_current_project(space_id, active_workspace)
+        };
         changed |= project_changed;
         changed |= self.sync_active_workspace(space_id, &project_id, active_workspace);
         changed
@@ -5219,6 +5589,9 @@ impl WorkspaceThreadStore {
             project.space_id = space_id.to_string();
             project.name = label.to_string();
             project.path = path.clone();
+            // Connecting to the host is an explicit gesture; it revives an
+            // archived project rather than landing threads in a hidden row.
+            project.archived_at = None;
         } else {
             self.projects.push(Project {
                 id: project_id.clone(),
@@ -5229,6 +5602,7 @@ impl WorkspaceThreadStore {
                 active_thread_id: None,
                 threads_collapsed: false,
                 active_note_path: None,
+                archived_at: None,
             });
         }
 
@@ -5259,9 +5633,15 @@ impl WorkspaceThreadStore {
         let project_id = project_id_for_path(space_id, &path);
         if let Some(existing_project_id) = self
             .projects
-            .iter()
+            .iter_mut()
             .find(|project| project.space_id == space_id && project.path == path)
-            .map(|project| project.id.clone())
+            .map(|project| {
+                // Opening the folder again is an unambiguous intent to
+                // un-hide it; a duplicate row on the same path would break
+                // the path->id reuse contract.
+                project.archived_at = None;
+                project.id.clone()
+            })
         {
             if let Some(thread_id) = self.active_thread_for_project(&existing_project_id) {
                 return thread_id;
@@ -5283,6 +5663,7 @@ impl WorkspaceThreadStore {
             active_thread_id: None,
             threads_collapsed: false,
             active_note_path: None,
+            archived_at: None,
         };
         let session = WorkspaceThread::new(project_id.clone(), "main".to_string(), None);
         let thread_id = session.id.clone();
@@ -5357,7 +5738,9 @@ impl WorkspaceThreadStore {
             .active_project_id_for_space(space_id)
             .and_then(|active_project_id| {
                 self.projects.iter().position(|project| {
-                    project.space_id == space_id && project.id == active_project_id
+                    project.space_id == space_id
+                        && project.id == active_project_id
+                        && !project.is_archived()
                 })
             })
             .into_iter()
@@ -5365,7 +5748,9 @@ impl WorkspaceThreadStore {
                 self.projects
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, project)| (project.space_id == space_id).then_some(index)),
+                    .filter_map(|(index, project)| {
+                        (project.space_id == space_id && !project.is_archived()).then_some(index)
+                    }),
             )
             .collect::<Vec<_>>();
 
@@ -5390,7 +5775,7 @@ impl WorkspaceThreadStore {
 
     fn restorable_thread_id_for_project(&self, project_index: usize) -> Option<WorkspaceThreadId> {
         let project = self.projects.get(project_index)?;
-        if self.is_client_domain_space(&project.space_id) {
+        if project.is_archived() || self.is_client_domain_space(&project.space_id) {
             return None;
         }
         project
@@ -5702,19 +6087,34 @@ impl WorkspaceThreadStore {
             live_projects.insert(project.id.as_str());
             let known_project = last_known.project(&project.id);
             match known_project {
-                None => ops.push(codec::TreeOp::CreateProject {
-                    project_id: project.id.clone(),
-                    space_id: project.space_id.clone(),
-                    name: project.name.clone(),
-                    path: project.path.to_string_lossy().to_string(),
-                }),
-                Some(known) if known.name != project.name => {
-                    ops.push(codec::TreeOp::RenameProject {
+                None => {
+                    ops.push(codec::TreeOp::CreateProject {
                         project_id: project.id.clone(),
+                        space_id: project.space_id.clone(),
                         name: project.name.clone(),
-                    })
+                        path: project.path.to_string_lossy().to_string(),
+                    });
+                    if project.archived_at.is_some() {
+                        ops.push(codec::TreeOp::SetProjectArchived {
+                            project_id: project.id.clone(),
+                            archived_at: project.archived_at,
+                        });
+                    }
                 }
-                Some(_) => {}
+                Some(known) => {
+                    if known.name != project.name {
+                        ops.push(codec::TreeOp::RenameProject {
+                            project_id: project.id.clone(),
+                            name: project.name.clone(),
+                        });
+                    }
+                    if known.archived_at != project.archived_at {
+                        ops.push(codec::TreeOp::SetProjectArchived {
+                            project_id: project.id.clone(),
+                            archived_at: project.archived_at,
+                        });
+                    }
+                }
             }
             for thread in &project.threads {
                 live_threads.insert(thread.id.as_str());
@@ -5972,6 +6372,9 @@ impl WorkspaceThreadStore {
                     threads,
                     threads_collapsed: view.map_or(false, |view| view.threads_collapsed),
                     active_note_path: view.and_then(|view| view.active_note_path.clone()),
+                    // Server-owned, never carried over from the previous
+                    // local rows: archived state lives in the shared tree.
+                    archived_at: project.archived_at,
                 }
             })
             .collect();
@@ -6285,7 +6688,7 @@ impl WorkspaceThreadStore {
         let project_count = self
             .projects
             .iter()
-            .filter(|project| project.space_id == space_id)
+            .filter(|project| project.space_id == space_id && !project.is_archived())
             .count();
 
         if project_count <= 1 {
@@ -6393,12 +6796,15 @@ impl WorkspaceThreadStore {
             .iter()
             .position(|project| project.id == project_id)?;
         let space_id = self.projects[index].space_id.clone();
-        if self
-            .projects
-            .iter()
-            .filter(|project| project.space_id == space_id)
-            .count()
-            <= 1
+        // Count live projects only: archived rows must not prop up a Space
+        // that has no usable project left.
+        if !self.projects[index].is_archived()
+            && self
+                .projects
+                .iter()
+                .filter(|project| project.space_id == space_id && !project.is_archived())
+                .count()
+                <= 1
         {
             return None;
         }
@@ -6415,7 +6821,7 @@ impl WorkspaceThreadStore {
                 .projects
                 .iter()
                 .enumerate()
-                .filter(|(_, project)| project.space_id == space_id)
+                .filter(|(_, project)| project.space_id == space_id && !project.is_archived())
                 .map(|(idx, _)| idx)
                 .find(|idx| *idx >= index)
                 .or_else(|| {
@@ -6423,7 +6829,7 @@ impl WorkspaceThreadStore {
                         .iter()
                         .enumerate()
                         .rev()
-                        .find(|(_, project)| project.space_id == space_id)
+                        .find(|(_, project)| project.space_id == space_id && !project.is_archived())
                         .map(|(idx, _)| idx)
                 })
             else {
@@ -6461,6 +6867,136 @@ impl WorkspaceThreadStore {
             next_thread_id,
             materialized_workspace_names,
         })
+    }
+
+    /// Repoint the Space's active project/thread away from `project_id`,
+    /// landing on the next live project down (wrapping like
+    /// `remove_project`), minting a "main" thread when the target has none.
+    /// Returns None when the Space has no other live project.
+    fn land_active_off_project(
+        &mut self,
+        space_id: &str,
+        project_id: &str,
+    ) -> Option<WorkspaceThreadId> {
+        let index = self
+            .projects
+            .iter()
+            .position(|project| project.id == project_id)?;
+        let next_index = self
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(idx, project)| {
+                *idx != index && project.space_id == space_id && !project.is_archived()
+            })
+            .map(|(idx, _)| idx)
+            .find(|idx| *idx > index)
+            .or_else(|| {
+                self.projects
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(idx, project)| {
+                        *idx != index && project.space_id == space_id && !project.is_archived()
+                    })
+                    .map(|(idx, _)| idx)
+            })?;
+        let next_project_id = self.projects[next_index].id.clone();
+        let picked = self.projects[next_index]
+            .active_thread_id
+            .clone()
+            .filter(|id| {
+                self.projects[next_index]
+                    .threads
+                    .iter()
+                    .any(|session| &session.id == id)
+            })
+            .or_else(|| {
+                self.projects[next_index]
+                    .threads
+                    .first()
+                    .map(|session| session.id.clone())
+            });
+        let thread_id = match picked {
+            Some(id) => id,
+            None => {
+                let project = &mut self.projects[next_index];
+                let session = WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
+                let id = session.id.clone();
+                project.threads.push(session);
+                id
+            }
+        };
+        self.projects[next_index].active_thread_id = Some(thread_id.clone());
+        self.set_active_project_for_space(space_id, next_project_id);
+        Some(thread_id)
+    }
+
+    /// Archive a project in place: rows, layouts, pins and workspace
+    /// bindings all stay so unarchiving can rebuild the shells. The caller
+    /// kills the materialized windows afterwards, exactly like
+    /// `remove_project`'s caller does.
+    fn archive_project(
+        &mut self,
+        project_id: &str,
+        archived_at: i64,
+    ) -> Result<ArchivedProject, ArchiveProjectError> {
+        let index = self
+            .projects
+            .iter()
+            .position(|project| project.id == project_id)
+            .ok_or(ArchiveProjectError::NotFound)?;
+        if self.projects[index].is_archived() {
+            return Err(ArchiveProjectError::AlreadyArchived);
+        }
+        let space_id = self.projects[index].space_id.clone();
+        if self
+            .projects
+            .iter()
+            .filter(|project| project.space_id == space_id && !project.is_archived())
+            .count()
+            <= 1
+        {
+            return Err(ArchiveProjectError::LastLiveProject);
+        }
+        let was_active = self.active_project_id_for_space(&space_id).as_deref() == Some(project_id);
+        let materialized_workspace_names = self.projects[index]
+            .threads
+            .iter()
+            .filter_map(|session| session.materialized_workspace_name.clone())
+            .collect::<Vec<_>>();
+
+        // Land on another live project, preferring the next one down like
+        // remove_project does; the guard above proved one exists.
+        let next_thread_id = if was_active {
+            let landed = self
+                .land_active_off_project(&space_id, project_id)
+                .ok_or(ArchiveProjectError::LastLiveProject)?;
+            Some(landed)
+        } else {
+            None
+        };
+
+        self.projects[index].archived_at = Some(archived_at);
+        Ok(ArchivedProject {
+            was_active,
+            next_thread_id,
+            materialized_workspace_names,
+        })
+    }
+
+    fn unarchive_project(&mut self, project_id: &str) -> bool {
+        match self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        {
+            Some(project) if project.is_archived() => {
+                project.archived_at = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn toggle_project_threads_collapsed(&mut self, project_id: &str) -> bool {
@@ -7305,9 +7841,7 @@ fn scan_workspace_work_status(workspace: &str) -> (WorkspaceThreadWorkStatus, Ve
                     .flatten()
                     .unwrap_or_else(|| native_pane_work_status(pane.as_ref()));
                 match observed {
-                    WorkspaceThreadWorkStatus::NeedsAttention => {
-                        waiting_panes.push(pane.pane_id())
-                    }
+                    WorkspaceThreadWorkStatus::NeedsAttention => waiting_panes.push(pane.pane_id()),
                     WorkspaceThreadWorkStatus::Running => running = true,
                     _ => {}
                 }
@@ -7604,6 +8138,10 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                 if project.space_id != space_id {
                     continue;
                 }
+                // A live remote session proves the project is in use; a
+                // hidden row must not swallow it unreachably. The reconcile
+                // that follows adoption propagates the un-archive.
+                project.archived_at = None;
                 let mut thread =
                     WorkspaceThread::new(project_id, "main".to_string(), Some(workspace));
                 thread.id = thread_id;
@@ -7639,6 +8177,7 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                         active_thread_id: None,
                         threads_collapsed: false,
                         active_note_path: None,
+                        archived_at: None,
                     });
                 }
                 let project = store
@@ -7679,6 +8218,7 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                     active_thread_id: Some(thread_id),
                     threads_collapsed: false,
                     active_note_path: None,
+                    archived_at: None,
                 });
                 changed = true;
             }
@@ -7770,6 +8310,7 @@ impl WorkspaceThreadStore {
                 active_thread_id: None,
                 threads_collapsed: false,
                 active_note_path: None,
+                archived_at: None,
             });
         }
 
@@ -7778,6 +8319,10 @@ impl WorkspaceThreadStore {
             .iter_mut()
             .find(|p| p.id == project_id)
             .expect("mux domain project was just ensured");
+        // Connecting to the server is an explicit gesture: a hidden project
+        // must not swallow the attach. The reconcile that follows a connect
+        // propagates the un-archive to the server.
+        project.archived_at = None;
         if project.threads.is_empty() {
             project.threads.push(WorkspaceThread::new(
                 project_id.clone(),
@@ -8573,6 +9118,7 @@ mod tests {
             active_thread_id: None,
             threads_collapsed: false,
             active_note_path: None,
+            archived_at: None,
         }
     }
 
@@ -9028,6 +9574,7 @@ mod tests {
             active_thread_id: None,
             threads_collapsed: false,
             active_note_path: None,
+            archived_at: None,
         });
 
         let state = store
@@ -9083,7 +9630,7 @@ mod tests {
                 requested_root: dir.path().to_string_lossy().into_owned(),
             }
         );
-        let view = store.view_for_project(&space_id, "project-path", &[]);
+        let view = store.view_for_project(&space_id, "project-path", &[], false);
         assert!(view.projects[0].is_remote);
         assert!(store.project_reveal_path("project-path").is_none());
         assert!(!store.snapshot_active_space_thread_layout(
@@ -9128,6 +9675,7 @@ mod tests {
             active_thread_id: None,
             threads_collapsed: false,
             active_note_path: None,
+            archived_at: None,
         });
 
         let plan = store
@@ -9292,11 +9840,7 @@ mod tests {
         );
 
         let change = store
-            .observe_thread_work_for_workspace(
-                "workspace-1",
-                WorkspaceThreadWorkStatus::Idle,
-                &[],
-            )
+            .observe_thread_work_for_workspace("workspace-1", WorkspaceThreadWorkStatus::Idle, &[])
             .unwrap();
         assert!(change.changed);
         assert!(change.should_persist);
@@ -9566,6 +10110,8 @@ mod tests {
                 ],
                 is_remote: false,
                 distro: None,
+                is_archived: false,
+                archived_at: None,
             }],
             ref_groups: Vec::new(),
             display_order: Vec::new(),
@@ -10064,7 +10610,7 @@ mod tests {
         store.projects.push(second_project);
         store.set_active_project_for_space(&space_id, "project-2".to_string());
 
-        let view = store.view_for_project(&space_id, "project-2", &[]);
+        let view = store.view_for_project(&space_id, "project-2", &[], false);
         assert!(!view.projects[0].is_active);
         assert!(!view.projects[0].threads[0].is_active);
         assert!(view.projects[1].is_active);
@@ -10192,6 +10738,52 @@ mod tests {
         assert!(!store.move_sidebar_folder_before(&local_space, "rp1", Some("nope")));
         // Domain-owned Spaces keep the server-synced project order.
         assert!(!store.move_sidebar_folder_before("space-remote", "rp1", None));
+    }
+
+    #[test]
+    fn tmp_probe_archived_breaks_mirror_and_folder_order() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        let local_space = store.spaces[0].id.clone();
+        store.projects.push(test_project_in_space(
+            &local_space,
+            "local-2",
+            "beta",
+            PathBuf::from("/tmp/beta"),
+            vec![],
+        ));
+        store.projects.push(test_project_in_space(
+            &local_space,
+            "local-3",
+            "gamma",
+            PathBuf::from("/tmp/gamma"),
+            vec![],
+        ));
+        store.archive_project("local-3", 100).unwrap();
+        eprintln!(
+            "PROBE keys before = {:?}",
+            ordered_folder_keys_locked(&store, &local_space)
+        );
+        assert!(store.move_sidebar_folder_before(&local_space, "local-1", None));
+        eprintln!(
+            "PROBE keys after  = {:?}",
+            ordered_folder_keys_locked(&store, &local_space)
+        );
+        let vec_order: Vec<&str> = store
+            .projects
+            .iter()
+            .filter(|project| project.space_id == local_space)
+            .map(|project| project.id.as_str())
+            .collect();
+        eprintln!("PROBE vec order   = {:?}", vec_order);
+        let fo = store
+            .spaces
+            .iter()
+            .find(|s| s.id == local_space)
+            .unwrap()
+            .folder_order
+            .clone();
+        eprintln!("PROBE folder_order= {:?}", fo);
     }
 
     /// A move is a re-home: the thread leaves its project, joins the target
@@ -10357,6 +10949,8 @@ mod tests {
                 threads: vec![make("own-active", true), make("own-idle", false)],
                 is_remote: false,
                 distro: None,
+                is_archived: false,
+                archived_at: None,
             }],
             ref_groups: Vec::new(),
             display_order: Vec::new(),
@@ -10783,7 +11377,7 @@ mod tests {
         assert!(updated.is_pinned);
         assert!(updated.is_unread);
 
-        let view = store.view_for_project(&space_id, "project-1", &[]);
+        let view = store.view_for_project(&space_id, "project-1", &[], false);
         assert_eq!(view.pinned_threads.len(), 1);
         assert_eq!(view.pinned_threads[0].id, second_id);
         assert_eq!(view.projects[0].threads.len(), 1);
@@ -10960,6 +11554,7 @@ mod tests {
                     tree_thread("rt1", "rp1", "main"),
                     tree_thread("rt2", "rp1", "build"),
                 ],
+                archived_at: None,
             }],
             revision: 1,
         }
@@ -11503,6 +12098,7 @@ mod tests {
             active_thread_id: None,
             threads_collapsed: false,
             active_note_path: None,
+            archived_at: None,
         });
 
         let mine = store.materialized_workspaces_for_space("space-remote");
@@ -11640,6 +12236,7 @@ mod tests {
             name: "notes".to_string(),
             path: "/srv/notes".to_string(),
             threads: vec![tree_thread("rt3", "rp2", "main")],
+            archived_at: None,
         });
         assert!(store.ingest_remote_tree("syd", &tree));
 
@@ -11737,5 +12334,266 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Two local projects, the first active with a pinned thread and a
+    /// materialized workspace -- the archive fixture.
+    fn store_with_two_projects() -> (WorkspaceThreadStore, String, String) {
+        let mut store = test_store();
+        let mut alpha = default_project_for_space(DEFAULT_SPACE_ID);
+        alpha.id = "proj-alpha".to_string();
+        alpha.path = PathBuf::from("/tmp/alpha");
+        let mut t1 = WorkspaceThread::new(alpha.id.clone(), "main".to_string(), None);
+        t1.materialized_workspace_name = Some("ws-alpha".to_string());
+        t1.is_pinned = true;
+        let mut t2 = WorkspaceThread::new(alpha.id.clone(), "side".to_string(), None);
+        t2.layout = Some(WorkspaceThreadLayoutSnapshot {
+            active_tab: 0,
+            tabs: vec![],
+            terminal_specs: vec![],
+        });
+        alpha.active_thread_id = Some(t1.id.clone());
+        alpha.threads.push(t1);
+        alpha.threads.push(t2);
+        let mut beta = default_project_for_space(DEFAULT_SPACE_ID);
+        beta.id = "proj-beta".to_string();
+        beta.path = PathBuf::from("/tmp/beta");
+        let bt = WorkspaceThread::new(beta.id.clone(), "main".to_string(), None);
+        beta.active_thread_id = Some(bt.id.clone());
+        beta.threads.push(bt);
+        let (alpha_id, beta_id) = (alpha.id.clone(), beta.id.clone());
+        store.projects.push(alpha);
+        store.projects.push(beta);
+        store.set_active_project_for_space(DEFAULT_SPACE_ID, alpha_id.clone());
+        (store, alpha_id, beta_id)
+    }
+
+    #[test]
+    fn archiving_a_project_hides_it_and_moves_the_active_pointer() {
+        let (mut store, alpha, beta) = store_with_two_projects();
+        let archived = store.archive_project(&alpha, 100).unwrap();
+        assert!(archived.was_active);
+        assert_eq!(
+            archived.materialized_workspace_names,
+            vec!["ws-alpha".to_string()]
+        );
+        assert_eq!(
+            store
+                .active_project_id_for_space(DEFAULT_SPACE_ID)
+                .as_deref(),
+            Some(beta.as_str())
+        );
+        // Hidden from the ordinary view...
+        let view = store.view_for_project(DEFAULT_SPACE_ID, &beta, &[], false);
+        assert!(view.projects.iter().all(|project| project.id != alpha));
+        // ...but every row, pin and layout stays in the store.
+        let row = store.projects.iter().find(|p| p.id == alpha).unwrap();
+        assert_eq!(row.archived_at, Some(100));
+        assert_eq!(row.threads.len(), 2);
+        assert!(row.threads[0].is_pinned);
+        assert!(row.threads[1].layout.is_some());
+        assert!(row.threads[0].materialized_workspace_name.is_some());
+    }
+
+    #[test]
+    fn archiving_refuses_the_spaces_last_live_project() {
+        let (mut store, alpha, beta) = store_with_two_projects();
+        // test_store's normalize seeds a Home project too; archive
+        // everything but one and the last one must be refused.
+        let others: Vec<String> = store
+            .projects
+            .iter()
+            .filter(|p| p.space_id == DEFAULT_SPACE_ID && p.id != alpha)
+            .map(|p| p.id.clone())
+            .collect();
+        for id in &others {
+            store.archive_project(id, 50).unwrap();
+        }
+        assert_eq!(
+            store.archive_project(&alpha, 60),
+            Err(ArchiveProjectError::LastLiveProject)
+        );
+        assert_eq!(
+            store.archive_project(&beta, 61),
+            Err(ArchiveProjectError::AlreadyArchived)
+        );
+    }
+
+    #[test]
+    fn archived_projects_pinned_threads_leave_the_pinned_section() {
+        let (mut store, alpha, beta) = store_with_two_projects();
+        let pinned_before = store.view_for_project(DEFAULT_SPACE_ID, &beta, &[], false);
+        assert!(!pinned_before.pinned_threads.is_empty());
+        store.archive_project(&alpha, 100).unwrap();
+        // Unconditionally out of Pinned, reveal on or off.
+        for include_archived in [false, true] {
+            let view = store.view_for_project(DEFAULT_SPACE_ID, &beta, &[], include_archived);
+            assert!(view.pinned_threads.is_empty());
+        }
+    }
+
+    #[test]
+    fn revealing_archived_projects_puts_them_last_with_no_thread_rows() {
+        let (mut store, alpha, beta) = store_with_two_projects();
+        store.archive_project(&alpha, 100).unwrap();
+        let mut view = store.view_for_project(DEFAULT_SPACE_ID, &beta, &[], true);
+        // A persisted folder_order listing alpha first must not pull the
+        // archived row back up.
+        view.rebuild_display_order(&[alpha.clone()]);
+        view.partition_archived_last();
+        let last = view.display_order.last().unwrap();
+        match last {
+            SidebarFolder::Project(index) => {
+                let project = &view.projects[*index];
+                assert_eq!(project.id, alpha);
+                assert!(project.is_archived);
+                assert!(project.threads.is_empty());
+                assert!(project.threads_collapsed);
+                assert!(!project.is_active);
+            }
+            SidebarFolder::RefGroup(_) => panic!("expected the archived project last"),
+        }
+    }
+
+    #[test]
+    fn unarchiving_restores_the_project_and_its_threads() {
+        let (mut store, alpha, beta) = store_with_two_projects();
+        store.archive_project(&alpha, 100).unwrap();
+        assert!(store.unarchive_project(&alpha));
+        assert!(
+            !store.unarchive_project(&alpha),
+            "second restore is a no-op"
+        );
+        let view = store.view_for_project(DEFAULT_SPACE_ID, &beta, &[], false);
+        let row = view.projects.iter().find(|p| p.id == alpha).unwrap();
+        assert!(!row.is_archived);
+        assert!(!view.pinned_threads.is_empty(), "the pin came back");
+        let record = store.projects.iter().find(|p| p.id == alpha).unwrap();
+        assert!(record.threads[1].layout.is_some(), "layout survived");
+    }
+
+    #[test]
+    fn archived_state_survives_an_ingest_and_is_not_carried_over() {
+        // The server is authoritative: a locally-archived remote project
+        // whose tree says live comes back live, and vice versa.
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        store
+            .projects
+            .iter_mut()
+            .find(|p| p.id == "rp1")
+            .unwrap()
+            .archived_at = Some(7);
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        assert_eq!(
+            store
+                .projects
+                .iter()
+                .find(|p| p.id == "rp1")
+                .unwrap()
+                .archived_at,
+            None
+        );
+
+        let mut archived_tree = sample_tree();
+        archived_tree.projects[0].archived_at = Some(9);
+        archived_tree.revision = 2;
+        assert!(store.ingest_remote_tree("syd", &archived_tree));
+        assert_eq!(
+            store
+                .projects
+                .iter()
+                .find(|p| p.id == "rp1")
+                .unwrap()
+                .archived_at,
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn reconcile_emits_a_set_project_archived_when_only_the_flag_moved() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        store
+            .projects
+            .iter_mut()
+            .find(|p| p.id == "rp1")
+            .unwrap()
+            .archived_at = Some(11);
+        let ops = store.reconcile_ops_for_domain("syd", &sample_tree());
+        assert_eq!(
+            ops,
+            vec![codec::TreeOp::SetProjectArchived {
+                project_id: "rp1".to_string(),
+                archived_at: Some(11),
+            }]
+        );
+    }
+
+    #[test]
+    fn reopening_an_archived_projects_path_unarchives_it() {
+        let (mut store, alpha, _beta) = store_with_two_projects();
+        store.archive_project(&alpha, 100).unwrap();
+        let thread_id =
+            store.create_project_from_path(DEFAULT_SPACE_ID, PathBuf::from("/tmp/alpha"));
+        let row = store.projects.iter().find(|p| p.id == alpha).unwrap();
+        assert_eq!(row.archived_at, None, "reopening the folder revives it");
+        assert!(
+            row.threads.iter().any(|t| t.id == thread_id),
+            "the existing project was reused, not duplicated"
+        );
+        assert_eq!(
+            store
+                .projects
+                .iter()
+                .filter(|p| p.path == PathBuf::from("/tmp/alpha"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_archived_projects_refs_are_hidden_but_never_pruned() {
+        let (mut store, coll, t1, _) = store_with_collection();
+        assert!(store.add_thread_ref(&coll, &t1));
+        store.normalize_after_load();
+        let origin_project_id = store
+            .projects
+            .iter()
+            .find(|p| p.threads.iter().any(|t| t.id == t1))
+            .unwrap()
+            .id
+            .clone();
+        // Guard needs a second live project in the origin Space.
+        let mut extra = default_project_for_space(DEFAULT_SPACE_ID);
+        extra.id = "proj-extra".to_string();
+        extra.path = PathBuf::from("/tmp/extra");
+        extra.threads.push(WorkspaceThread::new(
+            extra.id.clone(),
+            "main".to_string(),
+            None,
+        ));
+        store.projects.push(extra);
+
+        store.archive_project(&origin_project_id, 100).unwrap();
+        assert!(
+            store.view_for_thread_refs(&coll, &[], None).is_empty(),
+            "refs into an archived project are hidden"
+        );
+        assert!(!store.groom_thread_refs(), "and groom must not prune them");
+        assert!(store
+            .spaces
+            .iter()
+            .find(|s| s.id == coll)
+            .unwrap()
+            .thread_refs
+            .contains(&t1));
+
+        store.unarchive_project(&origin_project_id);
+        assert_eq!(
+            store.view_for_thread_refs(&coll, &[], None).len(),
+            1,
+            "unarchiving brings the ref row back verbatim"
+        );
     }
 }
