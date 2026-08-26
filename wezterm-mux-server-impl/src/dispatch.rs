@@ -64,6 +64,20 @@ where
         mux.subscribe(move |n| tx.try_send(Item::Notif(n)).is_ok());
     }
 
+    // Notification PDUs go through the same WritePdu queue as RPC
+    // responses instead of being written inline: the WritePdu arm below is
+    // the one place that tolerates a half-closed peer (BrokenPipe), and an
+    // inline `?` write here would kill the whole connection — and with it
+    // every pane's output push — the moment a notification raced a
+    // disconnecting client. A failed try_send means the channel is closed
+    // and the connection is already over.
+    let send_notif_pdu = {
+        let item_tx = item_tx.clone();
+        move |pdu: Pdu| {
+            let _ = item_tx.try_send(Item::WritePdu(DecodedPdu { serial: 0, pdu }));
+        }
+    };
+
     loop {
         let rx_msg = item_rx.recv();
         let wait_for_read = stream.readable().map(|_| Ok(Item::Readable));
@@ -116,16 +130,13 @@ where
                 // Read the status at send time so the payload is always the
                 // freshest classification, never a queued stale value.
                 let status = Mux::get().get_pane(pane_id).and_then(|p| p.agent_status());
-                Pdu::AgentStatusChanged(codec::AgentStatusChanged { pane_id, status })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::AgentStatusChanged(codec::AgentStatusChanged {
+                    pane_id,
+                    status,
+                }));
             }
             Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
-                Pdu::PaneRemoved(codec::PaneRemoved { pane_id })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id }));
             }
             Ok(Item::Notif(MuxNotification::Alert { pane_id, alert })) => {
                 {
@@ -141,20 +152,17 @@ where
                 selection,
                 clipboard,
             })) => {
-                Pdu::SetClipboard(codec::SetClipboard {
+                send_notif_pdu(Pdu::SetClipboard(codec::SetClipboard {
                     pane_id,
                     clipboard,
                     selection,
-                })
-                .encode_async(&mut stream, 0)
-                .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                }));
             }
             Ok(Item::Notif(MuxNotification::TabAddedToWindow { tab_id, window_id })) => {
-                Pdu::TabAddedToWindow(codec::TabAddedToWindow { tab_id, window_id })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::TabAddedToWindow(codec::TabAddedToWindow {
+                    tab_id,
+                    window_id,
+                }));
             }
             Ok(Item::Notif(MuxNotification::WindowRemoved(_window_id))) => {}
             Ok(Item::Notif(MuxNotification::WindowCreated(_window_id))) => {}
@@ -166,80 +174,63 @@ where
                         .map(|w| w.get_workspace().to_string())
                 };
                 if let Some(workspace) = workspace {
-                    Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
+                    send_notif_pdu(Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
                         window_id,
                         workspace,
-                    })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    }));
                 }
             }
             Ok(Item::Notif(MuxNotification::PaneFocused(pane_id))) => {
-                Pdu::PaneFocused(codec::PaneFocused { pane_id })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::PaneFocused(codec::PaneFocused { pane_id }));
             }
             Ok(Item::Notif(MuxNotification::TabResized(tab_id))) => {
-                Pdu::TabResized(codec::TabResized { tab_id })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::TabResized(codec::TabResized { tab_id }));
             }
             Ok(Item::Notif(MuxNotification::TabTitleChanged { tab_id, title })) => {
-                Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title }));
             }
             Ok(Item::Notif(MuxNotification::WindowTitleChanged { window_id, title })) => {
-                Pdu::WindowTitleChanged(codec::WindowTitleChanged { window_id, title })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::WindowTitleChanged(codec::WindowTitleChanged {
+                    window_id,
+                    title,
+                }));
             }
             Ok(Item::Notif(MuxNotification::WorkspaceRenamed {
                 old_workspace,
                 new_workspace,
             })) => {
-                Pdu::RenameWorkspace(codec::RenameWorkspace {
+                send_notif_pdu(Pdu::RenameWorkspace(codec::RenameWorkspace {
                     old_workspace,
                     new_workspace,
-                })
-                .encode_async(&mut stream, 0)
-                .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                }));
             }
             Ok(Item::Notif(MuxNotification::ThinkTermTreeChanged)) => {
                 // The tree is small enough to resend whole; this is also the
                 // path that tells the client which mutated it that the server
                 // accepted the op.
-                Pdu::ThinkTermTreeState(codec::ThinkTermTreeState {
+                send_notif_pdu(Pdu::ThinkTermTreeState(codec::ThinkTermTreeState {
                     tree: crate::thinkterm_tree::snapshot(),
-                })
-                .encode_async(&mut stream, 0)
-                .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                }));
             }
             Ok(Item::Notif(MuxNotification::ThinkTermSessionChanged)) => {
-                let state = crate::thinkterm_session::snapshot()?;
-                Pdu::ThinkTermSessionState(state)
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                // A snapshot failure must not kill the connection — that
+                // would stop every pane's pushes for this client.
+                match crate::thinkterm_session::snapshot() {
+                    Ok(state) => send_notif_pdu(Pdu::ThinkTermSessionState(state)),
+                    Err(err) => {
+                        log::error!("ThinkTermSessionState snapshot failed: {err:#}")
+                    }
+                }
             }
             Ok(Item::Notif(MuxNotification::FrontendLeaseChanged(state))) => {
-                Pdu::ClientViewportState(crate::sessionhandler::codec_viewport_state(state))
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::ClientViewportState(
+                    crate::sessionhandler::codec_viewport_state(state),
+                ));
             }
             Ok(Item::Notif(MuxNotification::FrontendAccessChanged(state))) => {
-                Pdu::FrontendAccessState(crate::sessionhandler::codec_access_state(state))
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                stream.flush().await.context("flushing PDU to client")?;
+                send_notif_pdu(Pdu::FrontendAccessState(
+                    crate::sessionhandler::codec_access_state(state),
+                ));
             }
             Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
             Ok(Item::Notif(MuxNotification::Empty)) => {}
