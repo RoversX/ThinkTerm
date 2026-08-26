@@ -36,8 +36,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
 /// Minimum interval between screen reads for one pane even while output
-/// is flowing.
-const SCREEN_READ_FLOOR: Duration = Duration::from_millis(150);
+/// is flowing. Must be comfortably larger than EVAL_INTERVAL to do
+/// anything at all: at 150ms it equaled the drain cadence and every
+/// round of a busy pane paid the full 64-row deep clone under the
+/// terminal lock plus a whole-manifest scan, on the main thread.
+const SCREEN_READ_FLOOR: Duration = Duration::from_millis(500);
 /// How many rows from the bottom of the live screen the rules may see.
 /// Large enough to cover a whole typical viewport: manifests address the
 /// top of the screen too (`top_non_empty_lines`), and a prompt drawn up
@@ -50,6 +53,10 @@ const EVAL_INTERVAL: Duration = Duration::from_millis(150);
 /// Quiet panes emit no PaneOutput, but contract freshness expiry, agents
 /// exiting back to a shell, and pane death still need a pulse.
 const SAFETY_TICK: Duration = Duration::from_secs(2);
+/// How long an unidentified background pane's evaluation may be deferred.
+/// Deliberately shorter than SAFETY_TICK: with equal periods the throttle
+/// window aliases against the tick and doubles the effective latency.
+const BACKGROUND_EVAL_WINDOW: Duration = Duration::from_millis(1500);
 
 struct ScreenCache {
     seqno: termwiz::surface::SequenceNo,
@@ -92,6 +99,9 @@ struct AgentPaneRecord {
 lazy_static::lazy_static! {
     static ref REGISTRY: RwLock<HashMap<PaneId, AgentPaneRecord>> = RwLock::new(HashMap::new());
     static ref PENDING: Mutex<HashSet<PaneId>> = Mutex::new(HashSet::new());
+    /// When each pane was last actually evaluated; lets the drain hold
+    /// background panes to the safety-tick cadence without a record.
+    static ref LAST_EVAL: Mutex<HashMap<PaneId, Instant>> = Mutex::new(HashMap::new());
     static ref PROCESS_PREFERENCE: RwLock<Option<Box<dyn Fn() -> bool + Send + Sync>>> =
         RwLock::new(None);
 }
@@ -301,6 +311,7 @@ pub fn reload_rules() -> usize {
 /// on the same dispatch channel; do not add further silent mutations.
 fn evict_pane(pane_id: PaneId) -> bool {
     identify::forget_pane(pane_id);
+    LAST_EVAL.lock().remove(&pane_id);
     REGISTRY
         .write()
         .remove(&pane_id)
@@ -327,6 +338,18 @@ fn publish_change(pane_id: PaneId) {
     .detach();
 }
 
+/// Whether some window's active tab contains the pane — i.e. a frontend
+/// could be painting it right now. `get_active_tab_for_window` clones the
+/// tab Arc and releases the windows guard before the tab's own lock is
+/// touched, so this adds no new lock-order pairing. Consulted lazily,
+/// after the cheap throttle checks.
+fn pane_is_foreground(mux: &Mux, pane_id: PaneId) -> bool {
+    mux.iter_windows().into_iter().any(|window_id| {
+        mux.get_active_tab_for_window(window_id)
+            .is_some_and(|tab| tab.contains_pane(pane_id))
+    })
+}
+
 fn drain_and_evaluate() {
     if !detection_enabled() {
         // Enabled→disabled edge: evict everything, loudly.
@@ -337,12 +360,16 @@ fn drain_and_evaluate() {
             }
         }
         PENDING.lock().clear();
+        // PaneRemoved is ignored while detection is off, so this sweep is
+        // the only place orphaned timestamps get reclaimed.
+        LAST_EVAL.lock().clear();
         return;
     }
     let dirty: Vec<PaneId> = PENDING.lock().drain().collect();
     let Some(mux) = Mux::try_get() else {
         return;
     };
+    let now = Instant::now();
     for pane_id in dirty {
         let Some(pane) = mux.get_pane(pane_id) else {
             if evict_pane(pane_id) {
@@ -359,6 +386,28 @@ fn drain_and_evaluate() {
             }
             continue;
         }
+        // Only panes without a live record are throttled in the
+        // background: their evaluation exists to notice a new agent
+        // appearing, which can wait — a background `cargo build`
+        // otherwise costs a full screen read + rule scan every
+        // EVAL_INTERVAL on the main thread. A recorded pane drives chips
+        // the GUI renders for every tab (including Blocked transitions
+        // someone is waiting on), so it always keeps the fast path, and
+        // so does hysteresis by extension (confirming implies a record).
+        if !REGISTRY.read().contains_key(&pane_id)
+            && LAST_EVAL
+                .lock()
+                .get(&pane_id)
+                .is_some_and(|at| now.duration_since(*at) < BACKGROUND_EVAL_WINDOW)
+            && !pane_is_foreground(&mux, pane_id)
+        {
+            // Deferred, not dropped: the mark that got us here may have
+            // been the pane's only one, and the next tick's drain must
+            // still see it.
+            PENDING.lock().insert(pane_id);
+            continue;
+        }
+        LAST_EVAL.lock().insert(pane_id, now);
         if evaluate_pane(pane.as_ref()) {
             publish_change(pane_id);
         }
