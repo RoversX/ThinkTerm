@@ -41,6 +41,10 @@ struct ResizeDecision {
     send_rpc: bool,
 }
 
+fn render_watchdog_should_run(dead: bool) -> bool {
+    !dead
+}
+
 #[derive(Debug, PartialEq)]
 struct ApplicationPaletteTransition {
     palette: ColorPalette,
@@ -668,6 +672,25 @@ impl ClientPane {
     /// the background instead, so it does not need this one-shot suppression.
     pub fn ignore_next_kill(&self) {
         *self.ignore_next_kill.lock() = true;
+    }
+
+    /// True when the renderable is sitting on displayed content the GUI
+    /// has not painted: rows tagged Stale awaiting a re-fetch, or fetches
+    /// in flight far longer than any healthy round trip (those are
+    /// repaired so the triggered paint re-requests them, and the poll
+    /// backoff is reset). `viewport_top` is the GUI's displayed viewport
+    /// origin for this pane (None = following the tail).
+    ///
+    /// The mirror render loop (push → PaneOutput → invalidate → paint →
+    /// poll/fetch) has no pulse of its own; the GUI's watchdog uses this to
+    /// restart it instead of leaving the pane frozen until user input.
+    pub fn render_looks_stalled(&self, viewport_top: Option<StableRowIndex>) -> bool {
+        let renderable = self.renderable.lock();
+        let mut inner = renderable.inner.borrow_mut();
+        if !render_watchdog_should_run(inner.dead) {
+            return false;
+        }
+        inner.watchdog_check_displayed_rows(viewport_top)
     }
 
     /// Adopt geometry that is carried by a complete frontend viewport RPC.
@@ -1496,6 +1519,12 @@ mod test {
 
         finish_preview_request(&mut requested, geometry, false, true);
         assert_eq!(requested, None);
+    }
+
+    #[test]
+    fn dead_panes_do_not_run_the_render_watchdog() {
+        assert!(render_watchdog_should_run(false));
+        assert!(!render_watchdog_should_run(true));
     }
 }
 

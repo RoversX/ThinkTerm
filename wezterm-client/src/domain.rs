@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
+use futures::channel::oneshot;
 use mux::command_spec::{CommandSpec, CommandSpecExt};
 use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
@@ -19,6 +20,274 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wezterm_term::TerminalSize;
+
+const MIN_PUSH_RESYNC_GAP: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResyncOutcome {
+    Applied,
+    /// A structure mutation owns the authoritative mapping update and will
+    /// enqueue its own catch-up resync when its guard is dropped.
+    Deferred,
+    NoClient,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedResyncCompletion {
+    generation: u64,
+    outcome: ResyncOutcome,
+}
+
+type SharedResyncResult = Result<SharedResyncCompletion, Arc<str>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResyncRequestKind {
+    Immediate,
+    FreshAfter(u64),
+    MutationCatchup,
+    Background,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueuedResync {
+    generation: u64,
+    not_before: Instant,
+    run_after_deferred: bool,
+}
+
+struct ResyncWaiter {
+    generation: u64,
+    sender: oneshot::Sender<SharedResyncResult>,
+}
+
+struct ResyncTicket {
+    joined_existing: bool,
+    receiver: oneshot::Receiver<SharedResyncResult>,
+}
+
+enum ResyncDriverAction {
+    Stop,
+    Wait {
+        delay: Duration,
+        wake: oneshot::Receiver<()>,
+    },
+    Run(u64),
+}
+
+struct ResyncCoordinatorState {
+    next_generation: u64,
+    active_generation: Option<u64>,
+    queued: Option<QueuedResync>,
+    last_started_at: Option<Instant>,
+    driver_running: bool,
+    timer_wake: Option<oneshot::Sender<()>>,
+    waiters: Vec<ResyncWaiter>,
+}
+
+impl Default for ResyncCoordinatorState {
+    fn default() -> Self {
+        Self {
+            next_generation: 1,
+            active_generation: None,
+            queued: None,
+            last_started_at: None,
+            driver_running: false,
+            timer_wake: None,
+            waiters: Vec::new(),
+        }
+    }
+}
+
+impl ResyncCoordinatorState {
+    fn allocate(&mut self, not_before: Instant, run_after_deferred: bool) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.queued = Some(QueuedResync {
+            generation,
+            not_before,
+            run_after_deferred,
+        });
+        generation
+    }
+
+    fn request(
+        &mut self,
+        kind: ResyncRequestKind,
+        now: Instant,
+    ) -> (ResyncTicket, bool, Option<oneshot::Sender<()>>) {
+        let mut joined_existing = false;
+        let mut wake = None;
+        let generation = match kind {
+            ResyncRequestKind::Immediate => {
+                if let Some(generation) = self.active_generation {
+                    joined_existing = true;
+                    generation
+                } else if let Some(queued) = self.queued.as_mut() {
+                    if queued.not_before > now {
+                        queued.not_before = now;
+                        wake = self.timer_wake.take();
+                    }
+                    queued.generation
+                } else {
+                    self.allocate(now, false)
+                }
+            }
+            ResyncRequestKind::FreshAfter(after) => {
+                if let Some(generation) = self.active_generation.filter(|g| *g > after) {
+                    generation
+                } else if let Some(queued) = self.queued.as_mut().filter(|q| q.generation > after) {
+                    if queued.not_before > now {
+                        queued.not_before = now;
+                        wake = self.timer_wake.take();
+                    }
+                    queued.generation
+                } else {
+                    self.allocate(now, false)
+                }
+            }
+            ResyncRequestKind::MutationCatchup => {
+                if let Some(queued) = self.queued.as_mut() {
+                    queued.not_before = now;
+                    queued.run_after_deferred = true;
+                    wake = self.timer_wake.take();
+                    queued.generation
+                } else {
+                    self.allocate(now, true)
+                }
+            }
+            ResyncRequestKind::Background => {
+                if let Some(queued) = self.queued {
+                    queued.generation
+                } else {
+                    let not_before = self
+                        .last_started_at
+                        .map(|started| started + MIN_PUSH_RESYNC_GAP)
+                        .unwrap_or(now)
+                        .max(now);
+                    self.allocate(not_before, false)
+                }
+            }
+        };
+
+        let (sender, receiver) = oneshot::channel();
+        self.waiters.push(ResyncWaiter { generation, sender });
+        let start_driver = !self.driver_running;
+        self.driver_running = true;
+        (
+            ResyncTicket {
+                joined_existing,
+                receiver,
+            },
+            start_driver,
+            wake,
+        )
+    }
+
+    fn next_action(&mut self, now: Instant) -> ResyncDriverAction {
+        debug_assert!(self.active_generation.is_none());
+        let Some(queued) = self.queued else {
+            self.driver_running = false;
+            self.timer_wake = None;
+            return ResyncDriverAction::Stop;
+        };
+        if queued.not_before > now {
+            let (wake, receiver) = oneshot::channel();
+            self.timer_wake = Some(wake);
+            return ResyncDriverAction::Wait {
+                delay: queued.not_before.saturating_duration_since(now),
+                wake: receiver,
+            };
+        }
+
+        self.queued = None;
+        self.timer_wake = None;
+        self.active_generation = Some(queued.generation);
+        self.last_started_at = Some(now);
+        ResyncDriverAction::Run(queued.generation)
+    }
+
+    fn finish(&mut self, generation: u64, result: SharedResyncResult, now: Instant) {
+        debug_assert_eq!(self.active_generation, Some(generation));
+        self.active_generation = None;
+
+        let deferred = matches!(
+            result,
+            Ok(SharedResyncCompletion {
+                outcome: ResyncOutcome::Deferred,
+                ..
+            })
+        );
+        let no_client = matches!(
+            result,
+            Ok(SharedResyncCompletion {
+                outcome: ResyncOutcome::NoClient,
+                ..
+            })
+        );
+        let keep_mutation_catchup =
+            deferred && self.queued.is_some_and(|queued| queued.run_after_deferred);
+        let terminal = no_client || (deferred && !keep_mutation_catchup);
+        let failed = result.is_err();
+        let mut remaining = Vec::new();
+        for waiter in self.waiters.drain(..) {
+            if terminal || waiter.generation <= generation {
+                let _ = waiter.sender.send(result.clone());
+            } else {
+                remaining.push(waiter);
+            }
+        }
+        self.waiters = remaining;
+
+        if terminal {
+            self.queued = None;
+        } else if keep_mutation_catchup {
+            if let Some(queued) = self.queued.as_mut() {
+                queued.not_before = now;
+            }
+        } else if failed {
+            self.last_started_at = None;
+            if let Some(queued) = self.queued.as_mut() {
+                queued.not_before = now;
+            }
+        }
+    }
+
+    fn abort(&mut self, reason: Arc<str>) {
+        self.active_generation = None;
+        self.queued = None;
+        self.last_started_at = None;
+        self.driver_running = false;
+        if let Some(wake) = self.timer_wake.take() {
+            let _ = wake.send(());
+        }
+        for waiter in self.waiters.drain(..) {
+            let _ = waiter.sender.send(Err(Arc::clone(&reason)));
+        }
+    }
+}
+
+struct ResyncDriverGuard {
+    domain_id: DomainId,
+    armed: bool,
+}
+
+impl Drop for ResyncDriverGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(mux) = Mux::try_get() else { return };
+        let Some(domain) = mux.get_domain(self.domain_id) else {
+            return;
+        };
+        let Some(domain) = domain.downcast_ref::<ClientDomain>() else {
+            return;
+        };
+        domain.resync_coordinator.lock().unwrap().abort(Arc::from(
+            "resync coordinator driver stopped before completing",
+        ));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachRetryOutcome {
@@ -623,7 +892,7 @@ impl Drop for StructureMutationGuard {
                 let Some(domain) = domain.downcast_ref::<ClientDomain>() else {
                     return;
                 };
-                if let Err(err) = domain.resync().await {
+                if let Err(err) = domain.resync_after_mutation().await {
                     log::error!("deferred resync for domain {domain_id}: {err:#}");
                 }
             })
@@ -1354,6 +1623,9 @@ pub struct ClientDomain {
     /// engine has not given up between attempts, or every backoff gap paints
     /// as a disconnect.
     attach_retries: std::sync::atomic::AtomicUsize,
+    /// Serializes topology snapshots. Immediate callers join an active
+    /// generation; background pushes coalesce behind one trailing pass.
+    resync_coordinator: Mutex<ResyncCoordinatorState>,
     local_domain_id: DomainId,
 }
 
@@ -1620,6 +1892,7 @@ impl ClientDomain {
             inner: Mutex::new(None),
             attaching: std::sync::atomic::AtomicBool::new(false),
             attach_retries: std::sync::atomic::AtomicUsize::new(0),
+            resync_coordinator: Mutex::new(ResyncCoordinatorState::default()),
             local_domain_id,
         }
     }
@@ -2254,7 +2527,172 @@ impl ClientDomain {
         Ok(true)
     }
 
+    fn enqueue_resync(&self, kind: ResyncRequestKind) -> ResyncTicket {
+        let (ticket, start_driver, wake) = self
+            .resync_coordinator
+            .lock()
+            .unwrap()
+            .request(kind, Instant::now());
+        if let Some(wake) = wake {
+            let _ = wake.send(());
+        }
+        if start_driver {
+            let domain_id = self.local_domain_id;
+            promise::spawn::spawn_into_main_thread(async move {
+                ClientDomain::run_resync_driver(domain_id).await
+            })
+            .detach();
+        }
+        ticket
+    }
+
+    async fn await_resync_ticket(
+        &self,
+        ticket: ResyncTicket,
+    ) -> anyhow::Result<(SharedResyncCompletion, bool)> {
+        let result = ticket
+            .receiver
+            .await
+            .map_err(|_| anyhow!("resync coordinator stopped before completing"))?;
+        let completion = result.map_err(|message| anyhow!(message.to_string()))?;
+        Ok((completion, ticket.joined_existing))
+    }
+
+    async fn coordinated_resync(
+        &self,
+        kind: ResyncRequestKind,
+    ) -> anyhow::Result<(SharedResyncCompletion, bool)> {
+        let ticket = self.enqueue_resync(kind);
+        self.await_resync_ticket(ticket).await
+    }
+
+    async fn run_resync_driver(domain_id: DomainId) {
+        let mut guard = ResyncDriverGuard {
+            domain_id,
+            armed: true,
+        };
+        loop {
+            let action = {
+                let Some(mux) = Mux::try_get() else { return };
+                let Some(domain) = mux.get_domain(domain_id) else {
+                    return;
+                };
+                let Some(domain) = domain.downcast_ref::<ClientDomain>() else {
+                    return;
+                };
+                let action = domain
+                    .resync_coordinator
+                    .lock()
+                    .unwrap()
+                    .next_action(Instant::now());
+                action
+            };
+
+            match action {
+                ResyncDriverAction::Stop => {
+                    guard.armed = false;
+                    return;
+                }
+                ResyncDriverAction::Wait { delay, wake } => {
+                    smol::future::or(
+                        async move {
+                            smol::Timer::after(delay).await;
+                        },
+                        async move {
+                            let _ = wake.await;
+                        },
+                    )
+                    .await;
+                }
+                ResyncDriverAction::Run(generation) => {
+                    let result = {
+                        let domain = Mux::try_get().and_then(|mux| mux.get_domain(domain_id));
+                        match domain {
+                            Some(domain) => match domain.downcast_ref::<ClientDomain>() {
+                                Some(domain) => domain.resync_once().await,
+                                None => Ok(ResyncOutcome::NoClient),
+                            },
+                            None => Ok(ResyncOutcome::NoClient),
+                        }
+                    };
+                    let shared = result
+                        .map(|outcome| SharedResyncCompletion {
+                            generation,
+                            outcome,
+                        })
+                        .map_err(|err| Arc::<str>::from(format!("{err:#}")));
+                    if let Err(err) = &shared {
+                        log::warn!("resync generation {generation} failed: {err}");
+                    }
+
+                    let Some(mux) = Mux::try_get() else { return };
+                    let Some(domain) = mux.get_domain(domain_id) else {
+                        return;
+                    };
+                    let Some(domain) = domain.downcast_ref::<ClientDomain>() else {
+                        return;
+                    };
+                    domain.resync_coordinator.lock().unwrap().finish(
+                        generation,
+                        shared,
+                        Instant::now(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Immediate single-flight resync. Concurrent callers join the active
+    /// generation instead of issuing parallel ListPanes snapshots.
     pub async fn resync(&self) -> anyhow::Result<()> {
+        self.coordinated_resync(ResyncRequestKind::Immediate)
+            .await?;
+        Ok(())
+    }
+
+    async fn resync_after_mutation(&self) -> anyhow::Result<()> {
+        self.coordinated_resync(ResyncRequestKind::MutationCatchup)
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve a pane-scoped push without losing it behind an older in-flight
+    /// snapshot. If that generation still did not materialize the pane, all
+    /// such callers share exactly one fresh trailing pass. A structure
+    /// mutation can deliberately defer both passes; its guard owns the later
+    /// catch-up, so that existing narrow window can still leave this push
+    /// unmapped.
+    pub(crate) async fn resync_for_remote_pane(&self, pane_id: PaneId) -> anyhow::Result<()> {
+        let (completion, joined_existing) = self
+            .coordinated_resync(ResyncRequestKind::Immediate)
+            .await?;
+        if completion.outcome == ResyncOutcome::Applied
+            && joined_existing
+            && !self.remote_pane_is_materialized(pane_id)
+        {
+            self.coordinated_resync(ResyncRequestKind::FreshAfter(completion.generation))
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn remote_pane_is_materialized(&self, remote_pane_id: PaneId) -> bool {
+        self.remote_to_local_pane_id(remote_pane_id)
+            .and_then(|local_pane_id| Mux::try_get()?.get_pane(local_pane_id))
+            .is_some()
+    }
+
+    /// Rate-limited trailing resync for topology-only push notifications.
+    /// The coordinator serializes it with every active pass and coalesces a
+    /// burst into one generation; immediate mapping recovery can wake and
+    /// upgrade a pending 500ms timer.
+    pub async fn resync_throttled(&self) -> anyhow::Result<()> {
+        self.coordinated_resync(ResyncRequestKind::Background)
+            .await?;
+        Ok(())
+    }
+
+    async fn resync_once(&self) -> anyhow::Result<ResyncOutcome> {
         if let Some(inner) = self.inner() {
             // A spawn/split response is about to install the mappings for
             // the very structures this resync would otherwise see as
@@ -2264,12 +2702,12 @@ impl ClientDomain {
             // ListPanes request was in flight.
             if inner.structure_mutation_in_flight() {
                 inner.defer_resync();
-                return Ok(());
+                return Ok(ResyncOutcome::Deferred);
             }
             let panes = inner.client.list_panes().await?;
             if inner.structure_mutation_in_flight() {
                 inner.defer_resync();
-                return Ok(());
+                return Ok(ResyncOutcome::Deferred);
             }
             Self::process_pane_list(inner, panes, None, false, None)?;
             // Catch-up only: steady-state updates arrive as pushed
@@ -2284,8 +2722,9 @@ impl ClientDomain {
                     );
                 }
             }
+            return Ok(ResyncOutcome::Applied);
         }
-        Ok(())
+        Ok(ResyncOutcome::NoClient)
     }
 
     /// Send mutations of the server's ThinkTerm sidebar tree, hand the
@@ -3114,9 +3553,10 @@ mod tests {
         attach_with_retry_loop, consistent_remote_tab_id, is_fatal_attach_error,
         next_attach_backoff, owns_remote_viewport_from_states, remote_frontend_gate_from_state,
         remote_move_pane_id, server_runtime_replaced, stale_mirrors_to_reap,
-        thread_id_for_workspace, AttachRetryOutcome, AttachRetryTiming,
-        AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
-        FrontendRecoverySlot, MirrorOrigin, RemoteFrontendGate, ViewportLatencyState,
+        thread_id_for_workspace, AttachRetryOutcome, AttachRetryTiming, AutomaticRemotePaneResize,
+        FrontendRecoveryAck, FrontendRecoveryBarrier, FrontendRecoverySlot, MirrorOrigin,
+        RemoteFrontendGate, ResyncCoordinatorState, ResyncDriverAction, ResyncOutcome,
+        ResyncRequestKind, SharedResyncCompletion, ViewportLatencyState,
     };
     use crate::client::ClientConnectionPhase;
     use mux::connui::ConnectionUI;
@@ -3142,6 +3582,238 @@ mod tests {
             max_backoff: Duration::from_millis(2),
             cancellation_poll: Duration::from_millis(1),
         }
+    }
+
+    fn start_resync_generation(state: &mut ResyncCoordinatorState, now: Instant) -> u64 {
+        match state.next_action(now) {
+            ResyncDriverAction::Run(generation) => generation,
+            ResyncDriverAction::Stop => panic!("expected a queued resync, got stop"),
+            ResyncDriverAction::Wait { .. } => panic!("expected an immediate resync, got timer"),
+        }
+    }
+
+    fn finish_resync_generation(
+        state: &mut ResyncCoordinatorState,
+        generation: u64,
+        outcome: ResyncOutcome,
+        now: Instant,
+    ) {
+        state.finish(
+            generation,
+            Ok(SharedResyncCompletion {
+                generation,
+                outcome,
+            }),
+            now,
+        );
+    }
+
+    #[test]
+    fn resync_single_flight_fans_one_completion_out_to_all_joiners() {
+        let now = Instant::now();
+        let mut state = ResyncCoordinatorState::default();
+        let (leader, start_driver, _) = state.request(ResyncRequestKind::Immediate, now);
+        assert!(start_driver);
+        assert!(!leader.joined_existing);
+        let generation = start_resync_generation(&mut state, now);
+
+        let mut joiners = Vec::new();
+        for _ in 0..100 {
+            let (ticket, start_driver, wake) = state.request(ResyncRequestKind::Immediate, now);
+            assert!(!start_driver);
+            assert!(wake.is_none());
+            assert!(ticket.joined_existing);
+            joiners.push(ticket);
+        }
+
+        finish_resync_generation(&mut state, generation, ResyncOutcome::Applied, now);
+        let leader_completion = smol::block_on(leader.receiver)
+            .expect("leader sender remains live")
+            .expect("resync succeeds");
+        assert_eq!(leader_completion.generation, generation);
+        for ticket in joiners {
+            let completion = smol::block_on(ticket.receiver)
+                .expect("joiner sender remains live")
+                .expect("joined resync succeeds");
+            assert_eq!(completion, leader_completion);
+        }
+    }
+
+    #[test]
+    fn missing_mapping_after_a_join_coalesces_one_fresh_generation() {
+        let now = Instant::now();
+        let mut state = ResyncCoordinatorState::default();
+        let (_leader, _, _) = state.request(ResyncRequestKind::Immediate, now);
+        let first = start_resync_generation(&mut state, now);
+        let (joined, _, _) = state.request(ResyncRequestKind::Immediate, now);
+        assert!(joined.joined_existing);
+        finish_resync_generation(&mut state, first, ResyncOutcome::Applied, now);
+        let joined_completion = smol::block_on(joined.receiver)
+            .expect("joined sender remains live")
+            .expect("first resync succeeds");
+
+        let mut trailing = Vec::new();
+        for _ in 0..100 {
+            let (ticket, _, _) = state.request(
+                ResyncRequestKind::FreshAfter(joined_completion.generation),
+                now,
+            );
+            trailing.push(ticket);
+        }
+        let second = start_resync_generation(&mut state, now);
+        assert_eq!(second, first + 1);
+        finish_resync_generation(&mut state, second, ResyncOutcome::Applied, now);
+        for ticket in trailing {
+            let completion = smol::block_on(ticket.receiver)
+                .expect("trailing sender remains live")
+                .expect("trailing resync succeeds");
+            assert_eq!(completion.generation, second);
+        }
+    }
+
+    #[test]
+    fn background_burst_waits_for_the_active_resync_and_runs_once() {
+        let started = Instant::now();
+        let mut state = ResyncCoordinatorState::default();
+        let (_leader, _, _) = state.request(ResyncRequestKind::Immediate, started);
+        let first = start_resync_generation(&mut state, started);
+        let mut background = Vec::new();
+        for _ in 0..20 {
+            let (ticket, _, _) = state.request(
+                ResyncRequestKind::Background,
+                started + Duration::from_millis(100),
+            );
+            background.push(ticket);
+        }
+        assert_eq!(
+            state.queued.map(|queued| queued.generation),
+            Some(first + 1)
+        );
+
+        let completed = started + Duration::from_millis(800);
+        finish_resync_generation(&mut state, first, ResyncOutcome::Applied, completed);
+        let trailing = start_resync_generation(&mut state, completed);
+        assert_eq!(trailing, first + 1);
+        finish_resync_generation(&mut state, trailing, ResyncOutcome::Applied, completed);
+        for ticket in background {
+            let completion = smol::block_on(ticket.receiver)
+                .expect("background sender remains live")
+                .expect("trailing resync succeeds");
+            assert_eq!(completion.generation, trailing);
+        }
+    }
+
+    #[test]
+    fn immediate_resync_wakes_and_upgrades_a_background_timer() {
+        let started = Instant::now();
+        let mut state = ResyncCoordinatorState::default();
+        state.last_started_at = Some(started);
+        let (_background, start_driver, _) = state.request(
+            ResyncRequestKind::Background,
+            started + Duration::from_millis(100),
+        );
+        assert!(start_driver);
+        let wake_receiver = match state.next_action(started + Duration::from_millis(100)) {
+            ResyncDriverAction::Wait { delay, wake } => {
+                assert_eq!(delay, Duration::from_millis(400));
+                wake
+            }
+            _ => panic!("background request should wait for its gap"),
+        };
+
+        let (immediate, _, wake) = state.request(
+            ResyncRequestKind::Immediate,
+            started + Duration::from_millis(110),
+        );
+        assert!(!immediate.joined_existing);
+        wake.expect("the active timer is interruptible")
+            .send(())
+            .expect("driver still holds its receiver");
+        smol::block_on(wake_receiver).expect("timer wake is delivered");
+        assert!(matches!(
+            state.next_action(started + Duration::from_millis(110)),
+            ResyncDriverAction::Run(_)
+        ));
+    }
+
+    #[test]
+    fn resync_failure_releases_the_gap_and_deferred_stops_trailing_work() {
+        let now = Instant::now();
+        let mut failed = ResyncCoordinatorState::default();
+        let (leader, _, _) = failed.request(ResyncRequestKind::Immediate, now);
+        let first = start_resync_generation(&mut failed, now);
+        let (joiner, _, _) = failed.request(ResyncRequestKind::Immediate, now);
+        let (trailing, _, _) = failed.request(ResyncRequestKind::Background, now);
+        let shared_error = std::sync::Arc::from("list panes failed");
+        failed.finish(first, Err(std::sync::Arc::clone(&shared_error)), now);
+        let leader_error = smol::block_on(leader.receiver)
+            .expect("leader receives the failure")
+            .expect_err("leader sees the RPC failure");
+        let joiner_error = smol::block_on(joiner.receiver)
+            .expect("joiner receives the failure")
+            .expect_err("joiner sees the RPC failure");
+        assert!(std::sync::Arc::ptr_eq(&leader_error, &shared_error));
+        assert!(std::sync::Arc::ptr_eq(&joiner_error, &shared_error));
+        assert_eq!(start_resync_generation(&mut failed, now), first + 1);
+        finish_resync_generation(&mut failed, first + 1, ResyncOutcome::Applied, now);
+        assert!(smol::block_on(trailing.receiver)
+            .expect("trailing sender remains live")
+            .is_ok());
+
+        let mut deferred = ResyncCoordinatorState::default();
+        let (leader, _, _) = deferred.request(ResyncRequestKind::Immediate, now);
+        let first = start_resync_generation(&mut deferred, now);
+        let (trailing, _, _) = deferred.request(ResyncRequestKind::Background, now);
+        finish_resync_generation(&mut deferred, first, ResyncOutcome::Deferred, now);
+        assert_eq!(
+            smol::block_on(leader.receiver)
+                .expect("leader sender remains live")
+                .expect("defer is not an RPC error")
+                .outcome,
+            ResyncOutcome::Deferred
+        );
+        assert_eq!(
+            smol::block_on(trailing.receiver)
+                .expect("trailing sender is completed")
+                .expect("defer is not an RPC error")
+                .outcome,
+            ResyncOutcome::Deferred
+        );
+        assert!(matches!(
+            deferred.next_action(now),
+            ResyncDriverAction::Stop
+        ));
+    }
+
+    #[test]
+    fn mutation_catchup_survives_a_deferred_active_generation() {
+        let now = Instant::now();
+        let mut state = ResyncCoordinatorState::default();
+        let (leader, _, _) = state.request(ResyncRequestKind::Immediate, now);
+        let first = start_resync_generation(&mut state, now);
+
+        // The last mutation guard can drop after resync_once has decided to
+        // defer but before the coordinator records that completion.
+        let (catchup, _, _) = state.request(ResyncRequestKind::MutationCatchup, now);
+        finish_resync_generation(&mut state, first, ResyncOutcome::Deferred, now);
+        assert_eq!(
+            smol::block_on(leader.receiver)
+                .expect("leader sender remains live")
+                .expect("defer is not an RPC error")
+                .outcome,
+            ResyncOutcome::Deferred
+        );
+
+        let second = start_resync_generation(&mut state, now);
+        assert_eq!(second, first + 1);
+        finish_resync_generation(&mut state, second, ResyncOutcome::Applied, now);
+        assert_eq!(
+            smol::block_on(catchup.receiver)
+                .expect("catchup sender remains live")
+                .expect("catchup resync succeeds")
+                .generation,
+            second
+        );
     }
 
     #[test]

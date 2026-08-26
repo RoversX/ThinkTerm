@@ -2335,8 +2335,30 @@ impl Mux {
             let mut windows = match self.windows.try_write() {
                 Some(w) => w,
                 None => {
-                    // It's ok if our caller already locked it; we can prune later.
+                    // Our caller already holds the lock. "Later" must
+                    // actually be scheduled: a mirror reaped from `panes`
+                    // but skipped here stays in its tab tree — painted,
+                    // is_dead()==false, yet unreachable via get_pane —
+                    // which freezes it and turns every push for it into a
+                    // full resync. One retry chain at a time: a bulk
+                    // teardown hits this branch once per pane. (The
+                    // Activity::count guard above needs no reschedule of
+                    // its own — every Activity::drop schedules a prune.)
                     log::trace!("prune_dead_windows: self.windows already borrowed");
+                    static RETRY_PENDING: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if promise::spawn::is_scheduler_configured()
+                        && !RETRY_PENDING.swap(true, Ordering::AcqRel)
+                    {
+                        promise::spawn::spawn_into_main_thread(async {
+                            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                            RETRY_PENDING.store(false, Ordering::Release);
+                            if let Some(mux) = Mux::try_get() {
+                                mux.prune_dead_windows();
+                            }
+                        })
+                        .detach();
+                    }
                     return;
                 }
             };

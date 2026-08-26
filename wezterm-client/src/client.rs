@@ -453,7 +453,7 @@ async fn process_unilateral_inner_async(
                 return Ok(());
             }
             log::debug!("got {decoded:?}, pane not found locally, resync");
-            client_domain.resync().await?;
+            client_domain.resync_for_remote_pane(pane_id).await?;
             if client_domain.connection_generation() != Some(connection_generation) {
                 return Ok(());
             }
@@ -469,7 +469,7 @@ async fn process_unilateral_inner_async(
         Some(p) => p,
         None => {
             log::debug!("got {decoded:?}, but local pane {local_pane_id} no longer exists; resync");
-            client_domain.resync().await?;
+            client_domain.resync_for_remote_pane(pane_id).await?;
             if client_domain.connection_generation() != Some(connection_generation) {
                 return Ok(());
             }
@@ -735,7 +735,10 @@ fn process_unilateral(
                     return Ok(());
                 }
 
-                client_domain.resync().await
+                // Throttled: a burst of tab-geometry pushes (every client
+                // resize fans one out per tab) must not cost one full
+                // ListPanes walk per PDU.
+                client_domain.resync_throttled().await
             })
             .detach();
 

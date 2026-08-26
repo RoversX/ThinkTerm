@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
@@ -24,13 +24,58 @@ use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
+// 30s, not shorter: poll is a fallback, and every poll costs the server a
+// full-scrollback get_changed_since scan under the terminal lock, per
+// painted mirror pane. Stall recovery is the watchdog's job — it resets
+// the interval to BASE the moment a pane looks stuck.
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const FETCH_STALL_BASE: Duration = Duration::from_secs(30);
+const POLL_STALL_BASE: Duration = Duration::from_secs(15);
+
+fn stall_timeout(base: Duration, attempt: u32) -> Duration {
+    let multiplier = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    base.checked_mul(multiplier).unwrap_or(Duration::MAX)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FetchToken {
     epoch: u64,
     started_at: Instant,
+    stall_attempt: u32,
+}
+
+impl FetchToken {
+    fn new(epoch: u64, started_at: Instant) -> Self {
+        Self {
+            epoch,
+            started_at,
+            stall_attempt: 0,
+        }
+    }
+
+    fn retry(self, started_at: Instant) -> Self {
+        Self {
+            epoch: self.epoch,
+            started_at,
+            stall_attempt: self.stall_attempt.saturating_add(1),
+        }
+    }
+}
+
+fn fetch_should_be_retried(token: FetchToken, now: Instant) -> bool {
+    now.saturating_duration_since(token.started_at)
+        > stall_timeout(FETCH_STALL_BASE, token.stall_attempt)
+}
+
+fn poll_should_be_retried(started_at: Instant, attempt: u32, now: Instant) -> bool {
+    now.saturating_duration_since(started_at) > stall_timeout(POLL_STALL_BASE, attempt)
+}
+
+fn claim_poll_completion(in_flight: &AtomicU64, generation: u64) -> bool {
+    in_flight
+        .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +108,72 @@ enum LineEntry {
     // We have a local copy but it is stale and will need to be
     // fetched again
     Stale(Line),
+}
+
+#[derive(Debug)]
+struct FetchRetryBatch {
+    token: FetchToken,
+    rows: RangeSet<StableRowIndex>,
+}
+
+#[derive(Debug, Default)]
+struct LineWatchdogDecision {
+    repaint: bool,
+    retries: Vec<FetchRetryBatch>,
+}
+
+impl LineWatchdogDecision {
+    fn retry(&mut self, row: StableRowIndex, token: FetchToken) {
+        self.repaint = true;
+        if let Some(batch) = self.retries.iter_mut().find(|batch| batch.token == token) {
+            batch.rows.add(row);
+            return;
+        }
+        let mut rows = RangeSet::new();
+        rows.add(row);
+        self.retries.push(FetchRetryBatch { token, rows });
+    }
+}
+
+fn line_watchdog_decision(
+    lines: &mut LruCache<StableRowIndex, LineEntry>,
+    range: Range<StableRowIndex>,
+    now: Instant,
+) -> LineWatchdogDecision {
+    let mut decision = LineWatchdogDecision::default();
+    for row in range {
+        let entry = match lines.pop(&row) {
+            Some(LineEntry::Stale(line)) => {
+                decision.repaint = true;
+                LineEntry::Stale(line)
+            }
+            Some(LineEntry::Fetching(token)) => {
+                if fetch_should_be_retried(token, now) {
+                    let replacement = token.retry(now);
+                    decision.retry(row, replacement);
+                    LineEntry::Fetching(replacement)
+                } else {
+                    LineEntry::Fetching(token)
+                }
+            }
+            Some(LineEntry::LineAndFetching(line, token)) => {
+                if fetch_should_be_retried(token, now) {
+                    let replacement = token.retry(now);
+                    decision.retry(row, replacement);
+                    LineEntry::LineAndFetching(line, replacement)
+                } else {
+                    LineEntry::LineAndFetching(line, token)
+                }
+            }
+            Some(entry) => entry,
+            None => {
+                decision.repaint = true;
+                continue;
+            }
+        };
+        lines.put(row, entry);
+    }
+    decision
 }
 
 impl LineEntry {
@@ -199,7 +310,14 @@ pub struct RenderableInner {
     local_pane_id: PaneId,
     last_poll: Instant,
     pub dead: bool,
-    poll_in_progress: AtomicBool,
+    /// Generation of the poll currently in flight; 0 means none. Shared
+    /// with the poll task so completion can clear it without finding this
+    /// pane again (a pane that left the mux must not stay latched), and
+    /// generation-checked so a watchdog-superseded poll completing late
+    /// can neither clear its successor's latch nor apply a stale answer.
+    poll_in_flight: Arc<AtomicU64>,
+    poll_gen: u64,
+    poll_stall_attempt: u32,
     poll_interval: Duration,
 
     cursor_position: StableCursorPosition,
@@ -217,6 +335,11 @@ pub struct RenderableInner {
 
     lines: LruCache<StableRowIndex, LineEntry>,
     line_cache_epoch: u64,
+    /// The epoch for which a discarded-fetch PaneOutput has already been
+    /// emitted; during a live resize every frame bumps the epoch and can
+    /// discard several in-flight fetches, and one repaint per epoch is
+    /// enough to re-issue them.
+    epoch_discard_notified: u64,
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
@@ -252,7 +375,9 @@ impl RenderableInner {
             local_pane_id,
             last_poll: now,
             dead: false,
-            poll_in_progress: AtomicBool::new(false),
+            poll_in_flight: Arc::new(AtomicU64::new(0)),
+            poll_gen: 0,
+            poll_stall_attempt: 0,
             poll_interval: BASE_POLL_INTERVAL,
             cursor_position: StableCursorPosition::default(),
             dimensions,
@@ -262,6 +387,7 @@ impl RenderableInner {
                 NonZeroUsize::new(configuration().scrollback_lines.max(128)).unwrap(),
             ),
             line_cache_epoch: 0,
+            epoch_discard_notified: 0,
             title: title.to_string(),
             working_dir: None,
             fetch_limiter,
@@ -385,7 +511,14 @@ impl RenderableInner {
 
         let row = self.cursor_position.y;
         match self.lines.pop(&row) {
-            Some(LineEntry::Stale(mut line)) | Some(LineEntry::Line(mut line)) => {
+            // A Stale row stays Stale: promoting it to Line would cancel
+            // the pending re-fetch (its seqno can never satisfy
+            // changed_since again) and freeze the row on predicted text.
+            Some(LineEntry::Stale(mut line)) => {
+                self.apply_prediction(c, &mut line);
+                self.lines.put(row, LineEntry::Stale(line));
+            }
+            Some(LineEntry::Line(mut line)) => {
                 self.apply_prediction(c, &mut line);
                 self.lines.put(row, LineEntry::Line(line));
             }
@@ -433,7 +566,12 @@ impl RenderableInner {
             let row = self.cursor_position.y + idx as StableRowIndex;
 
             match self.lines.pop(&row) {
-                Some(LineEntry::Stale(mut line)) | Some(LineEntry::Line(mut line)) => {
+                // Stale stays Stale; see predict_from_key_event.
+                Some(LineEntry::Stale(mut line)) => {
+                    self.apply_paste_prediction(idx, paste_line, &mut line);
+                    self.lines.put(row, LineEntry::Stale(line));
+                }
+                Some(LineEntry::Line(mut line)) => {
                     self.apply_paste_prediction(idx, paste_line, &mut line);
                     self.lines.put(row, LineEntry::Line(line));
                 }
@@ -608,11 +746,37 @@ impl RenderableInner {
         self.invalidate_line_cache(true);
     }
 
-    fn fetch_token(&self, started_at: Instant) -> FetchToken {
-        FetchToken {
-            epoch: self.line_cache_epoch,
-            started_at,
+    /// True when a row the GUI is actually displaying is waiting on work
+    /// that only a paint performs. `viewport_top` is the GUI's displayed
+    /// viewport origin (None = following the tail): scoping to the painted
+    /// range — not the live screen — is what keeps this from latching, and
+    /// Stale entries for rows outside it are normal and must not count.
+    ///
+    /// Checking also repairs a fetch whose detached future may have been
+    /// lost. Its retry deadline doubles after every supersession, so a
+    /// healthy but consistently slow request eventually gets a window long
+    /// enough to complete instead of losing forever to a fixed watchdog.
+    pub(crate) fn watchdog_check_displayed_rows(
+        &mut self,
+        viewport_top: Option<StableRowIndex>,
+    ) -> bool {
+        let top = viewport_top.unwrap_or(self.dimensions.physical_top);
+        let range = top..top.saturating_add(self.dimensions.viewport_rows as StableRowIndex);
+        // Keep the line-table borrow inside the pure decision helper. Only
+        // after it ends do we schedule RPCs through `self`, avoiding a
+        // renderable/RefCell re-entry while inspecting the cache.
+        let decision = line_watchdog_decision(&mut self.lines, range, Instant::now());
+        if decision.repaint {
+            self.poll_interval = BASE_POLL_INTERVAL;
         }
+        for batch in decision.retries {
+            self.schedule_fetch_lines(batch.rows, batch.token);
+        }
+        decision.repaint
+    }
+
+    fn fetch_token(&self, started_at: Instant) -> FetchToken {
+        FetchToken::new(self.line_cache_epoch, started_at)
     }
 
     fn invalidate_line_cache(&mut self, preserve_lines: bool) {
@@ -826,6 +990,7 @@ impl RenderableInner {
         let pane = mux
             .get_pane(local_pane_id)
             .ok_or_else(|| anyhow!("no such tab {}", local_pane_id))?;
+        let mut notify_pane_output = true;
         if let Some(client_tab) = pane.downcast_ref::<ClientPane>() {
             let renderable = client_tab.renderable.lock();
             let mut inner = renderable.inner.borrow_mut();
@@ -837,6 +1002,19 @@ impl RenderableInner {
                     fetch_token.epoch,
                     inner.line_cache_epoch
                 );
+                // The rows this fetch covered were re-tagged Stale when the
+                // epoch moved, and only a paint re-fetches Stale rows. A
+                // paint is only scheduled by PaneOutput, so returning
+                // without notifying can leave the pane frozen until the
+                // user interacts with it. Once per epoch is enough: a live
+                // resize discards several in-flight fetches per frame.
+                let already_notified = inner.epoch_discard_notified == inner.line_cache_epoch;
+                inner.epoch_discard_notified = inner.line_cache_epoch;
+                drop(inner);
+                drop(renderable);
+                if !already_notified {
+                    mux.notify(mux::MuxNotification::PaneOutput(local_pane_id));
+                }
                 return Ok(());
             }
 
@@ -860,6 +1038,12 @@ impl RenderableInner {
                 }
                 Err(err) => {
                     log::error!("get_lines failed: {}", err);
+                    // No PaneOutput for a failure: notifying would repaint,
+                    // the repaint would re-fetch the Stale rows, and a
+                    // persistent error would spin that loop at RPC rate.
+                    // The rows stay Stale; the next natural paint (input,
+                    // or the ~1s render watchdog) retries them instead.
+                    notify_pane_output = false;
                     for r in to_fetch.iter() {
                         for stable_row in r.clone() {
                             let entry = match inner.lines.pop(&stable_row) {
@@ -870,8 +1054,13 @@ impl RenderableInner {
                                 Some(LineEntry::LineAndFetching(line, then))
                                     if then == fetch_token =>
                                 {
-                                    // revert to just a line
-                                    LineEntry::Line(line)
+                                    // Stale, not Line: the local copy's seqno
+                                    // is already <= inner.seqno, so a Line
+                                    // would never satisfy changed_since and
+                                    // the row would keep its old content
+                                    // forever. Stale rows are re-fetched by
+                                    // the next paint.
+                                    LineEntry::Stale(line)
                                 }
                                 Some(entry) => entry,
                                 None => continue,
@@ -882,30 +1071,60 @@ impl RenderableInner {
                 }
             }
         }
-        log::trace!(
-            "Generate PaneOutput event for local_pane_id={}",
-            local_pane_id
-        );
-        mux.notify(mux::MuxNotification::PaneOutput(local_pane_id));
+        if notify_pane_output {
+            log::trace!(
+                "Generate PaneOutput event for local_pane_id={}",
+                local_pane_id
+            );
+            mux.notify(mux::MuxNotification::PaneOutput(local_pane_id));
+        }
         Ok(())
     }
 
     fn poll(&mut self) -> anyhow::Result<()> {
-        if self.poll_in_progress.load(Ordering::SeqCst) {
-            // We have a poll in progress
-            return Ok(());
+        let now = Instant::now();
+        let mut forced_retry = false;
+        let in_flight = self.poll_in_flight.load(Ordering::SeqCst);
+        if in_flight != 0 {
+            let deadline = stall_timeout(POLL_STALL_BASE, self.poll_stall_attempt);
+            if poll_should_be_retried(self.last_poll, self.poll_stall_attempt, now) {
+                // A detached completion may have been lost. Increase the
+                // next deadline instead of using a fixed threshold: a slow
+                // but healthy poll must eventually be allowed to win.
+                log::warn!(
+                    "pane {} poll generation {} exceeded {:?} (attempt {}); replacing it",
+                    self.local_pane_id,
+                    in_flight,
+                    deadline,
+                    self.poll_stall_attempt,
+                );
+                if !claim_poll_completion(&self.poll_in_flight, in_flight) {
+                    return Ok(());
+                }
+                self.poll_stall_attempt = self.poll_stall_attempt.saturating_add(1);
+                forced_retry = true;
+            } else {
+                // We have a poll in progress
+                return Ok(());
+            }
         }
 
-        if self.last_poll.elapsed() < self.poll_interval {
-            return Ok(());
+        if !forced_retry {
+            if now.saturating_duration_since(self.last_poll) < self.poll_interval {
+                return Ok(());
+            }
+            self.poll_stall_attempt = 0;
         }
 
         let interval = self.poll_interval;
         let interval = (interval + interval).min(MAX_POLL_INTERVAL);
         self.poll_interval = interval;
 
-        self.last_poll = Instant::now();
-        self.poll_in_progress.store(true, Ordering::SeqCst);
+        self.last_poll = now;
+        self.poll_gen = self.poll_gen.wrapping_add(1).max(1);
+        let gen = self.poll_gen;
+        self.poll_in_flight.store(gen, Ordering::SeqCst);
+        let poll_in_flight = Arc::clone(&self.poll_in_flight);
         let remote_pane_id = self.remote_pane_id;
         let local_pane_id = self.local_pane_id;
         let client = Arc::clone(&self.client);
@@ -924,6 +1143,15 @@ impl RenderableInner {
                 Err(_) => client.client.is_reconnectable,
             };
 
+            // Cleared through the shared handle before anything that can
+            // bail: if the pane has left the mux (or the downcast fails),
+            // a flag left set would silence every future poll. Generation
+            // checked: a poll the watchdog already superseded must not
+            // clear its successor's latch or apply its stale answer.
+            if !claim_poll_completion(&poll_in_flight, gen) {
+                return Ok(());
+            }
+
             let mux = Mux::get();
             let tab = mux
                 .get_pane(local_pane_id)
@@ -934,7 +1162,7 @@ impl RenderableInner {
 
                 inner.dead = !alive;
                 inner.last_recv_time = Instant::now();
-                inner.poll_in_progress.store(false, Ordering::SeqCst);
+                inner.poll_stall_attempt = 0;
             }
             Ok::<(), anyhow::Error>(())
         })
@@ -1302,10 +1530,7 @@ mod test {
     #[test]
     fn preserving_invalidation_cancels_fetches_and_keeps_stale_lines() {
         let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
-        let token = FetchToken {
-            epoch: 7,
-            started_at: Instant::now(),
-        };
+        let token = FetchToken::new(7, Instant::now());
         lines.put(1, LineEntry::Line(line(80)));
         lines.put(2, LineEntry::LineAndFetching(line(80), token));
         lines.put(3, LineEntry::Fetching(token));
@@ -1429,10 +1654,7 @@ mod test {
 
     #[test]
     fn a_partial_fetch_response_does_not_leave_an_unreturned_row_in_flight_forever() {
-        let token = FetchToken {
-            epoch: 9,
-            started_at: Instant::now(),
-        };
+        let token = FetchToken::new(9, Instant::now());
         let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
         lines.put(70, LineEntry::Fetching(token));
         lines.put(71, LineEntry::LineAndFetching(line(80), token));
@@ -1448,11 +1670,106 @@ mod test {
 
     #[test]
     fn fetch_token_from_prior_epoch_is_not_current() {
-        let token = FetchToken {
-            epoch: 4,
-            started_at: Instant::now(),
-        };
+        let token = FetchToken::new(4, Instant::now());
         assert!(fetch_token_is_current(token, 4));
         assert!(!fetch_token_is_current(token, 5));
+    }
+
+    #[test]
+    fn healthy_slow_fetch_keeps_its_original_token() {
+        let started = Instant::now();
+        let token = FetchToken::new(7, started);
+        let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
+        lines.put(10, LineEntry::Fetching(token));
+
+        let decision = line_watchdog_decision(&mut lines, 10..11, started + Duration::from_secs(3));
+        assert!(!decision.repaint);
+        assert!(decision.retries.is_empty());
+        assert!(matches!(lines.get(&10), Some(LineEntry::Fetching(current)) if *current == token));
+    }
+
+    #[test]
+    fn fetch_stall_deadline_grows_until_a_stable_slow_rtt_can_complete() {
+        let started = Instant::now();
+        let first = FetchToken::new(11, started);
+        let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
+        lines.put(20, LineEntry::Fetching(first));
+
+        let retry_started = started + Duration::from_secs(31);
+        let decision = line_watchdog_decision(&mut lines, 20..21, retry_started);
+        assert!(decision.repaint);
+        assert_eq!(decision.retries.len(), 1);
+        let replacement = decision.retries[0].token;
+        assert_eq!(replacement.epoch, first.epoch);
+        assert_eq!(replacement.stall_attempt, 1);
+
+        // A stable 40s RTT lost to the first 30s deadline, but the replacement
+        // keeps the exact token for its 60s window and can be accepted.
+        let decision =
+            line_watchdog_decision(&mut lines, 20..21, retry_started + Duration::from_secs(40));
+        assert!(!decision.repaint);
+        assert!(decision.retries.is_empty());
+        assert!(matches!(
+            lines.get(&20),
+            Some(LineEntry::Fetching(current)) if *current == replacement
+        ));
+    }
+
+    #[test]
+    fn displayed_missing_rows_retry_but_offscreen_pending_rows_do_not_latch() {
+        let now = Instant::now();
+        let mut missing = LruCache::new(NonZeroUsize::new(8).unwrap());
+        missing.put(10, LineEntry::Line(line(80)));
+        let decision = line_watchdog_decision(&mut missing, 10..12, now);
+        assert!(decision.repaint, "displayed row 11 is missing");
+        assert!(decision.retries.is_empty());
+
+        let mut offscreen = LruCache::new(NonZeroUsize::new(8).unwrap());
+        offscreen.put(5, LineEntry::Stale(line(80)));
+        offscreen.put(10, LineEntry::Line(line(80)));
+        offscreen.put(11, LineEntry::Line(line(80)));
+        let decision = line_watchdog_decision(&mut offscreen, 10..12, now);
+        assert!(!decision.repaint);
+        assert!(decision.retries.is_empty());
+    }
+
+    #[test]
+    fn epoch_bump_resets_fetch_stall_attempt() {
+        let now = Instant::now();
+        let old = FetchToken::new(3, now).retry(now).retry(now);
+        assert_eq!(old.stall_attempt, 2);
+
+        let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
+        lines.put(1, LineEntry::LineAndFetching(line(80), old));
+        invalidate_line_entries(&mut lines, true);
+        assert!(matches!(lines.get(&1), Some(LineEntry::Stale(_))));
+
+        let next = FetchToken::new(old.epoch + 1, now);
+        assert_eq!(next.stall_attempt, 0);
+        assert!(!fetch_token_is_current(old, next.epoch));
+        assert!(fetch_token_is_current(next, next.epoch));
+    }
+
+    #[test]
+    fn poll_stall_retry_is_generation_safe_and_uses_a_growing_deadline() {
+        let started = Instant::now();
+        assert!(poll_should_be_retried(
+            started,
+            0,
+            started + Duration::from_secs(20)
+        ));
+        assert!(!poll_should_be_retried(
+            started,
+            1,
+            started + Duration::from_secs(20)
+        ));
+        assert_eq!(stall_timeout(POLL_STALL_BASE, 2), Duration::from_secs(60));
+        assert_eq!(stall_timeout(FETCH_STALL_BASE, 2), Duration::from_secs(120));
+
+        let in_flight = AtomicU64::new(2);
+        assert!(!claim_poll_completion(&in_flight, 1));
+        assert_eq!(in_flight.load(Ordering::SeqCst), 2);
+        assert!(claim_poll_completion(&in_flight, 2));
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
     }
 }
