@@ -4810,28 +4810,49 @@ impl SettingsWindow {
             }
             // The brand mark leads the row; agents without a logo (and the
             // expand arrow) still line up because the text column starts
-            // past a fixed icon slot either way.
-            let brand_size = (self.metrics.cell_size.height as f32)
-                .clamp(self.ui_px(14.0), self.ui_px(22.0));
-            let brand_gap = self.ui_px(10.0);
-            let text_x = row_x + brand_size + brand_gap;
-            let text_width = row_width - (brand_size + brand_gap);
-            let brand_y = row_y + (self.metrics.cell_size.height as f32 - brand_size) / 2.0;
+            // past a fixed icon slot either way. The mark spans the
+            // two-line row block, centered over both lines — sized to one
+            // text line it read as a speck beside these tall rows.
+            // The mark sits in a rounded tile spanning the two-line row
+            // block, macOS-settings style. The tile is what makes the set
+            // read as one family: full-bleed marks get breathing room
+            // inside it, and white glyphs sit on a defined surface
+            // instead of floating on the page background. Sizes derive
+            // from the text metrics so every display scale agrees.
+            let tile = self.settings_row_description_y(row_y) - row_y
+                + self.metrics.cell_size.height as f32;
+            let brand_gap = self.ui_px(12.0);
+            let text_x = row_x + tile + brand_gap;
+            let text_width = row_width - (tile + brand_gap);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                row_x,
+                row_y,
+                tile,
+                tile,
+                palette.control_bg,
+                palette.rule,
+                self.ui_px(8.0),
+            )?;
+            let mark = tile * 0.62;
+            let mark_x = row_x + (tile - mark) / 2.0;
+            let mark_y = row_y + (tile - mark) / 2.0;
             // effective_appearance, not the raw OS appearance: the theme
             // override decides which Kimi mark is legible here.
             match crate::agent_status::brand_icon(agent_id, self.effective_appearance()) {
                 Some(crate::agent_status::AgentIcon::Color(brand)) => {
-                    self.draw_brand_icon(layers, brand, row_x, brand_y, brand_size)?
+                    self.draw_brand_icon(layers, brand, mark_x, mark_y, mark)?
                 }
                 Some(crate::agent_status::AgentIcon::Mono(icon)) => {
-                    self.draw_svg_icon(layers, icon, row_x, brand_y, brand_size, palette.text)?
+                    self.draw_svg_icon(layers, icon, mark_x, mark_y, mark, palette.text)?
                 }
                 None => self.draw_svg_icon(
                     layers,
                     SvgIcon::Bot,
-                    row_x,
-                    brand_y,
-                    brand_size,
+                    mark_x,
+                    mark_y,
+                    mark,
                     palette.text,
                 )?,
             }
