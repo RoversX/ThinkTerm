@@ -50,6 +50,7 @@ use raw_window_handle::{
 };
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -81,6 +82,118 @@ const NS_DRAG_OPERATION_NONE: NSUInteger = 0;
 const NS_DRAG_OPERATION_COPY: NSUInteger = 1;
 
 static THINKTERM_PERF_ENABLED: OnceLock<bool> = OnceLock::new();
+
+type PendingWindowNotification = Box<dyn Any + Send + Sync>;
+
+struct PendingNotificationQueue<T> {
+    pending: VecDeque<T>,
+    draining: bool,
+    drain_scheduled: bool,
+}
+
+impl<T> Default for PendingNotificationQueue<T> {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            draining: false,
+            drain_scheduled: false,
+        }
+    }
+}
+
+impl<T> PendingNotificationQueue<T> {
+    fn enqueue(&mut self, item: T) {
+        self.pending.push_back(item);
+    }
+
+    fn begin_scheduled_drain(&mut self) {
+        self.drain_scheduled = false;
+    }
+}
+
+/// Drain without holding the queue borrow across `dispatch`. That is what
+/// lets a notification handler enqueue another notification without either
+/// re-entering the window state or overtaking work that was already queued.
+/// Returns true when the caller must schedule one future drain attempt.
+fn drain_pending_notifications<T>(
+    queue: &RefCell<PendingNotificationQueue<T>>,
+    mut dispatch: impl FnMut(T) -> Result<(), T>,
+) -> bool {
+    {
+        let mut queue = queue.borrow_mut();
+        if queue.draining {
+            return false;
+        }
+        queue.draining = true;
+    }
+
+    let mut schedule_retry = false;
+    loop {
+        let Some(item) = queue.borrow_mut().pending.pop_front() else {
+            break;
+        };
+        if let Err(item) = dispatch(item) {
+            let mut queue = queue.borrow_mut();
+            queue.pending.push_front(item);
+            if !queue.drain_scheduled {
+                queue.drain_scheduled = true;
+                schedule_retry = true;
+            }
+            break;
+        }
+    }
+    queue.borrow_mut().draining = false;
+    schedule_retry
+}
+
+#[cfg(test)]
+mod pending_notification_tests {
+    use super::{drain_pending_notifications, PendingNotificationQueue};
+    use std::cell::RefCell;
+
+    #[test]
+    fn busy_notifications_retry_once_and_keep_fifo_order() {
+        let queue = RefCell::new(PendingNotificationQueue::default());
+        queue.borrow_mut().enqueue(1);
+        queue.borrow_mut().enqueue(2);
+
+        assert!(drain_pending_notifications(&queue, Err));
+        assert_eq!(queue.borrow().pending.iter().copied().collect::<Vec<_>>(), [1, 2]);
+        assert!(queue.borrow().drain_scheduled);
+
+        queue.borrow_mut().enqueue(3);
+        assert!(
+            !drain_pending_notifications(&queue, Err),
+            "an already scheduled retry must not be duplicated"
+        );
+
+        queue.borrow_mut().begin_scheduled_drain();
+        let mut delivered = Vec::new();
+        assert!(!drain_pending_notifications(&queue, |item| {
+            delivered.push(item);
+            Ok(())
+        }));
+        assert_eq!(delivered, [1, 2, 3]);
+        assert!(queue.borrow().pending.is_empty());
+    }
+
+    #[test]
+    fn reentrant_notifications_append_after_the_existing_backlog() {
+        let queue = RefCell::new(PendingNotificationQueue::default());
+        queue.borrow_mut().enqueue(1);
+        queue.borrow_mut().enqueue(2);
+
+        let mut delivered = Vec::new();
+        assert!(!drain_pending_notifications(&queue, |item| {
+            delivered.push(item);
+            if item == 1 {
+                queue.borrow_mut().enqueue(3);
+            }
+            Ok(())
+        }));
+        assert_eq!(delivered, [1, 2, 3]);
+    }
+}
 
 fn thinkterm_perf_enabled() -> bool {
     *THINKTERM_PERF_ENABLED.get_or_init(|| {
@@ -997,13 +1110,7 @@ impl WindowOps for Window {
     {
         Connection::with_window_inner(self.id, move |inner| {
             if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                if let Ok(mut inner) = window_view.inner.try_borrow_mut() {
-                    inner
-                        .events
-                        .dispatch(WindowEvent::Notification(Box::new(t)));
-                } else {
-                    log::trace!("skipping notification while window is busy");
-                }
+                window_view.enqueue_notification(Box::new(t), *inner.view);
             }
             Ok(())
         });
@@ -2812,6 +2919,11 @@ fn code_to_cursor(code: i64) -> Option<MouseCursor> {
 
 struct WindowView {
     inner: Rc<RefCell<Inner>>,
+    // Notifications must live outside `inner`: AppKit can run nested event
+    // loops while an event handler holds that RefCell. Dropping work on a
+    // failed try_borrow loses PaneOutput repaints and even the timer tick that
+    // would otherwise recover them.
+    pending_notifications: RefCell<PendingNotificationQueue<PendingWindowNotification>>,
     // Repaint scheduling flags live outside the RefCell: they are touched
     // from paths that can run while `inner` is borrowed (reentrant drawRect,
     // the frame throttle timer, invalidate()), and losing an update here is
@@ -4637,6 +4749,48 @@ impl WindowView {
         }
     }
 
+    fn enqueue_notification(&self, notification: PendingWindowNotification, view: id) {
+        self.pending_notifications
+            .borrow_mut()
+            .enqueue(notification);
+        self.try_drain_notifications(view);
+    }
+
+    fn try_drain_notifications(&self, view: id) {
+        let schedule_retry =
+            drain_pending_notifications(&self.pending_notifications, |notification| {
+                let Ok(mut inner) = self.inner.try_borrow_mut() else {
+                    return Err(notification);
+                };
+                inner
+                    .events
+                    .dispatch(WindowEvent::Notification(notification));
+                Ok(())
+            });
+        if schedule_retry {
+            let pending = self.pending_notifications.borrow().pending.len();
+            log::trace!(
+                "window is busy; queued {pending} notification(s) for the next runloop turn"
+            );
+            unsafe {
+                let () = msg_send![view, performSelector: sel!(thinktermDrainNotifications)
+                                   withObject: nil
+                                   afterDelay: 0.0];
+            }
+        }
+    }
+
+    extern "C" fn drain_notifications(this: &mut Object, _sel: Sel) {
+        let view: id = this as *mut Object;
+        if let Some(window_view) = Self::get_this(this) {
+            window_view
+                .pending_notifications
+                .borrow_mut()
+                .begin_scheduled_drain();
+            window_view.try_drain_notifications(view);
+        }
+    }
+
     fn init_with_frame(inner: &Rc<RefCell<Inner>>, rect: NSRect) -> anyhow::Result<StrongPtr> {
         let cls = Self::get_class();
 
@@ -4646,6 +4800,7 @@ impl WindowView {
 
         let view = Box::into_raw(Box::new(Self {
             inner: Rc::clone(&inner),
+            pending_notifications: RefCell::new(PendingNotificationQueue::default()),
             paint_throttled: Cell::new(false),
             paint_throttled_since: Cell::new(None),
             invalidated: Cell::new(true),
@@ -4693,6 +4848,10 @@ impl WindowView {
             cls.add_method(
                 sel!(thinktermRearmNeedsDisplay),
                 Self::rearm_needs_display as extern "C" fn(&mut Object, Sel),
+            );
+            cls.add_method(
+                sel!(thinktermDrainNotifications),
+                Self::drain_notifications as extern "C" fn(&mut Object, Sel),
             );
             cls.add_method(
                 sel!(windowWillClose:),

@@ -93,6 +93,7 @@ impl MyWindow {
             | WindowEvent::ContextMenuDismissed
             | WindowEvent::NativeTextInputReplace { .. }
             | WindowEvent::ToggleWorkspaceSidebar
+            | WindowEvent::WorkspaceSidebarButtonHover(_)
             | WindowEvent::MouseLeave
             | WindowEvent::SetInnerSizeCompleted => {}
         }

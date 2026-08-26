@@ -1431,6 +1431,71 @@ pub struct PaneState {
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
     pub font_scale: Option<f64>,
+    /// Latest durable Mux PaneOutput generation included in a frame this
+    /// native window successfully presented.
+    presented_output_generation: u64,
+}
+
+fn pane_output_needs_repaint(current: u64, presented: u64) -> bool {
+    current != presented
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PaintOutcome {
+    draw_submitted: bool,
+    frame_complete: bool,
+}
+
+fn frame_can_acknowledge_output(outcome: PaintOutcome, presented: bool) -> bool {
+    presented && outcome.draw_submitted && outcome.frame_complete
+}
+
+#[cfg(test)]
+mod pane_output_watchdog_tests {
+    use super::{frame_can_acknowledge_output, pane_output_needs_repaint, PaintOutcome};
+
+    #[test]
+    fn a_later_output_remains_unpresented_after_an_older_frame_commits() {
+        let captured = 4;
+        let current_after_paint = 5;
+        assert!(frame_can_acknowledge_output(
+            PaintOutcome {
+                draw_submitted: true,
+                frame_complete: true,
+            },
+            true,
+        ));
+        assert!(pane_output_needs_repaint(
+            current_after_paint,
+            captured
+        ));
+        assert!(!pane_output_needs_repaint(captured, captured));
+    }
+
+    #[test]
+    fn incomplete_failed_or_skipped_frames_never_acknowledge_output() {
+        assert!(!frame_can_acknowledge_output(
+            PaintOutcome {
+                draw_submitted: true,
+                frame_complete: false,
+            },
+            true,
+        ));
+        assert!(!frame_can_acknowledge_output(
+            PaintOutcome {
+                draw_submitted: false,
+                frame_complete: true,
+            },
+            true,
+        ));
+        assert!(!frame_can_acknowledge_output(
+            PaintOutcome {
+                draw_submitted: true,
+                frame_complete: true,
+            },
+            false,
+        ));
+    }
 }
 
 #[derive(Clone)]
@@ -1765,6 +1830,11 @@ pub struct TermWindow {
 
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
+    /// Generations read before the terminal lines used by the current paint
+    /// pass. Retried or abandoned passes replace this map; only a successful
+    /// GPU present commits it into `PaneState`.
+    frame_pane_output_generations: HashMap<PaneId, u64>,
+    track_pane_output_generations_for_frame: bool,
     pane_font_cache: RefCell<HashMap<PaneFontKey, PaneFontEntry>>,
     pane_font_cache_tick: Cell<u64>,
     /// One recorded thumbnail per card, kept across frames so an unchanged
@@ -2818,6 +2888,8 @@ impl TermWindow {
             last_scroll_info: RenderableDimensions::default(),
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
+            frame_pane_output_generations: HashMap::new(),
+            track_pane_output_generations_for_frame: false,
             pane_font_cache: RefCell::new(HashMap::new()),
             pane_font_cache_tick: Cell::new(0),
             preview_quad_cache: RefCell::new(HashMap::new()),
@@ -3576,8 +3648,25 @@ impl TermWindow {
                 self.dimensions.pixel_height as u32,
             ),
         );
-        self.paint_impl(&mut RenderFrame::Glium(&mut frame));
-        window.finish_frame(frame).is_ok()
+        let outcome = match self.paint_impl(&mut RenderFrame::Glium(&mut frame)) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                log::error!("failed to draw OpenGL frame: {err:#}");
+                self.discard_unpresented_pane_output();
+                return false;
+            }
+        };
+        if !outcome.draw_submitted {
+            self.discard_unpresented_pane_output();
+            return false;
+        }
+        let presented = window.finish_frame(frame).is_ok();
+        if frame_can_acknowledge_output(outcome, presented) {
+            self.acknowledge_presented_pane_output();
+        } else {
+            self.discard_unpresented_pane_output();
+        }
+        presented
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
@@ -3585,6 +3674,7 @@ impl TermWindow {
         match self.do_paint_webgpu_impl() {
             Ok(ok) => Ok(ok),
             Err(err) => {
+                self.discard_unpresented_pane_output();
                 match err.downcast_ref::<wgpu::SurfaceError>() {
                     Some(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                         self.webgpu.as_mut().unwrap().resize(self.dimensions);
@@ -3598,8 +3688,13 @@ impl TermWindow {
     }
 
     fn do_paint_webgpu_impl(&mut self) -> anyhow::Result<bool> {
-        self.paint_impl(&mut RenderFrame::WebGpu);
-        Ok(true)
+        let outcome = self.paint_impl(&mut RenderFrame::WebGpu)?;
+        if frame_can_acknowledge_output(outcome, outcome.draw_submitted) {
+            self.acknowledge_presented_pane_output();
+        } else {
+            self.discard_unpresented_pane_output();
+        }
+        Ok(outcome.draw_submitted)
     }
 
     fn dispatch_notif(&mut self, notif: TermWindowNotif, window: &Window) -> anyhow::Result<()> {
@@ -3924,8 +4019,15 @@ impl TermWindow {
                 MuxNotification::Empty => {}
             },
             TermWindowNotif::EmitStatusUpdate => {
+                // Re-arm before doing any work: this tick drives the render
+                // watchdog, and a panic below (swallowed by the spawn queue)
+                // must not end the heartbeat for the window's lifetime. The
+                // later re-arm from the title path dedupes via
+                // last_status_call.
+                self.schedule_next_status_update();
                 self.emit_status_event();
                 self.refresh_all_thread_work();
+                self.terminal_render_watchdog();
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
@@ -6054,6 +6156,109 @@ impl TermWindow {
             }
         }
         self.schedule_next_status_update();
+    }
+
+    fn active_terminal_has_overlay(&self, tab: &Arc<Tab>) -> bool {
+        if self
+            .tab_state
+            .borrow()
+            .get(&tab.tab_id())
+            .is_some_and(|state| state.overlay.is_some())
+        {
+            return true;
+        }
+        let pane_state = self.pane_state.borrow();
+        tab.iter_panes().into_iter().any(|pos| {
+            pane_state
+                .get(&pos.pane.pane_id())
+                .is_some_and(|state| state.overlay.is_some())
+        })
+    }
+
+    fn can_track_presented_terminal_output(&self, tab: &Arc<Tab>) -> bool {
+        !self.content_view_foreground()
+            && self.content_view_fade.is_none()
+            && !self.frontend_surface_blocked()
+            && !self.active_terminal_has_overlay(tab)
+    }
+
+    fn acknowledge_presented_pane_output(&mut self) {
+        let presented = std::mem::take(&mut self.frame_pane_output_generations);
+        let mut pane_state = self.pane_state.borrow_mut();
+        for (pane_id, generation) in presented {
+            pane_state
+                .entry(pane_id)
+                .or_default()
+                .presented_output_generation = generation;
+        }
+    }
+
+    fn discard_unpresented_pane_output(&mut self) {
+        self.frame_pane_output_generations.clear();
+    }
+
+    /// PaneOutput is durable in the Mux, while delivery into a native window
+    /// is asynchronous. Compare that durable generation with this window's
+    /// last successful present so a lost last repaint is observable for every
+    /// pane type. ClientPane gets an additional state watchdog for work that
+    /// has not yet become a renderable line.
+    fn terminal_render_watchdog(&mut self) {
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        // These surfaces replace or deliberately hide terminal pixels. They
+        // cannot acknowledge a terminal generation, so retrying underneath
+        // them would latch the watchdog at one repaint per status tick.
+        if !self.can_track_presented_terminal_output(&tab) {
+            return;
+        }
+        for pos in tab.iter_panes() {
+            if self
+                .collapsed_pane_layouts
+                .contains_key(&pos.pane_stack_id)
+            {
+                continue;
+            }
+            let pane_id = pos.pane.pane_id();
+            let current = mux.pane_output_generation(pane_id);
+            let presented = self
+                .pane_state
+                .borrow()
+                .get(&pane_id)
+                .map(|state| state.presented_output_generation)
+                .unwrap_or(0);
+            if pane_output_needs_repaint(current, presented) {
+                log::debug!(
+                    "terminal render watchdog: window={} pane={pane_id} output generation \
+                     {current} has not been presented (last={presented}); repainting",
+                    self.mux_window_id,
+                );
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+                return;
+            }
+            if let Some(client_pane) = pos
+                .pane
+                .downcast_ref::<wezterm_client::pane::ClientPane>()
+            {
+                // Pass the viewport the renderer will actually paint —
+                // scrolled back, that is not the live screen, and judging
+                // the live rows would latch the watchdog on Stale rows a
+                // repaint never touches.
+                let viewport_top = self.get_viewport(pane_id);
+                if client_pane.render_looks_stalled(viewport_top) {
+                    log::debug!(
+                        "terminal render watchdog: pane {pane_id} has undelivered content; repainting"
+                    );
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     fn schedule_next_status_update(&mut self) {

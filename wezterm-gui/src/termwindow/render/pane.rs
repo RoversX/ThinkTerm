@@ -1059,11 +1059,20 @@ impl crate::TermWindow {
     }
 
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
+        let pane_id = pos.pane.pane_id();
+        let output_generation = self
+            .track_pane_output_generations_for_frame
+            .then(|| mux::Mux::get().pane_output_generation(pane_id));
         let computed = self.build_pane(pos)?;
         let mut ui_items = computed.ui_items();
         self.ui_items.append(&mut ui_items);
         let gl_state = self.render_state.as_ref().unwrap();
-        self.render_element(&computed, gl_state, None)
+        self.render_element(&computed, gl_state, None)?;
+        if let Some(generation) = output_generation {
+            self.frame_pane_output_generations
+                .insert(pane_id, generation);
+        }
+        Ok(())
     }
 
     pub fn paint_pane(
@@ -1670,9 +1679,19 @@ impl crate::TermWindow {
                 }
             }
 
+            let output_generation = render
+                .term_window
+                .track_pane_output_generations_for_frame
+                .then(|| mux::Mux::get().pane_output_generation(pane_id));
             pos.pane.with_lines_mut(stable_range.clone(), &mut render);
             if let Some(error) = render.error.take() {
                 return Err(error).context("error while calling with_lines_mut");
+            }
+            if let Some(generation) = output_generation {
+                render
+                    .term_window
+                    .frame_pane_output_generations
+                    .insert(pane_id, generation);
             }
         }
 

@@ -415,6 +415,7 @@ pub struct Mux {
     client_registrations: RwLock<HashMap<ClientId, ClientRegistrationId>>,
     frontend_lease: Mutex<FrontendLeaseState>,
     tab_resize_notifications: Mutex<TabResizeNotificationState>,
+    pane_output_generations: Mutex<PaneOutputGenerationState>,
     #[cfg(test)]
     frontend_geometry_failures: Mutex<std::collections::VecDeque<bool>>,
     palette_advisories: Mutex<PaletteAdvisoryState>,
@@ -429,6 +430,27 @@ struct TabResizeNotificationState {
     depth: HashMap<TabId, usize>,
     pending: HashSet<TabId>,
     aborted: HashSet<TabId>,
+}
+
+#[derive(Default)]
+struct PaneOutputGenerationState {
+    generations: HashMap<PaneId, u64>,
+}
+
+impl PaneOutputGenerationState {
+    fn note_output(&mut self, pane_id: PaneId) -> u64 {
+        let generation = self.generations.entry(pane_id).or_default();
+        *generation = generation.wrapping_add(1).max(1);
+        *generation
+    }
+
+    fn generation(&self, pane_id: PaneId) -> u64 {
+        self.generations.get(&pane_id).copied().unwrap_or(0)
+    }
+
+    fn remove(&mut self, pane_id: PaneId) {
+        self.generations.remove(&pane_id);
+    }
 }
 
 impl TabResizeNotificationState {
@@ -850,6 +872,7 @@ impl Mux {
             client_registrations: RwLock::new(HashMap::new()),
             frontend_lease: Mutex::new(FrontendLeaseState::default()),
             tab_resize_notifications: Mutex::new(TabResizeNotificationState::default()),
+            pane_output_generations: Mutex::new(PaneOutputGenerationState::default()),
             #[cfg(test)]
             frontend_geometry_failures: Mutex::new(std::collections::VecDeque::new()),
             palette_advisories: Mutex::new(PaletteAdvisoryState::default()),
@@ -2059,6 +2082,17 @@ impl Mux {
     }
 
     pub fn notify(&self, notification: MuxNotification) {
+        let removed_pane = match &notification {
+            MuxNotification::PaneRemoved(pane_id) => Some(*pane_id),
+            _ => None,
+        };
+        if let MuxNotification::PaneOutput(pane_id) = &notification {
+            // Record the durable fact before invoking subscribers. A native
+            // window can temporarily be unable to accept its notification,
+            // but it can later compare this generation with the last frame it
+            // successfully presented and recover the missing repaint.
+            self.pane_output_generations.lock().note_output(*pane_id);
+        }
         match notification {
             MuxNotification::TabResized(tab_id) => {
                 if self.tab_resize_notifications.lock().defer(tab_id) {
@@ -2068,6 +2102,16 @@ impl Mux {
             }
             other => self.notify_immediate(other),
         }
+        if let Some(pane_id) = removed_pane {
+            self.pane_output_generations.lock().remove(pane_id);
+        }
+    }
+
+    /// The latest PaneOutput generation published for this pane. Each GUI
+    /// window acknowledges generations independently after a successful
+    /// frame presentation.
+    pub fn pane_output_generation(&self, pane_id: PaneId) -> u64 {
+        self.pane_output_generations.lock().generation(pane_id)
     }
 
     fn notify_immediate(&self, notification: MuxNotification) {
@@ -3193,6 +3237,40 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_output_generation_is_visible_before_subscribers_run() {
+        let mux = Arc::new(Mux::new(None));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let subscriber_mux = Arc::clone(&mux);
+        let subscriber_observed = Arc::clone(&observed);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::PaneOutput(pane_id) = notification {
+                subscriber_observed
+                    .lock()
+                    .push(subscriber_mux.pane_output_generation(pane_id));
+            }
+            true
+        });
+
+        mux.notify(MuxNotification::PaneOutput(7));
+        mux.notify(MuxNotification::PaneOutput(7));
+        mux.notify(MuxNotification::PaneOutput(8));
+        assert_eq!(&*observed.lock(), &[1, 2, 1]);
+        assert_eq!(mux.pane_output_generation(7), 2);
+        assert_eq!(mux.pane_output_generation(8), 1);
+
+        mux.notify(MuxNotification::PaneRemoved(7));
+        assert_eq!(mux.pane_output_generation(7), 0);
+        assert_eq!(mux.pane_output_generation(8), 1);
+    }
+
+    #[test]
+    fn pane_output_generation_wraps_without_using_zero() {
+        let mut state = PaneOutputGenerationState::default();
+        state.generations.insert(9, u64::MAX);
+        assert_eq!(state.note_output(9), 1);
+    }
 
     #[test]
     fn tab_geometry_transaction_coalesces_and_is_tab_scoped() {

@@ -3,7 +3,7 @@ use crate::quad::{
 };
 use crate::termwindow::content_view::{ContentViewTypography, TerminalPreviewRequest};
 use crate::termwindow::render::{LineToEleShapeCacheKey, RenderScreenLineParams};
-use crate::termwindow::{RenderFrame, TermWindowNotif, UIItem, UIItemType};
+use crate::termwindow::{PaintOutcome, RenderFrame, TermWindowNotif, UIItem, UIItemType};
 use crate::ui::{DrawContext, UiPalette};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::color::LinearRgba;
@@ -642,7 +642,10 @@ impl crate::TermWindow {
         }
     }
 
-    pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
+    pub(crate) fn paint_impl(
+        &mut self,
+        frame: &mut RenderFrame,
+    ) -> anyhow::Result<PaintOutcome> {
         self.num_frames += 1;
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
@@ -692,8 +695,11 @@ impl crate::TermWindow {
         // and will be swapped regardless, so an unpainted frame there would
         // present undefined content, which is worse than a partial one.
         let mut present_frame = true;
+        let mut frame_complete = false;
 
         'pass: for pass in 0.. {
+            self.frame_pane_output_generations.clear();
+            self.track_pane_output_generations_for_frame = false;
             match self.paint_pass() {
                 Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
                     Ok(allocated) => {
@@ -702,6 +708,7 @@ impl crate::TermWindow {
                             // so the counter can be read as a distribution
                             // rather than as "something went wrong once".
                             crate::perf::log_counter("paint_passes", pass + 1);
+                            frame_complete = true;
                             break 'pass;
                         }
                         // Each retry repaints the *whole* window, thumbnails
@@ -827,9 +834,11 @@ impl crate::TermWindow {
         }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
-        if present_frame || !matches!(frame, RenderFrame::WebGpu) {
-            self.call_draw(frame).ok();
-        }
+        let draw_result = if present_frame || !matches!(frame, RenderFrame::WebGpu) {
+            self.call_draw(frame).map(|_| true)
+        } else {
+            Ok(false)
+        };
         self.publish_ui_shape_cache_diagnostics_throttled();
         self.last_frame_duration = start.elapsed();
         log::debug!(
@@ -881,7 +890,10 @@ impl crate::TermWindow {
                     if let Some(window) = self.window.as_ref() {
                         window.invalidate();
                     }
-                    return;
+                    return draw_result.map(|draw_submitted| PaintOutcome {
+                        draw_submitted,
+                        frame_complete,
+                    });
                 }
                 let prior = self.scheduled_animation.borrow_mut().take();
                 match prior {
@@ -914,6 +926,10 @@ impl crate::TermWindow {
                 }
             }
         }
+        draw_result.map(|draw_submitted| PaintOutcome {
+            draw_submitted,
+            frame_complete,
+        })
     }
 
     /// Paint the active content view into the content area (right of the
@@ -3478,6 +3494,11 @@ impl crate::TermWindow {
         }
 
         let frontend_blocked = !content_view_active && self.frontend_surface_blocked();
+
+        self.track_pane_output_generations_for_frame = !recording_flight
+            && mux::Mux::get()
+                .get_active_tab_for_window(self.mux_window_id)
+                .is_some_and(|tab| self.can_track_presented_terminal_output(&tab));
 
         // Everything the terminal registers during a transition sits under a
         // view that is on its way in or out. Leaving those targets live would
