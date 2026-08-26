@@ -177,7 +177,7 @@ impl PaletteDelivery {
     }
 }
 
-fn remote_server_identity_matches(created: Option<&str>, current: Option<&str>) -> bool {
+pub(crate) fn remote_server_identity_matches(created: Option<&str>, current: Option<&str>) -> bool {
     created == current
 }
 
@@ -584,6 +584,13 @@ impl ClientPane {
 
     pub(crate) fn belongs_to_remote_server(&self, server_id: Option<&str>) -> bool {
         remote_server_identity_matches(self.remote_server_id.as_deref(), server_id)
+    }
+
+    /// The mux runtime that allocated this mirror's remote pane id, as
+    /// recorded at construction. `None` when the connection had not yet
+    /// learned a server identity.
+    pub(crate) fn created_remote_server_id(&self) -> Option<&str> {
+        self.remote_server_id.as_deref()
     }
 
     pub fn remote_pane_id(&self) -> PaneId {

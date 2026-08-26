@@ -1,5 +1,5 @@
 use crate::client::{Client, ClientConnectionPhase};
-use crate::pane::ClientPane;
+use crate::pane::{remote_server_identity_matches, ClientPane};
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
@@ -160,6 +160,19 @@ pub struct ThinkTermFrontendRecoveryTarget {
 struct FrontendRecoveryBarrier {
     generation: u64,
     pending: HashMap<FrontendRecoverySlot, TabId>,
+    /// When the barrier was armed, so the recovery log can say how long
+    /// the frontend took to publish its geometry.
+    started_at: Instant,
+}
+
+impl FrontendRecoveryBarrier {
+    fn new(generation: u64, pending: HashMap<FrontendRecoverySlot, TabId>) -> Self {
+        Self {
+            generation,
+            pending,
+            started_at: Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +276,65 @@ fn consistent_remote_tab_id(ids: impl IntoIterator<Item = TabId>) -> Option<TabI
     let mut ids = ids.into_iter();
     let first = ids.next()?;
     ids.all(|id| id == first).then_some(first)
+}
+
+/// Where a locally mirrored pane came from, as far as the stale-mirror
+/// reap in `process_pane_list` is concerned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MirrorOrigin {
+    /// A `ClientPane` of the domain being swept, tagged with the mux
+    /// runtime that allocated its remote pane id (`None` when the
+    /// connection had not learned a server identity at construction).
+    Mirror(Option<String>),
+    /// A pane the reap must never touch: another domain's pane, or a
+    /// local pane sharing a tab with mirrors.
+    Foreign,
+}
+
+/// Mirrors whose allocating mux runtime is gone. Their remote pane ids
+/// name nothing on the connected server -- worse, a replacement server
+/// allocates ids from scratch, so a stale id can collide with someone
+/// else's live pane.
+///
+/// Only a *committed* runtime may condemn anything, which is why both ids
+/// are required and must agree. `Client::remote_server_id` flips as soon
+/// as version bootstrap succeeds, long before the replacement topology
+/// exists; a server push during the replacement's own Ensure calls spawns
+/// a resync that reaches here past a connection-generation guard that
+/// already matches. Judging against the connected id there would condemn
+/// every mirror of the session that is still being rebuilt, and judging
+/// against the committed id would condemn the replacement's fresh panes
+/// instead. While the two disagree both runtimes' mirrors coexist by
+/// design, so the sweep stands down and the replacement machinery owns
+/// the teardown.
+///
+/// Absence of evidence never condemns either: an unidentified runtime on
+/// either side keeps the pane, and a response that described no mirrors
+/// at all reaps nothing, so a half-started server cannot condemn the
+/// whole session.
+fn stale_mirrors_to_reap(
+    panes: impl IntoIterator<Item = (PaneId, MirrorOrigin)>,
+    committed_server_id: Option<&str>,
+    connected_server_id: Option<&str>,
+    live_mirrors_in_response: usize,
+) -> Vec<PaneId> {
+    if live_mirrors_in_response == 0
+        || committed_server_id.is_none()
+        || !remote_server_identity_matches(committed_server_id, connected_server_id)
+    {
+        return vec![];
+    }
+    panes
+        .into_iter()
+        .filter_map(|(pane_id, origin)| match origin {
+            MirrorOrigin::Mirror(Some(created))
+                if !remote_server_identity_matches(Some(&created), committed_server_id) =>
+            {
+                Some(pane_id)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn remote_owner_matches_client(
@@ -1180,10 +1252,8 @@ impl ClientInner {
         targets: impl IntoIterator<Item = (FrontendRecoverySlot, TabId)>,
     ) {
         let pending = targets.into_iter().collect::<HashMap<_, _>>();
-        *self.frontend_recovery_barrier.lock().unwrap() = Some(FrontendRecoveryBarrier {
-            generation,
-            pending,
-        });
+        *self.frontend_recovery_barrier.lock().unwrap() =
+            Some(FrontendRecoveryBarrier::new(generation, pending));
     }
 
     fn ready_server_id(&self) -> Option<String> {
@@ -1233,20 +1303,25 @@ impl ClientInner {
         local_tab_id: TabId,
         generation: u64,
     ) -> bool {
-        let ack = {
+        let (ack, waited) = {
             let mut barrier = self.frontend_recovery_barrier.lock().unwrap();
-            acknowledge_recovery_target(
+            let started_at = barrier.as_ref().map(|barrier| barrier.started_at);
+            let ack = acknowledge_recovery_target(
                 &mut barrier,
                 slot,
                 local_tab_id,
                 generation,
                 self.client.connection_generation(),
-            )
+            );
+            (ack, started_at.map(|started_at| started_at.elapsed()))
         };
         if ack == FrontendRecoveryAck::Complete {
             self.mark_server_recovered();
             self.client.mark_ready();
-            log::info!("frontend geometry restored for mux generation {generation}");
+            log::info!(
+                "frontend geometry restored for mux generation {generation} after {:?}",
+                waited.unwrap_or_default()
+            );
             wake_thinkterm_frontend();
         }
         ack != FrontendRecoveryAck::Ignored
@@ -2022,9 +2097,41 @@ impl ClientDomain {
                 let _activity = mux::activity::Activity::new();
                 let mux = Mux::get();
                 for tab_id in replacement.old_tabs {
-                    if mux.get_tab(tab_id).is_some() {
-                        mux.remove_tab(tab_id);
+                    let Some(tab) = mux.get_tab(tab_id) else {
+                        continue;
+                    };
+                    // Removing a tab calls Pane::kill on every pane in it,
+                    // and ClientPane::kill reports the remote id it recorded
+                    // -- an id from the DEAD runtime. The replacement
+                    // allocates ids from scratch, so that id can name an
+                    // unrelated live pane on the new server. These mirrors
+                    // are being discarded, not closed: keep the server out
+                    // of it.
+                    //
+                    // Only mirrors of a *replaced* runtime qualify. A retried
+                    // replacement can leave current-runtime panes in an old
+                    // tab -- process_pane_list re-adopts those same Arcs into
+                    // the new topology -- and the latch is one-shot, cleared
+                    // only by a kill that actually reaches the pane. Arming
+                    // one of those would swallow the user's next deliberate
+                    // close and leak the remote pane for the session.
+                    let connected_server_id = inner.client.remote_server_id();
+                    for pane in tab.iter_all_panes() {
+                        if pane.domain_id() != inner.local_domain_id {
+                            continue;
+                        }
+                        if mux.get_pane(pane.pane_id()).is_none() {
+                            continue;
+                        }
+                        if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                            if !client_pane
+                                .belongs_to_remote_server(connected_server_id.as_deref())
+                            {
+                                client_pane.ignore_next_kill();
+                            }
+                        }
                     }
+                    mux.remove_tab(tab_id);
                 }
             }
             Mux::get().prune_dead_windows();
@@ -2615,6 +2722,12 @@ impl ClientDomain {
             .copied()
             .collect();
 
+        // How many mirror panes the authoritative response actually
+        // described. The stale-mirror reap below refuses to act on an
+        // empty answer: a half-started server must not condemn the whole
+        // session.
+        let mut live_mirrors_in_response = 0usize;
+
         for (mut tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
             // Translate remote stack ids into stable local ids BEFORE the
             // tree rebuild, so that GUI state keyed by pane_stack_id
@@ -2678,6 +2791,7 @@ impl ClientDomain {
                 tab.sync_with_pane_tree(sync_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
+                    live_mirrors_in_response += 1;
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
                         match mux.get_pane(pane_id) {
                             Some(pane) => {
@@ -2816,7 +2930,7 @@ impl ClientDomain {
                         continue;
                     }
                 }
-                log::debug!(
+                log::info!(
                     "making new local window for remote {} in workspace {:?}",
                     remote_window_id,
                     workspace
@@ -2872,6 +2986,81 @@ impl ClientDomain {
             }
         }
 
+        // The sweep above heals the *maps*. It cannot see a mirror that
+        // lost its map entries entirely: prepare_server_replacement clears
+        // every remote<->local map, so a replacement attempt that failed
+        // partway leaves whole tabs with no mapping at all, permanently
+        // frozen on their last frame. Identity survives on the panes
+        // themselves -- ClientPane records the runtime that allocated its
+        // remote id -- so reap every mirror still addressed to a previous
+        // mux runtime. When the runtime did not change this collects
+        // nothing, so an ordinary reconnect is untouched.
+        let committed_server_id = inner.ready_server_id();
+        let connected_server_id = inner.client.remote_server_id();
+        // Settle the scalar gate before walking the mux: this runs on every
+        // resync, and server pushes spawn one per TabResized/TabAddedToWindow.
+        let doomed = if committed_server_id.is_some()
+            && committed_server_id == connected_server_id
+            && live_mirrors_in_response > 0
+        {
+            stale_mirrors_to_reap(
+                mux.iter_panes().into_iter().map(|pane| {
+                    let origin = pane
+                        .downcast_ref::<ClientPane>()
+                        .filter(|_| pane.domain_id() == inner.local_domain_id)
+                        .map(|client_pane| {
+                            MirrorOrigin::Mirror(
+                                client_pane.created_remote_server_id().map(str::to_string),
+                            )
+                        })
+                        .unwrap_or(MirrorOrigin::Foreign);
+                    (pane.pane_id(), origin)
+                }),
+                committed_server_id.as_deref(),
+                connected_server_id.as_deref(),
+                live_mirrors_in_response,
+            )
+        } else {
+            vec![]
+        };
+        if !doomed.is_empty() {
+            log::info!(
+                "domain {}: reaping {} mirror pane(s) {:?} addressed to a replaced \
+                 mux runtime (committed runtime {:?})",
+                inner.local_domain_id,
+                doomed.len(),
+                doomed,
+                committed_server_id
+            );
+            {
+                // Keep the frontend alive while windows are momentarily
+                // empty, exactly like the replacement removal in reattach.
+                let _activity = mux::activity::Activity::new();
+                for pane_id in &doomed {
+                    if let Some(pane) = mux.get_pane(*pane_id) {
+                        if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                            // Removal calls Pane::kill; the stale remote id
+                            // could name an unrelated live pane on the new
+                            // server. Discard locally, tell it nothing.
+                            client_pane.ignore_next_kill();
+                        }
+                    }
+                    mux.remove_pane(*pane_id);
+                }
+            }
+            mux.prune_dead_windows();
+            // The reap can empty a retained recovery window. Left behind,
+            // its dead id survives into the next replacement attempt, whose
+            // rebind path skips it (`mux.get_window` is None) and mints a
+            // brand-new native window instead -- the duplicate this map
+            // exists to prevent.
+            inner
+                .pending_recovery_windows
+                .lock()
+                .unwrap()
+                .retain(|_workspace, window_id| mux.get_window(*window_id).is_some());
+        }
+
         Ok(())
     }
 
@@ -2924,9 +3113,10 @@ mod tests {
         accepts_generation, acknowledge_recovery_target, active_remote_tabs_by_workspace,
         attach_with_retry_loop, consistent_remote_tab_id, is_fatal_attach_error,
         next_attach_backoff, owns_remote_viewport_from_states, remote_frontend_gate_from_state,
-        remote_move_pane_id, server_runtime_replaced, thread_id_for_workspace, AttachRetryOutcome,
-        AttachRetryTiming, AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
-        FrontendRecoverySlot, RemoteFrontendGate, ViewportLatencyState,
+        remote_move_pane_id, server_runtime_replaced, stale_mirrors_to_reap,
+        thread_id_for_workspace, AttachRetryOutcome, AttachRetryTiming,
+        AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
+        FrontendRecoverySlot, MirrorOrigin, RemoteFrontendGate, ViewportLatencyState,
     };
     use crate::client::ClientConnectionPhase;
     use mux::connui::ConnectionUI;
@@ -3430,13 +3620,13 @@ mod tests {
 
     #[test]
     fn replacement_barrier_waits_for_every_frontend_slot() {
-        let mut barrier = Some(FrontendRecoveryBarrier {
-            generation: 9,
-            pending: HashMap::from([
+        let mut barrier = Some(FrontendRecoveryBarrier::new(
+            9,
+            HashMap::from([
                 (FrontendRecoverySlot::Window(1), 41),
                 (FrontendRecoverySlot::Window(2), 42),
             ]),
-        });
+        ));
         assert_eq!(
             acknowledge_recovery_target(&mut barrier, FrontendRecoverySlot::Window(1), 41, 9, 9,),
             FrontendRecoveryAck::Pending
@@ -3451,10 +3641,10 @@ mod tests {
 
     #[test]
     fn replacement_barrier_rejects_stale_generation_and_wrong_tab() {
-        let mut barrier = Some(FrontendRecoveryBarrier {
-            generation: 9,
-            pending: HashMap::from([(FrontendRecoverySlot::Primary, 41)]),
-        });
+        let mut barrier = Some(FrontendRecoveryBarrier::new(
+            9,
+            HashMap::from([(FrontendRecoverySlot::Primary, 41)]),
+        ));
         assert_eq!(
             acknowledge_recovery_target(&mut barrier, FrontendRecoverySlot::Primary, 42, 9, 9,),
             FrontendRecoveryAck::Ignored
@@ -3464,6 +3654,96 @@ mod tests {
             FrontendRecoveryAck::Ignored
         );
         assert!(barrier.is_some());
+    }
+
+    fn mirror(server: &str) -> MirrorOrigin {
+        MirrorOrigin::Mirror(Some(server.to_string()))
+    }
+
+    #[test]
+    fn stale_mirrors_from_a_replaced_runtime_are_reaped() {
+        // The observed zombie: prepare_server_replacement wiped every map,
+        // so nothing here consults a mapping -- identity alone condemns.
+        assert_eq!(
+            stale_mirrors_to_reap(
+                [
+                    (1, mirror("srv-a")),
+                    (2, mirror("srv-a")),
+                    (3, mirror("srv-a"))
+                ],
+                Some("srv-b"),
+                Some("srv-b"),
+                2,
+            ),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn mirrors_of_the_current_runtime_are_never_reaped() {
+        // An ordinary reconnect keeps the same runtime; the reap must be a
+        // strict no-op there.
+        assert!(stale_mirrors_to_reap(
+            [(1, mirror("srv-b")), (2, mirror("srv-b"))],
+            Some("srv-b"),
+            Some("srv-b"),
+            2,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_replacement_in_flight_condemns_nothing() {
+        // Client::remote_server_id flips at version bootstrap, long before
+        // the replacement topology exists, and a server push during the
+        // replacement's own Ensure calls spawns a resync that lands here
+        // past a connection-generation guard that already matches. Judging
+        // against the connected runtime there would condemn every mirror of
+        // the session being rebuilt; judging against the committed one
+        // would condemn the replacement's fresh panes. Stand down instead.
+        let mirrors = [(1, mirror("srv-a")), (2, mirror("srv-b"))];
+        assert!(stale_mirrors_to_reap(mirrors.clone(), Some("srv-a"), Some("srv-b"), 2).is_empty());
+        assert!(stale_mirrors_to_reap(mirrors, Some("srv-b"), Some("srv-a"), 2).is_empty());
+    }
+
+    #[test]
+    fn foreign_and_local_panes_sharing_a_tab_survive_the_sweep() {
+        assert_eq!(
+            stale_mirrors_to_reap(
+                [
+                    (1, MirrorOrigin::Foreign),
+                    (2, mirror("srv-a")),
+                    (3, MirrorOrigin::Foreign)
+                ],
+                Some("srv-b"),
+                Some("srv-b"),
+                1,
+            ),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn an_empty_response_condemns_nothing() {
+        // A half-started server that answered with no panes must not take
+        // the whole session down with it.
+        assert!(
+            stale_mirrors_to_reap([(1, mirror("srv-a"))], Some("srv-b"), Some("srv-b"), 0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mirrors_with_no_recorded_runtime_are_left_alone() {
+        // Absence of evidence, in either direction, never condemns.
+        assert!(stale_mirrors_to_reap(
+            [(1, MirrorOrigin::Mirror(None))],
+            Some("srv-b"),
+            Some("srv-b"),
+            1
+        )
+        .is_empty());
+        assert!(stale_mirrors_to_reap([(1, mirror("srv-a"))], None, None, 1).is_empty());
     }
 }
 
