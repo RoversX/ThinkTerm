@@ -110,6 +110,33 @@ fn decide_resize_for_viewport(
     decide_resize(last_requested, dimensions, target)
 }
 
+/// What `requested_size` holds after a resize decision. It dedupes the resize
+/// RPC, so it may only record a size the server was actually told about: a
+/// target latched on the passive branch would dedupe away the corrective RPC
+/// for that same size once this renderer becomes the owner.
+///
+/// A passive renderer clears the latch outright rather than preserving it:
+/// whatever it remembers was sent under a previous ownership, and the server
+/// may have been driven elsewhere since - a retained key that happens to
+/// equal the takeover target would dedupe away the very RPC that reclaims
+/// the geometry. Clearing can never produce a spurious RPC, because
+/// `send_rpc` still requires the local surface to disagree with the target.
+fn next_requested_size(
+    owns_viewport: Option<bool>,
+    prior: Option<TerminalSize>,
+    decision: ResizeDecision,
+    target: TerminalSize,
+) -> Option<TerminalSize> {
+    if owns_viewport != Some(true) {
+        return None;
+    }
+    if decision.send_rpc {
+        Some(target)
+    } else {
+        prior
+    }
+}
+
 /// Delivery state of the palette advisory RPC.
 ///
 /// A single worker task owns all sending for a pane, and it always sends the
@@ -1021,17 +1048,14 @@ impl Pane for ClientPane {
             let render = self.renderable.lock();
             let mut inner = render.inner.borrow_mut();
             let advertised = inner.dimensions;
-            let decision = decide_resize_for_viewport(
-                self.client.owns_remote_viewport(self.remote_tab_id()),
-                prior_requested,
-                advertised,
-                size,
-            );
+            let owns_viewport = self.client.owns_remote_viewport(self.remote_tab_id());
+            let decision =
+                decide_resize_for_viewport(owns_viewport, prior_requested, advertised, size);
             // A passive renderer displays the server's canonical grid. It
             // must neither reshape its local RenderableDimensions nor send a
             // resize that the server will reject; doing the former alone
             // creates a local/server invalidate loop and visible flicker.
-            requested.replace(size);
+            *requested = next_requested_size(owns_viewport, prior_requested, decision, size);
 
             if decision.converge_local_surface {
                 inner.apply_local_resize(size);
@@ -1506,6 +1530,54 @@ mod test {
                 converge_local_surface: false,
                 send_rpc: false,
             }
+        );
+    }
+
+    /// The disconnect-takeover regression: a stale dedupe key from the
+    /// passive period must never suppress the corrective RPC once the lease
+    /// lands here. Both halves matter: a target latched while passive (never
+    /// sent), and a key retained from a PREVIOUS ownership that happens to
+    /// equal the takeover target - the common case for a renderer whose
+    /// window never changed while another device drove the tab.
+    #[test]
+    fn a_passive_resize_does_not_dedupe_away_the_owners_first_rpc() {
+        let canonical = size(132, 40, 96);
+        let target = size(120, 40, 96);
+
+        let passive = decide_resize_for_viewport(Some(false), None, dimensions(canonical), target);
+        assert_eq!(
+            passive,
+            ResizeDecision {
+                converge_local_surface: false,
+                send_rpc: false,
+            }
+        );
+        let requested = next_requested_size(Some(false), None, passive, target);
+        assert_eq!(requested, None, "nothing was sent, so nothing may latch");
+
+        // A key left over from when this renderer last owned the tab is
+        // cleared by any passive round, even though it equals the target.
+        assert_eq!(
+            next_requested_size(Some(false), Some(target), passive, target),
+            None,
+            "a passive renderer's dedupe key is meaningless and must clear"
+        );
+
+        let takeover =
+            decide_resize_for_viewport(Some(true), requested, dimensions(canonical), target);
+        assert!(takeover.send_rpc, "the corrective RPC must still go out");
+        assert_eq!(
+            next_requested_size(Some(true), requested, takeover, target),
+            Some(target)
+        );
+
+        let repeat =
+            decide_resize_for_viewport(Some(true), Some(target), dimensions(canonical), target);
+        assert!(!repeat.send_rpc, "a sent size still dedupes the next call");
+        assert_eq!(
+            next_requested_size(Some(true), Some(target), repeat, target),
+            Some(target),
+            "an owner's deduped call keeps its key"
         );
     }
 
