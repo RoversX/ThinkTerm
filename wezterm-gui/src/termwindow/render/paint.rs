@@ -642,10 +642,7 @@ impl crate::TermWindow {
         }
     }
 
-    pub(crate) fn paint_impl(
-        &mut self,
-        frame: &mut RenderFrame,
-    ) -> anyhow::Result<PaintOutcome> {
+    pub(crate) fn paint_impl(&mut self, frame: &mut RenderFrame) -> anyhow::Result<PaintOutcome> {
         self.num_frames += 1;
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
@@ -2721,6 +2718,12 @@ impl crate::TermWindow {
             self.update_next_frame_time(Some(Instant::now() + remaining));
             return Ok(());
         }
+        // Re-check the dynamic conditions at paint time: a rename started
+        // from a key assignment (no mouse event) or a row whose label no
+        // longer overflows must suppress an already-armed tag.
+        if !self.hover_tooltip_allowed(&hover.item.item_type) {
+            return Ok(());
+        }
         let Some(label) = crate::termwindow::tooltip_label_for(&hover.item.item_type) else {
             return Ok(());
         };
@@ -2771,10 +2774,7 @@ impl crate::TermWindow {
         // buttons in the same row — these are laid out horizontally, so the
         // only free direction is up. Flip below when there is no room above.
         // Full-width list rows left-align their tag; icon buttons centre it.
-        let left_align = matches!(
-            hover.item.item_type,
-            crate::termwindow::UIItemType::ThreadRefGroupToggle { .. }
-        );
+        let left_align = crate::termwindow::tooltip_left_aligns(&hover.item.item_type);
         let x = crate::termwindow::tooltip_anchor_x(bx, bw, tip_w, window_w, left_align);
         let y = if by - gap - tip_h >= 0.0 {
             by - gap - tip_h

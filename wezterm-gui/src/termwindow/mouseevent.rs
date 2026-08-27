@@ -1474,7 +1474,7 @@ impl super::TermWindow {
         }
     }
 
-    /// Track which icon-only button the pointer is resting on.
+    /// Track which tagged item the pointer is resting on.
     ///
     /// Keyed by item *type*, not by the UIItem: the sidebar rebuilds its items
     /// every frame and a button's rect can shift by a pixel, which must not
@@ -1484,8 +1484,12 @@ impl super::TermWindow {
     /// appear is registered by `paint_hover_tooltip`, because `paint_impl`
     /// clears `has_animation` on entry and would discard a deadline set here.
     fn update_hover_tooltip(&mut self, item: Option<&UIItem>) {
-        let labelled =
-            item.filter(|item| crate::termwindow::tooltip_label_for(&item.item_type).is_some());
+        let labelled = item
+            .filter(|item| crate::termwindow::tooltip_label_for(&item.item_type).is_some())
+            // The dynamic half of the rule: no tag over a live rename
+            // editor, and none for a file row whose label already reads in
+            // full. `paint_hover_tooltip` re-checks the same predicate.
+            .filter(|item| self.hover_tooltip_allowed(&item.item_type));
         match labelled {
             None => self.hover_tooltip = None,
             Some(item) => match self.hover_tooltip.as_mut() {
@@ -1776,15 +1780,16 @@ impl super::TermWindow {
             self.current_mouse_capture = None;
         }
 
-        if self.mouse_wheel_right_sidebar(&event, context) {
-            return;
-        }
-
-        if self.mouse_wheel_workspace_sidebar(&event, context) {
-            return;
-        }
-
-        if self.mouse_wheel_tab_surfaces(&event, context) {
+        if self.mouse_wheel_right_sidebar(&event, context)
+            || self.mouse_wheel_workspace_sidebar(&event, context)
+            || self.mouse_wheel_tab_surfaces(&event, context)
+        {
+            // The wheel moved content under a stationary pointer, so an
+            // armed hover tag now names whatever row USED to be under it.
+            // These early returns never reach `update_hover_tooltip`, so the
+            // stale tag would otherwise fire over the wrong row once its
+            // delay elapses. It re-arms on the next real pointer move.
+            self.hover_tooltip = None;
             return;
         }
 

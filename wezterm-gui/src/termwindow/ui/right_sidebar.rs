@@ -9178,6 +9178,10 @@ impl crate::TermWindow {
         content_bottom: usize,
         icon_size: usize,
     ) -> anyhow::Result<()> {
+        // Rebuilt as the rows paint below: only rows recorded this frame may
+        // carry the truncated-name hover tag.
+        self.right_sidebar_truncated_file_rows.clear();
+        self.right_sidebar_truncated_remote_file_rows.clear();
         if let Some(target) = self
             .active_remote_project_for_files()
             .map_err(anyhow::Error::msg)?
@@ -10135,6 +10139,15 @@ impl crate::TermWindow {
                 false,
             )
         } else {
+            // Same rule as the local tree: only a name the ellipsis actually
+            // cut earns the hover tag.
+            if matches!(
+                self.ellipsize_ui_text(ui_font, &row.entry.name, text_width)?,
+                Cow::Owned(_)
+            ) {
+                self.right_sidebar_truncated_remote_file_rows
+                    .insert(row.entry.path.clone());
+            }
             self.paint_sidebar_text(
                 layers,
                 ui_font,
@@ -14038,6 +14051,16 @@ impl crate::TermWindow {
         } else {
             let cell_height = ui_metrics.cell_size.height as usize;
             let text_y = y + (row_metrics.row_height.saturating_sub(cell_height)) / 2;
+            // The hover tag exists to recover what the ellipsis ate; a name
+            // that fits carries no tag. The shared shape cache makes this
+            // re-measure a lookup, not a second shaping pass.
+            if matches!(
+                self.ellipsize_ui_text(ui_font, &row.name, text_width)?,
+                Cow::Owned(_)
+            ) {
+                self.right_sidebar_truncated_file_rows
+                    .insert(row.path.clone());
+            }
             if visible(text_y, cell_height) {
                 self.paint_sidebar_text(
                     layers,

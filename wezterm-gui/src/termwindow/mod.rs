@@ -1187,6 +1187,62 @@ mod tooltip_tests {
         })
         .is_none());
     }
+
+    /// The Files panel is only ever a sidebar wide, so a long name is cut --
+    /// and cut from the end, which is the end that names the file.
+    #[test]
+    fn a_file_row_names_the_file_in_full() {
+        assert_eq!(
+            tooltip_label_for(&UIItemType::RightSidebarFileRow(PathBuf::from(
+                "/src/a-very-long-component-name.module.tsx"
+            )))
+            .as_deref(),
+            Some("a-very-long-component-name.module.tsx")
+        );
+        // A search result's row shows a `display_path`, so the ellipsis eats
+        // the file name specifically -- the tag has to be what it removed,
+        // not the leading directories the row already showed.
+        assert_eq!(
+            tooltip_label_for(&UIItemType::RightSidebarFileRow(PathBuf::from(
+                "/root/wezterm-gui/src/termwindow/ui/right_sidebar.rs"
+            )))
+            .as_deref(),
+            Some("right_sidebar.rs")
+        );
+        // No final component: nothing to name, and an empty tag must not
+        // paint as a bare floating pill.
+        assert!(tooltip_label_for(&UIItemType::RightSidebarFileRow(PathBuf::from("/"))).is_none());
+        // Remote rows are the same full-width, end-ellipsized row painted
+        // from an SFTP listing, and must carry the same tag.
+        assert_eq!(
+            tooltip_label_for(&UIItemType::RightSidebarRemoteFileRow(
+                remote_files::RemotePath::from_server_absolute("/home/x/right_sidebar.rs").unwrap()
+            ))
+            .as_deref(),
+            Some("right_sidebar.rs")
+        );
+        assert!(tooltip_label_for(&UIItemType::RightSidebarRemoteFileRow(
+            remote_files::RemotePath::from_server_absolute("/").unwrap()
+        ))
+        .is_none());
+    }
+
+    /// Alignment is a property of the item's KIND. Kept as a named rule so a
+    /// third full-width row cannot quietly inherit the button behaviour.
+    #[test]
+    fn full_width_rows_left_align_their_tag_and_buttons_do_not() {
+        assert!(tooltip_left_aligns(&UIItemType::RightSidebarFileRow(
+            PathBuf::from("/a/b.rs")
+        )));
+        assert!(tooltip_left_aligns(&UIItemType::RightSidebarRemoteFileRow(
+            remote_files::RemotePath::from_server_absolute("/a/b.rs").unwrap()
+        )));
+        assert!(tooltip_left_aligns(&UIItemType::ThreadRefGroupToggle {
+            key: "project-1".to_string(),
+            origin: "Lab Server".to_string(),
+        }));
+        assert!(!tooltip_left_aligns(&UIItemType::WorkspaceSidebarSettings));
+    }
 }
 
 #[cfg(test)]
@@ -1375,8 +1431,22 @@ pub fn tooltip_anchor_x(
     x.clamp(0.0, (window_width - tip_width).max(0.0))
 }
 
-/// The name to show for an icon-only button, or `None` for everything that
-/// already carries its own label (or whose meaning is obvious from position).
+/// Whether a tag begins at its item's left edge instead of centring on it.
+///
+/// By item KIND, never by width -- see [`tooltip_anchor_x`] for why. Full-width
+/// list rows have no centre worth pointing at; icon buttons do.
+pub fn tooltip_left_aligns(item_type: &UIItemType) -> bool {
+    matches!(
+        item_type,
+        UIItemType::ThreadRefGroupToggle { .. }
+            | UIItemType::RightSidebarFileRow(_)
+            | UIItemType::RightSidebarRemoteFileRow(_)
+    )
+}
+
+/// The tag to show for an item whose own text cannot say enough: an icon-only
+/// button (no text at all) or a row whose label is cut to fit the sidebar.
+/// `None` for everything that already reads in full.
 pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
     // A reference group's header shows the origin project's name, exactly
     // like a local folder. Where that project actually lives — which Space,
@@ -1384,6 +1454,24 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
     // hover tag is where it appears.
     if let UIItemType::ThreadRefGroupToggle { origin, .. } = item_type {
         return (!origin.is_empty()).then(|| origin.clone());
+    }
+    // A file row gets only the sidebar's width, and `ellipsize_ui_text` cuts
+    // from the END -- so what survives is the part every sibling shares and
+    // what is lost is the part that identifies the file. The tag carries the
+    // file name in both modes: in the tree it is what the row already tried
+    // to show, and in search results (where the row shows a `display_path`)
+    // it is exactly the tail the ellipsis ate.
+    if let UIItemType::RightSidebarFileRow(path) = item_type {
+        return path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty());
+    }
+    // Remote file rows are the same full-width, end-ellipsized row painted
+    // from an SFTP listing; the tag recovers the same tail.
+    if let UIItemType::RightSidebarRemoteFileRow(path) = item_type {
+        let name = path.file_name();
+        return (!name.is_empty()).then(|| name.to_string());
     }
     let key = match item_type {
         UIItemType::WorkspaceSidebarSettings => "tooltip-sidebar-settings",
@@ -1465,10 +1553,7 @@ mod pane_output_watchdog_tests {
             },
             true,
         ));
-        assert!(pane_output_needs_repaint(
-            current_after_paint,
-            captured
-        ));
+        assert!(pane_output_needs_repaint(current_after_paint, captured));
         assert!(!pane_output_needs_repaint(captured, captured));
     }
 
@@ -1791,6 +1876,11 @@ pub struct TermWindow {
     /// detached tasks, and failures also await a resync) cannot mutate the
     /// rejection damper with a stale decision.
     client_viewport_publish_seq: HashMap<TabId, u64>,
+    /// File rows whose painted label was actually cut this frame, rebuilt by
+    /// the Files panel painters each paint. Gates the hover tag: a row that
+    /// already reads in full has nothing for a tag to add.
+    right_sidebar_truncated_file_rows: HashSet<PathBuf>,
+    right_sidebar_truncated_remote_file_rows: HashSet<remote_files::RemotePath>,
     /// Latest-only full-viewport streams for native divider drags. A stream
     /// owns the matching ClientPane preview epoch until its final target is
     /// confirmed or explicitly rolled back.
@@ -2843,6 +2933,8 @@ impl TermWindow {
             rejected_local_viewports: HashMap::new(),
             rejected_client_viewports: HashMap::new(),
             client_viewport_publish_seq: HashMap::new(),
+            right_sidebar_truncated_file_rows: HashSet::new(),
+            right_sidebar_truncated_remote_file_rows: HashSet::new(),
             remote_divider_resize_streams: HashMap::new(),
             next_frontend_geometry_epoch: 1,
             frontend_viewport_report_pending: Arc::new(AtomicBool::new(false)),
@@ -6226,10 +6318,7 @@ impl TermWindow {
             return;
         }
         for pos in tab.iter_panes() {
-            if self
-                .collapsed_pane_layouts
-                .contains_key(&pos.pane_stack_id)
-            {
+            if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
                 continue;
             }
             let pane_id = pos.pane.pane_id();
@@ -6251,10 +6340,7 @@ impl TermWindow {
                 }
                 return;
             }
-            if let Some(client_pane) = pos
-                .pane
-                .downcast_ref::<wezterm_client::pane::ClientPane>()
-            {
+            if let Some(client_pane) = pos.pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
                 // Pass the viewport the renderer will actually paint —
                 // scrolled back, that is not the live screen, and judging
                 // the live rows would latch the watchdog on Stale rows a
@@ -6662,6 +6748,30 @@ impl TermWindow {
     }
 
     /// Whether the given pressed UI item is the surface currently hosting the
+    /// Whether a hover tag may exist for this item right now. The static
+    /// half lives in [`tooltip_label_for`]; this adds the conditions only
+    /// the live window knows: a row being renamed shows an editor where its
+    /// name was (the tag would name the file the user is renaming away
+    /// from), and a file row whose painted label was not actually cut this
+    /// frame already reads in full. Checked both when the tag arms
+    /// (`update_hover_tooltip`) and when it paints (`paint_hover_tooltip`),
+    /// so a rename started from a key assignment with the pointer at rest
+    /// still suppresses an already-armed tag.
+    pub(crate) fn hover_tooltip_allowed(&self, item_type: &UIItemType) -> bool {
+        if self.ui_item_hosts_inline_rename(Some(item_type)) {
+            return false;
+        }
+        match item_type {
+            UIItemType::RightSidebarFileRow(path) => {
+                self.right_sidebar_truncated_file_rows.contains(path)
+            }
+            UIItemType::RightSidebarRemoteFileRow(path) => {
+                self.right_sidebar_truncated_remote_file_rows.contains(path)
+            }
+            _ => true,
+        }
+    }
+
     /// inline rename editor; presses there must not auto-commit the rename.
     fn ui_item_hosts_inline_rename(&self, item: Option<&UIItemType>) -> bool {
         let Some(rename) = self.inline_tab_rename.as_ref() else {
