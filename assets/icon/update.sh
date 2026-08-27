@@ -5,6 +5,7 @@ set -x
 cd $(git rev-parse --show-toplevel)/assets/icon
 
 src=ThinkTerm_simple.png
+windows_src=ThinkTerm_windows.png
 macos_icns=ThinkTerm_simple.icns
 classic_macos_icns=ThinkTerm.icns
 
@@ -36,4 +37,4 @@ fi
 rm -f icon_*px.png
 
 # The Windows icon
-convert $conv_opts -define icon:auto-resize=256,128,96,64,48,32,16 $src ../windows/terminal.ico
+convert "$windows_src" $conv_opts -define icon:auto-resize=256,128,96,64,48,32,16 ../windows/terminal.ico
