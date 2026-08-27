@@ -111,6 +111,41 @@ fn local_viewport_publish_is_worthwhile(
     rejected.is_none_or(|prior| prior.viewport != *candidate || prior.shape != *shape)
 }
 
+/// The last ClientPane viewport the remote mux rejected, with the tab shape
+/// it was computed against. The remote counterpart of
+/// [`RejectedLocalViewport`], with one difference: a wire failure is not
+/// always deterministic (the transport itself can fail, and the server's tab
+/// can change under the same local bytes), so the damper also expires. A
+/// same-bytes retry is paced to [`REJECTED_CLIENT_VIEWPORT_HOLD`] instead of
+/// re-sending at the report cadence - each retry costs a resync - or being
+/// silenced forever. A rejection recorded on one transport also says nothing
+/// about its replacement, so a reconnect (tracked by the domain's connection
+/// generation) expires the entry immediately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RejectedClientViewport {
+    viewport: codec::ClientViewport,
+    shape: LocalTabShape,
+    rejected_at: std::time::Instant,
+    generation: Option<u64>,
+}
+
+const REJECTED_CLIENT_VIEWPORT_HOLD: Duration = Duration::from_secs(5);
+
+fn client_viewport_publish_is_worthwhile(
+    rejected: Option<&RejectedClientViewport>,
+    candidate: &codec::ClientViewport,
+    shape: &LocalTabShape,
+    generation: Option<u64>,
+    now: std::time::Instant,
+) -> bool {
+    rejected.is_none_or(|prior| {
+        prior.viewport != *candidate
+            || prior.shape != *shape
+            || prior.generation != generation
+            || now.duration_since(prior.rejected_at) >= REJECTED_CLIENT_VIEWPORT_HOLD
+    })
+}
+
 // Full-screen TUIs handle SIGWINCH asynchronously after the server-side PTY
 // resize has returned.  Keep two 125ms overlay frames of quiet time so a
 // slightly delayed clear/redraw cannot become the first visible GUI frame.
@@ -1049,6 +1084,8 @@ impl super::TermWindow {
             return;
         }
 
+        // An explicit user takeover re-arms the remote publish path too.
+        self.forget_rejected_local_viewport(tab_id);
         let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, true) else {
             return;
         };
@@ -1105,6 +1142,9 @@ impl super::TermWindow {
             .get_active_pane()
             .is_some_and(|pane| pane.downcast_ref::<ClientPane>().is_some());
         if is_remote {
+            // A mode change is an explicit user action: re-arm the remote
+            // publish even if an identical viewport was recently rejected.
+            self.forget_rejected_local_viewport(tab_id);
             let Some((domain, viewport)) = self.client_viewport_for_tab(&tab, true) else {
                 return;
             };
@@ -1255,6 +1295,10 @@ impl super::TermWindow {
         let mux = Mux::get();
         // Rejections for tabs that no longer exist have nothing left to damp.
         self.rejected_local_viewports
+            .retain(|tab_id, _| mux.get_tab(*tab_id).is_some());
+        self.rejected_client_viewports
+            .retain(|tab_id, _| mux.get_tab(*tab_id).is_some());
+        self.client_viewport_publish_seq
             .retain(|tab_id, _| mux.get_tab(*tab_id).is_some());
         let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
             return;
@@ -1542,11 +1586,46 @@ impl super::TermWindow {
         .detach();
     }
 
-    /// Allow the next local publish for `tab_id` even if an identical one was
+    /// Allow the next publish for `tab_id` even if an identical one was
     /// rejected: an explicit user action (a claim, a mode change) means a
     /// retry is meaningful again.
     pub(crate) fn forget_rejected_local_viewport(&mut self, tab_id: mux::tab::TabId) {
         self.rejected_local_viewports.remove(&tab_id);
+        self.rejected_client_viewports.remove(&tab_id);
+    }
+
+    /// True while `seq` is the newest remote viewport publish spawned for
+    /// this tab. Completion callbacks use it to keep out-of-order finishes
+    /// from mutating the rejection damper with stale decisions.
+    fn client_viewport_publish_is_latest(&self, tab_id: mux::tab::TabId, seq: u64) -> bool {
+        self.client_viewport_publish_seq.get(&tab_id).copied() == Some(seq)
+    }
+
+    /// Record a rejected remote viewport and schedule one report for when
+    /// its hold expires. Without the follow-up, a transient failure whose
+    /// cause the accompanying resync already repaired would leave the server
+    /// on stale geometry until some unrelated geometry event happened to
+    /// fire - nothing else re-reports when the local sizes already match.
+    fn arm_rejected_client_viewport(
+        &mut self,
+        tab_id: mux::tab::TabId,
+        rejected: RejectedClientViewport,
+    ) {
+        self.rejected_client_viewports.insert(tab_id, rejected);
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            smol::Timer::after(REJECTED_CLIENT_VIEWPORT_HOLD).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                // The debounced entry point re-runs the worthwhile check; a
+                // damper entry that was superseded or cleared in the
+                // meantime makes this a cheap no-op on the server side.
+                term_window.report_frontend_viewport();
+            })));
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
     }
 
     fn report_frontend_viewport_for_tab(&mut self, tab: &Arc<mux::tab::Tab>) {
@@ -1563,6 +1642,20 @@ impl super::TermWindow {
             let Some((domain, viewport)) = self.client_viewport_for_tab(tab, include_panes) else {
                 return;
             };
+            let shape = LocalTabShape::of(tab);
+            let generation = domain
+                .downcast_ref::<ClientDomain>()
+                .and_then(ClientDomain::connection_generation);
+            if !client_viewport_publish_is_worthwhile(
+                self.rejected_client_viewports.get(&tab_id),
+                &viewport,
+                &shape,
+                generation,
+                std::time::Instant::now(),
+            ) {
+                mux::zoom_trace!("gui.viewport.skip tab={tab_id} reason=rejected_remote");
+                return;
+            }
             if let Some(client_domain) = domain.downcast_ref::<ClientDomain>() {
                 self.remember_gui_recovery_intent(client_domain, tab_id, &viewport);
             }
@@ -1573,28 +1666,77 @@ impl super::TermWindow {
                     .collect::<Vec<_>>(),
                 codec::ClientViewport::CellGrid { .. } => Vec::new(),
             };
+            // Only the newest publish for a tab may touch the damper: these
+            // completions are detached tasks with no ordering, and the
+            // failure path additionally awaits a resync, so a stale
+            // completion could otherwise delete a newer rejection or assert
+            // one for bytes a newer publish already superseded.
+            let seq = {
+                let counter = self.client_viewport_publish_seq.entry(tab_id).or_insert(0);
+                *counter += 1;
+                *counter
+            };
+            let had_rejection = self.rejected_client_viewports.contains_key(&tab_id);
             let window = self.window.as_ref().cloned();
             promise::spawn::spawn(async move {
                 let Some(client_domain) = domain.downcast_ref::<ClientDomain>() else {
                     return Ok::<(), anyhow::Error>(());
                 };
-                if let Err(err) = client_domain.set_client_viewport(tab_id, viewport).await {
-                    log::warn!("publishing GUI frontend viewport: {err:#}");
-                    if let Err(resync_err) = client_domain.resync().await {
-                        log::warn!("resyncing after failed GUI viewport: {resync_err:#}");
+                let damper_viewport = viewport.clone();
+                match client_domain.set_client_viewport(tab_id, viewport).await {
+                    Ok(_) => {
+                        if had_rejection {
+                            if let Some(window) = window {
+                                window.notify(TermWindowNotif::Apply(Box::new(
+                                    move |term_window| {
+                                        if term_window
+                                            .client_viewport_publish_is_latest(tab_id, seq)
+                                        {
+                                            term_window.rejected_client_viewports.remove(&tab_id);
+                                        }
+                                    },
+                                )));
+                            }
+                        }
                     }
-                    if let Some(window) = window {
-                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                            let mux = Mux::get();
-                            for (pane_id, size) in &adopted {
-                                if let Some(pane) = mux.get_pane(*pane_id) {
-                                    if let Some(client) = pane.downcast_ref::<ClientPane>() {
-                                        client.forget_frontend_geometry(*size);
+                    Err(err) => {
+                        log::warn!("publishing GUI frontend viewport: {err:#}");
+                        // Arm the damper BEFORE the resync runs. The hold
+                        // must cover the window in which an identical report
+                        // would fail again, and it must start at the failure
+                        // itself: stamped after the repair, it would suppress
+                        // exactly the retry the resync just made viable, and
+                        // while a slow resync was still running it would not
+                        // be armed at all - the storm it exists to damp.
+                        let rejected = RejectedClientViewport {
+                            viewport: damper_viewport,
+                            shape,
+                            rejected_at: std::time::Instant::now(),
+                            generation,
+                        };
+                        if let Some(window) = window.clone() {
+                            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                                if term_window.client_viewport_publish_is_latest(tab_id, seq) {
+                                    term_window.arm_rejected_client_viewport(tab_id, rejected);
+                                }
+                            })));
+                        }
+                        if let Err(resync_err) = client_domain.resync().await {
+                            log::warn!("resyncing after failed GUI viewport: {resync_err:#}");
+                        }
+                        if let Some(window) = window {
+                            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                                let mux = Mux::get();
+                                for (pane_id, size) in &adopted {
+                                    if let Some(pane) = mux.get_pane(*pane_id) {
+                                        if let Some(client) = pane.downcast_ref::<ClientPane>() {
+                                            client.forget_frontend_geometry(*size);
+                                        }
                                     }
                                 }
-                            }
-                            term_window.invalidate_window();
-                        })));
+                                term_window.invalidate_window();
+                            })));
+                        }
                     }
                 }
                 Ok(())
@@ -2737,10 +2879,11 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 #[cfg(test)]
 mod frontend_geometry_tests {
     use super::{
-        frontend_geometry_action, geometry_confirmation_settled,
-        local_viewport_publish_is_worthwhile, remote_divider_can_pump,
-        remote_divider_target_is_owed, visible_geometry_targets, FrontendGeometryAction,
-        LocalTabShape, RejectedLocalViewport, FRONTEND_GEOMETRY_SETTLE,
+        client_viewport_publish_is_worthwhile, frontend_geometry_action,
+        geometry_confirmation_settled, local_viewport_publish_is_worthwhile,
+        remote_divider_can_pump, remote_divider_target_is_owed, visible_geometry_targets,
+        FrontendGeometryAction, LocalTabShape, RejectedClientViewport, RejectedLocalViewport,
+        FRONTEND_GEOMETRY_SETTLE, REJECTED_CLIENT_VIEWPORT_HOLD,
     };
     use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy};
     use std::collections::HashSet;
@@ -2768,6 +2911,80 @@ mod frontend_geometry_tests {
         mux::FrontendViewport::CellGrid {
             size: test_size(cols, rows),
         }
+    }
+
+    fn test_client_viewport(cols: usize, rows: usize) -> codec::ClientViewport {
+        codec::ClientViewport::CellGrid {
+            size: test_size(cols, rows),
+        }
+    }
+
+    /// The remote damper is paced, not permanent: identical bytes are held
+    /// back for the hold interval (each retry costs a resync), then allowed
+    /// again so a transport hiccup or a server-side change under the same
+    /// local bytes cannot silence the viewport forever. A reconnect (new
+    /// connection generation) expires the entry immediately - the rejection
+    /// described a transport that no longer exists.
+    #[test]
+    fn a_rejected_client_viewport_is_paced_not_silenced() {
+        let viewport = test_client_viewport(120, 40);
+        let shape = test_shape(120, 40, &[1, 2]);
+        let now = Instant::now();
+        assert!(client_viewport_publish_is_worthwhile(
+            None,
+            &viewport,
+            &shape,
+            Some(7),
+            now
+        ));
+
+        let rejected = RejectedClientViewport {
+            viewport: viewport.clone(),
+            shape: shape.clone(),
+            rejected_at: now,
+            generation: Some(7),
+        };
+        assert!(!client_viewport_publish_is_worthwhile(
+            Some(&rejected),
+            &viewport,
+            &shape,
+            Some(7),
+            now
+        ));
+        assert!(
+            client_viewport_publish_is_worthwhile(
+                Some(&rejected),
+                &viewport,
+                &shape,
+                Some(7),
+                now + REJECTED_CLIENT_VIEWPORT_HOLD,
+            ),
+            "identical bytes retry once the hold expires"
+        );
+        assert!(
+            client_viewport_publish_is_worthwhile(Some(&rejected), &viewport, &shape, Some(8), now),
+            "a reconnected transport owes nothing to the old rejection"
+        );
+        assert!(
+            client_viewport_publish_is_worthwhile(
+                Some(&rejected),
+                &test_client_viewport(100, 30),
+                &shape,
+                Some(7),
+                now
+            ),
+            "changed bytes are always worth sending"
+        );
+        assert!(
+            client_viewport_publish_is_worthwhile(
+                Some(&rejected),
+                &viewport,
+                &test_shape(120, 40, &[1, 2, 3]),
+                Some(7),
+                now
+            ),
+            "a changed tab shape re-arms the publish"
+        );
     }
 
     #[test]

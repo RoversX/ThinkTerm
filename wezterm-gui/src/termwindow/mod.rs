@@ -1781,6 +1781,16 @@ pub struct TermWindow {
     /// which would otherwise loop: reject → lease revoked → notification →
     /// republish → reject. See `resize::RejectedLocalViewport`.
     rejected_local_viewports: HashMap<TabId, resize::RejectedLocalViewport>,
+    /// Remote counterpart: the last ClientPane viewport the remote mux
+    /// rejected, per tab. Same loop, but each retry also costs a resync, and
+    /// a wire failure is not always deterministic - so identical retries are
+    /// paced rather than silenced. See `resize::RejectedClientViewport`.
+    rejected_client_viewports: HashMap<TabId, resize::RejectedClientViewport>,
+    /// Monotonic id of the newest remote viewport publish spawned per tab.
+    /// Completions compare against it so an out-of-order finish (they are
+    /// detached tasks, and failures also await a resync) cannot mutate the
+    /// rejection damper with a stale decision.
+    client_viewport_publish_seq: HashMap<TabId, u64>,
     /// Latest-only full-viewport streams for native divider drags. A stream
     /// owns the matching ClientPane preview epoch until its final target is
     /// confirmed or explicitly rolled back.
@@ -2831,6 +2841,8 @@ impl TermWindow {
             frontend_recovery_geometry: HashMap::new(),
             frontend_geometry_resync_after_epoch: HashSet::new(),
             rejected_local_viewports: HashMap::new(),
+            rejected_client_viewports: HashMap::new(),
+            client_viewport_publish_seq: HashMap::new(),
             remote_divider_resize_streams: HashMap::new(),
             next_frontend_geometry_epoch: 1,
             frontend_viewport_report_pending: Arc::new(AtomicBool::new(false)),
