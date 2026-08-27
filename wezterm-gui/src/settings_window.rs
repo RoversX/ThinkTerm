@@ -332,6 +332,14 @@ impl SettingsSection {
                 "Weight",
             ],
             Self::Terminal => &[
+                "Default Shell",
+                "Shell",
+                "zsh",
+                "bash",
+                "fish",
+                "PowerShell",
+                "pwsh",
+                "cmd",
                 "Font Size",
                 "Font Family",
                 "ThinkTerm Font Size",
@@ -478,6 +486,28 @@ fn localized_quote_mode_label(mode: NativeBottomQuoteMode) -> String {
     })
 }
 
+/// The shells to offer, probed fresh.
+///
+/// A stored choice that discovery no longer returns is appended so it
+/// stays visible and re-selectable: without it the closed control shows a
+/// path that appears in no menu row and nothing reads as selected. That
+/// happens both when the shell is uninstalled and when it merely
+/// re-resolves elsewhere (a Homebrew fish shadowing `/usr/bin/fish`).
+fn shell_catalog_including(
+    chosen: Option<&Vec<String>>,
+) -> Vec<crate::shell_catalog::DiscoveredShell> {
+    let mut catalog = crate::shell_catalog::discover();
+    if let Some(argv) = chosen.filter(|argv| !argv.is_empty()) {
+        if !catalog.iter().any(|shell| &shell.argv == argv) {
+            catalog.push(crate::shell_catalog::DiscoveredShell {
+                label: argv.join(" "),
+                argv: argv.clone(),
+            });
+        }
+    }
+    catalog
+}
+
 fn localized_remote_pane_resize_mode_label(mode: NativeRemotePaneResizeMode) -> String {
     crate::i18n::tr(match mode {
         NativeRemotePaneResizeMode::Auto => "settings-remote-pane-resize-mode-auto",
@@ -531,6 +561,13 @@ enum SettingsAction {
     SetAppIcon(NativeAppIcon),
     ToggleMainRendererMenu,
     SetMainRenderer(NativeRendererBackend),
+    /// Swallows clicks that land in an open dropdown's padding or row
+    /// gaps instead of letting them reach the controls underneath.
+    DropdownMenuBackdrop,
+    ToggleDefaultShellMenu,
+    /// `None` is the platform default; `Some` indexes the shell catalog
+    /// cached at paint time, exactly like the archived-row actions above.
+    SetDefaultShell(Option<usize>),
     RestartApplication,
     QuitApplication,
     ToggleBottomQuote,
@@ -578,6 +615,7 @@ enum SettingsDropdown {
     ThemeMode,
     AppIcon,
     MainRenderer,
+    DefaultShell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -992,6 +1030,10 @@ struct SettingsUiState {
     /// The archived rows as last painted; row-action indices resolve here
     /// so a click acts on exactly what the user saw.
     archived_rows: Vec<crate::workspace_threads::ArchivedProjectRow>,
+    /// The shells found on this machine. Refreshed when the Terminal
+    /// section is entered, never while painting: discovery touches the
+    /// filesystem, and the paint path must not.
+    shell_catalog: Vec<crate::shell_catalog::DiscoveredShell>,
     /// Two-step delete: the project id whose Delete button was clicked
     /// once. A second click executes; any other action clears it.
     confirm_delete_archived: Option<String>,
@@ -1027,6 +1069,7 @@ impl SettingsUiState {
             main_window_resource_lines: Vec::new(),
             memory_snapshot_copied_until: None,
             archived_rows: Vec::new(),
+            shell_catalog: Vec::new(),
             confirm_delete_archived: None,
             input_diagnostics_copied_until: None,
             sidebar_scrollbar_visible_until: None,
@@ -1621,6 +1664,11 @@ impl SettingsWindow {
         );
         ui.remote_drop_input
             .set_text_end(crate::native_settings::remote_drop_destination());
+        // Discovered once here as well as on entering the Terminal section:
+        // the window can open straight onto Terminal, and the search box can
+        // jump to it without passing through the section action. A handful of
+        // path probes, and never from the paint path.
+        ui.shell_catalog = shell_catalog_including(native_settings.terminal.default_shell.as_ref());
 
         let settings = Rc::new(RefCell::new(Self {
             instance_id,
@@ -1910,7 +1958,10 @@ impl SettingsWindow {
                         | SettingsAction::ToggleAppIconMenu
                         | SettingsAction::SetAppIcon(_)
                         | SettingsAction::ToggleMainRendererMenu
-                        | SettingsAction::SetMainRenderer(_),
+                        | SettingsAction::SetMainRenderer(_)
+                        | SettingsAction::ToggleDefaultShellMenu
+                        | SettingsAction::SetDefaultShell(_)
+                        | SettingsAction::DropdownMenuBackdrop,
                     ) => {
                         self.set_focused_input(None);
                     }
@@ -2457,6 +2508,11 @@ impl SettingsWindow {
         let sections = self.filtered_sections();
         if !sections.is_empty() && !sections.contains(&self.selected) {
             self.selected = sections[0];
+            if self.selected == SettingsSection::Terminal {
+                // Reached without a Select action, so the catalog would
+                // otherwise still be whatever the window opened with.
+                self.refresh_shell_catalog();
+            }
             self.ui.content_scroll.reset();
         }
     }
@@ -3054,6 +3110,11 @@ impl SettingsWindow {
                     // filesystem.
                     crate::agent_status::refresh_path_probe();
                 }
+                if section == SettingsSection::Terminal {
+                    // Same rule: shell discovery stats candidate paths, so
+                    // it happens on entry and the row paints from the cache.
+                    self.refresh_shell_catalog();
+                }
             }
             SettingsAction::OpenThinkTermConfigFile => {
                 self.ui.open_dropdown = None;
@@ -3193,6 +3254,66 @@ impl SettingsWindow {
                     Err(err) => {
                         self.status = settings_tr(
                             "settings-status-renderer-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
+            SettingsAction::DropdownMenuBackdrop => {
+                // Deliberately inert: the click was inside the open menu
+                // but not on an option, so it selects nothing and the menu
+                // stays open.
+            }
+            SettingsAction::ToggleDefaultShellMenu => {
+                self.ui.open_dropdown =
+                    if self.ui.open_dropdown == Some(SettingsDropdown::DefaultShell) {
+                        None
+                    } else {
+                        Some(SettingsDropdown::DefaultShell)
+                    };
+            }
+            SettingsAction::SetDefaultShell(index) => {
+                self.ui.open_dropdown = None;
+                // `get` rather than indexing: the catalog is a paint-time
+                // snapshot, so a stale index must be a no-op, not a panic.
+                let chosen = match index {
+                    Some(index) => match self.ui.shell_catalog.get(index) {
+                        Some(shell) => Some(shell.clone()),
+                        None => return,
+                    },
+                    None => None,
+                };
+                let label = chosen
+                    .as_ref()
+                    .map(|shell| shell.label.clone())
+                    .unwrap_or_else(|| self.no_override_label());
+                // Written from a copy and only adopted once it lands: a
+                // failed save would otherwise leave the dropdown showing a
+                // shell that no pane will ever run, and the next unrelated
+                // successful save would quietly commit it.
+                // Modified from a fresh read rather than from the copy
+                // this window opened with: the main window saves sidebar
+                // widths and the open-with list independently, and writing
+                // a stale whole-tree snapshot would silently revert them.
+                let mut pending = crate::native_settings::load();
+                pending.terminal.default_shell = chosen.map(|shell| shell.argv);
+                // Nothing to repaint or reload: `save` refreshes the shared
+                // settings handle, and the spawn path reads it per pane, so
+                // the next terminal opened uses the new shell.
+                match crate::native_settings::save(&pending) {
+                    Ok(()) => {
+                        self.native_settings = pending;
+                        self.status = settings_tr(
+                            "settings-status-value-now",
+                            &[
+                                ("setting", crate::i18n::tr("settings-default-shell")),
+                                ("value", label),
+                            ],
+                        );
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-terminal-error",
                             &[("error", format!("{err:#}"))],
                         );
                     }
@@ -5184,8 +5305,11 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Each settings card owns its row count because rows are painted manually.
-        // Terminal currently paints eight rows below; the count drives card height and scroll extent.
-        let row_count = 8;
+        // Terminal currently paints nine rows below; the count drives card height and scroll extent.
+        // What must stay in sync with paint_open_dropdown_overlay is not this
+        // number but each row's `row_step * N` multiplier, which that function
+        // copies by hand to place an open menu.
+        let row_count = 9;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         let button_y = card_y + card_height + self.settings_section_card_gap();
@@ -5226,20 +5350,21 @@ impl SettingsWindow {
         let row_x = card_x + card_padding;
         let row_width = max_width - card_padding * 2.0;
         self.paint_group_card(layers, card_x, card_y, max_width, card_height)?;
-        self.paint_setting_row(
-            layers,
-            row_x,
-            first_row_y,
-            row_width,
-            &crate::i18n::tr("settings-terminal-font-size"),
-            &crate::i18n::tr("settings-terminal-font-size-description"),
-            &font_size,
-            false,
-        )?;
+        self.paint_default_shell_row(layers, row_x, first_row_y, row_width, false)?;
         self.paint_setting_row(
             layers,
             row_x,
             first_row_y + row_step,
+            row_width,
+            &crate::i18n::tr("settings-terminal-font-size"),
+            &crate::i18n::tr("settings-terminal-font-size-description"),
+            &font_size,
+            true,
+        )?;
+        self.paint_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 2.0,
             row_width,
             &crate::i18n::tr("settings-terminal-font-family"),
             &crate::i18n::tr("settings-terminal-font-family-description"),
@@ -5249,7 +5374,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 2.0,
+            first_row_y + row_step * 3.0,
             row_width,
             &crate::i18n::tr("settings-terminal-native-font-size"),
             &crate::i18n::tr("settings-terminal-native-font-size-description"),
@@ -5263,7 +5388,7 @@ impl SettingsWindow {
         self.paint_action_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 3.0,
+            first_row_y + row_step * 4.0,
             row_width,
             &crate::i18n::tr("settings-remote-pane-resize-mode"),
             &crate::i18n::tr("settings-remote-pane-resize-mode-description"),
@@ -5276,7 +5401,7 @@ impl SettingsWindow {
         self.paint_toggle_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 4.0,
+            first_row_y + row_step * 5.0,
             row_width,
             &crate::i18n::tr("settings-bottom-quote"),
             &crate::i18n::tr("settings-bottom-quote-description"),
@@ -5287,7 +5412,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 5.0,
+            first_row_y + row_step * 6.0,
             row_width,
             &crate::i18n::tr("settings-quote-font-size"),
             &crate::i18n::tr("settings-quote-font-size-description"),
@@ -5301,7 +5426,7 @@ impl SettingsWindow {
         self.paint_action_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 6.0,
+            first_row_y + row_step * 7.0,
             row_width,
             &crate::i18n::tr("settings-quote-rotation"),
             &crate::i18n::tr("settings-quote-rotation-description"),
@@ -5312,7 +5437,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 7.0,
+            first_row_y + row_step * 8.0,
             row_width,
             &crate::i18n::tr("settings-quote-interval"),
             &crate::i18n::tr("settings-quote-interval-description"),
@@ -7502,6 +7627,168 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn refresh_shell_catalog(&mut self) {
+        self.ui.shell_catalog =
+            shell_catalog_including(self.native_settings.terminal.default_shell.as_ref());
+    }
+
+    /// What the "no choice" option means right now.
+    ///
+    /// Clearing the choice does not force the platform login shell: it
+    /// removes the override, and `LocalDomain::build_command` then falls
+    /// back to the Lua `default_prog` when the config sets one. Labelling
+    /// that "System default" would be a plain lie about what the pane
+    /// will run.
+    fn no_override_label(&self) -> String {
+        if config::configuration().default_prog.is_some() {
+            crate::i18n::tr("settings-default-shell-follow-lua")
+        } else {
+            crate::i18n::tr("settings-default-shell-system")
+        }
+    }
+
+    /// What the closed dropdown shows. A shell that has since been
+    /// uninstalled still names itself rather than silently reading as the
+    /// system default, so the user can see why their panes changed.
+    fn current_default_shell_label(&self) -> String {
+        let Some(argv) = self.native_settings.terminal.default_shell.as_ref() else {
+            return self.no_override_label();
+        };
+        let Some(program) = argv.first() else {
+            return self.no_override_label();
+        };
+        self.ui
+            .shell_catalog
+            .iter()
+            .find(|shell| &shell.argv == argv)
+            .map(|shell| shell.label.clone())
+            .unwrap_or_else(|| program.clone())
+    }
+
+    fn paint_default_shell_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+
+        let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
+        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let action = SettingsAction::ToggleDefaultShellMenu;
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
+        let open = self.ui.open_dropdown == Some(SettingsDropdown::DefaultShell);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        // A Lua `default_prog` still exists in many configs; say plainly
+        // that this row now decides, instead of leaving the user to wonder
+        // why their config line stopped mattering.
+        let description = if config::configuration().default_prog.is_some() {
+            crate::i18n::tr("settings-default-shell-overrides-lua")
+        } else {
+            crate::i18n::tr("settings-default-shell-description")
+        };
+
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            &crate::i18n::tr("settings-default-shell"),
+            palette.text,
+            text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y),
+            &description,
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            control_rect.origin.x,
+            control_rect.origin.y,
+            control_rect.size.width,
+            control_rect.size.height,
+            bg,
+            border,
+            self.ui_px(CONTROL_RADIUS),
+        )?;
+        let current = self.current_default_shell_label();
+        self.draw_text(
+            layers,
+            &ui_font,
+            control_x + self.ui_px(16.0),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
+            &current,
+            palette.text,
+            control_width - self.ui_px(60.0),
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronDown,
+            control_x + control_width - self.ui_px(38.0),
+            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
+            self.ui_px(22.0),
+            palette.secondary_text,
+        )?;
+
+        Ok(())
+    }
+
+    fn paint_default_shell_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<()> {
+        let chosen = self.native_settings.terminal.default_shell.clone();
+        let mut options = vec![(
+            self.no_override_label(),
+            SettingsAction::SetDefaultShell(None),
+            chosen.is_none(),
+        )];
+        for (index, shell) in self.ui.shell_catalog.iter().enumerate() {
+            options.push((
+                shell.label.clone(),
+                SettingsAction::SetDefaultShell(Some(index)),
+                chosen.as_ref() == Some(&shell.argv),
+            ));
+        }
+        self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
     fn paint_main_renderer_row(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -7683,16 +7970,22 @@ impl SettingsWindow {
         let row_count = match self.selected {
             SettingsSection::General => 8,
             SettingsSection::Appearance => 4,
+            SettingsSection::Terminal => 9,
             _ => 4,
         };
         let (_, first_row_y) = self.settings_card_geometry(section_y, row_count);
+        // NOTE: each multiplier below is the row's zero-based index inside
+        // its section painter, copied by hand. Nothing checks the two
+        // against each other, so moving a row means editing both places.
         let (row_x, row_y, row_width) = match self.selected {
             SettingsSection::Appearance => {
                 let row_y = match dropdown {
                     SettingsDropdown::Language => return Ok(()),
                     SettingsDropdown::ThemeMode => first_row_y,
                     SettingsDropdown::AppIcon => first_row_y + self.settings_row_step(),
-                    SettingsDropdown::MainRenderer => return Ok(()),
+                    SettingsDropdown::MainRenderer | SettingsDropdown::DefaultShell => {
+                        return Ok(())
+                    }
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -7701,7 +7994,19 @@ impl SettingsWindow {
                     SettingsDropdown::Language => first_row_y,
                     SettingsDropdown::ThemeMode => first_row_y + self.settings_row_step() * 3.0,
                     SettingsDropdown::MainRenderer => first_row_y + self.settings_row_step() * 4.0,
-                    SettingsDropdown::AppIcon => return Ok(()),
+                    SettingsDropdown::AppIcon | SettingsDropdown::DefaultShell => return Ok(()),
+                };
+                (x + card_padding, row_y, max_width - card_padding * 2.0)
+            }
+            SettingsSection::Terminal => {
+                let row_y = match dropdown {
+                    // First row of the section: the menu neither scrolls
+                    // nor flips upward, so it needs the room below it.
+                    SettingsDropdown::DefaultShell => first_row_y,
+                    SettingsDropdown::Language
+                    | SettingsDropdown::ThemeMode
+                    | SettingsDropdown::AppIcon
+                    | SettingsDropdown::MainRenderer => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -7729,6 +8034,12 @@ impl SettingsWindow {
                 control_width,
             ),
             SettingsDropdown::MainRenderer => self.paint_main_renderer_menu(
+                layers,
+                control_x,
+                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_width,
+            ),
+            SettingsDropdown::DefaultShell => self.paint_default_shell_menu(
                 layers,
                 control_x,
                 control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
@@ -7850,6 +8161,17 @@ impl SettingsWindow {
             Appearance::Light | Appearance::LightHighContrast => rgba(248, 248, 250, 1.0),
             Appearance::Dark | Appearance::DarkHighContrast => rgba(34, 34, 36, 1.0),
         };
+
+        // Claim the whole menu area before the rows do. Hit testing takes
+        // the last matching rect, so the rows still win where they cover;
+        // this only catches the padding and the gaps between them, which
+        // would otherwise pass the click through to whatever control the
+        // open menu is painted over.
+        self.ui_context.push(
+            rect(x, y, width, menu_height),
+            WidgetKind::Button,
+            SettingsAction::DropdownMenuBackdrop,
+        );
 
         self.draw_rounded_frame(
             layers,
