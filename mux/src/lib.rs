@@ -1121,18 +1121,26 @@ impl Mux {
             if viewport_changed {
                 state.viewports.insert(client_id.clone(), viewport.clone());
             }
+            // Compare against the owner as it stood before this report:
+            // seeding a vacated tab IS an owner change and must apply and
+            // publish. Without the bumped generation the RPC reply is
+            // rejected as stale by the client, which then never learns it
+            // owns the tab and keeps reporting a bare paneless viewport
+            // forever - the server stays on the departed owner's geometry.
+            let owner_was_me = state.owner.as_ref() == Some(client_id);
             let can_drive = match mode {
-                FrontendAccessMode::TmuxLatest => {
-                    if state.owner.is_none() {
-                        state.owner = Some(client_id.clone());
-                    }
-                    state.owner.as_ref() == Some(client_id)
-                }
+                // An ownerless tab belongs to whoever reports. The write
+                // itself happens in the owner_changed branch below - the
+                // single place this path moves `state.owner`.
+                FrontendAccessMode::TmuxLatest => state.owner.is_none() || owner_was_me,
                 FrontendAccessMode::Handoff => handoff_owner.as_ref() == Some(client_id),
             };
-            let owner_changed = can_drive && state.owner.as_ref() != Some(client_id);
+            let owner_changed = can_drive && !owner_was_me;
             if owner_changed {
                 state.owner = Some(client_id.clone());
+                // Dropping the view on a takeover is safe because every path
+                // that vacates the owner also clears the view; a reseed
+                // therefore never discards a live scroll position.
                 state.view = None;
             }
             let should_apply = can_drive && (owner_changed || viewport_changed || access_changed);
@@ -3991,6 +3999,84 @@ mod tests {
         assert_eq!(
             mux.frontend_access_state().owner.as_ref(),
             Some(second.as_ref())
+        );
+    }
+
+    /// A's per-tab owner is reseeded by the survivor's next passive report
+    /// after a disconnect vacates it. That reseed must apply the survivor's
+    /// geometry AND publish with a bumped generation: the survivor's report
+    /// is typically byte-identical to its stored follower viewport, and an
+    /// unpublished reseed hands back a stale generation that the client
+    /// rejects - it then never learns it owns the tab, keeps sending bare
+    /// paneless viewports, and the server stays on the dead owner's geometry.
+    #[test]
+    fn tmux_reseeding_a_vacated_tab_applies_and_publishes() {
+        let mux = Mux::new(None);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::TmuxLatest);
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab);
+        let tab_id = tab.tab_id();
+        let departing = Arc::new(client_id(95));
+        let survivor = Arc::new(client_id(96));
+        let departing_registration = mux.register_client(Arc::clone(&departing));
+        let survivor_registration = mux.register_client(Arc::clone(&survivor));
+        let departing_size = TerminalSize {
+            cols: 132,
+            rows: 40,
+            pixel_width: 1056,
+            pixel_height: 640,
+            dpi: 96,
+        };
+        let survivor_size = TerminalSize {
+            cols: 100,
+            rows: 30,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let survivor_grid = FrontendViewport::CellGrid {
+            size: survivor_size,
+        };
+
+        mux.set_registered_client_viewport(
+            &departing,
+            departing_registration,
+            tab_id,
+            FrontendViewport::CellGrid {
+                size: departing_size,
+            },
+        )
+        .unwrap();
+        let followed = mux
+            .set_registered_client_viewport(
+                &survivor,
+                survivor_registration,
+                tab_id,
+                survivor_grid.clone(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(followed.owner.as_ref(), Some(departing.as_ref()));
+        assert_eq!(tab.get_size(), departing_size);
+
+        mux.unregister_client(&departing, departing_registration);
+        let vacated = mux.viewport_state(tab_id).unwrap();
+        assert_eq!(vacated.owner, None);
+        assert!(vacated.generation > followed.generation);
+
+        let reseeded = mux
+            .set_registered_client_viewport(&survivor, survivor_registration, tab_id, survivor_grid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reseeded.owner.as_ref(), Some(survivor.as_ref()));
+        assert!(
+            reseeded.generation > vacated.generation,
+            "an unpublished reseed is rejected as stale by the client"
+        );
+        assert_eq!(
+            tab.get_size(),
+            survivor_size,
+            "the takeover must apply the survivor's geometry"
         );
     }
 
