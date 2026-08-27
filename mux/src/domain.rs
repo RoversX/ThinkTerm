@@ -206,15 +206,48 @@ pub trait Domain: Downcast + Send + Sync {
 }
 impl_downcast!(Domain);
 
+/// Inside a Flatpak sandbox `fixup_command` re-routes the spawn to the
+/// host through `flatpak-spawn` and resolves the host's own login shell
+/// itself, so a choice made here would not be honored -- and the paths
+/// this process can see belong to the sandbox runtime, not to the host
+/// that would run them. Cached: the file cannot appear or disappear
+/// while the process lives, and this is consulted on every spawn.
+fn running_under_flatpak() -> bool {
+    static UNDER_FLATPAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNDER_FLATPAK.get_or_init(|| Path::new("/.flatpak-info").exists())
+}
+
+/// What a `LocalDomain` actually spawns into.
+///
+/// Recorded at construction rather than inferred from the config: a
+/// `thinkterm serial ...` invocation builds its domain from the command
+/// line and never registers it in `serial_ports`, so a config lookup
+/// would classify it as an ordinary local domain and apply settings that
+/// break it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalDomainKind {
+    /// Programs run directly on this machine.
+    Plain,
+    /// A serial port: the pty ignores the command and accepts only the
+    /// default program.
+    Serial,
+}
+
 pub struct LocalDomain {
     pty_system: Mutex<Box<dyn PtySystem + Send>>,
     id: DomainId,
     name: String,
+    kind: LocalDomainKind,
 }
 
 impl LocalDomain {
     pub fn new(name: &str) -> Result<Self, Error> {
         Ok(Self::with_pty_system(name, native_pty_system()))
+    }
+
+    fn with_kind(mut self, kind: LocalDomainKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     fn resolve_exec_domain(&self) -> Option<ExecDomain> {
@@ -223,6 +256,20 @@ impl LocalDomain {
             .iter()
             .find(|ed| ed.name == self.name)
             .cloned()
+    }
+
+    /// Whether this domain runs programs directly on this machine.
+    ///
+    /// WSL, exec and serial domains are all `LocalDomain`s that run
+    /// somewhere else -- inside a distribution, inside a container, or
+    /// not as a process at all -- so a shell chosen for *this* machine is
+    /// meaningless to them, and forcing one on them breaks them: a serial
+    /// pty rejects any command that is not the default program outright.
+    fn is_plain_local_domain(&self, wsl: Option<&WslDomain>) -> bool {
+        self.kind == LocalDomainKind::Plain
+            && wsl.is_none()
+            && self.resolve_exec_domain().is_none()
+            && !running_under_flatpak()
     }
 
     fn resolve_wsl_domain(&self) -> Option<WslDomain> {
@@ -239,6 +286,7 @@ impl LocalDomain {
             pty_system: Mutex::new(pty_system),
             id,
             name: name.to_string(),
+            kind: LocalDomainKind::Plain,
         }
     }
 
@@ -257,7 +305,8 @@ impl LocalDomain {
             serial.set_baud_rate(baud as u32);
         }
         let pty_system = Box::new(serial);
-        Ok(Self::with_pty_system(&serial_domain.name, pty_system))
+        Ok(Self::with_pty_system(&serial_domain.name, pty_system)
+            .with_kind(LocalDomainKind::Serial))
     }
 
     #[cfg(unix)]
@@ -462,10 +511,37 @@ impl LocalDomain {
         let config = configuration();
 
         let wsl = self.resolve_wsl_domain();
-        let default_prog = wsl
+        // The user's chosen shell occupies the same slot as the Lua
+        // `default_prog`, one tier above it. Sitting in that slot is what
+        // keeps a WSL pane out of it: the arm below deliberately never
+        // consults the global default for a WSL domain, because a program
+        // chosen for this machine is meaningless inside the distribution.
+        // Only a command that is still asking for the default program can
+        // be affected, so an explicit `wezterm cli spawn -- htop` never
+        // pays for consulting the preference (which stats the chosen
+        // shell to confirm it still exists).
+        let wants_default_prog = command
             .as_ref()
-            .map(|wsl| wsl.default_prog.as_ref())
-            .unwrap_or(config.default_prog.as_ref());
+            .map(|cmd| cmd.is_default_prog())
+            .unwrap_or(true);
+        let chosen_shell = (wants_default_prog && self.is_plain_local_domain(wsl.as_ref()))
+            .then(crate::default_prog::preferred_argv)
+            .flatten();
+        let chosen_application = chosen_shell
+            .as_deref()
+            .and_then(|argv| crate::default_prog::shell_application(argv, cfg!(windows)));
+        let chosen_argv = match &chosen_application {
+            Some(crate::default_prog::ShellApplication::Argv(argv)) => Some(argv),
+            _ => None,
+        };
+
+        let default_prog = match (&wsl, &chosen_application) {
+            (Some(wsl), _) => wsl.default_prog.as_ref(),
+            // The choice wins over the Lua option: a stale `default_prog`
+            // must not make the settings dropdown look inert.
+            (None, Some(_)) => chosen_argv,
+            (None, None) => config.default_prog.as_ref(),
+        };
 
         let mut cmd = match command {
             Some(mut cmd) => {
@@ -480,6 +556,18 @@ impl LocalDomain {
                     .unwrap_or(config.default_cwd.as_ref()),
             )?,
         };
+        // Applied after the command exists, and only while it is still
+        // asking for the default program, so an explicitly spawned program
+        // (`wezterm cli spawn -- htop`) keeps its own argv and its own
+        // inherited SHELL.
+        if let Some(crate::default_prog::ShellApplication::ShellEnv(shell)) = &chosen_application {
+            // A caller that set SHELL for this spawn meant it -- the
+            // documented `SpawnCommand { set_environment_variables = {
+            // SHELL = ... } }` idiom must outrank a global preference.
+            if cmd.is_default_prog() && cmd.get_env("SHELL").is_none() {
+                cmd.env("SHELL", shell);
+            }
+        }
         if let Some(dir) = command_dir {
             // Paths entered in the UI (or relayed by a mux client) may use
             // `~` for the home directory; the spawn cwd is used verbatim by

@@ -41,6 +41,7 @@ pub mod agent_status;
 pub mod client;
 pub mod command_spec;
 pub mod connui;
+pub mod default_prog;
 pub mod domain;
 pub mod geometrytrace;
 pub mod localpane;

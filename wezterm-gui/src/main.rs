@@ -61,6 +61,7 @@ mod secret;
 mod selection;
 mod settings_window;
 mod shapecache;
+mod shell_catalog;
 mod snippets;
 mod spawn;
 mod ssh_hosts;
@@ -1149,6 +1150,11 @@ fn setup_mux(
     mux::agent_status::set_process_preference(|| {
         crate::native_settings::agent_panel_enabled()
     });
+    // The user-facing shell choice reaches every local spawn from here.
+    // A headless mux server installs nothing, so this preference can only
+    // ever decide what *this* process spawns, never what a remote server
+    // runs for us.
+    mux::default_prog::set_process_preference(crate::native_settings::default_shell);
     let client_id = Arc::new(mux::client::generate_client_id());
     mux.register_client(client_id.clone());
     mux.replace_identity(Some(client_id));
@@ -1221,6 +1227,14 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     let cmd = if need_builder {
         let prog = opts.prog.iter().map(|s| s.as_os_str()).collect::<Vec<_>>();
+        // Deliberately still the Lua option, not the chosen shell: this
+        // resolves before any domain exists and the command may be routed
+        // to a remote/exec domain that never reaches the local tiers, so
+        // suppressing it here would break `default_prog` for those. The
+        // consequence is narrow and documented: with BOTH a Lua
+        // `default_prog` and a chosen shell, `--cwd` startups follow the
+        // Lua one. Every other spawn goes through LocalDomain::build_command
+        // where the choice outranks it.
         let mut builder = config.build_prog(
             if prog.is_empty() { None } else { Some(prog) },
             config.default_prog.as_ref(),

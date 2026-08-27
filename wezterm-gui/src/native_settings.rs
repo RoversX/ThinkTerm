@@ -207,10 +207,47 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) bottom_quote_mode: NativeBottomQuoteMode,
     pub(crate) bottom_quote_interval_minutes: Option<u32>,
     pub(crate) bottom_quote_font_size: Option<f64>,
+    /// The program a new pane runs, as argv. `None` means the platform
+    /// default (`$SHELL` / `%ComSpec%`).
+    pub(crate) default_shell: Option<Vec<String>>,
 }
 
 pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
     load().terminal.remote_pane_resize_mode
+}
+
+/// The shell the user picked, if any. Read on every local spawn, so it
+/// goes through the cached handle rather than `load`, which deep-clones
+/// the whole settings tree.
+///
+/// A choice that no longer exists is dropped rather than passed on, so an
+/// uninstalled shell degrades to the platform default instead of leaving
+/// the user unable to open a terminal at all.
+pub(crate) fn default_shell() -> Option<Vec<String>> {
+    let argv = load_shared()
+        .terminal
+        .default_shell
+        .as_ref()
+        .filter(|argv| !argv.is_empty())
+        .cloned()?;
+    let Some(resolved) = crate::shell_catalog::resolve_chosen_argv_now(&argv) else {
+        // Warned about once per distinct choice: this is consulted once per
+        // pane, so restoring a large layout would otherwise repeat the same
+        // line dozens of times.
+        static WARNED_FOR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+        let warned = WARNED_FOR.get_or_init(|| Mutex::new(None));
+        let mut warned = warned.lock();
+        if warned.as_deref() != Some(argv[0].as_str()) {
+            *warned = Some(argv[0].clone());
+            log::warn!(
+                "the chosen default shell {:?} is not an executable file; \
+                 falling back to the system default",
+                argv[0]
+            );
+        }
+        return None;
+    };
+    Some(resolved)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
