@@ -670,6 +670,133 @@ struct NoteCodeRowPaintLayout {
     max_horizontal_scroll: f32,
 }
 
+/// Why the Notes panel cannot show its vault.
+///
+/// Classified on the worker thread that already touched the filesystem, for two
+/// reasons: painting may never do IO, and by the time an error reaches the
+/// window thread the distinction is gone -- a deleted folder and a macOS TCC
+/// denial both arrive as an `anyhow` chain ending in a bare `os error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteVaultProblem {
+    /// The vault folder itself is gone: renamed, deleted, or on a volume that
+    /// is not mounted.
+    MissingRoot,
+    /// The folder is there but the system refuses to open it. On macOS this is
+    /// almost always TCC -- the vault sits under Desktop / Documents /
+    /// Downloads and ThinkTerm was never granted access to it.
+    UnreadableRoot,
+    /// The folder lists fine; this one note would not load.
+    Note,
+    /// Any other IO failure.
+    Other,
+}
+
+impl NoteVaultProblem {
+    pub(crate) fn icon(self) -> SvgIcon {
+        match self {
+            // A folder we cannot get into reads as a folder problem, not a
+            // fault; the rest are genuine faults.
+            Self::UnreadableRoot => SvgIcon::FolderOpen,
+            Self::MissingRoot | Self::Note | Self::Other => SvgIcon::CircleAlert,
+        }
+    }
+
+    /// The headline: what went wrong, in the user's language, instead of the
+    /// `anyhow` chain that used to be the whole panel.
+    pub(crate) fn title(self) -> String {
+        crate::i18n::tr(match self {
+            Self::MissingRoot => "right-notes-vault-missing",
+            Self::UnreadableRoot => "right-notes-vault-unreadable",
+            Self::Note => "right-notes-note-unreadable",
+            Self::Other => "right-notes-open-error",
+        })
+    }
+
+    /// What to do about it.
+    ///
+    /// Every platform can refuse a folder, but each refuses for its own reason
+    /// and is fixed somewhere else, so a generic "check the permissions" is
+    /// followed by one sentence naming where THIS platform hides the switch.
+    ///
+    /// Each branch spells out its own `tr("...")` literal rather than picking a
+    /// key into a variable: `i18n`'s scan test only sees literals, and a key it
+    /// cannot see is a key that ships untranslated.
+    pub(crate) fn hint(self) -> Option<String> {
+        match self {
+            Self::MissingRoot => Some(crate::i18n::tr("right-notes-vault-missing-hint")),
+            Self::UnreadableRoot => {
+                let mut hint = crate::i18n::tr("right-notes-vault-unreadable-hint");
+                hint.push(' ');
+                hint.push_str(&if cfg!(target_os = "macos") {
+                    crate::i18n::tr("right-notes-vault-unreadable-macos")
+                } else if cfg!(windows) {
+                    crate::i18n::tr("right-notes-vault-unreadable-windows")
+                } else {
+                    // Every remaining unix. Worded without naming a distro so
+                    // it stays true on the BSDs too.
+                    crate::i18n::tr("right-notes-vault-unreadable-unix")
+                });
+                Some(hint)
+            }
+            Self::Note | Self::Other => None,
+        }
+    }
+}
+
+/// A classified vault failure and the raw error behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoteVaultFailure {
+    pub(crate) problem: NoteVaultProblem,
+    /// The full `anyhow` chain, shown verbatim and wrapped. It names the exact
+    /// path and the exact refusal, which is precisely what the old single-line
+    /// ellipsized message cut off.
+    pub(crate) detail: String,
+}
+
+/// Map the outcome of listing the vault directory to a classification.
+///
+/// Pure, so the mapping is testable without a filesystem; the caller owns the
+/// `read_dir` and therefore which thread it happens on.
+fn problem_for_read_dir(kind: Option<std::io::ErrorKind>) -> NoteVaultProblem {
+    match kind {
+        // The directory listed, so the vault is reachable and it was the note
+        // itself that failed.
+        None => NoteVaultProblem::Note,
+        Some(std::io::ErrorKind::NotFound) => NoteVaultProblem::MissingRoot,
+        // Covers both EACCES and EPERM; a macOS TCC denial arrives as the
+        // latter.
+        Some(std::io::ErrorKind::PermissionDenied) => NoteVaultProblem::UnreadableRoot,
+        Some(_) => NoteVaultProblem::Other,
+    }
+}
+
+/// Collapse the two failure layers a classified worker produces. The outer one
+/// is the worker thread failing to run at all, which says nothing about the
+/// vault -- `spawn_into_new_thread` requires an `anyhow::Result`, so the real
+/// classification has to travel inside its Ok payload.
+fn flatten_vault_worker_result<T>(
+    result: anyhow::Result<Result<T, NoteVaultFailure>>,
+) -> Result<T, NoteVaultFailure> {
+    match result {
+        Ok(inner) => inner,
+        Err(err) => Err(NoteVaultFailure {
+            problem: NoteVaultProblem::Other,
+            detail: format!("{err:#}"),
+        }),
+    }
+}
+
+/// Probe the vault root to classify a failure that just happened.
+///
+/// Touches the filesystem, so it belongs on the worker that failed -- never on
+/// the paint path.
+fn classify_vault_failure(vault_root: &Path, err: &anyhow::Error) -> NoteVaultFailure {
+    NoteVaultFailure {
+        problem: problem_for_read_dir(fs::read_dir(vault_root).err().map(|err| err.kind())),
+        detail: format!("{err:#}"),
+    }
+}
+
 /// Immutable component geometry for one visual/layout revision. Vertical
 /// scrolling only clones these Arcs; it must not clone the full Markdown
 /// projection or remeasure every table/code cell on every frame.
@@ -1550,7 +1677,7 @@ impl crate::TermWindow {
             .wrapping_add(1);
         self.right_sidebar_note = crate::markdown_editor::NoteHostState::default();
         self.right_sidebar_note_opening = None;
-        self.right_sidebar_note_open_failure = None;
+        self.clear_right_sidebar_note_failures();
         self.right_sidebar_note_vault_index_root = None;
         self.right_sidebar_note_vault_paths = Arc::new(Vec::new());
         self.right_sidebar_note_vault_indexing = false;
@@ -3548,7 +3675,7 @@ impl crate::TermWindow {
                         .right_sidebar_note_open_generation
                         .wrapping_add(1);
                     term_window.right_sidebar_note_opening = None;
-                    term_window.right_sidebar_note_open_failure = None;
+                    term_window.clear_right_sidebar_note_failures();
                     match result {
                         Ok(_) => term_window.right_sidebar_note.clear_document(None),
                         Err(err) => term_window
@@ -3587,7 +3714,7 @@ impl crate::TermWindow {
             }
             sequence += 1;
         };
-        self.right_sidebar_note_open_failure = None;
+        self.clear_right_sidebar_note_failures();
         self.request_right_sidebar_note_open(vault.root, relative_path, true, project_id, true);
     }
 
@@ -3633,7 +3760,7 @@ impl crate::TermWindow {
         else {
             return;
         };
-        self.right_sidebar_note_open_failure = None;
+        self.clear_right_sidebar_note_failures();
         self.request_right_sidebar_note_open(
             vault.root,
             relative_path.to_string(),
@@ -3680,7 +3807,7 @@ impl crate::TermWindow {
             return;
         };
         self.right_sidebar_note_vault_last_scan = None;
-        self.right_sidebar_note_open_failure = None;
+        self.clear_right_sidebar_note_failures();
         self.request_right_sidebar_note_open(
             document.vault_root,
             relative,
@@ -6435,12 +6562,39 @@ impl crate::TermWindow {
         }
     }
 
+    /// Re-attempt a vault that failed to open.
+    ///
+    /// Three pieces of state have to go or the retry is a silent no-op: the
+    /// rescan throttle (`NOTE_VAULT_RESCAN_SECS` would otherwise swallow it),
+    /// the cached open failure (replayed verbatim for the same key), and the
+    /// classified failure itself. The button exists for the case where nothing
+    /// about ThinkTerm changed and something outside it did -- a permission
+    /// granted, a volume mounted -- so the fix must not be "restart the app".
+    /// Clear both failure records together.
+    ///
+    /// They must never diverge: the keyed one gates whether an open is
+    /// re-attempted at all, the classified one gates whether the problem page
+    /// -- and therefore the way out -- is shown. Leaving either behind gives a
+    /// panel that will not retry, or one with no escape hatch.
+    fn clear_right_sidebar_note_failures(&mut self) {
+        self.right_sidebar_note_open_failure = None;
+        self.right_sidebar_note_vault_failure = None;
+    }
+
+    pub(crate) fn retry_right_sidebar_note_vault(&mut self) {
+        self.right_sidebar_note_vault_last_scan = None;
+        self.clear_right_sidebar_note_failures();
+        self.right_sidebar_note.load_error = None;
+        self.invalidate_window();
+    }
+
     fn refresh_note_vault_index_if_needed(&mut self, root: &Path) {
         let root_changed = self
             .right_sidebar_note_vault_index_root
             .as_ref()
             .is_none_or(|current| current != root);
         if root_changed {
+            self.right_sidebar_note_vault_failure = None;
             self.right_sidebar_note_vault_index_generation = self
                 .right_sidebar_note_vault_index_generation
                 .wrapping_add(1);
@@ -6484,27 +6638,34 @@ impl crate::TermWindow {
         };
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
-                let paths = vault_file_paths(&worker_root)?;
-                let active_snapshot = active_document
-                    .map(|(path, known_stamp)| -> anyhow::Result<_> {
-                        let metadata = fs::metadata(&path)
-                            .with_context(|| format!("stat {}", path.display()))?;
-                        let modified = metadata
-                            .modified()
-                            .with_context(|| format!("read mtime {}", path.display()))?;
-                        let len = metadata.len();
-                        if known_stamp == Some((modified, len)) {
-                            return Ok(None);
-                        }
-                        let source = fs::read_to_string(&path)
-                            .with_context(|| format!("read {}", path.display()))?;
-                        Ok(Some((modified, len, source)))
-                    })
-                    .transpose()?
-                    .flatten();
-                Ok::<_, anyhow::Error>((paths, active_snapshot))
+                let outcome = (|| -> anyhow::Result<_> {
+                    let paths = vault_file_paths(&worker_root)?;
+                    let active_snapshot = active_document
+                        .map(|(path, known_stamp)| -> anyhow::Result<_> {
+                            let metadata = fs::metadata(&path)
+                                .with_context(|| format!("stat {}", path.display()))?;
+                            let modified = metadata
+                                .modified()
+                                .with_context(|| format!("read mtime {}", path.display()))?;
+                            let len = metadata.len();
+                            if known_stamp == Some((modified, len)) {
+                                return Ok(None);
+                            }
+                            let source = fs::read_to_string(&path)
+                                .with_context(|| format!("read {}", path.display()))?;
+                            Ok(Some((modified, len, source)))
+                        })
+                        .transpose()?
+                        .flatten();
+                    Ok::<_, anyhow::Error>((paths, active_snapshot))
+                })();
+                // Classified here, on the thread that already has filesystem
+                // access: paint may never do IO, and by the time this reaches
+                // the window thread the reason is no longer recoverable.
+                Ok(outcome.map_err(|err| classify_vault_failure(&worker_root, &err)))
             })
             .await;
+            let result = flatten_vault_worker_result(result);
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 if generation != term_window.right_sidebar_note_vault_index_generation
                     || term_window.right_sidebar_note_vault_index_root.as_ref() != Some(&root)
@@ -6515,6 +6676,10 @@ impl crate::TermWindow {
                 let mut changed = term_window.right_sidebar_note.document.is_none();
                 match result {
                     Ok((paths, active_snapshot)) => {
+                        changed |= term_window
+                            .right_sidebar_note_vault_failure
+                            .take()
+                            .is_some();
                         if term_window.right_sidebar_note_vault_paths.as_ref() != &paths {
                             for path in &paths {
                                 let mut parent = Path::new(path).parent();
@@ -6537,11 +6702,13 @@ impl crate::TermWindow {
                                 .apply_external_snapshot(modified, len, source);
                         }
                     }
-                    Err(err) => {
-                        let message = format!("{err:#}");
+                    Err(failure) => {
                         changed = term_window.right_sidebar_note.load_error.as_deref()
-                            != Some(message.as_str());
-                        term_window.right_sidebar_note.load_error = Some(message);
+                            != Some(failure.detail.as_str())
+                            || term_window.right_sidebar_note_vault_failure.as_ref()
+                                != Some(&failure);
+                        term_window.right_sidebar_note.load_error = Some(failure.detail.clone());
+                        term_window.right_sidebar_note_vault_failure = Some(failure);
                     }
                 }
                 if changed {
@@ -6756,6 +6923,207 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Paint `text` as wrapped lines and report the height used.
+    ///
+    /// Unlike `paint_sidebar_text` this never ellipsizes. It is for text whose
+    /// TAIL is the part that matters -- an error's reason, the end of a path --
+    /// which is exactly what a one-line cut removes.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_sidebar_wrapped_text(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        text: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        max_lines: usize,
+        color: LinearRgba,
+    ) -> anyhow::Result<usize> {
+        if text.is_empty() || width == 0 || max_lines == 0 {
+            return Ok(0);
+        }
+        let line_height = ui_metrics.cell_size.height as usize;
+        // Measured against the shared shape cache before any painting starts,
+        // so the immutable borrow is gone by the time the lines are drawn.
+        let lines = wrap_snippet_text_for_width(text, max_lines, false, |segment| {
+            self.sidebar_text_width(ui_font, segment)
+                .unwrap_or(f32::MAX)
+                / width.max(1) as f32
+        });
+        let mut line_y = y;
+        for line in &lines {
+            self.paint_sidebar_text(layers, ui_font, ui_metrics, line, x, line_y, width, color)?;
+            line_y += line_height;
+        }
+        Ok(lines.len().saturating_mul(line_height))
+    }
+
+    /// The panel shown when a CONFIGURED vault will not open.
+    ///
+    /// Modelled on `paint_remote_files_empty_state`, but with the two things
+    /// that one cannot do: a detail block that wraps instead of ellipsizing --
+    /// the reason and the path are the whole point -- and more than one action.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_note_vault_problem_state(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        failure: &NoteVaultFailure,
+        vault_root: Option<&Path>,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+    ) -> anyhow::Result<()> {
+        let line_h = ui_metrics.cell_size.height as usize;
+        let icon_size = self.ui_px(REMOTE_EMPTY_ICON_SIZE);
+        let icon_gap = self.ui_px(REMOTE_EMPTY_ICON_GAP);
+        let detail_gap = self.ui_px(REMOTE_EMPTY_DETAIL_GAP);
+        let button_block_gap = self.ui_px(REMOTE_EMPTY_BUTTON_GAP);
+        // Same metrics as the first-use panel's buttons, which this one stands
+        // in for.
+        let button_height = self.ui_px(52);
+        let button_gap = self.ui_px(10);
+
+        let title = failure.problem.title();
+        let hint = failure.problem.hint();
+        // Path first, then the refusal: the user has to recognise WHICH folder
+        // before any of the three buttons mean anything.
+        let mut detail = String::new();
+        if let Some(root) = vault_root {
+            detail.push_str(&root.display().to_string());
+            detail.push('\n');
+        }
+        detail.push_str(&failure.detail);
+
+        {
+            let wrap = |text: &str, max_lines: usize| -> Vec<String> {
+                wrap_snippet_text_for_width(text, max_lines, false, |segment| {
+                    self.sidebar_text_width(ui_font, segment)
+                        .unwrap_or(f32::MAX)
+                        / content_width.max(1) as f32
+                })
+            };
+            let title_lines = wrap(&title, 3);
+            let hint_lines = hint
+                .as_deref()
+                .map(|hint| wrap(hint, 4))
+                .unwrap_or_default();
+            let detail_lines = wrap(&detail, 6);
+
+            let block_h = icon_size
+                + icon_gap
+                + title_lines.len() * line_h
+                + if hint_lines.is_empty() {
+                    0
+                } else {
+                    detail_gap + hint_lines.len() * line_h
+                }
+                + detail_gap
+                + detail_lines.len() * line_h
+                + button_block_gap
+                + button_height * 3
+                + button_gap * 2;
+
+            // Centre in the panel, but never above its top edge when short.
+            let available = content_bottom.saturating_sub(content_top);
+            let mut y = content_top + available.saturating_sub(block_h) / 2;
+
+            let icon_x = content_x + content_width.saturating_sub(icon_size) / 2;
+            self.paint_sidebar_icon(
+                layers,
+                failure.problem.icon(),
+                icon_x,
+                y,
+                icon_size,
+                chrome.secondary_text,
+            )?;
+            y += icon_size + icon_gap;
+
+            for line in &title_lines {
+                self.paint_remote_files_centered_text(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    line,
+                    content_x,
+                    y,
+                    content_width,
+                    chrome.text,
+                )?;
+                y += line_h;
+            }
+
+            for lines in [&hint_lines, &detail_lines] {
+                if lines.is_empty() {
+                    continue;
+                }
+                y += detail_gap;
+                for line in lines {
+                    self.paint_remote_files_centered_text(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        line,
+                        content_x,
+                        y,
+                        content_width,
+                        chrome.muted_text,
+                    )?;
+                    y += line_h;
+                }
+            }
+
+            y += button_block_gap;
+            // The escape hatches. These used to be gated on there being NO
+            // vault at all, which hid "choose another folder" in the one state
+            // where it is the only useful thing left to do.
+            for (icon, label, item_type) in [
+                (
+                    SvgIcon::FolderOpen,
+                    "right-choose-another-vault",
+                    UIItemType::RightSidebarNoteChooseVault,
+                ),
+                (
+                    SvgIcon::FolderPlus,
+                    "right-create-new-vault",
+                    UIItemType::RightSidebarNoteCreateVault,
+                ),
+                (
+                    SvgIcon::RotateCcw,
+                    "right-retry",
+                    UIItemType::RightSidebarNoteRetry,
+                ),
+            ] {
+                self.paint_snippet_button(
+                    layers,
+                    1,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    y,
+                    content_width,
+                    button_height,
+                    Some(icon),
+                    &crate::i18n::tr(label),
+                    item_type,
+                    true,
+                )?;
+                y += button_height + button_gap;
+            }
+        }
+        Ok(())
+    }
+
     fn paint_note_sidebar(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -6773,10 +7141,63 @@ impl crate::TermWindow {
         self.right_sidebar_note_table_layouts.clear();
         let vault = workspace_threads::space_note_vault(&self.active_space_id);
         self.active_space_has_note_vault = vault.is_some();
-        if let Some(vault) = vault {
-            self.refresh_note_vault_index_if_needed(&vault.root);
+        let vault_root = vault.map(|vault| vault.root);
+        if let Some(root) = vault_root.as_ref() {
+            self.refresh_note_vault_index_if_needed(root);
         }
         if !self.ensure_active_right_sidebar_note_document() {
+            // A configured vault that will not open gets a real panel: what is
+            // wrong, which folder, and the way out. It used to get one
+            // ellipsized line of `anyhow` chain and no buttons at all.
+            if let Some(failure) = self.right_sidebar_note_vault_failure.clone() {
+                self.paint_note_vault_problem_state(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    &failure,
+                    vault_root.as_deref(),
+                    content_x,
+                    content_top,
+                    content_width,
+                    content_bottom,
+                )?;
+                // The expanded pane is reserved even while the note is broken;
+                // keep it legible and keep its collapse toggle reachable so it
+                // is never blank and stuck.
+                if let Some(pane_rect) = self.right_sidebar_note_pane_rect() {
+                    let inset = self.ui_px(SIDEBAR_INSET);
+                    let button_size = self.ui_px(NOTE_TOOLBAR_HEIGHT);
+                    self.paint_sidebar_wrapped_text(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        &failure.detail,
+                        pane_rect.x + inset * 2,
+                        pane_rect.y + inset * 2 + button_size + self.ui_px(NOTE_BODY_TOP_GAP),
+                        pane_rect.width.saturating_sub(inset * 4),
+                        6,
+                        muted_fg,
+                    )?;
+                    self.paint_snippet_icon_button(
+                        layers,
+                        chrome,
+                        foreground,
+                        muted_fg,
+                        pane_rect
+                            .x
+                            .saturating_add(pane_rect.width)
+                            .saturating_sub(inset * 2 + button_size),
+                        pane_rect.y + inset * 2,
+                        button_size,
+                        SvgIcon::Shrink,
+                        UIItemType::RightSidebarNotePaneToggle,
+                    )?;
+                }
+                return Ok(());
+            }
             let message = self
                 .right_sidebar_note
                 .load_error
@@ -8695,7 +9116,7 @@ impl crate::TermWindow {
             })
         {
             self.right_sidebar_note_opening = None;
-            self.right_sidebar_note_open_failure = None;
+            self.clear_right_sidebar_note_failures();
             self.right_sidebar_note.load_error = None;
             if focus {
                 self.right_sidebar_note.view.focused = true;
@@ -8707,9 +9128,11 @@ impl crate::TermWindow {
             }
             return true;
         }
-        if let Some((failed_key, message)) = self.right_sidebar_note_open_failure.as_ref() {
+        if let Some((failed_key, failure)) = self.right_sidebar_note_open_failure.as_ref() {
             if failed_key == &key {
-                self.right_sidebar_note.load_error = Some(message.clone());
+                let failure = failure.clone();
+                self.right_sidebar_note.load_error = Some(failure.detail.clone());
+                self.right_sidebar_note_vault_failure = Some(failure);
                 return false;
             }
         }
@@ -8729,7 +9152,7 @@ impl crate::TermWindow {
             self.right_sidebar_note_open_generation.wrapping_add(1);
         let generation = self.right_sidebar_note_open_generation;
         self.right_sidebar_note_opening = Some(key.clone());
-        self.right_sidebar_note_open_failure = None;
+        self.clear_right_sidebar_note_failures();
         self.right_sidebar_note.load_error = Some(crate::i18n::tr("right-opening-note"));
         let Some(window) = self.window.as_ref().cloned() else {
             self.right_sidebar_note_opening = None;
@@ -8740,9 +9163,11 @@ impl crate::TermWindow {
             let worker_root = vault_root.clone();
             let worker_path = relative_path.clone();
             let result = promise::spawn::spawn_into_new_thread(move || {
-                open_vault_document(&worker_root, &worker_path, create)
+                Ok(open_vault_document(&worker_root, &worker_path, create)
+                    .map_err(|err| classify_vault_failure(&worker_root, &err)))
             })
             .await;
+            let result = flatten_vault_worker_result(result);
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 if term_window.right_sidebar_note_open_generation != generation
                     || term_window.right_sidebar_note_opening.as_ref() != Some(&key)
@@ -8752,7 +9177,7 @@ impl crate::TermWindow {
                 term_window.right_sidebar_note_opening = None;
                 match result {
                     Ok(document) => {
-                        term_window.right_sidebar_note_open_failure = None;
+                        term_window.clear_right_sidebar_note_failures();
                         term_window.right_sidebar_note.load_error = None;
                         term_window.right_sidebar_note.bind_document(document);
                         term_window.right_sidebar_note.view.focused = focus;
@@ -8771,10 +9196,10 @@ impl crate::TermWindow {
                             term_window.right_sidebar_note_vault_last_scan = None;
                         }
                     }
-                    Err(err) => {
-                        let message = format!("{err:#}");
-                        term_window.right_sidebar_note.load_error = Some(message.clone());
-                        term_window.right_sidebar_note_open_failure = Some((key, message));
+                    Err(failure) => {
+                        term_window.right_sidebar_note.load_error = Some(failure.detail.clone());
+                        term_window.right_sidebar_note_open_failure = Some((key, failure.clone()));
+                        term_window.right_sidebar_note_vault_failure = Some(failure);
                     }
                 }
                 term_window.invalidate_window();
@@ -8786,6 +9211,7 @@ impl crate::TermWindow {
 
     fn ensure_active_right_sidebar_note_document(&mut self) -> bool {
         let Some(vault) = workspace_threads::space_note_vault(&self.active_space_id) else {
+            self.clear_right_sidebar_note_failures();
             self.right_sidebar_note
                 .clear_document(Some(crate::i18n::tr("right-notes-first-use")));
             return false;
@@ -8793,6 +9219,7 @@ impl crate::TermWindow {
         let Some(project_id) =
             workspace_threads::active_project_id_for_space(&self.active_space_id)
         else {
+            self.clear_right_sidebar_note_failures();
             self.right_sidebar_note
                 .clear_document(Some(crate::i18n::tr("right-no-active-project")));
             return false;
@@ -18759,8 +19186,8 @@ mod tests {
         pasted_image_file_name, path_key, pick_free_remote_name, preflight_local_copy,
         preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
         preview_text_range, preview_visible_colored, preview_visible_line_range,
-        remote_lease_failure_disposition, rescan_plan, resolve_drop_destination,
-        resolve_local_drop_target, resolve_remote_drop_target,
+        problem_for_read_dir, remote_lease_failure_disposition, rescan_plan,
+        resolve_drop_destination, resolve_local_drop_target, resolve_remote_drop_target,
         right_sidebar_file_browse_rows_from_dir_cache, right_sidebar_file_row_metrics,
         right_sidebar_open_with_cache_key, sanitize_preview_text, scrollable_note_table_columns,
         search_right_sidebar_file_index, sidebar_row_element_visible, snippet_cursor_visible,
@@ -18768,7 +19195,7 @@ mod tests {
         stage_pasted_image, terminal_paste_snapshot_mismatch, virtual_note_line_range,
         visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
         FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
-        NoteCodeHighlightState, NoteReleaseAction, RemoteLeaseFailureDisposition,
+        NoteCodeHighlightState, NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
         TerminalPasteSnapshotMismatch, TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES,
         LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
     };
@@ -20663,5 +21090,57 @@ mod tests {
             remote_lease_failure_disposition(None, "host:key", 7),
             RemoteLeaseFailureDisposition::NoLease,
         );
+    }
+
+    /// The distinction the panel is built on. A deleted folder and a macOS TCC
+    /// denial are indistinguishable in the error text, so it has to come from
+    /// the `ErrorKind` -- and it has to be right, because each one sends the
+    /// user somewhere different.
+    #[test]
+    fn a_vault_failure_is_classified_by_what_the_directory_said() {
+        use std::io::ErrorKind;
+        // The directory listed, so the vault is fine and the note is not.
+        assert_eq!(problem_for_read_dir(None), NoteVaultProblem::Note);
+        assert_eq!(
+            problem_for_read_dir(Some(ErrorKind::NotFound)),
+            NoteVaultProblem::MissingRoot
+        );
+        // EACCES and EPERM both land here; macOS TCC denials are the latter.
+        assert_eq!(
+            problem_for_read_dir(Some(ErrorKind::PermissionDenied)),
+            NoteVaultProblem::UnreadableRoot
+        );
+        // Anything unrecognised must degrade to the generic page rather than
+        // claim a cause it cannot support.
+        assert_eq!(
+            problem_for_read_dir(Some(ErrorKind::InvalidData)),
+            NoteVaultProblem::Other
+        );
+    }
+
+    /// The whole point of the panel is that the user can read it, so every
+    /// variant must resolve to real text rather than leaking a Fluent key.
+    #[test]
+    fn every_vault_problem_has_a_translated_title() {
+        for problem in [
+            NoteVaultProblem::MissingRoot,
+            NoteVaultProblem::UnreadableRoot,
+            NoteVaultProblem::Note,
+            NoteVaultProblem::Other,
+        ] {
+            let title = problem.title();
+            assert!(!title.is_empty(), "empty title for {problem:?}");
+            // A missing translation surfaces as the key itself.
+            assert!(
+                !title.starts_with("right-"),
+                "untranslated title {title:?} for {problem:?}"
+            );
+            if let Some(hint) = problem.hint() {
+                assert!(
+                    !hint.is_empty() && !hint.starts_with("right-"),
+                    "untranslated hint {hint:?} for {problem:?}"
+                );
+            }
+        }
     }
 }

@@ -1439,6 +1439,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarNoteMenu
             | UIItemType::RightSidebarNoteChooseVault
             | UIItemType::RightSidebarNoteCreateVault
+            | UIItemType::RightSidebarNoteRetry
             | UIItemType::RightSidebarNoteTreeToggle
             | UIItemType::RightSidebarNoteTreeBack
             | UIItemType::RightSidebarNoteTreeRow(_)
@@ -1557,6 +1558,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarNoteMenu
             | UIItemType::RightSidebarNoteChooseVault
             | UIItemType::RightSidebarNoteCreateVault
+            | UIItemType::RightSidebarNoteRetry
             | UIItemType::RightSidebarNoteTreeToggle
             | UIItemType::RightSidebarNoteTreeBack
             | UIItemType::RightSidebarNoteTreeRow(_)
@@ -3594,6 +3596,7 @@ impl super::TermWindow {
             UIItemType::RightSidebarNoteMenu
             | UIItemType::RightSidebarNoteChooseVault
             | UIItemType::RightSidebarNoteCreateVault
+            | UIItemType::RightSidebarNoteRetry
             | UIItemType::RightSidebarNoteTreeToggle
             | UIItemType::RightSidebarNoteTreeBack
             | UIItemType::RightSidebarNoteTreeRow(_)
@@ -3677,6 +3680,12 @@ impl super::TermWindow {
                     self.perform_right_sidebar_note_command(
                         crate::termwindow::NoteEditorCommand::ChooseVault { managed: false },
                     );
+                }
+            }
+            UIItemType::RightSidebarNoteRetry => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.retry_right_sidebar_note_vault();
                 }
             }
             UIItemType::RightSidebarNoteCreateVault => {
@@ -4142,6 +4151,7 @@ impl super::TermWindow {
             UIItemType::RightSidebarNoteMenu
             | UIItemType::RightSidebarNoteChooseVault
             | UIItemType::RightSidebarNoteCreateVault
+            | UIItemType::RightSidebarNoteRetry
             | UIItemType::RightSidebarNoteTreeToggle
             | UIItemType::RightSidebarNoteTreeBack
             | UIItemType::RightSidebarNoteTreeRow(_)

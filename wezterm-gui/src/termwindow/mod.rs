@@ -592,6 +592,11 @@ pub enum UIItemType {
     RightSidebarNoteMenu,
     RightSidebarNoteChooseVault,
     RightSidebarNoteCreateVault,
+    /// Re-attempt a vault that failed to open. The point of the button is the
+    /// case where nothing about ThinkTerm changed and something outside it did
+    /// -- a permission granted, a volume mounted -- so the fix must not be
+    /// "restart the app".
+    RightSidebarNoteRetry,
     RightSidebarNoteTreeToggle,
     RightSidebarNoteTreeBack,
     RightSidebarNoteTreeRow(String),
@@ -2151,7 +2156,18 @@ pub struct TermWindow {
     right_sidebar_note_vault_last_scan: Option<Instant>,
     right_sidebar_note_open_generation: u64,
     right_sidebar_note_opening: Option<(PathBuf, String)>,
-    right_sidebar_note_open_failure: Option<((PathBuf, String), String)>,
+    /// The last open that failed, and for which document. Carries the FULL
+    /// classified failure, not just its text: the replay below re-establishes
+    /// the problem page from it, so a scan that recovers on its own cannot
+    /// leave a still-broken note showing a dead-end message with no way out.
+    right_sidebar_note_open_failure:
+        Option<((PathBuf, String), ui::right_sidebar::NoteVaultFailure)>,
+    /// Set only for a REAL failure to open the vault, never for the transient
+    /// "Opening note..." / "Indexing Vault..." states that also live in
+    /// `load_error`: its presence is what swaps the panel for the problem page
+    /// and its escape-hatch buttons. It carries its own detail text rather than
+    /// reading `load_error`, which a later transient would overwrite.
+    right_sidebar_note_vault_failure: Option<ui::right_sidebar::NoteVaultFailure>,
     right_sidebar_note_tree_scroll_offset: f32,
     right_sidebar_note_tree_expanded: HashSet<String>,
     right_sidebar_note_vault_tree_collapsed: bool,
@@ -3138,6 +3154,7 @@ impl TermWindow {
             right_sidebar_note_open_generation: 0,
             right_sidebar_note_opening: None,
             right_sidebar_note_open_failure: None,
+            right_sidebar_note_vault_failure: None,
             right_sidebar_note_tree_scroll_offset: 0.0,
             right_sidebar_note_tree_expanded: HashSet::new(),
             right_sidebar_note_vault_tree_collapsed: false,
