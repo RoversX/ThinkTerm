@@ -841,10 +841,28 @@ impl HeapQuadAllocator {
         clip: QuadClipRect,
         opacity: f32,
     ) -> anyhow::Result<()> {
+        self.apply_to_clipped_at(other, 0.0, 0.0, clip, opacity)
+    }
+
+    /// `apply_to_clipped`, shifted by `offset` on the way out.
+    ///
+    /// Lets a caller record a surface in its own local space — its left edge
+    /// at 0 — and place it on replay. That matters when the surface's real
+    /// origin is off-screen: the painters take unsigned pixel coordinates, so
+    /// a negative origin cannot be expressed at record time, and clamping it
+    /// to 0 lays the contents out from the wrong place.
+    pub fn apply_to_clipped_at(
+        &self,
+        other: &mut TripleLayerQuadAllocator,
+        offset_x: f32,
+        offset_y: f32,
+        clip: QuadClipRect,
+        opacity: f32,
+    ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         for (layer_num, quads) in self.layers() {
             for quad in quads {
-                let Some(clipped) = quad.translated_clipped(0.0, 0.0, clip) else {
+                let Some(clipped) = quad.translated_clipped(offset_x, offset_y, clip) else {
                     continue;
                 };
                 let clipped = if opacity < 1.0 {
