@@ -1,5 +1,6 @@
 pub mod agent_panel;
 pub mod context_menu;
+pub mod folder_problem;
 pub mod icons;
 pub mod platform_chrome;
 pub mod right_sidebar;

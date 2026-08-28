@@ -23,6 +23,7 @@ use crate::termwindow::transfer_walk::{
     plan_transfer, ConflictChoice, DestinationRoot, OverwritePolicy, TransferEntryKind,
     TransferPlanError, TRANSFER_CONFIRM_THRESHOLD,
 };
+use crate::termwindow::ui::folder_problem::FolderProblem;
 use crate::termwindow::ui::icons::{
     material_file_icon_for_name, material_folder_icon_for_name, MaterialIcon, SvgIcon,
 };
@@ -86,6 +87,45 @@ const RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST: usize = 8;
 const RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST: usize = 16;
 const RIGHT_SIDEBAR_MODE_HEIGHT: usize = 72;
 const RIGHT_SIDEBAR_EMPTY_HEIGHT: usize = 88;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidebarMessageLayout {
+    height: usize,
+    visible_lines: usize,
+}
+
+fn sidebar_message_layout(
+    available_height: usize,
+    minimum_height: usize,
+    line_height: usize,
+    vertical_inset: usize,
+    line_count: usize,
+) -> SidebarMessageLayout {
+    let desired = minimum_height.max(
+        line_height
+            .saturating_mul(line_count)
+            .saturating_add(vertical_inset.saturating_mul(2)),
+    );
+    let height = desired.min(available_height);
+    let visible_lines = if line_height == 0 {
+        0
+    } else {
+        let fitted = height.saturating_sub(vertical_inset.saturating_mul(2)) / line_height;
+        // Keep the first line whenever the box is a line tall at all: the
+        // single-line callers ("No files", ...) predate the multi-line form
+        // and must not squeeze down to an icon and an empty box.
+        if fitted == 0 && height >= line_height {
+            1
+        } else {
+            fitted
+        }
+    }
+    .min(line_count);
+    SidebarMessageLayout {
+        height,
+        visible_lines,
+    }
+}
 /// Preview header geometry, in design pixels. These were the last raw literals
 /// left in this file after the scaling sweep: the sweep went file by file and
 /// this block reads like plain arithmetic, so it was missed. On a 0.5-scale
@@ -692,54 +732,45 @@ pub(crate) enum NoteVaultProblem {
 }
 
 impl NoteVaultProblem {
-    pub(crate) fn icon(self) -> SvgIcon {
+    /// The folder-level view of this problem, for the cases the shared
+    /// classifier owns. `Note` has none: the vault folder listed fine and it
+    /// was one document that would not load.
+    fn as_folder_problem(self) -> Option<FolderProblem> {
         match self {
-            // A folder we cannot get into reads as a folder problem, not a
-            // fault; the rest are genuine faults.
-            Self::UnreadableRoot => SvgIcon::FolderOpen,
-            Self::MissingRoot | Self::Note | Self::Other => SvgIcon::CircleAlert,
+            Self::MissingRoot => Some(FolderProblem::MissingRoot),
+            Self::UnreadableRoot => Some(FolderProblem::UnreadableRoot),
+            Self::Other => Some(FolderProblem::Other),
+            Self::Note => None,
+        }
+    }
+
+    pub(crate) fn icon(self) -> SvgIcon {
+        match self.as_folder_problem() {
+            Some(problem) => problem.icon(),
+            // A note that will not open is a genuine fault, not a folder we
+            // cannot get into.
+            None => SvgIcon::CircleAlert,
         }
     }
 
     /// The headline: what went wrong, in the user's language, instead of the
     /// `anyhow` chain that used to be the whole panel.
+    ///
+    /// Not delegated to [`FolderProblem::title`]: this panel can say "Notes
+    /// vault" where the shared wording can only say "folder". The permission
+    /// case shares the one string that is already exactly right.
     pub(crate) fn title(self) -> String {
         crate::i18n::tr(match self {
             Self::MissingRoot => "right-notes-vault-missing",
-            Self::UnreadableRoot => "right-notes-vault-unreadable",
+            Self::UnreadableRoot => "folder-unreadable",
             Self::Note => "right-notes-note-unreadable",
             Self::Other => "right-notes-open-error",
         })
     }
 
-    /// What to do about it.
-    ///
-    /// Every platform can refuse a folder, but each refuses for its own reason
-    /// and is fixed somewhere else, so a generic "check the permissions" is
-    /// followed by one sentence naming where THIS platform hides the switch.
-    ///
-    /// Each branch spells out its own `tr("...")` literal rather than picking a
-    /// key into a variable: `i18n`'s scan test only sees literals, and a key it
-    /// cannot see is a key that ships untranslated.
+    /// What to do about it; shared so every panel tells the same story.
     pub(crate) fn hint(self) -> Option<String> {
-        match self {
-            Self::MissingRoot => Some(crate::i18n::tr("right-notes-vault-missing-hint")),
-            Self::UnreadableRoot => {
-                let mut hint = crate::i18n::tr("right-notes-vault-unreadable-hint");
-                hint.push(' ');
-                hint.push_str(&if cfg!(target_os = "macos") {
-                    crate::i18n::tr("right-notes-vault-unreadable-macos")
-                } else if cfg!(windows) {
-                    crate::i18n::tr("right-notes-vault-unreadable-windows")
-                } else {
-                    // Every remaining unix. Worded without naming a distro so
-                    // it stays true on the BSDs too.
-                    crate::i18n::tr("right-notes-vault-unreadable-unix")
-                });
-                Some(hint)
-            }
-            Self::Note | Self::Other => None,
-        }
+        self.as_folder_problem().and_then(FolderProblem::hint)
     }
 }
 
@@ -762,11 +793,11 @@ fn problem_for_read_dir(kind: Option<std::io::ErrorKind>) -> NoteVaultProblem {
         // The directory listed, so the vault is reachable and it was the note
         // itself that failed.
         None => NoteVaultProblem::Note,
-        Some(std::io::ErrorKind::NotFound) => NoteVaultProblem::MissingRoot,
-        // Covers both EACCES and EPERM; a macOS TCC denial arrives as the
-        // latter.
-        Some(std::io::ErrorKind::PermissionDenied) => NoteVaultProblem::UnreadableRoot,
-        Some(_) => NoteVaultProblem::Other,
+        Some(kind) => match FolderProblem::from_read_dir_kind(kind) {
+            FolderProblem::MissingRoot => NoteVaultProblem::MissingRoot,
+            FolderProblem::UnreadableRoot => NoteVaultProblem::UnreadableRoot,
+            FolderProblem::Other => NoteVaultProblem::Other,
+        },
     }
 }
 
@@ -3222,7 +3253,10 @@ impl crate::TermWindow {
         &mut self,
         generation: u64,
         requested: Vec<PathBuf>,
-        loaded: Vec<(PathBuf, Vec<RightSidebarFileDirEntry>)>,
+        loaded: Vec<(
+            PathBuf,
+            Result<Vec<RightSidebarFileDirEntry>, FolderProblem>,
+        )>,
     ) {
         if generation != self.right_sidebar_file_dir_cache_generation {
             // Root changed while we were reading; the in-flight set was already
@@ -3236,11 +3270,17 @@ impl crate::TermWindow {
         // periodic re-scan re-reads everything on screen, and an unconditional
         // insert would rebuild rows and repaint every tick for nothing.
         let mut changed = false;
-        for (dir, children) in loaded {
-            if self.right_sidebar_file_dir_cache.children(&dir) != Some(children.as_slice()) {
-                self.right_sidebar_file_dir_cache.insert(dir, children);
-                changed = true;
+        for (dir, result) in loaded {
+            if !dir_load_changes_cache(&self.right_sidebar_file_dir_cache, &dir, &result) {
+                continue;
             }
+            match result {
+                Ok(children) => self.right_sidebar_file_dir_cache.insert(dir, children),
+                Err(problem) => self
+                    .right_sidebar_file_dir_cache
+                    .insert_failure(dir, problem),
+            }
+            changed = true;
         }
         if changed {
             self.invalidate_window();
@@ -3651,11 +3691,13 @@ impl crate::TermWindow {
             FolderPickerOptions {
                 title: crate::i18n::tr("right-create-vault"),
                 prompt: crate::i18n::tr("right-create"),
+                ..Default::default()
             }
         } else {
             FolderPickerOptions {
                 title: crate::i18n::tr("right-choose-vault"),
                 prompt: crate::i18n::tr("right-choose"),
+                ..Default::default()
             }
         };
         window.pick_folder_async_with_options(
@@ -13920,6 +13962,43 @@ impl crate::TermWindow {
                 );
             }
         };
+        // A root the system refused renders as the reason, not as an empty
+        // project -- "no files" reads as "my work is gone". Same
+        // classification as the content-area page so the two never disagree.
+        // The Refresh button above is the retry.
+        if let Some(problem) = self.right_sidebar_file_dir_cache.failure(&root.path) {
+            // Wrap to the width the card actually paints into, or every
+            // line gets ellipsized a second time at paint.
+            let card_text_width = content_width.saturating_sub(
+                self.ui_px(22) + self.ui_px(SIDEBAR_ICON_GAP) + self.ui_px(SIDEBAR_INSET) * 3,
+            );
+            let mut wrapped =
+                self.wrap_sidebar_problem_lines(ui_font, &[problem.title()], card_text_width);
+            let path_text = root.path.display().to_string();
+            wrapped.extend(wrap_path_for_width(&path_text, 3, |segment| {
+                self.sidebar_text_width(ui_font, segment)
+                    .unwrap_or(f32::MAX)
+                    / card_text_width.max(1) as f32
+            }));
+            if let Some(hint) = problem.hint() {
+                wrapped.extend(self.wrap_sidebar_problem_lines(ui_font, &[hint], card_text_width));
+            }
+            let wrapped: Vec<&str> = wrapped.iter().map(String::as_str).collect();
+            return self.paint_files_message_lines(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                muted_fg,
+                content_x,
+                tree_top,
+                content_width,
+                content_bottom,
+                icon_size,
+                problem.icon(),
+                &wrapped,
+            );
+        }
         if self
             .right_sidebar_file_expanded
             .insert(path_key(&root.path))
@@ -14213,9 +14292,76 @@ impl crate::TermWindow {
         icon_size: usize,
         message: &str,
     ) -> anyhow::Result<()> {
-        let height = self
-            .ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT)
-            .min(content_bottom.saturating_sub(y + self.ui_px(SIDEBAR_INSET)));
+        self.paint_files_message_lines(
+            layers,
+            ui_font,
+            ui_metrics,
+            chrome,
+            muted_fg,
+            x,
+            y,
+            width,
+            content_bottom,
+            icon_size,
+            SvgIcon::CircleAlert,
+            std::slice::from_ref(&message),
+        )
+    }
+
+    /// Wrap each line to the panel width: the hint is a full sentence and
+    /// the path can be long, and both would otherwise be ellipsized down to
+    /// their least useful halves.
+    fn wrap_sidebar_problem_lines(
+        &mut self,
+        ui_font: &Rc<LoadedFont>,
+        lines: &[String],
+        width: usize,
+    ) -> Vec<String> {
+        const MAX_LINES_PER_ENTRY: usize = 3;
+        lines
+            .iter()
+            .flat_map(|line| {
+                wrap_snippet_text_for_width(line, MAX_LINES_PER_ENTRY, false, |segment| {
+                    self.sidebar_text_width(ui_font, segment)
+                        .unwrap_or(f32::MAX)
+                        / width.max(1) as f32
+                })
+            })
+            .collect()
+    }
+
+    /// The same card, but able to hold a classified failure: its own icon, and
+    /// as many lines as it takes to name the folder and what to do about it.
+    /// One line renders identically to [`Self::paint_files_message`].
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_message_lines(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        width: usize,
+        content_bottom: usize,
+        icon_size: usize,
+        icon: SvgIcon,
+        lines: &[&str],
+    ) -> anyhow::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let line_height = ui_metrics.cell_size.height as usize;
+        let inset = self.ui_px(SIDEBAR_INSET);
+        let layout = sidebar_message_layout(
+            content_bottom.saturating_sub(y + inset),
+            self.ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT),
+            line_height,
+            inset,
+            lines.len(),
+        );
+        let height = layout.height;
         if height == 0 {
             return Ok(());
         }
@@ -14235,26 +14381,37 @@ impl crate::TermWindow {
             .max(1);
         let icon_x = x + self.ui_px(SIDEBAR_INSET) + 2;
         let icon_y = y + (height.saturating_sub(empty_icon_size)) / 2;
-        self.paint_sidebar_icon(
-            layers,
-            SvgIcon::CircleAlert,
-            icon_x,
-            icon_y,
-            empty_icon_size,
-            muted_fg,
-        )?;
-        self.paint_sidebar_text(
-            layers,
-            ui_font,
-            ui_metrics,
-            message,
-            icon_x + empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + 2,
-            y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
-            width.saturating_sub(
-                empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + self.ui_px(SIDEBAR_INSET) * 3,
-            ),
-            muted_fg,
-        )
+        self.paint_sidebar_icon(layers, icon, icon_x, icon_y, empty_icon_size, muted_fg)?;
+        let text_x = icon_x + empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + 2;
+        let text_width = width.saturating_sub(
+            empty_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + self.ui_px(SIDEBAR_INSET) * 3,
+        );
+        let mut visible_lines = lines
+            .iter()
+            .take(layout.visible_lines)
+            .map(|line| Cow::Borrowed(*line))
+            .collect::<Vec<_>>();
+        if layout.visible_lines < lines.len() {
+            if let Some(last) = visible_lines.last_mut() {
+                *last = Cow::Owned(format!("{}…", last.trim_end_matches('…')));
+            }
+        }
+        let mut text_y =
+            y + (height.saturating_sub(line_height.saturating_mul(visible_lines.len()))) / 2;
+        for line in &visible_lines {
+            self.paint_sidebar_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                line.as_ref(),
+                text_x,
+                text_y,
+                text_width,
+                muted_fg,
+            )?;
+            text_y += line_height;
+        }
+        Ok(())
     }
 
     fn paint_right_sidebar_note_top_fade(
@@ -14363,6 +14520,15 @@ impl crate::TermWindow {
             return Ok(());
         }
         let hovered = self.is_pointer_over_ui_rect(x, visible_y, width, visible_height);
+        // A directory the system refused still renders as a row -- hiding it
+        // would repeat the "my work is gone" lie one level down -- but it must
+        // not look like an ordinary empty folder, so it carries a warning
+        // marker at the right edge.
+        let dir_refused = row.is_dir
+            && self
+                .right_sidebar_file_dir_cache
+                .failure(&row.path)
+                .is_some();
         let is_selected = selected.is_some_and(|path| path == &row.path);
         // A drag hovering here is about to copy into this directory; say so
         // unmistakably, outranking the ordinary selection tint.
@@ -14448,9 +14614,25 @@ impl crate::TermWindow {
             }
         }
         let text_x = file_icon_x + row_icon_size + row_metrics.icon_gap;
-        let text_width = x
+        let mut text_width = x
             .saturating_add(width)
             .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET));
+        if dir_refused {
+            let marker_x = x
+                .saturating_add(width)
+                .saturating_sub(self.ui_px(SIDEBAR_INSET) + row_icon_size);
+            if visible(icon_y, row_icon_size) {
+                self.paint_sidebar_icon(
+                    layers,
+                    SvgIcon::CircleAlert,
+                    marker_x,
+                    icon_y,
+                    row_icon_size,
+                    muted_fg,
+                )?;
+            }
+            text_width = text_width.saturating_sub(row_icon_size + row_metrics.icon_gap);
+        }
         if let Some(input) = self.sidebar_file_rename_input(&row.path).cloned() {
             let box_y = y + self.ui_px(2);
             let box_height = row_metrics.row_height.saturating_sub(self.ui_px(4));
@@ -18537,8 +18719,10 @@ fn load_dir_cache_for_test(root: &Path, expanded: &HashSet<String>) -> RightSide
             break;
         }
         for dir in missing {
-            let children = read_right_sidebar_dir(&dir);
-            cache.insert(dir, children);
+            match read_right_sidebar_dir(&dir) {
+                Ok(children) => cache.insert(dir, children),
+                Err(problem) => cache.insert_failure(dir, problem),
+            }
         }
     }
     cache
@@ -18624,14 +18808,44 @@ fn build_right_sidebar_file_index_with_cancel(
     Ok(RightSidebarFileIndex { entries })
 }
 
+/// Whether a directory that was just read differs from what the cache holds.
+///
+/// Pulled out of the apply loop so the one case that is easy to get wrong is
+/// testable: a folder cached as *refused* is stored as empty, so a later read
+/// that succeeds and finds it genuinely empty compares equal on children alone.
+/// Without also comparing the failure, that success would not be written and
+/// the error card would survive the very re-read that proved the problem gone
+/// -- which is exactly the "I granted the permission and nothing happened"
+/// path.
+fn dir_load_changes_cache(
+    cache: &RightSidebarFileDirCache,
+    dir: &Path,
+    result: &Result<Vec<RightSidebarFileDirEntry>, FolderProblem>,
+) -> bool {
+    match result {
+        Ok(children) => {
+            cache.children(dir) != Some(children.as_slice()) || cache.failure(dir).is_some()
+        }
+        // `is_loaded` covers the first failure for a directory the cache has
+        // never held: the problem matches nothing, but there is still an empty
+        // entry to write so the row builder stops re-queueing the read.
+        Err(problem) => cache.failure(dir) != Some(*problem) || !cache.is_loaded(dir),
+    }
+}
+
 /// Read one directory's children, applying the same skip list and ordering the
 /// full-project index used, so a lazily-built tree renders identically to the
 /// eagerly-walked one.
-fn read_right_sidebar_dir(dir: &Path) -> Vec<RightSidebarFileDirEntry> {
-    let Ok(reader) = fs::read_dir(dir) else {
-        // Unreadable (permissions, raced deletion): cache it as empty rather
-        // than retrying on every paint. The periodic re-scan picks it up later.
-        return Vec::new();
+fn read_right_sidebar_dir(dir: &Path) -> Result<Vec<RightSidebarFileDirEntry>, FolderProblem> {
+    let reader = match fs::read_dir(dir) {
+        Ok(reader) => reader,
+        Err(err) => {
+            // Still cached (as a failure) rather than retried on every paint,
+            // but no longer cached as "this folder is empty": a macOS TCC
+            // denial and a genuinely empty project used to render identically,
+            // which told the user their files were gone.
+            return Err(FolderProblem::from_read_dir_kind(err.kind()));
+        }
     };
     let mut children = Vec::new();
     for entry in reader.flatten() {
@@ -18649,7 +18863,7 @@ fn read_right_sidebar_dir(dir: &Path) -> Vec<RightSidebarFileDirEntry> {
         });
     }
     children.sort_by(right_sidebar_dir_entry_cmp);
-    children
+    Ok(children)
 }
 
 fn right_sidebar_dir_entry_cmp(
@@ -18982,7 +19196,72 @@ fn snippet_run_buffer(body: &str) -> Option<Vec<u8>> {
     Some(buffer.replace('\n', "\r").into_bytes())
 }
 
-fn wrap_snippet_text_for_width<F>(
+/// Wrap a filesystem path to a width, breaking after separators.
+///
+/// The generic wrapper breaks wherever the width runs out, which cuts a
+/// component mid-name ("/Desktop/or" / "der_system") -- legible as prose,
+/// baffling as a path. Components are kept whole and lines end on their
+/// separators; only a single component wider than the whole line falls back to
+/// the character wrap. When the path still will not fit `max_lines`, the LAST
+/// lines win with a leading ellipsis: the tail of a path is the half the user
+/// recognises.
+///
+/// `measure` returns the fraction of the available width a segment occupies,
+/// the same contract as [`wrap_snippet_text_for_width`].
+pub(crate) fn wrap_path_for_width<F>(path: &str, max_lines: usize, mut measure: F) -> Vec<String>
+where
+    F: FnMut(&str) -> f32,
+{
+    let max_lines = max_lines.max(1);
+    let mut segments: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (index, ch) in path.char_indices() {
+        if ch == '/' || ch == '\\' {
+            segments.push(&path[start..index + ch.len_utf8()]);
+            start = index + ch.len_utf8();
+        }
+    }
+    if start < path.len() {
+        segments.push(&path[start..]);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for segment in segments {
+        let candidate = format!("{current}{segment}");
+        if !current.is_empty() && measure(&candidate) > 1.0 {
+            lines.push(std::mem::take(&mut current));
+            current = segment.to_string();
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    // A single component wider than the line still has to break somewhere.
+    let mut lines: Vec<String> = lines
+        .into_iter()
+        .flat_map(|line| {
+            if measure(&line) > 1.0 {
+                wrap_snippet_text_for_width(&line, max_lines, false, &mut measure)
+            } else {
+                vec![line]
+            }
+        })
+        .collect();
+
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+        if let Some(first) = lines.first_mut() {
+            first.insert(0, '\u{2026}');
+        }
+    }
+    lines
+}
+
+pub(crate) fn wrap_snippet_text_for_width<F>(
     text: &str,
     max_lines: usize,
     focused: bool,
@@ -19176,7 +19455,7 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 mod tests {
     use super::{
         approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
-        copy_entries_blocking, copy_file_chunked, download_name_candidates,
+        copy_entries_blocking, copy_file_chunked, dir_load_changes_cache, download_name_candidates,
         encode_pasted_image_png, failed_folder_download, file_preview_close_requires_reflow,
         file_release_action, file_row_placement, full_line_colors_by_byte,
         image_pixels_within_preview_budget, load_dir_cache_for_test, load_file_preview,
@@ -19190,15 +19469,17 @@ mod tests {
         resolve_drop_destination, resolve_local_drop_target, resolve_remote_drop_target,
         right_sidebar_file_browse_rows_from_dir_cache, right_sidebar_file_row_metrics,
         right_sidebar_open_with_cache_key, sanitize_preview_text, scrollable_note_table_columns,
-        search_right_sidebar_file_index, sidebar_row_element_visible, snippet_cursor_visible,
-        snippet_run_buffer, sorted_open_with_candidates, spawn_pasted_image_staging,
-        stage_pasted_image, terminal_paste_snapshot_mismatch, virtual_note_line_range,
-        visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
-        FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
-        NoteCodeHighlightState, NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
+        search_right_sidebar_file_index, sidebar_message_layout, sidebar_row_element_visible,
+        snippet_cursor_visible, snippet_run_buffer, sorted_open_with_candidates,
+        spawn_pasted_image_staging, stage_pasted_image, terminal_paste_snapshot_mismatch,
+        virtual_note_line_range, visible_code_block_rounded_edges, visible_file_row_range,
+        wrap_snippet_text_for_width, FileReleaseAction, FileRowPlacement,
+        NoteApproximateTextMetrics, NoteCodeHighlightEntry, NoteCodeHighlightState,
+        NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
         TerminalPasteSnapshotMismatch, TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES,
         LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
     };
+    use super::{FolderProblem, RightSidebarFileDirCache, RightSidebarFileDirEntry};
     use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
     use crate::termwindow::remote_files::{
         RemoteFileBytes, RemoteFileKind, RemotePath, RemoteTransferProgress,
@@ -19218,6 +19499,36 @@ mod tests {
     use wezterm_font::units::PixelLength;
     use window::color::LinearRgba;
     use window::Size;
+
+    /// Too short for a line plus its insets still shows the first line: the
+    /// insets give way, not the message. Only a box shorter than one line of
+    /// text has nothing it can honestly show.
+    #[test]
+    fn sidebar_message_layout_keeps_one_line_when_the_insets_do_not_fit() {
+        let layout = sidebar_message_layout(31, 88, 20, 8, 3);
+        assert_eq!(layout.height, 31);
+        assert_eq!(layout.visible_lines, 1);
+
+        let no_room = sidebar_message_layout(12, 88, 20, 8, 3);
+        assert_eq!(no_room.visible_lines, 0);
+    }
+
+    #[test]
+    fn sidebar_message_layout_keeps_the_first_line_when_tight() {
+        let layout = sidebar_message_layout(36, 88, 20, 8, 3);
+        assert_eq!(layout.height, 36);
+        assert_eq!(layout.visible_lines, 1);
+        assert!(8 + layout.visible_lines * 20 <= layout.height);
+    }
+
+    #[test]
+    fn sidebar_message_layout_never_places_text_below_the_card() {
+        let layout = sidebar_message_layout(77, 88, 20, 8, 6);
+        assert_eq!(layout.height, 77);
+        assert_eq!(layout.visible_lines, 3);
+        let centered_top = (layout.height - layout.visible_lines * 20) / 2;
+        assert!(centered_top + layout.visible_lines * 20 <= layout.height);
+    }
 
     #[test]
     fn preview_close_reflows_after_remote_selection_was_cleared() {
@@ -21118,6 +21429,112 @@ mod tests {
         );
     }
 
+    /// Paths break after separators, keep components whole, and when they
+    /// must be cut, keep the tail -- the half the user recognises.
+    #[test]
+    fn paths_wrap_at_separators_and_keep_their_tail() {
+        // Measure = one character per 1/16th of the line: 16 chars fit.
+        let measure = |segment: &str| segment.chars().count() as f32 / 16.0;
+
+        let lines = super::wrap_path_for_width("/Users/someone/Desktop/order_system", 3, measure);
+        assert_eq!(lines, vec!["/Users/someone/", "Desktop/", "order_system"]);
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 16,
+                "line overflows its width: {line:?}"
+            );
+        }
+
+        // A short path stays on one line.
+        assert_eq!(
+            super::wrap_path_for_width("/tmp/proj", 3, measure),
+            vec!["/tmp/proj"]
+        );
+
+        // Too many components for the line budget: the tail survives, with a
+        // leading ellipsis standing in for what was dropped.
+        let deep =
+            super::wrap_path_for_width("/one/two/three/four/five/six/seven/eight", 2, measure);
+        assert_eq!(deep.len(), 2);
+        assert!(deep[0].starts_with('\u{2026}'), "no ellipsis: {deep:?}");
+        assert!(deep[1].ends_with("eight"), "tail lost: {deep:?}");
+
+        // A single component wider than the whole line falls back to the
+        // character wrap rather than overflowing.
+        let long = super::wrap_path_for_width("/a/extraordinarily_long_component_name", 3, measure);
+        assert!(long.len() > 1);
+    }
+
+    /// Granting the permission and re-reading has to clear the failure even
+    /// when the folder turns out to be genuinely empty, because a refused
+    /// folder is cached as empty too. Comparing children alone would call that
+    /// re-read "no change" and leave the error card up forever -- the user
+    /// grants access, nothing happens, and the app looks broken.
+    #[test]
+    fn a_successful_reread_clears_a_failure_even_when_the_folder_is_empty() {
+        let dir = PathBuf::from("/project");
+        let mut cache = RightSidebarFileDirCache::default();
+        cache.insert_failure(dir.clone(), FolderProblem::UnreadableRoot);
+        assert_eq!(cache.failure(&dir), Some(FolderProblem::UnreadableRoot));
+        // Cached as empty so the row builder stops re-queueing the read.
+        assert_eq!(cache.children(&dir), Some(&[][..]));
+
+        let recovered: Result<Vec<RightSidebarFileDirEntry>, FolderProblem> = Ok(Vec::new());
+        assert!(dir_load_changes_cache(&cache, &dir, &recovered));
+        cache.insert(dir.clone(), Vec::new());
+        assert_eq!(cache.failure(&dir), None);
+    }
+
+    /// The other half: an unchanged failure must not churn the cache, or the
+    /// re-scan timer would bump the generation and repaint every tick for a
+    /// folder whose state never moved.
+    #[test]
+    fn an_unchanged_dir_load_does_not_touch_the_cache() {
+        let dir = PathBuf::from("/project");
+        let mut cache = RightSidebarFileDirCache::default();
+
+        // First failure for a directory the cache has never held still counts
+        // as a change: there is an empty entry to write.
+        let refused: Result<Vec<RightSidebarFileDirEntry>, FolderProblem> =
+            Err(FolderProblem::UnreadableRoot);
+        assert!(dir_load_changes_cache(&cache, &dir, &refused));
+        cache.insert_failure(dir.clone(), FolderProblem::UnreadableRoot);
+        assert!(!dir_load_changes_cache(&cache, &dir, &refused));
+
+        // A different problem for the same directory is a change: the card has
+        // to stop saying "permission denied" once the folder is deleted.
+        let missing: Result<Vec<RightSidebarFileDirEntry>, FolderProblem> =
+            Err(FolderProblem::MissingRoot);
+        assert!(dir_load_changes_cache(&cache, &dir, &missing));
+
+        // A successful read that matches what is cached, with no failure to
+        // clear, is not a change.
+        let entry = RightSidebarFileDirEntry {
+            path: dir.join("a"),
+            name: "a".to_string(),
+            is_dir: false,
+        };
+        cache.insert(dir.clone(), vec![entry.clone()]);
+        let same: Result<Vec<RightSidebarFileDirEntry>, FolderProblem> = Ok(vec![entry]);
+        assert!(!dir_load_changes_cache(&cache, &dir, &same));
+    }
+
+    /// A refused subdirectory must not hide the rest of the tree: it is cached
+    /// as empty so the folder still renders, with the failure recorded beside
+    /// it for the row to mark.
+    #[test]
+    fn a_refused_dir_is_still_loaded_so_the_tree_keeps_rendering() {
+        let dir = PathBuf::from("/project/secrets");
+        let mut cache = RightSidebarFileDirCache::default();
+        cache.insert_failure(dir.clone(), FolderProblem::UnreadableRoot);
+        assert!(cache.is_loaded(&dir));
+        assert!(cache.failure(&dir).is_some());
+
+        cache.clear();
+        assert!(!cache.is_loaded(&dir));
+        assert_eq!(cache.failure(&dir), None);
+    }
+
     /// The whole point of the panel is that the user can read it, so every
     /// variant must resolve to real text rather than leaking a Fluent key.
     #[test]
@@ -21130,14 +21547,17 @@ mod tests {
         ] {
             let title = problem.title();
             assert!(!title.is_empty(), "empty title for {problem:?}");
-            // A missing translation surfaces as the key itself.
+            // A missing translation surfaces as the key itself. Both prefixes
+            // are checked: the folder-level strings are shared with the Files
+            // tree and carry `folder-` keys, so guarding only `right-` would
+            // let an untranslated one through.
             assert!(
-                !title.starts_with("right-"),
+                !title.starts_with("right-") && !title.starts_with("folder-"),
                 "untranslated title {title:?} for {problem:?}"
             );
             if let Some(hint) = problem.hint() {
                 assert!(
-                    !hint.is_empty() && !hint.starts_with("right-"),
+                    !hint.is_empty() && !hint.starts_with("right-") && !hint.starts_with("folder-"),
                     "untranslated hint {hint:?} for {problem:?}"
                 );
             }

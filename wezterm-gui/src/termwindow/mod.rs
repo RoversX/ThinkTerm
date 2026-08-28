@@ -245,6 +245,9 @@ pub(crate) struct MoshConnectState {
     pub canceled: Arc<AtomicBool>,
 }
 
+/// Latest local Thread activation started by this window. Detached
+/// materialization tasks may finish out of order; only the generation that
+/// still matches this complete identity may change the visible workspace.
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
@@ -746,6 +749,16 @@ pub(crate) struct RightSidebarFileDirEntry {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RightSidebarFileDirCache {
     pub dirs: HashMap<PathBuf, Vec<RightSidebarFileDirEntry>>,
+    /// Why a directory in `dirs` is empty, when it is empty because the system
+    /// refused it rather than because it holds nothing.
+    ///
+    /// Parallel to `dirs` rather than replacing its value with a `Result` so
+    /// that `children()` keeps its signature and every existing caller and test
+    /// is untouched. A refused directory is still inserted into `dirs` as an
+    /// empty vector: that is what stops the row builder from queueing another
+    /// read of it on every rebuild, exactly as it did before failures were
+    /// recorded at all.
+    pub failures: HashMap<PathBuf, ui::folder_problem::FolderProblem>,
     pub generation: u64,
 }
 
@@ -754,12 +767,27 @@ impl RightSidebarFileDirCache {
         self.dirs.get(dir).map(|children| children.as_slice())
     }
 
+    /// Why this directory could not be listed, if it could not be.
+    pub fn failure(&self, dir: &Path) -> Option<ui::folder_problem::FolderProblem> {
+        self.failures.get(dir).copied()
+    }
+
     pub fn is_loaded(&self, dir: &Path) -> bool {
         self.dirs.contains_key(dir)
     }
 
+    /// Record a successful listing. Clearing any previous failure here is what
+    /// makes the panel self-heal: the user grants the permission, the re-read
+    /// succeeds, and the error card goes away without a restart.
     pub fn insert(&mut self, dir: PathBuf, children: Vec<RightSidebarFileDirEntry>) {
+        self.failures.remove(&dir);
         self.dirs.insert(dir, children);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn insert_failure(&mut self, dir: PathBuf, problem: ui::folder_problem::FolderProblem) {
+        self.dirs.insert(dir.clone(), Vec::new());
+        self.failures.insert(dir, problem);
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -770,6 +798,7 @@ impl RightSidebarFileDirCache {
 
     pub fn clear(&mut self) {
         self.dirs.clear();
+        self.failures.clear();
         self.generation = self.generation.wrapping_add(1);
     }
 }
