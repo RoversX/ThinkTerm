@@ -68,7 +68,17 @@ const NSViewLayerContentsPlacementTopLeft: NSInteger = 11;
 const NSViewLayerContentsRedrawDuringViewResize: NSInteger = 2;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_FALLBACK_X: f64 = 96.0;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_GAP: f64 = 8.0;
-const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE: f64 = 30.0;
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE: f64 = 26.0;
+/// Point size for the button's SF Symbol. Without an explicit
+/// `NSImageSymbolConfiguration` the symbol follows the button's font -- the
+/// system regular, around 13pt -- which reads far too small for the box around
+/// it: this is a control, not a run of text.
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SYMBOL_POINT_SIZE: f64 = 15.0;
+/// How far below the titlebar's vertical centre the button sits. The titlebar
+/// container is an unflipped AppKit view, so y grows upward and this is
+/// subtracted: the traffic lights are not centred in that container either, and
+/// matching them by eye needs a small drop.
+const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_Y_DROP: f64 = 1.5;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG: NSInteger = 0x7474_7362;
 /// userInfo marker on the titlebar sidebar button's tracking area, so the
 /// WindowView's mouseEntered:/mouseExited: can tell it apart from the
@@ -2279,6 +2289,15 @@ fn apply_decorations_to_window(
 
 fn install_thinkterm_titlebar_sidebar_button(window: &StrongPtr, target: id) {
     unsafe {
+        // Guard here rather than trusting callers. Entering fullscreen swaps
+        // the titlebar container and fires several resizes; a caller that
+        // still reads `is_full_screen == false` on one of those would put the
+        // button back, and it then rides along in the auto-hiding fullscreen
+        // titlebar where nothing removes it again.
+        if NSWindow::styleMask(**window).contains(NSWindowStyleMask::NSFullScreenWindowMask) {
+            remove_thinkterm_titlebar_sidebar_button(window);
+            return;
+        }
         let Some(titlebar_view_container) = get_titlebar_view_container(window) else {
             return;
         };
@@ -2320,6 +2339,25 @@ fn install_thinkterm_titlebar_sidebar_button(window: &StrongPtr, target: id) {
                 accessibilityDescription: *nsstring("Toggle sidebar")
             ];
             if !image.is_null() {
+                // NSFontWeightRegular is 0.0; NSImageSymbolScaleLarge is 3.
+                // `NSImageSymbolConfiguration` arrived alongside
+                // `imageWithSystemSymbolName:`, so the guard above covers it.
+                let config: id = msg_send![
+                    class!(NSImageSymbolConfiguration),
+                    configurationWithPointSize: THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SYMBOL_POINT_SIZE
+                    weight: 0.0f64
+                    scale: 3isize
+                ];
+                let image: id = if config.is_null() {
+                    image
+                } else {
+                    let configured: id = msg_send![image, imageWithSymbolConfiguration: config];
+                    if configured.is_null() {
+                        image
+                    } else {
+                        configured
+                    }
+                };
                 let () = msg_send![button, setImage: image];
             } else {
                 let () = msg_send![button, setTitle: *nsstring("▣")];
@@ -2396,8 +2434,9 @@ fn position_thinkterm_titlebar_sidebar_button(
                 zoom_frame.origin.x + zoom_frame.size.width + THINKTERM_TITLEBAR_SIDEBAR_BUTTON_GAP
             }
         };
-        let y =
-            ((titlebar_frame.size.height - THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE) / 2.0).max(0.0);
+        let y = ((titlebar_frame.size.height - THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SIZE) / 2.0
+            - THINKTERM_TITLEBAR_SIDEBAR_BUTTON_Y_DROP)
+            .max(0.0);
         let frame = NSRect::new(
             NSPoint::new(x, y),
             NSSize::new(
