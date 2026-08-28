@@ -1,4 +1,5 @@
 pub mod agent_panel;
+pub mod command_palette;
 pub mod context_menu;
 pub mod folder_problem;
 pub mod icons;

@@ -3855,6 +3855,8 @@ impl crate::TermWindow {
 
         self.paint_modal().context("paint_modal")?;
         self.paint_context_menu().context("paint_context_menu")?;
+        self.paint_command_palette()
+            .context("paint_command_palette")?;
         self.paint_pane_tab_drag_overlay()
             .context("paint_pane_tab_drag_overlay")?;
         self.paint_sidebar_row_drag_overlay()

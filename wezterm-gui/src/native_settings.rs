@@ -195,6 +195,9 @@ impl NativeBottomQuoteMode {
 pub(crate) struct NativeAppearanceSettings {
     pub(crate) theme_mode: NativeThemeMode,
     pub(crate) app_icon: NativeAppIcon,
+    /// Color scheme picked in the command palette; overrides the config's
+    /// `color_scheme` for every window. `None` follows the configuration.
+    pub(crate) color_scheme: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -373,6 +376,56 @@ pub(crate) struct NativeLocalizationSettings {
     pub(crate) language: Option<String>,
 }
 
+/// Chord that toggles the command palette, picked in Settings. The default
+/// bindings (⌘⇧P / ⌃⇧P) come from the keymap and always work; a non-default
+/// choice here is intercepted ahead of the keymap, so it also wins over
+/// whatever the chord normally does (e.g. ⌘K's clear-scrollback).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NativeCommandPaletteHotkey {
+    #[default]
+    CmdShiftP,
+    CmdP,
+    CmdK,
+    CtrlShiftP,
+}
+
+impl NativeCommandPaletteHotkey {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::CmdShiftP => "⌘ ⇧ P",
+            Self::CmdP => "⌘ P",
+            Self::CmdK => "⌘ K",
+            Self::CtrlShiftP => "⌃ ⇧ P",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeCommandPaletteSettings {
+    pub(crate) hotkey: NativeCommandPaletteHotkey,
+    /// Visible list rows; 0 = automatic (fit the window, honouring the
+    /// config's command_palette_rows).
+    pub(crate) rows: u32,
+    /// Overrides the config's command_palette_font_size when set.
+    pub(crate) font_size: Option<f64>,
+    /// Whether a top-level search may surface a few entries from inside
+    /// groups (theme names, workspaces) without drilling in.
+    pub(crate) search_penetrates_groups: bool,
+}
+
+impl Default for NativeCommandPaletteSettings {
+    fn default() -> Self {
+        Self {
+            hotkey: NativeCommandPaletteHotkey::default(),
+            rows: 0,
+            font_size: None,
+            search_penetrates_groups: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct ThinkTermNativeSettings {
@@ -386,6 +439,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) compatibility: NativeCompatibilitySettings,
     pub(crate) window: NativeWindowSettings,
     pub(crate) workspaces: NativeWorkspaceSettings,
+    pub(crate) command_palette: NativeCommandPaletteSettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -401,6 +455,7 @@ impl Default for ThinkTermNativeSettings {
             compatibility: NativeCompatibilitySettings::default(),
             window: NativeWindowSettings::default(),
             workspaces: NativeWorkspaceSettings::default(),
+            command_palette: NativeCommandPaletteSettings::default(),
         }
     }
 }
@@ -548,6 +603,19 @@ pub(crate) fn save(settings: &ThinkTermNativeSettings) -> anyhow::Result<()> {
     fs::rename(tmp, path)?;
     *settings_cache().lock() = Arc::new(settings.clone());
     Ok(())
+}
+
+/// Persist the palette-picked color scheme so new windows and the next
+/// launch start with it. A no-op when the stored value already matches.
+pub(crate) fn save_color_scheme(name: Option<String>) {
+    let mut settings = load();
+    if settings.appearance.color_scheme == name {
+        return;
+    }
+    settings.appearance.color_scheme = name;
+    if let Err(err) = save(&settings) {
+        log::error!("failed to save color scheme choice: {err:#}");
+    }
 }
 
 pub(crate) fn system_appearance() -> Appearance {

@@ -6,8 +6,10 @@ use window::Image;
 pub enum SvgIcon {
     Archive,
     ArchiveRestore,
+    ArrowDown,
     ArrowLeft,
     ArrowRight,
+    ArrowUp,
     Bell,
     Bot,
     Braces,
@@ -99,11 +101,17 @@ impl SvgIcon {
             Self::ArchiveRestore => {
                 include_bytes!("../../../../third_party/lucide/icons/archive-restore.svg")
             }
+            Self::ArrowDown => {
+                include_bytes!("../../../../third_party/lucide/icons/arrow-down.svg")
+            }
             Self::ArrowLeft => {
                 include_bytes!("../../../../third_party/lucide/icons/arrow-left.svg")
             }
             Self::ArrowRight => {
                 include_bytes!("../../../../third_party/lucide/icons/arrow-right.svg")
+            }
+            Self::ArrowUp => {
+                include_bytes!("../../../../third_party/lucide/icons/arrow-up.svg")
             }
             Self::Bell => include_bytes!("../../../../third_party/lucide/icons/bell.svg"),
             Self::Bot => include_bytes!("../../../../third_party/lucide/icons/bot.svg"),

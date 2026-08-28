@@ -325,6 +325,10 @@ pub(crate) const CONTENT_VIEW_FLIGHT_ZINDEX: i8 = 9;
 /// necessarily overhangs that sidebar and must not be painted underneath it.
 pub(crate) const TOOLTIP_ZINDEX: i8 = 10;
 
+/// Above even the tooltip layer: the command palette is a modal surface and
+/// nothing else may draw over it.
+pub(crate) const COMMAND_PALETTE_ZINDEX: i8 = 11;
+
 /// Z-index a transitioning full-window view is composited into.
 ///
 /// Everything else in the window draws at zero. The quad layers within a
@@ -639,6 +643,9 @@ pub enum UIItemType {
     RightSidebarRemoteTransfer(u64),
     ContextMenuBackdrop,
     ContextMenuItem(Vec<usize>),
+    /// Backdrop of the command palette; the palette routes its own pointer
+    /// events, this item only keeps clicks from reading as terminal surface.
+    CommandPalette,
     AboveScrollThumb,
     ScrollThumb,
     BelowScrollThumb,
@@ -2060,6 +2067,7 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     context_menu: Option<ui::context_menu::ContextMenuState>,
+    command_palette: Option<ui::command_palette::CommandPaletteState>,
     context_menu_application_actions: HashMap<u64, ContextMenuApplicationAction>,
     next_context_menu_application_action_id: u64,
     context_menu_suppressed_release: Option<MousePress>,
@@ -2758,8 +2766,10 @@ impl TermWindow {
                 state.mouse_terminal_coords.take();
             }
 
-            // Losing window focus commits a pending inline rename (same as
-            // clicking away) and abandons any in-flight file drag.
+            // Losing window focus dismisses the command palette, commits a
+            // pending inline rename (same as clicking away) and abandons any
+            // in-flight file drag.
+            self.close_command_palette();
             self.finish_inline_tab_rename(true);
             self.right_sidebar_file_drag = None;
             self.pane_tab_drag = None;
@@ -2856,6 +2866,31 @@ impl TermWindow {
     ) -> anyhow::Result<()> {
         let config = configuration();
         let native_settings = crate::native_settings::load();
+        // A palette-picked color scheme applies from the first frame; seeding
+        // config_overrides here is what makes it stick for new windows.
+        let (config, config_overrides) = match native_settings.appearance.color_scheme.clone() {
+            Some(scheme) => {
+                use wezterm_dynamic::ToDynamic;
+                // Deliberately louder than trace: this silently overrides
+                // `color_scheme` from the config file, and "why doesn't my
+                // config change do anything" needs a breadcrumb.
+                log::info!(
+                    "color scheme overridden to {scheme:?} by the command palette choice; \
+                     pick \"Use configured default\" there to follow the config file again"
+                );
+                let mut obj = wezterm_dynamic::Object::default();
+                obj.insert("color_scheme".to_dynamic(), scheme.to_dynamic());
+                let overrides = wezterm_dynamic::Value::Object(obj);
+                match config::overridden_config(&overrides) {
+                    Ok(config) => (config, overrides),
+                    Err(err) => {
+                        log::warn!("failed to apply saved color scheme: {err:#}");
+                        (config, wezterm_dynamic::Value::default())
+                    }
+                }
+            }
+            None => (config, wezterm_dynamic::Value::default()),
+        };
         let main_renderer =
             crate::native_settings::main_window_renderer(&native_settings, config.front_end);
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
@@ -3007,7 +3042,7 @@ impl TermWindow {
             window: None,
             window_background,
             config: config.clone(),
-            config_overrides: wezterm_dynamic::Value::default(),
+            config_overrides,
             palette: None,
             focused: None,
             mux_window_id,
@@ -3124,6 +3159,7 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             context_menu: None,
+            command_palette: None,
             context_menu_application_actions: HashMap::new(),
             next_context_menu_application_action_id: 1,
             context_menu_suppressed_release: None,
@@ -5195,6 +5231,54 @@ impl TermWindow {
         self.palette.as_ref().unwrap()
     }
 
+    /// Apply (or clear) a color-scheme override on this window without
+    /// touching persistence — the same mechanism as
+    /// `window:set_config_overrides`. A no-op when nothing changes.
+    pub(crate) fn apply_color_scheme_override(&mut self, name: Option<String>) {
+        use wezterm_dynamic::{ToDynamic, Value};
+        let mut map = match &self.config_overrides {
+            Value::Object(obj) => obj.clone(),
+            _ => Default::default(),
+        };
+        let key = "color_scheme".to_dynamic();
+        match &name {
+            Some(scheme) => {
+                map.insert(key, scheme.to_dynamic());
+            }
+            None => {
+                map.remove(&key);
+            }
+        }
+        let next = Value::Object(map);
+        if next == self.config_overrides
+            || (matches!(&next, Value::Object(obj) if obj.is_empty())
+                && matches!(&self.config_overrides, Value::Null))
+        {
+            return;
+        }
+        self.config_overrides = next;
+        self.config_was_reloaded();
+    }
+
+    /// The command palette's theme switch: apply to this window, persist the
+    /// choice for new windows and the next launch, and let every other open
+    /// window follow. The broadcast reaches this window too; the second
+    /// application no-ops on the unchanged overrides.
+    fn set_color_scheme_override(&mut self, name: Option<String>) {
+        self.apply_color_scheme_override(name.clone());
+        crate::native_settings::save_color_scheme(name.clone());
+        if let Some(front_end) = crate::frontend::try_front_end() {
+            for gui_window in front_end.gui_windows() {
+                let name = name.clone();
+                gui_window
+                    .window
+                    .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        term_window.apply_color_scheme_override(name);
+                    })));
+            }
+        }
+    }
+
     pub fn config_was_reloaded(&mut self) {
         log::debug!(
             "config was reloaded, overrides: {:?}",
@@ -5273,6 +5357,9 @@ impl TermWindow {
         self.fancy_tab_bar.take();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
+        // The command list, key labels and fonts all just changed out from
+        // under it; reopen rather than repair.
+        self.close_command_palette();
         self.input_map = InputMap::new(&config);
         self.leader_is_down = None;
         self.render_state.as_mut().map(|rs| rs.config_changed());
@@ -8324,8 +8411,10 @@ impl TermWindow {
                 self.toggle_live_overview_view();
             }
             ActivateCommandPalette => {
-                let modal = crate::termwindow::palette::CommandPalette::new(self);
-                self.set_modal(Rc::new(modal));
+                self.toggle_command_palette();
+            }
+            SetColorScheme(name) => {
+                self.set_color_scheme_override(name.clone());
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),

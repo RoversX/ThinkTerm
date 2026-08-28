@@ -180,6 +180,7 @@ enum SettingsSection {
     Agents,
     Archived,
     Keymap,
+    CommandPalette,
     Compatibility,
     Developer,
     UiKit,
@@ -195,6 +196,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Agents,
     SettingsSection::Archived,
     SettingsSection::Keymap,
+    SettingsSection::CommandPalette,
     SettingsSection::Compatibility,
     SettingsSection::Developer,
     SettingsSection::About,
@@ -251,6 +253,7 @@ fn initial_section() -> SettingsSection {
         "agents" => SettingsSection::Agents,
         "archived" => SettingsSection::Archived,
         "keymap" => SettingsSection::Keymap,
+        "commandpalette" => SettingsSection::CommandPalette,
         "compatibility" => SettingsSection::Compatibility,
         "developer" => SettingsSection::Developer,
         "about" => SettingsSection::About,
@@ -272,6 +275,7 @@ impl SettingsSection {
             Self::Agents => crate::i18n::tr("settings-section-agents"),
             Self::Archived => crate::i18n::tr("settings-section-archived"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
+            Self::CommandPalette => crate::i18n::tr("settings-section-command-palette"),
             Self::Compatibility => crate::i18n::tr("settings-section-compatibility"),
             Self::Developer => crate::i18n::tr("settings-section-developer"),
             Self::UiKit => "UI Kit".to_string(),
@@ -289,6 +293,7 @@ impl SettingsSection {
             Self::Agents => SettingsIcon::Agents,
             Self::Archived => SettingsIcon::Archived,
             Self::Keymap => SettingsIcon::Keymap,
+            Self::CommandPalette => SettingsIcon::CommandPalette,
             Self::Compatibility => SettingsIcon::Sync,
             Self::Developer => SettingsIcon::Developer,
             Self::UiKit => SettingsIcon::UiKit,
@@ -382,7 +387,17 @@ impl SettingsSection {
                 "Hidden",
                 "Archived Workspaces",
             ],
-            Self::Keymap => &["Keymap", "Keyboard", "Shortcut", "Command Palette"],
+            Self::Keymap => &["Keymap", "Keyboard", "Shortcut"],
+            Self::CommandPalette => &[
+                "Command Palette",
+                "Spotlight",
+                "Hotkey",
+                "Shortcut",
+                "Search Commands",
+                "Rows",
+                "Font Size",
+                "Theme Search",
+            ],
             Self::Compatibility => &[
                 "ThinkTerm Config",
                 "WezTerm Source",
@@ -568,6 +583,15 @@ enum SettingsAction {
     /// `None` is the platform default; `Some` indexes the shell catalog
     /// cached at paint time, exactly like the archived-row actions above.
     SetDefaultShell(Option<usize>),
+    ToggleCommandPaletteHotkeyMenu,
+    SetCommandPaletteHotkey(crate::native_settings::NativeCommandPaletteHotkey),
+    DecreaseCommandPaletteRows,
+    IncreaseCommandPaletteRows,
+    ResetCommandPaletteRows,
+    DecreaseCommandPaletteFontSize,
+    IncreaseCommandPaletteFontSize,
+    ResetCommandPaletteFontSize,
+    ToggleCommandPaletteSearchPenetration,
     RestartApplication,
     QuitApplication,
     ToggleBottomQuote,
@@ -616,6 +640,7 @@ enum SettingsDropdown {
     AppIcon,
     MainRenderer,
     DefaultShell,
+    CommandPaletteHotkey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1961,6 +1986,8 @@ impl SettingsWindow {
                         | SettingsAction::SetMainRenderer(_)
                         | SettingsAction::ToggleDefaultShellMenu
                         | SettingsAction::SetDefaultShell(_)
+                        | SettingsAction::ToggleCommandPaletteHotkeyMenu
+                        | SettingsAction::SetCommandPaletteHotkey(_)
                         | SettingsAction::DropdownMenuBackdrop,
                     ) => {
                         self.set_focused_input(None);
@@ -3688,6 +3715,41 @@ impl SettingsWindow {
                         Some(SettingsDropdown::ThemeMode)
                     };
             }
+            SettingsAction::ToggleCommandPaletteHotkeyMenu => {
+                self.ui.open_dropdown =
+                    if self.ui.open_dropdown == Some(SettingsDropdown::CommandPaletteHotkey) {
+                        None
+                    } else {
+                        Some(SettingsDropdown::CommandPaletteHotkey)
+                    };
+            }
+            SettingsAction::SetCommandPaletteHotkey(hotkey) => {
+                self.native_settings.command_palette.hotkey = hotkey;
+                self.ui.open_dropdown = None;
+                self.save_command_palette_settings();
+            }
+            SettingsAction::DecreaseCommandPaletteRows => self.step_command_palette_rows(-1),
+            SettingsAction::IncreaseCommandPaletteRows => self.step_command_palette_rows(1),
+            SettingsAction::ResetCommandPaletteRows => {
+                self.native_settings.command_palette.rows = 0;
+                self.save_command_palette_settings();
+            }
+            SettingsAction::DecreaseCommandPaletteFontSize => {
+                self.step_command_palette_font_size(-1.0)
+            }
+            SettingsAction::IncreaseCommandPaletteFontSize => {
+                self.step_command_palette_font_size(1.0)
+            }
+            SettingsAction::ResetCommandPaletteFontSize => {
+                self.native_settings.command_palette.font_size = None;
+                self.save_command_palette_settings();
+            }
+            SettingsAction::ToggleCommandPaletteSearchPenetration => {
+                self.ui.open_dropdown = None;
+                self.native_settings.command_palette.search_penetrates_groups =
+                    !self.native_settings.command_palette.search_penetrates_groups;
+                self.save_command_palette_settings();
+            }
             SettingsAction::ToggleLanguageMenu => {
                 self.ui.open_dropdown = if self.ui.open_dropdown == Some(SettingsDropdown::Language)
                 {
@@ -4451,6 +4513,9 @@ impl SettingsWindow {
                 &crate::i18n::tr("settings-keymap-description"),
                 max_width,
             )?,
+            SettingsSection::CommandPalette => {
+                self.paint_command_palette_section(layers, x, max_width)?
+            }
             SettingsSection::Developer => self.paint_developer(layers, x, max_width)?,
             SettingsSection::UiKit => self.paint_ui_kit(layers, x, max_width)?,
             SettingsSection::Memory => self.paint_memory_diagnostics(layers, x, max_width)?,
@@ -5033,6 +5098,140 @@ impl SettingsWindow {
             SettingsAction::ToggleNotificationSounds,
             true,
         )
+    }
+
+    fn paint_command_palette_section(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        // Hotkey, rows, font size, group search.
+        let row_count = 4;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
+        let card_height = self.settings_card_height(row_count);
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(card_y + scroll + card_height),
+        );
+
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-command-palette-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        let padding = 36.0;
+        let row_x = x + padding;
+        let row_width = max_width - padding * 2.0;
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        let row_step = self.settings_row_step();
+
+        self.paint_command_palette_hotkey_row(layers, row_x, first_row_y, row_width, false)?;
+
+        let rows = self.native_settings.command_palette.rows;
+        let rows_label = if rows == 0 {
+            crate::i18n::tr("settings-command-palette-rows-auto")
+        } else {
+            rows.to_string()
+        };
+        self.paint_font_size_stepper_row(
+            layers,
+            row_x,
+            first_row_y + row_step,
+            row_width,
+            &crate::i18n::tr("settings-command-palette-rows"),
+            &crate::i18n::tr("settings-command-palette-rows-description"),
+            rows as f64,
+            Some(&rows_label),
+            SettingsAction::ResetCommandPaletteRows,
+            SettingsAction::DecreaseCommandPaletteRows,
+            SettingsAction::IncreaseCommandPaletteRows,
+            true,
+        )?;
+
+        let font_size = self.current_command_palette_font_size();
+        let mut size_args = FluentArgs::new();
+        size_args.set("value", format!("{font_size:.1}"));
+        let size_label = crate::i18n::tr_args("common-points", &size_args);
+        self.paint_font_size_stepper_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 2.0,
+            row_width,
+            &crate::i18n::tr("settings-command-palette-font-size"),
+            &crate::i18n::tr("settings-command-palette-font-size-description"),
+            font_size,
+            Some(&size_label),
+            SettingsAction::ResetCommandPaletteFontSize,
+            SettingsAction::DecreaseCommandPaletteFontSize,
+            SettingsAction::IncreaseCommandPaletteFontSize,
+            true,
+        )?;
+
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 3.0,
+            row_width,
+            &crate::i18n::tr("settings-command-palette-penetration"),
+            &crate::i18n::tr("settings-command-palette-penetration-description"),
+            self.native_settings.command_palette.search_penetrates_groups,
+            SettingsAction::ToggleCommandPaletteSearchPenetration,
+            true,
+        )
+    }
+
+    fn current_command_palette_font_size(&self) -> f64 {
+        self.native_settings
+            .command_palette
+            .font_size
+            .unwrap_or_else(|| configuration().command_palette_font_size)
+    }
+
+    fn step_command_palette_rows(&mut self, delta: i32) {
+        let rows = (self.native_settings.command_palette.rows as i32 + delta).clamp(0, 30) as u32;
+        self.native_settings.command_palette.rows = rows;
+        self.save_command_palette_settings();
+    }
+
+    fn step_command_palette_font_size(&mut self, delta: f64) {
+        let value = (self.current_command_palette_font_size() + delta).clamp(8.0, 32.0);
+        self.native_settings.command_palette.font_size = Some(value);
+        self.save_command_palette_settings();
+    }
+
+    fn save_command_palette_settings(&mut self) {
+        // Merge into the freshest cached settings instead of writing this
+        // window's whole clone: the palette writes appearance.color_scheme
+        // through its own path while Settings is open, and a stale full
+        // write here would silently revert that choice.
+        let mut merged = crate::native_settings::load();
+        merged.command_palette = self.native_settings.command_palette.clone();
+        self.native_settings = merged;
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                // The palette re-reads its settings on every paint; a repaint
+                // is all the open windows need.
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+                self.status = crate::i18n::tr("settings-status-command-palette-saved");
+            }
+            Err(err) => {
+                self.status = settings_tr(
+                    "settings-status-command-palette-error",
+                    &[("error", format!("{err:#}"))],
+                );
+            }
+        }
     }
 
     fn paint_agents(
@@ -7342,6 +7541,125 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn paint_command_palette_hotkey_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+
+        let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
+        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let action = SettingsAction::ToggleCommandPaletteHotkeyMenu;
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
+        let open = self.ui.open_dropdown == Some(SettingsDropdown::CommandPaletteHotkey);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            &crate::i18n::tr("settings-command-palette-hotkey"),
+            palette.text,
+            text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            self.settings_row_description_y(y),
+            &crate::i18n::tr("settings-command-palette-hotkey-description"),
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            control_rect.origin.x,
+            control_rect.origin.y,
+            control_rect.size.width,
+            control_rect.size.height,
+            bg,
+            border,
+            self.ui_px(CONTROL_RADIUS),
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            control_x + self.ui_px(16.0),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
+            self.native_settings.command_palette.hotkey.label(),
+            palette.text,
+            control_width - self.ui_px(60.0),
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronDown,
+            control_x + control_width - self.ui_px(38.0),
+            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
+            self.ui_px(22.0),
+            palette.secondary_text,
+        )?;
+
+        Ok(())
+    }
+
+    fn paint_command_palette_hotkey_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<()> {
+        use crate::native_settings::NativeCommandPaletteHotkey as Hotkey;
+        let current = self.native_settings.command_palette.hotkey;
+        let options: Vec<(String, SettingsAction, bool)> = [
+            Hotkey::CmdShiftP,
+            Hotkey::CmdP,
+            Hotkey::CmdK,
+            Hotkey::CtrlShiftP,
+        ]
+        .iter()
+        .copied()
+        .map(|hotkey| {
+            (
+                hotkey.label().to_string(),
+                SettingsAction::SetCommandPaletteHotkey(hotkey),
+                current == hotkey,
+            )
+        })
+        .collect();
+        self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
     fn paint_theme_mode_row(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -7972,6 +8290,7 @@ impl SettingsWindow {
             SettingsSection::General => 8,
             SettingsSection::Appearance => 4,
             SettingsSection::Terminal => 9,
+            SettingsSection::CommandPalette => 4,
             _ => 4,
         };
         let (_, first_row_y) = self.settings_card_geometry(section_y, row_count);
@@ -7984,9 +8303,9 @@ impl SettingsWindow {
                     SettingsDropdown::Language => return Ok(()),
                     SettingsDropdown::ThemeMode => first_row_y,
                     SettingsDropdown::AppIcon => first_row_y + self.settings_row_step(),
-                    SettingsDropdown::MainRenderer | SettingsDropdown::DefaultShell => {
-                        return Ok(())
-                    }
+                    SettingsDropdown::MainRenderer
+                    | SettingsDropdown::DefaultShell
+                    | SettingsDropdown::CommandPaletteHotkey => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -7995,7 +8314,9 @@ impl SettingsWindow {
                     SettingsDropdown::Language => first_row_y,
                     SettingsDropdown::ThemeMode => first_row_y + self.settings_row_step() * 3.0,
                     SettingsDropdown::MainRenderer => first_row_y + self.settings_row_step() * 4.0,
-                    SettingsDropdown::AppIcon | SettingsDropdown::DefaultShell => return Ok(()),
+                    SettingsDropdown::AppIcon
+                    | SettingsDropdown::DefaultShell
+                    | SettingsDropdown::CommandPaletteHotkey => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -8007,7 +8328,16 @@ impl SettingsWindow {
                     SettingsDropdown::Language
                     | SettingsDropdown::ThemeMode
                     | SettingsDropdown::AppIcon
-                    | SettingsDropdown::MainRenderer => return Ok(()),
+                    | SettingsDropdown::MainRenderer
+                    | SettingsDropdown::CommandPaletteHotkey => return Ok(()),
+                };
+                (x + card_padding, row_y, max_width - card_padding * 2.0)
+            }
+            SettingsSection::CommandPalette => {
+                let row_y = match dropdown {
+                    // First row of its card, like DefaultShell above.
+                    SettingsDropdown::CommandPaletteHotkey => first_row_y,
+                    _ => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -8041,6 +8371,12 @@ impl SettingsWindow {
                 control_width,
             ),
             SettingsDropdown::DefaultShell => self.paint_default_shell_menu(
+                layers,
+                control_x,
+                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_width,
+            ),
+            SettingsDropdown::CommandPaletteHotkey => self.paint_command_palette_hotkey_menu(
                 layers,
                 control_x,
                 control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
