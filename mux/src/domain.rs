@@ -272,6 +272,13 @@ impl LocalDomain {
             && !running_under_flatpak()
     }
 
+    /// Public form of [`Self::is_plain_local_domain`]. "Is a `LocalDomain`"
+    /// is NOT this question: WSL, exec and serial domains are all
+    /// `LocalDomain`s whose cwd is interpreted somewhere else.
+    pub fn is_plain_local(&self) -> bool {
+        self.is_plain_local_domain(self.resolve_wsl_domain().as_ref())
+    }
+
     fn resolve_wsl_domain(&self) -> Option<WslDomain> {
         config::configuration()
             .wsl_domains()
@@ -489,7 +496,20 @@ impl LocalDomain {
             // that doesn't exist on the local system, process spawning can fail.
             // Another situation is `sudo -i` has the pane with set to a cwd
             // that is not accessible to the user.
+            let require_cwd = cmd.get_require_cwd();
             if let Err(err) = Path::new(&dir).read_dir() {
+                // A caller that named this directory on purpose gets the
+                // error instead of the fallback. Per-spawn rather than global:
+                // the lenient path's `sudo -i` case IS a permission denial,
+                // and only the caller knows whether its cwd was inherited or
+                // requested.
+                if required_cwd_error_is_fatal(require_cwd) {
+                    return Err(anyhow::Error::new(RequiredCwdUnavailable {
+                        dir: PathBuf::from(&dir),
+                        kind: err.kind(),
+                        detail: err.to_string(),
+                    }));
+                }
                 log::warn!(
                     "Directory {:?} is not readable and will not be \
                      used for the command we are spawning: {:#}",
@@ -838,5 +858,56 @@ impl Domain for LocalDomain {
 
     fn state(&self) -> DomainState {
         DomainState::Attached
+    }
+}
+
+/// A spawn could not use the directory its caller required because it could
+/// not be opened. A concrete type: the GUI recovers it with `downcast_ref`
+/// to decide between "show the recovery page" and "fail".
+#[derive(Debug, Clone)]
+pub struct RequiredCwdUnavailable {
+    pub dir: PathBuf,
+    pub kind: std::io::ErrorKind,
+    /// The raw OS error, for the user-visible detail line.
+    pub detail: String,
+}
+
+impl std::fmt::Display for RequiredCwdUnavailable {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            fmt,
+            "Directory {} cannot be opened, and this command requires it: {}",
+            self.dir.display(),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for RequiredCwdUnavailable {}
+
+/// Whether a cwd that could not be listed should fail the spawn outright.
+/// Pulled out so the `sudo -i` regression is pinned by a test: making every
+/// inherited PermissionDenied fatal would turn "split a pane out of a root
+/// shell" into "will not open at all". Only a caller that named the
+/// directory on purpose opts in.
+fn required_cwd_error_is_fatal(require_cwd: bool) -> bool {
+    require_cwd
+}
+
+#[cfg(test)]
+mod cwd_refusal_tests {
+    use super::required_cwd_error_is_fatal;
+
+    /// The `sudo -i` case, and every other pane that merely inherited its cwd:
+    /// a refusal still degrades to the home directory.
+    #[test]
+    fn an_inherited_cwd_still_falls_back_when_refused() {
+        assert!(!required_cwd_error_is_fatal(false));
+    }
+
+    /// A requested directory that is unavailable fails, so the caller can say so.
+    #[test]
+    fn every_requested_cwd_error_is_fatal() {
+        assert!(required_cwd_error_is_fatal(true));
     }
 }

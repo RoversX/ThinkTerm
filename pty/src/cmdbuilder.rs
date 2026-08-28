@@ -207,6 +207,12 @@ pub struct CommandBuilder {
     #[cfg(unix)]
     pub(crate) umask: Option<libc::mode_t>,
     controlling_tty: bool,
+    /// Whether `cwd` is a requirement or a preference. The default is a
+    /// preference: an inherited cwd (OSC 7, `sudo -i`) degrades to the home
+    /// directory. A spawner opening a *named* directory sets this so the
+    /// refusal becomes an error it can show instead of a silent `$HOME`.
+    #[cfg_attr(feature = "serde_support", serde(default))]
+    require_cwd: bool,
 }
 
 impl CommandBuilder {
@@ -220,6 +226,7 @@ impl CommandBuilder {
             #[cfg(unix)]
             umask: None,
             controlling_tty: true,
+            require_cwd: false,
         }
     }
 
@@ -232,6 +239,7 @@ impl CommandBuilder {
             #[cfg(unix)]
             umask: None,
             controlling_tty: true,
+            require_cwd: false,
         }
     }
 
@@ -249,6 +257,17 @@ impl CommandBuilder {
         self.controlling_tty
     }
 
+    /// Treat `cwd` as a requirement rather than a preference: a spawner that
+    /// was asked for a *named* directory would rather fail loudly than hand
+    /// back a shell somewhere else. See the field's documentation.
+    pub fn set_require_cwd(&mut self, require_cwd: bool) {
+        self.require_cwd = require_cwd;
+    }
+
+    pub fn get_require_cwd(&self) -> bool {
+        self.require_cwd
+    }
+
     /// Create a new builder instance that will run some idea of a default
     /// program.  Such a builder will panic if `arg` is called on it.
     pub fn new_default_prog() -> Self {
@@ -259,6 +278,7 @@ impl CommandBuilder {
             #[cfg(unix)]
             umask: None,
             controlling_tty: true,
+            require_cwd: false,
         }
     }
 
@@ -816,6 +836,9 @@ mod tests {
     /// of, and nothing else would tell you. When this breaks, either carry
     /// the new field in thinkterm_proto::CommandSpec (and bump
     /// CODEC_VERSION) or record here why it does not travel.
+    ///
+    /// `require_cwd` deliberately does not travel: it is local-domain policy,
+    /// and a remote server re-derives its own against its own filesystem.
     #[test]
     fn every_field_is_accounted_for_on_the_wire() {
         #[cfg(unix)]
@@ -825,6 +848,7 @@ mod tests {
             cwd: _,
             umask: _,
             controlling_tty: _,
+            require_cwd: _,
         } = CommandBuilder::new("prog");
         #[cfg(not(unix))]
         let CommandBuilder {
@@ -832,7 +856,20 @@ mod tests {
             envs: _,
             cwd: _,
             controlling_tty: _,
+            require_cwd: _,
         } = CommandBuilder::new("prog");
+    }
+
+    /// The default stays lenient; this flag opts out one caller at a time.
+    #[test]
+    fn cwd_is_a_preference_unless_a_caller_says_otherwise() {
+        assert!(!CommandBuilder::new("prog").get_require_cwd());
+        assert!(!CommandBuilder::new_default_prog().get_require_cwd());
+        assert!(!CommandBuilder::from_argv(vec!["prog".into()]).get_require_cwd());
+
+        let mut cmd = CommandBuilder::new_default_prog();
+        cmd.set_require_cwd(true);
+        assert!(cmd.get_require_cwd());
     }
 
     #[cfg(unix)]
