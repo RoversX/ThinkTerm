@@ -1,12 +1,16 @@
 use crate::customglyph::BlockKey;
-use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::quad::{
+    HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
+    TripleLayerQuadAllocatorTrait,
+};
 use crate::shapecache::{BorrowedShapeCacheKey, ShapedInfo};
 use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons;
 use crate::termwindow::ui::tokens::{
-    CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
-    TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP, TAB_ROW_START_PADDING, TAB_VERTICAL_PADDING,
+    ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
+    TAB_CLOSE_HOVER_RADIUS, TAB_CONTENT_INSET, TAB_ICON_SIZE, TAB_ROW_START_PADDING,
+    TAB_VERTICAL_PADDING,
     WINDOW_TAB_ADD_BUTTON_RADIUS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_GAP,
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
     WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
@@ -70,7 +74,7 @@ impl crate::TermWindow {
         };
         let content_row_y = row_y + content_top_spacer;
         let content_row_height = row_height.saturating_sub(content_top_spacer);
-        let icon_size = fancy_tab_icon_size(&metrics, content_row_height as f32) as usize;
+        let icon_size = self.ui_px(TAB_ICON_SIZE).min(content_row_height);
         let button_size = content_row_height
             .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(icon_size);
@@ -131,7 +135,10 @@ impl crate::TermWindow {
                 layers,
                 1,
                 euclid::rect(row_x as f32, divider_y as f32, row_width as f32, 1.0),
-                foreground.mul_alpha(0.14),
+                // The shared separator token, same as the sidebar edges draw:
+                // this used to be a one-off `text * 0.14`, which read markedly
+                // brighter than every other rule in the window.
+                chrome.separator,
             )
             .context("fancy tab bar pane layer divider")?;
         }
@@ -246,6 +253,21 @@ impl crate::TermWindow {
                 }
             }
         }
+
+        // Dissolve the row into the bar wherever it runs on past the viewport,
+        // so a clipped tab reads as continuing rather than as one sliced in
+        // half. Goes down after the tabs and before the trailing actions, which
+        // own the space beyond the boundary.
+        self.paint_tab_row_fades(
+            layers,
+            background,
+            content_row_y,
+            content_row_height,
+            viewport_left,
+            viewport_right,
+            scroll_offset > 0.5,
+            scroll_offset < max_scroll - 0.5,
+        )?;
 
         // Establish a hard paint boundary before the trailing actions. Tab
         // surfaces and glyphs are already geometrically clipped, but this mask
@@ -398,14 +420,10 @@ impl crate::TermWindow {
 
         if self.fancy_tab_bar_shows_window_buttons() {
             let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
-            let font = self
-                .fonts
-                .title_font_with_size(crate::native_settings::tab_font_size())?;
-            let metrics = RenderMetrics::with_font_metrics(&font.metrics());
             let content_top_spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height);
             let content_row_y = row_y + content_top_spacer;
             let content_row_height = row_height.saturating_sub(content_top_spacer);
-            let icon_size = fancy_tab_icon_size(&metrics, content_row_height as f32) as usize;
+            let icon_size = self.ui_px(TAB_ICON_SIZE).min(content_row_height);
             let button_size = content_row_height
                 .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
                 .max(icon_size);
@@ -724,14 +742,6 @@ impl crate::TermWindow {
         background: LinearRgba,
         foreground: LinearRgba,
     ) -> anyhow::Result<()> {
-        self.filled_rectangle(
-            layers,
-            1,
-            euclid::rect(visible_left, row_y as f32, visible_width, row_height as f32),
-            background,
-        )
-        .context("window tab background")?;
-
         let hover_x = visible_left.max(0.0) as usize;
         let hover_width = visible_width.max(0.0) as usize;
         let is_hovered = self.is_pointer_over_ui_rect(hover_x, row_y, hover_width, row_height);
@@ -743,25 +753,6 @@ impl crate::TermWindow {
             background
         };
         let tab_surface_y = row_y + (row_height.saturating_sub(button_size) / 2);
-        self.fill_rounded_rectangle_with_border(
-            layers,
-            1,
-            euclid::rect(
-                visible_left,
-                tab_surface_y as f32,
-                visible_width,
-                button_size as f32,
-            ),
-            tab_surface_color,
-            if active {
-                chrome.control_border
-            } else {
-                LinearRgba::TRANSPARENT
-            },
-            self.ui_f32(WINDOW_TAB_RADIUS),
-            CAPSULE_BORDER_WIDTH,
-        )
-        .context("window tab surface")?;
 
         ui_items.push(UIItem {
             x: visible_left.max(0.0) as usize,
@@ -771,40 +762,90 @@ impl crate::TermWindow {
             item_type: UIItemType::TabBar(TabBarItem::Tab { tab_idx, active }),
         });
 
-        let tab_left = tab_left.max(0.0) as usize;
-        let icon_x = tab_left + self.ui_px(WINDOW_TAB_INSET);
-        let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
-        if icon_x >= viewport_left && icon_x.saturating_add(icon_size) <= viewport_right {
-            self.paint_fancy_tab_icon(
-                layers,
-                SvgIcon::SquareTerminal,
-                icon_x,
-                icon_y,
-                icon_size,
-                foreground,
-            )?;
-        }
+        // The whole tab -- backdrop, capsule, shadow and content -- is recorded
+        // in the tab's own space, its left edge at 0, and replayed clipped to
+        // the row's viewport.
+        //
+        // Recording it at full width is what keeps a cut tab looking like a cut
+        // tab: `snapped_rounded_corner_radius` clamps the radius to half the
+        // rect it is given, so drawing the capsule pre-cut turned a 30px sliver
+        // into its own little lozenge instead of the end of a 320px pill. The
+        // clip supplies the hard edge, so the corners need no special casing.
+        //
+        // Recording it in local space is what keeps the content in the right
+        // place: once the row scrolls a tab's true origin goes negative, which
+        // the unsigned coordinates the painters take cannot express, and laying
+        // out from a clamped 0 drew the wrong slice and dropped the close
+        // target on a neighbouring tab.
+        let out_layers = layers;
+        let mut content = HeapQuadAllocator::default();
+        let mut content_layers = TripleLayerQuadAllocator::Heap(&mut content);
+        let layers = &mut content_layers;
 
-        let close_x = tab_left
-            .saturating_add(tab_width)
-            .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(0.0, row_y as f32, tab_width as f32, row_height as f32),
+            background,
+        )
+        .context("window tab background")?;
+
+        self.paint_tab_capsule(
+            layers,
+            1,
+            tab_surface_y,
+            tab_width,
+            button_size,
+            self.ui_f32(WINDOW_TAB_RADIUS),
+            tab_surface_color,
+            if active {
+                chrome.control_border
+            } else {
+                LinearRgba::TRANSPARENT
+            },
+            active,
+        )
+        .context("window tab surface")?;
+
+        let icon_x = self.ui_px(TAB_CONTENT_INSET);
+        let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
+        self.paint_fancy_tab_icon(
+            layers,
+            SvgIcon::SquareTerminal,
+            icon_x,
+            icon_y,
+            icon_size,
+            foreground,
+        )?;
+
+        let close_x = self.tab_close_button_x(tab_width, button_size, icon_size);
         let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
+        // Where the button really lands, for hover and hit testing. A target
+        // placed from a clamped origin used to sit over the neighbouring tab
+        // and close the wrong one.
+        let close_screen_x = tab_left + close_x as f32;
+        let close_hit_visible = close_screen_x >= viewport_left as f32
+            && close_screen_x + button_size as f32 <= viewport_right as f32;
         let close_slot_reserved = self.config.show_close_tab_button_in_tabs && !is_renaming;
         let show_close = close_slot_reserved && (active || is_hovered);
-        if show_close
-            && close_x >= viewport_left
-            && close_x.saturating_add(button_size) <= viewport_right
-        {
-            let close_hovered =
-                self.is_pointer_over_ui_rect(close_x, close_y, button_size, button_size);
+        if show_close {
+            // Hover feedback follows the hit target: a half-clipped button that
+            // lit up without accepting the click sent it through to the tab
+            // underneath, switching tabs instead of closing one.
+            let close_hit_x = close_screen_x.max(0.0) as usize;
+            let close_hovered = close_hit_visible
+                && self.is_pointer_over_ui_rect(close_hit_x, close_y, button_size, button_size);
             if close_hovered {
-                let hover_alpha =
-                    if self.is_pointer_pressing_ui_rect(close_x, close_y, button_size, button_size)
-                    {
-                        0.20
-                    } else {
-                        0.12
-                    };
+                let hover_alpha = if self.is_pointer_pressing_ui_rect(
+                    close_hit_x,
+                    close_y,
+                    button_size,
+                    button_size,
+                ) {
+                    0.20
+                } else {
+                    0.12
+                };
                 let hover_inset = self.ui_px(TAB_CLOSE_HOVER_INSET).min(button_size / 2);
                 let hover_size = button_size.saturating_sub(hover_inset * 2);
                 self.fill_rounded_rectangle(
@@ -821,13 +862,15 @@ impl crate::TermWindow {
                 )
                 .context("window tab close hover")?;
             }
-            ui_items.push(UIItem {
-                x: close_x,
-                y: close_y,
-                width: button_size,
-                height: button_size,
-                item_type: UIItemType::CloseTab(tab_idx),
-            });
+            if close_hit_visible {
+                ui_items.push(UIItem {
+                    x: close_hit_x,
+                    y: close_y,
+                    width: button_size,
+                    height: button_size,
+                    item_type: UIItemType::CloseTab(tab_idx),
+                });
+            }
             let close_fg = if close_hovered {
                 foreground
             } else {
@@ -846,23 +889,18 @@ impl crate::TermWindow {
         let mut text_x = icon_x + icon_size + self.ui_px(WINDOW_TAB_ICON_GAP);
         if let Some(status) = item.status {
             let status_x = text_x;
-            if status_x >= viewport_left && status_x.saturating_add(icon_size) <= viewport_right {
-                self.paint_status_icon(layers, 2, status, status_x, icon_y, icon_size, foreground)
-                    .context("window tab status icon")?;
-            }
+            self.paint_status_icon(layers, 2, status, status_x, icon_y, icon_size, foreground)
+                .context("window tab status icon")?;
             text_x = status_x + icon_size + self.ui_px(WINDOW_TAB_ICON_GAP);
         }
         let text_right = if close_slot_reserved {
             close_x.saturating_sub(self.ui_px(WINDOW_TAB_ICON_GAP))
         } else {
-            tab_left
-                .saturating_add(tab_width)
-                .saturating_sub(self.ui_px(WINDOW_TAB_INSET))
-        }
-        .min(viewport_right);
+            tab_width.saturating_sub(self.ui_px(TAB_CONTENT_INSET))
+        };
         let text_width = text_right.saturating_sub(text_x);
         let text_y = row_y + (row_height.saturating_sub(metrics.cell_size.height as usize) / 2);
-        if text_x >= viewport_left && text_x < viewport_right {
+        if text_width > 0 {
             let text_fg = if is_renaming {
                 self.filled_rectangle(
                     layers,
@@ -891,6 +929,23 @@ impl crate::TermWindow {
                 text_fg,
             )?;
         }
+
+        drop(content_layers);
+        content
+            .apply_to_clipped_at(
+                out_layers,
+                tab_left,
+                0.0,
+                QuadClipRect::from_top_left_pixels(
+                    viewport_left as f32,
+                    row_y as f32,
+                    viewport_right as f32,
+                    (row_y + row_height) as f32,
+                    &self.dimensions,
+                ),
+                1.0,
+            )
+            .context("window tab content")?;
         Ok(())
     }
 
@@ -932,25 +987,6 @@ impl crate::TermWindow {
             background
         };
         let tab_surface_y = row_y + (row_height.saturating_sub(button_size) / 2);
-        self.fill_rounded_rectangle_with_border(
-            layers,
-            1,
-            euclid::rect(
-                visible_left,
-                tab_surface_y as f32,
-                visible_width,
-                button_size as f32,
-            ),
-            surface,
-            if active {
-                chrome.control_border
-            } else {
-                LinearRgba::TRANSPARENT
-            },
-            self.ui_f32(WINDOW_TAB_RADIUS),
-            CAPSULE_BORDER_WIDTH,
-        )
-        .context("content view tab surface")?;
 
         ui_items.push(UIItem {
             x: visible_left.max(0.0) as usize,
@@ -960,37 +996,67 @@ impl crate::TermWindow {
             item_type: UIItemType::TabBar(TabBarItem::ContentView { id }),
         });
 
-        let tab_left = tab_left.max(0.0) as usize;
-        let icon_x = tab_left + self.ui_px(WINDOW_TAB_INSET);
-        let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
-        if icon_x >= viewport_left && icon_x.saturating_add(icon_size) <= viewport_right {
-            self.paint_fancy_tab_icon(
-                layers,
-                SvgIcon::Link2,
-                icon_x,
-                icon_y,
-                icon_size,
-                foreground,
-            )?;
-        }
+        // Whole tab recorded at full width in the tab's own space, replayed
+        // clipped to the row. See `paint_window_tab`.
+        let out_layers = layers;
+        let mut content = HeapQuadAllocator::default();
+        let mut content_layers = TripleLayerQuadAllocator::Heap(&mut content);
+        let layers = &mut content_layers;
 
-        let close_x = tab_left
-            .saturating_add(tab_width)
-            .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(0.0, row_y as f32, tab_width as f32, row_height as f32),
+            background,
+        )
+        .context("content view tab background")?;
+        self.paint_tab_capsule(
+            layers,
+            1,
+            tab_surface_y,
+            tab_width,
+            button_size,
+            self.ui_f32(WINDOW_TAB_RADIUS),
+            surface,
+            if active {
+                chrome.control_border
+            } else {
+                LinearRgba::TRANSPARENT
+            },
+            active,
+        )
+        .context("content view tab surface")?;
+
+        let icon_x = self.ui_px(TAB_CONTENT_INSET);
+        let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
+        self.paint_fancy_tab_icon(
+            layers,
+            SvgIcon::Link2,
+            icon_x,
+            icon_y,
+            icon_size,
+            foreground,
+        )?;
+
+        let close_x = self.tab_close_button_x(tab_width, button_size, icon_size);
         let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
-        let close_slot_visible =
-            close_x >= viewport_left && close_x.saturating_add(button_size) <= viewport_right;
-        let show_close = close_slot_visible && (active || is_hovered);
+        let close_screen_x = tab_left + close_x as f32;
+        let close_hit_visible = close_screen_x >= viewport_left as f32
+            && close_screen_x + button_size as f32 <= viewport_right as f32;
+        let show_close = active || is_hovered;
         if show_close {
-            let close_hovered =
-                self.is_pointer_over_ui_rect(close_x, close_y, button_size, button_size);
-            ui_items.push(UIItem {
-                x: close_x,
-                y: close_y,
-                width: button_size,
-                height: button_size,
-                item_type: UIItemType::ContentViewClose(id),
-            });
+            let close_hit_x = close_screen_x.max(0.0) as usize;
+            let close_hovered = close_hit_visible
+                && self.is_pointer_over_ui_rect(close_hit_x, close_y, button_size, button_size);
+            if close_hit_visible {
+                ui_items.push(UIItem {
+                    x: close_hit_x,
+                    y: close_y,
+                    width: button_size,
+                    height: button_size,
+                    item_type: UIItemType::ContentViewClose(id),
+                });
+            }
             self.paint_fancy_tab_icon(
                 layers,
                 SvgIcon::X,
@@ -1006,22 +1072,32 @@ impl crate::TermWindow {
         }
 
         let text_x = icon_x + icon_size + self.ui_px(WINDOW_TAB_ICON_GAP);
-        let text_right = if close_slot_visible {
-            close_x.saturating_sub(self.ui_px(WINDOW_TAB_ICON_GAP))
-        } else {
-            tab_left
-                .saturating_add(tab_width)
-                .saturating_sub(self.ui_px(WINDOW_TAB_INSET))
-        }
-        .min(viewport_right);
+        let text_right = close_x.saturating_sub(self.ui_px(WINDOW_TAB_ICON_GAP));
         let text_width = text_right.saturating_sub(text_x);
         let text_y = row_y + (row_height.saturating_sub(metrics.cell_size.height as usize) / 2);
-        if text_x >= viewport_left && text_x < viewport_right {
+        if text_width > 0 {
             let line = Line::from_text(title, &CellAttributes::blank(), 0, None);
             self.paint_fancy_tab_text(
                 layers, font, &line, false, text_x, text_y, text_width, foreground,
             )?;
         }
+
+        drop(content_layers);
+        content
+            .apply_to_clipped_at(
+                out_layers,
+                tab_left,
+                0.0,
+                QuadClipRect::from_top_left_pixels(
+                    viewport_left as f32,
+                    row_y as f32,
+                    viewport_right as f32,
+                    (row_y + row_height) as f32,
+                    &self.dimensions,
+                ),
+                1.0,
+            )
+            .context("content view tab content")?;
         Ok(())
     }
 
@@ -1727,13 +1803,6 @@ fn horizontal_texture_clip(
         texture_left: texture_left + texture_width * left_fraction,
         texture_right: texture_left + texture_width * right_fraction,
     })
-}
-
-fn fancy_tab_icon_size(metrics: &RenderMetrics, tab_bar_height: f32) -> f32 {
-    let cell_height = metrics.cell_size.height.max(1) as f32;
-    let from_bar = (tab_bar_height - cell_height * 0.45).max(1.0);
-    let from_font = metrics.cell_size.height as f32 * 0.95;
-    from_bar.min(from_font).max(1.0).floor()
 }
 
 fn is_legacy_progress_marker(value: &str) -> bool {

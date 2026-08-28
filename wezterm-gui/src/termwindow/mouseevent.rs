@@ -6,7 +6,7 @@ use crate::termwindow::space_swipe::{SidebarSpaceSwipeFinish, SidebarSpaceSwipeU
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::sidebar::SpaceConnectionState;
 use crate::termwindow::ui::tokens::{
-    PANE_NAV_BUTTON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_ROW_START_PADDING,
+    PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH, TAB_ROW_START_PADDING, TAB_TARGET_WIDTH,
     TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
 };
@@ -208,6 +208,31 @@ fn missing_ssh_host_blocks_activation(
     project_is_remote && !has_ssh_host && !space_has_client_domain
 }
 
+/// Divide a tab row of `viewport_width` among `tab_count` tabs.
+///
+/// Everything is already in device pixels, which keeps the rule testable
+/// without a live window. `target` is the width a tab wants; `floor` is the
+/// narrowest it stays readable at. Once the tabs no longer fit even at `floor`
+/// the row overflows and its caller scrolls.
+fn adaptive_tab_width_pixels(
+    tab_count: usize,
+    viewport_width: f32,
+    gap: f32,
+    target: f32,
+    floor: f32,
+) -> f32 {
+    let floor = floor.min(target);
+    if tab_count <= 1 {
+        return target;
+    }
+    let count = tab_count as f32;
+    let usable = (viewport_width - gap * (count - 1.0)).max(0.0);
+    // floor(), never ceil(): at the shrink threshold the tabs plus their gaps
+    // have to add up to at most the viewport, or every row would carry a pixel
+    // of phantom scroll.
+    (usable / count).floor().clamp(floor, target)
+}
+
 #[cfg(test)]
 mod window_tab_layout_tests {
     use super::{
@@ -367,7 +392,61 @@ impl super::TermWindow {
         }
     }
 
+    /// Width of one tab surface in a row that holds `tab_count` of them.
+    ///
+    /// Tabs are chrome, so the terminal font plays no part: the row's own width
+    /// and how many tabs share it decide everything. See `TAB_TARGET_WIDTH`.
+    pub(super) fn adaptive_tab_width(&self, tab_count: usize, viewport_width: f32, gap: f32) -> f32 {
+        // Whole pixels: the painters round the width up before laying tabs out,
+        // and the scroll clamps use it raw. A fractional ui scale would
+        // otherwise leave them disagreeing by up to a pixel per tab.
+        adaptive_tab_width_pixels(
+            tab_count,
+            viewport_width,
+            gap,
+            self.ui_f32(TAB_TARGET_WIDTH).floor(),
+            self.ui_f32(TAB_MIN_WIDTH).floor(),
+        )
+    }
+
+    /// The gap the window tab row leaves between neighbouring tabs.
+    pub(super) fn window_tab_gap_pixels(&self) -> f32 {
+        if self.config.use_fancy_tab_bar {
+            self.ui_px(WINDOW_TAB_GAP) as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// How many surfaces the window tab row paints: the mux tabs plus the
+    /// synthetic content-view tabs. Counted off `tab_bar` rather than the mux
+    /// window so this matches `paint_fancy_tab_bar` frame for frame — tab width
+    /// now depends on the count, so a stale one would resize every tab.
+    pub(super) fn window_tab_bar_item_count(&self) -> usize {
+        let mux_tabs = if self.active_content_view_is_remote_thread() {
+            0
+        } else {
+            self.tab_bar
+                .items()
+                .iter()
+                .filter(|item| matches!(item.item, TabBarItem::Tab { .. }))
+                .count()
+        };
+        mux_tabs + self.content_view_count()
+    }
+
     pub(super) fn window_tab_width_pixels(&self) -> f32 {
+        self.adaptive_tab_width(
+            self.window_tab_bar_item_count(),
+            self.window_tab_viewport_width(),
+            self.window_tab_gap_pixels(),
+        )
+    }
+
+    /// The collapsed pane strip still sizes its chips off the terminal cell
+    /// grid; only the window tab row and the pane nav bar moved to
+    /// `adaptive_tab_width`.
+    pub(super) fn collapsed_pane_tab_width_pixels(&self) -> f32 {
         let cell_width = self.render_metrics.cell_size.width.max(1) as f32;
         (self.config.tab_max_width as f32 * cell_width)
             .max(cell_width * 15.0)
@@ -497,7 +576,10 @@ impl super::TermWindow {
             .saturating_sub(self.tab_bar_left_edge())
             .saturating_sub(self.right_sidebar_width())
             .saturating_sub(border.right.get() as usize)
-            .saturating_sub(left_padding.max(0.0) as usize)
+            // ceil, matching `paint_fancy_tab_bar`'s viewport_left: tab width is
+            // derived from this number, so a one-pixel disagreement would clip
+            // the last tab in a row that otherwise fits exactly.
+            .saturating_sub(left_padding.max(0.0).ceil() as usize)
             .saturating_sub(if self.config.use_fancy_tab_bar {
                 self.ui_px(TAB_ROW_START_PADDING) + self.window_tab_trailing_action_reserved_width()
             } else {
@@ -507,26 +589,13 @@ impl super::TermWindow {
     }
 
     pub(super) fn max_window_tab_scroll_offset(&self) -> f32 {
-        let mux = Mux::get();
-        let Some(window) = mux.get_window(self.mux_window_id) else {
-            return 0.0;
-        };
-        let window_tab_count = if self.active_content_view_is_remote_thread() {
-            0
-        } else {
-            window.len()
-        };
-        let tab_count = window_tab_count + self.content_view_count();
+        let tab_count = self.window_tab_bar_item_count();
         if tab_count <= 1 {
             return 0.0;
         }
 
         let tab_width = self.window_tab_width_pixels();
-        let tab_gap = if self.config.use_fancy_tab_bar {
-            self.ui_px(WINDOW_TAB_GAP) as f32
-        } else {
-            0.0
-        };
+        let tab_gap = self.window_tab_gap_pixels();
         let total_width =
             tab_count as f32 * tab_width + tab_count.saturating_sub(1) as f32 * tab_gap;
         let available_width = self.window_tab_viewport_width();
@@ -566,34 +635,28 @@ impl super::TermWindow {
             return 0.0;
         }
 
-        let cell_width = self.render_metrics.cell_size.width as f32;
-        let content_width = pos.width as f32 * cell_width;
-        let pane_width = if pos.left == 0 && self.workspace_sidebar_width() > 0 {
-            content_width
-                + (self.padding_left_top().0 - self.workspace_sidebar_width() as f32).max(0.0)
+        // Share the painter's viewport rather than re-deriving one here: it
+        // used to assume two trailing action buttons where the painter draws
+        // four or five, and now that tab width follows the row, any drift would
+        // strand the last tab out of scroll range.
+        let tab_gap = self.ui_px(PANE_NAV_TAB_GAP) as f32;
+        // A collapsed stack has its own strip geometry and its own (legacy,
+        // cell-derived) tab width; clamping it against the expanded bar's
+        // figures left it with a stretch of dead scroll.
+        let (viewport_width, tab_width) = if self.collapsed_pane_layouts.contains_key(&stack_id) {
+            (
+                self.collapsed_pane_nav_tab_viewport_width(&pos),
+                self.collapsed_pane_tab_width_pixels().ceil(),
+            )
         } else {
-            content_width
+            let viewport_width = self.pane_nav_tab_viewport_width(&pos);
+            (
+                viewport_width,
+                self.adaptive_tab_width(tab_count, viewport_width, tab_gap),
+            )
         };
-        let pane_left = pos.left;
-        if pane_width <= 0.0 {
-            return 0.0;
-        }
-
-        let nav_height = self.pane_nav_bar_height();
-        let icon_size = nav_height
-            .saturating_sub(self.ui_px(PANE_NAV_INSET) * 2)
-            .clamp(self.ui_px(20), self.ui_px(24));
-        let button_size = nav_height
-            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
-            .max(icon_size);
-        let controls_width = (button_size + self.ui_px(PANE_NAV_BUTTON_GAP))
-            .saturating_mul(2)
-            .saturating_add(self.ui_px(PANE_NAV_INSET))
-            .saturating_add(self.pane_nav_tab_left_inset(pane_left));
-        let viewport_width = (pane_width as usize).saturating_sub(controls_width).max(1) as f32;
-        let tab_width = self.window_tab_width_pixels();
-        let total_width = tab_count as f32 * tab_width
-            + tab_count.saturating_sub(1) as f32 * self.ui_px(PANE_NAV_TAB_GAP) as f32;
+        let total_width =
+            tab_count as f32 * tab_width + tab_count.saturating_sub(1) as f32 * tab_gap;
 
         (total_width - viewport_width).max(0.0)
     }
@@ -8945,6 +9008,84 @@ mod space_menu_tests {
                 KeyAssignment::DeleteSpace("s1".to_string()),
                 KeyAssignment::DeleteSpaceEverywhere("s1".to_string()),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tab_width_tests {
+    use super::adaptive_tab_width_pixels;
+
+    const TARGET: f32 = 300.0;
+    const FLOOR: f32 = 160.0;
+    const GAP: f32 = 18.0;
+
+    fn width(count: usize, viewport: f32) -> f32 {
+        adaptive_tab_width_pixels(count, viewport, GAP, TARGET, FLOOR)
+    }
+
+    /// A roomy row does not stretch its tabs to fill it: two tabs in a wide
+    /// window stay at the target width, the way browser tab strips behave.
+    #[test]
+    fn a_roomy_row_parks_every_tab_at_the_target_width() {
+        assert_eq!(width(1, 2000.0), TARGET);
+        assert_eq!(width(2, 2000.0), TARGET);
+        assert_eq!(width(5, 2000.0), TARGET);
+    }
+
+    /// Past the point where targets fit, the tabs give up width together.
+    #[test]
+    fn crowding_shrinks_the_tabs_evenly() {
+        let w = width(8, 1600.0);
+        assert!(w < TARGET, "{w} should be under the target");
+        assert!(w > FLOOR, "{w} should still be over the floor");
+        // 8 tabs and 7 gaps have to land inside the row.
+        assert!(8.0 * w + 7.0 * GAP <= 1600.0);
+    }
+
+    /// Exactly at the fit boundary the row must not leave a stray pixel of
+    /// scroll behind — that is what the floor() in the divide is for.
+    #[test]
+    fn a_row_that_just_fits_leaves_no_phantom_scroll() {
+        for count in 2..=40usize {
+            for viewport in [640.0f32, 977.0, 1280.0, 1441.0, 2560.0] {
+                let w = width(count, viewport);
+                let total = count as f32 * w + (count - 1) as f32 * GAP;
+                if w > FLOOR {
+                    assert!(
+                        total <= viewport,
+                        "count={count} viewport={viewport} width={w} total={total}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Below the floor the tabs stop shrinking and the row overflows instead,
+    /// which is the signal for the caller to scroll.
+    #[test]
+    fn the_floor_holds_and_hands_the_overflow_to_the_scroller() {
+        let w = width(40, 1200.0);
+        assert_eq!(w, FLOOR);
+        assert!(40.0 * w + 39.0 * GAP > 1200.0);
+    }
+
+    /// A window narrower than one tab (or with no room at all) still reports a
+    /// usable width rather than 0 or a negative.
+    #[test]
+    fn a_starved_row_still_reports_the_floor() {
+        assert_eq!(width(3, 0.0), FLOOR);
+        assert_eq!(width(3, -50.0), FLOOR);
+        assert_eq!(width(0, 800.0), TARGET);
+    }
+
+    /// The floor is advisory: a design that set it above the target must not
+    /// produce a tab wider than the target.
+    #[test]
+    fn a_floor_above_the_target_never_wins() {
+        assert_eq!(
+            adaptive_tab_width_pixels(6, 400.0, GAP, 100.0, 250.0),
+            100.0
         );
     }
 }

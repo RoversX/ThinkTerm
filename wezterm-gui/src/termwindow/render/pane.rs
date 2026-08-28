@@ -1,5 +1,6 @@
 use crate::quad::{
-    HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
+    HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
+    TripleLayerQuadAllocatorTrait,
 };
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
@@ -12,7 +13,8 @@ use crate::termwindow::ui::status_icon::{split_leading_legacy_progress_marker, U
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, PANE_NAV_ACTION_BUTTON_RADIUS,
     PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS,
-    PANE_NAV_TAB_TOP_OFFSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS, TAB_CLOSE_RIGHT_GAP,
+    PANE_NAV_ACTION_ICON_SIZE, TAB_CLOSE_HOVER_INSET,
+    TAB_CLOSE_HOVER_RADIUS, TAB_CONTENT_INSET, TAB_ICON_SIZE,
     TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, UIItem, UIItemType};
@@ -119,6 +121,11 @@ pub(crate) fn client_pane_lag_ms(pane: &dyn mux::pane::Pane) -> Option<u64> {
     }
 }
 
+/// Inset from the collapsed strip's own edges to its content.
+const COLLAPSED_EDGE_PADDING: usize = 8;
+/// Gap the collapsed strip leaves between its tabs and its action button.
+const COLLAPSED_SECTION_GAP: usize = 10;
+
 impl crate::TermWindow {
     /// Height of the nav bar for this pane: the metric height, clamped so
     /// that at least one terminal row of the pane's cell remains visible.
@@ -127,6 +134,83 @@ impl crate::TermWindow {
             pos.pixel_height
                 .saturating_sub(self.render_metrics.cell_size.height.max(1) as usize),
         )
+    }
+
+    /// Icon, action-icon and button sizes for a nav bar of `nav_height`.
+    /// The painter and the scroll clamp both size their geometry from these, so
+    /// they are derived once.
+    fn pane_nav_button_metrics(&self, nav_height: usize) -> (usize, usize, usize) {
+        // Fixed chrome sizes, clamped only so a nav bar squeezed by a short
+        // pane cannot overflow its own row. The tab icon deliberately matches
+        // the window tab row's; it used to be capped at 24 here and computed
+        // from the font up there, which left the two rows visibly out of step.
+        let icon_size = self.ui_px(TAB_ICON_SIZE).min(nav_height);
+        let action_icon_size = self.ui_px(PANE_NAV_ACTION_ICON_SIZE).min(nav_height);
+        // Floored by both icons, as the window tab row is: a pane short enough
+        // to squeeze the row would otherwise leave the pill shorter than the
+        // icon inside it, which then top-aligns and gets its base clipped away.
+        let button_size = nav_height
+            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
+            .max(action_icon_size)
+            .max(icon_size);
+        (icon_size, action_icon_size, button_size)
+    }
+
+    /// Width the trailing action buttons claim from the nav bar's right edge:
+    /// new tab, split down, split right and zoom, plus collapse wherever the
+    /// split shape allows it.
+    fn pane_nav_action_reserved_width(&self, pos: &PositionedPane, nav_height: usize) -> usize {
+        let (_, _, button_size) = self.pane_nav_button_metrics(nav_height);
+        let action_count = 4 + usize::from(self.can_collapse_pane_stack(pos));
+        action_count
+            .saturating_mul(button_size + self.ui_px(PANE_NAV_BUTTON_GAP))
+            .saturating_add(self.ui_px(PANE_NAV_INSET))
+    }
+
+    /// Horizontal room the *collapsed* strip leaves for its tabs.
+    ///
+    /// The expanded bar's `pane_nav_tab_viewport_width` does not describe this
+    /// one: the collapsed strip insets by its own padding and reserves a single
+    /// Expand button where the expanded bar reserves four or five. Clamping the
+    /// wheel against the expanded figure left roughly a button-row of dead
+    /// scroll the strip never moved through.
+    pub(crate) fn collapsed_pane_nav_tab_viewport_width(&self, pos: &PositionedPane) -> f32 {
+        let Some(layout) = self.collapsed_pane_layouts.get(&pos.pane_stack_id).copied() else {
+            return 0.0;
+        };
+        if layout.split_direction == SplitDirection::Horizontal {
+            // A vertical strip stacks its chips; there is nothing to scroll.
+            return 0.0;
+        }
+        let Ok(pane_rect) = self.pane_frame_rect(pos) else {
+            return 0.0;
+        };
+        let strip_left = pane_rect.origin.x.max(0.0) as usize;
+        let strip_right = pane_rect.max_x().max(0.0) as usize;
+        let strip_height = pane_rect.size.height.max(1.0) as usize;
+        let chrome_height = self.pane_nav_bar_height().min(strip_height);
+        let (_, _, button_size) = self.pane_nav_button_metrics(chrome_height);
+        let tab_start = strip_left + COLLAPSED_EDGE_PADDING;
+        let max_tab_right = strip_right
+            .saturating_sub(COLLAPSED_EDGE_PADDING + button_size + COLLAPSED_SECTION_GAP);
+        max_tab_right.saturating_sub(tab_start) as f32
+    }
+
+    /// Horizontal room the nav bar leaves for its tab strip. Tab width is
+    /// derived from this, so the painter and the wheel-scroll clamp have to read
+    /// it from the same place or the last tab drifts out of reach.
+    pub(crate) fn pane_nav_tab_viewport_width(&self, pos: &PositionedPane) -> f32 {
+        let nav_height = self.pane_nav_bar_height_for_pane(pos);
+        if nav_height == 0 {
+            return 0.0;
+        }
+        let Ok((pane_x, pane_width)) = self.pane_chrome_span(pos) else {
+            return 0.0;
+        };
+        let tab_start = pane_x.max(0.0) as usize + self.pane_nav_tab_left_inset(pos.left);
+        let max_tab_right = ((pane_x + pane_width).max(0.0) as usize)
+            .saturating_sub(self.pane_nav_action_reserved_width(pos, nav_height));
+        max_tab_right.saturating_sub(tab_start) as f32
     }
 
     pub(crate) fn terminal_viewport_right(&self) -> f32 {
@@ -225,9 +309,7 @@ impl crate::TermWindow {
             },
         });
 
-        const COLLAPSED_EDGE_PADDING: usize = 8;
         const COLLAPSED_BUTTON_GAP: usize = 6;
-        const COLLAPSED_SECTION_GAP: usize = 10;
 
         let tabs = Mux::get().pane_stack_tabs(pos.pane.pane_id());
         let active_tab = tabs.iter().find(|tab| tab.is_active);
@@ -308,15 +390,8 @@ impl crate::TermWindow {
         // bar overlays the content (it steals no viewport rows), for local
         // panes the viewport was already shrunk to make room.
         let chrome_height = self.pane_nav_bar_height().min(strip_height);
-        let icon_size = chrome_height
-            .saturating_sub(self.ui_px(PANE_NAV_INSET) * 2)
-            .clamp(self.ui_px(20), self.ui_px(24));
-        let action_icon_size = icon_size
-            .saturating_add(self.ui_px(2))
-            .clamp(icon_size, self.ui_px(26));
-        let button_size = chrome_height
-            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
-            .max(action_icon_size);
+        let (icon_size, action_icon_size, button_size) =
+            self.pane_nav_button_metrics(chrome_height);
         let button_y =
             pane_rect.origin.y.max(0.0) as usize + (chrome_height.saturating_sub(button_size) / 2);
         let mut button_x = strip_right.saturating_sub(COLLAPSED_EDGE_PADDING);
@@ -342,7 +417,7 @@ impl crate::TermWindow {
         }
 
         let tab_start = strip_left + COLLAPSED_EDGE_PADDING;
-        let tab_width = self.window_tab_width_pixels().ceil() as usize;
+        let tab_width = self.collapsed_pane_tab_width_pixels().ceil() as usize;
         let tab_step = tab_width + self.ui_px(PANE_NAV_TAB_GAP);
         let total_tab_width = tabs.len().saturating_mul(tab_width).saturating_add(
             tabs.len()
@@ -406,17 +481,6 @@ impl crate::TermWindow {
             } else {
                 LinearRgba::TRANSPARENT
             };
-            self.fill_rounded_rectangle_with_border(
-                layers,
-                1,
-                euclid::rect(visible_left, tab_y as f32, visible_width, tab_height as f32),
-                tab_surface_color,
-                tab_border_color,
-                self.ui_f32(PANE_NAV_TAB_RADIUS),
-                CAPSULE_BORDER_WIDTH,
-            )
-            .context("collapsed pane nav tab surface")?;
-
             self.ui_items.push(UIItem {
                 x: visible_left.max(0.0) as usize,
                 y: tab_y,
@@ -429,8 +493,29 @@ impl crate::TermWindow {
                 },
             });
 
-            let draw_tab_x = tab_left.max(0.0) as usize;
-            let title_icon_x = draw_tab_x + self.ui_px(PANE_NAV_INSET);
+            // Reborrow: the surrounding loop cannot move the caller's `&mut`.
+            let out_layers = &mut *layers;
+            // Content rides in a heap and is replayed clipped to the strip's
+            // viewport, recorded in the tab's own space -- left edge at 0 --
+            // and shifted onto the strip on replay. See `paint_window_tab`.
+            let mut content = HeapQuadAllocator::default();
+            let mut content_layers = TripleLayerQuadAllocator::Heap(&mut content);
+            let layers = &mut content_layers;
+
+            self.paint_tab_capsule(
+                layers,
+                1,
+                tab_y,
+                tab_width,
+                tab_height,
+                self.ui_f32(PANE_NAV_TAB_RADIUS),
+                tab_surface_color,
+                tab_border_color,
+                selected_tab,
+            )
+            .context("pane nav tab surface")?;
+
+            let title_icon_x = self.ui_px(TAB_CONTENT_INSET);
             let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
             let raw_title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
             let (title, status) =
@@ -442,48 +527,52 @@ impl crate::TermWindow {
                 } else {
                     (raw_title.as_str(), None)
                 };
-            if title_icon_x >= tab_start && title_icon_x.saturating_add(icon_size) <= max_tab_right
-            {
-                if let Some(status) = status {
-                    self.paint_status_icon(
-                        layers,
-                        2,
-                        status,
-                        title_icon_x,
-                        title_icon_y,
-                        icon_size,
-                        this_tab_fg,
-                    )?;
-                } else {
-                    self.paint_pane_nav_icon(
-                        layers,
-                        SvgIcon::SquareTerminal,
-                        title_icon_x,
-                        title_icon_y,
-                        icon_size,
-                        this_tab_fg,
-                    )?;
-                }
+            if let Some(status) = status {
+                self.paint_status_icon(
+                    layers,
+                    2,
+                    status,
+                    title_icon_x,
+                    title_icon_y,
+                    icon_size,
+                    this_tab_fg,
+                )?;
+            } else {
+                self.paint_pane_nav_icon(
+                    layers,
+                    SvgIcon::SquareTerminal,
+                    title_icon_x,
+                    title_icon_y,
+                    icon_size,
+                    this_tab_fg,
+                )?;
             }
 
-            let raw_close_x = draw_tab_x
-                .saturating_add(tab_width)
-                .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
             let close_slot_reserved = !is_renaming_tab;
-            let close_view_left = draw_tab_x.max(tab_start);
-            let close_view_right = draw_tab_x.saturating_add(tab_width).min(max_tab_right);
-            let close_x = raw_close_x
-                .min(close_view_right.saturating_sub(button_size))
-                .max(close_view_left);
-            let show_close = close_slot_reserved
-                && (selected_tab || is_hovered)
-                && close_view_right.saturating_sub(close_view_left) >= button_size;
+            // The button slides to stay inside the tab's visible sliver, so a
+            // half-scrolled tab keeps a usable close target instead of letting
+            // it scroll off with the rest. The clamp is in the tab's own space
+            // and derived from its *true* origin: it used to be computed from
+            // an origin clamped to 0, which is what put the button on a
+            // neighbouring tab.
+            let view_left = (tab_start as f32 - tab_left).max(0.0);
+            let view_right = (max_tab_right as f32 - tab_left).min(tab_width as f32);
+            let close_x = (self.tab_close_button_x(tab_width, button_size, icon_size) as f32)
+                .min(view_right - button_size as f32)
+                .max(view_left)
+                .max(0.0) as usize;
+            let close_screen_x = tab_left + close_x as f32;
+            let close_hit_visible = view_right - view_left >= button_size as f32;
+            let close_hit_x = close_screen_x.max(0.0) as usize;
+            let show_close = close_slot_reserved && (selected_tab || is_hovered);
             if show_close {
-                let close_hovered =
-                    self.is_pointer_over_ui_rect(close_x, tab_y, button_size, button_size);
+                // Hover feedback follows the hit target, or a half-clipped
+                // button lights up and then passes the click through.
+                let close_hovered = close_hit_visible
+                    && self.is_pointer_over_ui_rect(close_hit_x, tab_y, button_size, button_size);
                 if close_hovered {
                     let hover_alpha = if self.is_pointer_pressing_ui_rect(
-                        close_x,
+                        close_hit_x,
                         tab_y,
                         button_size,
                         button_size,
@@ -508,17 +597,19 @@ impl crate::TermWindow {
                     )
                     .context("collapsed pane nav close hover")?;
                 }
-                self.ui_items.push(UIItem {
-                    x: close_x,
-                    y: tab_y,
-                    width: button_size,
-                    height: button_size,
-                    item_type: UIItemType::PaneNav {
-                        pane_id: pos.pane.pane_id(),
-                        pane_index: pos.index,
-                        action: PaneNavAction::Close(tab.pane_id),
-                    },
-                });
+                if close_hit_visible {
+                    self.ui_items.push(UIItem {
+                        x: close_hit_x,
+                        y: tab_y,
+                        width: button_size,
+                        height: button_size,
+                        item_type: UIItemType::PaneNav {
+                            pane_id: pos.pane.pane_id(),
+                            pane_index: pos.index,
+                            action: PaneNavAction::Close(tab.pane_id),
+                        },
+                    });
+                }
                 self.paint_pane_nav_icon(
                     layers,
                     SvgIcon::X,
@@ -536,20 +627,17 @@ impl crate::TermWindow {
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
             let text_x = title_icon_x + icon_size + self.ui_px(PANE_NAV_ICON_GAP);
             let text_right = if close_slot_reserved {
-                if show_close {
-                    close_x
-                } else {
-                    raw_close_x
-                }
+                // The tab's own close slot, not the slid-out position. Letting
+                // the title chase the slide collapsed `text_right` below
+                // `text_x` on a narrow sliver and dropped the title whole.
+                self.tab_close_button_x(tab_width, button_size, icon_size)
             } else {
-                draw_tab_x + tab_width - self.ui_px(PANE_NAV_INSET)
+                tab_width.saturating_sub(self.ui_px(TAB_CONTENT_INSET))
             };
-            let text_width = text_right
-                .min(max_tab_right)
-                .saturating_sub(text_x + self.ui_px(PANE_NAV_ICON_GAP));
+            let text_width = text_right.saturating_sub(text_x + self.ui_px(PANE_NAV_ICON_GAP));
             let text_y =
                 tab_y + ((tab_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2);
-            if text_x >= tab_start && text_x < max_tab_right && text_width > 0 {
+            if text_width > 0 {
                 let text_fg = if is_renaming_tab {
                     self.fill_rounded_rectangle(
                         layers,
@@ -572,7 +660,38 @@ impl crate::TermWindow {
                     layers, &ui_font, ui_metrics, title, text_x, text_y, text_width, text_fg,
                 )?;
             }
+
+            drop(content_layers);
+            content
+                .apply_to_clipped_at(
+                    out_layers,
+                    tab_left,
+                    0.0,
+                    QuadClipRect::from_top_left_pixels(
+                        tab_start as f32,
+                        tab_y as f32,
+                        max_tab_right as f32,
+                        (tab_y + tab_height) as f32,
+                        &self.dimensions,
+                    ),
+                    1.0,
+                )
+                .context("collapsed pane nav tab content")?;
         }
+
+        // Dissolve the strip into the bar wherever it runs on past its
+        // viewport, so a clipped tab reads as continuing rather than as one
+        // sliced in half.
+        self.paint_tab_row_fades(
+            layers,
+            chrome.sidebar_bg,
+            tab_y,
+            tab_height,
+            tab_start,
+            max_tab_right,
+            scroll_offset > 0.5,
+            scroll_offset < max_scroll - 0.5,
+        )?;
 
         Ok(strip_height)
     }
@@ -646,18 +765,11 @@ impl crate::TermWindow {
             },
         });
 
-        let icon_size = nav_height
-            .saturating_sub(self.ui_px(PANE_NAV_INSET) * 2)
-            .clamp(self.ui_px(20), self.ui_px(24));
-        let action_icon_size = icon_size
-            .saturating_add(self.ui_px(2))
-            .clamp(icon_size, self.ui_px(26));
-        let button_size = nav_height
-            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
-            .max(action_icon_size);
-        let button_y = pane_y as usize
-            + (nav_height.saturating_sub(button_size) / 2 + self.ui_px(PANE_NAV_TAB_TOP_OFFSET))
-                .min(nav_height.saturating_sub(button_size));
+        let (icon_size, action_icon_size, button_size) = self.pane_nav_button_metrics(nav_height);
+        // Centred, like the collapsed strip and the window tab row above. It
+        // used to carry a 4px downward nudge, which left 12px of air over the
+        // capsule and 4 under it — the row read as sagging.
+        let button_y = pane_y as usize + nav_height.saturating_sub(button_size) / 2;
         let mut button_x = (pane_x + pane_width) as usize;
         let mut actions = vec![
             (SvgIcon::Plus, PaneNavAction::NewTab),
@@ -698,15 +810,17 @@ impl crate::TermWindow {
 
         let tabs = Mux::get().pane_stack_tabs(pos.pane.pane_id());
         let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos.left);
-        let tab_width = self.window_tab_width_pixels().ceil() as usize;
-        let tab_step = tab_width + self.ui_px(PANE_NAV_TAB_GAP);
-        let total_tab_width = tabs.len().saturating_mul(tab_width).saturating_add(
-            tabs.len()
-                .saturating_sub(1)
-                .saturating_mul(self.ui_px(PANE_NAV_TAB_GAP)),
-        );
-        let max_tab_right = button_x.saturating_sub(self.ui_px(PANE_NAV_INSET));
-        let viewport_width = max_tab_right.saturating_sub(tab_start);
+        let tab_gap = self.ui_px(PANE_NAV_TAB_GAP);
+        let viewport_width = self.pane_nav_tab_viewport_width(pos) as usize;
+        let max_tab_right = tab_start.saturating_add(viewport_width);
+        let tab_width = self
+            .adaptive_tab_width(tabs.len(), viewport_width as f32, tab_gap as f32)
+            .ceil() as usize;
+        let tab_step = tab_width + tab_gap;
+        let total_tab_width = tabs
+            .len()
+            .saturating_mul(tab_width)
+            .saturating_add(tabs.len().saturating_sub(1).saturating_mul(tab_gap));
         let max_scroll = total_tab_width.saturating_sub(viewport_width) as f32;
         let scroll_offset = self
             .pane_nav_tab_scroll_offsets
@@ -761,16 +875,6 @@ impl crate::TermWindow {
             } else {
                 LinearRgba::TRANSPARENT
             };
-            self.fill_rounded_rectangle_with_border(
-                layers,
-                1,
-                euclid::rect(visible_left, tab_y as f32, visible_width, tab_height as f32),
-                tab_surface_color,
-                tab_border_color,
-                self.ui_f32(PANE_NAV_TAB_RADIUS),
-                CAPSULE_BORDER_WIDTH,
-            )
-            .context("pane nav tab surface")?;
             self.ui_items.push(UIItem {
                 x: visible_left.max(0.0) as usize,
                 y: tab_y,
@@ -783,8 +887,29 @@ impl crate::TermWindow {
                 },
             });
 
-            let draw_tab_x = tab_left.max(0.0) as usize;
-            let title_icon_x = draw_tab_x + self.ui_px(PANE_NAV_INSET);
+            // Reborrow: the surrounding loop cannot move the caller's `&mut`.
+            let out_layers = &mut *layers;
+            // Content rides in a heap and is replayed clipped to the strip's
+            // viewport, recorded in the tab's own space -- left edge at 0 --
+            // and shifted onto the strip on replay. See `paint_window_tab`.
+            let mut content = HeapQuadAllocator::default();
+            let mut content_layers = TripleLayerQuadAllocator::Heap(&mut content);
+            let layers = &mut content_layers;
+
+            self.paint_tab_capsule(
+                layers,
+                1,
+                tab_y,
+                tab_width,
+                tab_height,
+                self.ui_f32(PANE_NAV_TAB_RADIUS),
+                tab_surface_color,
+                tab_border_color,
+                selected_tab,
+            )
+            .context("pane nav tab surface")?;
+
+            let title_icon_x = self.ui_px(TAB_CONTENT_INSET);
             let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
             let raw_title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
             let (title, status) =
@@ -796,48 +921,52 @@ impl crate::TermWindow {
                 } else {
                     (raw_title.as_str(), None)
                 };
-            if title_icon_x >= tab_start && title_icon_x.saturating_add(icon_size) <= max_tab_right
-            {
-                if let Some(status) = status {
-                    self.paint_status_icon(
-                        layers,
-                        2,
-                        status,
-                        title_icon_x,
-                        title_icon_y,
-                        icon_size,
-                        this_tab_fg,
-                    )?;
-                } else {
-                    self.paint_pane_nav_icon(
-                        layers,
-                        SvgIcon::SquareTerminal,
-                        title_icon_x,
-                        title_icon_y,
-                        icon_size,
-                        this_tab_fg,
-                    )?;
-                }
+            if let Some(status) = status {
+                self.paint_status_icon(
+                    layers,
+                    2,
+                    status,
+                    title_icon_x,
+                    title_icon_y,
+                    icon_size,
+                    this_tab_fg,
+                )?;
+            } else {
+                self.paint_pane_nav_icon(
+                    layers,
+                    SvgIcon::SquareTerminal,
+                    title_icon_x,
+                    title_icon_y,
+                    icon_size,
+                    this_tab_fg,
+                )?;
             }
 
-            let raw_close_x = draw_tab_x
-                .saturating_add(tab_width)
-                .saturating_sub(button_size + self.ui_px(TAB_CLOSE_RIGHT_GAP));
             let close_slot_reserved = !is_renaming_tab;
-            let close_view_left = draw_tab_x.max(tab_start);
-            let close_view_right = draw_tab_x.saturating_add(tab_width).min(max_tab_right);
-            let close_x = raw_close_x
-                .min(close_view_right.saturating_sub(button_size))
-                .max(close_view_left);
-            let show_close = close_slot_reserved
-                && (selected_tab || is_hovered)
-                && close_view_right.saturating_sub(close_view_left) >= button_size;
+            // The button slides to stay inside the tab's visible sliver, so a
+            // half-scrolled tab keeps a usable close target instead of letting
+            // it scroll off with the rest. The clamp is in the tab's own space
+            // and derived from its *true* origin: it used to be computed from
+            // an origin clamped to 0, which is what put the button on a
+            // neighbouring tab.
+            let view_left = (tab_start as f32 - tab_left).max(0.0);
+            let view_right = (max_tab_right as f32 - tab_left).min(tab_width as f32);
+            let close_x = (self.tab_close_button_x(tab_width, button_size, icon_size) as f32)
+                .min(view_right - button_size as f32)
+                .max(view_left)
+                .max(0.0) as usize;
+            let close_screen_x = tab_left + close_x as f32;
+            let close_hit_visible = view_right - view_left >= button_size as f32;
+            let close_hit_x = close_screen_x.max(0.0) as usize;
+            let show_close = close_slot_reserved && (selected_tab || is_hovered);
             if show_close {
-                let close_hovered =
-                    self.is_pointer_over_ui_rect(close_x, tab_y, button_size, button_size);
+                // Hover feedback follows the hit target, or a half-clipped
+                // button lights up and then passes the click through.
+                let close_hovered = close_hit_visible
+                    && self.is_pointer_over_ui_rect(close_hit_x, tab_y, button_size, button_size);
                 if close_hovered {
                     let hover_alpha = if self.is_pointer_pressing_ui_rect(
-                        close_x,
+                        close_hit_x,
                         tab_y,
                         button_size,
                         button_size,
@@ -862,17 +991,19 @@ impl crate::TermWindow {
                     )
                     .context("pane nav close hover")?;
                 }
-                self.ui_items.push(UIItem {
-                    x: close_x,
-                    y: tab_y,
-                    width: button_size,
-                    height: button_size,
-                    item_type: UIItemType::PaneNav {
-                        pane_id: pos.pane.pane_id(),
-                        pane_index: pos.index,
-                        action: PaneNavAction::Close(tab.pane_id),
-                    },
-                });
+                if close_hit_visible {
+                    self.ui_items.push(UIItem {
+                        x: close_hit_x,
+                        y: tab_y,
+                        width: button_size,
+                        height: button_size,
+                        item_type: UIItemType::PaneNav {
+                            pane_id: pos.pane.pane_id(),
+                            pane_index: pos.index,
+                            action: PaneNavAction::Close(tab.pane_id),
+                        },
+                    });
+                }
                 self.paint_pane_nav_icon(
                     layers,
                     SvgIcon::X,
@@ -890,20 +1021,17 @@ impl crate::TermWindow {
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
             let text_x = title_icon_x + icon_size + self.ui_px(PANE_NAV_ICON_GAP);
             let text_right = if close_slot_reserved {
-                if show_close {
-                    close_x
-                } else {
-                    raw_close_x
-                }
+                // The tab's own close slot, not the slid-out position. Letting
+                // the title chase the slide collapsed `text_right` below
+                // `text_x` on a narrow sliver and dropped the title whole.
+                self.tab_close_button_x(tab_width, button_size, icon_size)
             } else {
-                draw_tab_x + tab_width - self.ui_px(PANE_NAV_INSET)
+                tab_width.saturating_sub(self.ui_px(TAB_CONTENT_INSET))
             };
-            let text_width = text_right
-                .min(max_tab_right)
-                .saturating_sub(text_x + self.ui_px(PANE_NAV_ICON_GAP));
+            let text_width = text_right.saturating_sub(text_x + self.ui_px(PANE_NAV_ICON_GAP));
             let text_y =
                 tab_y + ((tab_height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2);
-            if text_x >= tab_start && text_x < max_tab_right && text_width > 0 {
+            if text_width > 0 {
                 let text_fg = if is_renaming_tab {
                     self.fill_rounded_rectangle(
                         layers,
@@ -926,7 +1054,38 @@ impl crate::TermWindow {
                     layers, &ui_font, ui_metrics, title, text_x, text_y, text_width, text_fg,
                 )?;
             }
+
+            drop(content_layers);
+            content
+                .apply_to_clipped_at(
+                    out_layers,
+                    tab_left,
+                    0.0,
+                    QuadClipRect::from_top_left_pixels(
+                        tab_start as f32,
+                        tab_y as f32,
+                        max_tab_right as f32,
+                        (tab_y + tab_height) as f32,
+                        &self.dimensions,
+                    ),
+                    1.0,
+                )
+                .context("pane nav tab content")?;
         }
+
+        // Dissolve the strip into the bar wherever it runs on past its
+        // viewport, so a clipped tab reads as continuing rather than as one
+        // sliced in half.
+        self.paint_tab_row_fades(
+            layers,
+            background,
+            pane_y.max(0.0) as usize,
+            nav_height,
+            tab_start,
+            max_tab_right,
+            scroll_offset > 0.5,
+            scroll_offset < max_scroll - 0.5,
+        )?;
 
         Ok(nav_height)
     }

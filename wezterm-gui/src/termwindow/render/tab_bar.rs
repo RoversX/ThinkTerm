@@ -10,10 +10,8 @@ use wezterm_term::color::ColorAttribute;
 use window::color::LinearRgba;
 
 fn fancy_tab_bar_pixel_height(cell_height: usize, dpi: usize) -> usize {
-    let cell_height = cell_height.max(1);
-    // Keep a comfortable capsule while trimming a small amount of the
-    // vertical whitespace around the tab text.
-    cell_height * 2 + scale_ui_usize(WINDOW_TAB_TOP_SPACER, dpi)
+    crate::termwindow::ui::tokens::tab_row_height_for_cell(cell_height)
+        + scale_ui_usize(WINDOW_TAB_TOP_SPACER, dpi)
 }
 
 #[cfg(test)]
@@ -31,10 +29,10 @@ mod tests {
     #[test]
     fn fancy_height_keeps_compact_comfortable_proportion() {
         let dpi = if cfg!(target_os = "macos") { 144 } else { 192 };
-        assert_eq!(fancy_tab_bar_pixel_height(20, dpi), 44);
+        assert_eq!(fancy_tab_bar_pixel_height(20, dpi), 49);
         assert_eq!(
             fancy_tab_bar_pixel_height(30, dpi) - fancy_tab_bar_pixel_height(20, dpi),
-            20
+            22
         );
     }
 }

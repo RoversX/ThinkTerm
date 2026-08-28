@@ -8,7 +8,8 @@ use crate::termwindow::ui::platform_chrome;
 use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP, SIDEBAR_ROW_RADIUS, SIDEBAR_WIDTH_CELLS,
+    SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP, SIDEBAR_ROW_HIGHLIGHT_RADIUS,
+    SIDEBAR_ROW_RADIUS, SIDEBAR_WIDTH_CELLS,
     WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT, WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET,
     WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
     WINDOW_TAB_TOP_SPACER,
@@ -1710,18 +1711,26 @@ impl crate::TermWindow {
                     let is_selected =
                         self.is_workspace_sidebar_thread_selected(session, suppress_own_active);
                     if is_selected {
+                        let row_rect = euclid::rect(
+                            pinned_x as f32,
+                            y as f32,
+                            pinned_width as f32,
+                            session_row_height as f32,
+                        );
+                        self.paint_active_surface_shadow(
+                            layers,
+                            0,
+                            row_rect,
+                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                        )
+                        .context("sidebar selected pinned thread shadow")?;
                         self.fill_rounded_rectangle_with_border(
                             layers,
                             0,
-                            euclid::rect(
-                                pinned_x as f32,
-                                y as f32,
-                                pinned_width as f32,
-                                session_row_height as f32,
-                            ),
+                            row_rect,
                             selected_bg,
                             selected_border,
-                            self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
                             CAPSULE_BORDER_WIDTH,
                         )
                         .context("sidebar selected pinned thread")?;
@@ -1736,7 +1745,7 @@ impl crate::TermWindow {
                                 session_row_height as f32,
                             ),
                             chrome.sidebar_row_hover_bg,
-                            self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
                         )
                         .context("sidebar hovered pinned thread")?;
                     }
@@ -2131,18 +2140,26 @@ impl crate::TermWindow {
                         let is_selected =
                             self.is_workspace_sidebar_thread_selected(session, suppress_own_active);
                         if row_is_visible && is_selected {
+                            let row_rect = euclid::rect(
+                                session_x as f32,
+                                y as f32,
+                                session_width as f32,
+                                session_row_height as f32,
+                            );
+                            self.paint_active_surface_shadow(
+                                layers,
+                                0,
+                                row_rect,
+                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                            )
+                            .context("sidebar selected thread shadow")?;
                             self.fill_rounded_rectangle_with_border(
                                 layers,
                                 0,
-                                euclid::rect(
-                                    session_x as f32,
-                                    y as f32,
-                                    session_width as f32,
-                                    session_row_height as f32,
-                                ),
+                                row_rect,
                                 selected_bg,
                                 selected_border,
-                                self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
                                 CAPSULE_BORDER_WIDTH,
                             )
                             .context("sidebar selected thread")?;
@@ -2195,7 +2212,7 @@ impl crate::TermWindow {
                                         session_row_height as f32,
                                     ),
                                     chrome.sidebar_row_hover_bg,
-                                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                                    self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
                                 )
                                 .context("sidebar hovered thread")?;
                             }
@@ -2502,18 +2519,26 @@ impl crate::TermWindow {
                         let is_selected = self.is_workspace_sidebar_thread_selected(session, false);
                         let dimmed = reference.dangling || !reference.origin_domain_attached;
                         if is_selected {
+                            let row_rect = euclid::rect(
+                                session_x as f32,
+                                y as f32,
+                                session_width as f32,
+                                session_row_height as f32,
+                            );
+                            self.paint_active_surface_shadow(
+                                layers,
+                                0,
+                                row_rect,
+                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                            )
+                            .context("sidebar selected thread ref shadow")?;
                             self.fill_rounded_rectangle_with_border(
                                 layers,
                                 0,
-                                euclid::rect(
-                                    session_x as f32,
-                                    y as f32,
-                                    session_width as f32,
-                                    session_row_height as f32,
-                                ),
+                                row_rect,
                                 selected_bg,
                                 selected_border,
-                                self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
                                 CAPSULE_BORDER_WIDTH,
                             )
                             .context("sidebar selected thread ref")?;
@@ -2528,7 +2553,7 @@ impl crate::TermWindow {
                                     session_row_height as f32,
                                 ),
                                 chrome.sidebar_row_hover_bg,
-                                self.ui_f32(SIDEBAR_ROW_RADIUS) + 2.0,
+                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
                             )
                             .context("sidebar hovered thread ref")?;
                         }
@@ -3279,6 +3304,32 @@ impl crate::TermWindow {
         round_top: bool,
         round_bottom: bool,
     ) -> anyhow::Result<()> {
+        self.fill_rounded_rectangle_corners(
+            layers,
+            layer_num,
+            rect,
+            color,
+            radius,
+            RoundedCorners::vertical(round_top, round_bottom),
+        )
+    }
+
+    /// Fill a rectangle rounding only the corners `corners` names.
+    ///
+    /// A surface clipped by a viewport passes the flags for the edges that are
+    /// really its own: the cut edge then comes out square, so a half-scrolled
+    /// tab reads as running under the boundary instead of as a genuinely
+    /// narrower tab.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fill_rounded_rectangle_corners(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        color: LinearRgba,
+        radius: f32,
+        corners: RoundedCorners,
+    ) -> anyhow::Result<()> {
         let radius = snapped_rounded_corner_radius(rect, radius);
         // Sub-pixel radii round down to a 0px corner sprite (which panics when
         // building its pixmap), so fall back to a plain rectangle below ~1px.
@@ -3288,75 +3339,51 @@ impl crate::TermWindow {
         }
 
         let corner_size = euclid::size2(radius, radius);
-        if round_top {
-            self.poly_quad(
-                layers,
-                layer_num,
-                euclid::point2(rect.min_x(), rect.min_y()),
+        for (rounded, sprite, x, y) in [
+            (
+                corners.top_left,
                 TOP_LEFT_ROUNDED_CORNER,
-                0,
-                corner_size,
-                color,
-            )?
-            .set_grayscale();
-            self.poly_quad(
-                layers,
-                layer_num,
-                euclid::point2(rect.max_x() - radius, rect.min_y()),
+                rect.min_x(),
+                rect.min_y(),
+            ),
+            (
+                corners.top_right,
                 TOP_RIGHT_ROUNDED_CORNER,
-                0,
-                corner_size,
-                color,
-            )?
-            .set_grayscale();
-        } else {
-            self.filled_rectangle(
-                layers,
-                layer_num,
-                euclid::rect(rect.min_x(), rect.min_y(), radius, radius),
-                color,
-            )?;
-            self.filled_rectangle(
-                layers,
-                layer_num,
-                euclid::rect(rect.max_x() - radius, rect.min_y(), radius, radius),
-                color,
-            )?;
-        }
-        if round_bottom {
-            self.poly_quad(
-                layers,
-                layer_num,
-                euclid::point2(rect.min_x(), rect.max_y() - radius),
+                rect.max_x() - radius,
+                rect.min_y(),
+            ),
+            (
+                corners.bottom_left,
                 BOTTOM_LEFT_ROUNDED_CORNER,
-                0,
-                corner_size,
-                color,
-            )?
-            .set_grayscale();
-            self.poly_quad(
-                layers,
-                layer_num,
-                euclid::point2(rect.max_x() - radius, rect.max_y() - radius),
+                rect.min_x(),
+                rect.max_y() - radius,
+            ),
+            (
+                corners.bottom_right,
                 BOTTOM_RIGHT_ROUNDED_CORNER,
-                0,
-                corner_size,
-                color,
-            )?
-            .set_grayscale();
-        } else {
-            self.filled_rectangle(
-                layers,
-                layer_num,
-                euclid::rect(rect.min_x(), rect.max_y() - radius, radius, radius),
-                color,
-            )?;
-            self.filled_rectangle(
-                layers,
-                layer_num,
-                euclid::rect(rect.max_x() - radius, rect.max_y() - radius, radius, radius),
-                color,
-            )?;
+                rect.max_x() - radius,
+                rect.max_y() - radius,
+            ),
+        ] {
+            if rounded {
+                self.poly_quad(
+                    layers,
+                    layer_num,
+                    euclid::point2(x, y),
+                    sprite,
+                    0,
+                    corner_size,
+                    color,
+                )?
+                .set_grayscale();
+            } else {
+                self.filled_rectangle(
+                    layers,
+                    layer_num,
+                    euclid::rect(x, y, radius, radius),
+                    color,
+                )?;
+            }
         }
 
         self.filled_rectangle(
@@ -3646,6 +3673,33 @@ fn ellipsize_cut_byte(glyphs: &[(f32, usize)], text_len: usize, budget: f32) -> 
 /// Corner sprites are cached at integral physical-pixel sizes. Keep the quad
 /// geometry on that same grid so fractional radii cannot expose the joins
 /// between the four corners and the center rectangles on 1x displays.
+/// Which corners of a rounded rectangle actually get rounded.
+///
+/// A scrollable surface keeps the corners of its real edges and leaves a
+/// viewport-created cut edge square. (A surface cut *horizontally* does not
+/// need this: it is recorded at full width and clipped on replay, which both
+/// gives the cut a hard edge and keeps the radius the one the full shape would
+/// have had — see `paint_tab_capsule`.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RoundedCorners {
+    pub top_left: bool,
+    pub top_right: bool,
+    pub bottom_left: bool,
+    pub bottom_right: bool,
+}
+
+impl RoundedCorners {
+    pub(crate) fn vertical(round_top: bool, round_bottom: bool) -> Self {
+        Self {
+            top_left: round_top,
+            top_right: round_top,
+            bottom_left: round_bottom,
+            bottom_right: round_bottom,
+        }
+    }
+
+}
+
 fn snapped_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
     radius
         .min(rect.width() / 2.0)
