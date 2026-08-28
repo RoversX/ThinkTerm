@@ -639,6 +639,10 @@ pub enum KeyAssignment {
     OpenSshHosts,
     ToggleLiveOverview,
     ActivateCommandPalette,
+    /// Switch this window's color scheme. `None` reverts to the configured
+    /// default. Applied through the window's config_overrides, the same
+    /// mechanism as window:set_config_overrides.
+    SetColorScheme(Option<String>),
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),

@@ -807,6 +807,31 @@ impl super::TermWindow {
             self.schedule_next_status_update();
         }
 
+        // While the command palette is open no physical-key binding may fire
+        // behind it. Placed after the modifier/LED bookkeeping so status-line
+        // state stays current; not marking the event handled lets the cooked
+        // KeyEvent still arrive, where the palette's dispatch consumes it.
+        if self.command_palette.is_some() {
+            return;
+        }
+        // The Settings-picked palette hotkey must also beat the RAW binding
+        // lookup: ⌘K's stock clear-scrollback binding would otherwise fire
+        // here, mark the event handled, and the cooked interception below
+        // would never see the chord. Swallow the raw form; the cooked
+        // KeyEvent that follows performs the toggle.
+        if key.key_is_down {
+            let cooked_key = match &key.key {
+                ::window::KeyCode::Physical(phys) => phys.to_key_code(),
+                other => other.clone(),
+            };
+            if crate::termwindow::ui::command_palette::settings_hotkey_matches(
+                &cooked_key,
+                key.modifiers.remove_positional_mods(),
+            ) {
+                return;
+            }
+        }
+
         let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
         let pane = self.get_active_pane_or_overlay();
         stage.finish(pane.is_some());
@@ -1006,6 +1031,61 @@ impl super::TermWindow {
             return;
         }
         if self.handle_inline_tab_rename_key(&window_key, context) {
+            return;
+        }
+        // The command palette owns the keyboard outright while open: keys
+        // route to it before the keymap, and nothing leaks to the pane. This
+        // sits before the pane.is_none() early-return so the palette still
+        // works while a content view holds the foreground.
+        if self.command_palette.is_some() {
+            if window_key.key_is_down {
+                let mods = window_key.modifiers.remove_positional_mods();
+                // The Settings-picked hotkey closes the open palette too.
+                if crate::termwindow::ui::command_palette::settings_hotkey_matches(
+                    &window_key.key,
+                    mods,
+                ) {
+                    self.toggle_command_palette();
+                    context.invalidate();
+                    return;
+                }
+                // Whatever chord the user has bound to ActivateCommandPalette
+                // toggles it closed — the palette's own dispatch only knows
+                // the default chords, so a rebound key would otherwise open a
+                // palette it can never close.
+                if let Some(entry) = self.input_map.lookup_key(&window_key.key, mods, None) {
+                    if matches!(
+                        entry.action,
+                        config::keyassignment::KeyAssignment::ActivateCommandPalette
+                    ) {
+                        self.toggle_command_palette();
+                        context.invalidate();
+                        return;
+                    }
+                }
+                match self.win_key_code_to_termwiz_key_code(&window_key.key) {
+                    Key::Code(key) => {
+                        self.command_palette_key(key, mods, context);
+                    }
+                    Key::Composed(text) => {
+                        self.command_palette_text(&text, context);
+                    }
+                    Key::None => {}
+                }
+            }
+            return;
+        }
+        // A non-default palette hotkey picked in Settings opens it from
+        // here, ahead of the keymap — that precedence is what lets ⌘K win
+        // over its stock clear-scrollback binding.
+        if window_key.key_is_down
+            && crate::termwindow::ui::command_palette::settings_hotkey_matches(
+                &window_key.key,
+                window_key.modifiers.remove_positional_mods(),
+            )
+        {
+            self.toggle_command_palette();
+            context.invalidate();
             return;
         }
         let mut input_trace = crate::input_diagnostics::KeyEventTrace::begin(

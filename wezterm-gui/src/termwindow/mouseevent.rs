@@ -1466,6 +1466,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
+            | UIItemType::CommandPalette
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -1584,6 +1585,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
+            | UIItemType::CommandPalette
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -1751,9 +1753,21 @@ impl super::TermWindow {
         }
 
         self.current_mouse_event.replace(event.clone());
-        self.update_workspace_sidebar_hover(context);
+        // Not while the command palette's scrim covers the window: the
+        // hover-reveal machinery would slide the sidebar out underneath it.
+        if self.command_palette.is_none() {
+            self.update_workspace_sidebar_hover(context);
+        }
 
         if self.consume_context_menu_suppressed_release(&event) {
+            self.release_pointer_ownership(&event);
+            return;
+        }
+
+        // The command palette owns all pointer traffic while open. Dispatched
+        // before the pane-dependent context-menu branch so it also works when
+        // there is no active pane (content view foreground).
+        if self.mouse_event_command_palette(&event, context) {
             self.release_pointer_ownership(&event);
             return;
         }
@@ -2615,7 +2629,9 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarScrollThumb => {
                 self.drag_workspace_sidebar_scroll_thumb(item, start_event, event, context);
             }
-            UIItemType::ContextMenuBackdrop | UIItemType::ContextMenuItem(_) => {}
+            UIItemType::ContextMenuBackdrop
+            | UIItemType::ContextMenuItem(_)
+            | UIItemType::CommandPalette => {}
             UIItemType::PaneNav { .. } => {
                 self.drag_pane_nav_tab(item, start_event, event, context);
             }
@@ -3648,7 +3664,7 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarNotifications => {
                 self.mouse_event_workspace_sidebar_notifications(item.clone(), event, context);
             }
-            UIItemType::ContextMenuBackdrop => {
+            UIItemType::ContextMenuBackdrop | UIItemType::CommandPalette => {
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::ContextMenuItem(_) => {
@@ -4175,7 +4191,7 @@ impl super::TermWindow {
                     self.request_close_content_view_by_id(id);
                 }
             }
-            UIItemType::ContextMenuBackdrop => {
+            UIItemType::ContextMenuBackdrop | UIItemType::CommandPalette => {
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::ContextMenuItem(_) => {

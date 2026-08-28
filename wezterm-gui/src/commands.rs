@@ -2290,10 +2290,33 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         ActivateCommandPalette => CommandDef {
             brief: "Activate Command Palette".into(),
             doc: "Shows the command palette modal".into(),
-            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "p".into())],
+            keys: vec![
+                (Modifiers::CTRL.union(Modifiers::SHIFT), "p".into()),
+                // macOS gets the native chord too. Declared alongside rather
+                // than as SUPER|SHIFT everywhere: permute_keys synthesizes
+                // CTRL|SHIFT variants only from a bare SUPER binding (its
+                // SHIFT branch merely adds the shifted-keycap form), so
+                // replacing the entry would drop CTRL+SHIFT+P on
+                // Linux/Windows where SUPER belongs to the window manager.
+                #[cfg(target_os = "macos")]
+                (Modifiers::SUPER.union(Modifiers::SHIFT), "p".into()),
+            ],
             args: &[ArgType::ActivePane],
             menubar: &["Edit"],
             icon: None,
+        },
+        SetColorScheme(name) => CommandDef {
+            brief: match name {
+                Some(name) => format!("Set color scheme: {name}").into(),
+                None => "Use configured color scheme".into(),
+            },
+            doc: "Change the terminal color scheme for this window".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            // Deliberately absent from the menubar: the palette enumerates
+            // ~1000 schemes through this action and none belong in a menu.
+            menubar: &[],
+            icon: Some("md_palette"),
         },
     })
 }
