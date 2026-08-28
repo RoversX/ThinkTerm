@@ -158,6 +158,7 @@ pub mod onboarding;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
+pub(crate) mod project_root_view;
 pub(crate) mod remote_files;
 pub mod remote_thread_view;
 pub(crate) mod remote_walk;
@@ -248,6 +249,13 @@ pub(crate) struct MoshConnectState {
 /// Latest local Thread activation started by this window. Detached
 /// materialization tasks may finish out of order; only the generation that
 /// still matches this complete identity may change the visible workspace.
+pub(crate) struct LocalThreadActivationState {
+    pub generation: u64,
+    pub thread_id: String,
+    pub space_id: String,
+    pub workspace_name: String,
+}
+
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
@@ -2086,6 +2094,8 @@ pub struct TermWindow {
     /// Tracks Mosh bootstraps kicked off by `RemoteThreadView`s.
     mosh_connects: HashMap<ContentViewId, MoshConnectState>,
     next_mosh_connect_generation: u64,
+    local_thread_activation: Option<LocalThreadActivationState>,
+    next_local_thread_activation_generation: u64,
     space_owner_id: u64,
     active_space_id: String,
     /// True for windows the user did not explicitly open (domain-owned
@@ -3133,6 +3143,8 @@ impl TermWindow {
             next_remote_connect_generation: 1,
             mosh_connects: HashMap::new(),
             next_mosh_connect_generation: 1,
+            local_thread_activation: None,
+            next_local_thread_activation_generation: 1,
             space_owner_id,
             active_space_id,
             dies_with_mux_window,
@@ -3453,7 +3465,14 @@ impl TermWindow {
                 term_window.frontend_recovery_slot(),
             )
         };
-        front_end().record_known_window(window, adopted_mux_window_id, recovery_slot);
+        front_end().record_known_window(window.clone(), adopted_mux_window_id, recovery_slot);
+
+        // A Project directory refused before this window existed has been
+        // waiting for somewhere to be shown; this is the first moment there is
+        // one.
+        window.notify(TermWindowNotif::Apply(Box::new(|tw| {
+            tw.show_pending_project_root_problem()
+        })));
 
         Ok(())
     }

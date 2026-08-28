@@ -658,6 +658,8 @@ lazy_static::lazy_static! {
     static ref WINDOW_SPACES: Mutex<HashMap<u64, SpaceId>> = Mutex::new(HashMap::new());
     static ref MATERIALIZING_LAYOUT_WORKSPACES: Mutex<HashMap<String, usize>> =
         Mutex::new(HashMap::new());
+    static ref DENIED_PROJECT_FALLBACKS: Mutex<DeniedProjectFallbackRepairs> =
+        Mutex::new(DeniedProjectFallbackRepairs::default());
     /// Workspaces whose saved layout this build could not decode. They opened
     /// as a single terminal, so snapshotting them would write that one pane
     /// over the arrangement we failed to read — turning a version skew into
@@ -2244,6 +2246,72 @@ pub fn thread_connection_state(
     store.thread_connection_state(thread_id, live_workspaces)
 }
 
+/// Workspaces that exist only because their Project directory was refused at
+/// startup and got the lenient `$HOME` fallback. Recording them lets the next
+/// deliberate open add the terminal that was actually asked for. Session-
+/// scoped: the fallback does not outlive the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeniedProjectFallbackState {
+    Pending,
+    Repairing,
+}
+
+#[derive(Debug, Default)]
+struct DeniedProjectFallbackRepairs {
+    states: HashMap<String, DeniedProjectFallbackState>,
+}
+
+impl DeniedProjectFallbackRepairs {
+    fn mark(&mut self, workspace: String) {
+        self.states
+            .entry(workspace)
+            .or_insert(DeniedProjectFallbackState::Pending);
+    }
+
+    fn begin(&mut self, workspace: &str) -> bool {
+        let Some(state) = self.states.get_mut(workspace) else {
+            return false;
+        };
+        if *state != DeniedProjectFallbackState::Pending {
+            return false;
+        }
+        *state = DeniedProjectFallbackState::Repairing;
+        true
+    }
+
+    fn complete(&mut self, workspace: &str) {
+        if self.states.get(workspace) == Some(&DeniedProjectFallbackState::Repairing) {
+            self.states.remove(workspace);
+        }
+    }
+
+    fn retry(&mut self, workspace: &str) {
+        if let Some(state @ DeniedProjectFallbackState::Repairing) = self.states.get_mut(workspace)
+        {
+            *state = DeniedProjectFallbackState::Pending;
+        }
+    }
+}
+
+pub(crate) fn mark_denied_project_fallback(workspace: String) {
+    DENIED_PROJECT_FALLBACKS.lock().mark(workspace);
+}
+
+/// Claim the one repair attempt allowed for a fallback workspace.
+pub(crate) fn begin_denied_project_fallback_repair(workspace: &str) -> bool {
+    DENIED_PROJECT_FALLBACKS.lock().begin(workspace)
+}
+
+/// Remove the fallback note only after its Project terminal exists.
+pub(crate) fn complete_denied_project_fallback_repair(workspace: &str) {
+    DENIED_PROJECT_FALLBACKS.lock().complete(workspace);
+}
+
+/// Make a failed or cancelled repair eligible for the next deliberate open.
+pub(crate) fn retry_denied_project_fallback_repair(workspace: &str) {
+    DENIED_PROJECT_FALLBACKS.lock().retry(workspace);
+}
+
 pub fn thread_space_id(thread_id: &str) -> Option<SpaceId> {
     let store = THREAD_STORE.lock();
     store.thread_space_id(thread_id)
@@ -2599,6 +2667,45 @@ impl Drop for MaterializeThreadLayoutGuard {
     }
 }
 
+/// Owns every mux window created by one saved-layout restore until the layout
+/// is complete. Dropping an unfinished future is an error path too, so this is
+/// RAII rather than cleanup at the handful of current `?` sites.
+struct MaterializeWindowsRollback {
+    window_ids: Vec<MuxWindowId>,
+    cleanup: Option<Box<dyn FnMut(MuxWindowId)>>,
+}
+
+impl MaterializeWindowsRollback {
+    fn new(cleanup: impl FnMut(MuxWindowId) + 'static) -> Self {
+        Self {
+            window_ids: Vec::new(),
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+
+    fn record(&mut self, window_id: MuxWindowId) {
+        if !self.window_ids.contains(&window_id) {
+            self.window_ids.push(window_id);
+        }
+    }
+
+    fn commit(mut self) {
+        self.window_ids.clear();
+        self.cleanup = None;
+    }
+}
+
+impl Drop for MaterializeWindowsRollback {
+    fn drop(&mut self) {
+        let Some(cleanup) = self.cleanup.as_mut() else {
+            return;
+        };
+        for window_id in self.window_ids.drain(..) {
+            cleanup(window_id);
+        }
+    }
+}
+
 pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
     space_id: &str,
     workspace: &str,
@@ -2690,7 +2797,15 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
     }
 }
 
-pub async fn materialize_thread(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadMaterializationOutcome {
+    AlreadyLive,
+    RemoteEnsured,
+    RestoredLayout,
+    SpawnedFresh,
+}
+
+pub(crate) async fn materialize_thread(
     workspace_name: String,
     layout: Option<WorkspaceThreadLayoutSnapshot>,
     initial_cwd: Option<String>,
@@ -2698,10 +2813,14 @@ pub async fn materialize_thread(
     src_window_id: Option<MuxWindowId>,
     term_config: Arc<dyn TerminalConfiguration>,
     default_domain: SpawnTabDomain,
-) -> Result<()> {
+    // Whether an unavailable Project directory should fail this call. App
+    // startup passes `true` then retries with `false`: it builds the window
+    // *from* this materialization, and no window is worse than the wrong cwd.
+    strict_project_cwd: bool,
+) -> Result<ThreadMaterializationOutcome> {
     let mux = Mux::get();
     if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
-        return Ok(());
+        return Ok(ThreadMaterializationOutcome::AlreadyLive);
     }
 
     // A remote mux owns both its ThinkTerm tree and terminal topology.  Use
@@ -2736,8 +2855,70 @@ pub async fn materialize_thread(
                         workspace_name
                     );
                 }
-                return Ok(());
+                return Ok(ThreadMaterializationOutcome::RemoteEnsured);
             }
+        }
+    }
+
+    // Refuse to open a Thread whose Project directory cannot be read, before
+    // anything is materialized. Not the same check as `require_cwd` below:
+    // that flag guards a fresh spawn's directory, while this probe catches a
+    // layout an earlier silent fallback already poisoned with `$HOME` --
+    // which spawns fine and would never trip the flag. Inherited/OSC cwds
+    // never opt into the strict path.
+    //
+    // Gated on the local domain as a positive test: a mux/SSH Thread passes
+    // its *remote* project path, and stat-ing that here answers a question
+    // about the wrong host.
+    // `is_plain_local()`, not "is a LocalDomain": WSL, exec and serial domains
+    // are all `LocalDomain`s whose cwd is interpreted inside a distribution or
+    // container, and stat-ing the HOST path for them answers a question about
+    // the wrong filesystem -- a host-side refusal would block a Thread that
+    // works fine where it actually runs.
+    // Evaluated only when strictness is wanted: on Windows `is_plain_local()`
+    // shells out to `wsl.exe -l -v`, and the lenient retry does not need the
+    // answer. `is_plain_local()`, not "is a LocalDomain": WSL/exec/serial are
+    // `LocalDomain`s whose cwd lives on another filesystem.
+    let strict_cwd = if strict_project_cwd && initial_cwd.is_some() {
+        let domain = mux.resolve_spawn_tab_domain(None, &default_domain).ok();
+        // On a worker with the probe below, not before it. On Windows
+        // `is_plain_local()` resolves the WSL domain list, which shells out to
+        // an uncached `wsl.exe -l -v`; on the window-thread executor that
+        // freezes the UI for the subprocess on every cold materialization.
+        promise::spawn::spawn_into_new_thread(move || {
+            Ok(domain.is_some_and(|domain| {
+                domain
+                    .downcast_ref::<mux::domain::LocalDomain>()
+                    .is_some_and(mux::domain::LocalDomain::is_plain_local)
+            }))
+        })
+        .await
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    if let Some(cwd) = initial_cwd.as_deref().filter(|_| strict_cwd) {
+        // On a worker: this runs on the window thread's executor, and a
+        // Project on a stalled network mount must not freeze the GUI for the
+        // mount timeout -- the same rule the sidebar's directory reads follow.
+        let probe_cwd = cwd.to_string();
+        let unavailable = promise::spawn::spawn_into_new_thread(move || {
+            Ok(match std::fs::read_dir(&probe_cwd) {
+                Err(err) => Some(
+                    crate::termwindow::ui::folder_problem::ProjectRootUnavailable::from_io(
+                        probe_cwd.clone(),
+                        &err,
+                    ),
+                ),
+                Ok(_) => None,
+            })
+        })
+        .await
+        // The worker failing says nothing about the folder; let the spawn
+        // proceed and the require_cwd backstop below decide.
+        .unwrap_or(None);
+        if let Some(failure) = unavailable {
+            return Err(anyhow::Error::new(failure));
         }
     }
 
@@ -2763,7 +2944,8 @@ pub async fn materialize_thread(
             size,
             term_config,
         )
-        .await
+        .await?;
+        Ok(ThreadMaterializationOutcome::RestoredLayout)
     } else {
         // A thread whose Space lives on a mux server needs its window tagged
         // with that domain. `spawn_tab_or_window` makes untagged windows, and
@@ -2803,11 +2985,23 @@ pub async fn materialize_thread(
             );
         }
 
+        // Ask for the Project directory rather than merely preferring it:
+        // the probe above only speaks for the moment it ran, and this closes
+        // the gap to the actual spawn. `Some(new_default_prog())` behaves
+        // identically to the `None` it replaces in `build_command` (verified:
+        // the arms only differ on a `default_cwd` fallback this branch, which
+        // always sets a cwd, can never reach).
+        let command = initial_cwd.as_ref().filter(|_| strict_cwd).map(|_| {
+            let mut command = CommandBuilder::new_default_prog();
+            command.set_require_cwd(true);
+            command
+        });
+
         let spawned = mux
             .spawn_tab_or_window(
                 window_id,
                 default_domain,
-                None,
+                command,
                 initial_cwd,
                 size,
                 None,
@@ -2820,7 +3014,7 @@ pub async fn materialize_thread(
         let (_tab, pane, _window_id) = spawned.context("spawn default thread window")?;
         pane.set_config(term_config);
         let _ = src_window_id;
-        Ok(())
+        Ok(ThreadMaterializationOutcome::SpawnedFresh)
     }
 }
 
@@ -2892,6 +3086,33 @@ pub fn thread_layout(thread_id: &str) -> Option<WorkspaceThreadLayoutSnapshot> {
         .flat_map(|project| project.threads.iter())
         .find(|session| session.id == thread_id)
         .and_then(|session| session.layout.clone())
+}
+
+/// "Project \u{b7} Thread", matching [`thread_display_name_for_workspace`] so a
+/// Thread is named the same way wherever it appears -- including collapsing
+/// the case where the two names are equal, which would otherwise render as
+/// "Foo \u{b7} Foo" on this one surface. Takes the store lock once.
+pub fn thread_display_name(project_id: &str, thread_id: &str) -> String {
+    let store = THREAD_STORE.lock();
+    let project = store
+        .projects
+        .iter()
+        .find(|project| project.id == project_id);
+    let thread_name = project
+        .and_then(|project| project.threads.iter().find(|thread| thread.id == thread_id))
+        .map(|thread| thread.name.clone());
+    let project_name = project.map(|project| project.name.clone());
+    match (project_name, thread_name) {
+        (Some(project), Some(thread)) => {
+            if project.is_empty() || project == thread {
+                thread
+            } else {
+                format!("{project} \u{b7} {thread}")
+            }
+        }
+        (Some(name), None) | (None, Some(name)) => name,
+        (None, None) => thread_id.to_string(),
+    }
 }
 
 pub fn thread_name(thread_id: &str) -> Option<String> {
@@ -7518,6 +7739,9 @@ async fn materialize_layout(
     size: TerminalSize,
     term_config: Arc<dyn TerminalConfiguration>,
 ) -> Result<()> {
+    let rollback_mux = Arc::clone(&mux);
+    let mut rollback =
+        MaterializeWindowsRollback::new(move |window_id| rollback_mux.kill_window(window_id));
     let terminal_specs = layout
         .terminal_specs
         .iter()
@@ -7527,9 +7751,27 @@ async fn materialize_layout(
     let mut spawned_tabs = 0usize;
     for node in &tabs {
         let first_entry = first_pane_entry(node);
-        let cwd = first_entry
-            .and_then(|entry| working_dir_for_entry(entry, &terminal_specs))
-            .or_else(|| initial_cwd.clone());
+        let saved_cwd = first_entry.and_then(|entry| working_dir_for_entry(entry, &terminal_specs));
+        // Only a tab starting in the Project directory is strict. A pane's
+        // own saved cwd is inherited state and keeps the long-standing
+        // fallback; the Project directory was asked for by name, and
+        // silently substituting `$HOME` for it is the defect this removes.
+        let uses_project_root = match (&saved_cwd, &initial_cwd) {
+            // No saved cwd: this tab is being started in the Project root.
+            (None, Some(_)) => true,
+            // A saved cwd that IS the Project root -- the ordinary case for a
+            // healthy Thread. It must carry the backstop as well, or the race
+            // the backstop exists to close is open on exactly the Threads that
+            // were never broken.
+            (Some(saved), Some(root)) => saved == root,
+            _ => false,
+        };
+        let cwd = saved_cwd.or_else(|| initial_cwd.clone());
+        let command = uses_project_root.then(|| {
+            let mut command = CommandBuilder::new_default_prog();
+            command.set_require_cwd(true);
+            command
+        });
         let domain = first_entry
             .map(|entry| spawn_domain_for_entry(&mux, entry, &terminal_specs, true))
             .unwrap_or(SpawnTabDomain::DefaultDomain);
@@ -7537,7 +7779,7 @@ async fn materialize_layout(
             .spawn_tab_or_window(
                 window_id,
                 domain,
-                None,
+                command,
                 cwd,
                 node.root_size().unwrap_or(size),
                 None,
@@ -7546,6 +7788,7 @@ async fn materialize_layout(
             )
             .await
             .context("spawn thread tab")?;
+        rollback.record(win_id);
         pane.set_config(Arc::clone(&term_config));
         window_id = Some(win_id);
         restore_node(
@@ -7567,6 +7810,7 @@ async fn materialize_layout(
         }
     }
 
+    rollback.commit();
     Ok(())
 }
 
@@ -8482,6 +8726,59 @@ fn now_ts() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denied_project_fallback_is_cleared_only_after_a_successful_repair() {
+        let mut repairs = DeniedProjectFallbackRepairs::default();
+        repairs.mark("workspace-a".to_string());
+
+        assert!(repairs.begin("workspace-a"));
+        assert!(
+            !repairs.begin("workspace-a"),
+            "a repair already in flight must not be duplicated"
+        );
+
+        repairs.retry("workspace-a");
+        assert!(
+            repairs.begin("workspace-a"),
+            "a failed repair must remain eligible for retry"
+        );
+
+        repairs.complete("workspace-a");
+        assert!(
+            !repairs.begin("workspace-a"),
+            "only a successful repair removes the fallback note"
+        );
+    }
+
+    #[test]
+    fn layout_window_rollback_cleans_every_uncommitted_window() {
+        let cleaned = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let observed = std::rc::Rc::clone(&cleaned);
+            let mut rollback = MaterializeWindowsRollback::new(move |window_id| {
+                observed.borrow_mut().push(window_id);
+            });
+            rollback.record(17);
+            rollback.record(17);
+            rollback.record(18);
+        }
+        assert_eq!(&*cleaned.borrow(), &[17, 18]);
+
+        cleaned.borrow_mut().clear();
+        {
+            let observed = std::rc::Rc::clone(&cleaned);
+            let mut rollback = MaterializeWindowsRollback::new(move |window_id| {
+                observed.borrow_mut().push(window_id);
+            });
+            rollback.record(19);
+            rollback.commit();
+        }
+        assert!(
+            cleaned.borrow().is_empty(),
+            "a committed layout must keep its mux window"
+        );
+    }
 
     #[test]
     fn window_owner_lookup_tracks_claims_without_changing_them() {

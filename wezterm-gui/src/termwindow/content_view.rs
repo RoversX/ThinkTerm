@@ -345,6 +345,23 @@ pub(crate) enum RemoteConnectPhase {
     Failed { message: String },
 }
 
+/// Result of re-checking a Project directory that a content view reported as
+/// unusable, pushed by the owning `TermWindow` once the probe comes back off
+/// the worker thread. Only the project-root view consumes it.
+#[derive(Clone, Debug)]
+pub(crate) enum ProjectRootProbe {
+    /// The directory lists again: the user granted the access, remounted the
+    /// volume, or put the folder back.
+    Available,
+    /// Still unusable, with a freshly classified reason -- which may differ
+    /// from the original one.
+    Blocked(crate::termwindow::ui::folder_problem::ProjectRootUnavailable),
+    /// The user picked some *other* folder in the re-authorization panel;
+    /// the Project is never repointed on the strength of that, the view just
+    /// says what happened.
+    OtherFolderChosen,
+}
+
 /// What `TermWindow` should do after a content view handled an input event.
 pub(crate) enum ContentViewResponse {
     /// Event not consumed by the view.
@@ -414,6 +431,28 @@ pub(crate) trait ContentView {
     /// Push SSH connection progress into a view that initiated a connection.
     /// Default is a no-op; only the remote-thread view reacts.
     fn on_remote_connect_phase(&mut self, _phase: RemoteConnectPhase) {}
+
+    /// Gate a re-authorization round trip for the project-root page and
+    /// report whether it may start. Default is a no-op refusal; only the
+    /// project-root view participates.
+    fn begin_project_root_reauthorize(&mut self) -> bool {
+        false
+    }
+
+    /// Push the outcome of that round trip back into the view that asked.
+    fn on_project_root_reauthorize(&mut self, _outcome: ProjectRootProbe) {}
+
+    /// Re-point an existing project-root page at a newer refusal, instead of
+    /// opening a second page for the same Thread. Returns false for any other
+    /// view type.
+    fn replace_project_root_problem(
+        &mut self,
+        _space_id: String,
+        _display_name: String,
+        _failure: crate::termwindow::ui::folder_problem::ProjectRootUnavailable,
+    ) -> bool {
+        false
+    }
 
     /// Whether the view currently wants the cursor-blink animation running
     /// (true only while a text field is focused, to avoid needless repaints).

@@ -49,6 +49,40 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
 
+/// Returns an in-flight startup-fallback repair to the pending state if its
+/// detached future is cancelled before it can report an outcome.
+struct DeniedProjectFallbackRepair {
+    workspace: Option<String>,
+}
+
+impl DeniedProjectFallbackRepair {
+    fn begin(workspace: String) -> Option<Self> {
+        crate::workspace_threads::begin_denied_project_fallback_repair(&workspace).then_some(Self {
+            workspace: Some(workspace),
+        })
+    }
+
+    fn complete(mut self) {
+        if let Some(workspace) = self.workspace.take() {
+            crate::workspace_threads::complete_denied_project_fallback_repair(&workspace);
+        }
+    }
+
+    fn retry(mut self) {
+        if let Some(workspace) = self.workspace.take() {
+            crate::workspace_threads::retry_denied_project_fallback_repair(&workspace);
+        }
+    }
+}
+
+impl Drop for DeniedProjectFallbackRepair {
+    fn drop(&mut self) {
+        if let Some(workspace) = self.workspace.take() {
+            crate::workspace_threads::retry_denied_project_fallback_repair(&workspace);
+        }
+    }
+}
+
 fn tr_with_name(id: &'static str, name: &str) -> String {
     let mut args = FluentArgs::new();
     args.set("name", name.to_string());
@@ -6266,6 +6300,17 @@ impl super::TermWindow {
             context.invalidate();
             return;
         }
+        // Any valid selection supersedes an older detached local
+        // materialization, including a selection that resolves synchronously
+        // or takes a remote path. The old task may still finish, but it no
+        // longer owns this window's visible state.
+        let activation_generation = self.next_local_thread_activation_generation;
+        self.next_local_thread_activation_generation = self
+            .next_local_thread_activation_generation
+            .saturating_add(1)
+            .max(1);
+        let activation_space_id = self.active_space_id.clone();
+        self.local_thread_activation = None;
         if via_thread_ref {
             // Remember the choice so switching back to this Space restores
             // the reference, like a normal Space restores its active thread.
@@ -6316,6 +6361,21 @@ impl super::TermWindow {
                         if let Some(other) =
                             crate::frontend::front_end().gui_window_for_mux_window(target)
                         {
+                            let workspace = plan.workspace_name.clone();
+                            let project_path = plan.project_path.clone();
+                            let project_id = plan.project_id.clone();
+                            let thread_id = plan.thread_id.clone();
+                            other.window.notify(TermWindowNotif::Apply(Box::new(
+                                move |term_window| {
+                                    term_window.open_project_terminal_in_live_workspace(
+                                        workspace,
+                                        project_path,
+                                        project_id,
+                                        thread_id,
+                                        term_window.active_space_id.clone(),
+                                    );
+                                },
+                            )));
                             other.window.focus();
                             context.invalidate();
                             return;
@@ -6340,6 +6400,18 @@ impl super::TermWindow {
 
         if !plan.needs_materialize {
             self.adopt_workspace_in_this_window(&plan.workspace_name);
+            // This workspace may be live only because startup fell back to a
+            // `$HOME` shell for a refused Project; add the terminal that was
+            // actually asked for. Added rather than swapped: the fallback
+            // shell may have been used, and killing its mux window would take
+            // this GUI window down with it.
+            self.open_project_terminal_in_live_workspace(
+                plan.workspace_name.clone(),
+                plan.project_path.clone(),
+                plan.project_id.clone(),
+                plan.thread_id.clone(),
+                self.active_space_id.clone(),
+            );
             // Symmetric with the materialize branch below: if this switch
             // orphaned a startup mux window, tidy it up. cleanup_orphaned_mux_window
             // is a no-op when the window is still shown or has a thread binding.
@@ -6511,12 +6583,20 @@ impl super::TermWindow {
         front_end().set_switching_workspaces(true);
         mux.set_active_workspace(&workspace_name);
 
-        let reconcile_window = self.window.clone();
-        let adopt_workspace = workspace_name.clone();
-        let detect_window = self.window.clone();
         let cleanup_workspaces = workspaces_to_kill_after_adopt;
+        let problem_thread_id = plan.thread_id.clone();
+        let problem_display_name =
+            crate::workspace_threads::thread_display_name(&plan.project_id, &plan.thread_id);
+        self.local_thread_activation = Some(super::LocalThreadActivationState {
+            generation: activation_generation,
+            thread_id: plan.thread_id.clone(),
+            space_id: activation_space_id.clone(),
+            workspace_name: workspace_name.clone(),
+        });
+        let completion_window = self.window.clone();
+        let completion_workspace = workspace_name.clone();
         promise::spawn::spawn(async move {
-            let materialized = match crate::workspace_threads::materialize_thread(
+            let result = crate::workspace_threads::materialize_thread(
                 workspace_name,
                 layout,
                 initial_cwd,
@@ -6524,42 +6604,219 @@ impl super::TermWindow {
                 None,
                 term_config,
                 default_domain,
+                true,
             )
-            .await
-            {
-                Ok(()) => true,
-                Err(err) => {
-                    log::error!("failed to materialize ThinkTerm thread: {err:#}");
-                    false
-                }
+            .await;
+            // Released inside the completion below, after the adopt.
+            // Clearing it here reopens the additive-reconcile race: a
+            // MuxNotification handler would find the active workspace's mux
+            // window bound to no GUI window and spawn a second window.
+            let Some(window) = completion_window else {
+                front_end().set_switching_workspaces(false);
+                return;
             };
-            adopt_workspace_into_window(&reconcile_window, &adopt_workspace);
-            front_end().set_switching_workspaces(false);
-            if materialized {
-                cleanup_orphaned_mux_window(orphan_candidate_window_id);
-                kill_workspace_windows(&cleanup_workspaces, Some(&adopt_workspace));
-            }
-            reconcile_workspace_layout_after_materialize(reconcile_window);
-
-            if materialized {
-                if let Some((detect_domain, detect_project)) = detect_remote_os {
-                    if let Some(domain) = Mux::get().get_domain_by_name(&detect_domain) {
-                        if let Some(ssh) = domain.as_ref().downcast_ref::<RemoteSshDomain>() {
-                            if let Some(distro) = ssh.detect_os_release().await {
-                                if crate::ssh_hosts::set_host_distro(&detect_project, &distro) {
-                                    if let Some(win) = detect_window.as_ref() {
-                                        win.invalidate();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            {
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.finish_local_thread_activation(
+                        activation_generation,
+                        problem_thread_id,
+                        activation_space_id,
+                        completion_workspace,
+                        result,
+                        problem_display_name,
+                        orphan_candidate_window_id,
+                        cleanup_workspaces,
+                        detect_remote_os,
+                    );
+                })));
             }
         })
         .detach();
 
         context.invalidate();
+    }
+
+    /// Add a terminal rooted in the Project to a workspace that is already
+    /// live, and make it active.
+    ///
+    /// Strict about its directory: this exists precisely because the Project
+    /// was refused once, so silently landing in `$HOME` again -- the very
+    /// thing being repaired -- must fail loudly instead. A refusal reopens the
+    /// recovery page with the current classification.
+    fn open_project_terminal_in_live_workspace(
+        &mut self,
+        workspace: String,
+        project_path: std::path::PathBuf,
+        project_id: String,
+        thread_id: String,
+        space_id: String,
+    ) {
+        let Some(cwd) = project_path.to_str().map(str::to_string) else {
+            return;
+        };
+        let mux = Mux::get();
+        let Some(mux_window_id) = mux.iter_windows_in_workspace(&workspace).into_iter().next()
+        else {
+            return;
+        };
+        let Some(repair) = DeniedProjectFallbackRepair::begin(workspace.clone()) else {
+            return;
+        };
+        let display_name = crate::workspace_threads::thread_display_name(&project_id, &thread_id);
+        let size = self.terminal_size;
+        let term_config: Arc<dyn wezterm_term::TerminalConfiguration> =
+            Arc::new(TermConfig::with_config(self.config.clone()));
+        let window = self.window.clone();
+        promise::spawn::spawn(async move {
+            let mut command = portable_pty::CommandBuilder::new_default_prog();
+            command.set_require_cwd(true);
+            let result = Mux::get()
+                .spawn_tab_or_window(
+                    Some(mux_window_id),
+                    config::keyassignment::SpawnTabDomain::DefaultDomain,
+                    Some(command),
+                    Some(cwd),
+                    size,
+                    None,
+                    workspace.clone(),
+                    None,
+                )
+                .await;
+            match result {
+                Ok((_tab, pane, _window_id)) => {
+                    pane.set_config(term_config);
+                    repair.complete();
+                    if let Some(window) = window {
+                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            term_window.invalidate_window();
+                        })));
+                    }
+                }
+                Err(err) => {
+                    log::error!("open Project terminal in live workspace: {err:#}");
+                    let failure = crate::termwindow::ui::folder_problem::ProjectRootUnavailable::from_error_chain(&err);
+                    repair.retry();
+                    if let Some(window) = window {
+                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            if let Some(failure) = failure {
+                                term_window.show_project_root_problem(
+                                    thread_id,
+                                    space_id,
+                                    display_name,
+                                    failure,
+                                );
+                            } else {
+                                term_window.invalidate_window();
+                            }
+                        })));
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_local_thread_activation(
+        &mut self,
+        generation: u64,
+        thread_id: String,
+        space_id: String,
+        workspace_name: String,
+        result: anyhow::Result<crate::workspace_threads::ThreadMaterializationOutcome>,
+        display_name: String,
+        orphan_candidate_window_id: Option<MuxWindowId>,
+        workspaces_to_kill_after_adopt: Vec<String>,
+        detect_remote_os: Option<(String, String)>,
+    ) {
+        let is_current = self.local_thread_activation.as_ref().is_some_and(|state| {
+            local_thread_activation_matches(
+                state,
+                generation,
+                &thread_id,
+                &space_id,
+                &workspace_name,
+                &self.active_space_id,
+            )
+        });
+        // Every exit below releases the switching guard and re-baselines the
+        // layout; leaving either undone on a failed or overtaken activation
+        // leaves a stuck guard and a stale fingerprint behind.
+        let release = |term_window: &mut Self| {
+            front_end().set_switching_workspaces(false);
+            reconcile_workspace_layout_after_materialize(term_window.window.clone());
+            term_window.invalidate_window();
+        };
+
+        if !is_current {
+            // The materialized workspace is intentionally left live in the
+            // background. A newer click owns the visible window now -- but the
+            // cleanup this activation was carrying still has to happen, or the
+            // orphan window and the workspaces it was told to kill leak for
+            // the life of the process.
+            cleanup_orphaned_mux_window(orphan_candidate_window_id);
+            kill_workspace_windows(&workspaces_to_kill_after_adopt, None);
+            release(self);
+            return;
+        }
+        let state = self.local_thread_activation.take().unwrap();
+        let workspace = state.workspace_name;
+
+        if let Err(err) = result {
+            log::error!("failed to materialize ThinkTerm thread: {err:#}");
+            // The mux-level backstop refuses *inside* `spawn_tab_or_window`,
+            // which leaves a tab-less window behind; that would make the
+            // workspace look materialized and stop any retry.
+            let mux = Mux::get();
+            for window_id in mux.iter_windows_in_workspace(&workspace) {
+                if mux
+                    .get_window(window_id)
+                    .is_some_and(|window| window.is_empty())
+                {
+                    mux.kill_window(window_id);
+                }
+            }
+            if let Some(failure) =
+                crate::termwindow::ui::folder_problem::ProjectRootUnavailable::from_error_chain(
+                    &err,
+                )
+            {
+                self.show_project_root_problem(thread_id, space_id, display_name, failure);
+            }
+            release(self);
+            return;
+        }
+
+        if !self.adopt_workspace_in_this_window(&workspace) {
+            log::error!("materialized ThinkTerm workspace {workspace:?} has no window to adopt");
+            release(self);
+            return;
+        }
+        cleanup_orphaned_mux_window(orphan_candidate_window_id);
+        kill_workspace_windows(&workspaces_to_kill_after_adopt, Some(&workspace));
+        front_end().set_switching_workspaces(false);
+        self.snapshot_active_workspace_thread_layout();
+        self.remember_workspace_layout_structure_fingerprint();
+        reconcile_workspace_layout_after_materialize(self.window.clone());
+        self.invalidate_window();
+
+        if let Some((detect_domain, detect_project)) = detect_remote_os {
+            let detect_window = self.window.clone();
+            promise::spawn::spawn(async move {
+                if let Some(domain) = Mux::get().get_domain_by_name(&detect_domain) {
+                    if let Some(ssh) = domain.as_ref().downcast_ref::<RemoteSshDomain>() {
+                        if let Some(distro) = ssh.detect_os_release().await {
+                            if crate::ssh_hosts::set_host_distro(&detect_project, &distro) {
+                                if let Some(window) = detect_window {
+                                    window.invalidate();
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
     }
 
     fn failed_remote_thread_for_pane(
@@ -6774,6 +7031,7 @@ impl super::TermWindow {
                 None,
                 term_config,
                 config::keyassignment::SpawnTabDomain::DomainName(domain_name),
+                true,
             )
             .await
             {
@@ -8259,11 +8517,83 @@ fn reconcile_workspace_layout_after_materialize(window: Option<::window::Window>
     }
 }
 
-/// After a target workspace has been materialized in a background task, adopt
-/// its mux window into `window` (the window that initiated the switch) in
-/// place, without disturbing any other window. Rebinding the frontend mapping
-/// immediately closes the race where the additive reconcile might otherwise
-/// spawn a duplicate window for the freshly materialized mux window.
+fn local_thread_activation_matches(
+    state: &super::LocalThreadActivationState,
+    generation: u64,
+    thread_id: &str,
+    space_id: &str,
+    workspace_name: &str,
+    active_space_id: &str,
+) -> bool {
+    state.generation == generation
+        && state.thread_id == thread_id
+        && state.space_id == space_id
+        && state.workspace_name == workspace_name
+        && state.space_id == active_space_id
+}
+
+#[cfg(test)]
+mod local_thread_activation_tests {
+    use super::local_thread_activation_matches;
+    use crate::termwindow::LocalThreadActivationState;
+
+    fn state() -> LocalThreadActivationState {
+        LocalThreadActivationState {
+            generation: 7,
+            thread_id: "thread-a".to_string(),
+            space_id: "space-a".to_string(),
+            workspace_name: "workspace-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn only_the_exact_current_activation_may_complete() {
+        let state = state();
+        assert!(local_thread_activation_matches(
+            &state,
+            7,
+            "thread-a",
+            "space-a",
+            "workspace-a",
+            "space-a"
+        ));
+        assert!(!local_thread_activation_matches(
+            &state,
+            6,
+            "thread-a",
+            "space-a",
+            "workspace-a",
+            "space-a"
+        ));
+        assert!(!local_thread_activation_matches(
+            &state,
+            7,
+            "thread-b",
+            "space-a",
+            "workspace-a",
+            "space-a"
+        ));
+        assert!(!local_thread_activation_matches(
+            &state,
+            7,
+            "thread-a",
+            "space-a",
+            "workspace-a",
+            "space-b"
+        ));
+        assert!(!local_thread_activation_matches(
+            &state,
+            7,
+            "thread-a",
+            "space-a",
+            "workspace-b",
+            "space-a"
+        ));
+    }
+}
+
+/// Adopt a materialized workspace into the window that initiated an operation
+/// without disturbing any other GUI window already bound to the mux.
 pub(crate) fn adopt_workspace_into_window(window: &Option<::window::Window>, workspace: &str) {
     let mux = Mux::get();
     let Some(target) = mux.iter_windows_in_workspace(workspace).first().copied() else {

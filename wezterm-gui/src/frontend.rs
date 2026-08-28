@@ -747,16 +747,69 @@ impl GuiFrontEnd {
                 )
             };
 
-            crate::workspace_threads::materialize_thread(
+            // Strict first, so a refused Project directory does not quietly
+            // become `$HOME`. If it is refused, park the problem for the window
+            // that is about to be built and materialize leniently anyway: this
+            // call is what *creates* that window, so failing here would open no
+            // window at all -- a worse outcome than the wrong directory, and
+            // one the user could not even see to fix.
+            if let Err(err) = crate::workspace_threads::materialize_thread(
                 plan.workspace_name.clone(),
-                layout,
-                initial_cwd,
+                layout.clone(),
+                initial_cwd.clone(),
                 size,
                 None,
-                term_config,
-                default_domain,
+                term_config.clone(),
+                default_domain.clone(),
+                true,
             )
-            .await?;
+            .await
+            {
+                let Some(failure) =
+                    crate::termwindow::ui::folder_problem::ProjectRootUnavailable::from_error_chain(
+                        &err,
+                    )
+                else {
+                    return Err(err);
+                };
+                log::warn!("Space {space_id} starts in the home directory: {failure}");
+                // The failed strict attempt can leave a tab-less mux window
+                // behind; the lenient retry would then report AlreadyLive and
+                // hand back a window with no tabs at all.
+                let mux = Mux::get();
+                for window_id in mux.iter_windows_in_workspace(&plan.workspace_name) {
+                    if mux
+                        .get_window(window_id)
+                        .is_some_and(|window| window.is_empty())
+                    {
+                        mux.kill_window(window_id);
+                    }
+                }
+                crate::termwindow::project_root_view::queue_project_root_problem(
+                    space_id.to_string(),
+                    plan.thread_id.clone(),
+                    crate::workspace_threads::thread_display_name(
+                        &plan.project_id,
+                        &plan.thread_id,
+                    ),
+                    failure,
+                );
+                crate::workspace_threads::materialize_thread(
+                    plan.workspace_name.clone(),
+                    layout,
+                    initial_cwd,
+                    size,
+                    None,
+                    term_config,
+                    default_domain,
+                    false,
+                )
+                .await?;
+                // What just materialized is a shell in `$HOME`, not the Thread
+                // the user asked for. Mark it so the next deliberate open adds
+                // the Project terminal instead of handing this one back.
+                crate::workspace_threads::mark_denied_project_fallback(plan.workspace_name.clone());
+            }
         }
 
         mux.iter_windows_in_workspace(&plan.workspace_name)
