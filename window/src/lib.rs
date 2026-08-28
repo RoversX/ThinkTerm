@@ -261,6 +261,14 @@ pub enum ContextMenuIcon {
 pub struct FolderPickerOptions {
     pub title: String,
     pub prompt: String,
+    /// Where the picker opens, when the caller has a folder in mind.
+    ///
+    /// A re-authorization flow needs this: the user is being asked to confirm
+    /// the one folder the system refused, and making them navigate back to it
+    /// turns a single click into a scavenger hunt -- through a sidebar that,
+    /// being unreadable, cannot show them the way. Best-effort; a platform that
+    /// cannot honour it still opens a usable picker.
+    pub directory: Option<PathBuf>,
 }
 
 impl Default for FolderPickerOptions {
@@ -268,6 +276,7 @@ impl Default for FolderPickerOptions {
         Self {
             title: "Open Project".to_string(),
             prompt: "Open".to_string(),
+            directory: None,
         }
     }
 }

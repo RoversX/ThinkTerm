@@ -2648,6 +2648,7 @@ impl SettingsWindow {
             FolderPickerOptions {
                 title: crate::i18n::tr("settings-download-picker-title"),
                 prompt: crate::i18n::tr("common-choose"),
+                ..Default::default()
             },
             Box::new(move |path| {
                 // Cancelling the picker must leave the setting alone, so only

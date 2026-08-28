@@ -1180,6 +1180,16 @@ impl WindowOps for Window {
             let prompt = nsstring(&options.prompt);
             let () = msg_send![*panel, setTitle: *title];
             let () = msg_send![*panel, setPrompt: *prompt];
+            // Bound to a local so the NSString outlives the NSURL that borrows
+            // it; `setDirectoryURL` is only a hint, so a path AppKit dislikes
+            // simply leaves the panel wherever it would have opened.
+            if let Some(directory) = options.directory.as_ref().and_then(|dir| dir.to_str()) {
+                let directory = nsstring(directory);
+                let url: id = msg_send![class!(NSURL), fileURLWithPath: *directory isDirectory: YES];
+                if url != nil {
+                    let () = msg_send![*panel, setDirectoryURL: url];
+                }
+            }
 
             const NS_MODAL_RESPONSE_OK: NSInteger = 1;
             let callback = Arc::new(Mutex::new(Some(callback)));
