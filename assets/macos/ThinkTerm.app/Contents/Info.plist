@@ -56,6 +56,8 @@
 	<string>An application launched via ThinkTerm would like to access your microphone.</string>
 	<key>NSRemindersUsageDescription</key>
 	<string>An application launched via ThinkTerm would like to access your reminders.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>An application launched via ThinkTerm would like to access your Desktop folder.</string>
 	<key>NSDocumentsFolderUsageDescription</key>
 	<string>An application launched via ThinkTerm would like to access your Documents folder.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
