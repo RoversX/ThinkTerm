@@ -41,9 +41,6 @@ pub fn sidebar_toggle_size_px(
     if window_state.contains(WindowState::FULL_SCREEN) {
         return px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE);
     }
-    if cfg!(target_os = "macos") {
-        return px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE);
-    }
     if let Some(row_h) = top_fancy_row_height {
         if row_h > 0 {
             let spacer = px(WINDOW_TAB_TOP_SPACER).min(row_h);
@@ -287,9 +284,6 @@ mod tests {
 
     #[test]
     fn sidebar_toggle_size_tracks_the_fancy_row_and_never_collapses() {
-        if cfg!(target_os = "macos") {
-            return;
-        }
         let px = |v: usize| scale_ui_usize(v, 96);
         let fixed = px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE);
         // Capsule = row - spacer - 2 * vertical padding
