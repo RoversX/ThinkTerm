@@ -14,7 +14,8 @@ use wezterm_surface::SequenceNo;
 #[derive(Debug, Clone)]
 pub struct Screen {
     /// Holds the line data that comprises the screen contents.
-    /// This is allocated with capacity for the entire scrollback.
+    /// Grows on demand: eagerly reserving the whole scrollback cost
+    /// ~480KB per pane before a single line had scrolled off.
     /// The last N lines are the visible lines, with those prior being
     /// the lines that have scrolled off the top of the screen.
     /// Index 0 is the topmost line of the screen/scrollback (depending
@@ -46,6 +47,11 @@ pub struct Screen {
     pub(crate) saved_cursor: Option<SavedCursor>,
 }
 
+/// How much of the scrollback allowance to pre-reserve at creation. Enough
+/// to cover a burst of early output without a reallocation; the rest of the
+/// ring grows on demand as lines actually scroll off.
+const SCROLLBACK_PREALLOC: usize = 256;
+
 fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
     if allow_scrollback {
         config.scrollback_size()
@@ -68,8 +74,9 @@ impl Screen {
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
 
-        let mut lines =
-            VecDeque::with_capacity(physical_rows + scrollback_size(config, allow_scrollback));
+        let mut lines = VecDeque::with_capacity(
+            physical_rows + scrollback_size(config, allow_scrollback).min(SCROLLBACK_PREALLOC),
+        );
         for _ in 0..physical_rows {
             let mut line = Line::new(seqno);
             bidi_mode.apply_to_line(&mut line, seqno);
@@ -247,12 +254,6 @@ impl Screen {
         } else {
             (cursor.x, cursor_phys)
         };
-
-        let capacity = physical_rows + self.scrollback_size();
-        let current_capacity = self.lines.capacity();
-        if capacity > current_capacity {
-            self.lines.reserve(capacity - current_capacity);
-        }
 
         // If we resized wider and the rewrap resulted in fewer
         // lines than the viewport size, or we resized taller,
