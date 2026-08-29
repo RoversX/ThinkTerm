@@ -412,6 +412,11 @@ impl<'a> QuadAllocator for MappedQuads<'a> {
     }
 }
 
+/// The quad count no shrink goes below; shared by the idle observation
+/// shrink (shrink_target) and the occlusion shrink (shrink_quads_now) so
+/// both express the same floor policy.
+const MIN_QUADS: usize = 32;
+
 pub struct TripleVertexBuffer {
     pub index: RefCell<usize>,
     /// One buffer for WebGPU, three rotating buffers for Glium. Glium maps
@@ -570,7 +575,6 @@ impl TripleVertexBuffer {
     /// megabytes of staging + GPU memory forever.
     fn shrink_target(&self) -> Option<usize> {
         const OBSERVE_FRAMES: u32 = 120;
-        const MIN_QUADS: usize = 32;
         let used = *self.next_quad.borrow();
         self.high_water.set(self.high_water.get().max(used));
         let frames = self.frames_observed.get() + 1;
@@ -858,12 +862,16 @@ impl RenderState {
     /// deferred until the GPU is done with it, whereas glium's rotating
     /// buffers are persistently mapped and are left alone.
     pub fn maybe_shrink_quads(&self) {
+        self.shrink_layers(|vb| vb.shrink_target());
+    }
+
+    fn shrink_layers(&self, target_for: impl Fn(&TripleVertexBuffer) -> Option<usize>) {
         if matches!(self.context, RenderContext::Glium(_)) {
             return;
         }
         for layer in self.layers.borrow().iter() {
             for vb_idx in 0..3 {
-                let target = layer.vb.borrow()[vb_idx].shrink_target();
+                let target = target_for(&layer.vb.borrow()[vb_idx]);
                 if let Some(target) = target {
                     if let Err(err) = layer.reallocate_quads(vb_idx, target) {
                         log::error!("failed to shrink vertex buffer: {err:#}");
@@ -871,6 +879,18 @@ impl RenderState {
                 }
             }
         }
+    }
+
+    /// Shrink every vertex buffer to its floor right now, regardless of
+    /// the usage-observation window. Meant for a window that has gone
+    /// fully occluded: it paints no frames, so `shrink_target`'s
+    /// observation counter never advances and `high_water` is stale.
+    /// Regrowth on reveal is bounded: `allocated_more_quads` reallocates
+    /// once, sized to the exact need. WebGPU only, as maybe_shrink_quads.
+    pub fn shrink_quads_now(&self) {
+        // The same value shrink_target lands on for an idle buffer.
+        let floor = (MIN_QUADS * 5 / 4).next_power_of_two();
+        self.shrink_layers(move |vb| (vb.capacity > floor).then_some(floor));
     }
 
     fn compile_prog(

@@ -1897,6 +1897,15 @@ pub struct TermWindow {
     /// visible. The timestamp doubles as the start of the grace period
     /// before occlusion-driven cache release.
     occluded: Option<Instant>,
+    /// Whether the current occlusion episode's cache release already
+    /// ran. Reset when the window goes occluded and when a hidden
+    /// repaint regrows what the release dropped, so the heartbeat can
+    /// release again.
+    occlusion_released: bool,
+    /// When the last occlusion release ran; damps re-releases to at most
+    /// one per grace period even if something keeps repainting the
+    /// hidden window (snapshot and capture contexts can draw it).
+    occlusion_last_release: Option<Instant>,
     fonts: Rc<FontConfiguration>,
     /// Window dimensions and dpi
     pub dimensions: Dimensions,
@@ -2761,6 +2770,64 @@ impl TermWindow {
             self.occluded = None;
         } else if self.occluded.is_none() {
             self.occluded = Some(Instant::now());
+            self.occlusion_released = false;
+        }
+    }
+
+    /// A window nobody can see keeps everything it ever cached. Once it
+    /// has stayed hidden past the grace period, drop the caches that
+    /// rebuild lazily on the reveal repaint: the note and file-preview
+    /// shape caches (48MiB of budget), the vertex buffers (an overview
+    /// spike pins tens of megabytes), and the line quad cache. The glyph
+    /// atlas is deliberately left alone — rebuilding it re-rasterizes
+    /// every glyph on the reveal frame.
+    ///
+    /// Driven from the 1s status heartbeat rather than a one-shot timer:
+    /// display sleep can swallow a detached timer whole (the throttle
+    /// latch documents the same failure), while an elapsed() check
+    /// self-heals, and it releases again if a hidden repaint (a resize
+    /// completing, a config reload) regrew what an earlier release
+    /// dropped.
+    fn maybe_release_occluded_memory(&mut self) {
+        if !occlusion_release_due(
+            self.occluded.map(|since| since.elapsed()),
+            self.occlusion_released,
+        ) {
+            return;
+        }
+        // Damping: even when hidden repaints keep re-marking the episode
+        // dirty, the release runs at most once per grace period.
+        if self
+            .occlusion_last_release
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(OCCLUSION_RELEASE_SECS))
+        {
+            return;
+        }
+        self.occlusion_released = true;
+        self.occlusion_last_release = Some(Instant::now());
+        log::debug!("window occluded for {OCCLUSION_RELEASE_SECS}s; releasing caches");
+        {
+            let mut caches = self.ui_shape_caches.borrow_mut();
+            caches.clear_note();
+            caches.clear_file_preview();
+        }
+        self.publish_ui_shape_cache_diagnostics();
+        if let Some(render_state) = self.render_state.as_ref() {
+            render_state.shrink_quads_now();
+        }
+        self.line_quad_cache.borrow_mut().clear();
+        // The buffers just dropped stay resident until a device maintain
+        // runs, and an occluded window submits no frames — poll once so
+        // the memory actually returns now rather than at the reveal.
+        if let Some(webgpu) = self.webgpu.as_ref() {
+            if let Err(err) = webgpu.device.poll(wgpu::PollType::Poll) {
+                log::debug!("device poll after occlusion release: {err:?}");
+            }
+        }
+        // Set the sticky invalidated bit so the occlusion re-arm repaints
+        // us on reveal instead of presenting a stale frame.
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
         }
     }
 
@@ -3104,6 +3171,8 @@ impl TermWindow {
             palette: None,
             focused: None,
             occluded: None,
+            occlusion_released: false,
+            occlusion_last_release: None,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
             fonts: Rc::clone(&fontconfig),
@@ -3899,6 +3968,12 @@ impl TermWindow {
     }
 
     fn do_paint(&mut self, window: &Window) -> bool {
+        // A repaint of a hidden window (a resize completing, a config
+        // reload) regrows what the occlusion release dropped; mark the
+        // episode dirty so the heartbeat releases again.
+        if self.occluded.is_some() {
+            self.occlusion_released = false;
+        }
         let gl = match self.gl.as_ref() {
             Some(gl) => gl,
             None => return false,
@@ -3940,6 +4015,10 @@ impl TermWindow {
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
+        // See do_paint: a hidden repaint regrows released caches.
+        if self.occluded.is_some() {
+            self.occlusion_released = false;
+        }
         self.webgpu.as_mut().unwrap().resize(self.dimensions);
         match self.do_paint_webgpu_impl() {
             Ok(ok) => Ok(ok),
@@ -4301,6 +4380,7 @@ impl TermWindow {
                 self.emit_status_event();
                 self.refresh_all_thread_work();
                 self.terminal_render_watchdog();
+                self.maybe_release_occluded_memory();
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
@@ -9297,3 +9377,47 @@ impl Drop for TermWindow {
     }
 }
 
+
+/// How long a window must stay fully occluded before its lazily-rebuilt
+/// caches are released. Long enough to survive a glance at another Space
+/// or a brief cover-up; matches the sidebar's idle-release precedent.
+const OCCLUSION_RELEASE_SECS: u64 = 30;
+
+fn occlusion_release_due(occluded_for: Option<Duration>, already_released: bool) -> bool {
+    match occluded_for {
+        Some(elapsed) => {
+            !already_released && elapsed >= Duration::from_secs(OCCLUSION_RELEASE_SECS)
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod occlusion_release_tests {
+    use super::{occlusion_release_due, OCCLUSION_RELEASE_SECS};
+    use std::time::Duration;
+
+    fn past_grace() -> Duration {
+        Duration::from_secs(OCCLUSION_RELEASE_SECS + 1)
+    }
+
+    #[test]
+    fn a_window_hidden_past_the_grace_period_releases() {
+        assert!(occlusion_release_due(Some(past_grace()), false));
+    }
+
+    #[test]
+    fn a_visible_window_never_releases() {
+        assert!(!occlusion_release_due(None, false));
+    }
+
+    #[test]
+    fn the_grace_period_is_respected() {
+        assert!(!occlusion_release_due(Some(Duration::from_secs(5)), false));
+    }
+
+    #[test]
+    fn an_episode_releases_once_until_marked_dirty_again() {
+        assert!(!occlusion_release_due(Some(past_grace()), true));
+    }
+}
