@@ -581,6 +581,7 @@ pub enum UIItemType {
     WorkspaceSidebarBackground,
     WorkspaceSidebarResize,
     WorkspaceSidebarSettings,
+    WorkspaceSidebarThreadSearch,
     WorkspaceSidebarViewOptions,
     WorkspaceSidebarSshHosts,
     WorkspaceSidebarLiveOverview,
@@ -1169,6 +1170,7 @@ mod tooltip_tests {
         // place their name appears.
         for item_type in [
             UIItemType::WorkspaceSidebarSettings,
+            UIItemType::WorkspaceSidebarThreadSearch,
             UIItemType::WorkspaceSidebarViewOptions,
             UIItemType::WorkspaceSidebarSshHosts,
             UIItemType::WorkspaceSidebarLiveOverview,
@@ -1524,6 +1526,7 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
     }
     let key = match item_type {
         UIItemType::WorkspaceSidebarSettings => "tooltip-sidebar-settings",
+        UIItemType::WorkspaceSidebarThreadSearch => "tooltip-sidebar-thread-search",
         UIItemType::WorkspaceSidebarViewOptions => "tooltip-sidebar-view-options",
         UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",

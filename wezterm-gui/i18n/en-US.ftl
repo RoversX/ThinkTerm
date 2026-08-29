@@ -209,6 +209,7 @@ sidebar-settings = Settings
 # words: they are labels for an icon, not descriptions.
 tooltip-sidebar-settings = Settings
 tooltip-sidebar-view-options = View Options
+tooltip-sidebar-thread-search = Find Thread
 tooltip-sidebar-ssh-hosts = SSH Hosts
 tooltip-sidebar-live-overview = Live Overview
 tooltip-sidebar-notifications = Notifications

@@ -206,6 +206,7 @@ sidebar-settings = 設定
 # words: they are labels for an icon, not descriptions.
 tooltip-sidebar-settings = 設定
 tooltip-sidebar-view-options = 表示オプション
+tooltip-sidebar-thread-search = スレッドを検索
 tooltip-sidebar-ssh-hosts = SSH ホスト
 tooltip-sidebar-live-overview = ライブ概要
 tooltip-sidebar-notifications = 通知

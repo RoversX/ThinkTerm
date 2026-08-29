@@ -1509,6 +1509,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
+            | UIItemType::WorkspaceSidebarThreadSearch
             | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarLiveOverview
@@ -1629,6 +1630,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
+            | UIItemType::WorkspaceSidebarThreadSearch
             | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarLiveOverview
@@ -3758,6 +3760,12 @@ impl super::TermWindow {
                     self.request_close_content_view_by_id(id);
                 }
             }
+            UIItemType::WorkspaceSidebarThreadSearch => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.open_thread_search();
+                }
+            }
             UIItemType::WorkspaceSidebarViewOptions => {
                 self.mouse_event_workspace_sidebar_view_options(item, event, context);
             }
@@ -4191,6 +4199,12 @@ impl super::TermWindow {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
                     self.toggle_live_overview_view();
+                }
+            }
+            UIItemType::WorkspaceSidebarThreadSearch => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.open_thread_search();
                 }
             }
             UIItemType::WorkspaceSidebarViewOptions => {

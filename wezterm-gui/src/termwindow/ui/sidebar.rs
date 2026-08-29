@@ -40,6 +40,16 @@ const SIDEBAR_SETTINGS_ROW_LIFT: usize = 18;
 const SIDEBAR_TOP_FADE_HEIGHT: usize = 32;
 const WORKSPACE_GROUP_EXTRA_GAP: usize = 8;
 const WORKSPACE_SECTION_LABEL_GAP: usize = 12;
+/// Whether the sidebar footer carries its view-options button.
+///
+/// Parked: the menu behind it (group-by, the status filter, archived projects)
+/// was not earning the footer slot it cost. Everything behind the button --
+/// the menu, its handlers, the persisted filters -- is untouched, so flipping
+/// this back on restores it. Note that while it is off the menu has no other
+/// entry point, so a filter already persisted in
+/// `workspace_sidebar_hidden_statuses` cannot be cleared from the UI.
+const SHOW_SIDEBAR_VIEW_OPTIONS: bool = false;
+
 const SESSION_ROW_MIN_HEIGHT: usize = 66;
 const SESSION_ROW_SIDE_PADDING: usize = 10;
 const SESSION_ACTION_MIN_SIZE: usize = 48;
@@ -2957,18 +2967,31 @@ impl crate::TermWindow {
                 )
                 .max(1);
             let settings_action_size = settings_row_height.max(1);
-            let settings_action_x = settings_row_x
+            let footer_action_right = settings_row_x
                 .saturating_add(settings_row_width)
                 .saturating_sub(settings_action_size);
+            let action_step = settings_action_size + self.ui_px(SIDEBAR_INSET) / 2;
+            let settings_action_x = footer_action_right;
             let settings_action_y = settings_row_y;
-            // SSH hosts sits left of view options; Live Overview sits left of
-            // SSH so the settings label remains the primary footer action.
-            let ssh_action_x = settings_action_x
-                .saturating_sub(settings_action_size + self.ui_px(SIDEBAR_INSET) / 2);
+            // Right to left: view options (parked), thread search, SSH hosts,
+            // Live Overview — so the settings label stays the primary footer
+            // action. With view options off, search takes its slot.
+            let search_action_x = if SHOW_SIDEBAR_VIEW_OPTIONS {
+                settings_action_x.saturating_sub(action_step)
+            } else {
+                footer_action_right
+            };
+            let search_action_y = settings_row_y;
+            let ssh_action_x = search_action_x.saturating_sub(action_step);
             let ssh_action_y = settings_row_y;
-            let overview_action_x =
-                ssh_action_x.saturating_sub(settings_action_size + self.ui_px(SIDEBAR_INSET) / 2);
+            let overview_action_x = ssh_action_x.saturating_sub(action_step);
             let overview_action_y = settings_row_y;
+            let search_action_hovered = self.is_pointer_over_ui_rect(
+                search_action_x,
+                search_action_y,
+                settings_action_size,
+                settings_action_size,
+            );
             let ssh_action_hovered = self.is_pointer_over_ui_rect(
                 ssh_action_x,
                 ssh_action_y,
@@ -3012,12 +3035,13 @@ impl crate::TermWindow {
                 settings_body_width,
                 settings_row_height,
             );
-            let settings_options_hovered = self.is_pointer_over_ui_rect(
-                settings_action_x,
-                settings_action_y,
-                settings_action_size,
-                settings_action_size,
-            );
+            let settings_options_hovered = SHOW_SIDEBAR_VIEW_OPTIONS
+                && self.is_pointer_over_ui_rect(
+                    settings_action_x,
+                    settings_action_y,
+                    settings_action_size,
+                    settings_action_size,
+                );
             if settings_hovered {
                 self.fill_rounded_rectangle(
                     layers,
@@ -3055,13 +3079,52 @@ impl crate::TermWindow {
                 )
                 .context("sidebar settings view options hover")?;
             }
+            if SHOW_SIDEBAR_VIEW_OPTIONS {
+                self.ui_items.push(UIItem {
+                    x: settings_action_x,
+                    y: settings_action_y,
+                    width: settings_action_size,
+                    height: settings_action_size,
+                    item_type: UIItemType::WorkspaceSidebarViewOptions,
+                });
+            }
+            if search_action_hovered {
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        search_action_x as f32,
+                        search_action_y as f32,
+                        settings_action_size as f32,
+                        settings_action_size as f32,
+                    ),
+                    chrome.sidebar_button_hover_bg,
+                    self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
+                )
+                .context("sidebar thread search hover")?;
+            }
             self.ui_items.push(UIItem {
-                x: settings_action_x,
-                y: settings_action_y,
+                x: search_action_x,
+                y: search_action_y,
                 width: settings_action_size,
                 height: settings_action_size,
-                item_type: UIItemType::WorkspaceSidebarViewOptions,
+                item_type: UIItemType::WorkspaceSidebarThreadSearch,
             });
+            {
+                let search_icon_size = icon_size.min(settings_row_height.saturating_sub(8));
+                self.paint_sidebar_icon(
+                    layers,
+                    SvgIcon::Search,
+                    search_action_x + ((settings_action_size.saturating_sub(search_icon_size)) / 2),
+                    search_action_y + ((settings_action_size.saturating_sub(search_icon_size)) / 2),
+                    search_icon_size,
+                    if search_action_hovered {
+                        foreground
+                    } else {
+                        muted_fg
+                    },
+                )?;
+            }
             if ssh_action_hovered {
                 self.fill_rounded_rectangle(
                     layers,
@@ -3171,21 +3234,23 @@ impl crate::TermWindow {
                     foreground,
                 )?;
             }
-            let settings_action_icon_size = settings_icon_size;
-            self.paint_sidebar_icon(
-                layers,
-                SvgIcon::SlidersVertical,
-                settings_action_x
-                    + ((settings_action_size.saturating_sub(settings_action_icon_size)) / 2),
-                settings_action_y
-                    + ((settings_action_size.saturating_sub(settings_action_icon_size)) / 2),
-                settings_action_icon_size,
-                if settings_options_hovered {
-                    foreground
-                } else {
-                    muted_fg
-                },
-            )?;
+            if SHOW_SIDEBAR_VIEW_OPTIONS {
+                let settings_action_icon_size = settings_icon_size;
+                self.paint_sidebar_icon(
+                    layers,
+                    SvgIcon::SlidersVertical,
+                    settings_action_x
+                        + ((settings_action_size.saturating_sub(settings_action_icon_size)) / 2),
+                    settings_action_y
+                        + ((settings_action_size.saturating_sub(settings_action_icon_size)) / 2),
+                    settings_action_icon_size,
+                    if settings_options_hovered {
+                        foreground
+                    } else {
+                        muted_fg
+                    },
+                )?;
+            }
         }
 
         if self.workspace_sidebar_scrollbar_visible() {

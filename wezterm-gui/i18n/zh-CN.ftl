@@ -206,6 +206,7 @@ sidebar-settings = 设置
 # words: they are labels for an icon, not descriptions.
 tooltip-sidebar-settings = 设置
 tooltip-sidebar-view-options = 视图选项
+tooltip-sidebar-thread-search = 查找线程
 tooltip-sidebar-ssh-hosts = SSH 主机
 tooltip-sidebar-live-overview = 实时总览
 tooltip-sidebar-notifications = 通知
