@@ -1435,6 +1435,13 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
         let mut images = vec![];
 
         for (line_idx, (stable_row_idx, line)) in lines.iter_mut().enumerate() {
+            // The mutable pass below coerces the line to per-cell storage,
+            // undoing the compression scrollback just applied and shipping
+            // the fat form to the client. Only lines that actually carry
+            // links or images have anything to extract; skip the rest.
+            if !line.has_hyperlinks_or_images() {
+                continue;
+            }
             let mut current_link: Option<Arc<Hyperlink>> = None;
             let mut current_range = 0..0;
 
@@ -1821,6 +1828,42 @@ mod golden {
 #[cfg(test)]
 mod test {
     use super::*;
+    use termwiz::cell::CellAttributes;
+
+    #[test]
+    fn serializing_lines_keeps_plain_lines_compressed() {
+        let mut line = Line::from_text("hello world", &CellAttributes::default(), 1, None);
+        line.compress_for_scrollback();
+
+        let serialized = SerializedLines::from(vec![(0, line)]);
+        assert!(serialized.hyperlinks.is_empty());
+
+        let (lines, images) = serialized.extract_data();
+        assert!(images.is_empty());
+        assert!(
+            lines[0].1.is_compressed_for_scrollback(),
+            "a line with nothing to extract must not be coerced to per-cell storage"
+        );
+        assert_eq!(lines[0].1.as_str(), "hello world");
+    }
+
+    #[test]
+    fn serializing_lines_still_extracts_and_restores_hyperlinks() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        let mut line = Line::from_text("link", &attrs, 1, None);
+        line.compress_for_scrollback();
+
+        let serialized = SerializedLines::from(vec![(0, line)]);
+        assert!(!serialized.hyperlinks.is_empty());
+
+        let (lines, _) = serialized.extract_data();
+        let cell = lines[0].1.visible_cells().next().unwrap();
+        assert_eq!(
+            cell.attrs().hyperlink().map(|link| link.uri()),
+            Some("https://example.com")
+        );
+    }
 
     /// First coverage of the compressed path: every pre-existing test payload
     /// sits under COMPRESS_THRESH and never touches zstd.

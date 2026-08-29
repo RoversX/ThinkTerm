@@ -88,6 +88,14 @@ impl ClusteredLine {
         }
     }
 
+    /// Whether any cluster's attributes satisfy `pred`. A cell cannot carry
+    /// an attribute its cluster does not, so this answers per-cell questions
+    /// without expanding the line.
+    pub(crate) fn any_cluster_attrs(&self, pred: impl FnMut(&CellAttributes) -> bool) -> bool {
+        let mut pred = pred;
+        self.clusters.iter().any(|cluster| pred(&cluster.attrs))
+    }
+
     pub fn to_cell_vec(&self) -> Vec<Cell> {
         let mut cells = vec![];
 

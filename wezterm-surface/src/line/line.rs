@@ -1016,6 +1016,32 @@ impl Line {
         }
     }
 
+    /// Whether the line currently sits in compact cluster storage.
+    pub fn is_compressed_for_scrollback(&self) -> bool {
+        matches!(&self.cells, CellStorage::C(_))
+    }
+
+    /// Whether any cell carries a hyperlink or attached image, answered
+    /// without decompressing cluster storage. Serialization uses this to
+    /// leave the great majority of lines, which carry neither, in their
+    /// compact form.
+    pub fn has_hyperlinks_or_images(&self) -> bool {
+        fn wants_extraction(attrs: &CellAttributes) -> bool {
+            if attrs.hyperlink().is_some() {
+                return true;
+            }
+            #[cfg(feature = "use_image")]
+            if attrs.images().is_some() {
+                return true;
+            }
+            false
+        }
+        match &self.cells {
+            CellStorage::V(cells) => cells.iter().any(|cell| wants_extraction(cell.attrs())),
+            CellStorage::C(cl) => cl.any_cluster_attrs(wants_extraction),
+        }
+    }
+
     /// Iterates the visible cells, respecting the width of the cell.
     /// For instance, a double-width cell overlaps the following (blank)
     /// cell, so that blank cell is omitted from the iterator results.
