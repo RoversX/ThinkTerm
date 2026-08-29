@@ -50,16 +50,54 @@ pub fn alloc_font_id() -> LoadedFontId {
 
 lazy_static::lazy_static! {
     static ref LAST_WARNING: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
-    /// Fallback resolution results, process-wide, keyed by config generation
-    /// and the sorted missing codepoints. Resolution depends on neither font
-    /// size nor scale, but every LoadedFont (one per preview scale bucket in
-    /// the GUI) used to re-run the async resolve for the same codepoints and
-    /// answer its arrival by throwing away every shape cache. A memo hit is
-    /// a synchronous insert with nothing to clear. An empty entry records
+    /// Fallback resolution results, process-wide, keyed by the sorted missing
+    /// codepoints within one config generation. Resolution depends on neither
+    /// font size nor scale, but every LoadedFont (one per preview scale bucket
+    /// in the GUI) used to re-run the async resolve for the same codepoints
+    /// and answer its arrival by throwing away every shape cache. A memo hit
+    /// is a synchronous insert with nothing to clear. An empty entry records
     /// "nothing provides these", which also stops unresolvable glyphs from
     /// re-scheduling the resolver once per font forever.
-    static ref FALLBACK_RESOLVE_MEMO: Mutex<HashMap<(usize, Vec<char>), Vec<ParsedFont>>> =
-        Mutex::new(HashMap::new());
+    static ref FALLBACK_RESOLVE_MEMO: Mutex<FallbackResolveMemo> =
+        Mutex::new(FallbackResolveMemo::default());
+}
+
+/// Entries can weigh tens of KB each for CJK fallbacks, so the memo holds
+/// only the current config generation and a bounded number of entries;
+/// exceeding either simply forgets and re-resolves.
+const FALLBACK_RESOLVE_MEMO_CAP: usize = 512;
+
+#[derive(Default)]
+struct FallbackResolveMemo {
+    generation: usize,
+    entries: HashMap<Vec<char>, Vec<ParsedFont>>,
+}
+
+impl FallbackResolveMemo {
+    fn get(&self, generation: usize, chars: &[char]) -> Option<Vec<ParsedFont>> {
+        if self.generation != generation {
+            return None;
+        }
+        self.entries.get(chars).cloned()
+    }
+
+    fn insert(&mut self, generation: usize, chars: Vec<char>, handles: Vec<ParsedFont>) {
+        // Async resolves can complete out of order across a config reload;
+        // a straggler from an older generation must not clear the newer
+        // entries or roll the generation back.
+        if generation < self.generation {
+            return;
+        }
+        if generation > self.generation {
+            self.entries.clear();
+            self.generation = generation;
+        } else if self.entries.len() >= FALLBACK_RESOLVE_MEMO_CAP
+            && !self.entries.contains_key(&chars)
+        {
+            self.entries.clear();
+        }
+        self.entries.insert(chars, handles);
+    }
 }
 
 pub struct LoadedFont {
@@ -244,8 +282,7 @@ impl LoadedFont {
                     let memo = FALLBACK_RESOLVE_MEMO
                         .lock()
                         .unwrap()
-                        .get(&(generation, no_glyphs.clone()))
-                        .cloned();
+                        .get(generation, &no_glyphs);
                     if let Some(handles) = memo {
                         consulted_memo = true;
                         let inserted = if handles.is_empty() {
@@ -448,7 +485,8 @@ impl FallbackResolveInfo {
         // LoadedFont missing these same codepoints resolves synchronously
         // instead of repeating this search and clearing every shape cache.
         FALLBACK_RESOLVE_MEMO.lock().unwrap().insert(
-            (self.config.generation(), memo_glyphs.clone()),
+            self.config.generation(),
+            memo_glyphs.clone(),
             extra_handles.clone(),
         );
 
@@ -1371,5 +1409,41 @@ mod tests {
         assert_ne!(retina_again.id(), standard.id());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fallback_memo_test {
+    use super::*;
+
+    #[test]
+    fn memo_is_scoped_to_one_generation_and_bounded() {
+        let mut memo = FallbackResolveMemo::default();
+        memo.insert(1, vec!['a'], vec![]);
+        assert!(memo.get(1, &['a']).is_some());
+        assert!(memo.get(2, &['a']).is_none(), "other generations must miss");
+
+        memo.insert(2, vec!['b'], vec![]);
+        assert!(
+            memo.get(1, &['a']).is_none(),
+            "a new generation drops the old one's entries"
+        );
+        assert!(memo.get(2, &['b']).is_some());
+
+        memo.insert(1, vec!['c'], vec![]);
+        assert!(
+            memo.get(2, &['b']).is_some(),
+            "a straggler from an older generation must not clear newer entries"
+        );
+        assert!(memo.get(1, &['c']).is_none());
+        assert!(memo.get(2, &['c']).is_none());
+
+        for n in 0..FALLBACK_RESOLVE_MEMO_CAP as u32 {
+            memo.insert(2, vec![char::from_u32(0x4e00 + n).unwrap()], vec![]);
+        }
+        assert!(memo.entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
+        memo.insert(2, vec!['z'], vec![]);
+        assert!(memo.get(2, &['z']).is_some());
+        assert!(memo.entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
     }
 }
