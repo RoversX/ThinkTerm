@@ -97,7 +97,11 @@ impl ClusteredLine {
     }
 
     pub fn to_cell_vec(&self) -> Vec<Cell> {
-        let mut cells = vec![];
+        // This vec becomes the line's retained storage, so doubling growth
+        // would keep up to 60% slack alive in scrollback. len() is a width
+        // sum, which zero-width cells can overshoot; the shrink is a no-op
+        // in the exact case and trims the rare doubled buffer otherwise.
+        let mut cells = Vec::with_capacity(self.len());
 
         for c in self.iter() {
             cells.push(c.as_cell());
@@ -106,15 +110,19 @@ impl ClusteredLine {
             }
         }
 
+        cells.shrink_to_fit();
         cells
     }
 
     pub fn from_cell_vec<'a>(hint: usize, iter: impl Iterator<Item = CellRef<'a>>) -> Self {
         let mut last_cluster: Option<Cluster> = None;
-        let mut is_double_wide = FixedBitSet::with_capacity(hint);
-        let mut text = String::new();
+        // Runs once for every line that scrolls off: size the text up front
+        // and touch the bitset only if a wide cell actually appears, instead
+        // of growing one realloc at a time and allocating a bitset that the
+        // typical all-narrow line immediately throws away.
+        let mut is_double_wide: Option<Box<FixedBitSet>> = None;
+        let mut text = String::with_capacity(hint);
         let mut clusters = vec![];
-        let mut any_double = false;
         let mut len = 0;
         let mut last_cell_width = None;
 
@@ -123,8 +131,9 @@ impl ClusteredLine {
             last_cell_width = NonZeroU8::new(1);
 
             if cell.width() > 1 {
-                any_double = true;
-                is_double_wide.set(cell.cell_index(), true);
+                is_double_wide
+                    .get_or_insert_with(|| Box::new(FixedBitSet::with_capacity(hint)))
+                    .set(cell.cell_index(), true);
             }
 
             text.push_str(cell.str());
@@ -152,13 +161,14 @@ impl ClusteredLine {
             clusters.push(cluster);
         }
 
+        // `hint` counts cells, not bytes: a few multi-byte graphemes push
+        // past the reservation and amortized growth would retain ~2x hint
+        // for the life of the scrollback line. No-op when the fit is exact.
+        text.shrink_to_fit();
+
         Self {
             text,
-            is_double_wide: if any_double {
-                Some(Box::new(is_double_wide))
-            } else {
-                None
-            },
+            is_double_wide,
             clusters,
             len: len.try_into().unwrap(),
             last_cell_width,
