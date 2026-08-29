@@ -76,11 +76,17 @@ struct CachedLeaderInfo {
     path: Option<std::path::PathBuf>,
     current_working_dir: Option<std::path::PathBuf>,
     updating: bool,
+    /// Bumped on every refresh claim and on every FetchImmediate
+    /// replacement. A background refresh may only write its results back
+    /// while the claim it snapshotted is still current; anything else
+    /// means fresher data landed in the meantime and the stale results
+    /// must be discarded.
+    claim: u64,
 }
 
 #[cfg(unix)]
 impl CachedLeaderInfo {
-    fn new(fd: Option<std::os::fd::RawFd>) -> Self {
+    fn new(fd: Option<std::os::fd::RawFd>, claim: u64) -> Self {
         let mut me = Self {
             updated: Instant::now(),
             fd: fd.unwrap_or(-1),
@@ -88,6 +94,7 @@ impl CachedLeaderInfo {
             path: None,
             current_working_dir: None,
             updating: false,
+            claim,
         };
         me.update();
         me
@@ -97,21 +104,199 @@ impl CachedLeaderInfo {
         self.fd != -1 && !self.updating
     }
 
-    fn update(&mut self) {
-        self.pid = unsafe { libc::tcgetpgrp(self.fd) } as u32;
-        if self.pid > 0 {
-            self.path = LocalProcessInfo::executable_path(self.pid);
-            self.current_working_dir = LocalProcessInfo::current_working_dir(self.pid);
+    /// The actual probe: pure syscalls against the fd, no locks, no shared
+    /// state. tcgetpgrp reports errors as -1, which must not survive the
+    /// cast to u32 or the process-info lookups chase pid 4294967295.
+    fn probe(
+        fd: std::os::fd::RawFd,
+    ) -> (u32, Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        let pgrp = unsafe { libc::tcgetpgrp(fd) };
+        if pgrp > 0 {
+            let pid = pgrp as u32;
+            (
+                pid,
+                LocalProcessInfo::executable_path(pid),
+                LocalProcessInfo::current_working_dir(pid),
+            )
         } else {
-            self.path.take();
-            self.current_working_dir.take();
+            (0, None, None)
         }
+    }
+
+    fn update(&mut self) {
+        let (pid, path, cwd) = Self::probe(self.fd);
+        self.pid = pid;
+        self.path = path;
+        self.current_working_dir = cwd;
         self.updated = Instant::now();
         self.updating = false;
     }
 
     fn expired(&self) -> bool {
         self.updated.elapsed() > PROC_INFO_CACHE_TTL
+    }
+}
+
+/// Refreshes stale [`CachedLeaderInfo`] entries on smol's blocking pool
+/// instead of spawning a short-lived OS thread per pane per refresh (the
+/// old scheme cost a thread creation up to every 300ms per pane). The pool
+/// reuses warm threads and grows on demand, so one probe blocking forever
+/// (a cwd on a dead network mount, a D-state process) delays only its own
+/// pane instead of wedging every pane behind a single worker, and there is
+/// no request queue to overflow or fail to start.
+#[cfg(unix)]
+mod leader_refresh {
+    use super::CachedLeaderInfo;
+    use parking_lot::Mutex;
+    use std::sync::{Arc, Weak};
+
+    type LeaderCell = Mutex<Option<CachedLeaderInfo>>;
+
+    /// Queue a refresh of `leader`. The per-entry `updating` flag caps the
+    /// outstanding work at one task per pane.
+    ///
+    /// Deliberately never takes the leader lock: the caller holds it.
+    pub(super) fn request_refresh(leader: &Arc<LeaderCell>) {
+        let weak = Arc::downgrade(leader);
+        smol::unblock(move || refresh_one(&weak)).detach();
+    }
+
+    fn refresh_one(weak: &Weak<LeaderCell>) {
+        // The upgrade proves the cache cell is alive, not the pane: the pty
+        // (and its fd) can be gone by the time the probe runs, same as the
+        // old per-refresh thread. The probe is read-only and its result
+        // then lands in a cache nobody reads again, so that race is
+        // harmless; the upgrade just stops queued work for dead panes.
+        let Some(cell) = weak.upgrade() else { return };
+        let Some((fd, claim)) = snapshot(&cell) else {
+            return;
+        };
+        // The syscalls run without the lock so stale reads stay fast.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CachedLeaderInfo::probe(fd)
+        }));
+        match result {
+            Ok((pid, path, cwd)) => write_back(&cell, claim, pid, path, cwd),
+            Err(err) => {
+                // A panic must not strand the entry mid-claim (can_update()
+                // would stay false for the pane's whole life), but the flag
+                // may only be cleared while the claim is still ours: a
+                // newer claimant owns it otherwise.
+                if let Some(info) = cell.lock().as_mut() {
+                    if info.claim == claim {
+                        info.updating = false;
+                    }
+                }
+                log::error!("leader refresh panicked: {err:?}");
+            }
+        }
+    }
+
+    fn snapshot(cell: &LeaderCell) -> Option<(std::os::fd::RawFd, u64)> {
+        let guard = cell.lock();
+        match guard.as_ref() {
+            Some(info) if info.updating && info.fd != -1 => Some((info.fd, info.claim)),
+            _ => None,
+        }
+    }
+
+    fn write_back(
+        cell: &LeaderCell,
+        claim: u64,
+        pid: u32,
+        path: Option<std::path::PathBuf>,
+        cwd: Option<std::path::PathBuf>,
+    ) {
+        let mut guard = cell.lock();
+        if let Some(info) = guard.as_mut() {
+            if info.claim == claim {
+                info.pid = pid;
+                info.path = path;
+                info.current_working_dir = cwd;
+                info.updated = std::time::Instant::now();
+                info.updating = false;
+            }
+            // On mismatch the results are discarded and `updating` is left
+            // alone: it belongs to whoever holds the newer claim now.
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::Instant;
+
+        fn entry(fd: std::os::fd::RawFd, claim: u64) -> CachedLeaderInfo {
+            CachedLeaderInfo {
+                updated: Instant::now(),
+                fd,
+                pid: 0,
+                path: None,
+                current_working_dir: None,
+                updating: true,
+                claim,
+            }
+        }
+
+        #[test]
+        fn probe_reports_tcgetpgrp_errors_as_no_leader() {
+            // tcgetpgrp(-1) fails with -1; the old `as u32` cast turned
+            // that into pid 4294967295 and chased its process info.
+            let (pid, path, cwd) = CachedLeaderInfo::probe(-1);
+            assert_eq!(pid, 0);
+            assert!(path.is_none());
+            assert!(cwd.is_none());
+        }
+
+        #[test]
+        fn refresh_writes_back_and_clears_the_claim() {
+            let file = std::fs::File::open("/dev/null").unwrap();
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+            let cell = Arc::new(Mutex::new(Some(entry(fd, 7))));
+            refresh_one(&Arc::downgrade(&cell));
+            let guard = cell.lock();
+            let info = guard.as_ref().unwrap();
+            assert!(!info.updating, "refresh must release the claim");
+            assert_eq!(info.pid, 0, "/dev/null has no foreground group");
+            assert_eq!(info.claim, 7);
+        }
+
+        #[test]
+        fn stale_write_back_is_discarded() {
+            // Simulates a FetchImmediate (or newer claim) landing while the
+            // worker was mid-probe: the claim moved on, so the older
+            // results must not clobber the fresher entry.
+            let cell = Arc::new(Mutex::new(Some(CachedLeaderInfo {
+                pid: 42,
+                path: Some(std::path::PathBuf::from("/fresh")),
+                ..entry(-1, 8)
+            })));
+            write_back(
+                &cell,
+                7,
+                0,
+                Some(std::path::PathBuf::from("/stale")),
+                None,
+            );
+            let guard = cell.lock();
+            let info = guard.as_ref().unwrap();
+            assert_eq!(info.pid, 42);
+            assert_eq!(info.path.as_deref(), Some(std::path::Path::new("/fresh")));
+            assert!(
+                info.updating,
+                "the newer claim's refresh still owns the flag"
+            );
+        }
+
+        #[test]
+        fn matching_write_back_applies() {
+            let cell = Arc::new(Mutex::new(Some(entry(-1, 9))));
+            write_back(&cell, 9, 5, Some(std::path::PathBuf::from("/bin/sh")), None);
+            let guard = cell.lock();
+            let info = guard.as_ref().unwrap();
+            assert_eq!(info.pid, 5);
+            assert!(!info.updating);
+        }
     }
 }
 
@@ -1082,23 +1267,25 @@ impl LocalPane {
     fn get_leader(&self, policy: CachePolicy) -> CachedLeaderInfo {
         let mut leader = self.leader.lock();
 
-        if policy == CachePolicy::FetchImmediate {
-            leader.replace(CachedLeaderInfo::new(self.pty.lock().as_raw_fd()));
+        if policy == CachePolicy::FetchImmediate || leader.is_none() {
+            // The fd is bound first so the pty guard drops before the
+            // probe syscalls run; inlined, the temporary guard lives to
+            // the end of the statement and blocks resize/tty_name/writes
+            // for the probe's full ~700µs+.
+            let fd = self.pty.lock().as_raw_fd();
+            let claim = leader
+                .as_ref()
+                .map(|info| info.claim.wrapping_add(1))
+                .unwrap_or(0);
+            leader.replace(CachedLeaderInfo::new(fd, claim));
         } else if let Some(info) = leader.as_mut() {
-            // If stale, queue up some work in another thread to update.
-            // Right now, we'll return the stale data.
+            // If stale, claim the entry and queue a background refresh;
+            // the stale data is returned immediately.
             if info.expired() && info.can_update() {
                 info.updating = true;
-                let leader_ref = Arc::clone(&self.leader);
-                std::thread::spawn(move || {
-                    let mut leader = leader_ref.lock();
-                    if let Some(leader) = leader.as_mut() {
-                        leader.update();
-                    }
-                });
+                info.claim = info.claim.wrapping_add(1);
+                leader_refresh::request_refresh(&self.leader);
             }
-        } else {
-            leader.replace(CachedLeaderInfo::new(self.pty.lock().as_raw_fd()));
         }
 
         (*leader).clone().unwrap()
