@@ -438,6 +438,11 @@ pub fn set_application_icon_from_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[link(name = "Foundation", kind = "framework")]
+extern "C" {
+    static NSRunLoopCommonModes: id;
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGSMainConnectionID() -> id;
@@ -3548,25 +3553,78 @@ impl WindowView {
         }
     }
 
+    /// Re-post `selector` for a later runloop turn in the common modes,
+    /// so the retry also fires inside tracking loops (title-bar drags,
+    /// live resize, open menus) — a plain afterDelay: schedules only in
+    /// the default mode and can defer for the whole interaction.
+    ///
+    /// Earlier pending posts of the same selector are cancelled first
+    /// (the rechecks are level reads, one is enough), and the small
+    /// non-zero delay keeps a busy-borrow retry from turning into a
+    /// zero-delay spin should a future handler ever hold the borrow
+    /// across a nested runloop.
+    fn perform_in_common_modes(view_ptr: id, selector: Sel) {
+        unsafe {
+            let () = msg_send![class!(NSObject), cancelPreviousPerformRequestsWithTarget: view_ptr
+                               selector: selector
+                               object: nil];
+            let modes: id = msg_send![class!(NSArray), arrayWithObject: NSRunLoopCommonModes];
+            let () = msg_send![view_ptr, performSelector: selector
+                               withObject: nil
+                               afterDelay: 0.02
+                               inModes: modes];
+        }
+    }
+
     extern "C" fn did_become_key(this: &mut Object, _sel: Sel, _id: id) {
+        let view_ptr: id = this as *mut Object;
         if let Some(this) = Self::get_this(this) {
             if let Ok(mut inner) = this.inner.try_borrow_mut() {
                 inner.events.dispatch(WindowEvent::FocusChanged(true));
             } else {
-                log::trace!("skipping focus gained notification while window is busy");
+                // Key-window state is level-triggered and queryable, so a
+                // busy window re-reads it next turn instead of dropping
+                // the edge: a stale focus flag now also means a stale
+                // repaint throttle and frame latency, not just a wrong
+                // cursor style.
+                log::trace!("re-posting focus recheck while window is busy");
+                Self::perform_in_common_modes(view_ptr, sel!(thinktermRecheckKey));
             }
             this.update_application_presentation(true);
         }
     }
 
     extern "C" fn did_resign_key(this: &mut Object, _sel: Sel, _id: id) {
+        let view_ptr: id = this as *mut Object;
         if let Some(this) = Self::get_this(this) {
             if let Ok(mut inner) = this.inner.try_borrow_mut() {
                 inner.events.dispatch(WindowEvent::FocusChanged(false));
             } else {
-                log::trace!("skipping focus lost notification while window is busy");
+                log::trace!("re-posting focus recheck while window is busy");
+                Self::perform_in_common_modes(view_ptr, sel!(thinktermRecheckKey));
             }
             this.update_application_presentation(true);
+        }
+    }
+
+    extern "C" fn recheck_key(view: &mut Object, _sel: Sel) {
+        let view_ptr: id = view as *mut Object;
+        if let Some(this) = Self::get_this(view) {
+            // See recheck_occlusion: a post-close recheck must not
+            // dispatch a spurious blur into a torn-down TermWindow.
+            let window: id = unsafe { msg_send![view_ptr, window] };
+            if window.is_null() {
+                return;
+            }
+            let is_key = unsafe {
+                let key: BOOL = msg_send![window, isKeyWindow];
+                key == YES
+            };
+            if let Ok(mut inner) = this.inner.try_borrow_mut() {
+                inner.events.dispatch(WindowEvent::FocusChanged(is_key));
+            } else {
+                Self::perform_in_common_modes(view_ptr, sel!(thinktermRecheckKey));
+            }
         }
     }
 
@@ -3579,21 +3637,40 @@ impl WindowView {
         const NS_WINDOW_OCCLUSION_STATE_VISIBLE: NSUInteger = 1 << 1;
         let view_ptr: id = view as *mut Object;
         if let Some(this) = Self::get_this(view) {
+            // A deferred recheck can fire after the window closed
+            // (performSelector retains the view); a nil window must not
+            // dispatch a destructive "occluded" edge into a torn-down
+            // TermWindow.
+            let window: id = unsafe { msg_send![view_ptr, window] };
+            if window.is_null() {
+                return;
+            }
             let visible = unsafe {
-                let window: id = msg_send![view_ptr, window];
-                if window.is_null() {
-                    false
-                } else {
-                    let state: NSUInteger = msg_send![window, occlusionState];
-                    (state & NS_WINDOW_OCCLUSION_STATE_VISIBLE) != 0
-                }
+                let state: NSUInteger = msg_send![window, occlusionState];
+                (state & NS_WINDOW_OCCLUSION_STATE_VISIBLE) != 0
             };
             if visible && this.invalidated.get() {
                 unsafe {
                     let () = msg_send![view_ptr, setNeedsDisplay: YES];
                 }
             }
+            // Deliver the transition to the app layer. Occlusion is
+            // level-triggered and queryable, so unlike focus a busy
+            // window must not drop the edge — a lost "visible again"
+            // would leave the GUI convinced the window is still hidden
+            // and let a deferred cache release run in front of the
+            // user. Re-post and re-read instead.
+            if let Ok(mut inner) = this.inner.try_borrow_mut() {
+                inner.events.dispatch(WindowEvent::OcclusionChanged(visible));
+            } else {
+                log::trace!("re-posting occlusion recheck while window is busy");
+                Self::perform_in_common_modes(view_ptr, sel!(thinktermRecheckOcclusion));
+            }
         }
+    }
+
+    extern "C" fn recheck_occlusion(this: &mut Object, _sel: Sel) {
+        Self::did_change_occlusion_state(this, sel!(windowDidChangeOcclusionState:), nil);
     }
 
     // Switch the coordinate system to have 0,0 in the top left
@@ -4897,6 +4974,14 @@ impl WindowView {
             cls.add_method(
                 sel!(thinktermRearmNeedsDisplay),
                 Self::rearm_needs_display as extern "C" fn(&mut Object, Sel),
+            );
+            cls.add_method(
+                sel!(thinktermRecheckOcclusion),
+                Self::recheck_occlusion as extern "C" fn(&mut Object, Sel),
+            );
+            cls.add_method(
+                sel!(thinktermRecheckKey),
+                Self::recheck_key as extern "C" fn(&mut Object, Sel),
             );
             cls.add_method(
                 sel!(thinktermDrainNotifications),

@@ -1892,6 +1892,11 @@ pub struct TermWindow {
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     pub focused: Option<Instant>,
+    /// When the window stopped being visible to the user (fully covered,
+    /// minimized, on another macOS Space, app hidden). None while
+    /// visible. The timestamp doubles as the start of the grace period
+    /// before occlusion-driven cache release.
+    occluded: Option<Instant>,
     fonts: Rc<FontConfiguration>,
     /// Window dimensions and dpi
     pub dimensions: Dimensions,
@@ -2747,6 +2752,18 @@ impl TermWindow {
             || self.workspace_sidebar_hover.needs_frames()
     }
 
+    /// Tracks whether the user can see this window at all. macOS reports
+    /// the transition via WindowEvent::OcclusionChanged; other platforms
+    /// never emit it and the window simply counts as always visible.
+    fn occlusion_changed(&mut self, visible: bool, _window: &Window) {
+        log::trace!("Setting occlusion visible={visible:?}");
+        if visible {
+            self.occluded = None;
+        } else if self.occluded.is_none() {
+            self.occluded = Some(Instant::now());
+        }
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         if focused == self.focused.is_some() {
             // Level rechecks (and AppKit itself) can repeat an edge; a
@@ -2757,6 +2774,14 @@ impl TermWindow {
         }
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
+        if focused {
+            // Focus implies visible; belt-and-braces cover for a lost
+            // occlusion edge (the window backend re-posts rather than
+            // drops them). If a window somehow gains key focus while
+            // genuinely still hidden, this skips at most one episode's
+            // release — accepted.
+            self.occluded = None;
+        }
         // Disarm the unfocused repaint throttle either way: on focus the
         // invalidate below repaints immediately and a stale latch would
         // swallow the next output event; on blur the first output should
@@ -3078,6 +3103,7 @@ impl TermWindow {
             config_overrides,
             palette: None,
             focused: None,
+            occluded: None,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
             fonts: Rc::clone(&fontconfig),
@@ -3611,6 +3637,10 @@ impl TermWindow {
             }
             WindowEvent::FocusChanged(focused) => {
                 self.focus_changed(focused, window);
+                Ok(true)
+            }
+            WindowEvent::OcclusionChanged(visible) => {
+                self.occlusion_changed(visible, window);
                 Ok(true)
             }
             WindowEvent::MouseEvent(event) => {

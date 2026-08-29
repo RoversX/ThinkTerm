@@ -79,6 +79,7 @@ impl MyWindow {
                 }
             }
             WindowEvent::AppearanceChanged(_)
+            | WindowEvent::OcclusionChanged(_)
             | WindowEvent::AdviseDeadKeyStatus(_)
             | WindowEvent::AdviseModifiersLedStatus(_, _)
             | WindowEvent::Notification(_)
