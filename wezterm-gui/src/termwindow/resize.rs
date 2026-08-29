@@ -246,12 +246,14 @@ impl super::TermWindow {
         let gate = if let Some(client) = pane.downcast_ref::<ClientPane>() {
             client.remote_frontend_gate()
         } else {
-            let state = Mux::get().frontend_access_state();
+            let mux = Mux::get();
+            let state = mux.frontend_access_state();
+            // The lease predicate, not a bare owner comparison: it carries the
+            // sole-live-renderer recovery, so after the last TUI detaches the
+            // GUI's own panes come back on their own instead of sitting behind
+            // a takeover surface with nobody left to take the terminal from.
             if state.mode == mux::FrontendAccessMode::TmuxLatest
-                || Mux::get()
-                    .active_identity()
-                    .as_deref()
-                    .is_some_and(|identity| state.owner.as_ref() == Some(identity))
+                || mux.current_identity_owns_frontend_lease(tab.tab_id())
             {
                 RemoteFrontendGate::Visible
             } else {
