@@ -643,6 +643,13 @@ pub enum KeyAssignment {
     /// default. Applied through the window's config_overrides, the same
     /// mechanism as window:set_config_overrides.
     SetColorScheme(Option<String>),
+    /// Jump straight to a saved thread, switching Space first when it lives
+    /// in another one. Carries both ids because thread ids are only unique
+    /// within their Space's store.
+    ActivateWorkspaceThread {
+        space_id: String,
+        thread_id: String,
+    },
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),

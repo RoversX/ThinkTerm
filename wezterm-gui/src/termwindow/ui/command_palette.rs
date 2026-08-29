@@ -9,6 +9,7 @@
 
 use crate::commands::ExpandedCommand;
 use crate::overlay::selector::{matcher_pattern, matcher_score};
+use crate::workspace_threads::{ThreadSearchEntry, WorkspaceThreadWorkStatus};
 use crate::termwindow::palette::{build_commands, format_key_label, frecency_scores, save_recent};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::{GuiWin, TermWindowNotif, UIItem, UIItemType, COMMAND_PALETTE_ZINDEX};
@@ -86,6 +87,7 @@ pub(crate) enum PaletteAction {
 enum PaletteGroupKind {
     ColorScheme,
     Space,
+    Thread,
     Workspace,
     DomainNewTab,
     DomainAttach,
@@ -96,6 +98,15 @@ enum PaletteGroupKind {
 pub(crate) enum PaletteItem {
     Leaf(ExpandedCommand),
     Group(PaletteGroup),
+    /// A non-selectable divider naming the rows beneath it. Never scores on
+    /// its own; it rides along whenever one of its members survives a query.
+    Header(PaletteHeader),
+}
+
+pub(crate) struct PaletteHeader {
+    label: String,
+    /// Right-hand detail, e.g. the project's path.
+    detail: String,
 }
 
 pub(crate) struct PaletteGroup {
@@ -107,6 +118,8 @@ pub(crate) struct PaletteGroup {
     /// Extra English terms folded into the fuzzy haystack so localized group
     /// labels stay findable by their conventional names.
     aliases: &'static str,
+    /// Lets a caller open the palette already drilled into one group.
+    kind: PaletteGroupKind,
     items: Rc<Vec<PaletteItem>>,
     /// One fuzzy haystack per child, precomputed at build time: formatting
     /// ~1000 scheme haystacks (each with a `{:?}` of the action) on every
@@ -165,6 +178,7 @@ impl Default for PaletteLayout {
 enum EntryKind {
     Group(usize),
     Leaf,
+    Header,
 }
 
 pub(crate) struct CommandPaletteState {
@@ -263,6 +277,7 @@ impl CommandPaletteState {
         } else if self.selected >= len {
             self.selected = len - 1;
         }
+        self.snap_selection(true);
     }
 
     fn invalidate_matches(&mut self) {
@@ -297,6 +312,7 @@ impl CommandPaletteState {
             MatchEntry::Item(idx) => match self.current_items().get(idx)? {
                 PaletteItem::Group(_) => Some(EntryKind::Group(idx)),
                 PaletteItem::Leaf(_) => Some(EntryKind::Leaf),
+                PaletteItem::Header(_) => Some(EntryKind::Header),
             },
             MatchEntry::Nested(..) => Some(EntryKind::Leaf),
         }
@@ -306,15 +322,15 @@ impl CommandPaletteState {
         match self.entry(order_idx)? {
             MatchEntry::Item(idx) => match self.current_items().get(idx)? {
                 PaletteItem::Leaf(cmd) => Some(cmd.clone()),
-                PaletteItem::Group(_) => None,
+                PaletteItem::Group(_) | PaletteItem::Header(_) => None,
             },
             MatchEntry::Nested(group_idx, child_idx) => {
                 match self.current_items().get(group_idx)? {
                     PaletteItem::Group(group) => match group.items.get(child_idx)? {
                         PaletteItem::Leaf(cmd) => Some(cmd.clone()),
-                        PaletteItem::Group(_) => None,
+                        PaletteItem::Group(_) | PaletteItem::Header(_) => None,
                     },
-                    PaletteItem::Leaf(_) => None,
+                    PaletteItem::Leaf(_) | PaletteItem::Header(_) => None,
                 }
             }
         }
@@ -370,7 +386,39 @@ impl CommandPaletteState {
         }
         let current = self.selected as isize;
         self.selected = (current + delta).clamp(0, len as isize - 1) as usize;
+        self.snap_selection(delta > 0);
         self.ensure_selected_visible();
+    }
+
+    fn is_header_row(&self, order_idx: usize) -> bool {
+        matches!(self.classify_entry(order_idx), Some(EntryKind::Header))
+    }
+
+    /// Steps the selection off a header, preferring the given direction and
+    /// falling back to the other one at the ends of the list.
+    fn snap_selection(&mut self, forward: bool) {
+        let len = self.order_len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        self.selected = self.selected.min(len - 1);
+        if !self.is_header_row(self.selected) {
+            return;
+        }
+        let ahead: Vec<usize> = (self.selected + 1..len).collect();
+        let behind: Vec<usize> = (0..self.selected).rev().collect();
+        let (first, second) = if forward {
+            (ahead, behind)
+        } else {
+            (behind, ahead)
+        };
+        for idx in first.into_iter().chain(second) {
+            if !self.is_header_row(idx) {
+                self.selected = idx;
+                return;
+            }
+        }
     }
 
     fn set_selection(&mut self, idx: usize) {
@@ -379,6 +427,7 @@ impl CommandPaletteState {
             return;
         }
         self.selected = idx.min(len - 1);
+        self.snap_selection(true);
         self.ensure_selected_visible();
     }
 
@@ -405,6 +454,7 @@ fn item_label(item: &PaletteItem) -> &str {
     match item {
         PaletteItem::Leaf(cmd) => &cmd.brief,
         PaletteItem::Group(group) => &group.label,
+        PaletteItem::Header(header) => &header.label,
     }
 }
 
@@ -420,6 +470,8 @@ fn item_haystack(item: &PaletteItem) -> String {
         PaletteItem::Group(group) => {
             format!("{} {} {}", group.label, group.doc, group.aliases)
         }
+        // Headers follow their members rather than matching on their own.
+        PaletteItem::Header(_) => String::new(),
     }
 }
 
@@ -440,9 +492,21 @@ fn compute_order(
     }
 
     let pattern = matcher_pattern(query);
-    let mut scored: Vec<(u32, MatchEntry)> = items
+    // The header each row belongs to, so a surviving row can bring its
+    // header along. All None for a list without headers.
+    let mut owner: Vec<Option<usize>> = Vec::with_capacity(items.len());
+    let mut current_header: Option<usize> = None;
+    for (idx, item) in items.iter().enumerate() {
+        if matches!(item, PaletteItem::Header(_)) {
+            current_header = Some(idx);
+        }
+        owner.push(current_header);
+    }
+
+    let mut scored: Vec<(u32, usize)> = items
         .iter()
         .enumerate()
+        .filter(|(_, item)| !matches!(item, PaletteItem::Header(_)))
         .filter_map(|(idx, item)| {
             let owned;
             let haystack: &str = match haystacks.and_then(|all| all.get(idx)) {
@@ -460,12 +524,31 @@ fn compute_order(
                 } else {
                     score
                 };
-                (score, MatchEntry::Item(idx))
+                (score, idx)
             })
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut order: Vec<MatchEntry> = scored.into_iter().map(|(_, entry)| entry).collect();
+
+    // Regroup under the headers, best block first. `scored` is already in
+    // score order, so first appearance ranks the blocks and the members
+    // stay ranked inside each. A list with no headers is one block, which
+    // reproduces the plain score order exactly.
+    let mut blocks: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+    for (_, idx) in scored {
+        let key = owner[idx];
+        match blocks.iter_mut().find(|(block_key, _)| *block_key == key) {
+            Some((_, members)) => members.push(idx),
+            None => blocks.push((key, vec![idx])),
+        }
+    }
+    let mut order: Vec<MatchEntry> = Vec::new();
+    for (key, members) in blocks {
+        if let Some(header_idx) = key {
+            order.push(MatchEntry::Item(header_idx));
+        }
+        order.extend(members.into_iter().map(MatchEntry::Item));
+    }
 
     // Direct matches first, then a capped peek into each group so a theme or
     // workspace name typed at the top level is still reachable without
@@ -568,6 +651,11 @@ fn group_meta(kind: PaletteGroupKind) -> (&'static str, SvgIcon, &'static str) {
             SvgIcon::SquareStack,
             "space switch spaces",
         ),
+        PaletteGroupKind::Thread => (
+            "command-palette-group-thread",
+            SvgIcon::Search,
+            "thread threads project projects session search find open",
+        ),
         PaletteGroupKind::Workspace => (
             "command-palette-group-workspace",
             SvgIcon::Layers,
@@ -646,6 +734,139 @@ fn nerd_icon_to_svg(name: Option<&str>) -> Option<SvgIcon> {
         "oct_terminal" => SvgIcon::Terminal,
         _ => return None,
     })
+}
+
+/// The hues the sidebar's thread dots use, so a row reads the same in both.
+const THREAD_LIVE_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
+const THREAD_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
+const DOT_SIZE: f32 = 12.0;
+
+enum RowIcon {
+    None,
+    Glyph(SvgIcon),
+    Tinted(SvgIcon, LinearRgba),
+    Dot(LinearRgba),
+}
+
+/// Thread rows carry their state in the icon name — `tt_thread:<work>:<tone>`
+/// — so the generic `ExpandedCommand` needs no colour of its own. Returns
+/// None for every other kind of row.
+fn thread_row_indicator(name: Option<&str>, palette: &UiPalette) -> Option<RowIcon> {
+    let (work, tone) = name?.strip_prefix("tt_thread:")?.split_once(':')?;
+    // Same ladder as sidebar_thread_dot_color, minus the active case: the
+    // palette closes before the thread it opens becomes active.
+    let color = match tone {
+        "unread" => palette.selected_bg,
+        "pinned" => palette.text.mul_alpha(0.68),
+        "live" => THREAD_LIVE_COLOR,
+        _ => palette.text.mul_alpha(0.28),
+    };
+    Some(match work {
+        "done" => RowIcon::Tinted(SvgIcon::CircleCheck, THREAD_DONE_COLOR),
+        "running" => RowIcon::Tinted(SvgIcon::LoaderCircle, color),
+        "attention" => RowIcon::Tinted(SvgIcon::CircleAlert, color),
+        _ => RowIcon::Dot(color),
+    })
+}
+
+/// A command row's icon: a thread's state indicator when it has one, else
+/// the Lucide glyph its Nerd Font name maps to.
+fn row_icon(cmd: &ExpandedCommand, palette: &UiPalette) -> RowIcon {
+    if let Some(indicator) = thread_row_indicator(cmd.icon.as_deref(), palette) {
+        return indicator;
+    }
+    match nerd_icon_to_svg(cmd.icon.as_deref()) {
+        Some(icon) => RowIcon::Glyph(icon),
+        None => RowIcon::None,
+    }
+}
+
+/// The icon name that `thread_row_indicator` decodes.
+fn thread_icon_name(entry: &ThreadSearchEntry) -> String {
+    let work = match entry.work_status {
+        WorkspaceThreadWorkStatus::Running => "running",
+        WorkspaceThreadWorkStatus::NeedsAttention => "attention",
+        WorkspaceThreadWorkStatus::FinishedUnseen => "done",
+        WorkspaceThreadWorkStatus::Idle => "idle",
+    };
+    let tone = if entry.is_unread {
+        "unread"
+    } else if entry.is_pinned {
+        "pinned"
+    } else if entry.is_live {
+        "live"
+    } else {
+        "plain"
+    };
+    format!("tt_thread:{work}:{tone}")
+}
+
+/// `path` with the home directory folded back to `~`, for the header's
+/// right-hand detail. Three different projects are called "Home".
+fn abbreviate_home(path: &str) -> String {
+    let home = config::HOME_DIR.to_string_lossy().to_string();
+    match path.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// The searchable part of a project path. Matching the whole thing would
+/// let "users" or "documents" hit every local project; the tail names it,
+/// and for a remote root the user and host do.
+fn search_path_terms(path: &str) -> String {
+    if let Some((scheme, rest)) = path.split_once("://") {
+        return format!("{scheme} {}", rest.replace(['@', '/'], " "));
+    }
+    path.rsplit('/')
+        .filter(|part| !part.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Order for an empty query, which the list paints verbatim: live projects
+/// before archived ones, pinned first, then most recently used.
+fn sort_thread_entries(entries: &mut [ThreadSearchEntry]) {
+    entries.sort_by(|a, b| {
+        a.is_archived
+            .cmp(&b.is_archived)
+            .then_with(|| b.is_pinned.cmp(&a.is_pinned))
+            .then_with(|| b.last_active_at.cmp(&a.last_active_at))
+    });
+}
+
+/// One thread row, plus its fuzzy haystack. Thread names are mostly "main",
+/// so the project identifies the row and the Space accessory separates
+/// projects whose names repeat across Spaces.
+fn thread_leaf(entry: ThreadSearchEntry, archived_suffix: &str) -> (ExpandedCommand, String) {
+    let mut brief = entry.thread_name.clone();
+    if entry.is_archived {
+        brief.push_str(&format!(" ({archived_suffix})"));
+    }
+    let icon = thread_icon_name(&entry);
+    let haystack = format!(
+        "{} {} {} {}",
+        entry.project_name,
+        entry.thread_name,
+        entry.space_name,
+        search_path_terms(&entry.project_path),
+    );
+    (
+        ExpandedCommand {
+            brief: brief.into(),
+            doc: String::new().into(),
+            action: KeyAssignment::ActivateWorkspaceThread {
+                space_id: entry.space_id,
+                thread_id: entry.thread_id,
+            },
+            keys: vec![],
+            menubar: &[],
+            icon: Some(icon.into()),
+            accessory: Some(entry.space_name.into()),
+        },
+        haystack,
+    )
 }
 
 /// The floating-menu palette, tuned like `context_menu_palette` so the card
@@ -731,6 +952,21 @@ impl crate::TermWindow {
         self.invalidate_window();
     }
 
+    /// The sidebar's search button: the same palette, opened already inside
+    /// the thread group. Backing out of it lands in the full palette.
+    pub(crate) fn open_thread_search(&mut self) {
+        self.open_command_palette();
+        let Some(state) = self.command_palette.as_mut() else {
+            return;
+        };
+        let Some(idx) = state.root.iter().position(|item| {
+            matches!(item, PaletteItem::Group(group) if group.kind == PaletteGroupKind::Thread)
+        }) else {
+            return;
+        };
+        state.enter_group(idx);
+    }
+
     pub(crate) fn close_command_palette(&mut self) {
         if self.command_palette.take().is_some() {
             self.remove_command_palette_ui_items();
@@ -789,6 +1025,11 @@ impl crate::TermWindow {
 
         let mut groups: Vec<PaletteItem> = Vec::new();
 
+        // Find Thread: synthesized, and the sidebar's own search entry point.
+        if let Some(group) = self.build_thread_group() {
+            groups.push(PaletteItem::Group(group));
+        }
+
         // Change Theme: synthesized, no flat equivalent exists.
         groups.push(PaletteItem::Group(self.build_color_scheme_group(&scores)));
 
@@ -821,6 +1062,7 @@ impl crate::TermWindow {
                 icon,
                 current_value,
                 aliases,
+                kind,
                 items: Rc::new(items),
                 haystacks: Rc::new(haystacks),
             }));
@@ -867,6 +1109,7 @@ impl crate::TermWindow {
             keys: vec![],
             menubar: &[],
             icon: None,
+            accessory: None,
         }));
         for name in names {
             items.push(PaletteItem::Leaf(ExpandedCommand {
@@ -876,6 +1119,7 @@ impl crate::TermWindow {
                 keys: vec![],
                 menubar: &[],
                 icon: None,
+                accessory: None,
             }));
         }
 
@@ -892,6 +1136,7 @@ impl crate::TermWindow {
                     .unwrap_or_else(|| crate::i18n::tr("command-palette-value-default")),
             ),
             aliases,
+            kind: PaletteGroupKind::ColorScheme,
             items: Rc::new(items),
             haystacks: Rc::new(haystacks),
         }
@@ -916,6 +1161,7 @@ impl crate::TermWindow {
                     keys: vec![],
                     menubar: &[],
                     icon: None,
+                    accessory: None,
                 })
             })
             .collect();
@@ -927,6 +1173,54 @@ impl crate::TermWindow {
             icon,
             current_value: current,
             aliases,
+            kind: PaletteGroupKind::Space,
+            items: Rc::new(items),
+            haystacks: Rc::new(haystacks),
+        })
+    }
+
+    /// Every saved thread, across every Space. The sidebar only ever lists
+    /// one Space (and hides archived projects), so this group is the only
+    /// way to reach the rest.
+    fn build_thread_group(&self) -> Option<PaletteGroup> {
+        let live_workspaces = Mux::try_get()
+            .map(|mux| mux.iter_workspaces())
+            .unwrap_or_default();
+        let mut entries = crate::workspace_threads::threads_for_search(&live_workspaces);
+        if entries.is_empty() {
+            return None;
+        }
+        sort_thread_entries(&mut entries);
+
+        let archived_suffix = crate::i18n::tr("command-palette-thread-archived");
+        let mut items = Vec::with_capacity(entries.len() * 2);
+        let mut haystacks = Vec::with_capacity(entries.len() * 2);
+        // Entries arrive best-first, so a project's header lands where its
+        // strongest thread put it.
+        let mut open_project: Option<(String, String)> = None;
+        for entry in entries {
+            let project = (entry.space_id.clone(), entry.project_name.clone());
+            if open_project.as_ref() != Some(&project) {
+                items.push(PaletteItem::Header(PaletteHeader {
+                    label: entry.project_name.clone(),
+                    detail: abbreviate_home(&entry.project_path),
+                }));
+                haystacks.push(String::new());
+                open_project = Some(project);
+            }
+            let (leaf, haystack) = thread_leaf(entry, &archived_suffix);
+            items.push(PaletteItem::Leaf(leaf));
+            haystacks.push(haystack);
+        }
+
+        let (label_key, icon, aliases) = group_meta(PaletteGroupKind::Thread);
+        Some(PaletteGroup {
+            label: crate::i18n::tr(label_key),
+            doc: String::new(),
+            icon,
+            current_value: None,
+            aliases,
+            kind: PaletteGroupKind::Thread,
             items: Rc::new(items),
             haystacks: Rc::new(haystacks),
         })
@@ -1115,7 +1409,7 @@ impl crate::TermWindow {
                                 outcome = PaletteOutcome::Execute(cmd);
                             }
                         }
-                        None => {}
+                        Some(EntryKind::Header) | None => {}
                     }
                 }
                 KeyCode::Tab => {
@@ -1251,7 +1545,7 @@ impl crate::TermWindow {
                                         outcome = PaletteOutcome::Execute(cmd);
                                     }
                                 }
-                                None => {}
+                                Some(EntryKind::Header) | None => {}
                             }
                         }
                         PaletteAction::Back => {
@@ -1681,6 +1975,45 @@ impl crate::TermWindow {
                 break;
             }
             let row_rect = euclid::rect(card_x, row_y, card_w, row_h);
+
+            // Headers never highlight and get no hit rect, so the selection
+            // and the pointer both pass straight over them.
+            if let MatchEntry::Item(item_idx) = entry {
+                if let Some(PaletteItem::Header(header)) = items.get(item_idx) {
+                    let head_x = card_x + ctx.px(PAD_X);
+                    let text_y = row_y + (row_h - list_metrics.cell_size.height as f32) / 2.0;
+                    let mut label_right = card_x + card_w - ctx.px(PAD_X);
+                    if !header.detail.is_empty() {
+                        let max_detail = (card_w * 0.4).max(ctx.px(80.0));
+                        let shown =
+                            self.ellipsize_ui_text(&list_font, &header.detail, max_detail as usize)?;
+                        let width = self.sidebar_text_width(&list_font, &shown)?;
+                        self.paint_ui_title_text_cached(
+                            &mut row_layers,
+                            &list_font,
+                            &list_metrics,
+                            &shown,
+                            (label_right - width).max(0.0) as usize,
+                            text_y.round() as usize,
+                            (width + ctx.px(2.0)) as usize,
+                            palette.muted_text.mul_alpha(0.7),
+                        )?;
+                        label_right -= width + ctx.px(LABEL_GAP);
+                    }
+                    self.paint_sidebar_text(
+                        &mut row_layers,
+                        &list_font,
+                        list_metrics,
+                        &header.label,
+                        head_x as usize,
+                        text_y.round() as usize,
+                        (label_right - head_x).max(0.0) as usize,
+                        palette.muted_text,
+                    )?;
+                    continue;
+                }
+            }
+
             let selected = order_idx == state.selected;
             let hovered =
                 state.interaction.hovered == Some(PaletteAction::Row(order_idx)) && !selected;
@@ -1726,23 +2059,23 @@ impl crate::TermWindow {
                             Some(format!("{} › ", cmd.menubar.join(" › ")))
                         };
                         (
-                            nerd_icon_to_svg(cmd.icon.as_deref()),
+                            row_icon(cmd, &palette),
                             prefix,
                             cmd.brief.to_string(),
-                            None,
+                            cmd.accessory.as_ref().map(|text| text.to_string()),
                             false,
                             format_key_label(cmd, &self.config),
                         )
                     }
                     Some(PaletteItem::Group(group)) => (
-                        Some(group.icon),
+                        RowIcon::Glyph(group.icon),
                         None,
                         group.label.clone(),
                         group.current_value.clone(),
                         true,
                         None,
                     ),
-                    None => continue,
+                    _ => continue,
                 },
                 MatchEntry::Nested(group_idx, child_idx) => {
                     let Some(PaletteItem::Group(group)) = items.get(group_idx) else {
@@ -1752,10 +2085,10 @@ impl crate::TermWindow {
                         continue;
                     };
                     (
-                        Some(group.icon),
+                        RowIcon::Glyph(group.icon),
                         Some(format!("{} › ", group.label)),
                         cmd.brief.to_string(),
-                        None,
+                        cmd.accessory.as_ref().map(|text| text.to_string()),
                         false,
                         format_key_label(cmd, &self.config),
                     )
@@ -1764,15 +2097,33 @@ impl crate::TermWindow {
 
             // Icon slot (always reserved so labels align).
             let icon_x = card_x + ctx.px(PAD_X);
-            if let Some(icon) = icon {
+            let draw_glyph = |layers: &mut _, icon, color| {
                 ctx.draw_svg_icon(
-                    &mut row_layers,
+                    layers,
                     icon,
                     icon_x,
                     row_y + (row_h - ctx.px(ICON_SIZE)) / 2.0,
                     ctx.px(ICON_SIZE),
-                    text_color,
-                )?;
+                    color,
+                )
+            };
+            match icon {
+                RowIcon::None => {}
+                RowIcon::Glyph(icon) => draw_glyph(&mut row_layers, icon, text_color)?,
+                RowIcon::Tinted(icon, color) => draw_glyph(&mut row_layers, icon, color)?,
+                RowIcon::Dot(color) => {
+                    let dot = ctx.px(DOT_SIZE);
+                    ctx.draw_rounded_rect(
+                        &mut row_layers,
+                        1,
+                        icon_x + (ctx.px(ICON_SIZE) - dot) / 2.0,
+                        row_y + (row_h - dot) / 2.0,
+                        dot,
+                        dot,
+                        color,
+                        dot / 2.0,
+                    )?;
+                }
             }
             let label_x = icon_x + ctx.px(ICON_SLOT);
 
@@ -1930,6 +2281,7 @@ mod tests {
             keys: vec![],
             menubar: &[],
             icon: None,
+            accessory: None,
         })
     }
 
@@ -1941,6 +2293,7 @@ mod tests {
             icon: SvgIcon::Palette,
             current_value: None,
             aliases: "",
+            kind: PaletteGroupKind::ColorScheme,
             items: Rc::new(children),
             haystacks: Rc::new(haystacks),
         })
@@ -2055,6 +2408,178 @@ mod tests {
         assert_eq!(state.selected, 2);
         state.move_selection_by(-10);
         assert_eq!(state.selected, 0);
+    }
+
+    fn entry(
+        space: &str,
+        project: &str,
+        path: &str,
+        thread: &str,
+        pinned: bool,
+        archived: bool,
+        last_active_at: i64,
+    ) -> ThreadSearchEntry {
+        ThreadSearchEntry {
+            space_id: format!("space-{space}"),
+            space_name: space.to_string(),
+            project_name: project.to_string(),
+            project_path: path.to_string(),
+            thread_id: format!("{project}-{thread}"),
+            thread_name: thread.to_string(),
+            is_pinned: pinned,
+            is_archived: archived,
+            is_live: false,
+            is_unread: false,
+            work_status: WorkspaceThreadWorkStatus::Idle,
+            last_active_at,
+        }
+    }
+
+    fn header(label: &str) -> PaletteItem {
+        PaletteItem::Header(PaletteHeader {
+            label: label.to_string(),
+            detail: String::new(),
+        })
+    }
+
+    #[test]
+    fn path_terms_keep_the_tail_and_drop_the_home_prefix() {
+        let terms = search_path_terms("/Users/alice/Documents/GitHub/thinkterm");
+        assert!(terms.contains("thinkterm"));
+        assert!(terms.contains("GitHub"));
+        assert!(!terms.contains("Users"));
+        assert!(!terms.contains("alice"));
+    }
+
+    #[test]
+    fn path_terms_keep_the_user_and_host_of_a_remote_root() {
+        let terms = search_path_terms("ssh://alice@192.0.2.10");
+        assert!(terms.contains("alice"));
+        assert!(terms.contains("192.0.2.10"));
+        assert_eq!(search_path_terms("wezterm-mux://example-server"), "wezterm-mux example-server");
+    }
+
+    #[test]
+    fn empty_query_order_is_pinned_then_recent_then_archived() {
+        let mut entries = vec![
+            entry("Default", "Old", "/tmp/old", "main", false, true, 900),
+            entry("Default", "Stale", "/tmp/stale", "main", false, false, 10),
+            entry("Default", "Fresh", "/tmp/fresh", "main", false, false, 99),
+            entry("Default", "Kept", "/tmp/kept", "main", true, false, 1),
+        ];
+        sort_thread_entries(&mut entries);
+        let names: Vec<&str> = entries.iter().map(|e| e.project_name.as_str()).collect();
+        // Pinned first even though it is the least recent; archived last even
+        // though it is the most recent.
+        assert_eq!(names, vec!["Kept", "Fresh", "Stale", "Old"]);
+    }
+
+    #[test]
+    fn repeated_project_names_are_separated_by_their_space() {
+        let (a, _) = thread_leaf(
+            entry("Default", "Home", "/Users/alice", "main", false, false, 0),
+            "Archived",
+        );
+        let (b, _) = thread_leaf(
+            entry("Frontend", "Home", "/x/sample_frontend", "main", false, false, 0),
+            "Archived",
+        );
+        assert_eq!(a.brief, b.brief);
+        assert_eq!(a.accessory.as_deref(), Some("Default"));
+        assert_eq!(b.accessory.as_deref(), Some("Frontend"));
+    }
+
+    #[test]
+    fn a_thread_matches_on_its_project_name_not_only_its_own() {
+        // Multiple threads may be called "main"; the project has to be
+        // what carries the query.
+        let (leaf, haystack) = thread_leaf(
+            entry("Example Server", "SampleProject", "/home/alice/github/sampleproject", "main", false, false, 0),
+            "Archived",
+        );
+        assert_eq!(leaf.brief, "main");
+        let pattern = matcher_pattern("sampleproject");
+        assert!(matcher_score(&pattern, &haystack).is_some());
+    }
+
+    #[test]
+    fn an_archived_thread_says_so_in_its_label() {
+        let (leaf, _) = thread_leaf(
+            entry("Default", "sample_reader", "/x/sample_reader", "main", false, true, 0),
+            "Archived",
+        );
+        assert_eq!(leaf.brief, "main (Archived)");
+    }
+
+    #[test]
+    fn a_header_rides_along_with_the_rows_it_names() {
+        let items = vec![
+            header("ThinkTerm"),
+            leaf("GUI"),
+            leaf("MUX"),
+            header("SampleProject"),
+            leaf("main"),
+        ];
+        // The header itself cannot match, but it must precede its survivor.
+        let order = compute_order("mux", &items, None, false);
+        assert_eq!(
+            order,
+            vec![MatchEntry::Item(0), MatchEntry::Item(2)],
+            "the matching row must keep its project header"
+        );
+    }
+
+    #[test]
+    fn blocks_rank_by_their_best_row_and_stay_together() {
+        let items = vec![
+            header("Alpha"),
+            leaf("zzz other"),
+            header("Beta"),
+            leaf("target"),
+            leaf("target two"),
+        ];
+        let order = compute_order("target", &items, None, false);
+        // Only Beta has matches, and its header leads them.
+        assert_eq!(order.first().copied(), Some(MatchEntry::Item(2)));
+        assert!(order.contains(&MatchEntry::Item(3)));
+        assert!(!order.contains(&MatchEntry::Item(0)));
+    }
+
+    #[test]
+    fn a_list_without_headers_keeps_the_plain_score_order() {
+        let items = vec![leaf("New Tab Something Long"), leaf("New Tab")];
+        let order = compute_order("New Tab", &items, None, true);
+        assert_eq!(order.first().copied(), Some(MatchEntry::Item(1)));
+    }
+
+    #[test]
+    fn selection_never_rests_on_a_header() {
+        let mut state = state_with(vec![header("ThinkTerm"), leaf("GUI"), leaf("MUX")]);
+        // Row 0 is the header, so opening lands on the first real row.
+        assert_eq!(state.selected, 1);
+        state.move_selection_by(-1);
+        assert_eq!(state.selected, 1, "stepping up off row 1 has nowhere to go");
+        state.move_selection_by(1);
+        assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn a_header_is_never_executable() {
+        let state = state_with(vec![header("ThinkTerm"), leaf("GUI")]);
+        assert!(matches!(state.classify_entry(0), Some(EntryKind::Header)));
+        assert!(state.command_for_entry(0).is_none());
+    }
+
+    #[test]
+    fn a_running_thread_shows_its_status_glyph_not_a_dot() {
+        let mut running = entry("Default", "ThinkTerm", "/x/thinkterm", "GUI", false, false, 0);
+        running.work_status = WorkspaceThreadWorkStatus::Running;
+        assert_eq!(thread_icon_name(&running), "tt_thread:running:plain");
+        let idle = entry("Default", "ThinkTerm", "/x/thinkterm", "MUX", false, false, 0);
+        assert_eq!(thread_icon_name(&idle), "tt_thread:idle:plain");
+        let mut live = idle.clone();
+        live.is_live = true;
+        assert_eq!(thread_icon_name(&live), "tt_thread:idle:live");
     }
 
     #[test]

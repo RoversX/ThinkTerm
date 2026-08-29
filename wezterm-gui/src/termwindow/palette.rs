@@ -131,6 +131,7 @@ pub(crate) fn build_commands(
                     keys: vec![],
                     menubar: &[],
                     icon: entry.icon.map(Cow::Owned),
+                    accessory: None,
                 });
             }
         }

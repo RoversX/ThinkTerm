@@ -1983,6 +1983,68 @@ fn current_project_for_workspace(space_id: &str, active_workspace: &str) -> Proj
     project
 }
 
+/// One saved thread, flattened out of the Space/Project tree for the
+/// palette's thread search.
+#[derive(Debug, Clone)]
+pub struct ThreadSearchEntry {
+    pub space_id: String,
+    pub space_name: String,
+    pub project_name: String,
+    pub project_path: String,
+    pub thread_id: WorkspaceThreadId,
+    pub thread_name: String,
+    pub is_pinned: bool,
+    pub is_archived: bool,
+    /// Its workspace exists in this process right now, i.e. the thread is
+    /// open rather than merely saved.
+    pub is_live: bool,
+    pub is_unread: bool,
+    pub work_status: WorkspaceThreadWorkStatus,
+    pub last_active_at: i64,
+}
+
+/// Every saved thread in every Space, archived projects included — the
+/// sidebar only ever shows one Space, so search is the sole way to reach
+/// the rest. Takes THREAD_STORE, so never call it while that lock is held.
+pub fn threads_for_search(live_workspaces: &[String]) -> Vec<ThreadSearchEntry> {
+    let store = THREAD_STORE.lock();
+    let space_names: HashMap<&str, &str> = store
+        .spaces
+        .iter()
+        .map(|space| (space.id.as_str(), space.name.as_str()))
+        .collect();
+    let mut entries = Vec::new();
+    for project in &store.projects {
+        let space_name = space_names
+            .get(project.space_id.as_str())
+            .copied()
+            .unwrap_or("")
+            .to_string();
+        let project_path = project.path.to_string_lossy().to_string();
+        for thread in &project.threads {
+            let is_live = thread
+                .materialized_workspace_name
+                .as_ref()
+                .is_some_and(|name| live_workspaces.iter().any(|live| live == name));
+            entries.push(ThreadSearchEntry {
+                space_id: project.space_id.clone(),
+                space_name: space_name.clone(),
+                project_name: project.name.clone(),
+                project_path: project_path.clone(),
+                thread_id: thread.id.clone(),
+                thread_name: thread.name.clone(),
+                is_pinned: thread.is_pinned,
+                is_archived: project.archived_at.is_some(),
+                is_live,
+                is_unread: thread.is_unread,
+                work_status: thread.work_status(),
+                last_active_at: thread.last_active_at,
+            });
+        }
+    }
+    entries
+}
+
 pub fn view_for_current_project(
     space_id: &str,
     active_workspace: &str,

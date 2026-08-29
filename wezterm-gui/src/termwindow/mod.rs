@@ -8416,6 +8416,18 @@ impl TermWindow {
             SetColorScheme(name) => {
                 self.set_color_scheme_override(name.clone());
             }
+            ActivateWorkspaceThread {
+                space_id,
+                thread_id,
+            } => {
+                if let Some(window) = self.window.as_ref().cloned() {
+                    self.switch_space_to_thread(
+                        space_id.clone(),
+                        Some(thread_id.clone()),
+                        &window,
+                    );
+                }
+            }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),

@@ -76,6 +76,10 @@ pub struct ExpandedCommand {
     pub keys: Vec<(Modifiers, KeyCode)>,
     pub menubar: &'static [&'static str],
     pub icon: Option<Cow<'static, str>>,
+    /// Right-hand text for palette rows that have no shortcut to show, e.g.
+    /// the Space a thread belongs to. `menubar` cannot serve here: it is
+    /// `&'static` and these values are built from live state.
+    pub accessory: Option<Cow<'static, str>>,
 }
 
 impl std::fmt::Debug for CommandDef {
@@ -183,6 +187,7 @@ impl CommandDef {
                     action,
                     menubar: def.menubar,
                     icon: def.icon.map(Cow::Borrowed),
+                    accessory: None,
                 })
             }
         }
@@ -220,6 +225,7 @@ impl CommandDef {
                 action: KeyAssignment::SpawnCommandInNewTab(cmd.clone()),
                 menubar: &["Shell"],
                 icon: Some("md_tab_plus".into()),
+                accessory: None,
             });
         }
 
@@ -255,6 +261,7 @@ impl CommandDef {
                             }),
                             menubar: &["Shell"],
                             icon: Some("md_tab_plus".into()),
+                            accessory: None,
                         });
                     } else {
                         result.push(ExpandedCommand {
@@ -264,6 +271,7 @@ impl CommandDef {
                             action: KeyAssignment::AttachDomain(name.to_string()),
                             menubar: &["Shell", "Attach"],
                             icon: Some("md_pipe".into()),
+                            accessory: None,
                         });
                     }
                 }
@@ -286,6 +294,7 @@ impl CommandDef {
                         )),
                         menubar: &["Shell", "Detach"],
                         icon: Some("md_pipe_disconnected".into()),
+                        accessory: None,
                     });
                 }
             }
@@ -303,6 +312,7 @@ impl CommandDef {
                         },
                         menubar: &["Window", "Workspace"],
                         icon: None,
+                        accessory: None,
                     });
                 }
             }
@@ -316,6 +326,7 @@ impl CommandDef {
                 },
                 menubar: &["Window", "Workspace"],
                 icon: None,
+                accessory: None,
             });
         }
 
@@ -337,6 +348,7 @@ impl CommandDef {
                     action: entry.action.clone(),
                     menubar: cmd.menubar,
                     icon: cmd.icon.map(Cow::Borrowed),
+                    accessory: None,
                 });
             }
         }
@@ -357,6 +369,7 @@ impl CommandDef {
                         action: entry.action.clone(),
                         menubar: cmd.menubar,
                         icon: cmd.icon.map(Cow::Borrowed),
+                        accessory: None,
                     });
                 }
             }
@@ -2317,6 +2330,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             // ~1000 schemes through this action and none belong in a menu.
             menubar: &[],
             icon: Some("md_palette"),
+        },
+        ActivateWorkspaceThread { .. } => CommandDef {
+            brief: "Open thread".into(),
+            doc: "Switch to a saved thread, changing Space when needed".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            // Absent from the menubar for the same reason as SetColorScheme:
+            // the palette enumerates every saved thread through this action.
+            menubar: &[],
+            icon: Some("oct_terminal"),
         },
     })
 }
