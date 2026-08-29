@@ -858,13 +858,12 @@ impl crate::TermWindow {
         // the animation, which then only advances when some terminal happens
         // to emit output. Measured: 150-210ms between transition frames, with
         // the main thread idle the whole time.
-        let owes_frames_regardless_of_focus = self.content_view_fade.is_some()
-            || self.active_content_view_index().is_some()
-            // A dwell or grace deadline registered while the window is
-            // unfocused would otherwise be dropped, stranding a half-slid
-            // panel until some terminal happens to emit output.
-            || self.workspace_sidebar_hover.needs_frames();
-        if self.focused.is_some() || owes_frames_regardless_of_focus {
+        // (A dwell or grace deadline registered while the window is
+        // unfocused would otherwise be dropped, stranding a half-slid
+        // panel until some terminal happens to emit output.) The set of
+        // states lives in owes_frames_regardless_of_focus so the
+        // unfocused repaint throttle exempts exactly the same ones.
+        if self.focused.is_some() || self.owes_frames_regardless_of_focus() {
             if let Some(next_due) = *self.has_animation.borrow() {
                 // "The next frame the display will give me" is the common
                 // request: every frame of a scroll, of a card travelling, of a

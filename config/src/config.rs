@@ -865,6 +865,21 @@ pub struct Config {
     #[dynamic(default = "default_max_fps")]
     pub max_fps: u64,
 
+    /// Ceiling on output-driven repaints of a window that is visible but
+    /// not focused. A busy pane repaints its window on every chunk of
+    /// output; for the window the user is not looking at, those frames
+    /// are pure overhead, so they are coalesced down to this rate.
+    /// Focus restores the full rate immediately. Windows in states the
+    /// render watchdog cannot backstop are exempt and stay at full
+    /// rate: an open overview or content-view transition, a pane
+    /// overlay such as copy mode or search, and panes mirrored from a
+    /// mux server whose terminal surface is blocked.
+    ///
+    /// 0 disables the throttle. Dynamic, so it can be tuned without a
+    /// restart.
+    #[dynamic(default = "default_unfocused_fps")]
+    pub unfocused_fps: u64,
+
     /// How often, in milliseconds, a live overview card re-reads the terminal
     /// it is showing.
     ///
@@ -2048,6 +2063,10 @@ fn default_anim_fps() -> u8 {
 
 fn default_max_fps() -> u64 {
     120
+}
+
+fn default_unfocused_fps() -> u64 {
+    10
 }
 
 fn default_tiling_desktop_environments() -> Vec<String> {

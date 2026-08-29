@@ -2366,6 +2366,13 @@ pub struct TermWindow {
     allow_images: AllowImage,
     scheduled_animation: RefCell<Option<Instant>>,
 
+    /// Single-flight latch for the unfocused repaint throttle: the
+    /// deadline of the in-flight trailing-edge timer, if any.
+    unfocused_invalidate_due: Option<Instant>,
+    /// The earliest moment the next output-driven repaint of this window
+    /// may happen while it is unfocused.
+    unfocused_next_allowed: Instant,
+
     created: Instant,
 
     pub last_frame_duration: Duration,
@@ -2730,9 +2737,32 @@ impl TermWindow {
         }
     }
 
+    /// States that owe frames regardless of focus. The animation gate in
+    /// paint and the unfocused repaint throttle must agree on this set,
+    /// so both read it from here: a state added to one but not the other
+    /// silently strands frames or throttles what must not be throttled.
+    pub(crate) fn owes_frames_regardless_of_focus(&self) -> bool {
+        self.content_view_fade.is_some()
+            || self.active_content_view_index().is_some()
+            || self.workspace_sidebar_hover.needs_frames()
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
+        if focused == self.focused.is_some() {
+            // Level rechecks (and AppKit itself) can repeat an edge; a
+            // duplicate FocusChanged(true) would restart the
+            // click-swallow window, flush the quad caches and re-fire
+            // user-visible focus events for no actual change.
+            return;
+        }
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
+        // Disarm the unfocused repaint throttle either way: on focus the
+        // invalidate below repaints immediately and a stale latch would
+        // swallow the next output event; on blur the first output should
+        // paint promptly (leading edge) before the throttle kicks in.
+        self.unfocused_invalidate_due = None;
+        self.unfocused_next_allowed = Instant::now();
         self.quad_generation += 1;
         self.load_os_parameters();
 
@@ -3158,6 +3188,8 @@ impl TermWindow {
             current_event: None,
             has_animation: RefCell::new(None),
             scheduled_animation: RefCell::new(None),
+            unfocused_invalidate_due: None,
+            unfocused_next_allowed: Instant::now(),
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),
             ui_items: vec![],
@@ -4044,14 +4076,17 @@ impl TermWindow {
                 }
                 MuxNotification::Alert {
                     alert: Alert::PaletteChanged,
-                    pane_id,
+                    pane_id: _,
                 } => {
                     // Terminal-side shape caches include resolved palette
                     // colors, so invalidate them — but only them. The UI text
                     // caches are colorless and clearing them here made every
-                    // OSC palette write re-shape the whole sidebar.
+                    // OSC palette write re-shape the whole sidebar. The
+                    // handler already ends in an unconditional
+                    // window.invalidate(), so no separate repaint request is
+                    // needed (and none of this may be throttled: colors
+                    // changing must show even on an unfocused window).
                     self.dispatch_notif(TermWindowNotif::InvalidateTerminalShapeCache, window)?;
-                    self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::Alert {
                     alert: Alert::Bell,
@@ -4541,13 +4576,7 @@ impl TermWindow {
         }
     }
 
-    fn is_pane_visible(&mut self, pane_id: PaneId) -> bool {
-        let mux = Mux::get();
-        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
-            Some(tab) => tab,
-            None => return false,
-        };
-
+    fn is_pane_visible_in_tab(&mut self, tab: &Arc<Tab>, pane_id: PaneId) -> bool {
         let tab_id = tab.tab_id();
         if let Some(tab_overlay) = self
             .tab_state(tab_id)
@@ -4563,14 +4592,97 @@ impl TermWindow {
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
+
+        // An armed trailing-edge timer means this window already owes
+        // itself a repaint that will cover this output; nothing new to
+        // decide. Checked before anything else because a flooding pane
+        // lands here for every chunk of output. Only the cheap
+        // full-rate exemptions are probed here — the ones that are
+        // field reads. Focus clears the latch in focus_changed, and
+        // entering an overlay clears it in assign_overlay*, so a
+        // trusted latch genuinely implies the throttle still applies.
+        //
+        // A stale or newly-exempt latch is deliberately NOT cleared
+        // here: clearing is only safe where a repaint decision is
+        // reached below, or an invisible pane's event would cancel the
+        // promised trailing repaint and nothing would honor it.
+        if let Some(due) = self.unfocused_invalidate_due {
+            if !self.owes_frames_regardless_of_focus()
+                && Instant::now().saturating_duration_since(due) < Duration::from_millis(250)
+            {
+                return;
+            }
+        }
+
+        // One tab lookup serves both the visibility check and the
+        // full-rate probe below.
+        let tab = Mux::get().get_active_tab_for_window(self.mux_window_id);
         let content_view_wants_output = self
             .active_content_view()
             .is_some_and(|view| view.wants_pane_output(pane_id));
-        if content_view_wants_output || self.is_pane_visible(pane_id) {
-            if let Some(ref win) = self.window {
-                win.invalidate();
-            }
+        let visible = content_view_wants_output
+            || match tab.as_ref() {
+                Some(tab) => self.is_pane_visible_in_tab(tab, pane_id),
+                None => false,
+            };
+        if !visible {
+            return;
         }
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        // A decision is reached from here on, so a leftover latch — the
+        // timer was swallowed, or the window entered an exempt state
+        // with a timer armed — is resolved by this event; the in-flight
+        // timer bails on its ownership check.
+        self.unfocused_invalidate_due = None;
+
+        // Throttling is only safe where the render watchdog can catch a
+        // dropped frame; can_track_presented_terminal_output mirrors the
+        // watchdog's own bail-outs (overview, fades, overlays, blocked
+        // frontend surfaces), so those states stay at full rate.
+        let unfocused_fps = self.config.unfocused_fps;
+        let full_rate = self.focused.is_some()
+            || unfocused_fps == 0
+            || self.owes_frames_regardless_of_focus()
+            || match tab.as_ref() {
+                Some(tab) => !self.can_track_presented_terminal_output(tab),
+                None => true,
+            };
+
+        let now = Instant::now();
+        if full_rate || now >= self.unfocused_next_allowed {
+            if !full_rate {
+                self.unfocused_next_allowed =
+                    now + Duration::from_millis(1000 / unfocused_fps.max(1));
+            }
+            window.invalidate();
+            return;
+        }
+
+        // Trailing edge: arm one timer for the next allowed moment so the
+        // last burst of output before a pane goes quiet still paints.
+        let due = self.unfocused_next_allowed;
+        self.unfocused_invalidate_due = Some(due);
+        promise::spawn::spawn(async move {
+            Timer::at(due).await;
+            let win = window.clone();
+            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                // Only the timer that owns the current latch may act: a
+                // focus cycle clears the latch and lets a newer timer
+                // re-arm it; the stale timer must not clear that one's
+                // claim or double the paint rate.
+                if tw.unfocused_invalidate_due != Some(due) {
+                    return;
+                }
+                tw.unfocused_invalidate_due = None;
+                tw.unfocused_next_allowed = Instant::now()
+                    + Duration::from_millis(1000 / tw.config.unfocused_fps.max(1));
+                win.invalidate();
+            })));
+        })
+        .detach();
     }
 
     fn mux_pane_output_event_callback(
@@ -9022,6 +9134,11 @@ impl TermWindow {
             pane,
             key_table_state: KeyTableState::default(),
         });
+        // Overlays are exempt from the unfocused repaint throttle (the
+        // render watchdog cannot backstop them); an armed trailing-edge
+        // timer from before the overlay must not swallow their output
+        // events, so disarm it here at the transition.
+        self.unfocused_invalidate_due = None;
         self.update_title();
     }
 
@@ -9031,6 +9148,9 @@ impl TermWindow {
             pane: overlay,
             key_table_state: KeyTableState::default(),
         });
+        // See assign_overlay_for_pane: overlays must not inherit an
+        // armed throttle timer.
+        self.unfocused_invalidate_due = None;
         self.update_title();
     }
 
@@ -9146,3 +9266,4 @@ impl Drop for TermWindow {
         }
     }
 }
+
