@@ -2855,6 +2855,13 @@ impl TermWindow {
         // paint promptly (leading edge) before the throttle kicks in.
         self.unfocused_invalidate_due = None;
         self.unfocused_next_allowed = Instant::now();
+        // An unfocused window gets by with one less swapchain drawable
+        // (one framebuffer-sized allocation); applied lazily at the next
+        // paint's reconfigure. Guarded: FocusChanged can arrive before
+        // the async webgpu setup finishes.
+        if let Some(webgpu) = self.webgpu.as_ref() {
+            webgpu.set_desired_frame_latency(if focused { 2 } else { 1 });
+        }
         self.quad_generation += 1;
         self.load_os_parameters();
 
@@ -3582,6 +3589,11 @@ impl TermWindow {
             }
             if let Some(webgpu) = webgpu {
                 myself.webgpu.replace(Rc::clone(&webgpu));
+                // Seed the swapchain latency from the current focus: a
+                // window spawned in the background starts at the reduced
+                // latency and only pays for the third drawable once it is
+                // actually focused.
+                webgpu.set_desired_frame_latency(if myself.focused.is_some() { 2 } else { 1 });
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
             myself.apply_native_terminal_settings();
@@ -9376,7 +9388,6 @@ impl Drop for TermWindow {
         }
     }
 }
-
 
 /// How long a window must stay fully occluded before its lazily-rebuilt
 /// caches are released. Long enough to survive a glance at another Space

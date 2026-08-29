@@ -1,7 +1,7 @@
 use crate::quad::Vertex;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use window::bitmaps::Texture2d;
@@ -75,6 +75,11 @@ pub struct WebGpuState {
     pub texture_linear_sampler: wgpu::Sampler,
     frame_uniforms: RefCell<FrameUniforms>,
     atlas_bind_groups: RefCell<Option<AtlasBindGroups>>,
+    /// A frame-latency change waiting to be folded into the next
+    /// surface.configure. Reconfiguring drains the whole device queue on
+    /// the calling thread, so it is never done eagerly on focus change;
+    /// the next paint's resize() call picks it up.
+    pending_frame_latency: Cell<Option<u32>>,
     pub handle: RawHandlePair,
 }
 
@@ -676,7 +681,19 @@ impl WebGpuState {
             texture_linear_sampler,
             frame_uniforms: RefCell::new(FrameUniforms::default()),
             atlas_bind_groups: RefCell::new(None),
+            pending_frame_latency: Cell::new(None),
         })
+    }
+
+    /// Ask for a different swapchain frame latency. Applied lazily: the
+    /// next paint's resize() folds it into the surface.configure it
+    /// already makes, so the blocking queue drain is never paid twice.
+    pub fn set_desired_frame_latency(&self, latency: u32) {
+        if self.config.borrow().desired_maximum_frame_latency == latency {
+            self.pending_frame_latency.set(None);
+        } else {
+            self.pending_frame_latency.set(Some(latency));
+        }
     }
 
     /// The atlas texture only changes identity when the glyph cache is
@@ -790,7 +807,8 @@ impl WebGpuState {
             _ => {}
         }
 
-        if dims == *self.dimensions.borrow() {
+        let pending_latency = self.pending_frame_latency.get();
+        if dims == *self.dimensions.borrow() && pending_latency.is_none() {
             return;
         }
         let old = *self.dimensions.borrow();
@@ -799,14 +817,29 @@ impl WebGpuState {
         config.width = dims.pixel_width as u32;
         config.height = dims.pixel_height as u32;
         if config.width > 0 && config.height > 0 {
+            // The latency lands in the config only alongside the configure
+            // that applies it: writing it on the skipped zero-size path
+            // would desync the config from the real surface and make
+            // set_desired_frame_latency's equality check swallow a change
+            // that never took effect.
+            if let Some(latency) = pending_latency {
+                config.desired_maximum_frame_latency = latency;
+            }
             gpu_debug(format!(
-                "resize WebGpu surface {}x{} -> {}x{}",
-                old.pixel_width, old.pixel_height, config.width, config.height
+                "resize WebGpu surface {}x{} -> {}x{} frame_latency={}",
+                old.pixel_width,
+                old.pixel_height,
+                config.width,
+                config.height,
+                config.desired_maximum_frame_latency
             ));
             // Avoid reconfiguring with a 0 sized surface, as webgpu will
             // panic in that case
             // <https://github.com/wezterm/wezterm/issues/2881>
             self.surface.configure(&self.device, &config);
+            // Consumed only by a real configure: a zero-sized (minimized)
+            // surface must keep the change pending for later.
+            self.pending_frame_latency.set(None);
         }
     }
 }
