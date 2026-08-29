@@ -193,7 +193,9 @@ fn invalidate_line_entries(lines: &mut LruCache<StableRowIndex, LineEntry>, pres
         return;
     }
 
-    let mut stale = LruCache::unbounded();
+    // Keep the original bound: an unbounded rebuild left the cache free to
+    // grow with every fetched line for the rest of the pane's life.
+    let mut stale = LruCache::new(lines.cap());
     while let Some((stable_row, entry)) = lines.pop_lru() {
         match entry {
             LineEntry::Stale(line)
@@ -212,7 +214,7 @@ fn invalidate_line_entries(lines: &mut LruCache<StableRowIndex, LineEntry>, pres
 /// painted.  Cropping/padding a prior complete row is preferable to either a
 /// blank flash or mixing old-width storage with newly fetched cells.
 fn resize_stale_line_entries(lines: &mut LruCache<StableRowIndex, LineEntry>, cols: usize) {
-    let mut stale = LruCache::unbounded();
+    let mut stale = LruCache::new(lines.cap());
     while let Some((stable_row, entry)) = lines.pop_lru() {
         let line = match entry {
             LineEntry::Stale(line)
@@ -1543,6 +1545,18 @@ mod test {
             lines.get(&3).is_none(),
             "an in-flight fetch without a line must be canceled"
         );
+    }
+
+    #[test]
+    fn invalidation_and_live_resize_keep_the_cache_bounded() {
+        let mut lines = LruCache::new(NonZeroUsize::new(8).unwrap());
+        lines.put(1, LineEntry::Line(line(80)));
+
+        invalidate_line_entries(&mut lines, true);
+        assert_eq!(lines.cap().get(), 8);
+
+        resize_stale_line_entries(&mut lines, 37);
+        assert_eq!(lines.cap().get(), 8);
     }
 
     #[test]
