@@ -1,6 +1,6 @@
 use crate::colorease::ColorEaseUniform;
 use crate::renderstate::{LoggedSrgbTexture2d, RenderState};
-use crate::termwindow::webgpu::{ShaderUniform, WebGpuState, WebGpuTexture};
+use crate::termwindow::webgpu::{ShaderUniform, WebGpuState};
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
 use ::window::color::LinearRgba;
@@ -226,38 +226,7 @@ pub(crate) fn draw_webgpu_layers(
             label: Some("Render Encoder"),
         });
     let tex = render_state.glyph_cache.borrow().atlas.texture();
-    let tex = tex.downcast_ref::<WebGpuTexture>().unwrap();
-    let texture_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let texture_linear_bind_group = webgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &webgpu.texture_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&webgpu.texture_linear_sampler),
-            },
-        ],
-        label: Some("linear bind group"),
-    });
-
-    let texture_nearest_bind_group = webgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &webgpu.texture_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&webgpu.texture_nearest_sampler),
-            },
-        ],
-        label: Some("nearest bind group"),
-    });
+    let (texture_linear_bind_group, texture_nearest_bind_group) = webgpu.atlas_bind_groups(&tex);
 
     let projection = euclid::Transform3D::<f32, f32, f32>::ortho(
         -(dimensions.pixel_width as f32) / 2.0,

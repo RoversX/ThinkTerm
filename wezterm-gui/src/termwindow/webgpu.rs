@@ -2,6 +2,7 @@ use crate::quad::Vertex;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use window::bitmaps::Texture2d;
 use window::raw_window_handle::{
@@ -46,6 +47,19 @@ struct FrameUniforms {
     cards: Vec<UniformSlot>,
 }
 
+/// The two sampler flavours of the glyph atlas bind group, cached across
+/// frames. `texture` is held strongly so its address can never be reused
+/// while it serves as the identity key; when the atlas is recreated the
+/// whole value is replaced and the old texture goes with it. Between the
+/// recreation and the next completed draw this pins one stale atlas in
+/// GPU memory — accepted, since a recreation is followed by a repaint of
+/// the same window and the pin is bounded by a single atlas.
+struct AtlasBindGroups {
+    texture: Rc<dyn Texture2d>,
+    linear: wgpu::BindGroup,
+    nearest: wgpu::BindGroup,
+}
+
 pub struct WebGpuState {
     pub adapter_info: wgpu::AdapterInfo,
     pub downlevel_caps: wgpu::DownlevelCapabilities,
@@ -60,6 +74,7 @@ pub struct WebGpuState {
     pub texture_nearest_sampler: wgpu::Sampler,
     pub texture_linear_sampler: wgpu::Sampler,
     frame_uniforms: RefCell<FrameUniforms>,
+    atlas_bind_groups: RefCell<Option<AtlasBindGroups>>,
     pub handle: RawHandlePair,
 }
 
@@ -660,7 +675,52 @@ impl WebGpuState {
             texture_nearest_sampler,
             texture_linear_sampler,
             frame_uniforms: RefCell::new(FrameUniforms::default()),
+            atlas_bind_groups: RefCell::new(None),
         })
+    }
+
+    /// The atlas texture only changes identity when the glyph cache is
+    /// rebuilt (atlas growth, DPI/font change), so the two sampler bind
+    /// groups are cached against it and rebuilt on identity change alone.
+    pub fn atlas_bind_groups(
+        &self,
+        texture: &Rc<dyn Texture2d>,
+    ) -> (wgpu::BindGroup, wgpu::BindGroup) {
+        let mut cache = self.atlas_bind_groups.borrow_mut();
+        if let Some(cached) = cache.as_ref() {
+            if Rc::ptr_eq(&cached.texture, texture) {
+                return (cached.linear.clone(), cached.nearest.clone());
+            }
+        }
+        gpu_debug("rebuild atlas bind groups (atlas texture changed)");
+        let tex = texture
+            .downcast_ref::<WebGpuTexture>()
+            .expect("webgpu render path holds a WebGpuTexture atlas");
+        let texture_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let make = |sampler: &wgpu::Sampler, label: &str| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+                label: Some(label),
+            })
+        };
+        let linear = make(&self.texture_linear_sampler, "linear bind group");
+        let nearest = make(&self.texture_nearest_sampler, "nearest bind group");
+        *cache = Some(AtlasBindGroups {
+            texture: Rc::clone(texture),
+            linear: linear.clone(),
+            nearest: nearest.clone(),
+        });
+        (linear, nearest)
     }
 
     fn make_uniform_slot(&self) -> UniformSlot {
