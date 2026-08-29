@@ -263,6 +263,22 @@ impl Screen {
             self.lines.push_back(Line::new(seqno));
         }
 
+        // The alt screen has no scrollback: it is a fixed grid that
+        // full-screen apps redraw in place. The shared "visible region is
+        // the last N lines" rule below gives a shrink bottom gravity,
+        // which scrolls the whole grid up until the app's SIGWINCH redraw
+        // lands. Dragging a split can take many rows between two redraws,
+        // so the top of the pane briefly shows rows from the middle of
+        // the old grid — visible as flicker in any TUI. Anchor the alt
+        // screen to its top instead: crop the bottom and clamp the cursor
+        // into the window; the app repaints the lot on SIGWINCH anyway.
+        let cursor_y = if !self.allow_scrollback && self.lines.len() > physical_rows {
+            self.lines.truncate(physical_rows);
+            cursor_y.min(physical_rows.saturating_sub(1))
+        } else {
+            cursor_y
+        };
+
         let new_cursor_y;
 
         // true if a resize operation should consider rows that have

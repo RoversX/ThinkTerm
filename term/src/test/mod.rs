@@ -894,6 +894,34 @@ fn test_resize_2162_by_2_then_up_1() {
     term.assert_cursor_pos(19, 0, None, Some(8));
 }
 
+/// The alt screen has no scrollback, so shrinking it must not scroll the
+/// grid up to chase the cursor: full-screen apps redraw on SIGWINCH, and
+/// the bottom-gravity slice briefly showed rows from the middle of the
+/// old grid at the top of the pane (visible as flicker while dragging a
+/// split). The alt screen is anchored to its top: the bottom is cropped
+/// and the cursor clamped into the window.
+#[test]
+fn test_alt_screen_shrink_is_top_anchored() {
+    let mut term = TestTerm::new(6, 10, 100);
+    term.print("\x1b[?1049h");
+    term.print("aaa\r\nbbb\r\nccc\r\nddd\r\neee\r\nfff");
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["aaa", "bbb", "ccc", "ddd", "eee", "fff"],
+    );
+    term.resize(TerminalSize {
+        rows: 4,
+        cols: 10,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 0,
+    });
+    assert_visible_contents(&term, file!(), line!(), &["aaa", "bbb", "ccc", "ddd"]);
+    term.assert_cursor_pos(3, 3, None, None);
+}
+
 /// This test skips over an edge case with cursor positioning,
 /// so it passes even ahead of a fix for issue 2162.
 #[test]
