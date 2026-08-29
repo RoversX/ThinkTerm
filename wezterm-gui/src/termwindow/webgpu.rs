@@ -3,7 +3,6 @@ use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use std::cell::RefCell;
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 use window::bitmaps::Texture2d;
 use window::raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
@@ -33,6 +32,20 @@ pub struct ShaderUniform {
     // sampler2D atlas_linear_sampler;
 }
 
+/// A persistent uniform buffer plus its bind group. The buffer is written
+/// at most once per frame, so a slot can be reused every frame without
+/// re-creating either object.
+struct UniformSlot {
+    buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+#[derive(Default)]
+struct FrameUniforms {
+    window: Option<UniformSlot>,
+    cards: Vec<UniformSlot>,
+}
+
 pub struct WebGpuState {
     pub adapter_info: wgpu::AdapterInfo,
     pub downlevel_caps: wgpu::DownlevelCapabilities,
@@ -46,6 +59,7 @@ pub struct WebGpuState {
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_nearest_sampler: wgpu::Sampler,
     pub texture_linear_sampler: wgpu::Sampler,
+    frame_uniforms: RefCell<FrameUniforms>,
     pub handle: RawHandlePair,
 }
 
@@ -645,25 +659,58 @@ impl WebGpuState {
             texture_bind_group_layout,
             texture_nearest_sampler,
             texture_linear_sampler,
+            frame_uniforms: RefCell::new(FrameUniforms::default()),
         })
     }
 
-    pub fn create_uniform(&self, uniform: ShaderUniform) -> wgpu::BindGroup {
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("ShaderUniform Buffer"),
-                contents: bytemuck::cast_slice(&[uniform]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    fn make_uniform_slot(&self) -> UniformSlot {
+        crate::perf::log_counter("uniform_slot_creates", 1);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ShaderUniform Buffer"),
+            size: std::mem::size_of::<ShaderUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &self.shader_uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: buffer.as_entire_binding(),
             }],
             label: Some("ShaderUniform Bind Group"),
-        })
+        });
+        UniformSlot { buffer, bind_group }
+    }
+
+    /// The whole-window uniform value; every non-card pass in a frame uses
+    /// the same value, so they all share this one slot.
+    pub fn window_uniform(&self, uniform: ShaderUniform) -> wgpu::BindGroup {
+        let mut frame = self.frame_uniforms.borrow_mut();
+        let slot = match &frame.window {
+            Some(slot) => slot,
+            None => {
+                frame.window = Some(self.make_uniform_slot());
+                frame.window.as_ref().unwrap()
+            }
+        };
+        self.queue
+            .write_buffer(&slot.buffer, 0, bytemuck::bytes_of(&uniform));
+        slot.bind_group.clone()
+    }
+
+    /// Per-card uniform slots. Each slot's buffer may only be written once
+    /// per frame (queued writes all land at the head of the submit), which
+    /// holds because each pending card gets its own slot index.
+    pub fn card_uniform(&self, slot: usize, uniform: ShaderUniform) -> wgpu::BindGroup {
+        let mut frame = self.frame_uniforms.borrow_mut();
+        while frame.cards.len() <= slot {
+            let new_slot = self.make_uniform_slot();
+            frame.cards.push(new_slot);
+        }
+        let slot = &frame.cards[slot];
+        self.queue
+            .write_buffer(&slot.buffer, 0, bytemuck::bytes_of(&uniform));
+        slot.bind_group.clone()
     }
 
     #[allow(unused_mut)]

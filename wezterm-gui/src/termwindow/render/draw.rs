@@ -269,6 +269,26 @@ pub(crate) fn draw_webgpu_layers(
     )
     .to_arrays_transposed();
 
+    // Every non-card pass in this frame uses the same uniform value, so one
+    // persistent slot serves the layer passes and the composite passes alike.
+    let window_uniforms = webgpu.window_uniform(ShaderUniform {
+        foreground_text_hsb,
+        milliseconds,
+        viewport_and_corner: [
+            dimensions.pixel_width as f32,
+            dimensions.pixel_height as f32,
+            corner_radius,
+            0.0,
+        ],
+        window_border: [
+            window_border.color[0],
+            window_border.color[1],
+            window_border.color[2],
+            window_border.width,
+        ],
+        projection,
+    });
+
     // ---- Card texture work -------------------------------------------------
     // One combined vertex upload covers every card render pass and every
     // composite quad; each draw slices it with `base_vertex`. The uploads
@@ -303,7 +323,7 @@ pub(crate) fn draw_webgpu_layers(
         // Render each dirty card's quads into its texture. These passes are
         // encoded before the main pass, so the composites below sample the
         // fresh picture.
-        for pending in cards.pending.iter() {
+        for (card_slot, pending) in cards.pending.iter().enumerate() {
             let (base, quads) = (pending.first_vertex, pending.quad_count);
             if quads == 0 {
                 continue;
@@ -329,7 +349,7 @@ pub(crate) fn draw_webgpu_layers(
                 1.0,
             )
             .to_arrays();
-            let card_uniforms = webgpu.create_uniform(ShaderUniform {
+            let card_uniforms = webgpu.card_uniform(card_slot, ShaderUniform {
                 foreground_text_hsb,
                 milliseconds,
                 viewport_and_corner: [
@@ -377,7 +397,6 @@ pub(crate) fn draw_webgpu_layers(
         for idx in 0..3 {
             let vb = &layer.vb.borrow()[idx];
             let (vertex_count, index_count) = vb.vertex_index_count();
-            let uniforms;
             if vertex_count > 0 {
                 let vertices = vb.current_vb_mut();
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -400,26 +419,8 @@ pub(crate) fn draw_webgpu_layers(
                 });
                 cleared = true;
 
-                uniforms = webgpu.create_uniform(ShaderUniform {
-                    foreground_text_hsb,
-                    milliseconds,
-                    viewport_and_corner: [
-                        dimensions.pixel_width as f32,
-                        dimensions.pixel_height as f32,
-                        corner_radius,
-                        0.0,
-                    ],
-                    window_border: [
-                        window_border.color[0],
-                        window_border.color[1],
-                        window_border.color[2],
-                        window_border.width,
-                    ],
-                    projection,
-                });
-
                 render_pass.set_pipeline(&webgpu.render_pipeline);
-                render_pass.set_bind_group(0, &uniforms, &[]);
+                render_pass.set_bind_group(0, &window_uniforms, &[]);
                 render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
                 render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
                 // Upload only the quads this frame actually wrote into the
@@ -450,23 +451,6 @@ pub(crate) fn draw_webgpu_layers(
                 let scratch = card_scratch
                     .as_ref()
                     .expect("composite draws imply the scratch exists");
-                let comp_uniforms = webgpu.create_uniform(ShaderUniform {
-                    foreground_text_hsb,
-                    milliseconds,
-                    viewport_and_corner: [
-                        dimensions.pixel_width as f32,
-                        dimensions.pixel_height as f32,
-                        corner_radius,
-                        0.0,
-                    ],
-                    window_border: [
-                        window_border.color[0],
-                        window_border.color[1],
-                        window_border.color[2],
-                        window_border.width,
-                    ],
-                    projection,
-                });
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Card Composite Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -487,7 +471,7 @@ pub(crate) fn draw_webgpu_layers(
                 });
                 cleared = true;
                 pass.set_pipeline(&webgpu.render_pipeline);
-                pass.set_bind_group(0, &comp_uniforms, &[]);
+                pass.set_bind_group(0, &window_uniforms, &[]);
                 pass.set_vertex_buffer(0, scratch.vb.slice(..));
                 pass.set_index_buffer(scratch.index.slice(..), wgpu::IndexFormat::Uint32);
                 for (zindex, base, composite) in &composite_draws {
