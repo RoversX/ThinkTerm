@@ -144,6 +144,6 @@ ThinkTerm is built on [WezTerm](https://github.com/wezterm/wezterm), written in 
 
 ThinkTerm is released under **GPL-3.0** — see [LICENSE.md](LICENSE.md). Code originating from WezTerm remains under its original MIT license, preserved verbatim in [LICENSE-MIT](LICENSE-MIT). Bundled fonts and other third-party components are listed in [licenses/README.md](licenses/README.md).
 
-Icons from [Lucide](https://github.com/lucide-icons/lucide), [Simple Icons](https://github.com/simple-icons/simple-icons), and material-icon-theme.
+Icons from [Lucide](https://github.com/lucide-icons/lucide), [Simple Icons](https://github.com/simple-icons/simple-icons), and material-icon-theme. Agent detection manifests from [herdr](https://github.com/herdrdev/herdr), under the Apache License 2.0. Full third-party attributions are in [NOTICE](NOTICE).
 
 Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md).

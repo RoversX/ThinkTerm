@@ -2,6 +2,8 @@ ThinkTerm bundles some components provided by third parties. ThinkTerm as a
 whole is distributed under the GNU General Public License v3.0 (see
 [LICENSE.md](../LICENSE.md)), but the components below remain under their own
 licenses, and their copyright notices are preserved as those licenses require.
+The [NOTICE](../NOTICE) file at the repository root carries the attribution and
+license texts that those components require to be shipped with the binaries.
 
 ## WezTerm
 
@@ -40,6 +42,15 @@ predates it and does not enumerate it.
 ## ANGLE
 
 See [ANGLE.md](ANGLE.md).
+
+## Agent detection manifests
+
+The agent manifests under `mux/src/agent_status/manifests/` are sourced from
+[herdr](https://github.com/herdrdev/herdr) and remain under the Apache License
+2.0, reproduced verbatim in
+[`mux/src/agent_status/manifests/LICENSE`](../mux/src/agent_status/manifests/LICENSE).
+Each bundled manifest carries an attribution header naming the upstream commit
+it was taken from and any local changes.
 
 ## Icons
 
