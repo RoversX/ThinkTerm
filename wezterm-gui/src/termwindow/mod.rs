@@ -1958,6 +1958,24 @@ pub struct TermWindow {
     frontend_handoff_consumed_press: bool,
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
+    /// Kill switch for the currently registered mux pane-update
+    /// subscription. subscribe_to_pane_updates retires the previous
+    /// subscription through this before installing a new one, so a window
+    /// can re-subscribe at any time without accumulating duplicates.
+    pane_subscription_dead: RefCell<Option<Arc<AtomicBool>>>,
+    /// Consecutive render-watchdog ticks that had to force a repaint for
+    /// unpresented output. A run of these means output notifications are
+    /// not reaching this window at all (a dead subscription), not a lost
+    /// frame; the watchdog then rebuilds the subscription — once per
+    /// episode, because a pane that legitimately never presents (a hidden
+    /// stack member) keeps the watchdog latched forever and must not turn
+    /// the heal into a warn-spamming resubscribe loop.
+    watchdog_forced_repaints: u8,
+    /// When the counter above last advanced. The watchdog can run in
+    /// sub-second bursts (status updates queue up), so increments are
+    /// paced to at most one per ~700ms to approximate "consecutive
+    /// seconds behind".
+    watchdog_last_forced: Option<Instant>,
     pub render_metrics: RenderMetrics,
     render_state: Option<RenderState>,
     input_map: InputMap,
@@ -3182,6 +3200,9 @@ impl TermWindow {
             occlusion_last_release: None,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
+            pane_subscription_dead: RefCell::new(None),
+            watchdog_forced_repaints: 0,
+            watchdog_last_forced: None,
             fonts: Rc::clone(&fontconfig),
             render_metrics,
             dimensions,
@@ -4468,6 +4489,15 @@ impl TermWindow {
         self.mux_window_id = mux_window_id;
         *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
 
+        // Re-subscribe only now that the shared id names the adopted mux
+        // window. Subscribing any earlier (recover_from_dead_mux_window
+        // used to) loses a race with the queued WindowRemoved for the mux
+        // window being left: the notification compares against the shared
+        // id, still finds a match, and kills the brand-new subscription —
+        // leaving a live window that never hears PaneOutput again, painting
+        // only on input events and the 1s render watchdog.
+        self.subscribe_to_pane_updates();
+
         // Keep the frontend's window<->mux mapping accurate so that the
         // additive reconcile does not try to spawn a duplicate window for the
         // mux window we just adopted.
@@ -4547,8 +4577,10 @@ impl TermWindow {
             return;
         };
         // The mux subscription cancelled itself when our mux window was
-        // removed; re-establish it for the window we are about to adopt.
-        self.subscribe_to_pane_updates();
+        // removed. Deliberately NOT re-established here: the shared
+        // subscription id still names the dead mux window, so a queued
+        // WindowRemoved would match and kill a subscription made now.
+        // switch_to_mux_window re-subscribes after updating the id.
         self.activate_workspace_thread(thread_id, &window);
     }
 
@@ -4926,6 +4958,16 @@ impl TermWindow {
         let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
         let mux = Mux::get();
         let dead = Arc::new(AtomicBool::new(false));
+        // Retire the previous subscription (it unregisters itself on its
+        // next delivery) so re-subscribing is idempotent: callers may heal
+        // a suspected-dead subscription without checking first.
+        if let Some(prev) = self
+            .pane_subscription_dead
+            .borrow_mut()
+            .replace(Arc::clone(&dead))
+        {
+            prev.store(true, Ordering::Relaxed);
+        }
         mux.subscribe(move |n| {
             if dead.load(Ordering::Relaxed) {
                 return false;
@@ -6724,8 +6766,43 @@ impl TermWindow {
                      {current} has not been presented (last={presented}); repainting",
                     self.mux_window_id,
                 );
-                if let Some(window) = self.window.as_ref() {
-                    window.invalidate();
+                // One tick behind is a lost frame; a RUN of ticks means
+                // PaneOutput is not reaching this window at all — the fast
+                // path would have painted long before the next 1s tick.
+                // Rebuild the subscription so the failure heals in seconds
+                // instead of lasting for the window's life. Two guards keep
+                // this from misfiring: increments are paced (status updates
+                // can run this in sub-second bursts, which must not count
+                // as multiple seconds behind), and the heal fires exactly
+                // once per episode — a pane that legitimately never
+                // presents (a hidden stack member) latches the watchdog
+                // forever and must not drive a resubscribe loop. Occluded
+                // windows are exempt: AppKit suppresses their draws, so
+                // falling behind there is expected.
+                let paced = self
+                    .watchdog_last_forced
+                    .is_none_or(|at| at.elapsed() >= Duration::from_millis(700));
+                if paced {
+                    self.watchdog_last_forced = Some(Instant::now());
+                    self.watchdog_forced_repaints =
+                        self.watchdog_forced_repaints.saturating_add(1);
+                    if self.watchdog_forced_repaints == 3 && self.occluded.is_none() {
+                        log::warn!(
+                            "terminal render watchdog: window={} forced 3 consecutive repaints; \
+                             rebuilding the mux pane-update subscription",
+                            self.mux_window_id,
+                        );
+                        self.subscribe_to_pane_updates();
+                    }
+                    // The forced repaint rides the same pacing: status
+                    // updates can run this watchdog in sub-second bursts,
+                    // and a latched pane (one that never presents) would
+                    // otherwise turn each burst into a repaint storm —
+                    // sustained forced painting pins GPU/staging memory
+                    // that the usage-window shrink cannot reclaim.
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
                 }
                 return;
             }
@@ -6746,6 +6823,11 @@ impl TermWindow {
                 }
             }
         }
+        // A clean pass: every pane's output has been presented, so the
+        // notification path is delivering again. Re-arms the once-per-
+        // episode heal above.
+        self.watchdog_forced_repaints = 0;
+        self.watchdog_last_forced = None;
     }
 
     fn schedule_next_status_update(&mut self) {
