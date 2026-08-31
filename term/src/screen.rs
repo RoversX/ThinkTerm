@@ -238,7 +238,26 @@ impl Screen {
             // screen (hence the check for allow_scrollback), to avoid
             // conflicting screen updates with full screen apps.
             if self.allow_scrollback {
-                self.rewrap_lines(physical_cols, physical_rows, cursor.x, cursor_phys, seqno)
+                let cursor_stable = self.phys_to_stable_row_index(cursor_phys);
+                let (new_x, new_y) =
+                    self.rewrap_lines(physical_cols, physical_rows, cursor.x, cursor_phys, seqno);
+                // Rewrapping renumbers every physical row but used to leave
+                // stable_row_index_offset alone, so every StableRowIndex
+                // anyone saved (a GUI viewport, most visibly) silently
+                // pointed at different content — or below scrollback_top,
+                // where stable_range's fallback draws the top of the
+                // buffer. Re-anchor the offset so the cursor row keeps its
+                // stable index across the rewrap: rows near the live
+                // region, which is what viewports are relative to, then
+                // stay put, and the drift is pushed to the far scrollback
+                // where nobody is looking. Best effort: the offset is
+                // unsigned, so a narrowing rewrap on a screen with little
+                // accumulated scroll history can demand a negative anchor
+                // and floors at zero — the renderer's stale-viewport clamp
+                // covers that residue.
+                self.stable_row_index_offset =
+                    (cursor_stable.max(0) as usize).saturating_sub(new_y);
+                (new_x, new_y)
             } else {
                 for line in &mut self.lines {
                     if physical_cols < self.physical_cols {

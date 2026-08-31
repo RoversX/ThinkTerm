@@ -1591,6 +1591,56 @@ fn frame_can_acknowledge_output(outcome: PaintOutcome, presented: bool) -> bool 
 }
 
 #[cfg(test)]
+mod stale_viewport_tests {
+    use super::TermWindow;
+    use mux::renderable::RenderableDimensions;
+
+    fn dims(scrollback_top: isize, physical_top: isize) -> RenderableDimensions {
+        RenderableDimensions {
+            scrollback_top,
+            physical_top,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn valid_viewports_pass_through_untouched() {
+        assert_eq!(
+            TermWindow::normalize_stale_viewport(None, &dims(100, 500)),
+            None
+        );
+        assert_eq!(
+            TermWindow::normalize_stale_viewport(Some(100), &dims(100, 500)),
+            None
+        );
+        assert_eq!(
+            TermWindow::normalize_stale_viewport(Some(499), &dims(100, 500)),
+            None
+        );
+    }
+
+    #[test]
+    fn overtaken_viewport_clamps_to_oldest_retained_row() {
+        assert_eq!(
+            TermWindow::normalize_stale_viewport(Some(40), &dims(100, 500)),
+            Some(Some(100))
+        );
+    }
+
+    #[test]
+    fn overtaken_viewport_follows_bottom_when_no_scrollback_remains() {
+        // The app erased its scrollback (agent CLIs do this on redraw):
+        // scrollback_top == physical_top, so "the oldest retained row" IS
+        // the live screen and the pane must convert to follow-bottom
+        // rather than stay artificially pinned.
+        assert_eq!(
+            TermWindow::normalize_stale_viewport(Some(40), &dims(500, 500)),
+            Some(None)
+        );
+    }
+}
+
+#[cfg(test)]
 mod pane_output_watchdog_tests {
     use super::{frame_can_acknowledge_output, pane_output_needs_repaint, PaintOutcome};
 
@@ -9074,6 +9124,29 @@ impl TermWindow {
 
     pub fn get_viewport(&self, pane_id: PaneId) -> Option<StableRowIndex> {
         self.pane_state(pane_id).viewport
+    }
+
+    /// If a saved viewport has fallen below the retained scrollback — the
+    /// trim passed it, the app erased its scrollback, or a rewrap
+    /// renumbered rows beyond what the anchor could compensate — produce
+    /// the corrected position: the oldest retained row, or follow-bottom
+    /// when no scrollback remains at all. `None` means the viewport is
+    /// still valid as-is. Kept as a pure function so the policy is
+    /// testable without a TermWindow.
+    pub(crate) fn normalize_stale_viewport(
+        viewport: Option<StableRowIndex>,
+        dims: &RenderableDimensions,
+    ) -> Option<Option<StableRowIndex>> {
+        match viewport {
+            Some(v) if v < dims.scrollback_top => {
+                Some(if dims.scrollback_top >= dims.physical_top {
+                    None
+                } else {
+                    Some(dims.scrollback_top)
+                })
+            }
+            _ => None,
+        }
     }
 
     pub fn set_viewport(

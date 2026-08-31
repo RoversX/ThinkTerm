@@ -1321,6 +1321,24 @@ impl crate::TermWindow {
             .viewport_rows
             .saturating_mul(pane_render_metrics.cell_size.height.max(1) as usize);
 
+        // A saved viewport can still be overtaken (scrollback trimming
+        // passed it, the app erased its scrollback, or a resize renumbered
+        // rows faster than the rewrap anchoring compensates).
+        // stable_range's fallback would then silently draw physical row 0 —
+        // the notorious "terminal jumped to the top". Degrade by one small
+        // step instead, routed through set_viewport so the correction gets
+        // the same normalization as a user scroll (in particular the
+        // conversion to follow-bottom when no scrollback remains) and the
+        // copy/quickselect overlays hear about it.
+        let current_viewport =
+            match Self::normalize_stale_viewport(current_viewport, &dims) {
+                Some(fixed) => {
+                    self.set_viewport(pane_id, fixed, dims);
+                    fixed
+                }
+                None => current_viewport,
+            };
+
         let gl_state = self.render_state.as_ref().unwrap();
 
         let cursor_border_color = palette.cursor_border.to_linear();

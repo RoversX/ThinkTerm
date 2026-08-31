@@ -922,6 +922,38 @@ fn test_alt_screen_shrink_is_top_anchored() {
     term.assert_cursor_pos(3, 3, None, None);
 }
 
+/// Rewrapping on a width change renumbers every physical row; the screen
+/// must re-anchor stable_row_index_offset so the cursor row keeps its
+/// stable index, or every saved StableRowIndex (GUI scroll viewports,
+/// most visibly) silently points at different content after a split or
+/// sidebar drag — the "terminal jumped to the top" reports.
+#[test]
+fn test_rewrap_preserves_cursor_stable_row() {
+    let mut term = TestTerm::new(4, 20, 100);
+    // Enough wrapped output to overflow the scrollback and accumulate a
+    // real stable_row_index_offset first: the anchor is unsigned, so it
+    // is exact only once history has scrolled past (the every-day case
+    // for a long-lived pane).
+    for i in 0..200 {
+        term.print(format!("line {i} padding padding\r\n"));
+    }
+    let cursor = term.cursor_pos();
+    let before = term.screen().visible_row_to_stable_row(cursor.y);
+    term.resize(TerminalSize {
+        rows: 4,
+        cols: 10,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 0,
+    });
+    let cursor = term.cursor_pos();
+    let after = term.screen().visible_row_to_stable_row(cursor.y);
+    assert_eq!(
+        before, after,
+        "cursor row must keep its stable index across a rewrap"
+    );
+}
+
 /// This test skips over an edge case with cursor positioning,
 /// so it passes even ahead of a fix for issue 2162.
 #[test]
