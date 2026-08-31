@@ -823,13 +823,25 @@ impl super::TermWindow {
         let y = event.coords.y as f32;
 
         let nav_height = self.pane_nav_bar_height() as f32;
-        for pos in tab.iter_panes_ignoring_zoom() {
+        // iter_panes (NOT ignoring_zoom): the hit test must cover exactly
+        // the panes being painted. With a pane zoomed, the unzoomed
+        // layout's header strips would otherwise remain as invisible
+        // wheel-consuming bands inside the zoomed pane, at every hidden
+        // pane's old header position.
+        for pos in tab.iter_panes() {
             let Ok((pane_x, pane_width)) = self.pane_chrome_span(&pos) else {
                 continue;
             };
             let pane_y = top_bar_height + border.top.get() as f32 + pos.top as f32 * cell_height;
             if x >= pane_x && x < pane_x + pane_width && y >= pane_y && y < pane_y + nav_height {
-                return Some(TabWheelSurface::PaneStack(pos.pane_stack_id));
+                // The zoomed branch of iter_panes fills pane_stack_id with
+                // the pane's own id, not the real stack id; resolve through
+                // the mux like the ui-item branch above so the wheel
+                // scrolls the stack actually under the pointer.
+                let stack_id = Mux::get()
+                    .pane_stack_id(pos.pane.pane_id())
+                    .unwrap_or(pos.pane_stack_id);
+                return Some(TabWheelSurface::PaneStack(stack_id));
             }
         }
 
@@ -1790,13 +1802,24 @@ impl super::TermWindow {
         // including the card layout a click would be aiming at, which is still
         // moving.
         if self.content_view_transition_running() {
-            // Suppressing the action is the point; forgetting that the button
-            // physically came up is not. A press held across the start of a
-            // transition -- holding a card and hitting Escape, say -- would
-            // otherwise leave the pointer bookkeeping armed, and every guard
-            // that tests it reads as if the button were still down.
-            self.release_pointer_ownership(&event);
-            return;
+            // Finger-driven wheels are exempt from the hold: a scroll
+            // cannot "click the moving card", and the hold lasts up to a
+            // full second — long enough that swipes made right after
+            // closing a page were silently discarded and scrolling felt
+            // dead. Momentum events are NOT exempt: they belong to a
+            // gesture that started on the page being left, and letting
+            // them through would scroll whatever lands underneath.
+            if !matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+                || event.momentum_phase.is_some()
+            {
+                // Suppressing the action is the point; forgetting that the button
+                // physically came up is not. A press held across the start of a
+                // transition -- holding a card and hitting Escape, say -- would
+                // otherwise leave the pointer bookkeeping armed, and every guard
+                // that tests it reads as if the button were still down.
+                self.release_pointer_ownership(&event);
+                return;
+            }
         }
         let pane = self.get_active_pane_or_overlay();
 
