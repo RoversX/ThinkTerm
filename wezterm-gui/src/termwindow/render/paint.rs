@@ -446,6 +446,89 @@ pub enum AllowImage {
     No,
 }
 
+impl AllowImage {
+    /// The next coarser level after an atlas overflow, or None when there
+    /// is nothing left to give up.
+    fn coarser(self) -> Option<AllowImage> {
+        match self {
+            AllowImage::Yes => Some(AllowImage::Scale(2)),
+            AllowImage::Scale(2) => Some(AllowImage::Scale(4)),
+            AllowImage::Scale(4) => Some(AllowImage::Scale(8)),
+            AllowImage::Scale(_) => Some(AllowImage::No),
+            AllowImage::No => None,
+        }
+    }
+}
+
+/// What the overflow handler does about an atlas that could not fit the
+/// frame. Pure so the freeze case below can be pinned by a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtlasAction {
+    /// Rebuild at this larger size.
+    Grow(usize),
+    /// Rebuild at the current size to evict sprites no frame needs any more.
+    ClearInPlace,
+    /// The frame wants more than the cap allows. Handled as an allocation
+    /// failure: clear in place and downscale images. Never rounded down to
+    /// the cap -- at the cap that rebuild would succeed, skip the downscale
+    /// step, and overflow identically on the next pass, forever.
+    CapExceeded,
+}
+
+/// `pass` is the ordinal of this atlas overflow within the frame (0 for
+/// the first), not the paint loop's pass counter, which also advances on
+/// quad-growth and shape-cache retries.
+///
+/// First overflow: grow while there is headroom under `grow_ceiling` rather
+/// than clearing in place. Clearing answers "the atlas is full of glyphs we
+/// no longer need"; it is the wrong answer to "the working set does not
+/// fit", because the frame that overflowed fits once the atlas is empty, so
+/// the growth branch is never reached and the next frame that wants the
+/// same glyphs overflows again -- toggling the overview used to clear the
+/// atlas every single time. At the ceiling, clearing is all that is left,
+/// and it is also what reclaims the one-off glyphs a closed overview leaves
+/// behind.
+///
+/// Later overflows: the working set did not fit even after a clear, so grow
+/// to what the frame asked for -- up to `cap`, past which the request is a
+/// failure (see [`AtlasAction::CapExceeded`]).
+pub(crate) fn atlas_overflow_action(
+    pass: usize,
+    current: usize,
+    wanted: usize,
+    grow_ceiling: usize,
+    cap: usize,
+) -> AtlasAction {
+    if pass == 0 {
+        let grown = wanted.min(grow_ceiling);
+        if grown > current {
+            AtlasAction::Grow(grown)
+        } else {
+            AtlasAction::ClearInPlace
+        }
+    } else if wanted > cap {
+        AtlasAction::CapExceeded
+    } else if wanted > current {
+        AtlasAction::Grow(wanted)
+    } else {
+        AtlasAction::ClearInPlace
+    }
+}
+
+/// The image level a frame starts at, and the hold to carry forward: a
+/// downscale forced by an earlier overflow holds for `hold_for`, after
+/// which the next frame probes full size again.
+pub(crate) fn sticky_allow_images(
+    hold: Option<(AllowImage, Instant)>,
+    now: Instant,
+    hold_for: Duration,
+) -> (AllowImage, Option<(AllowImage, Instant)>) {
+    match hold {
+        Some((level, since)) if now.saturating_duration_since(since) < hold_for => (level, hold),
+        _ => (AllowImage::Yes, None),
+    }
+}
+
 impl crate::TermWindow {
     fn paint_frontend_handoff_overlay(
         &mut self,
@@ -647,8 +730,28 @@ impl crate::TermWindow {
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
         *self.has_animation.borrow_mut() = None;
-        // Start with the assumption that we should allow images to render
-        self.allow_images = AllowImage::Yes;
+        // Start at full-size images unless a recent overflow forced a
+        // downscale; that level holds for ATLAS_SCALE_HOLD so the frames
+        // after it do not each re-probe full size and overflow again.
+        let had_hold = self.atlas_scale_hold.is_some();
+        let (allow_images, hold) = sticky_allow_images(
+            self.atlas_scale_hold,
+            Instant::now(),
+            crate::termwindow::ATLAS_SCALE_HOLD,
+        );
+        self.allow_images = allow_images;
+        self.atlas_scale_hold = hold;
+        if had_hold && hold.is_none() {
+            // The hold lapsed: drop the downscaled sprites so this frame
+            // really does re-probe full size. The frame cache is keyed by
+            // hash alone and would otherwise keep serving the small copies.
+            if let Some(render_state) = self.render_state.as_ref() {
+                let evicted = render_state.evict_scaled_image_frames();
+                if evicted > 0 {
+                    log::trace!("atlas downscale hold lapsed; evicted {evicted} scaled frames");
+                }
+            }
+        }
 
         let start = Instant::now();
         self.advance_tab_scroll_animation(start);
@@ -682,6 +785,7 @@ impl crate::TermWindow {
         // half a second of nothing.
         const MAX_SHAPE_CACHE_RETRIES: usize = 1;
         let mut shape_retries = 0usize;
+        let mut atlas_retries = 0usize;
         // Cleared when the retry cap gives up on this frame: the quad buffers
         // then hold however much of the window the aborted pass got through,
         // and presenting that paints the terminal without its chrome for the
@@ -731,36 +835,81 @@ impl crate::TermWindow {
                             "paint_retry_atlas",
                             format!("pass={pass} have={current_size} want={size}"),
                         );
-                        let result = if pass == 0 {
-                            // Grow while there is headroom, rather than
-                            // clearing in place.
-                            //
-                            // Clearing answers "the atlas is full of glyphs we
-                            // no longer need". It is the wrong answer to "the
-                            // working set does not fit": the frame that
-                            // overflowed fits once the atlas is empty, so this
-                            // never reached the growth branch below, and the
-                            // next frame that wants the same glyphs overflows
-                            // again. Toggling the overview cleared the atlas
-                            // every single time, re-rasterising every glyph on
-                            // screen -- and taking the recorded transition
-                            // frames, whose texture coordinates the rebuild
-                            // invalidates, with it.
-                            let grown = size.min(crate::termwindow::MAX_GROWN_ATLAS_SIZE);
-                            if grown > current_size {
-                                log::trace!("grow texture atlas {current_size} -> {grown}");
-                                self.recreate_texture_atlas(Some(grown))
-                            } else {
-                                // At the ceiling: clearing is all that is left,
-                                // and it is also what reclaims the one-off
-                                // glyphs a closed overview leaves behind.
-                                log::trace!("recreate_texture_atlas at {current_size}");
-                                self.recreate_texture_atlas(Some(current_size))
+                        atlas_retries += 1;
+                        if atlas_retries > crate::termwindow::MAX_ATLAS_RETRIES {
+                            // Keep the previous complete frame rather than
+                            // present a half-built one (only WebGpu can skip
+                            // the present; glium swaps regardless). Unlike
+                            // the shape-retry cap below this does NOT
+                            // re-invalidate: clearing shape caches changes
+                            // the next frame, but a working set that will
+                            // not fit at the cap even with images downscaled
+                            // paints identically, and re-arming would turn
+                            // every vsync into ten atlas rebuilds.
+                            crate::perf::log_counter("paint_atlas_retry_capped", atlas_retries);
+                            log::error!(
+                                "texture atlas: {atlas_retries} rebuilds in one frame \
+                                 (have={current_size} want={size}); keeping the previous frame"
+                            );
+                            self.note_atlas_overflow(pass, current_size, size, "gave-up");
+                            present_frame = false;
+                            break 'pass;
+                        }
+                        // The outer `pass` also counts quad-growth and
+                        // shape-cache retries, so the first *atlas* overflow
+                        // of a frame is not necessarily pass 0. The policy
+                        // wants the atlas overflow ordinal.
+                        let action = atlas_overflow_action(
+                            atlas_retries - 1,
+                            current_size,
+                            size,
+                            crate::termwindow::MAX_GROWN_ATLAS_SIZE,
+                            crate::termwindow::MAX_ATLAS_SIZE,
+                        );
+                        let (result, action_name) = match action {
+                            AtlasAction::Grow(grown) => {
+                                // Growth up to the first-pass ceiling is
+                                // routine (startup climbs 128 -> 512 this
+                                // way); only growth past it is the event
+                                // worth a default-level log line.
+                                if grown > crate::termwindow::MAX_GROWN_ATLAS_SIZE {
+                                    log::warn!(
+                                        "texture atlas grow {current_size}->{grown} pass={pass} scene={}",
+                                        self.atlas_scene()
+                                    );
+                                } else {
+                                    log::trace!("grow texture atlas {current_size} -> {grown}");
+                                }
+                                (self.recreate_texture_atlas(Some(grown)), "grow")
                             }
-                        } else {
-                            log::trace!("grow texture atlas to {}", size);
-                            self.recreate_texture_atlas(Some(size))
+                            AtlasAction::ClearInPlace => {
+                                log::trace!("recreate_texture_atlas at {current_size}");
+                                (self.recreate_texture_atlas(Some(current_size)), "clear")
+                            }
+                            AtlasAction::CapExceeded => {
+                                log::warn!(
+                                    "texture atlas wants {size} texels per side, past the {} cap \
+                                     (have {current_size}); clearing and downscaling images, pass={pass} scene={}",
+                                    crate::termwindow::MAX_ATLAS_SIZE,
+                                    self.atlas_scene()
+                                );
+                                // Clear first: the frame cache would otherwise
+                                // keep handing out the full-size sprites by
+                                // hash and the downscaled retry would change
+                                // nothing. Then take the failure path below.
+                                let cleared = self.recreate_texture_atlas(Some(current_size));
+                                (
+                                    cleared.and_then(|()| {
+                                        Err(anyhow::anyhow!(
+                                            "texture atlas cap {} exceeded (wanted {size})",
+                                            crate::termwindow::MAX_ATLAS_SIZE
+                                        ))
+                                    }),
+                                    "cap",
+                                )
+                            }
                         };
+                        self.note_atlas_overflow(pass, current_size, size, action_name);
                         self.invalidate_fancy_tab_bar();
                         self.invalidate_modal();
                         // Captured sidebars hold atlas UV coordinates, not
@@ -772,20 +921,35 @@ impl crate::TermWindow {
                         self.discard_content_view_captures_after_atlas_recreation();
 
                         if let Err(err) = result {
-                            self.allow_images = match self.allow_images {
-                                AllowImage::Yes => AllowImage::Scale(2),
-                                AllowImage::Scale(2) => AllowImage::Scale(4),
-                                AllowImage::Scale(4) => AllowImage::Scale(8),
-                                AllowImage::Scale(8) => AllowImage::No,
-                                AllowImage::No | _ => {
+                            if !matches!(action, AtlasAction::CapExceeded) {
+                                // The rebuild failed at the GPU (limit or
+                                // memory) and left the old atlas in place,
+                                // full-size sprites included. Clear it so the
+                                // downscaled retry does not just hit them by
+                                // hash and overflow the same way.
+                                if let Err(clear_err) =
+                                    self.recreate_texture_atlas(Some(current_size))
+                                {
                                     log::error!(
-                                        "Failed to {} texture: {}",
-                                        if pass == 0 { "clear" } else { "resize" },
-                                        err
+                                        "texture atlas clear after failed resize also failed: {clear_err:#}"
                                     );
-                                    break 'pass;
                                 }
+                            }
+                            let Some(coarser) = self.allow_images.coarser() else {
+                                log::error!(
+                                    "Failed to {} texture: {}",
+                                    if pass == 0 { "clear" } else { "resize" },
+                                    err
+                                );
+                                // Nothing left to give up. The atlas was just
+                                // cleared (or the rebuild failed), so the
+                                // quads built this pass point at a zeroed or
+                                // stale texture: keep the previous frame.
+                                present_frame = false;
+                                break 'pass;
                             };
+                            self.allow_images = coarser;
+                            self.atlas_scale_hold = Some((coarser, Instant::now()));
 
                             log::info!(
                                 "Not enough texture space ({:#}); \
@@ -4090,5 +4254,93 @@ mod tests {
             quantize_terminal_preview_scale_down(f64::NAN, minimum),
             minimum
         );
+    }
+}
+
+#[cfg(test)]
+mod atlas_policy_tests {
+    use super::{atlas_overflow_action, sticky_allow_images, AllowImage, AtlasAction};
+    use std::time::{Duration, Instant};
+
+    const CEIL: usize = 2048;
+    const CAP: usize = 8192;
+
+    #[test]
+    fn first_pass_grows_only_up_to_the_ceiling() {
+        assert_eq!(
+            atlas_overflow_action(0, 512, 1024, CEIL, CAP),
+            AtlasAction::Grow(1024)
+        );
+        assert_eq!(
+            atlas_overflow_action(0, 1024, 4096, CEIL, CAP),
+            AtlasAction::Grow(CEIL)
+        );
+    }
+
+    #[test]
+    fn first_pass_at_or_past_the_ceiling_clears_in_place() {
+        assert_eq!(
+            atlas_overflow_action(0, CEIL, 4096, CEIL, CAP),
+            AtlasAction::ClearInPlace
+        );
+        assert_eq!(
+            atlas_overflow_action(0, CAP, 16384, CEIL, CAP),
+            AtlasAction::ClearInPlace
+        );
+    }
+
+    #[test]
+    fn retry_passes_grow_to_the_request_within_the_cap() {
+        assert_eq!(
+            atlas_overflow_action(1, CEIL, 4096, CEIL, CAP),
+            AtlasAction::Grow(4096)
+        );
+        assert_eq!(
+            atlas_overflow_action(2, 4096, CAP, CEIL, CAP),
+            AtlasAction::Grow(CAP)
+        );
+    }
+
+    #[test]
+    fn a_request_past_the_cap_is_a_failure_not_a_rounding() {
+        // The freeze case: already at the cap, asked for more. Rounding to
+        // the cap would rebuild at the same size, succeed, and overflow
+        // identically on the next pass.
+        assert_eq!(
+            atlas_overflow_action(1, CAP, 16384, CEIL, CAP),
+            AtlasAction::CapExceeded
+        );
+        assert_eq!(
+            atlas_overflow_action(1, 4096, 16384, CEIL, CAP),
+            AtlasAction::CapExceeded
+        );
+    }
+
+    #[test]
+    fn downscale_levels_end_at_no_images() {
+        assert_eq!(AllowImage::Yes.coarser(), Some(AllowImage::Scale(2)));
+        assert_eq!(AllowImage::Scale(2).coarser(), Some(AllowImage::Scale(4)));
+        assert_eq!(AllowImage::Scale(4).coarser(), Some(AllowImage::Scale(8)));
+        assert_eq!(AllowImage::Scale(8).coarser(), Some(AllowImage::No));
+        assert_eq!(AllowImage::No.coarser(), None);
+    }
+
+    #[test]
+    fn sticky_hold_carries_the_level_until_it_lapses() {
+        let armed = Instant::now();
+        let hold = Some((AllowImage::Scale(2), armed));
+        let hold_for = Duration::from_secs(30);
+
+        let (level, kept) = sticky_allow_images(hold, armed + Duration::from_secs(10), hold_for);
+        assert_eq!(level, AllowImage::Scale(2));
+        assert_eq!(kept, hold);
+
+        let (level, kept) = sticky_allow_images(hold, armed + Duration::from_secs(31), hold_for);
+        assert_eq!(level, AllowImage::Yes);
+        assert_eq!(kept, None);
+
+        let (level, kept) = sticky_allow_images(None, armed, hold_for);
+        assert_eq!(level, AllowImage::Yes);
+        assert_eq!(kept, None);
     }
 }

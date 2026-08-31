@@ -9404,6 +9404,11 @@ impl crate::TermWindow {
         let Some(gl_state) = self.render_state.as_ref() else {
             return Ok(());
         };
+        // Same rule as terminal-cell images: once the atlas overflow chain
+        // reached `No`, nothing uploads a picture this frame.
+        if self.allow_images == crate::termwindow::render::paint::AllowImage::No {
+            return Ok(());
+        }
         let (sprite, next_due, _load_state) = gl_state
             .glyph_cache
             .borrow_mut()
@@ -15463,6 +15468,9 @@ impl crate::TermWindow {
         let draw_x = metrics.x as f32 + (max_width - draw_width) / 2.0;
         let draw_y = metrics.y as f32 + (max_height - draw_height) / 2.0;
 
+        if self.allow_images == crate::termwindow::render::paint::AllowImage::No {
+            return Ok(());
+        }
         let gl_state = self.render_state.as_ref().unwrap();
         let (sprite, next_due, _load_state) = gl_state
             .glyph_cache

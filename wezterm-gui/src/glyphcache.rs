@@ -3,7 +3,7 @@ use crate::customglyph::*;
 use crate::renderstate::RenderContext;
 use crate::termwindow::render::paint::AllowImage;
 use crate::termwindow::ui::icons::{BrandIcon, MaterialIcon, SvgIcon};
-use ::window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
+use ::window::bitmaps::atlas::{Atlas, AtlasTag, AtlasUsage, OutOfTextureSpace, Sprite};
 use ::window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
 use ::window::color::SrgbaPixel;
 use ::window::{Point, Rect};
@@ -16,7 +16,7 @@ use image::{
 use lfucache::LfuCache;
 use ordered_float::NotNan;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Seek;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -581,6 +581,40 @@ impl DecodedImage {
     }
 }
 
+/// One image upload into the atlas. The atlas only knows areas; this is
+/// what lets the memory report name the pictures that took the space.
+#[derive(Debug, Clone)]
+pub struct ImageAllocRecord {
+    pub width: usize,
+    pub height: usize,
+    /// The downscale divisor the frame was uploaded at, if any.
+    pub scale: Option<usize>,
+    pub animated: bool,
+    /// A one-shot streaming frame (nonce key): never requested again
+    /// under the same key, so each one is fresh atlas area.
+    pub nonce: bool,
+    pub at: Instant,
+}
+
+impl ImageAllocRecord {
+    pub fn describe(&self, now: Instant) -> String {
+        format!(
+            "{}x{}{}{}{} {}s",
+            self.width,
+            self.height,
+            self.scale.map(|s| format!("/s{s}")).unwrap_or_default(),
+            if self.animated { " anim" } else { "" },
+            if self.nonce { " nonce" } else { "" },
+            now.saturating_duration_since(self.at).as_secs(),
+        )
+    }
+}
+
+/// How many recent image uploads the report keeps. Survives atlas
+/// recreation (the render state carries it across) so the uploads that
+/// forced a grow are still listed afterwards.
+const IMAGE_ALLOC_LOG_LEN: usize = 16;
+
 /// A number of items here are HashMaps rather than LfuCaches;
 /// eviction is managed by recreating Self when the Atlas is filled
 pub struct GlyphCache {
@@ -589,6 +623,10 @@ pub struct GlyphCache {
     pub fonts: Rc<FontConfiguration>,
     pub image_cache: LfuCache<[u8; 32], DecodedImage>,
     frame_cache: HashMap<[u8; 32], Sprite>,
+    /// Frames that were uploaded downscaled, so the hash-keyed frame cache
+    /// can drop them once full size is allowed again.
+    scaled_frames: HashSet<[u8; 32]>,
+    pub(crate) image_alloc_log: VecDeque<ImageAllocRecord>,
     line_glyphs: HashMap<LineKey, Sprite>,
     pub block_glyphs: HashMap<SizedBlockKey, Sprite>,
     pub svg_icons: HashMap<SizedSvgIconKey, Sprite>,
@@ -603,6 +641,9 @@ pub struct GlyphCache {
 #[derive(Debug, Clone)]
 pub struct GlyphCacheStats {
     pub atlas_size: usize,
+    pub atlas_usage: AtlasUsage,
+    /// Newest first.
+    pub recent_image_allocs: Vec<String>,
     pub glyphs: usize,
     pub decoded_images: usize,
     pub image_frames: usize,
@@ -616,8 +657,16 @@ pub struct GlyphCacheStats {
 
 impl GlyphCache {
     pub fn stats(&self) -> GlyphCacheStats {
+        let now = Instant::now();
         GlyphCacheStats {
             atlas_size: self.atlas.size(),
+            atlas_usage: self.atlas.usage(),
+            recent_image_allocs: self
+                .image_alloc_log
+                .iter()
+                .rev()
+                .map(|record| record.describe(now))
+                .collect(),
             glyphs: self.glyph_cache.len(),
             decoded_images: self.image_cache.len(),
             image_frames: self.frame_cache.len(),
@@ -644,6 +693,8 @@ impl GlyphCache {
                 &fonts.config(),
             ),
             frame_cache: HashMap::new(),
+            scaled_frames: HashSet::new(),
+            image_alloc_log: VecDeque::new(),
             atlas,
             line_glyphs: HashMap::new(),
             block_glyphs: HashMap::new(),
@@ -677,6 +728,8 @@ impl GlyphCache {
                 &fonts.config(),
             ),
             frame_cache: HashMap::new(),
+            scaled_frames: HashSet::new(),
+            image_alloc_log: VecDeque::new(),
             atlas,
             line_glyphs: HashMap::new(),
             block_glyphs: HashMap::new(),
@@ -937,7 +990,9 @@ impl GlyphCache {
                 (scale, raw_im)
             };
 
-            let tex = self.atlas.allocate(&raw_im)?;
+            let tex = self
+                .atlas
+                .allocate_tagged(&raw_im, None, None, AtlasTag::Glyph)?;
 
             let g = CachedGlyph {
                 brightness_adjust,
@@ -963,9 +1018,47 @@ impl GlyphCache {
         Ok(Rc::new(glyph))
     }
 
+    fn note_image_alloc(
+        log: &mut VecDeque<ImageAllocRecord>,
+        (width, height): (usize, usize),
+        scale: Option<usize>,
+        animated: bool,
+        nonce: bool,
+    ) {
+        if log.len() >= IMAGE_ALLOC_LOG_LEN {
+            log.pop_front();
+        }
+        log.push_back(ImageAllocRecord {
+            width,
+            height,
+            scale,
+            animated,
+            nonce,
+            at: Instant::now(),
+        });
+    }
+
+    /// Forget the sprites that were uploaded downscaled. The frame cache is
+    /// keyed by image hash alone, so without this a lapsed downscale hold
+    /// would keep serving the small copies until some unrelated atlas
+    /// rebuild. The atlas area they occupy is not reclaimed (the allocator
+    /// cannot free a rectangle); the next paint re-uploads at full size,
+    /// which is exactly the probe the hold's expiry is for.
+    pub fn evict_scaled_frames(&mut self) -> usize {
+        let mut evicted = 0;
+        for hash in self.scaled_frames.drain() {
+            if self.frame_cache.remove(&hash).is_some() {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
     fn cached_image_impl(
         frame_cache: &mut HashMap<[u8; 32], Sprite>,
+        scaled_frames: &mut HashSet<[u8; 32]>,
         atlas: &mut Atlas,
+        image_alloc_log: &mut VecDeque<ImageAllocRecord>,
         decoded: &DecodedImage,
         padding: Option<usize>,
         min_frame_duration: Duration,
@@ -975,10 +1068,17 @@ impl GlyphCache {
             h: decoded.image.data(),
             current_frame: *decoded.current_frame.borrow(),
         };
+        let nonce = ImageDataType::is_nonce_key(&decoded.image.hash());
 
         let scale_down = match allow_image {
+            AllowImage::Yes => None,
             AllowImage::Scale(n) => Some(n),
-            _ => None,
+            // Callers that can skip an image at `No` do so before getting
+            // here (terminal cells, the window background, the sidebar).
+            // Anything that still asks must never re-upload the original:
+            // that is the size the atlas just failed to hold, and the retry
+            // would end on an incomplete frame instead of recovering.
+            AllowImage::No => Some(8),
         };
 
         match &*handle.h {
@@ -987,9 +1087,19 @@ impl GlyphCache {
                     return Ok((sprite.clone(), None, LoadState::Loaded));
                 }
                 let sprite = atlas
-                    .allocate_with_padding(&handle, padding, scale_down)
+                    .allocate_tagged(&handle, padding, scale_down, AtlasTag::Image)
                     .context("atlas.allocate_with_padding")?;
+                Self::note_image_alloc(
+                    image_alloc_log,
+                    handle.image_dimensions(),
+                    scale_down,
+                    false,
+                    nonce,
+                );
                 frame_cache.insert(*hash, sprite.clone());
+                if scale_down.is_some() {
+                    scaled_frames.insert(*hash);
+                }
 
                 return Ok((sprite, None, LoadState::Loaded));
             }
@@ -1043,10 +1153,20 @@ impl GlyphCache {
                 }
 
                 let sprite = atlas
-                    .allocate_with_padding(&handle, padding, scale_down)
+                    .allocate_tagged(&handle, padding, scale_down, AtlasTag::Image)
                     .context("atlas.allocate_with_padding")?;
+                Self::note_image_alloc(
+                    image_alloc_log,
+                    handle.image_dimensions(),
+                    scale_down,
+                    true,
+                    nonce,
+                );
 
                 frame_cache.insert(hash, sprite.clone());
+                if scale_down.is_some() {
+                    scaled_frames.insert(hash);
+                }
 
                 return Ok((
                     sprite,
@@ -1135,9 +1255,19 @@ impl GlyphCache {
                     frames.current_frame.height,
                     frame_data,
                 );
-                let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
+                let sprite = atlas.allocate_tagged(&frame, padding, scale_down, AtlasTag::Image)?;
+                Self::note_image_alloc(
+                    image_alloc_log,
+                    (frames.current_frame.width, frames.current_frame.height),
+                    scale_down,
+                    true,
+                    nonce,
+                );
 
                 frame_cache.insert(hash, sprite.clone());
+                if scale_down.is_some() {
+                    scaled_frames.insert(hash);
+                }
 
                 Ok((
                     sprite,
@@ -1174,7 +1304,9 @@ impl GlyphCache {
             let decoded = DecodedImage::load(image_data);
             return Self::cached_image_impl(
                 &mut self.frame_cache,
+                &mut self.scaled_frames,
                 &mut self.atlas,
+                &mut self.image_alloc_log,
                 &decoded,
                 padding,
                 self.min_frame_duration,
@@ -1185,7 +1317,9 @@ impl GlyphCache {
         if let Some(decoded) = self.image_cache.get(&hash) {
             Self::cached_image_impl(
                 &mut self.frame_cache,
+                &mut self.scaled_frames,
                 &mut self.atlas,
+                &mut self.image_alloc_log,
                 decoded,
                 padding,
                 self.min_frame_duration,
@@ -1195,7 +1329,9 @@ impl GlyphCache {
             let decoded = DecodedImage::load(image_data);
             let res = Self::cached_image_impl(
                 &mut self.frame_cache,
+                &mut self.scaled_frames,
                 &mut self.atlas,
+                &mut self.image_alloc_log,
                 &decoded,
                 padding,
                 self.min_frame_duration,
@@ -1547,5 +1683,64 @@ impl GlyphCache {
         }
 
         self.line_sprite(key, metrics)
+    }
+}
+
+#[cfg(test)]
+mod scaled_frame_tests {
+    use super::*;
+    use wezterm_font::FontConfiguration;
+
+    fn glyph_cache() -> GlyphCache {
+        config::use_test_configuration();
+        let fonts =
+            Rc::new(FontConfiguration::new(None, ::window::default_dpi() as usize).unwrap());
+        GlyphCache::new_in_memory(&fonts, 256).unwrap()
+    }
+
+    fn image(side: u32, fill: u8) -> Arc<ImageData> {
+        Arc::new(ImageData::with_data(
+            ImageDataType::new_single_frame_content_hashed(
+                side,
+                side,
+                vec![fill; (side * side * 4) as usize],
+            ),
+        ))
+    }
+
+    #[test]
+    fn evicting_scaled_frames_drops_only_the_downscaled_sprites() {
+        let mut cache = glyph_cache();
+        let full = image(16, 255);
+        let scaled = image(32, 128);
+
+        cache.cached_image(&full, None, AllowImage::Yes).unwrap();
+        let (small, _, _) = cache
+            .cached_image(&scaled, None, AllowImage::Scale(2))
+            .unwrap();
+        assert_eq!(small.coords.width(), 16);
+        assert_eq!(cache.frame_cache.len(), 2);
+
+        // Hash-only lookup: full size asked for, small copy served.
+        let (still_small, _, _) = cache.cached_image(&scaled, None, AllowImage::Yes).unwrap();
+        assert_eq!(still_small.coords.width(), 16);
+
+        assert_eq!(cache.evict_scaled_frames(), 1);
+        assert_eq!(cache.frame_cache.len(), 1);
+        assert_eq!(cache.evict_scaled_frames(), 0);
+
+        let (reprobed, _, _) = cache.cached_image(&scaled, None, AllowImage::Yes).unwrap();
+        assert_eq!(reprobed.coords.width(), 32);
+        assert_eq!(cache.frame_cache.len(), 2);
+    }
+
+    #[test]
+    fn no_never_uploads_the_original_size() {
+        let mut cache = glyph_cache();
+        let (sprite, _, _) = cache
+            .cached_image(&image(64, 7), None, AllowImage::No)
+            .unwrap();
+        assert_eq!(sprite.coords.width(), 8);
+        assert_eq!(cache.scaled_frames.len(), 1);
     }
 }

@@ -278,6 +278,45 @@ const ATLAS_SIZE: usize = 128;
 /// one-off glyphs a closed overview leaves behind.
 const MAX_GROWN_ATLAS_SIZE: usize = 2048;
 
+/// Absolute ceiling for the glyph atlas on any paint pass, in texels per
+/// side; 8192² of RGBA is 256MiB. [`MAX_GROWN_ATLAS_SIZE`] only bounds the
+/// first pass: the retry passes grow to whatever the frame asked for, and
+/// without this cap that reaches the GPU maximum (16384² = 1GiB) before
+/// image downscaling is even attempted. A request past the cap is handled
+/// as an allocation failure -- the atlas is cleared in place and
+/// `AllowImage` advances -- never by silently rounding the request down,
+/// which would rebuild at the same size, succeed, and overflow again on the
+/// next pass forever. (Startup lands at 512; 2048 is a conservative floor
+/// for any future shrink, not the initial state.)
+pub(crate) const MAX_ATLAS_SIZE: usize = 8192;
+
+/// How many atlas-driven repaints one frame may take before it gives up and
+/// keeps the previous frame on screen. The worst legitimate case is four
+/// doublings up to the cap, one clear, and four image downscale steps.
+pub(crate) const MAX_ATLAS_RETRIES: usize = 10;
+
+/// Once a frame had to downscale images to fit the atlas, later frames
+/// start at that level for this long instead of probing full size every
+/// frame. When it lapses the downscaled sprites are evicted from the frame
+/// cache (it is keyed by hash alone and would otherwise keep serving them),
+/// the next frame probes full size, and the hold re-arms if that overflows.
+pub(crate) const ATLAS_SCALE_HOLD: Duration = Duration::from_secs(30);
+
+/// How many atlas overflow events the memory report keeps.
+const ATLAS_OVERFLOW_LOG_LEN: usize = 32;
+
+/// One atlas overflow, kept so the memory report can say what the window
+/// was showing when the atlas had to grow or clear.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtlasOverflowRecord {
+    pub at: Instant,
+    pub pass: usize,
+    pub have: usize,
+    pub want: usize,
+    pub action: &'static str,
+    pub scene: &'static str,
+}
+
 /// How long a full-window view takes to arrive or leave.
 ///
 /// Shorter than the Space swipe settle: that one continues a gesture the hand
@@ -2446,6 +2485,11 @@ pub struct TermWindow {
     /// We use this to attempt to do something reasonable
     /// if we run out of texture space
     allow_images: AllowImage,
+    /// Image downscale level carried across frames after an atlas overflow,
+    /// and when it was armed. See [`ATLAS_SCALE_HOLD`].
+    atlas_scale_hold: Option<(AllowImage, Instant)>,
+    /// Recent atlas overflow events, oldest first, for the memory report.
+    atlas_overflow_log: std::collections::VecDeque<AtlasOverflowRecord>,
     scheduled_animation: RefCell<Option<Instant>>,
 
     /// Single-flight latch for the unfocused repaint throttle: the
@@ -2470,6 +2514,39 @@ pub struct TermWindow {
 }
 
 impl TermWindow {
+    /// What the window was showing when the atlas overflowed; the report
+    /// uses it to tell an overview spike from a plain terminal frame.
+    pub(crate) fn atlas_scene(&self) -> &'static str {
+        if self.content_view_transition_running() {
+            "transition"
+        } else if self.content_view_foreground() {
+            "content_view"
+        } else {
+            "terminal"
+        }
+    }
+
+    pub(crate) fn note_atlas_overflow(
+        &mut self,
+        pass: usize,
+        have: usize,
+        want: usize,
+        action: &'static str,
+    ) {
+        let scene = self.atlas_scene();
+        if self.atlas_overflow_log.len() >= ATLAS_OVERFLOW_LOG_LEN {
+            self.atlas_overflow_log.pop_front();
+        }
+        self.atlas_overflow_log.push_back(AtlasOverflowRecord {
+            at: Instant::now(),
+            pass,
+            have,
+            want,
+            action,
+            scene,
+        });
+    }
+
     pub(crate) fn memory_resource_lines(&self, label: &str) -> Vec<String> {
         let backend = if self.webgpu.is_some() {
             "WebGpu"
@@ -2510,8 +2587,64 @@ impl TermWindow {
                 "{label}: layers={} vertex_buffers={} quad_capacity={} line_glyphs={}",
                 stats.layers, stats.vertex_buffers, stats.layer_quads, stats.line_glyphs
             ));
+            // RGBA texels -> MiB. Packed area is a high-water mark since the
+            // last clear (the allocator never frees a rectangle), so
+            // "used" means "was packed", not "is on screen".
+            let mib = |px: u64| px as f64 * 4.0 / (1024.0 * 1024.0);
+            let usage = stats.atlas_usage;
+            let capacity_px = (stats.atlas_size * stats.atlas_size) as u64;
+            let percent = if capacity_px == 0 {
+                0.0
+            } else {
+                usage.allocated_px as f64 * 100.0 / capacity_px as f64
+            };
+            let tag = |t: ::window::bitmaps::atlas::AtlasTag| {
+                let u = usage.tag(t);
+                format!("{:.1}MiB/{}", mib(u.allocated_px), u.allocations)
+            };
+            lines.push(format!(
+                "{label}: atlas_packed={:.1}MiB/{:.0}MiB ({percent:.0}%) glyph={} image={} other(icons/blocks/lines/util)={} max_rect={}x{} failures={}",
+                mib(usage.allocated_px),
+                mib(capacity_px),
+                tag(::window::bitmaps::atlas::AtlasTag::Glyph),
+                tag(::window::bitmaps::atlas::AtlasTag::Image),
+                tag(::window::bitmaps::atlas::AtlasTag::Other),
+                usage.max_rect.0,
+                usage.max_rect.1,
+                usage.failures,
+            ));
+            lines.push(format!(
+                "{label}: recent_images=[{}]",
+                stats.recent_image_allocs.join("; ")
+            ));
         } else {
             lines.push(format!("{label}: render_state=none"));
+        }
+        {
+            let now = Instant::now();
+            let recent: Vec<String> = self
+                .atlas_overflow_log
+                .iter()
+                .rev()
+                .take(8)
+                .map(|r| {
+                    format!(
+                        "{}s:p{} {}->{} {} {}",
+                        now.saturating_duration_since(r.at).as_secs(),
+                        r.pass,
+                        r.have,
+                        r.want,
+                        r.action,
+                        r.scene
+                    )
+                })
+                .collect();
+            lines.push(format!(
+                "{label}: atlas_overflows={} scale_hold={:?} recent=[{}]",
+                self.atlas_overflow_log.len(),
+                self.atlas_scale_hold.map(|(level, _)| level),
+                recent.join("; ")
+            ));
         }
 
         lines.push(format!(
@@ -3364,6 +3497,8 @@ impl TermWindow {
             unfocused_invalidate_due: None,
             unfocused_next_allowed: Instant::now(),
             allow_images: AllowImage::Yes,
+            atlas_scale_hold: None,
+            atlas_overflow_log: std::collections::VecDeque::new(),
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             context_menu: None,

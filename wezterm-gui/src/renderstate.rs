@@ -751,6 +751,9 @@ pub struct RenderState {
 pub struct RenderStateStats {
     pub backend: &'static str,
     pub atlas_size: usize,
+    pub atlas_usage: ::window::bitmaps::atlas::AtlasUsage,
+    /// Newest first.
+    pub recent_image_allocs: Vec<String>,
     pub glyphs: usize,
     pub decoded_images: usize,
     pub image_frames: usize,
@@ -940,6 +943,11 @@ impl RenderState {
         self.glyph_cache.borrow_mut().config_changed();
     }
 
+    /// See [`GlyphCache::evict_scaled_frames`].
+    pub fn evict_scaled_image_frames(&self) -> usize {
+        self.glyph_cache.borrow_mut().evict_scaled_frames()
+    }
+
     pub fn stats(&self) -> RenderStateStats {
         let glyph = self.glyph_cache.borrow().stats();
         let layers = self.layers.borrow();
@@ -953,6 +961,8 @@ impl RenderState {
                 RenderContext::WebGpu(_) => "WebGpu",
             },
             atlas_size: glyph.atlas_size,
+            atlas_usage: glyph.atlas_usage,
+            recent_image_allocs: glyph.recent_image_allocs,
             glyphs: glyph.glyphs,
             decoded_images: glyph.decoded_images,
             image_frames: glyph.image_frames,
@@ -996,6 +1006,16 @@ impl RenderState {
                         ..
                     }) = err.downcast_ref::<OutOfTextureSpace>()
                     {
+                        // This loop only has to fit the utility sprites; it
+                        // must not become a back door past the cap the
+                        // paint loop enforces.
+                        if needed_size > crate::termwindow::MAX_ATLAS_SIZE {
+                            anyhow::bail!(
+                                "texture atlas would need {needed_size} texels per side \
+                                 for the utility sprites, past the {} cap",
+                                crate::termwindow::MAX_ATLAS_SIZE
+                            );
+                        }
                         size.replace(needed_size);
                         continue;
                     }
@@ -1024,6 +1044,12 @@ impl RenderState {
         std::mem::swap(
             &mut glyph_cache.image_cache,
             &mut new_glyph_cache.image_cache,
+        );
+        // The upload log is diagnostics for exactly this moment: keep the
+        // pictures that forced the recreation visible in the report.
+        std::mem::swap(
+            &mut glyph_cache.image_alloc_log,
+            &mut new_glyph_cache.image_alloc_log,
         );
 
         *glyph_cache = new_glyph_cache;

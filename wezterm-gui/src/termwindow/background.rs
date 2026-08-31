@@ -425,6 +425,13 @@ impl crate::TermWindow {
         layer_index: i8,
         top: StableRowIndex,
     ) -> anyhow::Result<bool> {
+        // Once the atlas overflow chain reached `No`, no picture uploads
+        // this frame -- same rule as terminal cells and the sidebar. The
+        // caller already skips the whole background at `No`; this keeps
+        // the guarantee local to the one place that uploads.
+        if self.allow_images == crate::termwindow::render::paint::AllowImage::No {
+            return Ok(false);
+        }
         let render_layer = gl_state.layer_for_zindex(layer_index)?;
         let vbs = render_layer.vb.borrow();
         let mut layer0 = vbs[0].map();

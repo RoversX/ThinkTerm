@@ -3942,6 +3942,34 @@ impl SettingsWindow {
                     }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
                     {
                         let size = size.max(current_size);
+                        if size > crate::termwindow::MAX_ATLAS_SIZE {
+                            // The settings window draws no images, so a
+                            // glyph working set past the cap is not
+                            // something a downscale could fix. The failed
+                            // pass already cleared the layers, so drawing
+                            // now would present a half-built frame: return
+                            // without drawing and the previous frame stays.
+                            log::error!(
+                                "settings window atlas would need {size} texels per side, \
+                                 past the {} cap; keeping the previous frame",
+                                crate::termwindow::MAX_ATLAS_SIZE
+                            );
+                            // Clear in place before giving up: a full atlas
+                            // of stale glyphs asks for double its size, and
+                            // without a clear every later paint would hit
+                            // this same branch and the window would freeze.
+                            if let Err(err) =
+                                self.render_state.as_mut().unwrap().recreate_texture_atlas(
+                                    &self.fonts,
+                                    &self.metrics,
+                                    Some(current_size),
+                                )
+                            {
+                                log::error!("settings window atlas clear failed: {err:#}");
+                            }
+                            self.invalidate_shaped_text();
+                            return Ok(false);
+                        }
                         crate::perf::log_counter("settings_atlas_reallocate", size);
                         let recreated = self.render_state.as_mut().unwrap().recreate_texture_atlas(
                             &self.fonts,
