@@ -8023,6 +8023,12 @@ fn collect_terminal_spec<F>(
     let domain = mux
         .get_pane(entry.pane_id)
         .and_then(|pane| mux.get_domain(pane.domain_id()))
+        // An overlay pane -- the mux connection UI while a remote domain
+        // reconnects, copy mode -- lives in the TermWiz placeholder domain,
+        // which cannot spawn anything. A layout captured at that moment
+        // would record its name and every later materialize of the Thread
+        // would fail; leave it unset so restore falls back instead.
+        .filter(|domain| domain.spawnable())
         .map(|domain| domain.domain_name().to_string());
     terminal_specs.push(TerminalSpecEntry {
         pane_id: entry.pane_id,
@@ -8065,16 +8071,83 @@ fn spawn_domain_for_entry(
     terminal_specs: &HashMap<PaneId, TerminalSpawnSpec>,
     default_if_missing: bool,
 ) -> SpawnTabDomain {
-    terminal_specs
-        .get(&entry.pane_id)
-        .and_then(|spec| spec.domain.as_deref())
-        .filter(|domain| mux.get_domain_by_name(domain).is_some())
-        .map(|domain| SpawnTabDomain::DomainName(domain.to_string()))
+    spawn_domain_for_recorded_name(
+        terminal_specs
+            .get(&entry.pane_id)
+            .and_then(|spec| spec.domain.as_deref()),
+        |name| {
+            mux.get_domain_by_name(name)
+                .map(|domain| domain.spawnable())
+        },
+        default_if_missing,
+    )
+}
+
+/// Which domain a restored pane spawns in. A recorded name is honoured only
+/// when it names a domain that exists *and* can spawn: a layout saved while
+/// the mux connection UI was up recorded the TermWiz placeholder domain, and
+/// spawning there fails every time, so such an entry falls back exactly as
+/// if no domain had been recorded -- which also heals layouts already saved
+/// that way. `spawnable(name)` is `None` for an unknown domain.
+fn spawn_domain_for_recorded_name(
+    recorded: Option<&str>,
+    spawnable: impl Fn(&str) -> Option<bool>,
+    default_if_missing: bool,
+) -> SpawnTabDomain {
+    recorded
+        .filter(|name| spawnable(name) == Some(true))
+        .map(|name| SpawnTabDomain::DomainName(name.to_string()))
         .unwrap_or(if default_if_missing {
             SpawnTabDomain::DefaultDomain
         } else {
             SpawnTabDomain::CurrentPaneDomain
         })
+}
+
+#[cfg(test)]
+mod spawn_domain_tests {
+    use super::spawn_domain_for_recorded_name;
+    use config::keyassignment::SpawnTabDomain;
+
+    fn lookup(name: &str) -> Option<bool> {
+        match name {
+            "local" => Some(true),
+            "TermWizTerminalDomain" => Some(false),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_spawnable_recorded_domain_is_used() {
+        assert_eq!(
+            spawn_domain_for_recorded_name(Some("local"), lookup, true),
+            SpawnTabDomain::DomainName("local".to_string())
+        );
+    }
+
+    #[test]
+    fn the_termwiz_placeholder_falls_back_like_a_missing_domain() {
+        assert_eq!(
+            spawn_domain_for_recorded_name(Some("TermWizTerminalDomain"), lookup, true),
+            SpawnTabDomain::DefaultDomain
+        );
+        assert_eq!(
+            spawn_domain_for_recorded_name(Some("TermWizTerminalDomain"), lookup, false),
+            SpawnTabDomain::CurrentPaneDomain
+        );
+    }
+
+    #[test]
+    fn unknown_and_absent_domains_fall_back() {
+        assert_eq!(
+            spawn_domain_for_recorded_name(Some("ssh:gone@host"), lookup, true),
+            SpawnTabDomain::DefaultDomain
+        );
+        assert_eq!(
+            spawn_domain_for_recorded_name(None, lookup, false),
+            SpawnTabDomain::CurrentPaneDomain
+        );
+    }
 }
 
 fn project_id_for_path(space_id: &str, path: &Path) -> ProjectId {
