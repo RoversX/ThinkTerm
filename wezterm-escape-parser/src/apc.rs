@@ -62,6 +62,15 @@ pub enum KittyImageData {
         /// O=...
         data_offset: Option<u32>,
     },
+    /// An external source was read before entering the terminal lock and the
+    /// read failed. Keep the error with the action so the terminal can report
+    /// it without retrying a destructive TemporaryFile/SharedMem read while
+    /// holding that lock.
+    #[cfg(feature = "kitty-shm")]
+    MaterializedError {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
 }
 
 impl core::fmt::Debug for KittyImageData {
@@ -98,6 +107,12 @@ impl core::fmt::Debug for KittyImageData {
                 .field("name", &name)
                 .field("data_offset", &data_offset)
                 .field("data_size", data_size)
+                .finish(),
+            #[cfg(feature = "kitty-shm")]
+            Self::MaterializedError { kind, message } => fmt
+                .debug_struct("MaterializedError")
+                .field("kind", kind)
+                .field("message", message)
                 .finish(),
         }
     }
@@ -166,6 +181,12 @@ impl KittyImageData {
                 set(keys, "S", data_size);
                 set(keys, "S", data_offset);
             }
+            #[cfg(feature = "kitty-shm")]
+            Self::MaterializedError { .. } => {
+                // This internal variant has no wire representation. An empty
+                // direct payload keeps diagnostic Display impls well-formed.
+                keys.insert("payload", String::new());
+            }
         }
     }
 
@@ -180,7 +201,31 @@ impl KittyImageData {
             Self::DirectBin(data) => data.len(),
             Self::File { path, .. } | Self::TemporaryFile { path, .. } => path.len(),
             Self::SharedMem { name, .. } => name.len(),
+            #[cfg(feature = "kitty-shm")]
+            Self::MaterializedError { message, .. } => message.len(),
         }
+    }
+
+    /// Resolve external payloads before taking the terminal-model lock.
+    /// Direct data stays encoded because it may participate in the terminal's
+    /// chunk accumulation rules.
+    #[cfg(feature = "kitty-shm")]
+    pub fn materialize_external_source(&mut self) {
+        if !matches!(
+            self,
+            Self::File { .. } | Self::TemporaryFile { .. } | Self::SharedMem { .. }
+        ) {
+            return;
+        }
+
+        let source = core::mem::replace(self, Self::DirectBin(Vec::new()));
+        *self = match source.load_data() {
+            Ok(data) => Self::DirectBin(data),
+            Err(err) => Self::MaterializedError {
+                kind: err.kind(),
+                message: err.to_string(),
+            },
+        };
     }
 
     /// Take the image data bytes.
@@ -211,56 +256,7 @@ impl KittyImageData {
                 // early error return here (a refused oversized file included)
                 // would leave the temporary file behind on disk.
                 let result = read_from_file(&path, data_offset, data_size);
-
-                /// True when `p` resolves to a location we are willing to
-                /// delete from. Testing the unresolved string instead accepts
-                /// `/tmp/../etc/shadow`, and a symlink planted under /tmp can
-                /// name any file on the system; either turns a temporary-file
-                /// transfer into an arbitrary unlink for anything that can
-                /// write to this tty.
-                fn resolves_inside_temp_dir(p: &str) -> bool {
-                    let resolved = match std::fs::canonicalize(p) {
-                        Ok(resolved) => resolved,
-                        Err(_) => return false,
-                    };
-
-                    let mut roots = vec![
-                        std::path::PathBuf::from("/tmp"),
-                        std::path::PathBuf::from("/var/tmp"),
-                        std::path::PathBuf::from("/dev/shm"),
-                    ];
-                    if let Ok(dir) = std::env::var("TMPDIR") {
-                        roots.push(dir.into());
-                    }
-
-                    roots
-                        .iter()
-                        .filter_map(|root| std::fs::canonicalize(root).ok())
-                        // Path::starts_with compares whole components, so
-                        // /tmpfoo does not count as being under /tmp.
-                        .any(|root| resolved.starts_with(root))
-                }
-
-                // Decide using where the path resolves to, but unlink the path
-                // we were given. `unlink` does not follow a final symlink, so
-                // removing the resolved path would delete a symlink's target
-                // instead of the entry the client asked us to clean up.
-                if resolves_inside_temp_dir(&path) {
-                    if let Err(err) = std::fs::remove_file(&path) {
-                        log::error!(
-                            "Unable to remove kitty image protocol temporary file {}: {:#}",
-                            path,
-                            err
-                        );
-                    }
-                } else {
-                    log::warn!(
-                        "kitty image protocol temporary file {} isn't in a known \
-                                temporary directory; won't try to remove it",
-                        path
-                    );
-                }
-
+                remove_temporary_file(&path);
                 result
             }
             Self::SharedMem {
@@ -268,6 +264,7 @@ impl KittyImageData {
                 data_offset,
                 data_size,
             } => read_shared_memory_data(&name, data_offset, data_size),
+            Self::MaterializedError { kind, message } => Err(std::io::Error::new(kind, message)),
         }
     }
 }
@@ -279,15 +276,166 @@ impl KittyImageData {
 /// in term's image.rs; move the two together). Without a cap here the escape
 /// names a file and the terminal reads all of it, however large, before
 /// anything downstream gets a chance to refuse it.
+/// Unlink a `t=t` temporary file, but only inside a known temporary
+/// directory: the path is chosen by whatever wrote the escape.
+#[cfg(feature = "kitty-shm")]
+fn remove_temporary_file(path: &str) {
+    fn resolves_inside_temp_dir(p: &str) -> bool {
+        let resolved = match std::fs::canonicalize(p) {
+            Ok(resolved) => resolved,
+            Err(_) => return false,
+        };
+
+        let mut roots = vec![
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/var/tmp"),
+            std::path::PathBuf::from("/dev/shm"),
+        ];
+        if let Ok(dir) = std::env::var("TMPDIR") {
+            roots.push(dir.into());
+        }
+
+        roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| resolved.starts_with(root))
+    }
+
+    if resolves_inside_temp_dir(path) {
+        if let Err(err) = std::fs::remove_file(path) {
+            log::error!(
+                "Unable to remove kitty image protocol temporary file {}: {:#}",
+                path,
+                err
+            );
+        }
+    } else {
+        log::warn!(
+            "kitty image protocol temporary file {} isn't in a known \
+             temporary directory; won't try to remove it",
+            path
+        );
+    }
+}
+
+#[cfg(feature = "kitty-shm")]
+impl KittyImageData {
+    /// Drop an external payload without reading it. The temporary file or
+    /// shared-memory object is still unlinked -- the protocol makes that the
+    /// terminal's job whether or not it read the bytes -- and the action
+    /// carries a `MaterializedError` so the terminal answers the client
+    /// without touching the disk. Used when one flush holds more frames
+    /// than are worth reading: everything but the newest is already stale.
+    pub fn discard_external_source(&mut self, reason: &str) {
+        match self {
+            Self::File { .. } => {}
+            Self::TemporaryFile { path, .. } => remove_temporary_file(path),
+            Self::SharedMem { name, .. } => {
+                #[cfg(unix)]
+                {
+                    if let Err(err) = nix::sys::mman::shm_unlink(name.as_str()) {
+                        log::warn!("shm_unlink {name} while discarding a stale frame: {err:#}");
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = name;
+                }
+            }
+            _ => return,
+        }
+        *self = Self::MaterializedError {
+            kind: std::io::ErrorKind::Interrupted,
+            message: reason.to_string(),
+        };
+    }
+
+    /// Bytes held in memory by an already materialized payload.
+    pub fn materialized_len(&self) -> usize {
+        match self {
+            Self::DirectBin(bin) => bin.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// Materialize the external kitty payloads of one flush, newest first.
+/// Once `budget` bytes have been read, an older payload is discarded unread
+/// if -- and only if -- a newer transmit in the same flush carries the same
+/// image id (`i=`): that older picture is replaced before anything can be
+/// drawn from it. A parser that fell behind a frame stream can find
+/// hundreds of frame escapes in a single read; reading all of them holds
+/// gigabytes for pictures the next frame overwrites, and the frames a
+/// viewer will actually see are the last ones in the batch.
+///
+/// Anything not superseded that way -- distinct ids, id-less transmits, a
+/// gallery of separate pictures, queries, animation frames -- is read even
+/// past the budget: the budget bounds the waste, never the protocol.
+/// Returns (bytes materialized, actions discarded).
+#[cfg(feature = "kitty-shm")]
+pub fn materialize_kitty_actions_newest_first(
+    actions: &mut [crate::Action],
+    budget: usize,
+) -> (usize, usize) {
+    let mut remaining = budget;
+    let mut materialized = 0usize;
+    let mut discarded = 0usize;
+    let mut newer_ids = std::collections::HashSet::new();
+    for action in actions.iter_mut().rev() {
+        let crate::Action::KittyImage(image) = action else {
+            continue;
+        };
+        let replaces_id = image.replacing_transmit_image_id();
+        if image.has_external_data_source() {
+            let superseded = replaces_id.map_or(false, |id| newer_ids.contains(&id));
+            if remaining == 0 && superseded {
+                image.discard_data_sources("superseded by a newer frame in the same batch");
+                discarded += 1;
+            } else {
+                image.materialize_data_sources();
+                let len = image.materialized_len();
+                materialized += len;
+                remaining = remaining.saturating_sub(len);
+            }
+        }
+        // Recorded after the check so a transmit never supersedes itself,
+        // and for direct payloads too: a newer inline transmit replaces an
+        // older file transmit of the same id just the same.
+        if let Some(id) = replaces_id {
+            newer_ids.insert(id);
+        }
+    }
+    (materialized, discarded)
+}
+
+#[cfg(not(feature = "kitty-shm"))]
+pub fn materialize_kitty_actions_newest_first(
+    _actions: &mut [crate::Action],
+    _budget: usize,
+) -> (usize, usize) {
+    (0, 0)
+}
+
 #[cfg(feature = "kitty-shm")]
 const MAX_IMAGE_DATA_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The size hint comes from the opened descriptor, never from `S=`, so it is
+/// bounded by what actually exists on disk; `cap` bounds it further. A
+/// smaller eager allocation is not safer, only slower: `read_to_end` grows
+/// by doubling, so a 6.7MiB frame read into a smaller buffer ends up owning
+/// 8 or 16MiB, and that capacity is what the image store then keeps.
+#[cfg(feature = "kitty-shm")]
+fn initial_read_capacity(size_hint: Option<u64>, cap: u64) -> usize {
+    let size = size_hint.unwrap_or(0).min(cap);
+    usize::try_from(size).unwrap_or(usize::MAX)
+}
 
 /// Opens `path` for reading, refusing anything that is not a regular
 /// file. Reading a character device such as /dev/zero never ends, and
 /// opening a fifo blocks until a writer appears; either one wedges the
 /// pane's parser thread on a path chosen by whatever wrote the escape.
 #[cfg(feature = "kitty-shm")]
-fn open_regular_file(path: &str) -> std::io::Result<std::fs::File> {
+fn open_regular_file(path: &str) -> std::io::Result<(std::fs::File, u64)> {
     #[cfg(unix)]
     let f = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -303,13 +451,14 @@ fn open_regular_file(path: &str) -> std::io::Result<std::fs::File> {
 
     // Checked against the descriptor we already hold, so the answer
     // cannot change between the check and the read.
-    if !f.metadata()?.is_file() {
+    let metadata = f.metadata()?;
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{path} is not a regular file"),
         ));
     }
-    Ok(f)
+    Ok((f, metadata.len()))
 }
 
 #[cfg(feature = "kitty-shm")]
@@ -331,23 +480,45 @@ fn read_from_file_capped(
     cap: u64,
 ) -> std::io::Result<Vec<u8>> {
     use std::io::Seek;
-    let mut f = open_regular_file(path)?;
-    if let Some(offset) = data_offset {
-        f.seek(std::io::SeekFrom::Start(offset.into()))?;
+    let (mut f, file_len) = open_regular_file(path)?;
+    let offset = u64::from(data_offset.unwrap_or(0));
+    let available = file_len.saturating_sub(offset);
+    if offset != 0 {
+        f.seek(std::io::SeekFrom::Start(offset))?;
     }
     if let Some(len) = data_size {
-        read_exactly(&mut f, len, cap)
+        read_exactly(&mut f, len, cap, Some(available.min(u64::from(len))))
     } else {
-        read_to_end_capped(&mut f, cap)
+        read_to_end_capped(&mut f, cap, Some(available))
     }
 }
 
 /// Reads to end-of-file, refusing to hold more than `cap` bytes.
 #[cfg(feature = "kitty-shm")]
-fn read_to_end_capped(f: &mut impl std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
+fn read_to_end_capped(
+    f: &mut impl std::io::Read,
+    cap: u64,
+    size_hint: Option<u64>,
+) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
-    let mut res = Vec::new();
-    f.take(cap.saturating_add(1)).read_to_end(&mut res)?;
+    let mut res = Vec::with_capacity(initial_read_capacity(size_hint, cap));
+    // Fill the hinted size exactly first: `read_to_end` doubles the buffer
+    // as soon as it is full, so reading straight to EOF into an exactly
+    // sized buffer would still end at twice the size. Anything the file
+    // grew by since it was opened comes in a second, unbounded-by-hint read.
+    if let Some(hint) = size_hint {
+        let hint = hint.min(cap.saturating_add(1));
+        f.by_ref().take(hint).read_to_end(&mut res)?;
+        if (res.len() as u64) < hint {
+            return Ok(res);
+        }
+    }
+    let remaining = cap.saturating_add(1).saturating_sub(res.len() as u64);
+    let mut tail = Vec::new();
+    f.take(remaining).read_to_end(&mut tail)?;
+    if !tail.is_empty() {
+        res.extend_from_slice(&tail);
+    }
     if res.len() as u64 > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -357,14 +528,17 @@ fn read_to_end_capped(f: &mut impl std::io::Read, cap: u64) -> std::io::Result<V
     Ok(res)
 }
 
-/// Reads exactly `len` bytes, without trusting `len` enough to allocate it up
-/// front. `S=` is chosen by whatever wrote the escape sequence and its u32
-/// maximum is 4GiB, so reserving it before reading hands a remote writer a
-/// 4GiB allocation for a one-line escape. Growing a `Vec` to fit what actually
-/// arrives costs the same for honest callers. A `len` over `cap` is refused
-/// before any read happens.
+/// Reads exactly `len` bytes without trusting `len` as an allocation size.
+/// `S=` is chosen by the escape writer and can be 4GiB. A value over `cap` is
+/// refused before allocation; the bounded capacity hint comes from the opened
+/// descriptor rather than from `S=`.
 #[cfg(feature = "kitty-shm")]
-fn read_exactly(f: &mut impl std::io::Read, len: u32, cap: u64) -> std::io::Result<Vec<u8>> {
+fn read_exactly(
+    f: &mut impl std::io::Read,
+    len: u32,
+    cap: u64,
+    size_hint: Option<u64>,
+) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     if u64::from(len) > cap {
         return Err(std::io::Error::new(
@@ -372,7 +546,7 @@ fn read_exactly(f: &mut impl std::io::Read, len: u32, cap: u64) -> std::io::Resu
             format!("wanted {len} bytes of image data, over the {cap} byte limit"),
         ));
     }
-    let mut res = Vec::new();
+    let mut res = Vec::with_capacity(initial_read_capacity(size_hint, cap));
     let got = f.take(len.into()).read_to_end(&mut res)?;
     if got != len as usize {
         return Err(std::io::Error::new(
@@ -418,13 +592,23 @@ fn read_shared_memory_data(
     }
 
     let mut f = File::from(fd);
-    if let Some(offset) = data_offset {
-        f.seek(std::io::SeekFrom::Start(offset.into()))?;
+    let offset = u64::from(data_offset.unwrap_or(0));
+    let available = f
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.len().saturating_sub(offset));
+    if offset != 0 {
+        f.seek(std::io::SeekFrom::Start(offset))?;
     }
     let data = if let Some(len) = data_size {
-        read_exactly(&mut f, len, MAX_IMAGE_DATA_BYTES)?
+        read_exactly(
+            &mut f,
+            len,
+            MAX_IMAGE_DATA_BYTES,
+            available.map(|available| available.min(u64::from(len))),
+        )?
     } else {
-        read_to_end_capped(&mut f, MAX_IMAGE_DATA_BYTES)?
+        read_to_end_capped(&mut f, MAX_IMAGE_DATA_BYTES, available)?
     };
 
     Ok(data)
@@ -1193,6 +1377,108 @@ pub enum KittyImage {
 }
 
 impl KittyImage {
+    /// Whether this action names a file or shared-memory source that would do
+    /// blocking IO if the terminal processed it directly.
+    pub fn has_external_data_source(&self) -> bool {
+        #[cfg(feature = "kitty-shm")]
+        {
+            let data = match self {
+                Self::TransmitData { transmit, .. }
+                | Self::TransmitDataAndDisplay { transmit, .. }
+                | Self::Query { transmit, .. }
+                | Self::TransmitFrame { transmit, .. } => &transmit.data,
+                Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => {
+                    return false;
+                }
+            };
+            matches!(
+                data,
+                KittyImageData::File { .. }
+                    | KittyImageData::TemporaryFile { .. }
+                    | KittyImageData::SharedMem { .. }
+            )
+        }
+        #[cfg(not(feature = "kitty-shm"))]
+        {
+            false
+        }
+    }
+
+    /// See [`KittyImageData::discard_external_source`].
+    /// The image id a transmit replaces, when it names one. Only `a=t` and
+    /// `a=T` with `i=` replace an image: `I=` (image number) allocates a
+    /// fresh id per transmit, an id-less transmit is its own picture, a
+    /// frame (`a=f`) extends an animation rather than replacing it, and a
+    /// query stores nothing. A chunked transmit (`m=1`) has not replaced
+    /// anything yet -- its tail may never arrive -- so it must not count
+    /// as newer than a complete frame under the same id.
+    pub fn replacing_transmit_image_id(&self) -> Option<u32> {
+        match self {
+            Self::TransmitData { transmit, .. } | Self::TransmitDataAndDisplay { transmit, .. } => {
+                if transmit.more_data_follows {
+                    return None;
+                }
+                transmit.image_id
+            }
+            Self::Query { .. }
+            | Self::TransmitFrame { .. }
+            | Self::Display { .. }
+            | Self::Delete { .. }
+            | Self::ComposeFrame { .. } => None,
+        }
+    }
+
+    pub fn discard_data_sources(&mut self, reason: &str) {
+        #[cfg(feature = "kitty-shm")]
+        match self {
+            Self::TransmitData { transmit, .. }
+            | Self::TransmitDataAndDisplay { transmit, .. }
+            | Self::Query { transmit, .. }
+            | Self::TransmitFrame { transmit, .. } => {
+                transmit.data.discard_external_source(reason);
+            }
+            Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => {}
+        }
+        #[cfg(not(feature = "kitty-shm"))]
+        {
+            let _ = reason;
+        }
+    }
+
+    /// Bytes an already materialized payload holds in memory.
+    pub fn materialized_len(&self) -> usize {
+        #[cfg(feature = "kitty-shm")]
+        {
+            match self {
+                Self::TransmitData { transmit, .. }
+                | Self::TransmitDataAndDisplay { transmit, .. }
+                | Self::Query { transmit, .. }
+                | Self::TransmitFrame { transmit, .. } => transmit.data.materialized_len(),
+                Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => 0,
+            }
+        }
+        #[cfg(not(feature = "kitty-shm"))]
+        {
+            0
+        }
+    }
+
+    /// Read external payloads before the action enters the terminal model.
+    /// Direct fragments stay encoded until the terminal applies its ordering
+    /// and accumulation rules.
+    pub fn materialize_data_sources(&mut self) {
+        #[cfg(feature = "kitty-shm")]
+        match self {
+            Self::TransmitData { transmit, .. }
+            | Self::TransmitDataAndDisplay { transmit, .. }
+            | Self::Query { transmit, .. }
+            | Self::TransmitFrame { transmit, .. } => {
+                transmit.data.materialize_external_source();
+            }
+            Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => {}
+        }
+    }
+
     pub fn verbosity(&self) -> KittyImageVerbosity {
         match self {
             Self::TransmitData { verbosity, .. } => *verbosity,
@@ -1473,8 +1759,11 @@ mod temp_file_test {
         /// Creates a directory that is deliberately *not* under any of the
         /// temporary roots the protocol is allowed to delete from.
         fn outside_temp(tag: &str) -> Self {
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join(format!(".apc-test-{}-{}", tag, std::process::id()));
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                ".apc-test-{}-{}",
+                tag,
+                std::process::id()
+            ));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -1515,7 +1804,10 @@ mod temp_file_test {
         let data = load_temporary_file(file.to_str().unwrap().to_string()).unwrap();
 
         assert_eq!(data, b"payload");
-        assert!(!file.exists(), "a genuine temporary file should be unlinked");
+        assert!(
+            !file.exists(),
+            "a genuine temporary file should be unlinked"
+        );
     }
 
     #[test]
@@ -1601,8 +1893,7 @@ mod temp_file_test {
         let dir = ScratchDir::in_temp("cap-size");
         let file = dir.file("f", &[0u8; 8]);
 
-        let err =
-            read_from_file_capped(file.to_str().unwrap(), None, Some(64), 16).unwrap_err();
+        let err = read_from_file_capped(file.to_str().unwrap(), None, Some(64), 16).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -1635,6 +1926,231 @@ mod temp_file_test {
             !file.exists(),
             "a temporary file must be cleaned up even when the read fails"
         );
+    }
+
+    #[test]
+    fn external_data_is_materialized_once() {
+        let dir = ScratchDir::in_temp("materialize");
+        let file = dir.file("frame.rgba", b"payload");
+        let mut data = KittyImageData::TemporaryFile {
+            path: file.to_str().unwrap().to_string(),
+            data_offset: None,
+            data_size: None,
+        };
+
+        data.materialize_external_source();
+
+        assert!(
+            !file.exists(),
+            "materialization should perform temporary-file cleanup"
+        );
+        assert_eq!(data.load_data().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn materialized_file_survives_ring_slot_reuse() {
+        let dir = ScratchDir::in_temp("materialize-ring");
+        let file = dir.file("frame-0.rgba", b"first frame");
+        let mut data = KittyImageData::File {
+            path: file.to_str().unwrap().to_string(),
+            data_offset: None,
+            data_size: None,
+        };
+
+        data.materialize_external_source();
+
+        // A streaming producer may recycle a small set of paths, or remove
+        // the old set after a resize, before the terminal-model queue runs.
+        std::fs::write(&file, b"later frame").unwrap();
+        std::fs::remove_file(&file).unwrap();
+
+        assert_eq!(data.load_data().unwrap(), b"first frame");
+    }
+
+    #[test]
+    fn materialization_preserves_a_read_error_without_retrying() {
+        let dir = ScratchDir::in_temp("materialize-error");
+        let file = dir.file("frame.rgba", &[0u8; 8]);
+        let mut data = KittyImageData::TemporaryFile {
+            path: file.to_str().unwrap().to_string(),
+            data_offset: None,
+            data_size: Some(64),
+        };
+
+        data.materialize_external_source();
+
+        assert!(!file.exists());
+        let err = data.load_data().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("wanted 64 bytes"));
+    }
+
+    #[test]
+    fn read_preallocation_follows_the_file_size_up_to_the_cap() {
+        assert_eq!(
+            initial_read_capacity(Some(3 * 1024 * 1024), 128 * 1024 * 1024),
+            3 * 1024 * 1024
+        );
+        assert_eq!(initial_read_capacity(Some(u64::MAX), 16), 16);
+        assert_eq!(initial_read_capacity(None, u64::MAX), 0);
+    }
+
+    #[test]
+    fn a_batch_reads_newest_first_and_discards_the_rest_unread() {
+        use crate::Action;
+        let dir = ScratchDir::in_temp("newest-first");
+        let mut actions: Vec<Action> = Vec::new();
+        let mut files = Vec::new();
+        for i in 0..3 {
+            let file = dir.file(&format!("frame-{i}.rgba"), &[i as u8; 100]);
+            files.push(file.clone());
+            // One id for every frame, the way a frame stream transmits.
+            actions.push(temp_file_transmit(&file, Some(1)));
+        }
+
+        // 150 bytes: the newest two frames (100 each) are read, the oldest
+        // is discarded without a read -- but its temporary file still goes.
+        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 150);
+        assert_eq!((bytes, discarded), (200, 1));
+        for file in &files {
+            assert!(!file.exists(), "every temporary file is unlinked");
+        }
+        assert_eq!(transmit_payload(&actions[2]).unwrap(), vec![2u8; 100]);
+        assert_eq!(transmit_payload(&actions[1]).unwrap(), vec![1u8; 100]);
+        let err = transmit_payload(&actions[0]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    fn temp_file_transmit(file: &std::path::Path, image_id: Option<u32>) -> crate::Action {
+        crate::Action::KittyImage(Box::new(KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgba),
+                data: KittyImageData::TemporaryFile {
+                    path: file.to_str().unwrap().to_string(),
+                    data_offset: None,
+                    data_size: None,
+                },
+                width: Some(5),
+                height: Some(5),
+                image_id,
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+            },
+            verbosity: KittyImageVerbosity::Verbose,
+        }))
+    }
+
+    fn transmit_payload(action: &crate::Action) -> std::io::Result<Vec<u8>> {
+        match action {
+            crate::Action::KittyImage(image) => match &**image {
+                KittyImage::TransmitData { transmit, .. } => transmit.data.clone().load_data(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_gallery_of_distinct_pictures_is_read_past_the_budget() {
+        // Three separate pictures -- two ids and one id-less -- coalesced
+        // into one flush. None replaces another, so the budget must not
+        // cost the viewer any of them.
+        let dir = ScratchDir::in_temp("gallery");
+        let files: Vec<_> = (0..3)
+            .map(|i| dir.file(&format!("pic-{i}.rgba"), &[i as u8; 100]))
+            .collect();
+        let mut actions = vec![
+            temp_file_transmit(&files[0], Some(1)),
+            temp_file_transmit(&files[1], Some(2)),
+            temp_file_transmit(&files[2], None),
+        ];
+        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 150);
+        assert_eq!((bytes, discarded), (300, 0));
+        for (i, action) in actions.iter().enumerate() {
+            assert_eq!(transmit_payload(action).unwrap(), vec![i as u8; 100]);
+        }
+    }
+
+    #[test]
+    fn only_a_newer_transmit_of_the_same_id_supersedes() {
+        // id 1 twice with id 2 in between: over budget, the old id-1 frame
+        // goes and the id-2 picture stays, whichever order they arrived in.
+        let dir = ScratchDir::in_temp("mixed-ids");
+        let files: Vec<_> = (0..3)
+            .map(|i| dir.file(&format!("pic-{i}.rgba"), &[i as u8; 100]))
+            .collect();
+        let mut actions = vec![
+            temp_file_transmit(&files[0], Some(1)),
+            temp_file_transmit(&files[1], Some(2)),
+            temp_file_transmit(&files[2], Some(1)),
+        ];
+        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 100);
+        assert_eq!((bytes, discarded), (200, 1));
+        assert_eq!(transmit_payload(&actions[2]).unwrap(), vec![2u8; 100]);
+        assert_eq!(transmit_payload(&actions[1]).unwrap(), vec![1u8; 100]);
+        assert_eq!(
+            transmit_payload(&actions[0]).unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn a_whole_file_read_does_not_double_its_buffer() {
+        let dir = ScratchDir::in_temp("exact-capacity");
+        let payload = vec![7u8; 3 * 1024 * 1024 + 123];
+        let file = dir.file("frame.rgba", &payload);
+        let data =
+            read_from_file_capped(file.to_str().unwrap(), None, None, 64 * 1024 * 1024).unwrap();
+        assert_eq!(data, payload);
+        assert_eq!(
+            data.capacity(),
+            data.len(),
+            "the buffer must be sized from the file, not grown by doubling"
+        );
+    }
+
+    #[test]
+    fn a_file_that_grew_after_open_is_still_read_completely() {
+        // The hint is the size at open; a producer may append before the
+        // read. Pass a hint smaller than the content and make sure the tail
+        // arrives.
+        let mut buf = std::io::Cursor::new(vec![1u8; 100]);
+        let data = read_to_end_capped(&mut buf, 1000, Some(40)).unwrap();
+        assert_eq!(data.len(), 100);
+        let mut buf = std::io::Cursor::new(vec![1u8; 100]);
+        let err = read_to_end_capped(&mut buf, 50, Some(40)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn external_source_detection_ignores_direct_payloads() {
+        let mut image = KittyImage::parse_apc(b"Gf=32,s=1,v=1;AAAAAA==").unwrap();
+        assert!(!image.has_external_data_source());
+
+        let dir = ScratchDir::in_temp("external-detection");
+        let file = dir.file("frame.rgba", &[0u8; 4]);
+        image = KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgba),
+                data: KittyImageData::File {
+                    path: file.to_str().unwrap().to_string(),
+                    data_offset: None,
+                    data_size: Some(4),
+                },
+                width: Some(1),
+                height: Some(1),
+                image_id: None,
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+            },
+            verbosity: KittyImageVerbosity::Verbose,
+        };
+        assert!(image.has_external_data_source());
+
+        image.materialize_data_sources();
+        assert!(!image.has_external_data_source());
     }
 
     #[test]

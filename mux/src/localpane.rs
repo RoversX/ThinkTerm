@@ -172,9 +172,8 @@ mod leader_refresh {
             return;
         };
         // The syscalls run without the lock so stale reads stay fast.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            CachedLeaderInfo::probe(fd)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CachedLeaderInfo::probe(fd)));
         match result {
             Ok((pid, path, cwd)) => write_back(&cell, claim, pid, path, cwd),
             Err(err) => {
@@ -271,13 +270,7 @@ mod leader_refresh {
                 path: Some(std::path::PathBuf::from("/fresh")),
                 ..entry(-1, 8)
             })));
-            write_back(
-                &cell,
-                7,
-                0,
-                Some(std::path::PathBuf::from("/stale")),
-                None,
-            );
+            write_back(&cell, 7, 0, Some(std::path::PathBuf::from("/stale")), None);
             let guard = cell.lock();
             let info = guard.as_ref().unwrap();
             assert_eq!(info.pid, 42);
@@ -588,7 +581,14 @@ impl Pane for LocalPane {
         Some(self.terminal.lock().get_config())
     }
 
-    fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
+    fn perform_actions(&self, mut actions: Vec<termwiz::escape::Action>) {
+        if crate::has_external_kitty_image_data_source(&actions) {
+            let kitty_graphics_enabled =
+                { self.terminal.lock().get_config().enable_kitty_graphics() };
+            if kitty_graphics_enabled {
+                crate::materialize_kitty_image_data_sources(&mut actions);
+            }
+        }
         self.terminal.lock().perform_actions(actions)
     }
 

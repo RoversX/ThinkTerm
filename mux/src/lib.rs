@@ -522,10 +522,56 @@ const BUFSIZE: usize = 1024 * 1024;
 /// BUFSIZE, which would pin 1MB per pane.
 const PTY_READ_BUFSIZE: usize = 64 * 1024;
 
+/// Bytes of external kitty payloads one flush may read into memory. A
+/// parser that fell behind a frame stream finds hundreds of frame escapes
+/// in a single read; reading every file they name held gigabytes for
+/// pictures the next frame overwrites. Newest first, within this budget;
+/// the rest are discarded unread (their temporary files still unlinked).
+/// About nine full-pane 1632x1026 frames.
+const KITTY_MATERIALIZE_BUDGET_PER_FLUSH: usize = 64 * 1024 * 1024;
+
+/// Materialize Kitty file/shared-memory payloads on the parser thread, before
+/// a pane implementation takes its terminal-model lock, so the lock never
+/// covers disk IO.
+pub(crate) fn materialize_kitty_image_data_sources(actions: &mut [Action]) {
+    let (bytes, discarded) = termwiz::escape::apc::materialize_kitty_actions_newest_first(
+        actions,
+        KITTY_MATERIALIZE_BUDGET_PER_FLUSH,
+    );
+    if discarded > 0 {
+        log::debug!(
+            "kitty: materialized {bytes} bytes of external image data, discarded {discarded} \
+             older frames unread"
+        );
+    } else if bytes > KITTY_MATERIALIZE_BUDGET_PER_FLUSH {
+        // Nothing to discard: the flush held distinct pictures (or a stream
+        // under fresh ids), which the protocol obliges us to read. The
+        // terminal's own image budget bounds what stays resident.
+        log::debug!(
+            "kitty: materialized {bytes} bytes of external image data in one flush, \
+             none superseded"
+        );
+    }
+}
+
+pub(crate) fn has_external_kitty_image_data_source(actions: &[Action]) -> bool {
+    actions.iter().any(|action| match action {
+        Action::KittyImage(image) => image.has_external_data_source(),
+        _ => false,
+    })
+}
+
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
-fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: Vec<Action>) {
+fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut actions: Vec<Action>) {
     let start = Instant::now();
+    // External kitty payloads (a path or shm name) are read here, on the
+    // parser thread and per flush, so the terminal lock never covers disk
+    // IO and a backlog is trimmed to its newest frames before any of it is
+    // read. Reading at parse time instead held every frame of the backlog.
+    if configuration().enable_kitty_graphics && has_external_kitty_image_data_source(&actions) {
+        materialize_kitty_image_data_sources(&mut actions);
+    }
     match pane.upgrade() {
         Some(pane) => {
             pane.perform_actions(actions);

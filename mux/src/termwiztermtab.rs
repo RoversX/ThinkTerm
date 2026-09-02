@@ -262,7 +262,14 @@ impl Pane for TermWizTerminalPane {
         Some(self.terminal.lock().get_config())
     }
 
-    fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
+    fn perform_actions(&self, mut actions: Vec<termwiz::escape::Action>) {
+        if crate::has_external_kitty_image_data_source(&actions) {
+            let kitty_graphics_enabled =
+                { self.terminal.lock().get_config().enable_kitty_graphics() };
+            if kitty_graphics_enabled {
+                crate::materialize_kitty_image_data_sources(&mut actions);
+            }
+        }
         self.terminal.lock().perform_actions(actions)
     }
 
