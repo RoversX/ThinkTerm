@@ -43,9 +43,10 @@ case $OSTYPE in
     cp assets/icon/ThinkTerm_simple.icns $zipdir/ThinkTerm.app/Contents/Resources/ThinkTerm_simple.icns
     cp -r assets/shell-integration/* $zipdir/ThinkTerm.app/Contents/Resources
     cp -r assets/shell-completion $zipdir/ThinkTerm.app/Contents/Resources
-    # Third-party attributions (icon sets, detection manifests); their
-    # licenses require the notice to ship with the binaries that embed them.
-    cp NOTICE $zipdir/ThinkTerm.app/Contents/Resources/NOTICE
+    # The license texts (GPL-3 for this project, MIT for the upstream WezTerm
+    # code) and the third-party attributions; all of them have to ship with the
+    # binaries that embed the material they cover.
+    cp LICENSE.md LICENSE-MIT NOTICE $zipdir/ThinkTerm.app/Contents/Resources/
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
 
     for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes ; do
@@ -156,6 +157,8 @@ case $OSTYPE in
       assets/windows/conhost/OpenConsole.exe \
       assets/windows/angle/libEGL.dll \
       assets/windows/angle/libGLESv2.dll \
+      LICENSE.md \
+      LICENSE-MIT \
       NOTICE \
       $zipdir
 
@@ -301,10 +304,14 @@ install -Dm644 assets/wezterm.desktop %{buildroot}/usr/share/applications/com.ro
 install -Dm644 assets/wezterm.appdata.xml %{buildroot}/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm/NOTICE
+install -Dm644 LICENSE.md %{buildroot}/usr/share/licenses/thinkterm/LICENSE.md
+install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm/LICENSE-MIT
 # A second copy owned by the standalone mux-server package: it links the
 # same third-party material and installs without thinkterm-common, and
 # one file owned by two packages would conflict on co-install.
 install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm-mux-server/NOTICE
+install -Dm644 LICENSE.md %{buildroot}/usr/share/licenses/thinkterm-mux-server/LICENSE.md
+install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-mux-server/LICENSE-MIT
 
 %files
 # Main package (metapackage) has no files
@@ -313,7 +320,7 @@ install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm-mux-server/NOTIC
 /usr/bin/thinkterm
 /usr/bin/wezterm
 /usr/bin/strip-ansi-escapes
-/usr/share/licenses/thinkterm/NOTICE
+/usr/share/licenses/thinkterm/*
 /usr/share/zsh/site-functions/_thinkterm
 /usr/share/fish/vendor_completions.d/thinkterm.fish
 /usr/share/fish/vendor_completions.d/wezterm.fish
@@ -332,7 +339,7 @@ install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm-mux-server/NOTIC
 
 %files -n thinkterm-mux-server
 /usr/bin/thinkterm-mux-server
-/usr/share/licenses/thinkterm-mux-server/NOTICE
+/usr/share/licenses/thinkterm-mux-server/*
 
 %changelog
 * Mon Oct 2 2023 Wez Furlong
@@ -422,6 +429,8 @@ EOF
         ln -s thinkterm.fish pkg/debian/usr/share/fish/vendor_completions.d/wezterm.fish
         install -Dm644 assets/shell-integration/* -t pkg/debian/etc/profile.d
         install -Dm644 NOTICE pkg/debian/usr/share/doc/$pkgname/NOTICE
+        install -Dm644 LICENSE.md pkg/debian/usr/share/doc/$pkgname/LICENSE.md
+        install -Dm644 LICENSE-MIT pkg/debian/usr/share/doc/$pkgname/LICENSE-MIT
 
         if [[ "$BUILD_REASON" == "Schedule" ]] ; then
           debname=thinkterm-nightly.$distro$distver
@@ -480,6 +489,8 @@ source="
   assets/icon/wezterm-icon.svg
   termwiz/data/wezterm.terminfo
   NOTICE
+  LICENSE.md
+  LICENSE-MIT
 "
 builddir="\$srcdir"
 
@@ -503,6 +514,8 @@ package() {
   install -Dm644 "\$srcdir"/wezterm-icon.svg "\$pkgdir"/usr/share/icons/hicolor/scalable/apps/com.roversx.thinkterm.svg
   install -Dm644 "\$builddir"/wezterm.terminfo "\$pkgdir"/usr/share/terminfo/w/wezterm
   install -Dm644 "\$srcdir"/NOTICE "\$pkgdir"/usr/share/licenses/thinkterm/NOTICE
+  install -Dm644 "\$srcdir"/LICENSE.md "\$pkgdir"/usr/share/licenses/thinkterm/LICENSE.md
+  install -Dm644 "\$srcdir"/LICENSE-MIT "\$pkgdir"/usr/share/licenses/thinkterm/LICENSE-MIT
 }
 EOF
         abuild -F checksum

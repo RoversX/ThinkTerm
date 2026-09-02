@@ -15,6 +15,11 @@ install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/com.roversx.
 install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py AppDir/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 install -Dm644 NOTICE AppDir/usr/share/doc/thinkterm/NOTICE
+# Both license texts, not just the NOTICE that points at them: AUR and
+# linuxbrew unpack this AppImage for their own license dirs, so leaving
+# them out here leaves them out of every downstream Linux package.
+install -Dm644 LICENSE.md AppDir/usr/share/doc/thinkterm/LICENSE.md
+install -Dm644 LICENSE-MIT AppDir/usr/share/doc/thinkterm/LICENSE-MIT
 
 # linuxdeploy publishes per-machine names (x86_64, aarch64); the rest of the
 # release labels the same machine arm64, so normalise for the output name.
