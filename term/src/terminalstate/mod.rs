@@ -230,6 +230,16 @@ impl ScreenOrAlt {
         self.alt_screen_is_active
     }
 
+    /// The named screen, active or not: image placements record which one
+    /// their cells live on, and eviction must reach that one.
+    pub fn screen_for_alt_mut(&mut self, alt_screen: bool) -> &mut Screen {
+        if alt_screen {
+            &mut self.alt_screen
+        } else {
+            &mut self.screen
+        }
+    }
+
     pub fn saved_cursor(&mut self) -> &mut Option<SavedCursor> {
         if self.alt_screen_is_active {
             &mut self.alt_screen.saved_cursor
@@ -810,7 +820,7 @@ impl TerminalState {
         // budget sweep — with the placements gone the images are
         // unreferenced, and anything over the budget is reclaimed right now.
         self.kitty_remove_all_placements(false);
-        self.kitty_img.prune_unreferenced();
+        self.kitty_enforce_image_budget();
         self.kitty_reset_accumulator();
 
         self.erase_in_display(EraseInDisplay::EraseScrollback);

@@ -82,6 +82,15 @@ impl wezterm_term::TerminalConfiguration for TermConfig {
         self.configuration().enable_kitty_graphics
     }
 
+    fn kitty_image_memory_budget(&self) -> usize {
+        match self.configuration().kitty_image_memory_budget_mib {
+            // The natural reading of 0, and the safe one: taking it
+            // literally would evict every picture on arrival.
+            0 => usize::MAX,
+            mib => (mib as usize).saturating_mul(1024 * 1024),
+        }
+    }
+
     fn enable_title_reporting(&self) -> bool {
         self.configuration().enable_title_reporting
     }

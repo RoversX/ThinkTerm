@@ -281,7 +281,18 @@ impl<'a> Performer<'a> {
             Action::KittyImage(img) => {
                 self.flush_print();
                 if let Err(err) = self.kitty_img(*img) {
-                    log::error!("kitty_img: {:#}", err);
+                    // A frame the parser discarded as superseded carries an
+                    // Interrupted io error: expected under a backlog, and
+                    // hundreds per second when it happens.
+                    let superseded = err
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted);
+                    if superseded {
+                        log::debug!("kitty_img: {:#}", err);
+                    } else {
+                        log::error!("kitty_img: {:#}", err);
+                    }
                 }
             }
         }

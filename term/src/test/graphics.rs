@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug)]
 struct GraphicsConfig {
     kitty: bool,
+    image_budget: usize,
 }
 
 impl TerminalConfiguration for GraphicsConfig {
@@ -29,9 +30,27 @@ impl TerminalConfiguration for GraphicsConfig {
     fn enable_kitty_graphics(&self) -> bool {
         self.kitty
     }
+
+    fn kitty_image_memory_budget(&self) -> usize {
+        self.image_budget
+    }
 }
 
 fn term(pixel_width: usize, pixel_height: usize, kitty: bool) -> Terminal {
+    term_with_budget(
+        pixel_width,
+        pixel_height,
+        kitty,
+        crate::config::DEFAULT_KITTY_IMAGE_MEMORY_BUDGET,
+    )
+}
+
+fn term_with_budget(
+    pixel_width: usize,
+    pixel_height: usize,
+    kitty: bool,
+    image_budget: usize,
+) -> Terminal {
     Terminal::new(
         TerminalSize {
             rows: 24,
@@ -40,7 +59,10 @@ fn term(pixel_width: usize, pixel_height: usize, kitty: bool) -> Terminal {
             pixel_height,
             dpi: 96,
         },
-        Arc::new(GraphicsConfig { kitty }),
+        Arc::new(GraphicsConfig {
+            kitty,
+            image_budget,
+        }),
         "ThinkTerm",
         "O_o",
         Box::new(Vec::new()),
@@ -118,7 +140,10 @@ fn term_with_tap(pixel_width: usize, pixel_height: usize) -> (Terminal, Tap) {
             pixel_height,
             dpi: 96,
         },
-        Arc::new(GraphicsConfig { kitty: true }),
+        Arc::new(GraphicsConfig {
+            kitty: true,
+            image_budget: crate::config::DEFAULT_KITTY_IMAGE_MEMORY_BUDGET,
+        }),
         "ThinkTerm",
         "O_o",
         Box::new(tap.clone()),
@@ -857,5 +882,129 @@ fn clearing_the_scrollback_and_viewport_keeps_reusable_image_data() {
             .and_then(|c| c.attrs().images())
             .is_some(),
         "the stored image data should still be placeable after a clear"
+    );
+}
+
+#[test]
+fn eviction_reaches_a_placement_on_the_inactive_screen() {
+    // Budget: two 2x2 frames. Image 1 is placed on the primary screen;
+    // the stream that busts the budget runs on the alt screen. Eviction
+    // must detach image 1 from the primary screen's cells even though the
+    // alt screen is active when the sweep fires -- aiming at the active
+    // screen would free nothing and the picture would revive on switch.
+    let mut term = term_with_budget(640, 384, true, 2 * 16);
+    let one = base64_of(&[1u8; 16]);
+    term.advance_bytes(format!("\x1b[H\x1b_Ga=T,i=1,f=32,s=2,v=2;{one}\x1b\\"));
+    term.advance_bytes("\x1b[?1049h");
+    for id in 2..=5 {
+        let pixels = base64_of(&[id as u8; 16]);
+        term.advance_bytes(format!(
+            "\x1b[H\x1b_Ga=T,i={id},f=32,s=2,v=2;{pixels}\x1b\\"
+        ));
+    }
+    assert!(
+        term.kitty_used_memory() <= 2 * 16,
+        "stored image bytes {} exceed the budget",
+        term.kitty_used_memory()
+    );
+    term.advance_bytes("\x1b[?1049l");
+    let line = term.screen_mut().line_mut(0);
+    let cell = line.get_cell(0).expect("cell 0,0");
+    let holds_evicted = cell
+        .attrs()
+        .images()
+        .map(|imgs| imgs.iter().any(|img| img.image_id() == Some(1)))
+        .unwrap_or(false);
+    assert!(
+        !holds_evicted,
+        "the evicted image is still attached to the primary screen"
+    );
+}
+
+#[test]
+fn appended_animation_frames_stay_within_the_image_budget() {
+    // Budget: four 2x2 RGBA frames (64 bytes). Two still images fill half
+    // of it; growing the first into an animation must reclaim the other
+    // (unreferenced) picture before it is allowed to grow further, and
+    // must be refused once the animation alone would fill the budget.
+    let mut term = term_with_budget(640, 384, true, 4 * 16);
+    // Placed, so the sweep treats it as in use and reclaims image 2 instead.
+    term.advance_bytes("\x1b[H\x1b_Ga=T,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    // Different pixels from image 1: identical small images are content-
+    // deduplicated into one shared object, and growing that object would
+    // grow both.
+    term.advance_bytes("\x1b_Ga=t,i=2,f=32,s=2,v=2;/////////////////////w==\x1b\\");
+    k9::assert_equal!(term.kitty_used_memory(), 32);
+    for _ in 0..6 {
+        term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        assert!(
+            term.kitty_used_memory() <= 4 * 16,
+            "stored image bytes {} exceed the budget after an append",
+            term.kitty_used_memory()
+        );
+    }
+    // Four frames of image 1 are exactly the budget; image 2 made room.
+    k9::assert_equal!(term.kitty_used_memory(), 4 * 16);
+}
+
+/// Standard base64 for test payloads; the crate has no encoder of its own.
+fn base64_of(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let mut word = 0u32;
+        for (i, byte) in chunk.iter().enumerate() {
+            word |= (*byte as u32) << (16 - 8 * i);
+        }
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((word >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_frame_stream_with_fresh_ids_is_capped_by_the_image_budget() {
+    // Every frame is transmitted-and-displayed under a new id on the same
+    // cells and never deleted, the way a streaming client behaves. Placed
+    // images stack, so without a hard cap each cell keeps every frame ever
+    // shown. Budget: three 2x2 RGBA images (16 bytes each).
+    let mut term = term_with_budget(640, 384, true, 3 * 16);
+    for id in 1..=20 {
+        // Home first: a=T advances the cursor, and the point is to stack
+        // every frame on the same cells like a redrawing client does.
+        // Distinct pixels per frame, as a real stream has: identical small
+        // payloads are content-deduplicated into one shared object, which
+        // the budget correctly counts once.
+        let pixels = base64_of(&[id as u8; 16]);
+        term.advance_bytes(format!(
+            "\x1b[H\x1b_Ga=T,i={id},f=32,s=2,v=2;{pixels}\x1b\\"
+        ));
+    }
+    assert!(
+        term.kitty_used_memory() <= 3 * 16,
+        "stored image bytes {} exceed the budget",
+        term.kitty_used_memory()
+    );
+    let line = term.screen_mut().line_mut(0);
+    let cell = line.get_cell(0).expect("cell 0,0");
+    let stacked = cell.attrs().images().map(|v| v.len()).unwrap_or(0);
+    assert!(
+        (1..=3).contains(&stacked),
+        "cell keeps {} frames; expected the newest few, not all twenty",
+        stacked
+    );
+    assert!(
+        cell.attrs()
+            .images()
+            .unwrap()
+            .iter()
+            .any(|img| img.image_id() == Some(20)),
+        "the newest frame must survive eviction"
     );
 }

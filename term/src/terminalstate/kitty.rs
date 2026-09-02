@@ -57,18 +57,70 @@ pub struct KittyImageState {
     max_image_id: u32,
     number_to_id: HashMap<u32, u32>,
     id_to_data: HashMap<u32, Arc<ImageData>>,
+    /// Transmission order of each stored image, so eviction drops the
+    /// oldest unplaced image first. A HashMap walk would evict at random,
+    /// which for a frame stream means keeping stale frames over fresh ones.
+    id_seq: HashMap<u32, u64>,
+    next_seq: u64,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
     used_memory: usize,
 }
 
 impl KittyImageState {
+    /// Bytes actually held: small pictures with identical pixels share one
+    /// `ImageData` through the content-hash cache, so summing per id would
+    /// count a logo re-emitted under fresh ids once per prompt, and the
+    /// sweep acting on that phantom total would detach real pictures.
+    fn recompute_used_memory(&mut self) {
+        let mut seen: HashSet<*const ImageData> = HashSet::new();
+        self.used_memory = self
+            .id_to_data
+            .values()
+            .filter(|data| seen.insert(Arc::as_ptr(data)))
+            .map(|data| data.len())
+            .sum();
+    }
+
     fn remove_data_for_id(&mut self, image_id: u32) {
-        if let Some(data) = self.id_to_data.remove(&image_id) {
-            self.used_memory = self.used_memory.saturating_sub(data.len());
+        self.id_to_data.remove(&image_id);
+        self.id_seq.remove(&image_id);
+        self.recompute_used_memory();
+    }
+
+    /// Eviction, as opposed to replacement: an image number that named the
+    /// evicted id must not keep resolving to it, or every later `a=p,I=n`
+    /// fails on an id that no longer exists.
+    fn evict(&mut self, image_id: u32) {
+        self.remove_data_for_id(image_id);
+        self.number_to_id.retain(|_, id| *id != image_id);
+    }
+
+    /// The stored image that was transmitted earliest, skipping the most
+    /// recent one (it is about to be placed).
+    fn oldest_stored_image_except_newest(&self) -> Option<u32> {
+        let newest = self.next_seq;
+        self.id_to_data
+            .keys()
+            .filter_map(|id| {
+                let seq = self.id_seq.get(id).copied().unwrap_or(0);
+                (seq != newest).then_some((seq, *id))
+            })
+            .min()
+            .map(|(_, id)| id)
+    }
+
+    /// An appended animation frame is the newest image data in the store,
+    /// even though it arrived through `a=f` rather than a transmit. Without
+    /// this the sweep would protect some later still picture and evict the
+    /// animation that is being streamed into, mid-stream.
+    fn mark_newest(&mut self, image_id: u32) {
+        if self.id_seq.contains_key(&image_id) {
+            self.next_seq += 1;
+            self.id_seq.insert(image_id, self.next_seq);
         }
     }
 
-    fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>) {
+    fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>, budget: usize) {
         // Unconditionally, id 0 included. The insert below replaces whatever
         // was at this key either way, so skipping the bookkeeping for the
         // anonymous-transmission key does not keep that image alive — it only
@@ -77,9 +129,23 @@ impl KittyImageState {
         // evicting every unplaced image on every transfer, which breaks
         // transmit-now-place-later.
         self.remove_data_for_id(image_id);
-        self.prune_unreferenced();
-        self.used_memory += data.len();
         self.id_to_data.insert(image_id, data);
+        self.recompute_used_memory();
+        self.next_seq += 1;
+        self.id_seq.insert(image_id, self.next_seq);
+        if self.next_seq % 100 == 0 {
+            log::info!(
+                "kitty store: images={} bytes={} placements={} (after {} transmits)",
+                self.id_to_data.len(),
+                self.used_memory,
+                self.placements.len(),
+                self.next_seq
+            );
+        }
+        // After the insert, so the budget holds strictly; the image just
+        // stored is the newest and prune never evicts that one, which keeps
+        // transmit-now-place-later working.
+        self.prune_unreferenced(budget);
     }
 
     #[cfg(test)]
@@ -87,28 +153,73 @@ impl KittyImageState {
         self.used_memory
     }
 
-    pub(crate) fn prune_unreferenced(&mut self) {
-        let budget = 320 * 1024 * 1024; // FIXME: make this configurable
-        if self.used_memory > budget {
-            let referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
-            let target = self.used_memory - budget;
-            let mut freed = 0;
-            self.id_to_data.retain(|id, data| {
-                if referenced.contains(id) || freed > target {
-                    true
-                } else {
-                    freed += data.len();
-                    false
-                }
-            });
-
-            log::info!(
-                "using {} RAM for images, pruned {}",
-                self.used_memory,
-                freed
-            );
-            self.used_memory = self.used_memory.saturating_sub(freed);
+    /// Evict unplaced images, oldest transmission first, until the stored
+    /// bytes fit `budget`. Placed images and the most recently transmitted
+    /// image are never touched.
+    pub(crate) fn prune_unreferenced(&mut self, budget: usize) {
+        if self.used_memory <= budget {
+            return;
         }
+        let referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
+        let newest = self.next_seq;
+        let before = self.used_memory;
+        let mut candidates: Vec<(u64, u32)> = self
+            .id_to_data
+            .keys()
+            .filter(|id| !referenced.contains(id) && self.id_seq.get(id).copied() != Some(newest))
+            .map(|id| (self.id_seq.get(id).copied().unwrap_or(0), *id))
+            .collect();
+        candidates.sort_unstable();
+        // Re-measured after every eviction rather than summed from lengths:
+        // dropping one id of a shared picture frees nothing.
+        for (_, id) in candidates {
+            if self.used_memory <= budget {
+                break;
+            }
+            self.evict(id);
+        }
+        // Debug, not info: a frame stream prunes on nearly every transfer.
+        log::debug!(
+            "using {} RAM for images, pruned {} (budget {})",
+            self.used_memory,
+            before.saturating_sub(self.used_memory),
+            budget
+        );
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::KittyImageState;
+    use std::sync::Arc;
+    use wezterm_cell::image::{ImageData, ImageDataType};
+
+    fn image(side: u32) -> Arc<ImageData> {
+        Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            side,
+            side,
+            vec![0u8; (side * side * 4) as usize],
+        )))
+    }
+
+    #[test]
+    fn the_oldest_unplaced_images_go_first_and_placed_ones_never() {
+        let mut state = KittyImageState::default();
+        let one = image(16).len();
+        let budget = 3 * one;
+        for id in 1..=5 {
+            state.record_id_to_data(id, image(16), budget);
+        }
+        // Five transfers against a three-image budget hold the three newest.
+        let mut kept: Vec<u32> = state.id_to_data.keys().copied().collect();
+        kept.sort();
+        assert_eq!(kept, vec![3, 4, 5]);
+        assert_eq!(state.used_memory, budget);
+
+        // Re-transmitting an id replaces it without double counting.
+        state.record_id_to_data(5, image(16), budget);
+        assert_eq!(state.used_memory, budget);
+        assert_eq!(state.id_to_data.len(), 3);
     }
 }
 
@@ -135,6 +246,30 @@ impl TerminalState {
     #[cfg(test)]
     pub(crate) fn kitty_used_memory(&self) -> usize {
         self.kitty_img.used_memory()
+    }
+
+    /// Kitty's own rule for a full image store: the oldest images go,
+    /// placed ones included, placements and all. Without it an application
+    /// that never deletes -- a frame stream placing every frame under a
+    /// fresh id, so every frame stays attached to its cells under the next
+    /// one -- grows the terminal without bound until it happens to clear
+    /// the screen. Unplaced images go first; the image transmitted last is
+    /// always kept.
+    pub(crate) fn kitty_enforce_image_budget(&mut self) {
+        let budget = self.config.kitty_image_memory_budget();
+        self.kitty_img.prune_unreferenced(budget);
+        while self.kitty_img.used_memory > budget {
+            let Some(victim) = self.kitty_img.oldest_stored_image_except_newest() else {
+                break;
+            };
+            log::debug!(
+                "kitty store over budget ({} > {}): evicting placed image {victim}",
+                self.kitty_img.used_memory,
+                budget
+            );
+            self.kitty_remove_placement(victim, None);
+            self.kitty_img.evict(victim);
+        }
     }
 
     fn kitty_img_place(
@@ -197,6 +332,10 @@ impl TerminalState {
 
         let (image_width, image_height) = img.data().dimensions()?;
 
+        // Kitty evicts by last use, not by transmit order: a picture sent
+        // once and re-placed on every redraw must outlive frames streamed
+        // after it, or the client's next `a=p` fails on a missing id.
+        self.kitty_img.mark_newest(image_id);
         let info = self.assign_image_to_cells(ImageAttachParams {
             image_width,
             image_height,
@@ -608,7 +747,10 @@ impl TerminalState {
         info: PlacementInfo,
     ) {
         let seqno = self.seqno;
-        let screen = self.screen_mut();
+        // The recorded screen, not the active one: the sweep can run while
+        // the other screen is up (a stream in one pane, btop in this one),
+        // and StableRowIndex only means anything on the screen it came from.
+        let screen = self.screen.screen_for_alt_mut(info.alt_screen);
         let range =
             screen.stable_range(&(info.first_row..info.first_row + info.rows as StableRowIndex));
         for idx in range {
@@ -655,6 +797,7 @@ impl TerminalState {
         }
         if delete {
             self.kitty_img.id_to_data.clear();
+            self.kitty_img.id_seq.clear();
             self.kitty_img.used_memory = 0;
             self.kitty_img.number_to_id.clear();
         }
@@ -914,11 +1057,6 @@ impl TerminalState {
             }
         };
 
-        // Measured before and after, because frames are appended behind the
-        // Mutex: the size reported to the memory budget when the image was
-        // transmitted goes stale the moment an animation grows.
-        let bytes_before = image.len();
-
         let mut anim = image.data();
         let x = frame.x.unwrap_or(0);
         let y = frame.y.unwrap_or(0);
@@ -1021,8 +1159,15 @@ impl TerminalState {
                         .saturating_mul(*height as usize)
                         .saturating_mul(4);
                     let held = frames.len().saturating_mul(frame_bytes);
+                    // The animation caps bound one image; the pane budget
+                    // bounds the store, and an appended frame grows the
+                    // store without passing through the transmit path that
+                    // enforces it. One image is never allowed to fill the
+                    // whole budget on its own, and the sweep below the
+                    // append reclaims older images for what does fit.
+                    let budget = self.config.kitty_image_memory_budget();
                     if frames.len() + 1 > MAX_ANIM_FRAMES
-                        || held.saturating_add(frame_bytes) > MAX_ANIM_BYTES
+                        || held.saturating_add(frame_bytes) > MAX_ANIM_BYTES.min(budget)
                     {
                         // Answered from here because the caller only logs
                         // errors; a refusal the client never hears leaves it
@@ -1040,7 +1185,7 @@ impl TerminalState {
                             image_id,
                             held.saturating_add(frame_bytes),
                             frames.len() + 1,
-                            MAX_ANIM_BYTES,
+                            MAX_ANIM_BYTES.min(budget),
                             MAX_ANIM_FRAMES
                         );
                     }
@@ -1100,14 +1245,15 @@ impl TerminalState {
 
         drop(anim);
 
-        let bytes_after = image.len();
-        self.kitty_img.used_memory = self
-            .kitty_img
-            .used_memory
-            .saturating_add(bytes_after)
-            .saturating_sub(bytes_before);
+        // Frames are appended behind the Mutex, so the total measured when
+        // the image was transmitted is stale the moment an animation grows.
+        self.kitty_img.recompute_used_memory();
 
         self.kitty_touch_placements_for_image(image_id);
+        // A grown animation is a bigger store: apply the same sweep a
+        // transmit gets, so appends cannot carry the pane past its budget.
+        self.kitty_img.mark_newest(image_id);
+        self.kitty_enforce_image_budget();
 
         Ok(())
     }
@@ -1163,10 +1309,22 @@ impl TerminalState {
             }
         };
 
-        let data = transmit
-            .data
-            .load_data()
-            .context("data should have been materialized in coalesce_kitty_accumulation")?;
+        let data = match transmit.data.load_data() {
+            Ok(data) => data,
+            Err(err) => {
+                // A client that counts one answer per transmission (q=0, or
+                // a stream pacing itself on ACKs) would otherwise wait on a
+                // reply that never comes; kitty answers a failed read too.
+                // The number allocated above must not outlive the image it
+                // never got.
+                if let Some(no) = no {
+                    self.kitty_img.number_to_id.remove(&no);
+                }
+                self.kitty_send_response(verbosity, false, Some(id), no, format!("EBADF:{err}"));
+                return Err(anyhow::Error::new(err)
+                    .context("data should have been materialized in coalesce_kitty_accumulation"));
+            }
+        };
 
         let data = match transmit.compression {
             KittyImageCompression::None => data,
@@ -1219,6 +1377,11 @@ impl TerminalState {
                     width * height * 4
                 );
 
+                // The buffer keeps whatever capacity reading it left behind,
+                // and this image may sit in the store for a long time; the
+                // memory accounting counts len(), so make the two agree.
+                let mut data = data;
+                data.shrink_to_fit();
                 ImageDataType::new_single_frame(width, height, data)
             }
             Some(KittyImageFormat::Png) => {
@@ -1248,7 +1411,9 @@ impl TerminalState {
         let img = self
             .raw_image_to_image_data(img)
             .context("storing image data")?;
-        self.kitty_img.record_id_to_data(image_id, img);
+        self.kitty_img
+            .record_id_to_data(image_id, img, self.config.kitty_image_memory_budget());
+        self.kitty_enforce_image_budget();
 
         Ok((image_id, image_number))
     }

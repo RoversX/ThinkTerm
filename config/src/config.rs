@@ -269,6 +269,14 @@ pub struct Config {
 
     #[dynamic(default = "default_true")]
     pub enable_kitty_graphics: bool,
+    /// MiB of kitty image data each pane may keep. Past it the oldest
+    /// unplaced images go first; if the placed ones alone exceed it, the
+    /// least recently placed or transmitted picture is removed from the
+    /// screen too (kitty's own rule), except the newest. One animation is
+    /// additionally capped at the smaller of this budget and 256 MiB.
+    /// 0 means unlimited. Default 128.
+    #[dynamic(default = "default_kitty_image_memory_budget_mib")]
+    pub kitty_image_memory_budget_mib: u32,
     #[dynamic(default)]
     pub enable_kitty_keyboard: bool,
 
@@ -2345,6 +2353,10 @@ impl DroppedFileQuoting {
 
 fn default_glyph_cache_image_cache_size() -> usize {
     256
+}
+
+fn default_kitty_image_memory_budget_mib() -> u32 {
+    (wezterm_term::config::DEFAULT_KITTY_IMAGE_MEMORY_BUDGET / (1024 * 1024)) as u32
 }
 
 fn default_note_reading_max_width() -> usize {

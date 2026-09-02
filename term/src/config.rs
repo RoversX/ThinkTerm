@@ -132,6 +132,9 @@ impl Default for NewlineCanon {
 /// The configuration can be changed at runtime; provided that the implementation
 /// increments the generation counter appropriately, the changes will be detected
 /// and applied at the next appropriate opportunity.
+/// See [`TerminalConfiguration::kitty_image_memory_budget`].
+pub const DEFAULT_KITTY_IMAGE_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
+
 pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// Returns a generation counter for the active
     /// configuration.  If the implementation may be
@@ -174,6 +177,17 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
 
     fn enable_kitty_graphics(&self) -> bool {
         false
+    }
+
+    /// How many bytes of kitty image data one terminal may keep. Beyond it
+    /// the oldest unplaced images are evicted first; if the placed ones
+    /// alone exceed it, the least recently placed or transmitted picture is
+    /// detached from its cells and dropped as well, newest excepted. A
+    /// streaming client that sends every frame under a fresh id relies on
+    /// this to bound its footprint: a 1632x1026 RGBA frame is 6.7MiB, so the
+    /// default keeps roughly twenty of them.
+    fn kitty_image_memory_budget(&self) -> usize {
+        DEFAULT_KITTY_IMAGE_MEMORY_BUDGET
     }
 
     fn enable_kitty_keyboard(&self) -> bool {

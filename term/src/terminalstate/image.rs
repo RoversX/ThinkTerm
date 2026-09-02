@@ -14,6 +14,11 @@ pub struct PlacementInfo {
     pub first_row: StableRowIndex,
     pub rows: usize,
     pub cols: usize,
+    /// Which screen the cells live on. Removal must target that screen:
+    /// the budget sweep can fire while the other one is active, and
+    /// detaching rows on the wrong screen frees nothing while the picture
+    /// comes back with the screen switch.
+    pub alt_screen: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -274,6 +279,7 @@ impl TerminalState {
             first_row,
             rows: height_in_cells,
             cols: width_in_cells,
+            alt_screen: self.screen.is_alt_screen_active(),
         })
     }
 
