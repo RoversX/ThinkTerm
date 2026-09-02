@@ -1,5 +1,5 @@
 use crate::quad::{
-    HeapQuadAllocator, HeapQuadMark, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
+    HeapQuadAllocator, HeapQuadMark, QuadClipRect, QuadTrait, TripleLayerQuadAllocator, Vertex,
 };
 use crate::termwindow::content_view::{ContentViewTypography, TerminalPreviewRequest};
 use crate::termwindow::render::{LineToEleShapeCacheKey, RenderScreenLineParams};
@@ -227,6 +227,71 @@ pub(crate) struct CardComposite {
     /// above their card's background and below every label. Settled frames
     /// use layer 0; a closing ghost's fading pictures use the fade layer.
     pub zindex: i8,
+}
+
+/// Where a dedicated-texture image composite is drawn relative to the
+/// terminal layer's sub-buffers, mirroring the sub-buffer the atlas path
+/// would have used: under the glyphs for z<0 pictures, over them for z>=0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageCompositeSlot {
+    AfterFills,
+    AfterGlyphs,
+}
+
+/// A run of per-cell quads that all sample one dedicated image texture,
+/// drawn with a single bind + draw in the composite pass.
+pub(crate) struct ImageComposite {
+    pub texture: Rc<crate::termwindow::webgpu::ImageTexture>,
+    pub slot: ImageCompositeSlot,
+    /// Offset into `ImageCompositeBatch::verts`.
+    pub first_vertex: usize,
+    pub quad_count: usize,
+}
+
+/// The dedicated-texture image quads of one paint pass. Persistent and
+/// cleared per pass like `card_frame_verts`, so a stream does not allocate
+/// per frame; consecutive quads on the same texture and slot coalesce into
+/// one composite.
+#[derive(Default)]
+pub(crate) struct ImageCompositeBatch {
+    pub verts: Vec<Vertex>,
+    pub groups: Vec<ImageComposite>,
+}
+
+impl ImageCompositeBatch {
+    pub fn push_quad(
+        &mut self,
+        texture: &Rc<crate::termwindow::webgpu::ImageTexture>,
+        slot: ImageCompositeSlot,
+        quad: [Vertex; 4],
+    ) {
+        let first_vertex = self.verts.len();
+        self.verts.extend_from_slice(&quad);
+        match self.groups.last_mut() {
+            Some(group)
+                if group.slot == slot
+                    && Rc::ptr_eq(&group.texture, texture)
+                    && group.first_vertex + group.quad_count * 4 == first_vertex =>
+            {
+                group.quad_count += 1;
+            }
+            _ => self.groups.push(ImageComposite {
+                texture: Rc::clone(texture),
+                slot,
+                first_vertex,
+                quad_count: 1,
+            }),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.verts.clear();
+        self.groups.clear();
+    }
+
+    pub fn max_quad_count(&self) -> usize {
+        self.groups.iter().map(|g| g.quad_count).max().unwrap_or(0)
+    }
 }
 
 fn preview_quad_key(
@@ -995,6 +1060,13 @@ impl crate::TermWindow {
         }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
+        // One paint, presented or not: retire dedicated textures nobody
+        // drew. Ticking only after a successful draw left the cache's
+        // budget switched off for exactly the frames that fail or are
+        // skipped, while every pass kept uploading a fresh texture.
+        if let Some(render_state) = self.render_state.as_ref() {
+            render_state.dedicated_images.borrow_mut().end_frame();
+        }
         let draw_result = if present_frame || !matches!(frame, RenderFrame::WebGpu) {
             self.call_draw(frame).map(|_| true)
         } else {
@@ -3490,6 +3562,7 @@ impl crate::TermWindow {
         self.card_composites.borrow_mut().clear();
         // Truncate, not drop: the buffer's capacity is the whole point.
         self.card_frame_verts.borrow_mut().clear();
+        self.image_composites.borrow_mut().clear();
         {
             let gl_state = self.render_state.as_ref().unwrap();
             for layer in gl_state.layers.borrow().iter() {

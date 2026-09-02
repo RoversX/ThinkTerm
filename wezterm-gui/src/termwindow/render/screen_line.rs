@@ -28,6 +28,7 @@ impl crate::TermWindow {
         params: RenderScreenLineParams,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<RenderScreenLineResult> {
+        self.dedicated_image_cell.set(None);
         if params.line.is_double_height_bottom() {
             // The top and bottom lines are required to have the same content.
             // For the sake of simplicity, we render both of them as part of
@@ -917,7 +918,17 @@ impl crate::TermWindow {
 
         let shaped = Rc::new(shaped);
 
-        if let Some(shape_key) = params.shape_key {
+        // A line carrying pictures is not cached. The clusters keep the
+        // cells' image attachments, so every entry pins its frame's pixels;
+        // a streaming client changes those attachments every frame, every
+        // line hashes differently, and the cache ends up holding thousands
+        // of entries times a multi-megabyte frame each until LFU pressure --
+        // gigabytes for pictures that were overwritten long ago. Shaping a
+        // line of mostly blank cells again is cheap.
+        let holds_images = shaped
+            .iter()
+            .any(|item| item.cluster.attrs.images().is_some());
+        if let (Some(shape_key), false) = (params.shape_key, holds_images) {
             let item = LineToElementShapeItem {
                 expires,
                 shaped: Rc::clone(&shaped),

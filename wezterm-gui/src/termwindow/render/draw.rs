@@ -1,5 +1,6 @@
 use crate::colorease::ColorEaseUniform;
 use crate::renderstate::{LoggedSrgbTexture2d, RenderState};
+use crate::termwindow::render::paint::{ImageComposite, ImageCompositeBatch, ImageCompositeSlot};
 use crate::termwindow::webgpu::{ShaderUniform, WebGpuState};
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
@@ -211,6 +212,7 @@ pub(crate) fn draw_webgpu_layers(
     window_border: WindowBorder,
     window_label: usize,
     cards: CardDrawData,
+    images: &ImageCompositeBatch,
     card_scratch: &mut Option<CardScratch>,
     frame_verts: &mut Vec<crate::quad::Vertex>,
 ) -> anyhow::Result<()> {
@@ -275,6 +277,16 @@ pub(crate) fn draw_webgpu_layers(
             composite_draws.push((composite.zindex, base as i32, composite));
         }
     }
+    // Dedicated-texture picture quads ride in the same scratch upload; each
+    // group is one bind + one indexed draw covering `quad_count` quads.
+    let image_base = frame_verts.len();
+    frame_verts.extend_from_slice(&images.verts);
+    let image_draws: Vec<(ImageCompositeSlot, i32, &ImageComposite)> = images
+        .groups
+        .iter()
+        .map(|group| (group.slot, (image_base + group.first_vertex) as i32, group))
+        .collect();
+    crate::perf::log_counter("image_composites", image_draws.len());
     if !frame_verts.is_empty() {
         let max_quads = cards
             .pending
@@ -282,6 +294,7 @@ pub(crate) fn draw_webgpu_layers(
             .map(|pending| pending.quad_count)
             .max()
             .unwrap_or(0)
+            .max(images.max_quad_count())
             .max(1);
         CardScratch::ensure(card_scratch, webgpu, frame_verts.len(), max_quads);
         let scratch = card_scratch.as_ref().expect("just ensured");
@@ -411,17 +424,32 @@ pub(crate) fn draw_webgpu_layers(
 
             // Card pictures composite between this layer's base fills and
             // its glyph sub-buffers: above their own card background, below
-            // every label drawn on top.
-            if idx == 0
+            // every label drawn on top. Dedicated-texture terminal pictures
+            // join that pass when they belong under the text (z<0, formerly
+            // sub-buffer 0) and get an identical pass after the glyph
+            // sub-buffer when they belong over it (z>=0, formerly sub-buffer
+            // 2). Not after sub-buffer 2 itself: the context menu, scrollbar
+            // thumb, drag ghost and hover sidebar are emitted into that
+            // sub-buffer after the panes, and by quad order they sat above
+            // a z>=0 picture; a pass after it would paint the picture over
+            // them. Terminal panes live in layer 0.
+            let image_slot = match idx {
+                0 => Some(ImageCompositeSlot::AfterFills),
+                1 => Some(ImageCompositeSlot::AfterGlyphs),
+                _ => None,
+            };
+            let cards_here = idx == 0
                 && composite_draws
                     .iter()
-                    .any(|(zindex, _, _)| *zindex == layer.zindex())
-            {
+                    .any(|(zindex, _, _)| *zindex == layer.zindex());
+            let images_here = layer.zindex() == 0
+                && image_slot.is_some_and(|slot| image_draws.iter().any(|(s, _, _)| *s == slot));
+            if cards_here || images_here {
                 let scratch = card_scratch
                     .as_ref()
                     .expect("composite draws imply the scratch exists");
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Card Composite Pass"),
+                    label: Some("Composite Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
@@ -443,14 +471,31 @@ pub(crate) fn draw_webgpu_layers(
                 pass.set_bind_group(0, &window_uniforms, &[]);
                 pass.set_vertex_buffer(0, scratch.vb.slice(..));
                 pass.set_index_buffer(scratch.index.slice(..), wgpu::IndexFormat::Uint32);
-                for (zindex, base, composite) in &composite_draws {
-                    if *zindex != layer.zindex() {
-                        continue;
+                if cards_here {
+                    for (zindex, base, composite) in &composite_draws {
+                        if *zindex != layer.zindex() {
+                            continue;
+                        }
+                        pass.set_bind_group(1, &composite.texture.bind_group, &[]);
+                        pass.set_bind_group(2, &composite.texture.bind_group, &[]);
+                        pass.draw_indexed(0..6, *base, 0..1);
+                        draw_calls += 1;
                     }
-                    pass.set_bind_group(1, &composite.texture.bind_group, &[]);
-                    pass.set_bind_group(2, &composite.texture.bind_group, &[]);
-                    pass.draw_indexed(0..6, *base, 0..1);
-                    draw_calls += 1;
+                }
+                if images_here {
+                    let slot = image_slot.expect("images_here implies a slot");
+                    for (s, base, group) in &image_draws {
+                        if *s != slot {
+                            continue;
+                        }
+                        // Linear in slot 1, nearest in slot 2: the same
+                        // pairing the main pass gives the atlas, so the
+                        // shader's minification mix behaves identically.
+                        pass.set_bind_group(1, &group.texture.bind_group_linear, &[]);
+                        pass.set_bind_group(2, &group.texture.bind_group_nearest, &[]);
+                        pass.draw_indexed(0..(group.quad_count * 6) as u32, *base, 0..1);
+                        draw_calls += 1;
+                    }
                 }
             }
 
@@ -527,6 +572,7 @@ impl crate::TermWindow {
         };
         let mut card_scratch = self.card_scratch.borrow_mut();
         let mut frame_verts = self.card_frame_verts.borrow_mut();
+        let images = self.image_composites.borrow();
         draw_webgpu_layers(
             webgpu,
             render_state,
@@ -543,9 +589,11 @@ impl crate::TermWindow {
             window_border,
             self.mux_window_id as usize,
             cards,
+            &images,
             &mut card_scratch,
             &mut frame_verts,
         )?;
+        drop(images);
         render_state.maybe_shrink_quads();
         Ok(())
     }

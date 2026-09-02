@@ -4011,6 +4011,8 @@ impl SettingsWindow {
             .render_state
             .as_ref()
             .context("settings render state not initialized")?;
+        // The settings window draws no terminal pictures.
+        let no_images = crate::termwindow::render::paint::ImageCompositeBatch::default();
         draw_webgpu_layers(
             webgpu,
             render_state,
@@ -4025,6 +4027,7 @@ impl SettingsWindow {
                 pending: Vec::new(),
                 composites: Vec::new(),
             },
+            &no_images,
             &mut None,
             &mut Vec::new(),
         )?;

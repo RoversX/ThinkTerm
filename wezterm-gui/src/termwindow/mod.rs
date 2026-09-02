@@ -2134,6 +2134,17 @@ pub struct TermWindow {
     card_frame_verts: RefCell<Vec<crate::quad::Vertex>>,
     /// One textured quad per card standing in for its glyph quads.
     card_composites: RefCell<Vec<crate::termwindow::render::paint::CardComposite>>,
+    /// Per-cell quads of pictures drawn from dedicated textures this pass
+    /// (see `populate_image_quad`), consumed by the composite passes.
+    image_composites: RefCell<crate::termwindow::render::paint::ImageCompositeBatch>,
+    /// Set by `populate_image_quad` when the line being rendered drew a
+    /// picture from a dedicated texture; the pane renderer then keeps that
+    /// line out of the line quad cache, whose replay would lose the picture.
+    dedicated_image_in_line: std::cell::Cell<bool>,
+    /// The (layer, cell) whose latest picture went to a dedicated texture,
+    /// so pictures stacked above it in the same cell follow it there and
+    /// keep their z-order; reset at the start of every line.
+    dedicated_image_cell: std::cell::Cell<Option<(usize, usize)>>,
     /// The settled frame's composites, kept so a closing overview's ghost
     /// can fade the card pictures out with it (the ghost heap itself holds
     /// no thumbnail quads on the texture path).
@@ -2514,6 +2525,14 @@ pub struct TermWindow {
 }
 
 impl TermWindow {
+    /// Whether pictures may draw from dedicated textures right now. A
+    /// content-view transition records the whole terminal into one heap and
+    /// replays it scaled; per-cell composites cannot be replayed from a
+    /// heap, so those frames fall back to the atlas path.
+    pub(crate) fn dedicated_image_textures_allowed(&self) -> bool {
+        self.content_view_fade.is_none() && self.content_view_last_frame.is_none()
+    }
+
     /// What the window was showing when the atlas overflowed; the report
     /// uses it to tell an overview spike from a plain terminal frame.
     pub(crate) fn atlas_scene(&self) -> &'static str {
@@ -2616,6 +2635,14 @@ impl TermWindow {
             lines.push(format!(
                 "{label}: recent_images=[{}]",
                 stats.recent_image_allocs.join("; ")
+            ));
+            let dedicated = stats.dedicated_images;
+            lines.push(format!(
+                "{label}: dedicated_images live={} pooled={} {:.1}MiB budget={}MiB",
+                dedicated.live,
+                dedicated.pooled,
+                dedicated.bytes as f64 / (1024.0 * 1024.0),
+                crate::renderstate::DEDICATED_IMAGE_BUDGET_BYTES / (1024 * 1024),
             ));
         } else {
             lines.push(format!("{label}: render_state=none"));
@@ -3015,6 +3042,9 @@ impl TermWindow {
         self.publish_ui_shape_cache_diagnostics();
         if let Some(render_state) = self.render_state.as_ref() {
             render_state.shrink_quads_now();
+            // A hidden window paints no frames, so these could not age out
+            // through end_frame; re-upload on the next paint is cheap.
+            render_state.dedicated_images.borrow_mut().clear();
         }
         self.line_quad_cache.borrow_mut().clear();
         // The buffers just dropped stay resident until a device maintain
@@ -3431,6 +3461,9 @@ impl TermWindow {
             pending_card_renders: RefCell::new(Vec::new()),
             card_frame_verts: RefCell::new(Vec::new()),
             card_composites: RefCell::new(Vec::new()),
+            image_composites: RefCell::new(Default::default()),
+            dedicated_image_in_line: std::cell::Cell::new(false),
+            dedicated_image_cell: std::cell::Cell::new(None),
             content_view_last_composites: RefCell::new(Vec::new()),
             card_scratch: RefCell::new(None),
             preview_scale_hold: RefCell::new(HashMap::new()),

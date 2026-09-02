@@ -593,18 +593,21 @@ pub struct ImageAllocRecord {
     /// A one-shot streaming frame (nonce key): never requested again
     /// under the same key, so each one is fresh atlas area.
     pub nonce: bool,
+    /// Uploaded into its own texture rather than packed into the atlas.
+    pub dedicated: bool,
     pub at: Instant,
 }
 
 impl ImageAllocRecord {
     pub fn describe(&self, now: Instant) -> String {
         format!(
-            "{}x{}{}{}{} {}s",
+            "{}x{}{}{}{}{} {}s",
             self.width,
             self.height,
             self.scale.map(|s| format!("/s{s}")).unwrap_or_default(),
             if self.animated { " anim" } else { "" },
             if self.nonce { " nonce" } else { "" },
+            if self.dedicated { " tex" } else { " atlas" },
             now.saturating_duration_since(self.at).as_secs(),
         )
     }
@@ -1034,6 +1037,24 @@ impl GlyphCache {
             scale,
             animated,
             nonce,
+            dedicated: false,
+            at: Instant::now(),
+        });
+    }
+
+    /// Record a picture uploaded into a dedicated texture (it never touches
+    /// the atlas), so the memory report shows which path each upload took.
+    pub(crate) fn note_dedicated_image(&mut self, width: u32, height: u32, nonce: bool) {
+        if self.image_alloc_log.len() >= IMAGE_ALLOC_LOG_LEN {
+            self.image_alloc_log.pop_front();
+        }
+        self.image_alloc_log.push_back(ImageAllocRecord {
+            width: width as usize,
+            height: height as usize,
+            scale: None,
+            animated: false,
+            nonce,
+            dedicated: true,
             at: Instant::now(),
         });
     }

@@ -317,6 +317,113 @@ impl CardRenderTexture {
     }
 }
 
+/// A dedicated texture for one large image -- a streaming kitty frame, an
+/// `icat` picture -- drawn as its own composite instead of being packed into
+/// the shared glyph atlas. The atlas cannot free a rectangle, so a stream of
+/// multi-megabyte frames filled it every few frames and forced a full clear
+/// (a 64MiB zero image, a 64MiB upload and a second paint pass) each time.
+/// These textures are reused across frames of the same size, so a stream
+/// costs one `write_texture` per frame and nothing else.
+pub struct ImageTexture {
+    pub texture: wgpu::Texture,
+    /// Same layout as the atlas bind groups, so the composite pass binds
+    /// linear into slot 1 and nearest into slot 2 exactly like the main pass
+    /// does for the atlas, and the shader's minification mix behaves the
+    /// same on both paths (a single linear binding would soften 1:1 output).
+    pub bind_group_linear: wgpu::BindGroup,
+    pub bind_group_nearest: wgpu::BindGroup,
+    pub width: u32,
+    pub height: u32,
+    queue: Arc<wgpu::Queue>,
+}
+
+impl ImageTexture {
+    pub fn new(width: u32, height: u32, state: &WebGpuState) -> anyhow::Result<Self> {
+        let limit = state.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > limit || height > limit {
+            anyhow::bail!(
+                "image texture dimensions {width}x{height} are outside the \
+                 1..={limit} range supported by your GPU"
+            );
+        }
+        gpu_debug(format!(
+            "create WebGpu texture label=Image Texture size={width}x{height} bytes={}",
+            width as usize * height as usize * 4
+        ));
+        // The same format as the atlas: the pixels are the same RGBA8 bytes
+        // the atlas path uploads today, just not through the allocator.
+        let texture = state.device.create_texture(&wgpu::TextureDescriptor {
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label: Some("Image Texture"),
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let make = |sampler: &wgpu::Sampler, label: &str| {
+            state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &state.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+                label: Some(label),
+            })
+        };
+        let bind_group_linear = make(&state.texture_linear_sampler, "image texture linear");
+        let bind_group_nearest = make(&state.texture_nearest_sampler, "image texture nearest");
+        Ok(Self {
+            texture,
+            bind_group_linear,
+            bind_group_nearest,
+            width,
+            height,
+            queue: Arc::clone(&state.queue),
+        })
+    }
+
+    /// Upload tightly packed RGBA8 pixels covering the whole texture.
+    pub fn upload(&self, rgba: &[u8]) {
+        debug_assert_eq!(rgba.len(), self.byte_size());
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.width * 4),
+                rows_per_image: Some(self.height),
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    pub fn byte_size(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
+}
+
 pub fn adapter_info_to_gpu_info(info: wgpu::AdapterInfo) -> GpuInfo {
     GpuInfo {
         name: info.name,

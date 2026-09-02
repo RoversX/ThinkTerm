@@ -13,6 +13,7 @@ use ::window::glium::{
 use ::window::*;
 use anyhow::Context;
 use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::rc::Rc;
 use wezterm_font::FontConfiguration;
@@ -745,6 +746,225 @@ pub struct RenderState {
     pub util_sprites: UtilSprites,
     pub glyph_prog: Option<glium::Program>,
     pub layers: RefCell<Vec<Rc<RenderLayer>>>,
+    /// Large images drawn from their own textures instead of the atlas
+    /// (WebGpu only; glium keeps packing everything into the atlas). Lives
+    /// here rather than in the glyph cache so an atlas recreation does not
+    /// throw the textures away.
+    pub dedicated_images: RefCell<DedicatedImageCache<crate::termwindow::webgpu::ImageTexture>>,
+}
+
+/// Images at or above this many RGBA bytes bypass the glyph atlas for a
+/// dedicated texture. Absolute rather than relative to the atlas: the atlas
+/// settles near 512 at startup, where a fraction of its area would send
+/// ordinary small pictures off-atlas too, and a threshold that moved with
+/// the atlas would flip the same picture between paths (and samplers) as
+/// the atlas grew.
+pub const DEDICATED_IMAGE_MIN_BYTES: usize = 1024 * 1024;
+
+/// Resident budget for dedicated image textures, live and pooled together,
+/// across all sizes -- a per-size pool has no bound on the number of sizes
+/// a drag-resize mints. Two 1632x1026 streams need about 27MiB: two live
+/// frames and two spares.
+pub const DEDICATED_IMAGE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// Whether an image can be drawn from a dedicated texture at all. Two
+/// gates: the GPU's per-side texture limit (queried from the adapter --
+/// 16384 on Apple GPUs -- because a 20000x1 kitty image is valid yet
+/// cannot be one texture), and the cache's own byte budget (an 8000x6000
+/// photo is 192MiB as one texture; while displayed it could never be
+/// evicted, so the budget would mean nothing). Either way the picture
+/// takes the atlas path, which knows how to downscale; failing the paint
+/// instead would keep the previous frame on screen for as long as the
+/// picture is placed.
+pub fn image_fits_dedicated_texture(width: u32, height: u32, max_side: u32) -> bool {
+    let bytes = width as usize * height as usize * 4;
+    width > 0
+        && height > 0
+        && width <= max_side
+        && height <= max_side
+        && bytes <= DEDICATED_IMAGE_BUDGET_BYTES
+}
+
+/// Whether an image should be drawn from a dedicated texture. Besides the
+/// size threshold, anything the atlas could never place -- a side longer
+/// than the atlas once its padding is added -- goes dedicated too, since
+/// packing it would only drive atlas growth. Callers gate this on
+/// `image_fits_dedicated_texture` first.
+pub fn image_wants_dedicated_texture(
+    width: u32,
+    height: u32,
+    padding: usize,
+    atlas_side: usize,
+) -> bool {
+    let bytes = width as usize * height as usize * 4;
+    // Atlas::allocate_with_padding reserves the caller's padding plus one
+    // texel of its own on each side.
+    let reserve = |dim: u32| dim as usize + padding + 2;
+    bytes >= DEDICATED_IMAGE_MIN_BYTES
+        || reserve(width) > atlas_side
+        || reserve(height) > atlas_side
+}
+
+/// What the cache needs to know about a texture; abstract so the eviction
+/// policy can be tested without a GPU.
+pub trait DedicatedTexture {
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+    fn byte_size(&self) -> usize {
+        self.width() as usize * self.height() as usize * 4
+    }
+}
+
+impl DedicatedTexture for crate::termwindow::webgpu::ImageTexture {
+    fn width(&self) -> u32 {
+        self.width
+    }
+    fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DedicatedImageStats {
+    pub live: usize,
+    pub pooled: usize,
+    pub bytes: usize,
+}
+
+struct DedicatedImageEntry<T> {
+    texture: Rc<T>,
+    last_used: u64,
+}
+
+/// Dedicated textures keyed by image hash, with spares pooled by size so a
+/// stream of same-sized frames reuses one texture per frame instead of
+/// allocating. Bounded by a single byte budget across all sizes.
+pub struct DedicatedImageCache<T> {
+    entries: HashMap<[u8; 32], DedicatedImageEntry<T>>,
+    /// Retired textures, oldest first.
+    pool: Vec<Rc<T>>,
+    /// Advanced once per presented frame by `end_frame`, so the retry
+    /// passes of one frame all see the same value and a second pass hits
+    /// the entry the first pass uploaded.
+    frame: u64,
+    budget: usize,
+}
+
+impl<T: DedicatedTexture> DedicatedImageCache<T> {
+    pub fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            pool: Vec::new(),
+            frame: 0,
+            budget,
+        }
+    }
+
+    /// The texture holding `hash`, uploading it via `upload` into a pooled
+    /// or freshly `create`d texture on a miss.
+    pub fn get_or_upload(
+        &mut self,
+        hash: [u8; 32],
+        width: u32,
+        height: u32,
+        create: impl FnOnce() -> anyhow::Result<T>,
+        upload: impl FnOnce(&T),
+    ) -> anyhow::Result<Rc<T>> {
+        if let Some(entry) = self.entries.get_mut(&hash) {
+            entry.last_used = self.frame;
+            return Ok(Rc::clone(&entry.texture));
+        }
+        let texture = match self
+            .pool
+            .iter()
+            .position(|t| t.width() == width && t.height() == height)
+        {
+            Some(idx) => self.pool.remove(idx),
+            None => Rc::new(create()?),
+        };
+        upload(&texture);
+        self.entries.insert(
+            hash,
+            DedicatedImageEntry {
+                texture: Rc::clone(&texture),
+                last_used: self.frame,
+            },
+        );
+        self.enforce_budget();
+        Ok(texture)
+    }
+
+    /// Call once per paint. Entries not drawn for two frames retire to
+    /// the pool; the budget is then re-applied.
+    pub fn end_frame(&mut self) {
+        // Budget first, while `frame` still marks what this paint drew:
+        // after the bump every entry looks idle, and an over-budget frame
+        // would destroy the very textures its composites are encoding,
+        // re-uploading them all next frame.
+        self.enforce_budget();
+        self.frame += 1;
+        let frame = self.frame;
+        let mut retired: Vec<(u64, Rc<T>)> = Vec::new();
+        self.entries.retain(|_, entry| {
+            if entry.last_used + 2 <= frame {
+                retired.push((entry.last_used, Rc::clone(&entry.texture)));
+                false
+            } else {
+                true
+            }
+        });
+        retired.sort_by_key(|(last_used, _)| *last_used);
+        self.pool.extend(retired.into_iter().map(|(_, t)| t));
+        // Spares only: the live set was already trimmed above, and what
+        // just retired may simply exceed the pool's share.
+        while self.resident_bytes() > self.budget && !self.pool.is_empty() {
+            self.pool.remove(0);
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|e| e.texture.byte_size())
+            .chain(self.pool.iter().map(|t| t.byte_size()))
+            .sum()
+    }
+
+    /// Spares go first, oldest first; then the least recently drawn live
+    /// entries, never one drawn this frame (its composite is about to be
+    /// encoded).
+    fn enforce_budget(&mut self) {
+        while self.resident_bytes() > self.budget && !self.pool.is_empty() {
+            self.pool.remove(0);
+        }
+        while self.resident_bytes() > self.budget {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.last_used < self.frame)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(hash, _)| *hash);
+            match victim {
+                Some(hash) => {
+                    self.entries.remove(&hash);
+                }
+                None => break,
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.pool.clear();
+    }
+
+    pub fn stats(&self) -> DedicatedImageStats {
+        DedicatedImageStats {
+            live: self.entries.len(),
+            pooled: self.pool.len(),
+            bytes: self.resident_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -766,6 +986,7 @@ pub struct RenderStateStats {
     pub layers: usize,
     pub layer_quads: usize,
     pub vertex_buffers: usize,
+    pub dedicated_images: DedicatedImageStats,
 }
 
 impl RenderState {
@@ -795,6 +1016,9 @@ impl RenderState {
                         util_sprites,
                         glyph_prog,
                         layers: RefCell::new(vec![main_layer]),
+                        dedicated_images: RefCell::new(DedicatedImageCache::new(
+                            DEDICATED_IMAGE_BUDGET_BYTES,
+                        )),
                     });
                 }
                 Err(OutOfTextureSpace {
@@ -973,6 +1197,7 @@ impl RenderState {
             cursor_glyphs: glyph.cursor_glyphs,
             color_sprites: glyph.color_sprites,
             layers: layers.len(),
+            dedicated_images: self.dedicated_images.borrow().stats(),
             layer_quads,
             vertex_buffers: layers.len() * 3,
         }
@@ -1054,5 +1279,169 @@ impl RenderState {
 
         *glyph_cache = new_glyph_cache;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dedicated_image_tests {
+    use super::{
+        image_wants_dedicated_texture, DedicatedImageCache, DedicatedTexture,
+        DEDICATED_IMAGE_MIN_BYTES,
+    };
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct FakeTex(u32, u32);
+    impl DedicatedTexture for FakeTex {
+        fn width(&self) -> u32 {
+            self.0
+        }
+        fn height(&self) -> u32 {
+            self.1
+        }
+    }
+
+    fn hash(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    // 512x512x4 = 1MiB per fake texture; a 3MiB budget holds three.
+    const SIDE: u32 = 512;
+    const MIB: usize = 1024 * 1024;
+
+    fn get(cache: &mut DedicatedImageCache<FakeTex>, n: u8, uploads: &Cell<usize>) -> Rc<FakeTex> {
+        cache
+            .get_or_upload(
+                hash(n),
+                SIDE,
+                SIDE,
+                || Ok(FakeTex(SIDE, SIDE)),
+                |_| uploads.set(uploads.get() + 1),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_second_pass_in_the_same_frame_does_not_upload_again() {
+        let mut cache = DedicatedImageCache::new(3 * MIB);
+        let uploads = Cell::new(0);
+        let a = get(&mut cache, 1, &uploads);
+        let b = get(&mut cache, 1, &uploads);
+        assert!(Rc::ptr_eq(&a, &b));
+        assert_eq!(uploads.get(), 1);
+    }
+
+    #[test]
+    fn a_stream_reuses_one_pooled_texture_per_frame() {
+        let mut cache = DedicatedImageCache::new(3 * MIB);
+        let uploads = Cell::new(0);
+        let first = get(&mut cache, 1, &uploads);
+        cache.end_frame();
+        let second = get(&mut cache, 2, &uploads);
+        cache.end_frame();
+        // Frame 1 was last drawn two frames ago: retired to the pool.
+        assert_eq!(cache.stats().live, 1);
+        assert_eq!(cache.stats().pooled, 1);
+        let third = get(&mut cache, 3, &uploads);
+        // The retired texture is the one handed out, not a fresh one.
+        assert!(Rc::ptr_eq(&first, &third));
+        assert!(!Rc::ptr_eq(&second, &third));
+        assert_eq!(uploads.get(), 3);
+        assert_eq!(cache.stats().bytes, 2 * MIB);
+    }
+
+    #[test]
+    fn the_budget_drops_spares_first_then_the_least_recently_drawn() {
+        let mut cache = DedicatedImageCache::new(3 * MIB);
+        let uploads = Cell::new(0);
+        get(&mut cache, 1, &uploads);
+        cache.end_frame();
+        get(&mut cache, 2, &uploads);
+        cache.end_frame();
+        get(&mut cache, 3, &uploads);
+        cache.end_frame();
+        // Frame 3 took frame 1's retired texture, so only two textures
+        // exist: 3 live, 2's retired to the pool.
+        assert_eq!((cache.stats().live, cache.stats().pooled), (1, 1));
+        assert_eq!(cache.stats().bytes, 2 * MIB);
+
+        // A second live picture this frame takes the spare...
+        get(&mut cache, 4, &uploads);
+        assert_eq!((cache.stats().live, cache.stats().pooled), (2, 0));
+        // ...a third allocates, landing exactly on the budget...
+        get(&mut cache, 5, &uploads);
+        assert_eq!((cache.stats().live, cache.stats().pooled), (3, 0));
+        assert_eq!(cache.stats().bytes, 3 * MIB);
+        // ...and a fourth goes over: with no spares left, the least recently
+        // drawn live entry (3, drawn last frame) is evicted, never 4/5/6.
+        get(&mut cache, 6, &uploads);
+        assert_eq!(cache.stats().live, 3);
+        assert_eq!(cache.stats().bytes, 3 * MIB);
+        let before = uploads.get();
+        get(&mut cache, 4, &uploads);
+        get(&mut cache, 5, &uploads);
+        get(&mut cache, 6, &uploads);
+        assert_eq!(uploads.get(), before, "4/5/6 must still be resident");
+        get(&mut cache, 3, &uploads);
+        assert_eq!(uploads.get(), before + 1, "3 was evicted and re-uploads");
+    }
+
+    #[test]
+    fn entries_drawn_this_frame_are_never_evicted() {
+        let mut cache = DedicatedImageCache::new(MIB);
+        let uploads = Cell::new(0);
+        get(&mut cache, 1, &uploads);
+        get(&mut cache, 2, &uploads);
+        // Over budget, but both were drawn this frame: both stay.
+        assert_eq!(cache.stats().live, 2);
+        cache.end_frame();
+        cache.end_frame();
+        // Retired and trimmed back under budget.
+        assert!(cache.stats().bytes <= MIB);
+    }
+
+    #[test]
+    fn threshold_is_absolute_and_catches_unpackable_sides() {
+        assert!(image_wants_dedicated_texture(SIDE, SIDE, 16, 4096));
+        assert!(!image_wants_dedicated_texture(300, 300, 16, 4096));
+        assert_eq!(DEDICATED_IMAGE_MIN_BYTES, 512 * 512 * 4);
+        // Small in bytes but wider than the atlas once padded.
+        assert!(image_wants_dedicated_texture(500, 8, 16, 512));
+        assert!(!image_wants_dedicated_texture(490, 8, 16, 512));
+    }
+
+    #[test]
+    fn a_side_past_the_gpu_limit_cannot_be_dedicated() {
+        use super::image_fits_dedicated_texture;
+        assert!(image_fits_dedicated_texture(8192, 1, 8192));
+        assert!(!image_fits_dedicated_texture(8193, 1, 8192));
+        assert!(!image_fits_dedicated_texture(1, 20000, 8192));
+        assert!(!image_fits_dedicated_texture(0, 10, 8192));
+    }
+
+    #[test]
+    fn a_picture_bigger_than_the_whole_budget_cannot_be_dedicated() {
+        use super::{image_fits_dedicated_texture, DEDICATED_IMAGE_BUDGET_BYTES};
+        // 8000x6000 RGBA = 192MiB: six times the budget, unevictable while
+        // displayed. The atlas path downscales it instead.
+        assert!(!image_fits_dedicated_texture(8000, 6000, 16384));
+        let side = ((DEDICATED_IMAGE_BUDGET_BYTES / 4) as f64).sqrt() as u32;
+        assert!(image_fits_dedicated_texture(side, side, 16384));
+    }
+
+    #[test]
+    fn an_over_budget_frame_keeps_what_it_is_drawing() {
+        // Two live pictures against a one-picture budget: end_frame runs
+        // while their composites are still waiting to be encoded, so
+        // neither may be destroyed this frame. The next frame, with
+        // neither redrawn, trims back to the budget.
+        let mut cache = DedicatedImageCache::new(MIB);
+        let uploads = Cell::new(0);
+        get(&mut cache, 1, &uploads);
+        get(&mut cache, 2, &uploads);
+        cache.end_frame();
+        assert_eq!(cache.stats().live, 2, "hot textures survive the frame");
+        cache.end_frame();
+        assert!(cache.stats().bytes <= MIB, "idle textures trim next frame");
     }
 }

@@ -1769,6 +1769,7 @@ impl crate::TermWindow {
                         },
                     };
 
+                    self.term_window.dedicated_image_in_line.set(false);
                     let render_result = self
                         .term_window
                         .render_screen_line(
@@ -1836,10 +1837,15 @@ impl crate::TermWindow {
                         &quad_key,
                         &quad_value,
                     );
-                    self.term_window
-                        .line_quad_cache
-                        .borrow_mut()
-                        .put_weighted(quad_key, quad_value, weight);
+                    // A line that drew a picture from a dedicated texture
+                    // emitted composites as a side effect; replaying its
+                    // cached heap would repaint the line without the picture.
+                    if !self.term_window.dedicated_image_in_line.replace(false) {
+                        self.term_window
+                            .line_quad_cache
+                            .borrow_mut()
+                            .put_weighted(quad_key, quad_value, weight);
+                    }
 
                     Ok(())
                 }

@@ -2,11 +2,16 @@ use crate::colorease::ColorEase;
 use crate::customglyph::{BlockKey, *};
 use crate::glyphcache::{CachedGlyph, GlyphCache};
 use crate::quad::{
-    HeapQuadAllocator, QuadAllocator, QuadImpl, QuadTrait, TripleLayerQuadAllocator,
-    TripleLayerQuadAllocatorTrait,
+    HeapQuadAllocator, Quad, QuadAllocator, QuadImpl, QuadTrait, TripleLayerQuadAllocator,
+    TripleLayerQuadAllocatorTrait, Vertex,
+};
+use crate::renderstate::{
+    image_fits_dedicated_texture, image_wants_dedicated_texture, RenderContext,
 };
 use crate::shapecache::*;
 use crate::termwindow::render::paint::AllowImage;
+use crate::termwindow::render::paint::ImageCompositeSlot;
+use crate::termwindow::webgpu::ImageTexture;
 use crate::termwindow::{
     BorrowedShapeCacheKey, MouseCapture, RenderState, ShapedInfo, TermWindowNotif,
 };
@@ -590,6 +595,82 @@ impl crate::TermWindow {
             padding.next_power_of_two()
         };
 
+        // Large pictures -- streaming kitty frames, icat -- draw from their
+        // own texture instead of a slot in the shared atlas. The atlas cannot
+        // free a rectangle, so a stream of multi-megabyte frames filled it
+        // every few frames and each overflow cleared it: a 64MiB zero image,
+        // a 64MiB upload, every glyph re-rasterised and the frame painted a
+        // second time. WebGpu only (the composite pass is), static RGBA only
+        // (animations advance their frame clock inside cached_image), and
+        // never while a content-view transition records or replays the
+        // terminal as one heap.
+        if let RenderContext::WebGpu(webgpu) = &gl_state.context {
+            let atlas_side = gl_state.glyph_cache.borrow().atlas.size();
+            let guard = image.image_data().data();
+            if let termwiz::image::ImageDataType::Rgba8 {
+                data: rgba,
+                width,
+                height,
+                hash,
+            } = &*guard
+            {
+                let (width, height, hash) = (*width, *height, *hash);
+                {
+                    // Once one picture in a cell has gone to the composite
+                    // pass, every picture stacked above it in that cell
+                    // goes too, whatever its size: the composite pass runs
+                    // after the whole atlas layer, so a small atlas picture
+                    // with a higher z would otherwise be painted under the
+                    // big one instead of over it.
+                    let stacked_on_dedicated =
+                        self.dedicated_image_cell.get() == Some((layer_num, cell_idx));
+                    let max_side = webgpu.device.limits().max_texture_dimension_2d;
+                    let goes_dedicated = image_fits_dedicated_texture(width, height, max_side)
+                        && (stacked_on_dedicated
+                            || image_wants_dedicated_texture(width, height, padding, atlas_side));
+                    // Marked before the transition check: a line painted
+                    // through the atlas only because a content-view
+                    // transition forbade the dedicated path must not be
+                    // cached either, or its replay would pin the picture in
+                    // the atlas long after the transition ended.
+                    if goes_dedicated {
+                        self.dedicated_image_in_line.set(true);
+                    }
+                    if goes_dedicated && self.dedicated_image_textures_allowed() {
+                        let texture = gl_state
+                            .dedicated_images
+                            .borrow_mut()
+                            .get_or_upload(
+                                hash,
+                                width,
+                                height,
+                                || ImageTexture::new(width, height, webgpu),
+                                |texture| {
+                                    texture.upload(rgba);
+                                    gl_state.glyph_cache.borrow_mut().note_dedicated_image(
+                                        width,
+                                        height,
+                                        termwiz::image::ImageDataType::is_nonce_key(&hash),
+                                    );
+                                },
+                            )
+                            .context("dedicated image texture")?;
+                        drop(guard);
+                        self.push_dedicated_image_quad(
+                            image,
+                            &texture,
+                            layer_num,
+                            cell_idx,
+                            params,
+                            hsv,
+                            glyph_color,
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let (sprite, next_due, _load_state) = gl_state
             .glyph_cache
             .borrow_mut()
@@ -644,6 +725,62 @@ impl crate::TermWindow {
         quad.set_has_color(true);
 
         Ok(())
+    }
+
+    /// The dedicated-texture twin of the atlas quad above: same cell
+    /// geometry, but the texture coordinates are the cell's sub-rectangle
+    /// of the picture over a texture that holds exactly that picture, and
+    /// the quad goes to the composite batch instead of the layer buffers.
+    fn push_dedicated_image_quad(
+        &self,
+        image: &termwiz::image::ImageCell,
+        texture: &Rc<ImageTexture>,
+        layer_num: usize,
+        cell_idx: usize,
+        params: &RenderScreenLineParams,
+        hsv: Option<config::HsbTransform>,
+        glyph_color: LinearRgba,
+    ) {
+        let top_left = image.top_left();
+        let bottom_right = image.bottom_right();
+        let texture_rect = TextureRect::new(
+            TextureCoord::new(*top_left.x, *top_left.y),
+            TextureSize::new(*bottom_right.x - *top_left.x, *bottom_right.y - *top_left.y),
+        );
+
+        let mut vert: [Vertex; 4] = Default::default();
+        let mut quad = Quad { vert: &mut vert };
+        let cell_width = params.render_metrics.cell_size.width as f32;
+        let cell_height = params.render_metrics.cell_size.height as f32;
+        let pos_y = (self.dimensions.pixel_height as f32 / -2.) + params.top_pixel_y;
+        let pos_x = (self.dimensions.pixel_width as f32 / -2.)
+            + params.left_pixel_x
+            + (cell_idx as f32 * cell_width);
+        let (padding_left, padding_top, padding_right, padding_bottom) = image.padding();
+        quad.set_position(
+            pos_x + padding_left as f32,
+            pos_y + padding_top as f32,
+            pos_x + cell_width + padding_left as f32 - padding_right as f32,
+            pos_y + cell_height + padding_top as f32 - padding_bottom as f32,
+        );
+        quad.set_hsv(hsv);
+        quad.set_fg_color(glyph_color);
+        quad.set_texture(texture_rect);
+        quad.set_has_color(true);
+
+        // Sub-buffer 0 is where z<0 pictures went (under the glyphs),
+        // sub-buffer 2 where z>=0 went (over them); the composite passes
+        // sit at the same two points.
+        let slot = if layer_num == 0 {
+            ImageCompositeSlot::AfterFills
+        } else {
+            ImageCompositeSlot::AfterGlyphs
+        };
+        self.image_composites
+            .borrow_mut()
+            .push_quad(texture, slot, vert);
+        self.dedicated_image_in_line.set(true);
+        self.dedicated_image_cell.set(Some((layer_num, cell_idx)));
     }
 
     fn ensure_min_contrast(&self, fg_color: LinearRgba, bg_color: LinearRgba) -> LinearRgba {
