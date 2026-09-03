@@ -96,9 +96,10 @@ jobs:
 
           version="$INPUT_VERSION"
           if [ -n "$version" ]; then
-            # Accept either form. The tag keeps the v and the asset names drop
-            # it, which is the split ci/deploy.sh and the Homebrew cask
-            # template already assume.
+            # A leading v is accepted and dropped. Nothing downstream wants
+            # one: deb and rpm version fields reject it outright, Homebrew
+            # expects a bare version, and the `tags: v*` trigger that used to
+            # require it is gone. One form, in the tag and in every filename.
             version="${version#v}"
             # This becomes a filename that ci/deploy.sh builds paths from and
             # hands to rm -rf. Same character rule as ci/macos-package.sh.
@@ -108,7 +109,7 @@ jobs:
                 exit 1
                 ;;
             esac
-            release_tag="v$version"
+            release_tag="$version"
           else
             release_tag="$(bash ci/tag-name.sh)"
             version="$release_tag"
@@ -469,32 +470,20 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Checksum
+      # No checksum files are published. GitHub records a sha256 for every
+      # release asset as it is uploaded -- including the macOS zip attached by
+      # hand -- and shows it on the asset. A checksums file of our own would
+      # cover only what CI built, and unsigned it sits on the same server as
+      # the packages, so it proves no more than the digest already does.
+      - name: Check there is something to publish
         run: |
           set -eu
-          mkdir -p dist
-          cd dist
           # A plan with every platform deselected reaches this job with nothing
           # downloaded. Stop here rather than let ci/create-release.sh mint an
           # empty draft on the default branch.
-          [ -n "$(ls -A .)" ] || { echo "::error::no artifacts to publish"; exit 1; }
-          # One SHA256SUMS rather than a .sha256 beside every file. A release
-          # page lists its assets to a human, so a sidecar each doubles the
-          # length of that list; the sidecar convention belongs to the CDN
-          # directories it came from, where you fetch one file and its sibling
-          # and never see a listing. `sha256sum -c SHA256SUMS` checks the set.
-          #
-          # Collected into "$@" rather than passed as a glob because the
-          # redirection creates SHA256SUMS before the glob is expanded, so a
-          # plain `sha256sum *` would list the file in itself.
-          set --
-          for f in * ; do
-            case "$f" in SHA256SUMS) continue ;; esac
-            [ -f "$f" ] || continue
-            set -- "$@" "$f"
-          done
-          sha256sum "$@" > SHA256SUMS
-          cat SHA256SUMS
+          [ -d dist ] && [ -n "$(ls -A dist)" ] \
+            || { echo "::error::no artifacts to publish"; exit 1; }
+          ls -l dist
 
       # The tag reaches these steps through env rather than a ${{ }} splice into
       # the script body. It derives from free text typed into the Run workflow

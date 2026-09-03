@@ -1,17 +1,15 @@
 #!/bin/bash
-set -x
+set -ex
 name="$1"
+dist="${2:-dist}"
 
-# Placeholder body. Whoever finishes the release replaces it in the web UI --
-# these two lines are here so a half-finished draft says what it is still
-# missing rather than sitting there blank.
-notes=$(cat <<EOT
-_Draft: replace these notes before publishing._
-
-- [ ] Attach the macOS zip from \`ci/macos-package.sh\`
-- [ ] Write the release notes
-EOT
-)
+# The body is generated from what is actually in $dist -- see
+# ci/release-notes.sh -- so the draft already carries a download list that
+# matches the packages attached to it. Only whoever finishes the release adds
+# what changed.
+notes=$(mktemp)
+trap 'rm -f "$notes"' EXIT
+bash "$(dirname "$0")/release-notes.sh" "$name" "$dist" > "$notes"
 
 # A draft, not a prerelease: a prerelease is publicly visible, so the window
 # between CI uploading the Windows and Linux packages and a human attaching the
@@ -20,7 +18,8 @@ EOT
 #
 # The tag comes into existence when the draft is published, pointing at
 # --target. Without it gh would tag the default branch -- a commit nobody
-# built. Re-running the workflow finds the existing draft and only re-uploads.
+# built. Re-running the workflow finds the existing draft and only re-uploads:
+# the notes are written once, so an edit made on the release page survives.
 gh release view "$name" || gh release create --draft \
   ${GITHUB_SHA:+--target "$GITHUB_SHA"} \
-  --notes "$notes" --title "$name" "$name"
+  --notes-file "$notes" --title "$name" "$name"
