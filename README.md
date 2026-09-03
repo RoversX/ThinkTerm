@@ -61,7 +61,7 @@ The TUI is a subcommand of the `thinkterm` binary, not a second program — it c
 
 It isn't a read-only mirror of the GUI. It's a peer client of the same authoritative server: Space/Project/Thread data is accepted only from server snapshots, and every change waits for the server to acknowledge it before the display updates, so having the GUI and TUI open at once never leaves them disagreeing. It can do what the GUI can — new tabs, splits, resizing, closing panes, reordering the sidebar, copy mode — with full mouse support.
 
-The use case is straightforward: SSH into a machine, or just skip the GUI, and your workspace is still right there. See [thinkterm-tui/README.md](thinkterm-tui/README.md) for keys and configuration.
+The use case is straightforward: SSH into a machine, or just skip the GUI, and your workspace is still right there. Run `thinkterm tui --help` for the current command-line options.
 
 ---
 
@@ -134,7 +134,16 @@ Groundwork has been landing: the mux protocol now supports moving panes between 
 
 ## Privacy
 
-ThinkTerm collects no usage data. Its only outbound request is an update check: once every 24 hours it asks the GitHub Releases API whether a newer version exists, and you can turn that off with `check_for_updates = false`. Scrollback lives in memory only.
+ThinkTerm collects no analytics or usage telemetry. Its only automatic
+background internet request is an update check: once every 24 hours it asks the
+GitHub Releases API whether a newer version exists, and you can turn that off
+with `check_for_updates = false`. Features you choose to use can make their own
+connections, including SSH, SFTP, Mosh, ThinkTerm Connect, opening links, and
+loading HTTP(S) images embedded in Notes. Remote Note images are enabled by
+default and can be disabled with `note_remote_images_enabled = false`.
+Scrollback lives in memory only.
+
+See [PRIVACY.md](PRIVACY.md) for the project's privacy policy.
 
 ---
 
@@ -142,8 +151,8 @@ ThinkTerm collects no usage data. Its only outbound request is an update check: 
 
 ThinkTerm is built on [WezTerm](https://github.com/wezterm/wezterm), written in Rust by [@wez](https://github.com/wez/). Terminal emulation, font rendering, GPU drawing, the multiplexer protocol, and SSH transport all come from that project. Thank you.
 
-ThinkTerm is released under **GPL-3.0** — see [LICENSE.md](LICENSE.md). Code originating from WezTerm remains under its original MIT license, preserved verbatim in [LICENSE-MIT](LICENSE-MIT). Bundled fonts and other third-party components are listed in [licenses/README.md](licenses/README.md).
+ThinkTerm is released under **GPL-3.0-only** — see [LICENSE.md](LICENSE.md). Code originating from WezTerm remains under its original MIT license, preserved verbatim in [LICENSE-MIT](LICENSE-MIT). Bundled assets and other third-party components are listed in [NOTICE](NOTICE) and [licenses/README.md](licenses/README.md).
 
-Icons from [Lucide](https://github.com/lucide-icons/lucide), [Simple Icons](https://github.com/simple-icons/simple-icons), and material-icon-theme. Agent detection manifests from [herdr](https://github.com/herdrdev/herdr), under the Apache License 2.0. Full third-party attributions are in [NOTICE](NOTICE).
+Icons from [Lucide](https://github.com/lucide-icons/lucide), [Simple Icons](https://github.com/simple-icons/simple-icons), [Lobe Icons](https://github.com/lobehub/lobe-icons), and material-icon-theme. Agent detection manifests from [herdr](https://github.com/herdrdev/herdr), under the Apache License 2.0. Full bundled-asset attributions are in [NOTICE](NOTICE).
 
 Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md).

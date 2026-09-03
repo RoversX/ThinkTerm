@@ -35,7 +35,7 @@ body:
     attributes:
       label: ThinkTerm version
       description: |
-        Please run `wezterm -V` and include its output here.
+        Please run `thinkterm -V` and include its output here.
         If you installed the flatpak version of ThinkTerm, please consider trying
         the native package format for your system and comparing the behavior,
         as flatpak runs in an isolated sandbox that can prevent some functionality

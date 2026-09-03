@@ -1,16 +1,15 @@
-# Maintainer:  Wez Furlong <wez at wezfurlong dot org>
 # NOTE: if you're looking at this on AUR, this file is generated from
 # https://github.com/RoversX/thinkterm/blob/main/ci/PKGBUILD.template
-# by automation in the wezterm repo.
+# by automation in the ThinkTerm repository.
 
-pkgname=wezterm-bin
+pkgname=thinkterm-bin
 _tag=@TAG@
 pkgver=$(echo $_tag | tr - .)
 pkgrel=2
-pkgdesc='A GPU-accelerated cross-platform terminal emulator and multiplexer implemented in Rust'
-arch=('i686' 'x86_64')
+pkgdesc='A workspace-first terminal built for heavy AI workflows'
+arch=('x86_64')
 url='https://github.com/RoversX/thinkterm'
-license=('MIT')
+license=('GPL-3.0-only')
 provides=('thinkterm' 'wezterm')
 conflicts=('thinkterm' 'wezterm')
 # Don't strip: it will break the binary and it only saves ~10% anyway
@@ -31,11 +30,9 @@ optdepends=(
 )
 source=(
   "wezterm::https://github.com/RoversX/thinkterm/releases/download/${_tag}/ThinkTerm-${_tag}-Ubuntu20.04.AppImage"
-  'LICENSE::https://github.com/RoversX/thinkterm/raw/main/LICENSE.md'
 )
 sha256sums=(
   '@SHA256@'
-  'ad915d9508677a4e94e4b3c0a045fedd20e953d95d7cd3ec97e6d16840fa0ed5'
 )
 
 prepare() {
@@ -55,8 +52,9 @@ package() {
   install -Dm755 squashfs-root/usr/bin/wezterm -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/thinkterm-gui -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/thinkterm-mux-server -t "${pkgdir}/usr/bin/"
-  install -Dm644 LICENSE -t "${pkgdir}/usr/share/licenses/${pkgname}"
-  install -Dm644 squashfs-root/usr/share/doc/thinkterm/NOTICE \
+  install -Dm644 squashfs-root/usr/share/doc/thinkterm/LICENSE.md \
+                 squashfs-root/usr/share/doc/thinkterm/LICENSE-MIT \
+                 squashfs-root/usr/share/doc/thinkterm/NOTICE \
                  -t "${pkgdir}/usr/share/licenses/${pkgname}"
   install -Dm644 squashfs-root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png \
                  "${pkgdir}/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png"

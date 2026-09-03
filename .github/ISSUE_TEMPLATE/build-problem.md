@@ -21,8 +21,9 @@ Did you run the `get-deps` script to install required system dependencies?
 Was it successful?
 
 If building from the git repo, did you update the submodules?  Not doing this
-is a common source of problems; see the information at
-<https://wezfurlong.org/wezterm/install/source.html> for more information.
+is a common source of problems. Clone with `git clone --recursive`, or run
+`git submodule update --init --recursive` in an existing checkout. See the
+[ThinkTerm build instructions](../../CONTRIBUTING.md#getting-set-up) for more information.
 
 ## The build output
 

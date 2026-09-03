@@ -1,5 +1,5 @@
 ThinkTerm bundles some components provided by third parties. ThinkTerm as a
-whole is distributed under the GNU General Public License v3.0 (see
+whole is distributed under the GNU General Public License v3.0 only (see
 [LICENSE.md](../LICENSE.md)), but the components below remain under their own
 licenses, and their copyright notices are preserved as those licenses require.
 The [NOTICE](../NOTICE) file at the repository root carries the attribution and
@@ -14,7 +14,7 @@ MIT license, reproduced verbatim in [LICENSE-MIT](../LICENSE-MIT).
 
 Workspace crates that are still substantially unmodified WezTerm code continue
 to declare `license = "MIT"` in their own `Cargo.toml`. That is deliberate and
-accurate — the MIT grant on that code is not withdrawn by ThinkTerm's GPL-3.0
+accurate — the MIT grant on that code is not withdrawn by ThinkTerm's GPL-3.0-only
 license on the combined work.
 
 ## Bundled fonts
@@ -55,5 +55,11 @@ it was taken from and any local changes.
 ## Icons
 
 Icons come from [Lucide](https://github.com/lucide-icons/lucide),
-[Simple Icons](https://github.com/simple-icons/simple-icons) and
-material-icon-theme.
+[Simple Icons](https://github.com/simple-icons/simple-icons),
+[Lobe Icons](https://github.com/lobehub/lobe-icons), and material-icon-theme.
+Their provenance and license texts are recorded in [NOTICE](../NOTICE).
+
+## Bundled Windows runtime components
+
+Windows packages include ANGLE, Microsoft Terminal ConPTY components, and a
+Mesa software OpenGL fallback. Their notices are recorded in [NOTICE](../NOTICE).

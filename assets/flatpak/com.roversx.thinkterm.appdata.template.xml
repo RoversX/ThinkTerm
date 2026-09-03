@@ -3,7 +3,7 @@
   <content_rating type="oars-1.0" />
   <id>com.roversx.thinkterm</id>
   <metadata_license>MIT</metadata_license>
-  <project_license>MIT</project_license>
+  <project_license>GPL-3.0-only</project_license>
   <name>ThinkTerm</name>
   <summary>Workspace-first terminal and multiplexer</summary>
   <description>

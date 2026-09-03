@@ -7,6 +7,7 @@ the Lobe Icons project.
 Repository: https://github.com/lobehub/lobe-icons
 Commit:     4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75
 Path:       packages/static-svg/icons/
+License:    MIT (see LICENSE in this directory)
 
 Only these files are used, one mark per coding agent the status panel can
 detect; the upstream repository is ~75 MB of React packages and raster

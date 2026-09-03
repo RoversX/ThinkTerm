@@ -4,6 +4,8 @@ This directory contains a copy of built artifacts from the Microsoft
 Terminal project which is provided by Microsoft under the terms
 of the MIT license.
 
+The MIT license text is included in `LICENSE` in this directory.
+
 Why are they here?  At the time of writing, the conpty implementation
 that ships with windows is lacking support for mouse reporting but
 that support is available in the opensource project so it is desirable

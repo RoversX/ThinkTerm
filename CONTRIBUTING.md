@@ -10,14 +10,14 @@ belong here.
 
 ## License, and what contributing means
 
-ThinkTerm is GPL-3.0 — see [LICENSE.md](LICENSE.md). Code inherited from WezTerm
+ThinkTerm is GPL-3.0-only — see [LICENSE.md](LICENSE.md). Code inherited from WezTerm
 remains under its original MIT license, preserved in
 [LICENSE-MIT](LICENSE-MIT); other third-party components are listed in
 [licenses/README.md](licenses/README.md).
 
 By opening a pull request you agree to two things:
 
-1. Your contribution is licensed under GPL-3.0.
+1. Your contribution is licensed under GPL-3.0-only.
 2. You grant the ThinkTerm project a perpetual, worldwide, non-exclusive,
    royalty-free and irrevocable right to relicense your contribution under
    different terms, including a more permissive license such as MIT.
