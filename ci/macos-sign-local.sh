@@ -60,7 +60,21 @@ fi
 # seal: only CFBundleExecutable inherits the bundle's entitlements, so the mux
 # server and CLIs would otherwise run under Hardened Runtime with an empty set
 # and be denied by TCC in developerid builds alone.
+#
+# The bundle's own main executable is skipped and left to that seal. codesign
+# treats signing Contents/MacOS/<CFBundleExecutable> as signing the bundle, so
+# doing it in this loop validates every other executable at that moment -- and
+# whichever of them sorts after it is still unsigned, which fails the run.
+# arm64 hides this: the linker ad-hoc signs every Mach-O it produces on Apple
+# silicon, so the not-yet-signed binaries already carry a signature. A
+# cross-built x86_64 tree carries none, and the loop dies on the third file.
+main_executable=$(plutil -extract CFBundleExecutable raw \
+  "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)
+
 while IFS= read -r executable; do
+  if [[ -n "$main_executable" && "${executable##*/}" == "$main_executable" ]]; then
+    continue
+  fi
   codesign --force ${CODESIGN_EXTRA[@]+"${CODESIGN_EXTRA[@]}"} \
     --entitlements "$ENTITLEMENTS" \
     --sign "$SIGNING_IDENTITY" "$executable"
