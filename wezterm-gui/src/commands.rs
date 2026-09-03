@@ -763,13 +763,30 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["ThinkTerm"],
             icon: Some("cod_settings_gear"),
         },
+        CheckForUpdates => CommandDef {
+            brief: "Check for Updates...".into(),
+            doc: "Opens Settings on the Software Update page".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["ThinkTerm"],
+            icon: Some("md_update"),
+        },
         OpenSshHosts => CommandDef {
-            brief: "SSH Hosts...".into(),
+            brief: "Remote Hosts...".into(),
             doc: "Opens the ThinkTerm SSH host manager".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &["Shell"],
             icon: Some("md_server_network"),
+        },
+        AddRemoteHost => CommandDef {
+            brief: "Add Remote Host...".into(),
+            // Says SSH so that typing it in the palette still finds this.
+            doc: "Opens the ThinkTerm SSH host manager on a blank host".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("md_earth"),
         },
         ToggleLiveOverview => CommandDef {
             brief: "Live Overview".into(),
@@ -2350,6 +2367,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
     // These are ordered by their position within the various menus
     return vec![
         // ----------------- ThinkTerm
+        CheckForUpdates,
         ReloadConfiguration,
         OpenSettings,
         #[cfg(target_os = "macos")]
@@ -2359,6 +2377,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         // ----------------- Shell
         ToggleLiveOverview,
         OpenSshHosts,
+        AddRemoteHost,
         ArchiveActiveProject,
         ToggleShowArchivedProjects,
         SpawnTab(SpawnTabDomain::CurrentPaneDomain),

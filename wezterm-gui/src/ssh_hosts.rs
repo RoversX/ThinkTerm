@@ -142,7 +142,23 @@ pub fn host_spec(host_id: &str) -> Option<SshHostSpec> {
         .map(|entry| entry.spec)
 }
 
+pub fn host_exists(host_id: &str) -> bool {
+    SSH_HOST_STORE
+        .lock()
+        .hosts
+        .iter()
+        .any(|record| record.id == host_id)
+}
+
 pub fn try_create_host(spec: SshHostSpec) -> Result<SshHostId> {
+    // Refuse rather than replace. `upsert_host` matches on an id derived from
+    // the endpoint, so saving a *new* host that dials an endpoint some other
+    // host already uses used to overwrite that host's whole record -- its
+    // saved password included -- and leave one card behind wearing the new
+    // name.
+    if host_exists(&host_id_for_host(&spec)) {
+        bail!("a saved host already uses {}", endpoint(&spec));
+    }
     let (host_id, spec) = upsert_host(spec)?;
     register_ssh_domain(&spec)?;
     Ok(host_id)
@@ -183,26 +199,40 @@ fn upsert_host(spec: SshHostSpec) -> Result<(SshHostId, SshHostSpec)> {
     Ok((host_id, saved_spec))
 }
 
-pub fn try_update_host(host_id: &str, spec: SshHostSpec) -> Result<bool> {
+/// Save an edited host. Returns the record's id, which is *not* always the
+/// one passed in: the id is derived from the endpoint, so an edit that moves
+/// the host to a different `user@host:port` has to re-key the record or it
+/// stops matching its own spec. `None` means there was no such editable
+/// record.
+pub fn try_update_host(host_id: &str, spec: SshHostSpec) -> Result<Option<SshHostId>> {
     if is_system_host_id(host_id) {
-        return Ok(false);
+        return Ok(None);
     }
     let mut store = SSH_HOST_STORE.lock();
+    // The same invariant `try_create_host` enforces, and for the same reason:
+    // one record per endpoint. Editing a host onto an endpoint another record
+    // already owns would leave two records dialing it, both registering a
+    // domain under the single name `ssh_domain_name` derives.
+    let new_id = host_id_for_host(&spec);
+    if new_id != host_id && store.hosts.iter().any(|record| record.id == new_id) {
+        bail!("a saved host already uses {}", endpoint(&spec));
+    }
     let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) else {
-        return Ok(false);
+        return Ok(None);
     };
+    record.id = new_id.clone();
     record.spec = spec;
     save_ssh_host_store(&store)?;
     let spec = store
         .hosts
         .iter()
-        .find(|record| record.id == host_id)
+        .find(|record| record.id == new_id)
         .map(|record| record.spec.clone());
     drop(store);
     if let Some(spec) = spec {
         register_ssh_domain(&spec)?;
     }
-    Ok(true)
+    Ok(Some(new_id))
 }
 
 pub fn try_remove_host(host_id: &str) -> Result<bool> {
@@ -247,7 +277,7 @@ pub fn is_system_host_id(host_id: &str) -> bool {
 
 /// `user@host` (or `host`, with `:port` when non-default) used for the
 /// human-readable domain / workspace identifiers.
-fn endpoint(spec: &SshHostSpec) -> String {
+pub(crate) fn endpoint(spec: &SshHostSpec) -> String {
     let host = match spec.port {
         Some(port) if port != 22 => format!("{}:{port}", spec.host),
         _ => spec.host.clone(),
@@ -694,7 +724,11 @@ fn fnv1a(input: &str) -> u64 {
     hash
 }
 
-fn host_id_for_host(spec: &SshHostSpec) -> SshHostId {
+/// The record id for a host, derived from `user@host:port` alone -- so two
+/// hosts that dial the same endpoint are the same record no matter what they
+/// are named. Both save paths lean on that: see `try_create_host` and
+/// `try_update_host`.
+pub fn host_id_for_host(spec: &SshHostSpec) -> SshHostId {
     let key = format!(
         "ssh:{}@{}:{}",
         spec.username.as_deref().unwrap_or(""),

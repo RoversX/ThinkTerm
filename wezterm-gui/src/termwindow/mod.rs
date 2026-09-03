@@ -491,6 +491,14 @@ pub(crate) enum NoteEditorCommand {
 #[derive(Clone, Debug)]
 pub(crate) enum ContextMenuApplicationAction {
     Note(NoteEditorCommand),
+    /// One entry of the Remote Hosts page's card menu, carrying the host it
+    /// was raised on. An owned id rather than a list index: the page's
+    /// filtered list can change between building the menu and choosing from
+    /// it, and an index would then point at a different machine.
+    RemoteHost {
+        host_id: String,
+        command: crate::termwindow::content_view::RemoteHostCommand,
+    },
     SetFrontendAccessMode(codec::FrontendAccessMode),
     /// Notification bell entry: jump to a thread, switching Space first when
     /// it lives elsewhere, and acknowledge its unseen work.
@@ -6435,6 +6443,98 @@ impl TermWindow {
         }
     }
 
+    /// The card menu for the Remote Hosts page. Built here because a menu
+    /// belongs to the window: the page has no window handle, and a native
+    /// menu reports its choice back to the window anyway.
+    pub(crate) fn show_remote_host_menu(
+        &mut self,
+        host_id: String,
+        label: String,
+        editable: bool,
+        x: f32,
+        y: f32,
+    ) {
+        use crate::termwindow::content_view::RemoteHostCommand;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.begin_context_menu_application_actions();
+        let mut items = vec![self.context_menu_application_item_with_icon(
+            crate::i18n::tr("ssh-menu-connect"),
+            ContextMenuIcon::Terminal,
+            ContextMenuApplicationAction::RemoteHost {
+                host_id: host_id.clone(),
+                command: RemoteHostCommand::Connect,
+            },
+            true,
+        )];
+        if editable {
+            items.push(ContextMenuItem::Separator);
+            items.push(self.context_menu_application_item_with_icon(
+                crate::i18n::tr("ssh-menu-edit"),
+                ContextMenuIcon::Edit,
+                ContextMenuApplicationAction::RemoteHost {
+                    host_id: host_id.clone(),
+                    command: RemoteHostCommand::Edit,
+                },
+                true,
+            ));
+            items.push(self.context_menu_application_item_with_icon(
+                crate::i18n::tr("ssh-menu-duplicate"),
+                ContextMenuIcon::Copy,
+                ContextMenuApplicationAction::RemoteHost {
+                    host_id: host_id.clone(),
+                    command: RemoteHostCommand::Duplicate,
+                },
+                true,
+            ));
+            items.push(ContextMenuItem::Separator);
+            // Deleting a host takes its threads and its mirrored Spaces with
+            // it and cannot be undone, so it asks first.
+            let confirm = self.context_menu_application_item_with_icon(
+                crate::i18n::tr("ssh-menu-delete-confirm"),
+                ContextMenuIcon::Delete,
+                ContextMenuApplicationAction::RemoteHost {
+                    host_id,
+                    command: RemoteHostCommand::Delete,
+                },
+                true,
+            );
+            let mut args = fluent_bundle::FluentArgs::new();
+            args.set("name", label);
+            items.push(ContextMenuItem::submenu_with_icon(
+                crate::i18n::tr_args("ssh-menu-delete-named", &args),
+                ContextMenuIcon::Delete,
+                vec![
+                    ContextMenuItem::section_header(crate::i18n::tr("ssh-menu-delete-explain")),
+                    confirm,
+                ],
+            ));
+        }
+        self.show_term_context_menu(&window, euclid::point2(x as isize, y as isize), items);
+    }
+
+    /// Open the SSH hosts page on a blank host form. Unlike
+    /// `toggle_ssh_hosts_view` this never closes an open page: it is reached
+    /// from a menu entry worded as an action, and an action that sometimes
+    /// closes the page instead is not one.
+    pub(crate) fn open_ssh_hosts_view_new_host(&mut self) {
+        let key = crate::termwindow::ssh_hosts_view::SSH_HOSTS_CONTENT_VIEW_KEY;
+        match self.content_view_id_for_key(key) {
+            Some(id) => {
+                self.activate_content_view(id);
+                if let Some(view) = self.content_view_mut_by_id(id) {
+                    view.begin_new_remote_host();
+                }
+            }
+            None => {
+                self.open_content_view(Box::new(
+                    crate::termwindow::ssh_hosts_view::SshHostsView::new_host(),
+                ));
+            }
+        }
+    }
+
     /// Toggle the SSH hosts content view (sidebar button / OpenSshHosts).
     pub(crate) fn toggle_ssh_hosts_view(&mut self) {
         let key = crate::termwindow::ssh_hosts_view::SSH_HOSTS_CONTENT_VIEW_KEY;
@@ -8941,8 +9041,14 @@ impl TermWindow {
             OpenSettings => {
                 crate::settings_window::show();
             }
+            CheckForUpdates => {
+                crate::settings_window::show_update_page();
+            }
             OpenSshHosts => {
                 self.toggle_ssh_hosts_view();
+            }
+            AddRemoteHost => {
+                self.open_ssh_hosts_view_new_host();
             }
             ToggleLiveOverview => {
                 self.toggle_live_overview_view();

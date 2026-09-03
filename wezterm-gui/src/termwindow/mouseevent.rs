@@ -531,7 +531,11 @@ impl super::TermWindow {
         } else {
             configured_button_size
         };
-        let action_button_count = if self.right_sidebar_width() > 0 && cfg!(target_os = "macos") {
+        let action_button_count = if !self.right_sidebar_has_panels() {
+            // Every sidebar panel is off, so fancy_tab_bar paints no toggle;
+            // reserving its width anyway just shortens the tab strip.
+            1
+        } else if self.right_sidebar_width() > 0 && cfg!(target_os = "macos") {
             1
         } else {
             2
@@ -5524,6 +5528,17 @@ impl super::TermWindow {
             ));
         }
 
+        // The servers listed above are what this adds another of. Kept out of
+        // the Space block below because a remote host is a connection, not a
+        // Space: one host can carry several. It stays visible with no servers
+        // configured at all -- then it is the only path to the first one.
+        items.push(ContextMenuItem::Separator);
+        items.push(ContextMenuItem::item_with_icon(
+            crate::i18n::tr("menu-add-remote-host"),
+            ContextMenuIcon::Network,
+            KeyAssignment::AddRemoteHost,
+        ));
+
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item_with_icon(
             crate::i18n::tr("menu-new-space"),
@@ -6090,6 +6105,16 @@ impl super::TermWindow {
         // <name>` — rather than opening a direct-ssh remote thread.
         if spec.multiplexing && !spec.use_mosh {
             let name = spec.label.clone();
+            // These hosts used to skip OS detection entirely: the branch
+            // returned before anything read `detect_os`, and both detection
+            // call sites downcast to `RemoteSshDomain`, which a mux client
+            // domain is not. There is no ssh session here to borrow for an
+            // `exec` either -- it is buried in the client's transport -- so
+            // the server reports its own distro in the version handshake and
+            // this just reads what it said.
+            let detect = spec.detect_os && spec.detected_distro.is_none();
+            let detect_host_id = host_id.clone();
+            let detect_window = self.window.as_ref().cloned();
             promise::spawn::spawn(async move {
                 let domain = match Mux::get().get_domain_by_name(&name) {
                     Some(domain) => domain,
@@ -6101,8 +6126,23 @@ impl super::TermWindow {
                         }
                     },
                 };
+                let attached = Arc::clone(&domain);
                 if let Err(err) = crate::connect_domain_into_space(None, domain).await {
                     log::error!("connect {name}: {err:#}");
+                    return;
+                }
+                if detect {
+                    if let Some(distro) = attached
+                        .as_ref()
+                        .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                        .and_then(|client| client.remote_os_release())
+                    {
+                        if crate::ssh_hosts::set_host_distro(&detect_host_id, &distro) {
+                            if let Some(window) = detect_window.as_ref() {
+                                window.invalidate();
+                            }
+                        }
+                    }
                 }
             })
             .detach();

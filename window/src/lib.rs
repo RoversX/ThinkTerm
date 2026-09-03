@@ -233,6 +233,7 @@ pub enum ContextMenuIcon {
     Info,
     MoveLeft,
     MoveRight,
+    Network,
     New,
     Note,
     Notification,
@@ -313,6 +314,8 @@ impl ContextMenuIcon {
             Self::Info => "info.circle",
             Self::MoveLeft => "arrow.left",
             Self::MoveRight => "arrow.right",
+            // The Mac glyph for "a machine somewhere else on the network".
+            Self::Network => "network",
             Self::New => "plus",
             Self::Note => "square.and.pencil",
             Self::Notification => "bell",
@@ -369,6 +372,9 @@ impl ContextMenuIcon {
             Self::Home => include_bytes!("../../third_party/lucide/icons/house.svg"),
             Self::Info => include_bytes!("../../third_party/lucide/icons/info.svg"),
             Self::MoveRight => include_bytes!("../../third_party/lucide/icons/arrow-right.svg"),
+            // lucide's meridian globe, the closest match to SF's `network`;
+            // `earth.svg` draws continents and reads as a different idea.
+            Self::Network => include_bytes!("../../third_party/lucide/icons/globe.svg"),
             Self::New => include_bytes!("../../third_party/lucide/icons/plus.svg"),
             Self::Note => include_bytes!("../../third_party/lucide/icons/notebook-tabs.svg"),
             Self::Notification => include_bytes!("../../third_party/lucide/icons/bell.svg"),

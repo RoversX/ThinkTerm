@@ -636,7 +636,11 @@ pub enum KeyAssignment {
     ResetTerminal,
     OpenUri(String),
     OpenSettings,
+    CheckForUpdates,
     OpenSshHosts,
+    /// Open the SSH host manager on a blank host form. Distinct from
+    /// `OpenSshHosts`, which toggles the page: this one only ever opens.
+    AddRemoteHost,
     ToggleLiveOverview,
     ActivateCommandPalette,
     /// Switch this window's color scheme. `None` reverts to the configured

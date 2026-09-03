@@ -374,6 +374,17 @@ pub(crate) enum ContentViewResponse {
     Run(Box<dyn FnOnce(&mut TermWindow)>),
 }
 
+/// One entry of the Remote Hosts page's card menu. Lives here rather than in
+/// the page because the window is what dispatches it: a native menu reports
+/// back to the window, not to the view that asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteHostCommand {
+    Connect,
+    Edit,
+    Duplicate,
+    Delete,
+}
+
 pub(crate) trait ContentView {
     /// Title shown on the synthetic tab.
     fn title(&self) -> String;
@@ -431,6 +442,22 @@ pub(crate) trait ContentView {
     /// Push SSH connection progress into a view that initiated a connection.
     /// Default is a no-op; only the remote-thread view reacts.
     fn on_remote_connect_phase(&mut self, _phase: RemoteConnectPhase) {}
+
+    /// Send an already-open hosts page straight to its blank host form.
+    /// The menu entry that leads here is worded as an action, so landing on
+    /// the list would leave the user a click short of what they asked for.
+    /// Default is a no-op; only the SSH hosts view reacts.
+    fn begin_new_remote_host(&mut self) {}
+
+    /// Run one entry of that page's card menu. Default is a no-op; only the
+    /// remote hosts page reacts.
+    fn run_remote_host_command(
+        &mut self,
+        _host_id: &str,
+        _command: RemoteHostCommand,
+    ) -> ContentViewResponse {
+        ContentViewResponse::Ignored
+    }
 
     /// Gate a re-authorization round trip for the project-root page and
     /// report whether it may start. Default is a no-op refusal; only the

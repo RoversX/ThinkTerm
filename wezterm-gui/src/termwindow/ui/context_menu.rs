@@ -230,6 +230,18 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::SetFrontendAccessMode(mode) => {
                 self.request_frontend_access_mode(mode);
             }
+            crate::termwindow::ContextMenuApplicationAction::RemoteHost { host_id, command } => {
+                let key = crate::termwindow::ssh_hosts_view::SSH_HOSTS_CONTENT_VIEW_KEY;
+                let Some(id) = self.content_view_id_for_key(key) else {
+                    return;
+                };
+                let response = self
+                    .content_view_mut_by_id(id)
+                    .map(|view| view.run_remote_host_command(&host_id, command));
+                if let Some(response) = response {
+                    self.handle_content_response_for(id, response);
+                }
+            }
             crate::termwindow::ContextMenuApplicationAction::ActivateWorkspaceThread {
                 space_id,
                 thread_id,
@@ -1115,6 +1127,7 @@ fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
         ContextMenuIcon::Home => Some(SvgIcon::House),
         ContextMenuIcon::Info => Some(SvgIcon::Info),
         ContextMenuIcon::MoveRight => Some(SvgIcon::ArrowRight),
+        ContextMenuIcon::Network => Some(SvgIcon::Globe),
         ContextMenuIcon::New => Some(SvgIcon::Plus),
         ContextMenuIcon::Note => Some(SvgIcon::NotebookTabs),
         ContextMenuIcon::Notification => Some(SvgIcon::Bell),

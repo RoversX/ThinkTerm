@@ -859,7 +859,7 @@ fn connection_catalog(
                 detail: if host.spec.use_mosh {
                     "Mosh sessions are not mux servers; edit in GUI".into()
                 } else {
-                    "Enable ThinkTerm Connect in SSH Hosts".into()
+                    "Enable ThinkTerm Connect in Remote Hosts".into()
                 },
                 status: ConnectionStatus::Unsupported,
                 connectable: false,
