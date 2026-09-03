@@ -476,13 +476,25 @@ jobs:
           cd dist
           # A plan with every platform deselected reaches this job with nothing
           # downloaded. Stop here rather than let ci/create-release.sh mint an
-          # empty tag and prerelease on the default branch.
+          # empty draft on the default branch.
           [ -n "$(ls -A .)" ] || { echo "::error::no artifacts to publish"; exit 1; }
+          # One SHA256SUMS rather than a .sha256 beside every file. A release
+          # page lists its assets to a human, so a sidecar each doubles the
+          # length of that list; the sidecar convention belongs to the CDN
+          # directories it came from, where you fetch one file and its sibling
+          # and never see a listing. `sha256sum -c SHA256SUMS` checks the set.
+          #
+          # Collected into "$@" rather than passed as a glob because the
+          # redirection creates SHA256SUMS before the glob is expanded, so a
+          # plain `sha256sum *` would list the file in itself.
+          set --
           for f in * ; do
+            case "$f" in SHA256SUMS) continue ;; esac
             [ -f "$f" ] || continue
-            sha256sum "$f" > "$f.sha256"
+            set -- "$@" "$f"
           done
-          ls -l
+          sha256sum "$@" > SHA256SUMS
+          cat SHA256SUMS
 
       # The tag reaches these steps through env rather than a ${{ }} splice into
       # the script body. It derives from free text typed into the Run workflow
