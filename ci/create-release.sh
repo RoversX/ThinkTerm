@@ -2,18 +2,25 @@
 set -x
 name="$1"
 
+# Placeholder body. Whoever finishes the release replaces it in the web UI --
+# these two lines are here so a half-finished draft says what it is still
+# missing rather than sitting there blank.
 notes=$(cat <<EOT
-See https://github.com/RoversX/thinkterm/releases/tag/$name for the release notes
+_Draft: replace these notes before publishing._
 
-If you're looking for nightly downloads or more detailed installation instructions:
-
-[ThinkTerm releases](https://github.com/RoversX/thinkterm/releases)
+- [ ] Attach the macOS zip from \`ci/macos-package.sh\`
+- [ ] Write the release notes
 EOT
 )
 
-# When $name is not already a git tag (a manual run, where the name comes from
-# ci/tag-name.sh) gh creates it -- against the default branch unless told
-# otherwise, which would tag a commit nobody built.
-gh release view "$name" || gh release create --prerelease \
+# A draft, not a prerelease: a prerelease is publicly visible, so the window
+# between CI uploading the Windows and Linux packages and a human attaching the
+# macOS zip would show everyone a release that is missing a platform. A draft
+# is visible only to people who can write to the repo.
+#
+# The tag comes into existence when the draft is published, pointing at
+# --target. Without it gh would tag the default branch -- a commit nobody
+# built. Re-running the workflow finds the existing draft and only re-uploads.
+gh release view "$name" || gh release create --draft \
   ${GITHUB_SHA:+--target "$GITHUB_SHA"} \
   --notes "$notes" --title "$name" "$name"

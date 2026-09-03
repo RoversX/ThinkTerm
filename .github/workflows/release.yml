@@ -1,8 +1,9 @@
-# Builds and publishes ThinkTerm for every supported platform.
+# Builds the Windows and Linux halves of a ThinkTerm release.
 #
-# Two ways in:
-#   * push a tag matching v*  -> builds everything and publishes a release
-#   * Run workflow            -> tick the platforms you want; publishing is opt-in
+# Run it from the Actions tab: name a version, tick the platforms, tick publish.
+# It leaves a draft release holding those packages; the macOS zip is signed and
+# notarized on a laptop by ci/macos-package.sh and attached to that draft by
+# hand, and publishing the draft from the web UI is what creates the tag.
 #
 # The packaging itself lives in ci/deploy.sh and ci/appimage.sh; this file only
 # decides what to build, on which runner, and what to do with the results.
@@ -10,10 +11,20 @@
 name: release
 
 on:
-  push:
-    tags: ['v*']
+  # Deliberately not `push: tags`. The tag does not exist until the draft this
+  # workflow leaves behind is published, so triggering on it would start a
+  # second, redundant build of a release that is already out -- and race that
+  # build's uploads against the finished one.
   workflow_dispatch:
     inputs:
+      # Blank keeps ci/tag-name.sh's build timestamp, which identifies a build
+      # rather than a release: wezterm-gui's update check refuses to order a
+      # timestamp against a v0.1.0-style tag, so nobody is ever offered one as
+      # an update. Name a version for anything users are meant to receive.
+      version:
+        description: 'Version, e.g. 0.1.0 (blank = timestamped test build)'
+        type: string
+        default: ''
       # Off by default: this runner has no Developer ID certificate, so
       # ci/deploy.sh falls back to an ad-hoc signature that Gatekeeper refuses.
       # Release builds are produced locally with ci/macos-package.sh instead.
@@ -33,10 +44,14 @@ on:
         description: Linux x86_64 (deb + rpm + AppImage)
         type: boolean
         default: true
+      # arm64 hosted runners are free on public repos only. Ticking this on a
+      # private repo fails the leg, and the publish gate below refuses to ship
+      # a release with any failed job -- so it would build everything and
+      # publish nothing. Turn it on once the repo is public.
       linux_arm64:
-        description: Linux arm64 (arm64 runners are free on public repos only)
+        description: Linux arm64 (public repos only -- leave off while private)
         type: boolean
-        default: true
+        default: false
       publish:
         description: Publish to a GitHub Release (otherwise artifacts only)
         type: boolean
@@ -68,42 +83,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # The version reaches the script through env rather than a ${{ }} splice:
+      # it is free text from the Run workflow form, and spliced inline a value
+      # containing quotes or $(...) would run as shell in a job holding
+      # contents: write and a token. The booleans below cannot carry a payload.
       - name: Resolve build plan
         id: plan
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
-          if [ "$GITHUB_EVENT_NAME" = 'push' ]; then
-            # A tag build publishes everything CI can build correctly.
-            release_tag="$GITHUB_REF_NAME"
-            version="${GITHUB_REF_NAME#v}"
-            publish=true
-            # macOS is signed, notarized and stapled locally by
-            # ci/macos-package.sh, because the Developer ID certificate lives
-            # in a keychain rather than in this repo's secrets. Building it
-            # here would attach an ad-hoc signed zip that no other Mac can
-            # open -- a broken download is worse than a missing one -- and
-            # bill two jobs at the 10x macOS rate to do it.
-            macos_arm64=false
-            macos_x86_64=false
-            windows=true
-            linux_x86_64=true
-            # arm64 hosted runners are free on public repos only. Scheduling
-            # them from a private repo fails the leg, and the publish gate
-            # below refuses to ship a release with any failed job -- so a tag
-            # push would burn two macOS jobs at 10x and publish nothing. This
-            # starts including arm64 by itself once the repo goes public.
-            linux_arm64='${{ !github.event.repository.private }}'
+          version="$INPUT_VERSION"
+          if [ -n "$version" ]; then
+            # Accept either form. The tag keeps the v and the asset names drop
+            # it, which is the split ci/deploy.sh and the Homebrew cask
+            # template already assume.
+            version="${version#v}"
+            # This becomes a filename that ci/deploy.sh builds paths from and
+            # hands to rm -rf. Same character rule as ci/macos-package.sh.
+            case "$version" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::refusing version '$version': letters, digits, dot, underscore and dash only"
+                exit 1
+                ;;
+            esac
+            release_tag="v$version"
           else
             release_tag="$(bash ci/tag-name.sh)"
             version="$release_tag"
-            publish='${{ inputs.publish }}'
-            macos_arm64='${{ inputs.macos_arm64 }}'
-            macos_x86_64='${{ inputs.macos_x86_64 }}'
-            windows='${{ inputs.windows_x86_64 }}'
-            linux_x86_64='${{ inputs.linux_x86_64 }}'
-            linux_arm64='${{ inputs.linux_arm64 }}'
           fi
+
+          publish='${{ inputs.publish }}'
+          # macOS is signed, notarized and stapled locally by
+          # ci/macos-package.sh, because the Developer ID certificate lives in
+          # a keychain rather than in this repo's secrets. Anything built here
+          # is ad-hoc signed: well-formed, but refused by Gatekeeper on every
+          # Mac but this runner, and billed at the 10x macOS rate to produce.
+          macos_arm64='${{ inputs.macos_arm64 }}'
+          macos_x86_64='${{ inputs.macos_x86_64 }}'
+          windows='${{ inputs.windows_x86_64 }}'
+          linux_x86_64='${{ inputs.linux_x86_64 }}'
+          linux_arm64='${{ inputs.linux_arm64 }}'
 
           macos_matrix="$(jq -nc \
             --argjson a "$macos_arm64" --argjson x "$macos_x86_64" '
@@ -177,8 +198,9 @@ jobs:
       # version from git. Without it a released binary reports a commit stamp,
       # and wezterm-gui's update check compares that against a `v*` release tag
       # -- two unrelated schemes, so every release looks newer forever.
-      # Via env rather than a ${{ }} splice: on a tag push this is
-      # GITHUB_REF_NAME, and git accepts refs containing shell metacharacters.
+      # Via env rather than a ${{ }} splice: it derives from free text typed
+      # into the Run workflow form, which the plan step validates but does not
+      # quote for every later use.
       - name: Stamp version
         shell: bash
         env:
@@ -359,8 +381,9 @@ jobs:
       # version from git. Without it a released binary reports a commit stamp,
       # and wezterm-gui's update check compares that against a `v*` release tag
       # -- two unrelated schemes, so every release looks newer forever.
-      # Via env rather than a ${{ }} splice: on a tag push this is
-      # GITHUB_REF_NAME, and git accepts refs containing shell metacharacters.
+      # Via env rather than a ${{ }} splice: it derives from free text typed
+      # into the Run workflow form, which the plan step validates but does not
+      # quote for every later use.
       - name: Stamp version
         shell: bash
         env:
@@ -462,9 +485,9 @@ jobs:
           ls -l
 
       # The tag reaches these steps through env rather than a ${{ }} splice into
-      # the script body. On a tag push it is GITHUB_REF_NAME verbatim, and git
-      # accepts refs containing quotes and $(...) -- spliced inline, such a tag
-      # would run as shell in a job holding contents: write and a token.
+      # the script body. It derives from free text typed into the Run workflow
+      # form -- spliced inline, a value containing quotes or $(...) would run
+      # as shell in a job holding contents: write and a token.
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
