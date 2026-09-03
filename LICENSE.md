@@ -1,4 +1,21 @@
-Copyright (c) 2026 RoversX
+ThinkTerm — a terminal that keeps your work together
+Copyright (C) 2026 RoversX
+
+SPDX-License-Identifier: GPL-3.0-only
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 3,
+as published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License below for more details.
+
+Code originating from WezTerm (Copyright (c) 2018-Present Wez Furlong)
+remains under its original MIT license, preserved verbatim in LICENSE-MIT.
+
+----------------------------------------------------------------------
 
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
