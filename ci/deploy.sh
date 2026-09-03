@@ -49,10 +49,28 @@ case $OSTYPE in
     cp LICENSE.md LICENSE-MIT NOTICE $zipdir/ThinkTerm.app/Contents/Resources/
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
 
+    # Naming an architecture names its target directory too. Without that the
+    # lipo below folds together every $TARGET_DIR/*/release it can see, which
+    # on a machine that has also cross-built for Linux means handing lipo an
+    # ELF binary -- and on one that has run a plain `cargo build --release`
+    # means silently packaging the host's architecture whatever was asked for.
+    # ci/macos-package.sh resolves this itself, because it also has to look in
+    # the same place to decide whether a build is needed at all.
+    macos_bin_dir=${MACOS_BIN_DIR:-}
+    if [[ -z "$macos_bin_dir" ]] ; then
+      case "${MACOS_ARCH:-}" in
+        arm64) macos_bin_dir=$TARGET_DIR/aarch64-apple-darwin/release ;;
+        x86_64) macos_bin_dir=$TARGET_DIR/x86_64-apple-darwin/release ;;
+        *) macos_bin_dir= ;;
+      esac
+    fi
+
     for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes ; do
+      if [[ -n "$macos_bin_dir" ]] ; then
+        cp $macos_bin_dir/$bin $zipdir/ThinkTerm.app/Contents/MacOS/$bin
       # If the user ran a simple `cargo build --release`, then we want to allow
       # a single-arch package to be built
-      if [[ -f $TARGET_DIR/release/$bin ]] ; then
+      elif [[ -f $TARGET_DIR/release/$bin ]] ; then
         cp $TARGET_DIR/release/$bin $zipdir/ThinkTerm.app/Contents/MacOS/$bin
       else
         # The CI runs `cargo build --target XXX --release` which means that
@@ -129,8 +147,22 @@ case $OSTYPE in
     # sibling __MACOSX/ that extractors ignore.
     /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$zipdir" "$zipname"
 
-    SHA256=$(shasum -a 256 "$zipname" | cut -d' ' -f1)
-    sed -e "s/@TAG@/$TAG_NAME/g" -e "s/@SHA256@/$SHA256/g" < ci/wezterm-homebrew-macos.rb.template > wezterm.rb
+    # The cask covers both Macs, but one run of this script builds one archive.
+    # Read each hash off the archive itself, so packaging the second
+    # architecture -- in either order -- ends with a cask that names both, and
+    # a hash can never describe anything other than a file that is really here.
+    macos_sha() {
+      local zip="ThinkTerm-macos-$1-$TAG_NAME.zip"
+      if [[ -f "$zip" ]] ; then
+        shasum -a 256 "$zip" | cut -d' ' -f1
+      else
+        echo "@SHA256_$2@"
+      fi
+    }
+    sed -e "s/@TAG@/$TAG_NAME/g" \
+      -e "s/@SHA256_ARM64@/$(macos_sha arm64 ARM64)/g" \
+      -e "s/@SHA256_X86_64@/$(macos_sha x86_64 X86_64)/g" \
+      < ci/wezterm-homebrew-macos.rb.template > wezterm.rb
 
     ;;
   # Every Windows bash reports something different here -- Git Bash and MSYS2

@@ -5,11 +5,24 @@
 # vim:ft=ruby:
 cask "thinkterm" do
   version "@TAG@"
-  sha256 "@SHA256@"
 
-  # The v belongs to the git tag only: Homebrew expects a bare version, and the
-  # asset is named without one to match the Linux and Windows artifacts.
-  url "https://github.com/RoversX/thinkterm/releases/download/v#{version}/ThinkTerm-macos-#{version}.zip"
+  # One archive per Mac rather than a universal binary: folding both in would
+  # double a 66MB download for everyone to spare the smaller half of the
+  # audience a choice.
+  #
+  # No v anywhere -- the tag, the asset names and this version are all the same
+  # bare string, because deb and rpm version fields reject a v and Homebrew
+  # expects a bare version.
+  on_arm do
+    sha256 "@SHA256_ARM64@"
+    url "https://github.com/RoversX/thinkterm/releases/download/#{version}/ThinkTerm-macos-arm64-#{version}.zip"
+  end
+
+  on_intel do
+    sha256 "@SHA256_X86_64@"
+    url "https://github.com/RoversX/thinkterm/releases/download/#{version}/ThinkTerm-macos-x86_64-#{version}.zip"
+  end
+
   name "ThinkTerm"
   desc "A workspace-first terminal"
   homepage "https://github.com/RoversX/thinkterm"

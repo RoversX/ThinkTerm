@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+# Resolved before the cd, because --arch both re-runs this script once per
+# architecture and $0 is relative for most of the ways it gets invoked.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
 cd "$(dirname "$0")/.."
 
 . ci/macos-identity.sh
@@ -14,16 +18,23 @@ NOTARY_PROFILE=${MACOS_NOTARY_PROFILE:-thinkterm}
 
 usage() {
   cat <<EOT
-usage: ci/macos-package.sh [--build] [adhoc|developerid] [tag]
+usage: ci/macos-package.sh [--build] [--arch arm64|x86_64|both]
+                           [--upload] [adhoc|developerid] [tag]
 
-  --build       Run \`cargo build --release\` before packaging.
+  --build       Compile the binaries before packaging.
+  --arch        Which Mac the package is for.  Defaults to this one; the
+                other is cross-compiled, which needs its standard library
+                (\`rustup target add x86_64-apple-darwin\`).  \`both\` runs
+                the whole thing twice, which is what a release wants.
+  --upload      Attach the finished archives to the release named by the
+                tag, which has to exist already -- the draft the release
+                workflow leaves behind.
   adhoc         Self-signed.  Fast and offline, but Gatekeeper rejects the
                 result everywhere except the machine that built it.
   developerid   Developer ID signature, notarization and stapling.  Needs
                 network and an Apple Developer account; opens on any Mac.
 
-Both positional arguments are optional -- you are prompted for whatever is
-missing.
+Every argument is optional -- you are prompted for whatever is missing.
 EOT
 }
 
@@ -33,10 +44,20 @@ EOT
 # \`cargo build -p wezterm-gui\` refreshes two of the five binaries and leaves a
 # bundle whose parts come from different commits.
 BUILD=no
+ARCH=
+UPLOAD=no
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build)
       BUILD=yes
+      shift
+      ;;
+    --arch)
+      ARCH=${2:-}
+      shift 2 || { usage >&2; exit 2; }
+      ;;
+    --upload)
+      UPLOAD=yes
       shift
       ;;
     -h | --help)
@@ -95,17 +116,64 @@ if [[ "$MODE" != adhoc && "$MODE" != developerid ]]; then
   exit 2
 fi
 
+# One package holds one architecture.  A universal binary would be the other
+# way to cover both Macs, but it doubles a 66MB download for everyone to spare
+# the smaller half of the audience a choice, and the release page has to name
+# the two anyway.
+HOST_ARCH=$(uname -m)
+arm_note=
+intel_note=
+if [[ "$HOST_ARCH" == arm64 ]]; then
+  arm_note='  -- this Mac'
+  default_choice=1
+else
+  intel_note='  -- this Mac'
+  default_choice=2
+fi
+
+if [[ -z "$ARCH" ]]; then
+  cat <<EOT
+Architecture
+
+  1) Apple silicon (arm64)$arm_note
+  2) Intel (x86_64)$intel_note
+  3) Both -- what a release needs
+
+EOT
+  while [[ -z "$ARCH" ]]; do
+    printf "Select [1/2/3, default %s]: " "$default_choice"
+    read -r reply || { echo; exit 1; }
+    case "${reply:-$default_choice}" in
+      1) ARCH=arm64 ;;
+      2) ARCH=x86_64 ;;
+      3) ARCH=both ;;
+      *) echo "Enter 1, 2 or 3." ;;
+    esac
+  done
+  echo
+fi
+
+case "$ARCH" in
+  arm64 | x86_64 | both) ;;
+  *)
+    echo "Unsupported architecture: $ARCH" >&2
+    echo >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 INFO_PLIST=assets/macos/ThinkTerm.app/Contents/Info.plist
 bundle_version=$(plutil -extract CFBundleShortVersionString raw "$INFO_PLIST")
 
 if [[ -z "$TAG" ]]; then
   # The tag names the archive, and ci/wezterm-homebrew-macos.rb.template builds
   # its download URL out of it, so it has to match the GitHub release tag byte
-  # for byte.  The v prefix is not decoration: .github/workflows/release.yml
-  # only triggers on 'v*', so every release this has to line up with has one.
+  # for byte -- and no v anywhere, because deb and rpm version fields reject
+  # one and Homebrew wants a bare version.
   # Deliberately not ci/tag-name.sh's build timestamp -- that identifies a build
   # rather than a release, and `thinkterm --version` already reports it.
-  suggested="v$bundle_version"
+  suggested="$bundle_version"
   printf "Version tag [%s]: " "$suggested"
   read -r TAG || { echo; exit 1; }
   TAG=${TAG:-$suggested}
@@ -130,6 +198,44 @@ if [[ "${TAG#v}" != "$bundle_version" ]]; then
   echo "Bump CFBundleShortVersionString in $INFO_PLIST first," >&2
   echo "or package the version the bundle already declares." >&2
   exit 2
+fi
+
+# Both is one run per architecture rather than one pass producing two, so that
+# half a release and a single-architecture run go through the same code. The
+# tag is resolved above first, so the second run does not prompt for it again.
+if [[ "$ARCH" == both ]]; then
+  extra=()
+  if [[ "$BUILD" == yes ]]; then extra+=(--build); fi
+  if [[ "$UPLOAD" == yes ]]; then extra+=(--upload); fi
+  for one in arm64 x86_64; do
+    echo
+    echo "################  $one  ################"
+    "$SELF" ${extra[@]+"${extra[@]}"} --arch "$one" "$MODE" "$TAG"
+  done
+  echo
+  echo "==> Both archives"
+  for one in arm64 x86_64; do
+    echo "    $PWD/ThinkTerm-macos-$one-${TAG#v}.zip"
+  done
+  exit 0
+fi
+
+case "$ARCH" in
+  arm64) RUST_TARGET=aarch64-apple-darwin ;;
+  x86_64) RUST_TARGET=x86_64-apple-darwin ;;
+esac
+
+# ci/deploy.sh reads this for both the archive name and which target directory
+# to take the binaries from.
+export MACOS_ARCH="$ARCH"
+BIN_DIR="target/$RUST_TARGET/release"
+
+# `rustc` on PATH is often the one Homebrew installed, and a toolchain from a
+# package manager carries only its own host's standard library: a cross build
+# against it dies in the first dependency with E0463.  rustup's has both, so
+# prefer it whenever there is one.
+if toolchain_bin=$(rustup which cargo 2>/dev/null); then
+  PATH="$(dirname "$toolchain_bin"):$PATH"
 fi
 
 echo "==> Checking prerequisites"
@@ -165,24 +271,47 @@ fi
 BINARIES="wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes"
 
 if [[ "$BUILD" == yes ]]; then
+  if ! rustup target list --installed 2>/dev/null | grep -qx "$RUST_TARGET"; then
+    echo "No standard library for $RUST_TARGET." >&2
+    echo "Install it with: rustup target add $RUST_TARGET" >&2
+    exit 1
+  fi
+  echo "    toolchain: $(cargo --version) at $(command -v cargo)"
+
   echo
-  echo "==> Building"
-  # No -p: every binary the bundle carries has to come from the same tree.
-  cargo build --release
+  echo "==> Building for $ARCH"
+  # The same four packages the release workflow builds, which between them
+  # produce all five binaries the bundle carries.  Building the whole
+  # workspace instead would compile crates no package ships.
+  cargo build --release --target "$RUST_TARGET" \
+    -p wezterm \
+    -p wezterm-gui \
+    -p wezterm-mux-server \
+    -p strip-ansi-escapes
   echo
   echo "==> Checking prerequisites (continued)"
 fi
+
+# A plain `cargo build --release` writes to target/release with no target
+# directory of its own, and for this Mac's own architecture that is the same
+# set of binaries. Keep accepting it, so packaging what is already built does
+# not force a second full build into a target-specific directory.
+if [[ ! -f "$BIN_DIR/thinkterm-gui" && "$ARCH" == "$HOST_ARCH" &&
+  -f target/release/thinkterm-gui ]]; then
+  BIN_DIR=target/release
+fi
+export MACOS_BIN_DIR="$BIN_DIR"
 
 # Catch a missing build here rather than letting deploy.sh fail halfway through
 # assembling a bundle it cannot populate.
 missing=
 for bin in $BINARIES; do
-  [[ -f "target/release/$bin" ]] || missing="$missing $bin"
+  [[ -f "$BIN_DIR/$bin" ]] || missing="$missing $bin"
 done
 if [[ -n "$missing" ]]; then
-  echo "Missing release binaries:$missing" >&2
-  echo "Build them first with 'cargo build --release', or re-run with" >&2
-  echo "--build to have this script do it." >&2
+  echo "Missing $ARCH binaries in $BIN_DIR:$missing" >&2
+  echo "Build them first with 'cargo build --release --target $RUST_TARGET'," >&2
+  echo "or re-run with --build to have this script do it." >&2
   exit 1
 fi
 
@@ -199,7 +328,7 @@ else
   stale=
   if [[ -n "$head_time" ]]; then
     for bin in $BINARIES; do
-      [[ "$(stat -f %m "target/release/$bin")" -lt "$head_time" ]] &&
+      [[ "$(stat -f %m "$BIN_DIR/$bin")" -lt "$head_time" ]] &&
         stale="$stale $bin"
     done
   fi
@@ -213,16 +342,13 @@ else
   fi
 fi
 
-# The tag keeps its v so it matches the GitHub release, but the filename drops
-# it. That is the same split the workflow makes -- release.yml derives
-# version="${GITHUB_REF_NAME#v}" and names every Linux and Windows artifact
-# from it -- and matching here is what keeps one release page from carrying
-# both ThinkTerm-macos-v0.1.0.zip and thinkterm-0.1.0.Ubuntu22.04.deb. The v
-# has to go for deb and rpm regardless: their version fields reject it.
+# A leading v is tolerated here and dropped, the same as the Run workflow form
+# does, so that typing one out of habit cannot produce a release page carrying
+# both ThinkTerm-macos-arm64-v0.1.0.zip and thinkterm-0.1.0.Ubuntu22.04.deb.
 version="${TAG#v}"
 
 echo
-echo "==> Packaging as $TAG in $MODE mode"
+echo "==> Packaging $ARCH as $TAG in $MODE mode"
 TAG_NAME="$version" MACOS_SIGNING_MODE="$MODE" bash ci/deploy.sh
 
 # deploy.sh derives both names the same way; keep them in sync with it.
@@ -247,4 +373,19 @@ if [[ "$MODE" == developerid ]]; then
 else
   echo "$zipname is ad-hoc signed -- this Mac only."
   echo "Re-run with 'developerid' to produce something distributable."
+fi
+
+echo
+if [[ "$UPLOAD" == yes ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "gh is not installed, so $zipname has to be attached by hand." >&2
+    exit 1
+  fi
+  echo "==> Attaching to release $TAG"
+  # --clobber so that re-packaging after a fix replaces the archive rather
+  # than failing because the name is already taken.
+  gh release upload --clobber "$TAG" "$zipname"
+else
+  echo "Attach to the release:"
+  echo "    $PWD/$zipname"
 fi
