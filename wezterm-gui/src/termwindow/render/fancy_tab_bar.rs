@@ -213,7 +213,7 @@ impl crate::TermWindow {
             }
         }
 
-        // Synthetic content-view tabs (e.g. SSH Hosts), placed after the mux tabs.
+        // Synthetic content-view tabs (e.g. Remote Hosts), placed after the mux tabs.
         for content_tab in &self.content_views {
             if !self.content_view_shown_in_tab_bar(content_tab) {
                 continue;
@@ -356,8 +356,17 @@ impl crate::TermWindow {
             }
         } else {
             let right_sidebar_toggle_x = action_right.saturating_sub(button_size);
-            let new_button_x = right_sidebar_toggle_x
-                .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size);
+            // With every sidebar panel off the toggle paints nothing, and
+            // window_tab_trailing_action_reserved_width reserves a single
+            // slot to match. The new button has to take that slot, or it
+            // lands one button to the left -- inside the width the tab strip
+            // was just given -- and overlaps the last tab.
+            let new_button_x = if self.right_sidebar_has_panels() {
+                right_sidebar_toggle_x
+                    .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size)
+            } else {
+                right_sidebar_toggle_x
+            };
             self.paint_window_tab_new_button(
                 layers,
                 &mut ui_items,
@@ -1181,6 +1190,10 @@ impl crate::TermWindow {
         foreground: LinearRgba,
         muted_fg: LinearRgba,
     ) -> anyhow::Result<()> {
+        // Every sidebar panel turned off: the button would open nothing.
+        if !self.right_sidebar_has_panels() {
+            return Ok(());
+        }
         let button_y = row_y + (row_height.saturating_sub(button_size) / 2);
         let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
         let pressed = hovered

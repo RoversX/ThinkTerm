@@ -9,9 +9,10 @@ use crate::termwindow::render::corners::{
 use crate::termwindow::render::draw::draw_webgpu_layers;
 use crate::termwindow::webgpu::WebGpuState;
 use crate::ui::{
-    rect, scale_ui_f32, scale_ui_usize, BrandIcon, ButtonSpec, ControlState, EditModifiers,
-    InputCaret, InteractionState, ResizablePaneState, ScrollState, ScrollbarSpec, SettingsIcon,
-    SvgIcon, TextInputSpec, TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
+    rect, scale_ui_f32, scale_ui_usize, BrandIcon, ButtonSpec, ButtonVariant, ControlState,
+    EditModifiers, InputCaret, InteractionState, ResizablePaneState, ScrollState, ScrollbarSpec,
+    SettingsIcon, SvgIcon, TextInputSpec, TextInputState, UiContext, UiPalette, UiTokens,
+    WidgetKind,
 };
 use crate::utilsprites::RenderMetrics;
 use anyhow::{Context, Error};
@@ -60,9 +61,22 @@ const SIDEBAR_BRAND_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
 const SIDEBAR_BRAND_FONT_WEIGHT: u16 = 750;
 const CONTROL_HEIGHT: f32 = 56.0;
 const CONTROL_RADIUS: f32 = 14.0;
-const NAV_ROW_RADIUS: f32 = 14.0;
-const NAV_ROW_HEIGHT: f32 = 56.0;
-const NAV_ROW_STEP: f32 = 68.0;
+const HERO_PADDING: f32 = 36.0;
+const HERO_MARK_SIZE: f32 = 108.0;
+const SWITCH_WIDTH: f32 = 76.0;
+const SWITCH_HEIGHT: f32 = 44.0;
+const SWITCH_KNOB_INSET: f32 = 4.0;
+// Matches termwindow::ui::tokens::SIDEBAR_ROW_HIGHLIGHT_RADIUS: the two
+// sidebars draw the same shape.
+const NAV_ROW_RADIUS: f32 = 20.0;
+// Row geometry lifted from the main window's sidebar -- SESSION_ROW_MIN_HEIGHT,
+// SIDEBAR_INSET and SIDEBAR_ROW_GAP in termwindow::ui. Both sidebars grow a row
+// from their own font's cell height against a shared floor rather than pinning
+// a constant, so a Settings row and a thread row are the same size even though
+// the two use different font sizes.
+const NAV_ROW_MIN_HEIGHT: f32 = 66.0;
+const NAV_ROW_INSET: f32 = 10.0;
+const NAV_ROW_GAP: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 132.0;
 const SIDEBAR_TITLE_Y: f32 = 78.0;
 const SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME: f32 = 34.0;
@@ -73,6 +87,7 @@ const SIDEBAR_BRAND_FONT_SIZE_WITH_CUSTOM_CHROME: f64 = if cfg!(target_os = "mac
 };
 const SIDEBAR_SEARCH_Y: f32 = 142.0;
 const SIDEBAR_LIST_TOP: f32 = 222.0;
+const SIDEBAR_LIST_FADE_HEIGHT: f32 = 24.0;
 const CONTENT_TITLE_Y: f32 = 82.0;
 const CONTENT_SECTION_Y: f32 = 168.0;
 const CONTENT_RULE_Y: f32 = 202.0;
@@ -88,6 +103,10 @@ thread_local! {
     static SETTINGS_WINDOW: RefCell<SettingsWindowSlot> =
         RefCell::new(SettingsWindowSlot::Closed);
     static SETTINGS_WINDOW_NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    /// A page requested before the window exists -- the app menu's Check for
+    /// Updates opens Settings straight onto Software Update. Consumed by the
+    /// next window to open, and only ever set when one is about to be.
+    static PENDING_SECTION: Cell<Option<SettingsSection>> = const { Cell::new(None) };
 }
 
 enum SettingsWindowSlot {
@@ -171,10 +190,115 @@ fn format_archived_when(archived_at: i64) -> String {
     }
 }
 
+/// What sits at the left of a hero card: the app's own mark on About, or a
+/// tinted status glyph on Software Update.
+enum HeroBadge {
+    AppIcon,
+    Status { icon: SvgIcon, tint: LinearRgba },
+}
+
+/// What the Update page's status card can say. Derived from the on-disk
+/// check cache rather than from a live query, which is why "up to date" is
+/// only ever claimed for a build that actually carries a release tag.
+#[derive(Debug, Clone)]
+enum UpdateHero {
+    /// No usable result on disk: either no check has run, or the cache is
+    /// unreadable. Either way there is nothing to compare against.
+    Unknown,
+    UpToDate,
+    Available {
+        tag: String,
+    },
+    /// A commit-stamped build from a plain checkout. It has no ordering
+    /// against any release tag, so releases simply do not apply to it.
+    LocalBuild,
+}
+
+/// Semantic accents for the status badges. They stay local rather than
+/// joining UiPalette because nothing else in the chrome carries a success or
+/// neutral status color, and a token would imply a system that does not
+/// exist. The action tint is not here: that one *is* the accent, so it reads
+/// `palette.accent`.
+fn status_tint_positive(appearance: Appearance) -> LinearRgba {
+    match appearance {
+        Appearance::Light | Appearance::LightHighContrast => rgba(52, 199, 89, 1.0),
+        Appearance::Dark | Appearance::DarkHighContrast => rgba(48, 209, 88, 1.0),
+    }
+}
+
+fn status_tint_neutral(appearance: Appearance) -> LinearRgba {
+    match appearance {
+        Appearance::Light | Appearance::LightHighContrast => rgba(142, 142, 147, 1.0),
+        Appearance::Dark | Appearance::DarkHighContrast => rgba(120, 120, 128, 1.0),
+    }
+}
+
+/// Secondary text sits a step below the label. Clamped at 350 so a user who
+/// already runs a light UI weight does not end up with hairline text.
+fn settings_body_font_weight(label_weight: u16) -> u16 {
+    // Proportional, not a fixed subtraction. The label weight is a user
+    // setting that ranges 300..800, and subtracting a constant collapses at
+    // the light end: from a 400 label it lands on the floor and secondary
+    // text ends up either identical to the label or Light-thin, neither of
+    // which separates them.
+    ((label_weight as f32 * 0.875) as u16).max(350)
+}
+
+/// Names the background check interval the way someone would say it out
+/// loud, falling back to whole hours or minutes for a hand-edited value.
+fn format_check_interval(seconds: u64) -> String {
+    match seconds {
+        0 => crate::i18n::tr("settings-update-frequency-off"),
+        86_400 => crate::i18n::tr("settings-update-frequency-daily"),
+        604_800 => crate::i18n::tr("settings-update-frequency-weekly"),
+        s if s % 86_400 == 0 => settings_tr(
+            "settings-update-frequency-days",
+            &[("count", (s / 86_400).to_string())],
+        ),
+        s if s % 3_600 == 0 => settings_tr(
+            "settings-update-frequency-hours",
+            &[("count", (s / 3_600).to_string())],
+        ),
+        s => settings_tr(
+            "settings-update-frequency-minutes",
+            &[("count", (s.max(60) / 60).to_string())],
+        ),
+    }
+}
+
+/// "just now" / "N minutes ago" / "N hours ago" / a local date. The recent
+/// cases get words because recency is what the user is checking for; older
+/// than a day, the date is more useful than a growing hour count.
+fn format_last_checked(when: SystemTime) -> String {
+    let Ok(elapsed) = when.elapsed() else {
+        // A clock that moved backwards leaves the stamp in the future.
+        return crate::i18n::tr("settings-update-just-now");
+    };
+    let secs = elapsed.as_secs();
+    if secs < 90 {
+        return crate::i18n::tr("settings-update-just-now");
+    }
+    if secs < 3_600 {
+        return settings_tr(
+            "settings-update-minutes-ago",
+            &[("count", (secs / 60).to_string())],
+        );
+    }
+    if secs < 86_400 {
+        return settings_tr(
+            "settings-update-hours-ago",
+            &[("count", (secs / 3_600).to_string())],
+        );
+    }
+    let when: chrono::DateTime<chrono::Local> = when.into();
+    when.format("%Y-%m-%d %H:%M").to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsSection {
     General,
     Appearance,
+    Sidebar,
     Terminal,
     Workspaces,
     Agents,
@@ -185,12 +309,14 @@ enum SettingsSection {
     Developer,
     UiKit,
     Memory,
+    Update,
     About,
 }
 
 const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::General,
     SettingsSection::Appearance,
+    SettingsSection::Sidebar,
     SettingsSection::Terminal,
     SettingsSection::Workspaces,
     SettingsSection::Agents,
@@ -199,6 +325,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::CommandPalette,
     SettingsSection::Compatibility,
     SettingsSection::Developer,
+    SettingsSection::Update,
     SettingsSection::About,
 ];
 
@@ -241,6 +368,9 @@ fn initial_expanded_agent() -> Option<&'static str> {
 /// when the settings window opens (e.g. for unattended UI captures with
 /// `THINKTERM_FRAME_DUMP`). Names match the enum variants, case-insensitive.
 fn initial_section() -> SettingsSection {
+    if let Some(section) = PENDING_SECTION.with(|pending| pending.take()) {
+        return section;
+    }
     let Some(name) = std::env::var_os("THINKTERM_SETTINGS_SECTION") else {
         return SettingsSection::Appearance;
     };
@@ -248,6 +378,7 @@ fn initial_section() -> SettingsSection {
     let section = match name.as_str() {
         "general" => SettingsSection::General,
         "appearance" => SettingsSection::Appearance,
+        "sidebar" => SettingsSection::Sidebar,
         "terminal" => SettingsSection::Terminal,
         "workspaces" => SettingsSection::Workspaces,
         "agents" => SettingsSection::Agents,
@@ -256,6 +387,9 @@ fn initial_section() -> SettingsSection {
         "commandpalette" => SettingsSection::CommandPalette,
         "compatibility" => SettingsSection::Compatibility,
         "developer" => SettingsSection::Developer,
+        "uikit" => SettingsSection::UiKit,
+        "memory" => SettingsSection::Memory,
+        "update" => SettingsSection::Update,
         "about" => SettingsSection::About,
         _ => SettingsSection::Appearance,
     };
@@ -270,6 +404,7 @@ impl SettingsSection {
         match self {
             Self::General => crate::i18n::tr("settings-section-general"),
             Self::Appearance => crate::i18n::tr("settings-section-appearance"),
+            Self::Sidebar => crate::i18n::tr("settings-section-sidebar"),
             Self::Terminal => crate::i18n::tr("settings-section-terminal"),
             Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
             Self::Agents => crate::i18n::tr("settings-section-agents"),
@@ -280,6 +415,7 @@ impl SettingsSection {
             Self::Developer => crate::i18n::tr("settings-section-developer"),
             Self::UiKit => "UI Kit".to_string(),
             Self::Memory => "Memory".to_string(),
+            Self::Update => crate::i18n::tr("settings-section-update"),
             Self::About => crate::i18n::tr("settings-section-about"),
         }
     }
@@ -288,6 +424,7 @@ impl SettingsSection {
         match self {
             Self::General => SettingsIcon::General,
             Self::Appearance => SettingsIcon::Appearance,
+            Self::Sidebar => SettingsIcon::Sidebar,
             Self::Terminal => SettingsIcon::Terminal,
             Self::Workspaces => SettingsIcon::Workspaces,
             Self::Agents => SettingsIcon::Agents,
@@ -298,6 +435,7 @@ impl SettingsSection {
             Self::Developer => SettingsIcon::Developer,
             Self::UiKit => SettingsIcon::UiKit,
             Self::Memory => SettingsIcon::Memory,
+            Self::Update => SettingsIcon::Update,
             Self::About => SettingsIcon::About,
         }
     }
@@ -450,7 +588,36 @@ impl SettingsSection {
                 "Key Events",
                 "P95",
             ],
-            Self::About => &["About", "Version", "ThinkTerm"],
+            Self::Sidebar => &[
+                "Sidebar",
+                "Panels",
+                "Files",
+                "Notes",
+                "Snippets",
+                "Agents",
+                "Agent Panel",
+                "Right Sidebar",
+            ],
+            Self::Update => &[
+                "Update",
+                "Software Update",
+                "Check for Updates",
+                "Automatic Updates",
+                "Release",
+                "Upgrade",
+                "Version",
+            ],
+            Self::About => &[
+                "About",
+                "Version",
+                "Build",
+                "ThinkTerm",
+                "License",
+                "Source Code",
+                "Privacy",
+                "Third-Party",
+                "Diagnostics",
+            ],
         }
     }
 
@@ -554,7 +721,8 @@ enum SettingsAction {
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
     ToggleNotificationSounds,
-    ToggleAgentPanel,
+    /// Turn one right-sidebar panel on or off.
+    ToggleRightSidebarPanel(crate::termwindow::RightSidebarMode),
     ToggleAgentDetails(&'static str),
     /// Index into the archived rows cached at paint time.
     UnarchiveArchivedRow(usize),
@@ -568,6 +736,14 @@ enum SettingsAction {
     ToggleInputDiagnostics,
     ResetInputDiagnostics,
     CopyInputDiagnostics,
+    CheckForUpdates,
+    OpenLatestRelease,
+    OpenReleasesIndex,
+    OpenSourceRepository,
+    OpenThirdPartyNotices,
+    OpenPrivacyPolicy,
+    OpenDataFolder,
+    CopyVersionInfo,
     ToggleThemeModeMenu,
     SetThemeMode(NativeThemeMode),
     ToggleLanguageMenu,
@@ -1063,6 +1239,14 @@ struct SettingsUiState {
     /// once. A second click executes; any other action clears it.
     confirm_delete_archived: Option<String>,
     input_diagnostics_copied_until: Option<Instant>,
+    /// The Update page's view of the on-disk check cache. Read when the
+    /// section is entered and when Check Now is clicked, never while
+    /// painting: it stats and reads a file, and the paint path must not.
+    update_status: Option<crate::update::CachedUpdateStatus>,
+    /// Set briefly after Check Now so the button can report that it ran even
+    /// when the cached answer is unchanged.
+    update_checked_until: Option<Instant>,
+    version_info_copied_until: Option<Instant>,
     sidebar_scrollbar_visible_until: Option<Instant>,
     content_scrollbar_visible_until: Option<Instant>,
 }
@@ -1097,6 +1281,9 @@ impl SettingsUiState {
             shell_catalog: Vec::new(),
             confirm_delete_archived: None,
             input_diagnostics_copied_until: None,
+            update_status: None,
+            update_checked_until: None,
+            version_info_copied_until: None,
             sidebar_scrollbar_visible_until: None,
             content_scrollbar_visible_until: None,
         }
@@ -1472,17 +1659,48 @@ struct SettingsPalette {
     nav_hover_bg: LinearRgba,
     nav_pressed_bg: LinearRgba,
     nav_selected_bg: LinearRgba,
+    nav_selected_border: LinearRgba,
     control_bg: LinearRgba,
     control_hover_bg: LinearRgba,
     control_pressed_bg: LinearRgba,
     control_border: LinearRgba,
     card_bg: LinearRgba,
+    accent: LinearRgba,
+    on_accent: LinearRgba,
     title: LinearRgba,
     text: LinearRgba,
     secondary_text: LinearRgba,
     muted_text: LinearRgba,
     selected_text: LinearRgba,
     rule: LinearRgba,
+}
+
+/// Open Settings on the Software Update page. This is where the app menu's
+/// Check for Updates lands: one page that already carries the status, the
+/// automatic-check preference and the release links, rather than a second
+/// dialog that can only say one of those things in isolation.
+pub fn show_update_page() {
+    let switched = SETTINGS_WINDOW.with(|slot| {
+        let slot = slot.borrow();
+        let SettingsWindowSlot::Open { settings, .. } = &*slot else {
+            return false;
+        };
+        let mut settings = settings.borrow_mut();
+        // An Open slot whose window is gone opens a fresh one below, which
+        // reads the pending section instead.
+        if settings.window.is_none() {
+            return false;
+        }
+        settings.enter_section(SettingsSection::Update);
+        if let Some(window) = settings.window.as_ref() {
+            window.invalidate();
+        }
+        true
+    });
+    if !switched {
+        PENDING_SECTION.with(|pending| pending.set(Some(SettingsSection::Update)));
+    }
+    show();
 }
 
 pub fn show() {
@@ -1579,11 +1797,17 @@ struct SettingsWindow {
     window_state: WindowState,
     fonts: Rc<FontConfiguration>,
     ui_font: Rc<LoadedFont>,
+    /// The same family two weights lighter, for every secondary line. One
+    /// weight for labels and explanations made the two read as equally
+    /// important; macOS separates them by weight, not only by color.
+    body_font: Rc<LoadedFont>,
     title_font: Rc<LoadedFont>,
     sidebar_title_font: Rc<LoadedFont>,
     metrics: RenderMetrics,
     render_state: Option<RenderState>,
     webgpu: Option<Rc<WebGpuState>>,
+    /// Last system appearance seen. Not used for painting -- see
+    /// `effective_appearance` -- only to notice that a repaint is due.
     appearance: Appearance,
     selected: SettingsSection,
     agents_expanded: Option<&'static str>,
@@ -1646,6 +1870,10 @@ impl SettingsWindow {
         )?;
         let ui_font = fonts
             .command_palette_font_with_size_and_weight(settings_font_size, settings_font_weight)?;
+        let body_font = fonts.command_palette_font_with_size_and_weight(
+            settings_font_size,
+            settings_body_font_weight(settings_font_weight),
+        )?;
         let metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let appearance = Connection::get()
             .map(|conn| conn.get_appearance())
@@ -1694,6 +1922,9 @@ impl SettingsWindow {
         // jump to it without passing through the section action. A handful of
         // path probes, and never from the paint path.
         ui.shell_catalog = shell_catalog_including(native_settings.terminal.default_shell.as_ref());
+        // Same reasoning for the update cache: the window can open straight
+        // onto Update or About, and both read it while painting.
+        ui.update_status = Some(crate::update::cached_update_status());
 
         let settings = Rc::new(RefCell::new(Self {
             instance_id,
@@ -1703,6 +1934,7 @@ impl SettingsWindow {
             window_state: WindowState::default(),
             fonts: Rc::clone(&fonts),
             ui_font,
+            body_font,
             title_font,
             sidebar_title_font,
             metrics,
@@ -2217,6 +2449,22 @@ impl SettingsWindow {
                     .is_some_and(|until| Instant::now() >= until)
                 {
                     settings.ui.memory_snapshot_copied_until = None;
+                    window.invalidate();
+                }
+                if settings
+                    .ui
+                    .update_checked_until
+                    .is_some_and(|until| Instant::now() >= until)
+                {
+                    settings.ui.update_checked_until = None;
+                    window.invalidate();
+                }
+                if settings
+                    .ui
+                    .version_info_copied_until
+                    .is_some_and(|until| Instant::now() >= until)
+                {
+                    settings.ui.version_info_copied_until = None;
                     window.invalidate();
                 }
                 if settings
@@ -2894,6 +3142,10 @@ impl SettingsWindow {
             Self::sidebar_brand_font_size_for_config(&configuration()),
             SIDEBAR_BRAND_FONT_WEIGHT,
         )?;
+        self.body_font = self.fonts.command_palette_font_with_size_and_weight(
+            settings_font_size,
+            settings_body_font_weight(settings_font_weight),
+        )?;
         self.metrics = RenderMetrics::with_font_metrics(&self.ui_font.metrics());
         self.invalidate_shaped_text();
         Ok(())
@@ -2961,59 +3213,53 @@ impl SettingsWindow {
         }
     }
 
+    /// The theme this window paints in.
+    ///
+    /// The system half is read live, which is what the main window's chrome
+    /// does (`native_settings::effective_appearance`). It used to come from a
+    /// snapshot taken when this window was built and refreshed only by an
+    /// `AppearanceChanged` event -- so any moment the snapshot was wrong (the
+    /// window built before AppKit settled on the system appearance, or an
+    /// event that never arrived) left Settings painting a different theme
+    /// from the terminal behind it. The theme *mode* still comes from this
+    /// window's own copy so an edit previews before it is saved.
     fn effective_appearance(&self) -> Appearance {
         self.native_settings
             .appearance
             .theme_mode
-            .effective_appearance(self.appearance)
+            .effective_appearance(crate::native_settings::system_appearance())
     }
 
+    /// Every field reads a `UiPalette` token, so Settings tracks the main
+    /// window by construction. It stopped doing that once: two arms that
+    /// differed only in a hand-written `card_bg`, which was the token's value
+    /// copied out by hand and would have gone stale the first time the token
+    /// moved.
     fn palette(&self) -> SettingsPalette {
-        let appearance = self.effective_appearance();
-        let ui = UiPalette::for_appearance(appearance);
-        match appearance {
-            Appearance::Light | Appearance::LightHighContrast => SettingsPalette {
-                window_bg: ui.window_bg,
-                sidebar_bg: ui.workspace_sidebar_bg,
-                separator: ui.separator,
-                search_bg: ui.control_bg,
-                search_border: ui.control_border,
-                nav_hover_bg: ui.sidebar_row_hover_bg,
-                nav_pressed_bg: ui.control_pressed_bg,
-                nav_selected_bg: ui.sidebar_row_active_bg,
-                control_bg: ui.control_bg,
-                control_hover_bg: ui.control_hover_bg,
-                control_pressed_bg: ui.control_pressed_bg,
-                control_border: ui.control_border,
-                card_bg: rgba(255, 255, 255, 0.72),
-                title: ui.text,
-                text: ui.text,
-                secondary_text: ui.secondary_text,
-                muted_text: ui.muted_text,
-                selected_text: ui.text,
-                rule: ui.separator,
-            },
-            Appearance::Dark | Appearance::DarkHighContrast => SettingsPalette {
-                window_bg: ui.window_bg,
-                sidebar_bg: ui.workspace_sidebar_bg,
-                separator: ui.separator,
-                search_bg: ui.control_bg,
-                search_border: ui.control_border,
-                nav_hover_bg: ui.sidebar_row_hover_bg,
-                nav_pressed_bg: ui.control_pressed_bg,
-                nav_selected_bg: ui.sidebar_row_active_bg,
-                control_bg: ui.control_bg,
-                control_hover_bg: ui.control_hover_bg,
-                control_pressed_bg: ui.control_pressed_bg,
-                control_border: ui.control_border,
-                card_bg: rgba(30, 30, 32, 0.78),
-                title: ui.text,
-                text: ui.text,
-                secondary_text: ui.secondary_text,
-                muted_text: ui.muted_text,
-                selected_text: ui.text,
-                rule: ui.separator,
-            },
+        let ui = UiPalette::for_appearance(self.effective_appearance());
+        SettingsPalette {
+            window_bg: ui.window_bg,
+            sidebar_bg: ui.workspace_sidebar_bg,
+            separator: ui.separator,
+            search_bg: ui.control_bg,
+            search_border: ui.control_border,
+            nav_hover_bg: ui.sidebar_row_hover_bg,
+            nav_pressed_bg: ui.sidebar_row_pressed_bg,
+            nav_selected_bg: ui.sidebar_row_active_bg,
+            nav_selected_border: ui.sidebar_row_active_border,
+            control_bg: ui.control_bg,
+            control_hover_bg: ui.control_hover_bg,
+            control_pressed_bg: ui.control_pressed_bg,
+            control_border: ui.control_border,
+            card_bg: ui.card_bg,
+            accent: ui.accent,
+            on_accent: ui.on_accent,
+            title: ui.text,
+            text: ui.text,
+            secondary_text: ui.secondary_text,
+            muted_text: ui.muted_text,
+            selected_text: ui.text,
+            rule: ui.separator,
         }
     }
 
@@ -3071,6 +3317,37 @@ impl SettingsWindow {
         (card_y, first_row_y)
     }
 
+    fn sidebar_icon_size(&self) -> f32 {
+        (self.metrics.cell_size.height as f32 + self.ui_px(8.0))
+            .clamp(self.ui_px(24.0), self.ui_px(34.0))
+            .round()
+    }
+
+    fn nav_row_height(&self) -> f32 {
+        ((self.metrics.cell_size.height as f32).max(self.sidebar_icon_size())
+            + self.ui_px(NAV_ROW_INSET))
+        .max(self.ui_px(NAV_ROW_MIN_HEIGHT))
+    }
+
+    fn sidebar_list_top(&self) -> f32 {
+        self.ui_px(SIDEBAR_LIST_TOP)
+    }
+
+    fn nav_row_step(&self) -> f32 {
+        self.nav_row_height() + self.ui_px(NAV_ROW_GAP)
+    }
+
+    /// Width of the control column shared by every settings row kind, so a
+    /// value pill, a toggle and a link button all line up on the same right
+    /// edge no matter which rows a card mixes.
+    fn settings_control_width(width: f32) -> f32 {
+        if width >= 680.0 {
+            280.0_f32.min(width * 0.36)
+        } else {
+            220.0_f32.min(width * 0.44)
+        }
+    }
+
     fn settings_content_extent(&self, bottom_y: f32) -> f32 {
         (bottom_y + self.ui_px(65.0)).max(self.content_bottom())
     }
@@ -3079,13 +3356,41 @@ impl SettingsWindow {
         self.native_settings.developer.developer_mode
     }
 
+    /// Everything a section needs done when it becomes the visible page.
+    /// Shared by the sidebar click and by an external request to open a
+    /// particular page, so a page reached from the app menu arrives in the
+    /// same state as one clicked into.
+    fn enter_section(&mut self, section: SettingsSection) {
+        self.selected = section;
+        self.ui.content_scroll.reset();
+        self.ui.open_dropdown = None;
+        if section == SettingsSection::Agents {
+            // Probe PATH on entry so painting never touches the filesystem.
+            crate::agent_status::refresh_path_probe();
+        }
+        if section == SettingsSection::Terminal {
+            // Same rule: shell discovery stats candidate paths, so it happens
+            // on entry and the row paints from the cache.
+            self.refresh_shell_catalog();
+        }
+        if matches!(section, SettingsSection::Update | SettingsSection::About) {
+            // Re-read the cache the background checker writes, so re-entering
+            // the page picks up a check that ran while the window sat on
+            // another section.
+            self.ui.update_status = Some(crate::update::cached_update_status());
+        }
+    }
+
     fn visible_sections(&self) -> Vec<SettingsSection> {
         let mut sections = Vec::with_capacity(BASE_SECTIONS.len() + DEVELOPER_SECTIONS.len());
         for section in BASE_SECTIONS {
-            if *section == SettingsSection::About && self.developer_mode_enabled() {
+            sections.push(*section);
+            // The developer pages belong to Developer, not to whatever
+            // happens to follow it in BASE_SECTIONS; anchoring on Developer
+            // keeps them adjacent to it as sections are added below.
+            if *section == SettingsSection::Developer && self.developer_mode_enabled() {
                 sections.extend_from_slice(DEVELOPER_SECTIONS);
             }
-            sections.push(*section);
         }
         sections
     }
@@ -3130,19 +3435,7 @@ impl SettingsWindow {
             }
             SettingsAction::Select(section) => {
                 self.commit_focused_input();
-                self.selected = section;
-                self.ui.content_scroll.reset();
-                self.ui.open_dropdown = None;
-                if section == SettingsSection::Agents {
-                    // Probe PATH on entry so painting never touches the
-                    // filesystem.
-                    crate::agent_status::refresh_path_probe();
-                }
-                if section == SettingsSection::Terminal {
-                    // Same rule: shell discovery stats candidate paths, so
-                    // it happens on entry and the row paints from the cache.
-                    self.refresh_shell_catalog();
-                }
+                self.enter_section(section);
             }
             SettingsAction::OpenThinkTermConfigFile => {
                 self.ui.open_dropdown = None;
@@ -3571,27 +3864,33 @@ impl SettingsWindow {
                 }
                 window.invalidate();
             }
-            SettingsAction::ToggleAgentPanel => {
+            SettingsAction::ToggleRightSidebarPanel(panel) => {
                 self.ui.open_dropdown = None;
-                self.native_settings.chrome.agent_panel_enabled =
-                    !self.native_settings.chrome.agent_panel_enabled;
+                let slot = self.right_sidebar_panel_slot(panel);
+                *slot = Some(!slot.unwrap_or(true));
                 match crate::native_settings::save(&self.native_settings) {
                     Ok(()) => {
-                        // After the save so the detector's preference
-                        // closure reads the new shared value; without this
-                        // the gate waits for the next safety tick.
+                        // After the save so the agent detector's preference
+                        // closure reads the new shared value; without this the
+                        // gate waits for the next safety tick.
                         mux::agent_status::refresh_enabled();
-                        self.status = if self.native_settings.chrome.agent_panel_enabled {
-                            crate::i18n::tr("settings-agent-panel-enabled")
-                        } else {
-                            crate::i18n::tr("settings-agent-panel-disabled")
-                        };
+                        // Not invalidate_all_windows: the sidebar's width can
+                        // have gone to or from zero, and only a real relayout
+                        // resizes the panes around that.
                         if let Some(front_end) = crate::frontend::try_front_end() {
-                            front_end.invalidate_all_windows();
+                            for gui_window in front_end.gui_windows() {
+                                gui_window.window.notify(
+                                    crate::termwindow::TermWindowNotif::Apply(Box::new(
+                                        |term_window| {
+                                            term_window.right_sidebar_panels_changed();
+                                        },
+                                    )),
+                                );
+                            }
                         }
                     }
                     Err(err) => {
-                        self.status = format!("Unable to save agent panel setting: {err:#}");
+                        self.status = format!("Unable to save sidebar panel setting: {err:#}");
                     }
                 }
             }
@@ -3677,6 +3976,61 @@ impl SettingsWindow {
                     self.status = "Memory snapshot copied.".to_string();
                     self.schedule_copied_state_clear(window);
                 }
+            }
+            SettingsAction::CheckForUpdates => {
+                self.ui.open_dropdown = None;
+                // The live query is not wired up yet. Re-reading the cache the
+                // background checker maintains is the same answer a check that
+                // found nothing new would produce, and it costs one stat plus
+                // one small read rather than a blocking HTTP request on the UI
+                // thread. The live check replaces this call, not the button.
+                self.ui.update_status = Some(crate::update::cached_update_status());
+                self.ui.update_checked_until = Some(Instant::now() + Duration::from_millis(1400));
+                self.schedule_copied_state_clear(window);
+            }
+            SettingsAction::OpenLatestRelease => {
+                self.ui.open_dropdown = None;
+                let url = self
+                    .ui
+                    .update_status
+                    .as_ref()
+                    .and_then(|status| status.latest.as_ref())
+                    .map(|latest| crate::update::release_tag_url(&latest.tag_name))
+                    .unwrap_or_else(crate::update::releases_url);
+                wezterm_open_url::open_url(&url);
+            }
+            SettingsAction::OpenReleasesIndex => {
+                self.ui.open_dropdown = None;
+                wezterm_open_url::open_url(&crate::update::releases_url());
+            }
+            SettingsAction::OpenSourceRepository => {
+                self.ui.open_dropdown = None;
+                wezterm_open_url::open_url(crate::update::REPO_URL);
+            }
+            SettingsAction::OpenThirdPartyNotices => {
+                self.ui.open_dropdown = None;
+                wezterm_open_url::open_url(&format!(
+                    "{}/blob/main/NOTICE",
+                    crate::update::REPO_URL
+                ));
+            }
+            SettingsAction::OpenPrivacyPolicy => {
+                self.ui.open_dropdown = None;
+                wezterm_open_url::open_url(&format!(
+                    "{}/blob/main/PRIVACY.md",
+                    crate::update::REPO_URL
+                ));
+            }
+            SettingsAction::OpenDataFolder => {
+                self.ui.open_dropdown = None;
+                Self::open_path(config::DATA_DIR.clone());
+            }
+            SettingsAction::CopyVersionInfo => {
+                self.ui.open_dropdown = None;
+                window.set_clipboard(Clipboard::Clipboard, self.version_info_for_clipboard());
+                self.ui.version_info_copied_until =
+                    Some(Instant::now() + Duration::from_millis(1400));
+                self.schedule_copied_state_clear(window);
             }
             SettingsAction::ToggleInputDiagnostics => {
                 self.ui.open_dropdown = None;
@@ -4283,14 +4637,12 @@ impl SettingsWindow {
 
     fn paint_sidebar(&mut self, layers: &mut TripleLayerQuadAllocator<'_>) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let sidebar_title_font = Rc::clone(&self.sidebar_title_font);
         let nav_font = Rc::clone(&self.ui_font);
         let tokens = self.ui.tokens;
         let sidebar_width = self.ui.sidebar.width;
-        let sidebar_icon_size = ((self.metrics.cell_size.height as f32 + self.ui_px(8.0))
-            .clamp(self.ui_px(24.0), self.ui_px(34.0))
-            .round()) as usize;
+        let sidebar_icon_size = self.sidebar_icon_size();
 
         self.draw_text(
             layers,
@@ -4308,61 +4660,9 @@ impl SettingsWindow {
             sidebar_width - tokens.sidebar_padding * 2.0,
             tokens.control_height,
         );
-        let search_text = self.ui.search.text().to_string();
-        self.paint_text_input(
-            layers,
-            TextInputSpec {
-                placeholder: &crate::i18n::tr("settings-search-placeholder"),
-                text: &search_text,
-                rect: search_rect,
-                focused: self.ui.interaction.focused == Some(SettingsAction::SearchInput),
-                selected_all: self.ui.search.selected_all,
-                action: SettingsAction::SearchInput,
-            },
-        )?;
-        self.draw_svg_icon(
-            layers,
-            SettingsIcon::Search.svg(),
-            search_rect.origin.x + self.ui_px(15.0),
-            search_rect.origin.y + (search_rect.size.height - sidebar_icon_size as f32) / 2.0,
-            sidebar_icon_size as f32,
-            palette.muted_text,
-        )?;
-        if !self.ui.search.is_empty() {
-            let clear_size = self.ui_px(34.0);
-            let clear_icon_size = self.ui_px(24.0);
-            let clear_rect = rect(
-                search_rect.origin.x + search_rect.size.width - clear_size - self.ui_px(10.0),
-                search_rect.origin.y + (search_rect.size.height - clear_size) / 2.0,
-                clear_size,
-                clear_size,
-            );
-            self.ui_context
-                .push(clear_rect, WidgetKind::Button, SettingsAction::ClearSearch);
-            if self.ui.interaction.hovered == Some(SettingsAction::ClearSearch)
-                || self.ui.interaction.pressed == Some(SettingsAction::ClearSearch)
-            {
-                self.draw_rounded_rect(
-                    layers,
-                    0,
-                    clear_rect.origin.x,
-                    clear_rect.origin.y,
-                    clear_rect.size.width,
-                    clear_rect.size.height,
-                    palette.control_hover_bg,
-                    self.ui_px(14.0),
-                )?;
-            }
-            self.draw_svg_icon(
-                layers,
-                SettingsIcon::Clear.svg(),
-                clear_rect.origin.x + (clear_rect.size.width - clear_icon_size) / 2.0,
-                clear_rect.origin.y + (clear_rect.size.height - clear_icon_size) / 2.0,
-                clear_icon_size,
-                palette.secondary_text,
-            )?;
-        }
-
+        // Painted below, after the nav list and on the top layer: the mask
+        // that hides the list's overhang reaches up into this field, so the
+        // field has to go down after it and above it.
         let handle_rect = rect(
             sidebar_width - tokens.resize_handle_width / 2.0,
             0.0,
@@ -4392,10 +4692,10 @@ impl SettingsWindow {
         )?;
 
         let sections = self.filtered_sections();
-        let list_top = self.ui_px(SIDEBAR_LIST_TOP);
+        let list_top = self.sidebar_list_top();
         let list_bottom = (self.dimensions.pixel_height as f32 - self.ui_px(16.0)).max(list_top);
         let list_height = list_bottom - list_top;
-        let content_extent = sections.len() as f32 * self.ui_px(NAV_ROW_STEP) + 8.0;
+        let content_extent = sections.len() as f32 * self.nav_row_step() + 8.0;
         self.ui
             .sidebar_scroll
             .set_extents(list_height, content_extent.max(list_height));
@@ -4410,7 +4710,7 @@ impl SettingsWindow {
         if sections.is_empty() {
             self.draw_text(
                 layers,
-                &ui_font,
+                &body_font,
                 tokens.sidebar_padding + 12.0,
                 list_top + self.ui_px(18.0),
                 &crate::i18n::tr("settings-search-no-results"),
@@ -4420,15 +4720,15 @@ impl SettingsWindow {
         }
 
         for section in sections {
-            if y + self.ui_px(NAV_ROW_HEIGHT) < list_top || y > list_bottom {
-                y += self.ui_px(NAV_ROW_STEP);
+            if y + self.nav_row_height() < list_top || y > list_bottom {
+                y += self.nav_row_step();
                 continue;
             }
             let action = SettingsAction::Select(section);
             let selected = section == self.selected;
             let hovered = self.ui.interaction.hovered == Some(action);
             let pressed = self.ui.interaction.pressed == Some(action);
-            let row_y = y - self.ui_px(6.0);
+            let row_y = y;
             let row_x = tokens.sidebar_padding;
             let row_width = sidebar_width - tokens.sidebar_padding * 2.0;
             let row_bg = if selected {
@@ -4440,24 +4740,43 @@ impl SettingsWindow {
             } else {
                 None
             };
-            if let Some(row_bg) = row_bg {
-                self.draw_rounded_rect(
+            let row_height = self.nav_row_height();
+            let row_radius = self.ui_px(NAV_ROW_RADIUS);
+            if selected {
+                // Shadow, fill, then hairline border -- the same three passes
+                // the main window's sidebar gives its active row.
+                self.paint_active_row_shadow(
+                    layers, row_x, row_y, row_width, row_height, row_radius,
+                )?;
+                self.draw_rounded_frame(
                     layers,
                     0,
                     row_x,
                     row_y,
                     row_width,
-                    self.ui_px(NAV_ROW_HEIGHT),
-                    row_bg,
-                    self.ui_px(NAV_ROW_RADIUS),
+                    row_height,
+                    palette.nav_selected_bg,
+                    palette.nav_selected_border,
+                    row_radius,
+                )?;
+            } else if let Some(row_bg) = row_bg {
+                self.draw_rounded_rect(
+                    layers, 0, row_x, row_y, row_width, row_height, row_bg, row_radius,
                 )?;
             }
 
-            self.ui_context.push(
-                rect(row_x, row_y, row_width, self.ui_px(NAV_ROW_HEIGHT)),
-                WidgetKind::SidebarRow,
-                action,
-            );
+            // Clamped to the list, matching the main window's sidebar: the
+            // part of a half-scrolled row that sits above the list is hidden,
+            // and a hidden row must not be clickable.
+            let hit_top = row_y.max(list_top);
+            let hit_bottom = (row_y + self.nav_row_height()).min(list_bottom);
+            if hit_bottom > hit_top {
+                self.ui_context.push(
+                    rect(row_x, hit_top, row_width, hit_bottom - hit_top),
+                    WidgetKind::SidebarRow,
+                    action,
+                );
+            }
             let text_color = if selected {
                 palette.selected_text
             } else {
@@ -4467,8 +4786,8 @@ impl SettingsWindow {
                 layers,
                 section.icon().svg(),
                 row_x + self.ui_px(14.0),
-                row_y + (self.ui_px(NAV_ROW_HEIGHT) - sidebar_icon_size as f32) / 2.0,
-                sidebar_icon_size as f32,
+                row_y + (self.nav_row_height() - sidebar_icon_size) / 2.0,
+                sidebar_icon_size,
                 text_color,
             )?;
             let section_label = section.label();
@@ -4476,12 +4795,72 @@ impl SettingsWindow {
                 layers,
                 &nav_font,
                 row_x + self.ui_px(56.0),
-                self.control_text_y(row_y, self.ui_px(NAV_ROW_HEIGHT)),
+                self.control_text_y(row_y, self.nav_row_height()),
                 &section_label,
                 text_color,
                 row_width - self.ui_px(76.0),
             )?;
-            y += self.ui_px(NAV_ROW_STEP);
+            y += self.nav_row_step();
+        }
+
+        self.paint_sidebar_top_mask(layers, list_area)?;
+        let search_text = self.ui.search.text().to_string();
+        self.paint_text_input(
+            layers,
+            2,
+            TextInputSpec {
+                placeholder: &crate::i18n::tr("settings-search-placeholder"),
+                text: &search_text,
+                rect: search_rect,
+                focused: self.ui.interaction.focused == Some(SettingsAction::SearchInput),
+                selected_all: self.ui.search.selected_all,
+                action: SettingsAction::SearchInput,
+            },
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SettingsIcon::Search.svg(),
+            search_rect.origin.x + self.ui_px(15.0),
+            search_rect.origin.y + (search_rect.size.height - sidebar_icon_size) / 2.0,
+            sidebar_icon_size,
+            palette.muted_text,
+        )?;
+        if !self.ui.search.is_empty() {
+            let clear_size = self.ui_px(34.0);
+            let clear_icon_size = self.ui_px(24.0);
+            let clear_rect = rect(
+                search_rect.origin.x + search_rect.size.width - clear_size - self.ui_px(10.0),
+                search_rect.origin.y + (search_rect.size.height - clear_size) / 2.0,
+                clear_size,
+                clear_size,
+            );
+            self.ui_context
+                .push(clear_rect, WidgetKind::Button, SettingsAction::ClearSearch);
+            if self.ui.interaction.hovered == Some(SettingsAction::ClearSearch)
+                || self.ui.interaction.pressed == Some(SettingsAction::ClearSearch)
+            {
+                // Layer 2, with the field: layers composite bottom-up
+                // regardless of call order, so a highlight on layer 0 sits
+                // under the field's own fill and is never seen.
+                self.draw_rounded_rect(
+                    layers,
+                    2,
+                    clear_rect.origin.x,
+                    clear_rect.origin.y,
+                    clear_rect.size.width,
+                    clear_rect.size.height,
+                    palette.control_hover_bg,
+                    self.ui_px(14.0),
+                )?;
+            }
+            self.draw_svg_icon(
+                layers,
+                SettingsIcon::Clear.svg(),
+                clear_rect.origin.x + (clear_rect.size.width - clear_icon_size) / 2.0,
+                clear_rect.origin.y + (clear_rect.size.height - clear_icon_size) / 2.0,
+                clear_icon_size,
+                palette.secondary_text,
+            )?;
         }
 
         self.paint_scrollbar(
@@ -4491,6 +4870,71 @@ impl SettingsWindow {
             self.sidebar_scrollbar_visible(),
         )?;
 
+        Ok(())
+    }
+
+    /// Hide what the nav list hangs above its own area.
+    ///
+    /// Rows are culled against the list but not clipped to it, so a row
+    /// scrolled halfway out still paints its full height -- upwards, into the
+    /// search field. The opaque band swallows that overhang and the ramp under
+    /// it dissolves the row, the way `ssh_hosts_view::paint_list_fades` does
+    /// for its list. Only the top: at the bottom the row runs off the window,
+    /// which is what a list is supposed to look like.
+    fn paint_sidebar_top_mask(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        list_area: window::RectF,
+    ) -> anyhow::Result<()> {
+        if list_area.size.width <= 0.0 || list_area.size.height <= 0.0 {
+            return Ok(());
+        }
+        let palette = self.palette();
+        let scroll = self.ui.sidebar_scroll;
+
+        // Opaque, a full row tall, ending at the list. A row is culled only
+        // once it is entirely above the list, so it hangs up to one row height
+        // over this band -- which means the band reaches into the search field
+        // and the field is repainted over it on a higher layer. Sizing the
+        // band to the tallest element is the rule from
+        // `right_sidebar::sidebar_row_element_visible`; a shorter band silently
+        // goes back to withholding rows near the edge instead of sliding them.
+        let gap_top = list_area.origin.y - self.nav_row_height();
+        let gap_height = list_area.origin.y - gap_top;
+        if gap_height > 0.0 {
+            self.draw_rect(
+                layers,
+                2,
+                list_area.origin.x,
+                gap_top,
+                list_area.size.width,
+                gap_height,
+                palette.sidebar_bg,
+            )?;
+        }
+
+        let fade = self
+            .ui_px(SIDEBAR_LIST_FADE_HEIGHT)
+            .min(list_area.size.height)
+            .ceil() as usize;
+        if fade == 0 {
+            return Ok(());
+        }
+        if scroll.offset > 0.5 {
+            for step in 0..fade {
+                let progress = step as f32 / fade as f32;
+                let alpha = 1.0 - progress * progress * (3.0 - 2.0 * progress);
+                self.draw_rect(
+                    layers,
+                    2,
+                    list_area.origin.x,
+                    list_area.origin.y + step as f32,
+                    list_area.size.width,
+                    1.0,
+                    palette.sidebar_bg.mul_alpha(alpha),
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -4550,13 +4994,9 @@ impl SettingsWindow {
             SettingsSection::Developer => self.paint_developer(layers, x, max_width)?,
             SettingsSection::UiKit => self.paint_ui_kit(layers, x, max_width)?,
             SettingsSection::Memory => self.paint_memory_diagnostics(layers, x, max_width)?,
-            SettingsSection::About => self.paint_placeholder(
-                layers,
-                &ui_font,
-                x,
-                &crate::i18n::tr("settings-about-description"),
-                max_width,
-            )?,
+            SettingsSection::Sidebar => self.paint_sidebar_settings(layers, x, max_width)?,
+            SettingsSection::Update => self.paint_update(layers, x, max_width)?,
+            SettingsSection::About => self.paint_about(layers, x, max_width)?,
         }
         self.paint_scrollbar(
             layers,
@@ -4576,7 +5016,7 @@ impl SettingsWindow {
         max_width: f32,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
@@ -4606,7 +5046,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             &crate::i18n::tr("settings-general-heading"),
@@ -4682,7 +5122,7 @@ impl SettingsWindow {
         max_width: f32,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let config = configuration();
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
@@ -4710,7 +5150,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             &crate::i18n::tr("settings-appearance-theme-heading"),
@@ -4765,7 +5205,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             typography_title_y,
             &crate::i18n::tr("settings-typography-heading"),
@@ -4826,6 +5266,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let scroll = self.ui.content_scroll.offset;
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
 
@@ -4844,7 +5285,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             &crate::i18n::tr("settings-archived-heading"),
@@ -4892,7 +5333,7 @@ impl SettingsWindow {
             )?;
             self.draw_text(
                 layers,
-                &ui_font,
+                &body_font,
                 row_x + tile + icon_gap,
                 first_row_y,
                 &crate::i18n::tr("settings-archived-empty"),
@@ -4980,7 +5421,7 @@ impl SettingsWindow {
             meta_args.set("when", format_archived_when(row.archived_at));
             self.draw_text(
                 layers,
-                &ui_font,
+                &body_font,
                 text_x,
                 self.settings_row_description_y(y),
                 &crate::i18n::tr_args("settings-archived-meta", &meta_args),
@@ -5019,7 +5460,7 @@ impl SettingsWindow {
         max_width: f32,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let scroll = self.ui.content_scroll.offset;
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Idle timeout, download folder, its reset, and the drop destination.
@@ -5040,7 +5481,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             &crate::i18n::tr("settings-workspaces-heading"),
@@ -5110,7 +5551,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             sounds_title_y,
             &crate::i18n::tr("settings-notifications-heading"),
@@ -5138,7 +5579,7 @@ impl SettingsWindow {
         max_width: f32,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let scroll = self.ui.content_scroll.offset;
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Hotkey, rows, font size, group search.
@@ -5152,7 +5593,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             &crate::i18n::tr("settings-command-palette-heading"),
@@ -5273,16 +5714,14 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let scroll = self.ui.content_scroll.offset;
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
 
-        // Card 1: the panel/detection feature toggle.
-        let toggle_row_count = 1;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, toggle_row_count);
-        let card_height = self.settings_card_height(toggle_row_count);
-        // Card 2: one row per supported agent. Clicking a row expands an
-        // inset card explaining how that agent is covered; the outer card
-        // grows by the detail block's height.
+        // One row per supported agent. Clicking a row expands an inset card
+        // explaining how that agent is covered; the outer card grows by the
+        // detail block's height. Whether the panel is shown at all is a
+        // sidebar question and lives in Settings > Sidebar.
         let integrations_row_count = crate::agent_status::SUPPORTED_AGENTS.len();
         let padding = 36.0;
         let row_x = x + padding;
@@ -5324,8 +5763,8 @@ impl SettingsWindow {
                 (detail_block_rel_y + detail_block_height + self.ui_px(18.0) - row_step).max(0.0)
             })
             .unwrap_or(0.0);
-        let integrations_title_y = card_y + card_height + self.settings_section_card_gap();
-        let integrations_card_y = integrations_title_y + self.settings_section_card_gap().min(54.0);
+        let integrations_title_y = section_y;
+        let integrations_card_y = integrations_title_y + self.settings_section_card_gap();
         let integrations_first_row_y = integrations_card_y + self.settings_card_top_padding();
         let mut integrations_card_height =
             self.settings_card_height(integrations_row_count) + expanded_extra;
@@ -5352,31 +5791,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
-            x,
-            section_y,
-            &crate::i18n::tr("settings-agents-heading"),
-            palette.muted_text,
-            max_width,
-        )?;
-        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
-        self.paint_toggle_setting_row(
-            layers,
-            row_x,
-            first_row_y,
-            row_width,
-            &crate::i18n::tr("settings-agent-panel"),
-            &crate::i18n::tr("settings-agent-panel-description"),
-            self.native_settings.chrome.agent_panel_enabled,
-            SettingsAction::ToggleAgentPanel,
-            // Sole row in its card: a top rule would just underline the
-            // group heading for no reason.
-            false,
-        )?;
-
-        self.draw_text(
-            layers,
-            &ui_font,
+            &body_font,
             x,
             integrations_title_y,
             &crate::i18n::tr("settings-agents-integrations-heading"),
@@ -5473,7 +5888,7 @@ impl SettingsWindow {
             )?;
             self.draw_text(
                 layers,
-                &ui_font,
+                &body_font,
                 text_x,
                 self.settings_row_description_y(row_y),
                 &description,
@@ -5505,7 +5920,7 @@ impl SettingsWindow {
                     for line in lines {
                         self.draw_text(
                             layers,
-                            &ui_font,
+                            &body_font,
                             row_x + detail_text_inset,
                             detail_y,
                             line,
@@ -5530,7 +5945,7 @@ impl SettingsWindow {
         max_width: f32,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let config = configuration();
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
@@ -5568,7 +5983,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             &crate::i18n::tr("settings-terminal-heading"),
@@ -5709,7 +6124,7 @@ impl SettingsWindow {
         max_width: f32,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
@@ -5723,7 +6138,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             &crate::i18n::tr("settings-developer-description"),
@@ -5734,25 +6149,21 @@ impl SettingsWindow {
         let card_padding = 36.0;
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
-        let developer_mode_value = if self.developer_mode_enabled() {
-            crate::i18n::tr("common-on")
-        } else {
-            crate::i18n::tr("common-off")
-        };
         let developer_tabs_value = if self.developer_mode_enabled() {
             crate::i18n::tr("settings-developer-tabs-value")
         } else {
             crate::i18n::tr("common-hidden")
         };
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
-        self.paint_setting_row(
+        self.paint_toggle_setting_row(
             layers,
             row_x,
             first_row_y,
             row_width,
             &crate::i18n::tr("settings-developer-mode"),
             &crate::i18n::tr("settings-developer-mode-description"),
-            &developer_mode_value,
+            self.developer_mode_enabled(),
+            SettingsAction::ToggleDeveloperMode,
             false,
         )?;
         self.paint_toggle_setting_row(
@@ -5786,24 +6197,10 @@ impl SettingsWindow {
             &crate::i18n::tr("settings-onboarding-launcher-value"),
             true,
         )?;
-        let developer_label = if self.developer_mode_enabled() {
-            crate::i18n::tr("settings-disable-developer")
-        } else {
-            crate::i18n::tr("settings-enable-developer")
-        };
-        let developer_width = self.button_width_for_label(&developer_label, 300.0);
         let show_onboarding_label = crate::i18n::tr("settings-show-onboarding");
         self.draw_button(
             layers,
             x,
-            button_y,
-            developer_width,
-            &developer_label,
-            SettingsAction::ToggleDeveloperMode,
-        )?;
-        self.draw_button(
-            layers,
-            x + developer_width + self.ui_px(14.0),
             button_y,
             self.button_width_for_label(&show_onboarding_label, 300.0),
             &show_onboarding_label,
@@ -5821,6 +6218,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let two_column = max_width >= 940.0;
         let content_extent = if two_column { 1020.0 } else { 1660.0 };
         self.ui
@@ -5830,7 +6228,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.ui_px(CONTENT_SECTION_Y) - scroll,
             "Live settings UI components. The left side is rendered with the same primitives as the real window.",
@@ -6063,6 +6461,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
@@ -6073,7 +6472,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             "Memory and input diagnostics are manual. Developer mode only reveals this page; sampling starts when you enable it here.",
@@ -6129,13 +6528,7 @@ impl SettingsWindow {
         } else {
             "Refresh for vmmap"
         };
-        let monitor_state = if self.ui.memory_monitoring {
-            "Running"
-        } else {
-            "Off"
-        };
         let input = crate::input_diagnostics::snapshot();
-        let input_state = if input.enabled { "Running" } else { "Off" };
         let input_events = format!("{} events", input.key_events);
         let input_p95 = crate::input_diagnostics::format_duration(input.recent_p95);
         let input_avg = crate::input_diagnostics::format_duration(input.average_duration());
@@ -6165,14 +6558,15 @@ impl SettingsWindow {
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
-        self.paint_setting_row(
+        self.paint_toggle_setting_row(
             layers,
             row_x,
             first_row_y,
             row_width,
             "Manual Sampling",
             "Keeps refreshing this page until you turn it off.",
-            monitor_state,
+            self.ui.memory_monitoring,
+            SettingsAction::ToggleMemoryMonitoring,
             false,
         )?;
         self.paint_setting_row(
@@ -6275,14 +6669,15 @@ impl SettingsWindow {
             &text,
             true,
         )?;
-        self.paint_setting_row(
+        self.paint_toggle_setting_row(
             layers,
             row_x,
             first_row_y + row_step * 11.0,
             row_width,
             "Input Diagnostics",
             "Manual tracing for long-running typing latency. No key text is stored.",
-            input_state,
+            input.enabled,
+            SettingsAction::ToggleInputDiagnostics,
             true,
         )?;
         self.paint_setting_row(
@@ -6318,7 +6713,7 @@ impl SettingsWindow {
         if let Some(error) = &snapshot.vmmap_error {
             self.draw_text(
                 layers,
-                &ui_font,
+                &body_font,
                 row_x,
                 first_row_y + row_step * 15.0,
                 error,
@@ -6326,20 +6721,7 @@ impl SettingsWindow {
                 row_width,
             )?;
         }
-        let primary_label = if self.ui.memory_monitoring {
-            "Stop Memory Sampling"
-        } else {
-            "Start Memory Sampling"
-        };
-        self.draw_button(
-            layers,
-            x,
-            button_y,
-            self.button_width_for_label(primary_label, 300.0),
-            primary_label,
-            SettingsAction::ToggleMemoryMonitoring,
-        )?;
-        let refresh_x = x + self.button_width_for_label(primary_label, 300.0) + self.ui_px(16.0);
+        let refresh_x = x;
         self.draw_button(
             layers,
             refresh_x,
@@ -6363,21 +6745,7 @@ impl SettingsWindow {
             copy_label,
             SettingsAction::CopyMemorySnapshot,
         )?;
-        let input_primary_label = if input.enabled {
-            "Stop Input Trace"
-        } else {
-            "Start Input Trace"
-        };
-        self.draw_button(
-            layers,
-            x,
-            input_button_y,
-            self.button_width_for_label(input_primary_label, 250.0),
-            input_primary_label,
-            SettingsAction::ToggleInputDiagnostics,
-        )?;
-        let reset_input_x =
-            x + self.button_width_for_label(input_primary_label, 250.0) + self.ui_px(16.0);
+        let reset_input_x = x;
         self.draw_button(
             layers,
             reset_input_x,
@@ -6415,7 +6783,7 @@ impl SettingsWindow {
         for (idx, line) in resource_lines.iter().enumerate() {
             self.draw_text(
                 layers,
-                &ui_font,
+                &body_font,
                 row_x,
                 resource_card_y + self.ui_px(66.0) + resource_line_height * idx as f32,
                 line,
@@ -6436,6 +6804,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         self.draw_text(layers, &ui_font, x, y, "Search Field", palette.title, width)?;
         self.draw_rounded_frame(
             layers,
@@ -6450,7 +6819,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x + self.ui_px(18.0),
             self.control_text_y(y + 28.0, self.ui_px(CONTROL_HEIGHT)),
             "Search settings...",
@@ -6470,7 +6839,7 @@ impl SettingsWindow {
         selected: bool,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let row_width = width.min(self.ui_px(420.0));
         if selected {
             self.draw_rounded_rect(
@@ -6479,7 +6848,7 @@ impl SettingsWindow {
                 x,
                 y,
                 row_width,
-                self.ui_px(NAV_ROW_HEIGHT),
+                self.nav_row_height(),
                 palette.nav_selected_bg,
                 self.ui_px(NAV_ROW_RADIUS),
             )?;
@@ -6490,16 +6859,16 @@ impl SettingsWindow {
                 x,
                 y,
                 row_width,
-                self.ui_px(NAV_ROW_HEIGHT),
+                self.nav_row_height(),
                 palette.nav_hover_bg,
                 self.ui_px(NAV_ROW_RADIUS),
             )?;
         }
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x + self.ui_px(16.0),
-            self.control_text_y(y, self.ui_px(NAV_ROW_HEIGHT)),
+            self.control_text_y(y, self.nav_row_height()),
             label,
             if selected {
                 palette.selected_text
@@ -6680,7 +7049,7 @@ impl SettingsWindow {
         max_width: f32,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
@@ -6742,7 +7111,7 @@ impl SettingsWindow {
 
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             section_y,
             &crate::i18n::tr("settings-compatibility-description"),
@@ -6858,6 +7227,648 @@ impl SettingsWindow {
         Ok(())
     }
 
+    /// A filled, rounded tile with a white glyph centered in it -- the badge
+    /// that carries the Update page's status and the About page's app mark.
+    fn paint_status_badge(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        icon: SvgIcon,
+        x: f32,
+        y: f32,
+        size: f32,
+        tint: LinearRgba,
+    ) -> anyhow::Result<()> {
+        // A disc rather than a rounded square: the badge states a status, and
+        // the app's own mark on About is the rounded square. The shadow is the
+        // same one a selected sidebar row gets, so the two lift by the same
+        // amount.
+        let radius = size / 2.0;
+        self.paint_active_row_shadow(layers, x, y, size, size, radius)?;
+        self.draw_rounded_frame(layers, 0, x, y, size, size, tint, tint, radius)?;
+        let glyph = (size * 0.5).round();
+        self.draw_svg_icon(
+            layers,
+            icon,
+            x + (size - glyph) / 2.0,
+            y + (size - glyph) / 2.0,
+            glyph,
+            LinearRgba::with_components(1.0, 1.0, 1.0, 1.0),
+        )
+    }
+
+    /// Row geometry for the two app-level pages. Unlike `settings_row_step`
+    /// these rows carry no explanation line, so they are a single line tall
+    /// -- the shape macOS System Settings uses for a list of plain facts.
+    fn compact_row_step(&self) -> f32 {
+        let cell_height = self.metrics.cell_size.height as f32;
+        (cell_height + self.ui_px(48.0))
+            .max(self.ui_px(84.0))
+            .ceil()
+    }
+
+    fn compact_card_height(&self, rows: usize) -> f32 {
+        if rows == 0 {
+            return 0.0;
+        }
+        self.compact_row_step() * rows as f32 + self.ui_px(24.0)
+    }
+
+    /// `label ............ value`, both on one line, the value flush right in
+    /// the secondary weight. `y` is the top of the row band, not the text.
+    fn paint_compact_row(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        value: &str,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        let step = self.compact_row_step();
+        if draw_top_rule {
+            self.paint_separator(layers, x, y, width)?;
+        }
+        let text_y = self.control_text_y(y, step);
+
+        // The value takes what it needs from the right; the label gets the
+        // rest, so a long value shortens the label rather than overlapping.
+        let value_width = self
+            .measure_text_width(&body_font, value)
+            .min(width * 0.62)
+            .ceil();
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            text_y,
+            label,
+            palette.text,
+            (width - value_width - self.ui_px(20.0)).max(0.0),
+        )?;
+        self.draw_text(
+            layers,
+            &body_font,
+            x + width - value_width,
+            text_y,
+            value,
+            palette.secondary_text,
+            value_width,
+        )
+    }
+
+    /// The application icon at `size`, from the packaged PNG rather than the
+    /// SVG set: it is the app's real mark, and About is where that matters.
+    fn draw_app_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        size: f32,
+    ) -> anyhow::Result<()> {
+        if size <= 0.0 {
+            return Ok(());
+        }
+        let render_state = self.render_state.as_ref().unwrap();
+        let sprite = render_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_app_icon(size.round() as usize)?
+            .texture_coords();
+        let mut quad = layers.allocate(2)?;
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        quad.set_position(
+            x - left_offset,
+            y - top_offset,
+            x + size - left_offset,
+            y + size - top_offset,
+        );
+        quad.set_texture(sprite);
+        let white = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
+        quad.set_fg_color(white);
+        quad.set_alt_color_and_mix_value(white, 0.0);
+        quad.set_hsv(None);
+        quad.set_has_color(true);
+        Ok(())
+    }
+
+    /// A wrapping row of pill buttons, the way LaunchNext and macOS put a
+    /// page's outbound links along the bottom instead of one per row.
+    /// Returns the height it consumed.
+    fn paint_button_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        max_width: f32,
+        buttons: &[(String, SettingsAction)],
+    ) -> anyhow::Result<f32> {
+        let gap = self.ui_px(14.0);
+        let height = self.ui_px(CONTROL_HEIGHT);
+        let mut cursor_x = x;
+        let mut cursor_y = y;
+        for (label, action) in buttons {
+            let width = self.button_width_for_label(label, 0.0);
+            if cursor_x > x && cursor_x + width > x + max_width {
+                cursor_x = x;
+                cursor_y += height + gap;
+            }
+            self.draw_button(layers, cursor_x, cursor_y, width, label, *action)?;
+            cursor_x += width + gap;
+        }
+        Ok(cursor_y + height - y)
+    }
+
+    /// What the Update hero is currently able to say. Derived entirely from
+    /// the cache the background checker writes; a live check will produce
+    /// these same states once one is wired up.
+    fn update_hero(&self) -> UpdateHero {
+        let Some(status) = self.ui.update_status.as_ref() else {
+            return UpdateHero::Unknown;
+        };
+        if !status.running_a_release_build() {
+            return UpdateHero::LocalBuild;
+        }
+        match (&status.latest, status.update_available) {
+            (Some(latest), true) => UpdateHero::Available {
+                tag: latest.tag_name.clone(),
+            },
+            (Some(_), false) => UpdateHero::UpToDate,
+            (None, _) => UpdateHero::Unknown,
+        }
+    }
+
+    fn running_version_label(&self) -> String {
+        self.ui
+            .update_status
+            .as_ref()
+            .map(|status| status.current_version.clone())
+            .unwrap_or_else(|| config::wezterm_version().to_string())
+    }
+
+    /// The hero every app-level page opens with: a badge, a headline, a
+    /// second line, and one button on the right. Returns the card's height.
+    fn paint_hero(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        max_width: f32,
+        badge: HeroBadge,
+        headline: &str,
+        subline: &str,
+        button: Option<(String, SettingsAction)>,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let title_font = Rc::clone(&self.title_font);
+        let cell = self.metrics.cell_size.height as f32;
+        let padding = self.ui_px(HERO_PADDING);
+        let mark = self.ui_px(HERO_MARK_SIZE);
+        let height = (cell * 2.0 + self.ui_px(74.0)).max(mark + padding * 2.0);
+
+        self.paint_group_card(layers, x, y, max_width, height)?;
+
+        let mut text_right = x + max_width - padding;
+        if let Some((label, action)) = button {
+            let width = self.button_width_for_label(&label, self.ui_px(230.0));
+            let button_x = x + max_width - padding - width;
+            self.draw_button(
+                layers,
+                button_x,
+                y + (height - self.ui_px(CONTROL_HEIGHT)) / 2.0,
+                width,
+                &label,
+                action,
+            )?;
+            text_right = button_x - self.ui_px(24.0);
+        }
+
+        let mark_x = x + padding;
+        let mark_y = y + (height - mark) / 2.0;
+        match badge {
+            HeroBadge::AppIcon => self.draw_app_icon(layers, mark_x, mark_y, mark)?,
+            HeroBadge::Status { icon, tint } => {
+                self.paint_status_badge(layers, icon, mark_x, mark_y, mark, tint)?
+            }
+        }
+
+        let text_x = mark_x + mark + self.ui_px(24.0);
+        let text_width = (text_right - text_x).max(self.ui_px(120.0));
+        let line_gap = self.ui_px(12.0);
+        let text_y = y + (height - (cell * 2.0 + line_gap)) / 2.0;
+        self.draw_text(
+            layers,
+            &title_font,
+            text_x,
+            text_y,
+            headline,
+            palette.title,
+            text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &body_font,
+            text_x,
+            text_y + cell + line_gap,
+            subline,
+            palette.secondary_text,
+            text_width,
+        )?;
+        Ok(height)
+    }
+
+    /// The four right-sidebar panels, in the order their selector shows them.
+    const RIGHT_SIDEBAR_PANELS: [crate::termwindow::RightSidebarMode; 4] = [
+        crate::termwindow::RightSidebarMode::Chat,
+        crate::termwindow::RightSidebarMode::Tasks,
+        crate::termwindow::RightSidebarMode::Snippets,
+        crate::termwindow::RightSidebarMode::Agents,
+    ];
+
+    /// The stored flag for a panel. `None` means the user never chose, which
+    /// every panel reads as on.
+    fn right_sidebar_panel_slot(
+        &mut self,
+        panel: crate::termwindow::RightSidebarMode,
+    ) -> &mut Option<bool> {
+        use crate::termwindow::RightSidebarMode as Panel;
+        let chrome = &mut self.native_settings.chrome;
+        match panel {
+            Panel::Chat => &mut chrome.right_sidebar_files_enabled,
+            Panel::Tasks => &mut chrome.right_sidebar_notes_enabled,
+            Panel::Snippets => &mut chrome.right_sidebar_snippets_enabled,
+            Panel::Agents => &mut chrome.agent_panel_enabled,
+        }
+    }
+
+    /// Whether the switch shows as on. Deliberately the same predicate the
+    /// sidebar itself uses rather than the stored flag: Agents is also gated
+    /// by the Lua `agent_status_detection` option, and a switch reading on
+    /// while the panel can never appear is how someone turns off the other
+    /// three believing one is left.
+    fn right_sidebar_panel_enabled(&self, panel: crate::termwindow::RightSidebarMode) -> bool {
+        panel.panel_enabled()
+    }
+
+    fn right_sidebar_panel_label(panel: crate::termwindow::RightSidebarMode) -> String {
+        use crate::termwindow::RightSidebarMode as Panel;
+        crate::i18n::tr(match panel {
+            Panel::Chat => "right-mode-files",
+            Panel::Tasks => "right-mode-notes",
+            Panel::Snippets => "right-mode-snippets",
+            Panel::Agents => "right-mode-agents",
+        })
+    }
+
+    fn right_sidebar_panel_description(panel: crate::termwindow::RightSidebarMode) -> String {
+        use crate::termwindow::RightSidebarMode as Panel;
+        crate::i18n::tr(match panel {
+            Panel::Chat => "settings-sidebar-files-description",
+            Panel::Tasks => "settings-sidebar-notes-description",
+            Panel::Snippets => "settings-sidebar-snippets-description",
+            Panel::Agents => "settings-agent-panel-description",
+        })
+    }
+
+    fn paint_sidebar_settings(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let row_step = self.settings_row_step();
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        let card_padding = 36.0;
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+
+        let panels = Self::RIGHT_SIDEBAR_PANELS;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, panels.len());
+        let card_height = self.settings_card_height(panels.len());
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(card_y + scroll + card_height),
+        );
+
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-sidebar-description"),
+            palette.secondary_text,
+            max_width,
+        )?;
+
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        for (index, panel) in panels.iter().enumerate() {
+            let panel = *panel;
+            self.paint_toggle_setting_row(
+                layers,
+                row_x,
+                first_row_y + row_step * index as f32,
+                row_width,
+                &Self::right_sidebar_panel_label(panel),
+                &Self::right_sidebar_panel_description(panel),
+                self.right_sidebar_panel_enabled(panel),
+                SettingsAction::ToggleRightSidebarPanel(panel),
+                index > 0,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn paint_update(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let appearance = self.effective_appearance();
+        let scroll = self.ui.content_scroll.offset;
+        let card_padding = self.ui_px(HERO_PADDING);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        let gap = self.settings_section_card_gap();
+
+        let hero = self.update_hero();
+        let version = self.running_version_label();
+        let (icon, tint, headline, subline) = match &hero {
+            UpdateHero::UpToDate => (
+                SvgIcon::Check,
+                status_tint_positive(appearance),
+                crate::i18n::tr("settings-update-current"),
+                settings_tr("settings-update-current-detail", &[("version", version)]),
+            ),
+            UpdateHero::Available { tag } => (
+                SvgIcon::Download,
+                palette.accent,
+                crate::i18n::tr("settings-update-available"),
+                settings_tr(
+                    "settings-update-available-detail",
+                    &[("latest", tag.clone()), ("current", version)],
+                ),
+            ),
+            UpdateHero::LocalBuild => (
+                SvgIcon::Package,
+                status_tint_neutral(appearance),
+                crate::i18n::tr("settings-update-local-build"),
+                settings_tr(
+                    "settings-update-local-build-detail",
+                    &[("version", version)],
+                ),
+            ),
+            UpdateHero::Unknown => (
+                SvgIcon::RefreshCw,
+                status_tint_neutral(appearance),
+                crate::i18n::tr("settings-update-unknown"),
+                settings_tr("settings-update-unknown-detail", &[("version", version)]),
+            ),
+        };
+
+        let checked_recently = self
+            .ui
+            .update_checked_until
+            .is_some_and(|until| Instant::now() < until);
+        let check_label = if checked_recently {
+            crate::i18n::tr("settings-update-checked")
+        } else {
+            crate::i18n::tr("settings-update-check-now")
+        };
+
+        let hero_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        let hero_height = self.paint_hero(
+            layers,
+            x,
+            hero_y,
+            max_width,
+            HeroBadge::Status { icon, tint },
+            &headline,
+            &subline,
+            Some((check_label, SettingsAction::CheckForUpdates)),
+        )?;
+
+        // Three plain facts, one line each: the labels say what they are, and
+        // an explanation under every one of them was noise.
+        let config = configuration();
+        let rows = [
+            (
+                crate::i18n::tr("settings-update-automatic"),
+                if config.check_for_updates {
+                    crate::i18n::tr("common-on")
+                } else {
+                    crate::i18n::tr("common-off")
+                },
+            ),
+            (
+                crate::i18n::tr("settings-update-frequency"),
+                format_check_interval(config.check_for_updates_interval_seconds),
+            ),
+            (
+                crate::i18n::tr("settings-update-last-checked"),
+                self.ui
+                    .update_status
+                    .as_ref()
+                    .and_then(|status| status.last_checked)
+                    .map(format_last_checked)
+                    .unwrap_or_else(|| crate::i18n::tr("settings-update-never")),
+            ),
+        ];
+        let card_y = hero_y + hero_height + gap;
+        let card_height = self.compact_card_height(rows.len());
+        let row_step = self.compact_row_step();
+        let first_row_y = card_y + self.ui_px(12.0);
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        for (index, (label, value)) in rows.iter().enumerate() {
+            self.paint_compact_row(
+                layers,
+                row_x,
+                first_row_y + row_step * index as f32,
+                row_width,
+                label,
+                value,
+                index > 0,
+            )?;
+        }
+
+        let note_y = card_y + card_height + gap;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            note_y,
+            &crate::i18n::tr("settings-update-manual-note"),
+            palette.secondary_text,
+            max_width,
+        )?;
+
+        let (link_label, link_action) = match &hero {
+            UpdateHero::Available { .. } => (
+                crate::i18n::tr("settings-update-whats-new"),
+                SettingsAction::OpenLatestRelease,
+            ),
+            _ => (
+                crate::i18n::tr("settings-update-all-releases"),
+                SettingsAction::OpenReleasesIndex,
+            ),
+        };
+        let button_y = note_y + self.metrics.cell_size.height as f32 + self.ui_px(24.0);
+        let button_height =
+            self.paint_button_row(layers, x, button_y, max_width, &[(link_label, link_action)])?;
+
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(button_y + scroll + button_height),
+        );
+        Ok(())
+    }
+
+    fn paint_about(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let scroll = self.ui.content_scroll.offset;
+        let card_padding = self.ui_px(HERO_PADDING);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        let gap = self.settings_section_card_gap();
+        let version = self.running_version_label();
+
+        let copied = self
+            .ui
+            .version_info_copied_until
+            .is_some_and(|until| Instant::now() < until);
+        let copy_label = if copied {
+            crate::i18n::tr("settings-about-copied")
+        } else {
+            crate::i18n::tr("settings-about-copy")
+        };
+
+        let hero_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        let hero_height = self.paint_hero(
+            layers,
+            x,
+            hero_y,
+            max_width,
+            HeroBadge::AppIcon,
+            "ThinkTerm",
+            &settings_tr(
+                "settings-about-version-line",
+                &[("version", version.clone())],
+            ),
+            Some((copy_label, SettingsAction::CopyVersionInfo)),
+        )?;
+
+        // Build only earns a line when it says something Version does not: a
+        // release binary stamps both from the same tag.
+        let build = config::wezterm_version();
+        let mut rows = vec![(crate::i18n::tr("settings-about-version"), version.clone())];
+        if build != version {
+            rows.push((crate::i18n::tr("settings-about-build"), build.to_string()));
+        }
+        rows.push((
+            crate::i18n::tr("settings-about-platform"),
+            config::wezterm_target_triple().to_string(),
+        ));
+        rows.push((
+            crate::i18n::tr("settings-about-license"),
+            // Must match what the packages declare -- ci/deploy.sh and
+            // ci/make-winget-pr.sh both say GPL-3.0-only. "or-later" is a
+            // different promise (recipients may use a future GPL), not a
+            // wording variant, so the two must not drift.
+            "GPL-3.0-only".to_string(),
+        ));
+
+        let card_y = hero_y + hero_height + gap;
+        let card_height = self.compact_card_height(rows.len());
+        let row_step = self.compact_row_step();
+        let first_row_y = card_y + self.ui_px(12.0);
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        for (index, (label, value)) in rows.iter().enumerate() {
+            self.paint_compact_row(
+                layers,
+                row_x,
+                first_row_y + row_step * index as f32,
+                row_width,
+                label,
+                value,
+                index > 0,
+            )?;
+        }
+
+        // Everything outbound sits in one wrapping row along the bottom
+        // rather than as a button per row, which is five cards' worth of
+        // chrome for five links.
+        let buttons = [
+            (
+                crate::i18n::tr("settings-about-source"),
+                SettingsAction::OpenSourceRepository,
+            ),
+            (
+                crate::i18n::tr("settings-about-release-notes"),
+                SettingsAction::OpenReleasesIndex,
+            ),
+            (
+                crate::i18n::tr("settings-about-config-file"),
+                SettingsAction::OpenThinkTermConfigFile,
+            ),
+            (
+                crate::i18n::tr("settings-about-data-folder"),
+                SettingsAction::OpenDataFolder,
+            ),
+            (
+                crate::i18n::tr("settings-about-notices"),
+                SettingsAction::OpenThirdPartyNotices,
+            ),
+            (
+                crate::i18n::tr("settings-about-privacy"),
+                SettingsAction::OpenPrivacyPolicy,
+            ),
+        ];
+        let button_y = card_y + card_height + gap;
+        let button_height = self.paint_button_row(layers, x, button_y, max_width, &buttons)?;
+
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(button_y + scroll + button_height),
+        );
+        Ok(())
+    }
+
+    /// The block the About page's Copy button puts on the clipboard: what a
+    /// bug report needs on its first line so nobody has to ask.
+    fn version_info_for_clipboard(&self) -> String {
+        let mut lines = vec![
+            format!("ThinkTerm {}", self.running_version_label()),
+            format!("Build: {}", config::wezterm_version()),
+            format!("Target: {}", config::wezterm_target_triple()),
+            format!("OS: {}", std::env::consts::OS),
+            format!(
+                "Config: {}",
+                Self::thinkterm_compatible_config_path().display()
+            ),
+            format!("Data: {}", config::DATA_DIR.display()),
+        ];
+        if let Some(status) = self.ui.update_status.as_ref() {
+            if let Some(latest) = status.latest.as_ref() {
+                lines.push(format!("Latest release seen: {}", latest.tag_name));
+            }
+        }
+        lines.join("\n")
+    }
+
     fn paint_placeholder(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -6905,21 +7916,18 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
-        let control_width = if width >= 680.0 {
-            280.0_f32.min(width * 0.36)
-        } else {
-            220.0_f32.min(width * 0.44)
-        };
+        let control_width = Self::settings_control_width(width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             description,
@@ -6949,6 +7957,54 @@ impl SettingsWindow {
         Ok(())
     }
 
+    /// An iOS-style switch: a pill track with a circular knob. Replaces the
+    /// On/Off word pill, which read as a value to be inspected rather than a
+    /// control to be flipped.
+    fn paint_switch(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        enabled: bool,
+        hovered: bool,
+        pressed: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let width = self.ui_px(SWITCH_WIDTH);
+        let height = self.ui_px(SWITCH_HEIGHT);
+        let inset = self.ui_px(SWITCH_KNOB_INSET);
+        let knob = height - inset * 2.0;
+
+        // Shared with the in-window switch, which this cannot call: that one
+        // draws through a DrawContext and this window has its own primitives.
+        let track = crate::ui::widgets::toggle_track_color(
+            UiPalette::for_appearance(self.effective_appearance()),
+            enabled,
+            hovered,
+            pressed,
+        );
+        // Passing the fill as the border makes draw_rounded_frame skip the
+        // ring: a stroke the same colour only hardens the pill's edge.
+        let border = track;
+        self.draw_rounded_frame(layers, 0, x, y, width, height, track, border, height / 2.0)?;
+
+        let knob_x = if enabled {
+            x + width - inset - knob
+        } else {
+            x + inset
+        };
+        self.draw_rounded_rect(
+            layers,
+            0,
+            knob_x,
+            y + inset,
+            knob,
+            knob,
+            palette.on_accent,
+            knob / 2.0,
+        )
+    }
+
     fn paint_toggle_setting_row(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -6963,14 +8019,11 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
-        let control_width = if width >= 680.0 {
-            280.0_f32.min(width * 0.36)
-        } else {
-            220.0_f32.min(width * 0.44)
-        };
+        let control_width = Self::settings_control_width(width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
@@ -6985,48 +8038,25 @@ impl SettingsWindow {
 
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
-        let bg = if pressed {
-            palette.control_pressed_bg
-        } else if hovered {
-            palette.control_hover_bg
-        } else {
-            palette.control_bg
-        };
-        let border = if hovered || pressed {
-            palette.separator
-        } else {
-            palette.control_border
-        };
-
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             description,
             palette.secondary_text,
             text_width,
         )?;
-        self.draw_rounded_frame(
+        // The switch sits at the right edge of the control column; the
+        // whole column stays the hit target so the row is still easy to hit.
+        self.paint_switch(
             layers,
-            0,
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            control_x + self.ui_px(14.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            if enabled { "On" } else { "Off" },
-            palette.text,
-            control_width - self.ui_px(26.0),
+            control_x + control_width - self.ui_px(SWITCH_WIDTH),
+            control_y + (self.ui_px(CONTROL_HEIGHT) - self.ui_px(SWITCH_HEIGHT)) / 2.0,
+            enabled,
+            hovered,
+            pressed,
         )?;
         Ok(())
     }
@@ -7045,14 +8075,11 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
-        let control_width = if width >= 680.0 {
-            280.0_f32.min(width * 0.36)
-        } else {
-            220.0_f32.min(width * 0.44)
-        };
+        let control_width = Self::settings_control_width(width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
@@ -7083,7 +8110,7 @@ impl SettingsWindow {
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             description,
@@ -7124,6 +8151,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         let action = SettingsAction::ToggleImportField(field.id);
         let enabled = field.lua_value.is_some();
         let selected = enabled && self.import_field_selected(field.id);
@@ -7213,7 +8241,7 @@ impl SettingsWindow {
         let title = format!("{} / {}", field.category, field.label);
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             label_x,
             y,
             &title,
@@ -7226,7 +8254,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             label_x,
             self.settings_row_description_y(y),
             &field.description,
@@ -7282,6 +8310,42 @@ impl SettingsWindow {
         )
     }
 
+    /// The soft drop shadow the main window puts under a selected sidebar
+    /// row. Same two-pass ramp and the same alphas, so the two sidebars read
+    /// as one surface treatment -- see
+    /// `termwindow::ui::paint_active_surface_shadow` for why light and dark
+    /// need different numbers rather than one shared ramp.
+    fn paint_active_row_shadow(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+    ) -> anyhow::Result<()> {
+        let (outer, inner) = match self.effective_appearance() {
+            Appearance::Light | Appearance::LightHighContrast => (0.04, 0.05),
+            Appearance::Dark | Appearance::DarkHighContrast => (0.12, 0.18),
+        };
+        for (spread, offset_y, alpha) in [
+            (self.ui_px(2.0), self.ui_px(1.0), outer),
+            (self.ui_px(1.0), self.ui_px(1.0), inner),
+        ] {
+            self.draw_rounded_rect(
+                layers,
+                0,
+                x - spread,
+                y - spread + offset_y,
+                width + spread * 2.0,
+                height + spread * 2.0,
+                LinearRgba::with_components(0.0, 0.0, 0.0, alpha),
+                radius + spread,
+            )?;
+        }
+        Ok(())
+    }
+
     fn paint_separator(
         &self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -7310,15 +8374,12 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
-        let control_width = if width >= 680.0 {
-            280.0_f32.min(width * 0.36)
-        } else {
-            220.0_f32.min(width * 0.44)
-        };
+        let control_width = Self::settings_control_width(width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
         let dynamic_icon_size =
@@ -7331,7 +8392,7 @@ impl SettingsWindow {
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             description,
@@ -7443,15 +8504,12 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
-        let control_width = if width >= 680.0 {
-            280.0_f32.min(width * 0.36)
-        } else {
-            220.0_f32.min(width * 0.44)
-        };
+        let control_width = Self::settings_control_width(width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - 24.0).max(width * 0.45);
@@ -7484,7 +8542,7 @@ impl SettingsWindow {
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             description,
@@ -7582,6 +8640,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
@@ -7624,7 +8683,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             &crate::i18n::tr("settings-command-palette-hotkey-description"),
@@ -7702,6 +8761,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
@@ -7744,7 +8804,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             description,
@@ -7793,6 +8853,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
@@ -7835,7 +8896,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             &crate::i18n::tr("settings-language-description"),
@@ -7885,6 +8946,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
@@ -7927,7 +8989,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             description,
@@ -7936,7 +8998,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y)
                 + self.metrics.cell_size.height as f32
@@ -8025,6 +9087,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
@@ -8076,7 +9139,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             &description,
@@ -8149,6 +9212,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
@@ -8191,7 +9255,7 @@ impl SettingsWindow {
         )?;
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             &crate::i18n::tr("settings-main-renderer-description"),
@@ -8240,6 +9304,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
@@ -8268,7 +9333,7 @@ impl SettingsWindow {
         status_args.set("status", value);
         self.draw_text(
             layers,
-            &ui_font,
+            &body_font,
             x,
             self.settings_row_description_y(y),
             &crate::i18n::tr_args("settings-restart-status", &status_args),
@@ -8292,11 +9357,7 @@ impl SettingsWindow {
     }
 
     fn dropdown_control_geometry(&self, x: f32, y: f32, width: f32) -> (f32, f32, f32) {
-        let control_width = if width >= 680.0 {
-            280.0_f32.min(width * 0.36)
-        } else {
-            220.0_f32.min(width * 0.44)
-        };
+        let control_width = Self::settings_control_width(width);
         (
             x + width - control_width,
             y + self.ui_px(4.0),
@@ -8655,45 +9716,49 @@ impl SettingsWindow {
             .collect()
     }
 
+    /// `layer_num` is the layer the whole field paints on -- frame, selection,
+    /// text and caret together. The sidebar's search field passes the top
+    /// layer so it sits above the mask that hides the nav list's overhang;
+    /// layers composite in order, so painting after the mask is not enough.
     fn paint_text_input(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
         spec: TextInputSpec<'_, SettingsAction>,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         self.ui_context
             .push(spec.rect, WidgetKind::TextInput, spec.action);
+        // A neutral bright ring. nav_selected_bg used to sit here, but it
+        // composites darker than the unfocused border, so focus read as no
+        // change at all -- it was the 2px bar above the field, since removed,
+        // that was actually doing the work.
         let border = if spec.focused {
-            palette.nav_selected_bg
+            palette.muted_text
         } else if self.ui.interaction.hovered == Some(spec.action) {
             palette.separator
         } else {
             palette.search_border
         };
+        // The search field is a pill; the value inputs keep the control radius,
+        // so the one you type a query into is shaped unlike the ones you type
+        // a setting into.
+        let radius = if spec.action == SettingsAction::SearchInput {
+            spec.rect.size.height / 2.0
+        } else {
+            self.ui.tokens.control_radius
+        };
         self.draw_rounded_frame(
             layers,
-            0,
+            layer_num,
             spec.rect.origin.x,
             spec.rect.origin.y,
             spec.rect.size.width,
             spec.rect.size.height,
             palette.search_bg,
             border,
-            self.ui.tokens.control_radius,
+            radius,
         )?;
-        if spec.focused {
-            self.draw_rounded_rect(
-                layers,
-                0,
-                spec.rect.origin.x,
-                spec.rect.origin.y,
-                spec.rect.size.width,
-                2.0,
-                palette.nav_selected_bg,
-                1.0,
-            )?;
-        }
-
         let text = if spec.text.is_empty() && !spec.focused {
             spec.placeholder
         } else {
@@ -8724,7 +9789,7 @@ impl SettingsWindow {
                     .min(text_area);
                 self.draw_rounded_rect(
                     layers,
-                    1,
+                    layer_num,
                     text_left + start_x - self.ui_px(4.0),
                     spec.rect.origin.y + self.ui_px(6.0),
                     (end_x - start_x) + self.ui_px(8.0),
@@ -8734,8 +9799,9 @@ impl SettingsWindow {
                 )?;
             }
         }
-        self.draw_text(
+        self.draw_text_on_layer(
             layers,
+            layer_num,
             &font,
             text_left,
             self.control_text_y(spec.rect.origin.y, spec.rect.size.height),
@@ -8751,7 +9817,7 @@ impl SettingsWindow {
             let caret_width = self.ui_px(3.0).max(1.0);
             self.draw_rect(
                 layers,
-                1,
+                layer_num,
                 text_left + caret_dx.min(text_area) - caret_width / 3.0,
                 spec.rect.origin.y + self.ui_px(8.0),
                 caret_width,
@@ -8811,6 +9877,9 @@ impl SettingsWindow {
                 ControlState::Normal
             },
             kind: WidgetKind::Button,
+            // This window paints its own frame below and only reads the
+            // state's colours, so the variant is inert here.
+            variant: ButtonVariant::Secondary,
         };
         self.ui_context
             .push(button.rect, button.kind, button.action);
@@ -8818,6 +9887,9 @@ impl SettingsWindow {
         let palette = self.palette();
         let ui_palette = UiPalette::for_appearance(self.effective_appearance());
         let (background, border) = button.state.colors(ui_palette);
+        // Fully rounded rather than CONTROL_RADIUS: a pill reads as a
+        // button, which is what distinguishes it from the value pills and
+        // text fields that share this height and use the smaller radius.
         self.draw_rounded_frame(
             layers,
             0,
@@ -8827,7 +9899,7 @@ impl SettingsWindow {
             self.ui_px(CONTROL_HEIGHT),
             background,
             border,
-            self.ui_px(CONTROL_RADIUS),
+            self.ui_px(CONTROL_HEIGHT) / 2.0,
         )?;
         // Center the label in the frame. A fixed left inset left every
         // button's text biased toward the left edge -- button_width_for_label
@@ -8911,18 +9983,9 @@ impl SettingsWindow {
         border: LinearRgba,
         radius: f32,
     ) -> anyhow::Result<()> {
-        self.draw_rounded_rect(layers, layer_num, x, y, width, height, border, radius)?;
-        self.draw_rounded_rect(
-            layers,
-            layer_num,
-            x + 1.0,
-            y + 1.0,
-            width - 2.0,
-            height - 2.0,
-            fill,
-            (radius - 1.0).max(0.0),
-        )?;
-        Ok(())
+        crate::ui::draw::draw_rounded_frame(
+            self, layers, layer_num, x, y, width, height, fill, border, radius,
+        )
     }
 
     fn draw_rounded_rect(
@@ -9173,6 +10236,25 @@ impl SettingsWindow {
         color: LinearRgba,
         max_width: f32,
     ) -> anyhow::Result<()> {
+        self.draw_text_on_layer(layers, 1, font, x, y, text, color, max_width)
+    }
+
+    /// Text on a caller-chosen layer. Everything uses the glyph layer except
+    /// the sidebar's search field, which has to paint above the mask that
+    /// hides the nav list's overhang -- and layers composite in order, so
+    /// "after" is not enough there.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_on_layer(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        font: &Rc<LoadedFont>,
+        x: f32,
+        y: f32,
+        text: &str,
+        color: LinearRgba,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
         if text.is_empty() || max_width <= 0.0 {
             return Ok(());
         }
@@ -9203,7 +10285,7 @@ impl SettingsWindow {
                     break;
                 }
 
-                let mut quad = layers.allocate(1)?;
+                let mut quad = layers.allocate(layer_num)?;
                 quad.set_position(
                     glyph_x - left_offset,
                     glyph_y - top_offset,
@@ -9817,5 +10899,47 @@ fn wgpu_color(color: LinearRgba) -> wgpu::Color {
         g: color.1 as f64,
         b: color.2 as f64,
         a: color.3 as f64,
+    }
+}
+
+impl crate::ui::draw::RoundedFramePainter for SettingsWindow {
+    fn frame_rounded_rect(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: LinearRgba,
+        radius: f32,
+    ) -> anyhow::Result<()> {
+        self.draw_rounded_rect(layers, layer_num, x, y, width, height, color, radius)
+    }
+
+    fn frame_rect(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        self.draw_rect(layers, layer_num, x, y, width, height, color)
+    }
+
+    fn frame_corner(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        polys: &'static [Poly],
+        size: euclid::Size2D<f32, window::PixelUnit>,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        self.draw_corner(layers, layer_num, x, y, polys, size, color)
     }
 }

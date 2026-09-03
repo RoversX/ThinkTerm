@@ -8,7 +8,7 @@ use serde::*;
 use std::convert::TryFrom;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use termwiz::cell::{Hyperlink, Underline};
 use termwiz::color::AnsiColor;
 use termwiz::escape::csi::{Cursor, Sgr};
@@ -31,6 +31,19 @@ pub struct Asset {
     pub size: usize,
     pub url: String,
     pub browser_download_url: String,
+}
+
+/// The repository every update link points at. The update check, the toast,
+/// and the Settings Update/About pages all build their URLs from this, so a
+/// fork or a rename is one edit rather than a grep.
+pub const REPO_URL: &str = "https://github.com/RoversX/thinkterm";
+
+pub fn releases_url() -> String {
+    format!("{REPO_URL}/releases")
+}
+
+pub fn release_tag_url(tag: &str) -> String {
+    format!("{REPO_URL}/releases/tag/{tag}")
 }
 
 fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
@@ -89,10 +102,7 @@ pub fn load_last_release_info_and_set_banner() {
 
 fn set_banner_from_release_info(latest: &Release) {
     let mux = crate::Mux::get();
-    let url = format!(
-        "https://github.com/RoversX/thinkterm/releases/tag/{}",
-        latest.tag_name
-    );
+    let url = release_tag_url(&latest.tag_name);
 
     let icon = ITermFileData {
         name: None,
@@ -155,7 +165,7 @@ fn schedule_set_banner_from_release_info(latest: &Release) {
 /// bundle's Info.plist does carry the release version, is read at runtime
 /// rather than compile time, and is already what Finder and the About panel
 /// show, so prefer it when we are running from inside an app bundle.
-fn running_release_version() -> String {
+pub fn running_release_version() -> String {
     #[cfg(target_os = "macos")]
     {
         if let Some(version) = macos_bundle_version() {
@@ -209,6 +219,57 @@ fn is_newer_release(latest: &str, current: &str) -> bool {
         // One of each: there is no ordering between the schemes, and a build
         // that never came from a release is not something to nag about.
         _ => false,
+    }
+}
+
+/// Everything the Settings > Update page can say without touching the network.
+///
+/// `update_checker` already persists the last release it saw to
+/// `DATA_DIR/check_update`, and the filesystem stamps that write with the time
+/// of the check. Reading it back is pure local state, which is what lets the
+/// page render on the UI thread: it can name the running build, the newest
+/// release this install has ever heard of, and when it last looked, without
+/// opening a socket. A live check is a separate concern and does not belong on
+/// the paint path.
+#[derive(Debug, Clone)]
+pub struct CachedUpdateStatus {
+    /// The running build, in the same form `is_newer_release` compares.
+    pub current_version: String,
+    /// The newest release recorded by the last successful check, if any.
+    pub latest: Option<Release>,
+    /// Whether `latest` is something this build should upgrade to. False
+    /// whenever the two versions use different schemes -- see
+    /// `is_newer_release` for why a local build is never nagged.
+    pub update_available: bool,
+    /// When the last check completed. None until one has ever run.
+    pub last_checked: Option<SystemTime>,
+}
+
+impl CachedUpdateStatus {
+    /// Whether the running build carries a release tag rather than a commit
+    /// stamp. A commit-stamped build has no ordering against any release, so
+    /// the UI must say so instead of claiming to be up to date.
+    pub fn running_a_release_build(&self) -> bool {
+        semver::Version::parse(self.current_version.trim_start_matches('v')).is_ok()
+    }
+}
+
+pub fn cached_update_status() -> CachedUpdateStatus {
+    let current_version = running_release_version();
+    let path = config::DATA_DIR.join("check_update");
+    let last_checked = path.metadata().and_then(|meta| meta.modified()).ok();
+    let latest = std::fs::read(&path)
+        .ok()
+        .and_then(|data| serde_json::from_slice::<Release>(&data).ok());
+    let update_available = latest
+        .as_ref()
+        .is_some_and(|latest| is_newer_release(&latest.tag_name, &current_version));
+
+    CachedUpdateStatus {
+        current_version,
+        latest,
+        update_available,
+        last_checked,
     }
 }
 
@@ -303,10 +364,7 @@ fn update_checker() {
                         current
                     );
 
-                    let url = format!(
-                        "https://github.com/RoversX/thinkterm/releases/tag/{}",
-                        latest.tag_name
-                    );
+                    let url = release_tag_url(&latest.tag_name);
 
                     if force_ui || socks.is_empty() || socks[0] == my_sock {
                         persistent_toast_notification_with_click_to_open_url(

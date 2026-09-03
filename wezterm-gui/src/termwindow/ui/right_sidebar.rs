@@ -1267,6 +1267,49 @@ pub(crate) struct RightSidebarFileRowMetrics {
 }
 
 impl RightSidebarMode {
+    /// Selector order, and the order `fall_back_to_an_enabled_panel` walks --
+    /// so the first entry is where a disabled panel falls back to.
+    const ALL: [Self; 4] = [Self::Chat, Self::Tasks, Self::Snippets, Self::Agents];
+
+    /// The panels the selector offers, in order. Reading the toggles here
+    /// rather than hard-coding the list is what lets Settings hide a panel --
+    /// and is the seam a future plugin would extend.
+    pub(crate) fn enabled_panels() -> Vec<Self> {
+        let toggles = crate::native_settings::right_sidebar_panel_toggles();
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|panel| panel.enabled_with(&toggles))
+            .collect()
+    }
+
+    /// Whether the sidebar offers anything at all. Hot: `right_sidebar_width`
+    /// asks it, and that runs several times per frame and again on every
+    /// pointer move over the tab bar -- so one settings read, no Vec, and it
+    /// stops at the first panel that is on.
+    pub(crate) fn any_panel_enabled() -> bool {
+        let toggles = crate::native_settings::right_sidebar_panel_toggles();
+        Self::ALL.iter().any(|panel| panel.enabled_with(&toggles))
+    }
+
+    pub(crate) fn panel_enabled(self) -> bool {
+        self.enabled_with(&crate::native_settings::right_sidebar_panel_toggles())
+    }
+
+    fn enabled_with(self, toggles: &crate::native_settings::RightSidebarPanelToggles) -> bool {
+        match self {
+            Self::Chat => toggles.files,
+            Self::Tasks => toggles.notes,
+            Self::Snippets => toggles.snippets,
+            // Not the panel toggle alone: this one also gates the detector,
+            // and that master switch is a Lua config value rather than a
+            // native setting, so this arm takes a second read. `ALL` puts it
+            // last, where the short-circuit in `any_panel_enabled` reaches it
+            // only when the other three are off.
+            Self::Agents => crate::agent_status::enabled(),
+        }
+    }
+
     fn icon(self) -> SvgIcon {
         match self {
             Self::Chat => SvgIcon::FolderTree,
@@ -1426,8 +1469,16 @@ impl crate::TermWindow {
         Some(configured_width.clamp(self.ui_px(NOTE_PANE_MIN_WIDTH), max_pane_width))
     }
 
+    /// Whether the sidebar has anything to show. Turning off every panel in
+    /// Settings hides it outright rather than leaving an empty selector: the
+    /// terminal reclaims the space through the same zero-width path collapse
+    /// already uses, so nothing downstream needs its own special case.
+    pub(crate) fn right_sidebar_has_panels(&self) -> bool {
+        RightSidebarMode::any_panel_enabled()
+    }
+
     pub fn right_sidebar_width(&self) -> usize {
-        if self.right_sidebar_collapsed {
+        if self.right_sidebar_collapsed || !self.right_sidebar_has_panels() {
             0
         } else {
             // The file preview pane and the Note pane are mutually exclusive
@@ -1845,6 +1896,56 @@ impl crate::TermWindow {
             }
             self.right_sidebar_note.freeze_live_source();
             self.save_right_sidebar_note_now();
+        }
+    }
+
+    /// Bring this window in line with a change to which panels exist.
+    ///
+    /// Repainting is not enough. Turning a panel off can take the sidebar's
+    /// width to zero, and the terminal has to be laid out again for that or
+    /// the panes stay sized around a sidebar that is no longer there. Leaving
+    /// a panel also has to release what that panel was holding, the same way
+    /// switching away from it by hand does -- otherwise the note focus and the
+    /// file index survive a panel the user just turned off.
+    pub(crate) fn right_sidebar_panels_changed(&mut self) {
+        if !self.right_sidebar_mode.panel_enabled() {
+            if self.right_sidebar_mode == RightSidebarMode::Tasks {
+                self.clear_right_sidebar_text_focus();
+                self.schedule_right_sidebar_note_memory_release();
+            }
+            self.fall_back_to_an_enabled_panel();
+            if self.right_sidebar_file_view_active() {
+                self.kick_right_sidebar_file_rescan_cycle();
+                self.request_right_sidebar_remote_files_connect(false);
+            } else {
+                self.schedule_right_sidebar_file_memory_release();
+                self.release_right_sidebar_remote_files_if_hidden();
+            }
+        }
+        // Unconditional: the toggle that got us here has already been saved,
+        // so the old width is gone and there is nothing left to compare
+        // against. A settings change is rare enough to just re-lay-out.
+        if let Some(window) = self.window.as_ref().cloned() {
+            let dimensions = self.dimensions;
+            self.apply_dimensions(&dimensions, None, &window);
+            window.invalidate();
+        }
+    }
+
+    /// Move off a panel that is no longer offered, onto the first one that
+    /// is. All four can be off at once -- that is how you get rid of the
+    /// right sidebar -- and then there is nothing to move to, so we stay put.
+    pub(crate) fn fall_back_to_an_enabled_panel(&mut self) {
+        if let Some(first) = RightSidebarMode::enabled_panels().first().copied() {
+            self.right_sidebar_mode = first;
+        }
+        // No panels at all: the sidebar is hidden, so the stale mode is
+        // unreachable and harmless. It becomes correct again the moment a
+        // panel is turned back on.
+        // This frame's selector already painted for the old mode, so ask for
+        // another or the body stays blank.
+        if let Some(win) = self.window.as_ref() {
+            win.invalidate();
         }
     }
 
@@ -6359,14 +6460,7 @@ impl crate::TermWindow {
         )
         .context("right sidebar mode selector")?;
 
-        let mut modes = vec![
-            RightSidebarMode::Chat,
-            RightSidebarMode::Tasks,
-            RightSidebarMode::Snippets,
-        ];
-        if crate::agent_status::enabled() {
-            modes.push(RightSidebarMode::Agents);
-        }
+        let modes = RightSidebarMode::enabled_panels();
         const MODE_LABEL_CLIP_SLOP: usize = 4;
         let mode_icon_size = (ui_cell_height + self.ui_px(12))
             .clamp(self.ui_px(24), self.ui_px(30))
@@ -6515,6 +6609,12 @@ impl crate::TermWindow {
         }
 
         let content_top = mode_y + mode_height + self.ui_px(RIGHT_SIDEBAR_SECTION_GAP);
+        // A panel turned off while it was open would paint a stranded mode:
+        // the selector no longer offers it, so nothing could switch away.
+        if !self.right_sidebar_mode.panel_enabled() {
+            self.fall_back_to_an_enabled_panel();
+            return Ok(());
+        }
         match self.right_sidebar_mode {
             RightSidebarMode::Chat => {
                 let file_font_size = self.right_sidebar_file_preview_font_size();
@@ -6576,15 +6676,8 @@ impl crate::TermWindow {
                 return Ok(());
             }
             RightSidebarMode::Agents => {
-                if !crate::agent_status::enabled() {
-                    // The toggle went off while the panel was open; fall
-                    // back rather than painting a stranded mode. This
-                    // frame's selector already painted for the old mode,
-                    // so request another paint or the body stays blank.
-                    self.right_sidebar_mode = RightSidebarMode::Chat;
-                    if let Some(win) = self.window.as_ref() {
-                        win.invalidate();
-                    }
+                if !RightSidebarMode::Agents.panel_enabled() {
+                    self.fall_back_to_an_enabled_panel();
                     return Ok(());
                 }
                 self.paint_agents_sidebar(

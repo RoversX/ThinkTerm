@@ -277,9 +277,17 @@ pub(crate) struct NativeChromeSettings {
     /// Workspace-thread statuses hidden by the sidebar view-options filter,
     /// as stable keys ("idle", "running", "needs-attention", "finished").
     pub(crate) workspace_sidebar_hidden_statuses: Vec<String>,
+    /// Which panels the right sidebar offers. Absent means on. All four may
+    /// be off at once -- that is how you get rid of the right sidebar -- and
+    /// the sidebar plus its tab-bar toggle then stop being drawn. Settings is
+    /// a separate window, so turning one back on is still reachable.
+    pub(crate) right_sidebar_files_enabled: Option<bool>,
+    pub(crate) right_sidebar_notes_enabled: Option<bool>,
+    pub(crate) right_sidebar_snippets_enabled: Option<bool>,
     /// Feature toggle for agent status detection and the right-sidebar
-    /// Agents panel. Off by default; absent in settings.json means off.
-    pub(crate) agent_panel_enabled: bool,
+    /// Agents panel. Absent means on -- it was off by default while the
+    /// detection was new, and is a panel toggle like the three above now.
+    pub(crate) agent_panel_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -760,10 +768,35 @@ pub(crate) fn workspace_sidebar_hover_reveal_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Agent status detection + Agents panel feature toggle. Default off.
-/// `load_shared`: asked once per work-status scan and once per sidebar frame.
+/// Agent status detection + Agents panel feature toggle. Default on.
+/// `load_shared`: asked once per work-status scan, and by the Agents arm of
+/// `RightSidebarMode::panel_enabled`.
 pub(crate) fn agent_panel_enabled() -> bool {
-    load_shared().chrome.agent_panel_enabled
+    load_shared().chrome.agent_panel_enabled.unwrap_or(true)
+}
+
+/// The three plain right-sidebar panel toggles, read under one lock. Absent
+/// means on. Callers ask which panels are offered several times per frame --
+/// `right_sidebar_width` alone is asked from 34 places -- and one
+/// `load_shared` per panel adds up. Agents is not here: it needs the Lua
+/// detector switch on top of its own toggle, so it goes through
+/// `agent_status::enabled`.
+pub(crate) struct RightSidebarPanelToggles {
+    pub(crate) files: bool,
+    pub(crate) notes: bool,
+    pub(crate) snippets: bool,
+}
+
+pub(crate) fn right_sidebar_panel_toggles() -> RightSidebarPanelToggles {
+    let settings = load_shared();
+    RightSidebarPanelToggles {
+        files: settings.chrome.right_sidebar_files_enabled.unwrap_or(true),
+        notes: settings.chrome.right_sidebar_notes_enabled.unwrap_or(true),
+        snippets: settings
+            .chrome
+            .right_sidebar_snippets_enabled
+            .unwrap_or(true),
+    }
 }
 
 pub(crate) fn right_sidebar_width() -> Option<usize> {
