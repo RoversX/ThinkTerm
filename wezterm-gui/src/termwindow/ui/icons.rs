@@ -20,8 +20,11 @@ pub enum SvgIcon {
     CodeXml,
     ClipboardPaste,
     Copy,
+    Download,
     Ellipsis,
     Expand,
+    Eye,
+    EyeOff,
     ExternalLink,
     File,
     FileCode,
@@ -53,17 +56,21 @@ pub enum SvgIcon {
     PanelLeftOpen,
     PanelRightClose,
     PanelRightOpen,
+    Package,
     Pencil,
     Pin,
     PinOff,
     Plus,
     RotateCcw,
+    RefreshCw,
     Redo,
     Save,
+    Scale,
     Scissors,
     Search,
     Server,
     Settings,
+    Shield,
     SlidersHorizontal,
     SlidersVertical,
     Shrink,
@@ -129,8 +136,13 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/clipboard-paste.svg")
             }
             Self::Copy => include_bytes!("../../../../third_party/lucide/icons/copy.svg"),
+            Self::Download => {
+                include_bytes!("../../../../third_party/lucide/icons/download.svg")
+            }
             Self::Ellipsis => include_bytes!("../../../../third_party/lucide/icons/ellipsis.svg"),
             Self::Expand => include_bytes!("../../../../third_party/lucide/icons/expand.svg"),
+            Self::Eye => include_bytes!("../../../../third_party/lucide/icons/eye.svg"),
+            Self::EyeOff => include_bytes!("../../../../third_party/lucide/icons/eye-off.svg"),
             Self::ExternalLink => {
                 include_bytes!("../../../../third_party/lucide/icons/external-link.svg")
             }
@@ -201,6 +213,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/panel-right-open.svg")
             }
             Self::Pencil => include_bytes!("../../../../third_party/lucide/icons/pencil.svg"),
+            Self::Package => include_bytes!("../../../../third_party/lucide/icons/package.svg"),
             Self::Pin => include_bytes!("../../../../third_party/lucide/icons/pin.svg"),
             Self::PinOff => include_bytes!("../../../../third_party/lucide/icons/pin-off.svg"),
             Self::Unlink2 => include_bytes!("../../../../third_party/lucide/icons/unlink-2.svg"),
@@ -208,12 +221,17 @@ impl SvgIcon {
             Self::RotateCcw => {
                 include_bytes!("../../../../third_party/lucide/icons/rotate-ccw.svg")
             }
+            Self::RefreshCw => {
+                include_bytes!("../../../../third_party/lucide/icons/refresh-cw.svg")
+            }
             Self::Redo => include_bytes!("../../../../third_party/lucide/icons/redo.svg"),
             Self::Save => include_bytes!("../../../../third_party/lucide/icons/save.svg"),
+            Self::Scale => include_bytes!("../../../../third_party/lucide/icons/scale.svg"),
             Self::Scissors => include_bytes!("../../../../third_party/lucide/icons/scissors.svg"),
             Self::Search => include_bytes!("../../../../third_party/lucide/icons/search.svg"),
             Self::Server => include_bytes!("../../../../third_party/lucide/icons/server.svg"),
             Self::Settings => include_bytes!("../../../../third_party/lucide/icons/settings.svg"),
+            Self::Shield => include_bytes!("../../../../third_party/lucide/icons/shield.svg"),
             Self::SlidersHorizontal => {
                 include_bytes!("../../../../third_party/lucide/icons/sliders-horizontal.svg")
             }
@@ -549,6 +567,31 @@ pub fn distro_to_icon(id: &str) -> Option<BrandIcon> {
 
 /// Shared SVG -> RGBA raster path used by both [`SvgIcon`] and [`BrandIcon`].
 /// The icon is scaled to fit and centered within a `size`×`size` pixmap.
+/// The application icon, for the About page's hero.
+///
+/// The only raster asset in here. `image` hands back straight alpha while the
+/// atlas stores premultiplied -- the multiply below is what stops the icon's
+/// soft edges from ringing bright against a dark card.
+pub fn rasterize_app_icon(size: usize) -> Result<Image> {
+    let size = size.max(1);
+    let decoded = image::load_from_memory(crate::termwindow::ICON_DATA)
+        .context("decoding the application icon")?
+        .resize_exact(
+            size as u32,
+            size as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .into_rgba8();
+    let mut data = decoded.into_raw();
+    for pixel in data.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        for channel in &mut pixel[..3] {
+            *channel = ((*channel as u32 * alpha + 127) / 255) as u8;
+        }
+    }
+    Ok(Image::from_raw(size, size, data))
+}
+
 fn rasterize_svg_str(svg: &str, size: usize, degrees: f32) -> Result<Image> {
     let size = size.max(1);
     let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())

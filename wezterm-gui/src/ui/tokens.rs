@@ -14,10 +14,35 @@ pub(crate) struct UiPalette {
     pub control_border: LinearRgba,
     pub sidebar_button_bg: LinearRgba,
     pub sidebar_button_hover_bg: LinearRgba,
+    /// The sidebar row ramp. These three are ordered on purpose --
+    /// hover < pressed < active -- because a selected row is a state and the
+    /// other two are momentary feedback; feedback that outweighs the state
+    /// makes the row under the pointer look more current than the one that is.
+    /// Write them as concrete colors, never as a white wash: a wash composites
+    /// in linear space, so 7.5% white over the dark bar landed at rgb(80) and
+    /// silently jumped the whole ramp.
     pub sidebar_row_hover_bg: LinearRgba,
+    pub sidebar_row_pressed_bg: LinearRgba,
     pub sidebar_row_active_bg: LinearRgba,
     pub sidebar_row_active_border: LinearRgba,
     pub selected_bg: LinearRgba,
+    /// The one saturated color in the chrome. Everything else is a neutral,
+    /// so this is what a selected row, an active switch or a primary button
+    /// uses to say "this one". Kept identical in shape across platforms --
+    /// the whole UI is drawn from these tokens, so one edit moves every OS.
+    pub accent: LinearRgba,
+    pub accent_hover: LinearRgba,
+    /// Text and glyphs sitting on top of `accent`.
+    pub on_accent: LinearRgba,
+    /// Irreversible actions. Used as a label/border tint rather than a fill,
+    /// so a destructive button still reads as a button and not as an alert.
+    pub danger: LinearRgba,
+    /// The off half of a switch track. Distinct from `control_border`, which
+    /// is a hairline colour and disappears when used as a filled track.
+    pub track_off: LinearRgba,
+    /// Fill for a grouped card floating on `window_bg`. Translucent on
+    /// purpose: it picks up whatever the page paints behind it.
+    pub card_bg: LinearRgba,
     pub text: LinearRgba,
     pub secondary_text: LinearRgba,
     pub muted_text: LinearRgba,
@@ -42,9 +67,16 @@ impl UiPalette {
                 sidebar_button_bg: rgba(255, 255, 255, 0.72),
                 sidebar_button_hover_bg: rgba(255, 255, 255, 0.94),
                 sidebar_row_hover_bg: rgba(60, 60, 67, 0.08),
+                sidebar_row_pressed_bg: rgba(60, 60, 67, 0.16),
                 sidebar_row_active_bg: rgba(255, 255, 255, 0.78),
                 sidebar_row_active_border: rgba(60, 60, 67, 0.18),
                 selected_bg: rgb(0, 122, 255),
+                accent: rgb(0, 122, 255),
+                accent_hover: rgb(0, 106, 224),
+                on_accent: rgb(255, 255, 255),
+                danger: rgb(215, 38, 61),
+                track_off: rgba(220, 220, 226, 1.0),
+                card_bg: rgba(255, 255, 255, 0.72),
                 text: rgb(28, 28, 30),
                 secondary_text: rgb(72, 72, 74),
                 muted_text: rgb(142, 142, 147),
@@ -64,10 +96,17 @@ impl UiPalette {
                 control_border: rgba(118, 118, 128, 0.28),
                 sidebar_button_bg: rgba(36, 36, 38, 0.94),
                 sidebar_button_hover_bg: rgba(48, 48, 50, 0.98),
-                sidebar_row_hover_bg: rgba(255, 255, 255, 0.075),
-                sidebar_row_active_bg: rgba(48, 48, 50, 0.98),
+                sidebar_row_hover_bg: rgba(42, 42, 44, 0.98),
+                sidebar_row_pressed_bg: rgba(52, 52, 55, 0.98),
+                sidebar_row_active_bg: rgba(62, 62, 65, 0.98),
                 sidebar_row_active_border: rgba(118, 118, 128, 0.22),
                 selected_bg: rgb(58, 58, 60),
+                accent: rgb(10, 132, 255),
+                accent_hover: rgb(50, 152, 255),
+                on_accent: rgb(255, 255, 255),
+                danger: rgb(255, 69, 58),
+                track_off: rgba(78, 78, 82, 1.0),
+                card_bg: rgba(30, 30, 32, 0.78),
                 text: rgb(242, 242, 247),
                 secondary_text: rgb(199, 199, 204),
                 muted_text: rgb(142, 142, 147),
@@ -89,6 +128,8 @@ pub(crate) struct UiTokens {
     pub row_gap: f32,
     pub control_height: f32,
     pub control_radius: f32,
+    /// Grouped-card corner radius.
+    pub card_radius: f32,
     pub row_radius: f32,
     pub icon_size: f32,
     pub resize_handle_width: f32,
@@ -112,6 +153,7 @@ impl Default for UiTokens {
             row_gap: 8.0,
             control_height: 56.0,
             control_radius: 12.0,
+            card_radius: 36.0,
             row_radius: 9.0,
             icon_size: 26.0,
             resize_handle_width: 24.0,
@@ -140,6 +182,7 @@ impl UiTokens {
             row_gap: base.row_gap * scale,
             control_height: base.control_height * scale,
             control_radius: base.control_radius * scale,
+            card_radius: base.card_radius * scale,
             row_radius: base.row_radius * scale,
             icon_size: base.icon_size * scale,
             resize_handle_width: base.resize_handle_width * scale,

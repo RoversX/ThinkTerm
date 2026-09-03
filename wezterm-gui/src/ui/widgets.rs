@@ -22,10 +22,11 @@ use window::RectF;
 /// `ui::tokens::ui_scale_for_dpi`.
 ///
 /// Horizontal inset for a button label; the available text width is the button
-/// width minus this on *both* sides. Callers size buttons as
-/// `measure_text_width(label) + px(36)`, which leaves 8 design px of slack.
-const BUTTON_TEXT_PAD: f32 = 14.0;
-const BUTTON_RADIUS: f32 = 8.0;
+/// width minus this on *both* sides. Callers must therefore size buttons as
+/// `measure_text_width(label) + px(N)` with `N` at least twice this, or the
+/// widget will ellipsize the label it was asked to show. `px(56)` is the
+/// house size and leaves 16 design px of slack.
+const BUTTON_TEXT_PAD: f32 = 20.0;
 const ICON_BUTTON_RADIUS: f32 = 8.0;
 /// Icon side length is derived from the (already DPI-aware) cell height, so
 /// only the padding and the clamp bounds are design pixels.
@@ -54,8 +55,8 @@ pub(crate) fn button_label_width(button_width: f32, scale: f32) -> f32 {
     button_width - BUTTON_TEXT_PAD * 2.0 * scale
 }
 
-/// A filled, rounded button with a centered-left label. The caller fills
-/// `spec.state` (e.g. from its [`InteractionState`]).
+/// A filled pill button with a centred label. The caller fills `spec.state`
+/// (e.g. from its [`InteractionState`]) and `spec.variant`.
 pub(crate) fn draw_button<A: Copy + PartialEq>(
     ctx: &DrawContext,
     layers: &mut TripleLayerQuadAllocator<'_>,
@@ -96,7 +97,7 @@ fn draw_button_with_layers<A: Copy + PartialEq>(
     text_layer: usize,
 ) -> anyhow::Result<()> {
     widgets.push(spec.rect, spec.kind, spec.action);
-    let (background, border) = spec.state.colors(palette);
+    let (background, border, label_color) = spec.variant.colors(spec.state, palette);
     ctx.draw_rounded_frame(
         layers,
         background_layer,
@@ -106,17 +107,26 @@ fn draw_button_with_layers<A: Copy + PartialEq>(
         spec.rect.size.height,
         background,
         border,
-        ctx.px(BUTTON_RADIUS),
+        // A pill rather than a rounded rectangle: at a glance that is what
+        // separates a button from the text field sitting next to it.
+        spec.rect.size.height / 2.0,
     )?;
+    // Centre the label. It used to be pinned to the left inset, which reads as
+    // a layout bug on any button wider than its text -- most obviously on the
+    // equal-width buttons of a confirmation dialog.
+    let available = button_label_width(spec.rect.size.width, ctx.scale());
+    let measured = ctx.measure_text_width(font, spec.label).min(available);
+    let text_x =
+        spec.rect.origin.x + ((spec.rect.size.width - measured) / 2.0).max(ctx.px(BUTTON_TEXT_PAD));
     ctx.draw_text_on_layer(
         layers,
         text_layer,
         font,
-        spec.rect.origin.x + ctx.px(BUTTON_TEXT_PAD),
+        text_x,
         control_text_y(ctx, spec.rect.origin.y, spec.rect.size.height),
         spec.label,
-        palette.text,
-        button_label_width(spec.rect.size.width, ctx.scale()),
+        label_color,
+        available,
     )?;
     Ok(())
 }
@@ -290,9 +300,78 @@ pub(crate) fn draw_text_input<A: Copy + PartialEq>(
     spec: TextInputSpec<'_, A>,
     caret: Option<InputCaret>,
 ) -> anyhow::Result<()> {
+    draw_text_input_with_layers(
+        ctx,
+        layers,
+        font,
+        widgets,
+        interaction,
+        palette,
+        tokens,
+        text_pad,
+        cursor_on,
+        spec,
+        caret,
+        0,
+        1,
+    )
+}
+
+/// The same field drawn entirely on one layer. A field that sits in a fixed
+/// header has scrolled content passing beneath it, and the mask that hides
+/// that content covers every layer -- so the field has to be painted above
+/// the mask, not merely after it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_text_input_on_layer<A: Copy + PartialEq>(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    font: &Rc<LoadedFont>,
+    widgets: &mut UiContext<A>,
+    interaction: &InteractionState<A>,
+    palette: UiPalette,
+    tokens: UiTokens,
+    text_pad: f32,
+    cursor_on: bool,
+    spec: TextInputSpec<'_, A>,
+    caret: Option<InputCaret>,
+    layer_num: usize,
+) -> anyhow::Result<()> {
+    draw_text_input_with_layers(
+        ctx,
+        layers,
+        font,
+        widgets,
+        interaction,
+        palette,
+        tokens,
+        text_pad,
+        cursor_on,
+        spec,
+        caret,
+        layer_num,
+        layer_num,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_input_with_layers<A: Copy + PartialEq>(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    font: &Rc<LoadedFont>,
+    widgets: &mut UiContext<A>,
+    interaction: &InteractionState<A>,
+    palette: UiPalette,
+    tokens: UiTokens,
+    text_pad: f32,
+    cursor_on: bool,
+    spec: TextInputSpec<'_, A>,
+    caret: Option<InputCaret>,
+    frame_layer: usize,
+    text_layer: usize,
+) -> anyhow::Result<()> {
     widgets.push(spec.rect, WidgetKind::TextInput, spec.action);
     let border = if spec.focused {
-        palette.selected_bg
+        palette.accent
     } else if interaction.hovered == Some(spec.action) {
         palette.separator
     } else {
@@ -300,7 +379,7 @@ pub(crate) fn draw_text_input<A: Copy + PartialEq>(
     };
     ctx.draw_rounded_frame(
         layers,
-        0,
+        frame_layer,
         spec.rect.origin.x,
         spec.rect.origin.y,
         spec.rect.size.width,
@@ -310,12 +389,15 @@ pub(crate) fn draw_text_input<A: Copy + PartialEq>(
         tokens.control_radius,
     )?;
 
-    let text = if spec.text.is_empty() && !spec.focused {
+    // An empty field keeps its placeholder while focused. Hiding it left a
+    // blank slab with a caret in it, which says nothing about what belongs
+    // there -- and the field this page focuses on open is the search box.
+    let text = if spec.text.is_empty() {
         spec.placeholder
     } else {
         spec.text
     };
-    let color = if spec.text.is_empty() && !spec.focused {
+    let color = if spec.text.is_empty() {
         palette.muted_text
     } else {
         palette.text
@@ -343,18 +425,19 @@ pub(crate) fn draw_text_input<A: Copy + PartialEq>(
             let end_x = text_width_to_char(ctx, font, spec.text, end).min(text_area);
             ctx.draw_rounded_rect(
                 layers,
-                1,
+                text_layer,
                 text_left + start_x - bleed_x,
                 highlight_y,
                 (end_x - start_x) + bleed_x * 2.0,
                 highlight_h,
-                palette.selected_bg.mul_alpha(0.56),
+                palette.accent.mul_alpha(0.56),
                 highlight_radius,
             )?;
         }
     }
-    ctx.draw_text(
+    ctx.draw_text_on_layer(
         layers,
+        text_layer,
         font,
         text_left,
         control_text_y(ctx, spec.rect.origin.y, spec.rect.size.height),
@@ -372,22 +455,25 @@ pub(crate) fn draw_text_input<A: Copy + PartialEq>(
         let caret_width = ctx.px(CARET_WIDTH);
         ctx.draw_rect(
             layers,
-            1,
+            text_layer,
             text_left + caret_dx.min(text_area) - caret_width / 3.0,
             highlight_y,
             caret_width,
             highlight_h,
-            palette.selected_bg,
+            palette.accent,
         )?;
     }
     Ok(())
 }
 
-/// A pill toggle (iOS-style). `on` selects accent vs muted track + knob side.
+/// A pill switch. The on track is the accent; the off track is a filled
+/// neutral, not `control_border` -- a hairline colour used as a fill left the
+/// two states nearly identical in the dark palette.
 pub(crate) fn draw_toggle<A: Copy + PartialEq>(
     ctx: &DrawContext,
     layers: &mut TripleLayerQuadAllocator<'_>,
     widgets: &mut UiContext<A>,
+    interaction: &InteractionState<A>,
     palette: UiPalette,
     rect: RectF,
     on: bool,
@@ -395,11 +481,9 @@ pub(crate) fn draw_toggle<A: Copy + PartialEq>(
 ) -> anyhow::Result<()> {
     widgets.push(rect, WidgetKind::Button, action);
     let h = rect.size.height;
-    let track = if on {
-        palette.selected_bg
-    } else {
-        palette.control_border
-    };
+    let pressed = interaction.pressed == Some(action);
+    let hovered = interaction.hovered == Some(action);
+    let track = toggle_track_color(palette, on, hovered, pressed);
     ctx.draw_rounded_rect(
         layers,
         0,
@@ -424,10 +508,35 @@ pub(crate) fn draw_toggle<A: Copy + PartialEq>(
         rect.origin.y + inset,
         knob,
         knob,
-        LinearRgba::with_components(1.0, 1.0, 1.0, 1.0),
+        palette.on_accent,
         knob / 2.0,
     )?;
     Ok(())
+}
+
+/// The track colour of a switch in every state. The settings window paints
+/// its own switch -- it has no `DrawContext`, so it cannot call
+/// [`draw_toggle`] -- and this is the part the two must agree on, so it lives
+/// here rather than being written twice.
+pub(crate) fn toggle_track_color(
+    palette: UiPalette,
+    on: bool,
+    hovered: bool,
+    pressed: bool,
+) -> LinearRgba {
+    if on {
+        if pressed || hovered {
+            palette.accent_hover
+        } else {
+            palette.accent
+        }
+    } else if pressed {
+        palette.track_off.mul_alpha(0.8)
+    } else if hovered {
+        palette.track_off.mul_alpha(0.9)
+    } else {
+        palette.track_off
+    }
 }
 
 /// A vertical scrollbar thumb within `area` (no track), matching the settings
@@ -477,13 +586,13 @@ pub(crate) fn draw_scrollbar_on_layer(
 mod tests {
     use super::{button_label_width, BUTTON_TEXT_PAD};
 
-    /// Callers size buttons as `measure_text_width(label) + px(36)`. The label
+    /// Callers size buttons as `measure_text_width(label) + px(56)`. The label
     /// must still fit after the widget subtracts its own insets, at *every*
     /// scale — mixing a scaled width with unscaled insets is what truncated
     /// "Save & Open" into "Save & O..." on 96dpi displays.
     #[test]
     fn label_always_fits_the_button_the_caller_sized() {
-        const CALLER_PAD: f32 = 36.0;
+        const CALLER_PAD: f32 = 56.0;
         for scale in [0.25, 0.5, 0.75, 1.0, 2.0] {
             for measured in [0.0, 12.5, 61.0, 168.0] {
                 let button_width = measured + CALLER_PAD * scale;
@@ -501,8 +610,8 @@ mod tests {
 
     #[test]
     fn insets_are_symmetric() {
-        // 8 design px of slack at scale 1.0, matching the settings window's
-        // own 44/36 pairing.
+        // The inset comes off both sides and scales with the button, which
+        // is what leaves the house size its 16 design px of slack.
         assert_eq!(
             button_label_width(100.0, 1.0),
             100.0 - BUTTON_TEXT_PAD * 2.0

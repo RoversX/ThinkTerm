@@ -22,6 +22,7 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER_MASK, TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
 };
 use crate::termwindow::ui::icons::{BrandIcon, SvgIcon};
+use crate::ui::{UiPalette, UiTokens};
 use crate::utilsprites::RenderMetrics;
 use std::rc::Rc;
 use wezterm_bidi::Direction;
@@ -45,6 +46,23 @@ impl<'a> DrawContext<'a> {
         Self {
             render_state,
             dimensions,
+            metrics,
+        }
+    }
+
+    /// The same surface measured with another font's metrics.
+    ///
+    /// Text lands on the baseline of whichever metrics the *context* carries,
+    /// not the font passed to `draw_text` -- so a heading drawn in a larger
+    /// font through the body context sits on the body baseline and looks
+    /// misaligned. Re-borrow with the heading's metrics instead.
+    pub(crate) fn with_metrics<'m>(&self, metrics: &'m RenderMetrics) -> DrawContext<'m>
+    where
+        'a: 'm,
+    {
+        DrawContext {
+            render_state: self.render_state,
+            dimensions: self.dimensions,
             metrics,
         }
     }
@@ -402,6 +420,29 @@ impl<'a> DrawContext<'a> {
         Ok(())
     }
 
+    /// A grouped card: the translucent surface a panel's contents sit on.
+    /// One call, so every page groups things the same way.
+    pub(crate) fn draw_card(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        rect: RectF,
+        palette: UiPalette,
+        tokens: UiTokens,
+    ) -> anyhow::Result<()> {
+        self.draw_rounded_frame(
+            layers,
+            layer_num,
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+            palette.card_bg,
+            palette.separator,
+            tokens.card_radius,
+        )
+    }
+
     pub(crate) fn draw_rounded_frame(
         &self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -414,18 +455,9 @@ impl<'a> DrawContext<'a> {
         border: LinearRgba,
         radius: f32,
     ) -> anyhow::Result<()> {
-        self.draw_rounded_rect(layers, layer_num, x, y, width, height, border, radius)?;
-        self.draw_rounded_rect(
-            layers,
-            layer_num,
-            x + 1.0,
-            y + 1.0,
-            width - 2.0,
-            height - 2.0,
-            fill,
-            (radius - 1.0).max(0.0),
-        )?;
-        Ok(())
+        draw_rounded_frame(
+            self, layers, layer_num, x, y, width, height, fill, border, radius,
+        )
     }
 
     pub(crate) fn draw_corner(
@@ -691,4 +723,164 @@ impl<'a> DrawContext<'a> {
 
 fn color_with_alpha(color: LinearRgba, alpha: f32) -> LinearRgba {
     LinearRgba(color.0, color.1, color.2, alpha.clamp(0.0, 1.0))
+}
+
+/// The primitives [`draw_rounded_frame`] is built from. Two painters supply
+/// them and cannot share a draw path -- [`DrawContext`] for the in-window
+/// pages, the settings window for its own -- so they share the frame's
+/// geometry through this instead of keeping a copy of it each. The names are
+/// deliberately not the painters' own, so that implementing this cannot
+/// shadow the inherent methods it forwards to.
+pub(crate) trait RoundedFramePainter {
+    fn frame_rounded_rect(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: LinearRgba,
+        radius: f32,
+    ) -> anyhow::Result<()>;
+
+    fn frame_rect(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()>;
+
+    fn frame_corner(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        polys: &'static [Poly],
+        size: euclid::Size2D<f32, window::PixelUnit>,
+        color: LinearRgba,
+    ) -> anyhow::Result<()>;
+}
+
+/// A filled rounded rect with a one-pixel ring on its edge.
+///
+/// Fill first, then the ring. This used to paint the border across the whole
+/// rect and cover it with the fill inset by a pixel, which only works when
+/// the fill is opaque. Every translucent one -- a card at 0.78 alpha, a
+/// control at 0.98 -- let the border colour through across the entire
+/// interior, so selecting a card tinted the whole card with the accent
+/// instead of just outlining it.
+///
+/// A border the same colour as the fill is not a border: stroking it anyway
+/// draws the antialiased edge twice, which hardens the outline into a visible
+/// ring around a filled button and chews the corners of a pill. Passing the
+/// fill as the border is how a caller asks for no ring at all.
+pub(crate) fn draw_rounded_frame(
+    painter: &impl RoundedFramePainter,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    layer_num: usize,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    fill: LinearRgba,
+    border: LinearRgba,
+    radius: f32,
+) -> anyhow::Result<()> {
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(());
+    }
+    if fill.3 > 0.0 {
+        painter.frame_rounded_rect(layers, layer_num, x, y, width, height, fill, radius)?;
+    }
+    if border.3 <= 0.0 || border == fill {
+        return Ok(());
+    }
+    let radius = radius.min(width / 2.0).min(height / 2.0).round().max(0.0);
+    const STROKE: f32 = 1.0;
+    if radius > 0.0 {
+        let size = euclid::size2(radius, radius);
+        for (cx, cy, poly) in [
+            (x, y, TOP_LEFT_ROUNDED_CORNER_OUTLINE),
+            (x + width - radius, y, TOP_RIGHT_ROUNDED_CORNER_OUTLINE),
+            (x, y + height - radius, BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE),
+            (
+                x + width - radius,
+                y + height - radius,
+                BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE,
+            ),
+        ] {
+            painter.frame_corner(layers, layer_num, cx, cy, poly, size, border)?;
+        }
+    }
+    let straight_w = (width - radius * 2.0).max(0.0);
+    let straight_h = (height - radius * 2.0).max(0.0);
+    painter.frame_rect(layers, layer_num, x + radius, y, straight_w, STROKE, border)?;
+    painter.frame_rect(
+        layers,
+        layer_num,
+        x + radius,
+        y + height - STROKE,
+        straight_w,
+        STROKE,
+        border,
+    )?;
+    painter.frame_rect(layers, layer_num, x, y + radius, STROKE, straight_h, border)?;
+    painter.frame_rect(
+        layers,
+        layer_num,
+        x + width - STROKE,
+        y + radius,
+        STROKE,
+        straight_h,
+        border,
+    )?;
+    Ok(())
+}
+
+impl RoundedFramePainter for DrawContext<'_> {
+    fn frame_rounded_rect(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: LinearRgba,
+        radius: f32,
+    ) -> anyhow::Result<()> {
+        self.draw_rounded_rect(layers, layer_num, x, y, width, height, color, radius)
+    }
+
+    fn frame_rect(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        self.draw_rect(layers, layer_num, x, y, width, height, color)
+    }
+
+    fn frame_corner(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        polys: &'static [Poly],
+        size: euclid::Size2D<f32, window::PixelUnit>,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        self.draw_corner(layers, layer_num, x, y, polys, size, color)
+    }
 }

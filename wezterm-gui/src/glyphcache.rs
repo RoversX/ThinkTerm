@@ -634,6 +634,9 @@ pub struct GlyphCache {
     pub block_glyphs: HashMap<SizedBlockKey, Sprite>,
     pub svg_icons: HashMap<SizedSvgIconKey, Sprite>,
     pub brand_icons: HashMap<SizedBrandIconKey, Sprite>,
+    /// The application icon, keyed by pixel size. One raster decode per
+    /// size, reused for the life of the cache.
+    pub app_icons: HashMap<u16, Sprite>,
     pub material_icons: HashMap<SizedMaterialIconKey, Sprite>,
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
@@ -703,6 +706,7 @@ impl GlyphCache {
             block_glyphs: HashMap::new(),
             svg_icons: HashMap::new(),
             brand_icons: HashMap::new(),
+            app_icons: HashMap::new(),
             material_icons: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             cursor_glyphs: HashMap::new(),
@@ -738,6 +742,7 @@ impl GlyphCache {
             block_glyphs: HashMap::new(),
             svg_icons: HashMap::new(),
             brand_icons: HashMap::new(),
+            app_icons: HashMap::new(),
             material_icons: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             cursor_glyphs: HashMap::new(),
@@ -1415,6 +1420,19 @@ impl GlyphCache {
         let image = icon.rasterize(size)?;
         let sprite = self.atlas.allocate(&image)?;
         self.brand_icons.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    pub fn cached_app_icon(&mut self, size: usize) -> anyhow::Result<Sprite> {
+        let size = size.max(1).min(u16::MAX as usize);
+        let key = size as u16;
+        if let Some(sprite) = self.app_icons.get(&key) {
+            return Ok(sprite.clone());
+        }
+
+        let image = crate::termwindow::ui::icons::rasterize_app_icon(size)?;
+        let sprite = self.atlas.allocate(&image)?;
+        self.app_icons.insert(key, sprite.clone());
         Ok(sprite)
     }
 

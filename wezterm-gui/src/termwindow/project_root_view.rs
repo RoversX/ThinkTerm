@@ -11,7 +11,8 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{wrap_path_for_width, wrap_snippet_text_for_width};
 use crate::termwindow::{ContentViewId, TermWindow, TermWindowNotif};
 use crate::ui::{
-    draw_scrollbar, rect, wheel_delta_pixels, ControlState, DrawContext, InteractionState,
+    draw_scrollbar, rect, wheel_delta_pixels, ButtonVariant, ControlState, DrawContext,
+    InteractionState,
     ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use std::path::PathBuf;
@@ -493,18 +494,16 @@ impl ProjectRootView {
         primary: bool,
     ) -> anyhow::Result<()> {
         self.widgets.push(area, WidgetKind::Button, action);
-        let state = self.button_state(action, primary);
-        let (mut bg, mut border) = state.colors(palette);
-        let mut text = palette.text;
-        if primary {
-            bg = if state == ControlState::Pressed {
-                palette.selected_bg.mul_alpha(0.82)
-            } else {
-                palette.selected_bg
-            };
-            border = palette.selected_bg;
-            text = palette.selected_text;
-        }
+        let state = self.button_state(action);
+        // Shared with every other button in the app, so "primary" means the
+        // accent in both appearances rather than a grey that only reads as
+        // primary in the light one.
+        let variant = if primary {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Secondary
+        };
+        let (bg, border, text) = variant.colors(state, palette);
         ctx.draw_rounded_frame(
             layers,
             0,
@@ -533,13 +532,11 @@ impl ProjectRootView {
         Ok(())
     }
 
-    fn button_state(&self, action: ProjectRootAction, primary: bool) -> ControlState {
+    fn button_state(&self, action: ProjectRootAction) -> ControlState {
         if self.interaction.pressed == Some(action) {
             ControlState::Pressed
         } else if self.interaction.hovered == Some(action) {
             ControlState::Hovered
-        } else if primary {
-            ControlState::Active
         } else {
             ControlState::Normal
         }

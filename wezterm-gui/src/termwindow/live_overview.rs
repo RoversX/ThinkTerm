@@ -8,7 +8,9 @@ use crate::termwindow::{TermWindow, TermWindowNotif};
 use crate::ui::anim::{self, Easing, Timeline};
 use crate::ui::{
     draw_button_on_layer, draw_icon_button, draw_icon_button_on_layer, draw_scrollbar_on_layer,
-    precise_wheel_delta_pixels, wheel_delta_pixels, ButtonSpec, ControlState, DrawContext,
+    card_is_warm, card_rect, grid_card_width, precise_wheel_delta_pixels, row_fully_visible,
+    row_visible, shared_grid_columns, wheel_delta_pixels, ButtonSpec, ButtonVariant, CardGrid,
+    ControlState, DrawContext, RowAlign,
     InteractionState, ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads;
@@ -215,18 +217,10 @@ struct PendingClose {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct GroupGrid {
-    columns: usize,
-    rows: usize,
-    card_width: f32,
-    card_height: f32,
-}
-
-#[derive(Clone, Copy, Debug)]
 struct GroupLayout {
     header_y: f32,
     cards_y: f32,
-    grid: GroupGrid,
+    grid: CardGrid,
 }
 
 /// Where a card is travelling from and to, so that a change of layout is
@@ -546,6 +540,8 @@ impl LiveOverviewView {
             content_width,
             layout.cards_y,
             gap,
+            // Big tiles: a short last row centred under the full ones.
+            RowAlign::Center,
         );
         // Card rectangles are in content space, so the band on screen right now
         // is `[offset, offset + viewport_height]`.
@@ -753,6 +749,7 @@ impl LiveOverviewView {
                         content_width,
                         layout.cards_y,
                         gap,
+                        RowAlign::Center,
                     );
                     seen_keys.insert(card.key.clone());
                     let rect =
@@ -1371,8 +1368,8 @@ impl LiveOverviewView {
         let confirm_label = crate::i18n::tr("live-overview-close-confirm");
         let button_gap = ctx.px(CONFIRM_BUTTON_GAP);
         let button_available = (dialog.size.width - padding * 2.0 - button_gap).max(2.0);
-        let desired_cancel = ctx.measure_text_width(font, &cancel_label) + ctx.px(36.0);
-        let desired_confirm = ctx.measure_text_width(font, &confirm_label) + ctx.px(36.0);
+        let desired_cancel = ctx.measure_text_width(font, &cancel_label) + ctx.px(56.0);
+        let desired_confirm = ctx.measure_text_width(font, &confirm_label) + ctx.px(56.0);
         let (cancel_width, confirm_width) = if desired_cancel + desired_confirm <= button_available
         {
             (desired_cancel, desired_confirm)
@@ -1395,6 +1392,7 @@ impl LiveOverviewView {
                 rect: euclid::rect(cancel_x, buttons_y, cancel_width, tokens.control_height),
                 state: cancel_state,
                 kind: WidgetKind::Button,
+                variant: ButtonVariant::Secondary,
             },
             2,
         )?;
@@ -1411,6 +1409,7 @@ impl LiveOverviewView {
                 rect: euclid::rect(confirm_x, buttons_y, confirm_width, tokens.control_height),
                 state: confirm_state,
                 kind: WidgetKind::Button,
+                variant: ButtonVariant::Primary,
             },
             2,
         )
@@ -2137,52 +2136,6 @@ fn max_columns_for_surface_width(surface_width: f32, five_column_width: f32) -> 
     }
 }
 
-fn grid_columns(width: f32, minimum: f32, gap: f32, maximum: usize) -> usize {
-    if maximum == 0 {
-        return 0;
-    }
-    if maximum == 1 || width <= minimum {
-        1
-    } else {
-        (((width + gap) / (minimum + gap)).floor() as usize).clamp(1, maximum)
-    }
-}
-
-fn single_orphan_group_count(counts: &[usize], columns: usize) -> usize {
-    if columns == 0 {
-        return 0;
-    }
-    counts
-        .iter()
-        .filter(|&&count| count > columns && count % columns == 1)
-        .count()
-}
-
-fn shared_grid_columns(
-    counts: &[usize],
-    content_width: f32,
-    maximum_columns: usize,
-    minimum: f32,
-    orphan_comfort_width: f32,
-    gap: f32,
-) -> usize {
-    let mut columns = grid_columns(content_width, minimum, gap, maximum_columns);
-    if columns == 0 {
-        return 0;
-    }
-    let initial_available =
-        (content_width - gap * columns.saturating_sub(1) as f32) / columns as f32;
-    if columns > 2 && initial_available < orphan_comfort_width {
-        let reduced_columns = columns - 1;
-        if single_orphan_group_count(counts, reduced_columns)
-            < single_orphan_group_count(counts, columns)
-        {
-            columns = reduced_columns;
-        }
-    }
-    columns
-}
-
 #[allow(clippy::too_many_arguments)]
 fn group_grid(
     count: usize,
@@ -2193,19 +2146,15 @@ fn group_grid(
     card_header_height: f32,
     card_inset: f32,
     preview_aspect: f32,
-) -> GroupGrid {
+) -> CardGrid {
     if columns == 0 {
-        return GroupGrid {
-            columns: 0,
-            rows: 0,
-            card_width: 0.0,
-            card_height: 0.0,
-        };
+        return CardGrid::EMPTY;
     }
-    let available = (content_width - gap * columns.saturating_sub(1) as f32) / columns as f32;
-    let card_width = available.min(maximum).max(1.0);
+    // Unlike a plain card grid, an overview card's height follows from its
+    // width: the preview keeps the host terminal's aspect.
+    let card_width = grid_card_width(content_width, columns, maximum, gap);
     let preview_width = (card_width - card_inset * 2.0).max(1.0);
-    GroupGrid {
+    CardGrid {
         columns,
         rows: (count + columns - 1) / columns,
         card_width,
@@ -2266,46 +2215,11 @@ fn group_layouts(
     (layouts, (y - group_gap).max(0.0))
 }
 
-fn card_rect(
-    index: usize,
-    count: usize,
-    grid: GroupGrid,
-    content_x: f32,
-    content_width: f32,
-    cards_y: f32,
-    gap: f32,
-) -> RectF {
-    let row = index / grid.columns;
-    let column = index % grid.columns;
-    let row_start = row * grid.columns;
-    let row_count = (count - row_start).min(grid.columns);
-    let row_width = row_count as f32 * grid.card_width + row_count.saturating_sub(1) as f32 * gap;
-    let row_x = content_x + (content_width - row_width).max(0.0) / 2.0;
-    euclid::rect(
-        row_x + column as f32 * (grid.card_width + gap),
-        cards_y + row as f32 * (grid.card_height + gap),
-        grid.card_width,
-        grid.card_height,
-    )
-}
-
-fn row_visible(y: f32, height: f32, viewport: RectF) -> bool {
-    y + height > viewport.min_y() && y < viewport.max_y()
-}
-
-fn card_is_warm(rect: RectF, viewport: RectF, overscan: f32) -> bool {
-    let warm_top = viewport.min_y() - overscan.max(0.0);
-    let warm_bottom = viewport.max_y() + overscan.max(0.0);
-    rect.max_y() > warm_top && rect.min_y() < warm_bottom
-}
-
-fn row_fully_visible(y: f32, height: f32, viewport: RectF) -> bool {
-    y >= viewport.min_y() && y + height <= viewport.max_y()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Lives in `ui::geometry` now, and only the tests reach for it directly.
+    use crate::ui::grid_columns;
 
     #[allow(clippy::too_many_arguments)]
     fn test_group_grid(
@@ -2319,7 +2233,7 @@ mod tests {
         card_header_height: f32,
         card_inset: f32,
         preview_aspect: f32,
-    ) -> GroupGrid {
+    ) -> CardGrid {
         let columns = shared_grid_columns(
             &[count],
             content_width,
@@ -2434,7 +2348,7 @@ mod tests {
         for count in 1..=10 {
             let grid = test_group_grid(count, 1332.0, 5, 400.0, 480.0, 640.0, 16.0, 44.0, 8.0, 1.8);
             let rects = (0..count)
-                .map(|idx| card_rect(idx, count, grid, 84.0, 1332.0, 100.0, 16.0))
+                .map(|idx| card_rect(idx, count, grid, 84.0, 1332.0, 100.0, 16.0, RowAlign::Center))
                 .collect::<Vec<_>>();
             assert_eq!(grid.rows, (count + grid.columns - 1) / grid.columns);
             for (idx, rect) in rects.iter().enumerate() {
@@ -2508,7 +2422,7 @@ mod tests {
     #[test]
     fn card_hit_rect_matches_painted_geometry() {
         let grid = test_group_grid(5, 1332.0, 5, 400.0, 480.0, 640.0, 16.0, 44.0, 8.0, 1.8);
-        let rect = card_rect(2, 5, grid, 84.0, 1332.0, 100.0, 16.0);
+        let rect = card_rect(2, 5, grid, 84.0, 1332.0, 100.0, 16.0, RowAlign::Center);
         let mut widgets = UiContext::default();
         widgets.push(rect, WidgetKind::SidebarRow, OverviewAction::OpenThread(42));
         let hit = widgets
@@ -2577,7 +2491,7 @@ mod tests {
         vec![GroupLayout {
             header_y: 0.0,
             cards_y: 40.0,
-            grid: GroupGrid {
+            grid: CardGrid {
                 columns,
                 rows,
                 card_width: 480.0,

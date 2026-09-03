@@ -4,7 +4,8 @@ use crate::termwindow::content_view::{ContentView, ContentViewResponse, RemoteCo
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::TermWindow;
 use crate::ui::{
-    draw_scrollbar, rect, wheel_delta_pixels, ControlState, DrawContext, InteractionState,
+    draw_scrollbar, rect, wheel_delta_pixels, ButtonVariant, ControlState, DrawContext,
+    InteractionState,
     ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads::{self, ThreadConnectionState};
@@ -20,8 +21,7 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 const CONTENT_MAX_W: f32 = 860.0;
 const PAD: f32 = 48.0;
-const CARD_RADIUS: f32 = 18.0;
-const BUTTON_RADIUS: f32 = 14.0;
+const CARD_RADIUS: f32 = 24.0;
 const BUTTON_MIN_H: f32 = 52.0;
 const HERO_ICON_SIZE: f32 = 64.0;
 pub(crate) const REMOTE_THREAD_CONTENT_VIEW_KEY_PREFIX: &str = "remote-thread:";
@@ -498,21 +498,16 @@ impl RemoteThreadView {
         enabled: bool,
     ) -> anyhow::Result<()> {
         self.widgets.push(area, WidgetKind::Button, action);
-        let state = self.button_state(action, primary, enabled);
-        let (mut bg, mut border) = state.colors(palette);
-        let mut text = palette.text;
-        if primary && enabled {
-            bg = if state == ControlState::Pressed {
-                palette.selected_bg.mul_alpha(0.82)
-            } else {
-                palette.selected_bg
-            };
-            border = palette.selected_bg;
-            text = palette.selected_text;
-        } else if !enabled {
-            bg = bg.mul_alpha(0.52);
-            text = palette.muted_text;
-        }
+        let state = self.button_state(action, enabled);
+        // Shared with every other button in the app, so "primary" means the
+        // accent in both appearances, and disabled dims consistently instead
+        // of by a local rule.
+        let variant = if primary {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Secondary
+        };
+        let (bg, _border, text) = variant.colors(state, palette);
         ctx.draw_rounded_frame(
             layers,
             0,
@@ -521,8 +516,17 @@ impl RemoteThreadView {
             area.size.width,
             area.size.height,
             bg,
-            border,
-            ctx.px(BUTTON_RADIUS),
+            // No outline. The fill already separates these from the page, and
+            // the stroked ring is drawn as its own curve rather than following
+            // the fill: at pill radius its corner arc runs almost horizontally
+            // where it meets the top edge, so the antialiasing smears sideways
+            // and the end reads as a rounded rectangle. Passing the fill as the
+            // border makes draw_rounded_frame skip the ring entirely.
+            bg,
+            // Fully rounded, like every other button in the app. Derived from
+            // the rect instead of a constant so it cannot fall out of step
+            // when the button height changes.
+            area.size.height / 2.0,
         )?;
         let icon_size = ctx.px(22.0);
         let icon_x = area.origin.x + ctx.px(18.0);
@@ -597,20 +601,13 @@ impl RemoteThreadView {
         }
     }
 
-    fn button_state(
-        &self,
-        action: RemoteThreadAction,
-        primary: bool,
-        enabled: bool,
-    ) -> ControlState {
+    fn button_state(&self, action: RemoteThreadAction, enabled: bool) -> ControlState {
         if !enabled {
             ControlState::Disabled
         } else if self.interaction.pressed == Some(action) {
             ControlState::Pressed
         } else if self.interaction.hovered == Some(action) {
             ControlState::Hovered
-        } else if primary {
-            ControlState::Active
         } else {
             ControlState::Normal
         }

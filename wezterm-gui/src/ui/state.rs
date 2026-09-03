@@ -45,6 +45,34 @@ impl<A: Copy> UiContext<A> {
         self.hits.push(HitTarget { rect, kind, action });
     }
 
+    /// How many targets have been recorded so far. Paired with
+    /// [`Self::clip_since`] to bracket a scrolling region.
+    pub(crate) fn len(&self) -> usize {
+        self.hits.len()
+    }
+
+    /// Bound every target pushed since `start` to `viewport`, dropping the
+    /// ones that fall entirely outside it. A scrolling body drawn into its
+    /// own allocator and replayed clipped has its *pixels* bounded; without
+    /// this its widgets keep taking clicks where they are no longer drawn.
+    pub(crate) fn clip_since(&mut self, start: usize, viewport: window::RectF) {
+        let mut index = 0;
+        self.hits.retain_mut(|target| {
+            let position = index;
+            index += 1;
+            if position < start {
+                return true;
+            }
+            match target.rect.intersection(&viewport) {
+                Some(visible) => {
+                    target.rect = visible;
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
     pub(crate) fn hit_test(&self, x: f32, y: f32) -> Option<HitTarget<A>> {
         self.hits
             .iter()

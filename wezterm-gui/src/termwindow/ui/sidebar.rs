@@ -50,6 +50,15 @@ const WORKSPACE_SECTION_LABEL_GAP: usize = 12;
 /// `workspace_sidebar_hidden_statuses` cannot be cleared from the UI.
 const SHOW_SIDEBAR_VIEW_OPTIONS: bool = false;
 
+/// Diameter for every round sidebar action button, and the height of the
+/// New Thread pill beside them. Also their corner radius, since they are all
+/// fully rounded.
+///
+/// 58 is the ceiling: the per-section buttons are additionally clamped to
+/// `session_row_height - 8`, so anything larger makes them stop matching the
+/// notification button. Raising it past 58 means raising
+/// `SESSION_ROW_MIN_HEIGHT` too.
+const TOP_ACTION_MAX_HEIGHT: usize = 58;
 const SESSION_ROW_MIN_HEIGHT: usize = 66;
 const SESSION_ROW_SIDE_PADDING: usize = 10;
 const SESSION_ACTION_MIN_SIZE: usize = 48;
@@ -65,7 +74,6 @@ const NOTIFICATION_BADGE_COLOR: LinearRgba = LinearRgba::with_components(0.96, 0
 const NOTIFICATION_BADGE_PULSE_DURATION: Duration = Duration::from_millis(1800);
 const NOTIFICATION_BADGE_PULSE_COUNT: f32 = 3.0;
 const NOTIFICATION_BADGE_FRAME_MS: u64 = 33;
-const SIDEBAR_SECTION_ACTION_SIZE: usize = 48;
 const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 6;
 
 /// Connection health of the active Space's mux client domain, as shown by
@@ -783,7 +791,7 @@ impl crate::TermWindow {
             y += self.workspace_sidebar_toggle_visual_size() + self.ui_px(SIDEBAR_INSET);
         }
         let top_action_height = row_height
-            .min(self.ui_px(48))
+            .min(self.ui_px(TOP_ACTION_MAX_HEIGHT))
             .max(ui_cell_height + self.ui_px(SIDEBAR_INSET))
             + if sidebar_toolbar_uses_fullscreen_style {
                 self.ui_px(WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT)
@@ -1270,8 +1278,14 @@ impl crate::TermWindow {
                 if toggle_hovered { foreground } else { muted_fg },
             )?;
         }
-        let section_button_size = self
-            .ui_px(SIDEBAR_SECTION_ACTION_SIZE)
+        // One diameter for every round sidebar action button. It follows the
+        // notification button, which is pinned to the New Thread row's height
+        // because the two sit side by side -- so tying the section buttons to
+        // the same number is what keeps the whole right-hand column one size.
+        // Still clamped to its own row: a section button must not outgrow the
+        // row it sits in.
+        let section_button_size = layout
+            .top_action_height
             .max(button_size)
             .min(session_row_height.saturating_sub(8));
         let active_project_id = view
@@ -1490,7 +1504,7 @@ impl crate::TermWindow {
             notification_action_size,
             notification_action_size,
         );
-        self.fill_rounded_rectangle(
+        self.paint_sidebar_action_button(
             layers,
             1,
             euclid::rect(
@@ -1499,15 +1513,12 @@ impl crate::TermWindow {
                 top_action_width as f32,
                 top_action_height as f32,
             ),
-            if top_action_hovered {
-                chrome.sidebar_button_hover_bg
-            } else {
-                chrome.sidebar_button_bg
-            },
-            self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
+            chrome,
+            top_action_hovered,
+            false,
         )
         .context("sidebar add thread button")?;
-        self.fill_rounded_rectangle(
+        self.paint_sidebar_action_button(
             layers,
             1,
             euclid::rect(
@@ -1516,12 +1527,9 @@ impl crate::TermWindow {
                 notification_action_size as f32,
                 notification_action_size as f32,
             ),
-            if notification_action_hovered {
-                chrome.sidebar_button_hover_bg
-            } else {
-                chrome.sidebar_button_bg
-            },
-            self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
+            chrome,
+            notification_action_hovered,
+            false,
         )
         .context("sidebar notifications button")?;
         if let Some(project_id) = active_project_id.clone() {
@@ -1878,7 +1886,7 @@ impl crate::TermWindow {
                     button_x.saturating_sub(item_x + self.ui_px(SIDEBAR_INSET) * 2),
                     muted_fg,
                 )?;
-                self.fill_rounded_rectangle(
+                self.paint_sidebar_action_button(
                     layers,
                     1,
                     euclid::rect(
@@ -1887,12 +1895,9 @@ impl crate::TermWindow {
                         section_button_size as f32,
                         section_button_size as f32,
                     ),
-                    if button_hovered {
-                        chrome.sidebar_button_hover_bg
-                    } else {
-                        chrome.sidebar_button_bg
-                    },
-                    self.ui_f32(SIDEBAR_ROW_RADIUS),
+                    chrome,
+                    button_hovered,
+                    false,
                 )
                 .context("sidebar new project button")?;
                 self.ui_items.push(UIItem {
@@ -2078,7 +2083,7 @@ impl crate::TermWindow {
                             project_action_size,
                             project_action_size,
                         );
-                    self.fill_rounded_rectangle(
+                    self.paint_sidebar_action_button(
                         layers,
                         1,
                         euclid::rect(
@@ -2087,12 +2092,9 @@ impl crate::TermWindow {
                             project_action_size as f32,
                             project_action_size as f32,
                         ),
-                        if project_action_hovered {
-                            chrome.sidebar_button_hover_bg
-                        } else {
-                            chrome.sidebar_button_bg
-                        },
-                        self.ui_f32(SIDEBAR_ROW_RADIUS),
+                        chrome,
+                        project_action_hovered,
+                        false,
                     )
                     .context("sidebar new thread button")?;
                     self.ui_items.push(UIItem {
@@ -2433,7 +2435,7 @@ impl crate::TermWindow {
                             group_action_size,
                             group_action_size,
                         );
-                    self.fill_rounded_rectangle(
+                    self.paint_sidebar_action_button(
                         layers,
                         1,
                         euclid::rect(
@@ -2442,14 +2444,9 @@ impl crate::TermWindow {
                             group_action_size as f32,
                             group_action_size as f32,
                         ),
-                        if group_action_hovered {
-                            chrome.sidebar_button_hover_bg
-                        } else if group.attached {
-                            chrome.sidebar_button_bg
-                        } else {
-                            chrome.sidebar_button_bg.mul_alpha(0.4)
-                        },
-                        self.ui_f32(SIDEBAR_ROW_RADIUS),
+                        chrome,
+                        group_action_hovered,
+                        !group.attached,
                     )
                     .context("sidebar ref group new thread button")?;
                     if group.attached {
@@ -2786,7 +2783,9 @@ impl crate::TermWindow {
                     top_action_width,
                     top_action_height,
                 );
-            self.fill_rounded_rectangle(
+            // The repaint over the scrolled list; it is what ends up visible,
+            // so it has to use the same treatment as the layer-1 fill.
+            self.paint_sidebar_action_button(
                 layers,
                 2,
                 euclid::rect(
@@ -2795,12 +2794,9 @@ impl crate::TermWindow {
                     top_action_width as f32,
                     top_action_height as f32,
                 ),
-                if top_action_hovered {
-                    chrome.sidebar_button_hover_bg
-                } else {
-                    chrome.sidebar_button_bg
-                },
-                self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
+                chrome,
+                top_action_hovered,
+                false,
             )
             .context("sidebar add thread button repaint")?;
             let notification_action_hovered = self.is_pointer_over_ui_rect(
@@ -2809,7 +2805,7 @@ impl crate::TermWindow {
                 notification_action_size,
                 notification_action_size,
             );
-            self.fill_rounded_rectangle(
+            self.paint_sidebar_action_button(
                 layers,
                 2,
                 euclid::rect(
@@ -2818,12 +2814,9 @@ impl crate::TermWindow {
                     notification_action_size as f32,
                     notification_action_size as f32,
                 ),
-                if notification_action_hovered {
-                    chrome.sidebar_button_hover_bg
-                } else {
-                    chrome.sidebar_button_bg
-                },
-                self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
+                chrome,
+                notification_action_hovered,
+                false,
             )
             .context("sidebar notifications button repaint")?;
             let top_action_fg = if active_project_id.is_some() {
@@ -3151,7 +3144,9 @@ impl crate::TermWindow {
                 let ssh_icon_size = icon_size.min(settings_row_height.saturating_sub(8));
                 self.paint_sidebar_icon(
                     layers,
-                    SvgIcon::Link2,
+                    // Same globe the Space menu's "Add Remote Host" uses; a
+                    // chain link never said "a machine somewhere else".
+                    SvgIcon::Globe,
                     ssh_action_x + ((settings_action_size.saturating_sub(ssh_icon_size)) / 2),
                     ssh_action_y + ((settings_action_size.saturating_sub(ssh_icon_size)) / 2),
                     ssh_icon_size,
@@ -3342,6 +3337,44 @@ impl crate::TermWindow {
             || self
                 .workspace_sidebar_scrollbar_visible_until
                 .is_some_and(|until| until > std::time::Instant::now())
+    }
+
+    /// A sidebar action button: circle or pill, with the same shadow and
+    /// hairline border a selected sidebar row gets.
+    ///
+    /// Four call sites paint these (New Thread and the bell, each of which is
+    /// also repainted on a higher layer over the scrolled list, plus the
+    /// per-section add buttons), and they used to carry the radius and the
+    /// fill separately. Keeping the treatment in one place is what stops one
+    /// of them from staying a rounded square when the others become pills.
+    pub(crate) fn paint_sidebar_action_button(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        chrome: UiPalette,
+        hovered: bool,
+        // `dimmed` is a button whose action is unavailable right now -- a
+        // detached ref group's add button. It keeps its shape and place so
+        // the column stays even, and fades instead of disappearing.
+        dimmed: bool,
+    ) -> anyhow::Result<()> {
+        let radius = rect.height().min(rect.width()) / 2.0;
+        let fade = if dimmed { 0.4 } else { 1.0 };
+        self.paint_active_surface_shadow(layers, layer_num, rect, radius)?;
+        self.fill_rounded_rectangle_with_border(
+            layers,
+            layer_num,
+            rect,
+            if hovered {
+                chrome.sidebar_button_hover_bg
+            } else {
+                chrome.sidebar_button_bg.mul_alpha(fade)
+            },
+            chrome.sidebar_row_active_border.mul_alpha(fade),
+            radius,
+            CAPSULE_BORDER_WIDTH,
+        )
     }
 
     pub(crate) fn fill_rounded_rectangle(
