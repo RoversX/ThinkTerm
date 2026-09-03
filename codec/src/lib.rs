@@ -487,7 +487,7 @@ macro_rules! pdu {
 ///     cold-start delivery and for `thinkterm cli agent list`.
 /// 62: Projects carry an archived state in the shared ThinkTerm tree
 ///     (TtProject.archived_at, TreeOp::SetProjectArchived).
-pub const CODEC_VERSION: usize = 62;
+pub const CODEC_VERSION: usize = 63;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -568,6 +568,8 @@ pdu! {
     AgentStatusChanged: 80,
     GetAgentStatuses: 81,
     GetAgentStatusesResponse: 82,
+    GetServerOsRelease: 83,
+    GetServerOsReleaseResponse: 84,
 }
 
 impl Pdu {
@@ -713,6 +715,24 @@ pub struct GetCodecVersionResponse {
     pub server_id: String,
     pub executable_path: PathBuf,
     pub config_file_path: Option<PathBuf>,
+}
+
+/// What the server is running on, asked for separately.
+///
+/// Deliberately its own request rather than another field on
+/// `GetCodecVersionResponse`: varbincode is positional, so any field added to
+/// that struct makes it undecodable by a peer built against a different
+/// version -- and that is the one message whose whole job is to report a
+/// version mismatch in the first place. Its shape has to stay frozen or a
+/// skewed pair gets "failed to fill whole buffer" instead of being told which
+/// versions they are.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetServerOsRelease {}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetServerOsReleaseResponse {
+    /// The `ID=` from the server's own `/etc/os-release`, when it has one.
+    pub os_release_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -2108,7 +2128,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 62);
+        assert_eq!(CODEC_VERSION, 63);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {

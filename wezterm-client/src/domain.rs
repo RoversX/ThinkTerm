@@ -1897,6 +1897,13 @@ impl ClientDomain {
         }
     }
 
+    /// The distro id the remote mux reported at handshake. `None` until the
+    /// domain is attached, or when the server is not on a machine with an
+    /// `/etc/os-release`.
+    pub fn remote_os_release(&self) -> Option<String> {
+        self.inner()?.client.remote_os_release()
+    }
+
     fn inner(&self) -> Option<Arc<ClientInner>> {
         self.inner.lock().unwrap().as_ref().map(Arc::clone)
     }

@@ -16,10 +16,23 @@ use mux::{
 };
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use termwiz::surface::SequenceNo;
 use url::Url;
+
+/// This machine's distro id, read once. Clients ask for it in the version
+/// handshake so that a host reached through the mux can show the right logo
+/// without anyone opening a second connection to go and look.
+fn local_os_release_id() -> &'static Option<String> {
+    static ID: OnceLock<Option<String>> = OnceLock::new();
+    ID.get_or_init(|| {
+        std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .as_deref()
+            .and_then(mux::ssh::parse_os_release_id)
+    })
+}
 use wezterm_term::color::ColorPalette;
 use wezterm_term::terminal::Alert;
 use wezterm_term::StableRowIndex;
@@ -1540,6 +1553,14 @@ impl SessionHandler {
                 }
             }
 
+            Pdu::GetServerOsRelease(_) => {
+                send_response(Ok(Pdu::GetServerOsReleaseResponse(
+                    GetServerOsReleaseResponse {
+                        os_release_id: local_os_release_id().clone(),
+                    },
+                )))
+            }
+
             Pdu::GetTlsCreds(_) => {
                 catch(
                     move || {
@@ -1660,6 +1681,7 @@ impl SessionHandler {
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
             | Pdu::GetPaneRenderChangesResponse { .. }
+            | Pdu::GetServerOsReleaseResponse { .. }
             | Pdu::UnitResponse { .. }
             | Pdu::LivenessResponse { .. }
             | Pdu::GetPaneDirectionResponse { .. }

@@ -284,7 +284,7 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
 }
 
 /// Parse the `ID=` value out of `/etc/os-release` contents (e.g. "ubuntu").
-fn parse_os_release_id(text: &str) -> Option<String> {
+pub fn parse_os_release_id(text: &str) -> Option<String> {
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("ID=") {
             let value = rest.trim().trim_matches('"').to_string();

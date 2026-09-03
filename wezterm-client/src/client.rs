@@ -184,6 +184,8 @@ pub struct Client {
     connection_phase: Arc<AtomicU8>,
     resume_reconnect_tx: std::sync::mpsc::Sender<()>,
     remote_server_id: Arc<RwLock<Option<String>>>,
+    /// The distro id the server reported when we shook hands, if any.
+    remote_os_release: Arc<RwLock<Option<String>>>,
     /// Process-unique identity of the currently attached transport.  A
     /// reconnect gets a fresh value so queued unilateral messages from the
     /// superseded reader cannot be mistaken for current server state.
@@ -227,6 +229,11 @@ impl Client {
 
     pub fn remote_server_id(&self) -> Option<String> {
         self.remote_server_id.read().unwrap().clone()
+    }
+
+    /// What the server said it is running on, once the handshake completed.
+    pub fn remote_os_release(&self) -> Option<String> {
+        self.remote_os_release.read().unwrap().clone()
     }
 
     pub fn connection_generation(&self) -> u64 {
@@ -1623,6 +1630,7 @@ impl Client {
         let reader_connection_phase = Arc::clone(&connection_phase);
         let (resume_reconnect_tx, resume_reconnect_rx) = channel::<()>();
         let remote_server_id = Arc::new(RwLock::new(None));
+        let remote_os_release = Arc::new(RwLock::new(None));
         let connection_generation = Arc::new(AtomicU64::new(0));
         let reader_connection_generation = Arc::clone(&connection_generation);
         let fatal_connection_error = Arc::new(Mutex::new(None));
@@ -1930,6 +1938,7 @@ impl Client {
             connection_phase,
             resume_reconnect_tx,
             remote_server_id,
+            remote_os_release,
             connection_generation,
             fatal_connection_error,
         }
@@ -1997,6 +2006,19 @@ impl Client {
                     ),
                 }
                 *self.remote_server_id.write().unwrap() = Some(info.server_id.clone());
+                // Best effort, and its own request: see GetServerOsRelease for
+                // why this cannot ride the version response. A server that
+                // does not answer simply leaves the distro unknown.
+                if let Ok(Pdu::GetServerOsReleaseResponse(os)) = self
+                    .send_bootstrap_pdu(Pdu::GetServerOsRelease(GetServerOsRelease {}))
+                    .or(async {
+                        smol::Timer::after(Duration::from_secs(10)).await;
+                        Err(Timeout).context("Timeout")
+                    })
+                    .await
+                {
+                    *self.remote_os_release.write().unwrap() = os.os_release_id;
+                }
                 self.mark_registration_complete()?;
                 Ok(info)
             }
