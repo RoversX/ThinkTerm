@@ -1765,8 +1765,12 @@ impl SessionHandler {
             }
 
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
-            Pdu::Pong { .. }
-            | Pdu::AgentStatusChanged { .. }
+            // The answer to this connection's liveness probe. Arriving at
+            // all is the answer; there is nothing to reply, and replying
+            // with an error (as the catch-all below would) killed the
+            // client that had just proved it was alive.
+            Pdu::Pong(_) => {}
+            Pdu::AgentStatusChanged { .. }
             | Pdu::GetAgentStatusesResponse { .. }
             | Pdu::ListPanesResponse { .. }
             | Pdu::SetApplicationPalette { .. }

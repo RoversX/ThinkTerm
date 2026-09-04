@@ -421,6 +421,84 @@ mod tests {
         );
     }
 
+    /// A peer that answers the probe is kept, and hears nothing back for
+    /// its Pong. (The first cut replied to the Pong with an ErrorResponse,
+    /// which the client could not handle: every client died ten seconds
+    /// after connecting.)
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_that_answers_the_probe_is_kept_and_not_answered_back() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ours = unsafe { UnixStream::from_raw_fd(ours.into_raw_fd()) };
+        let stream = Async::new(ours).unwrap();
+        let liveness = Liveness::with_timing(
+            Instant::now(),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+
+        let peer = std::thread::spawn(move || {
+            // Answer every probe for a while. The only things the server
+            // may send are further probes: a reply to the Pong would be an
+            // ErrorResponse, which a client takes as fatal, and a hangup
+            // means it was counted dead regardless.
+            theirs
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let started = Instant::now();
+            let mut probes = 0;
+            while started.elapsed() < Duration::from_millis(700) {
+                match Pdu::decode(&mut theirs) {
+                    Ok(decoded) => {
+                        assert!(
+                            matches!(decoded.pdu, Pdu::Ping(_)),
+                            "the server sent {:?} to a peer that answered",
+                            decoded.pdu
+                        );
+                        assert_eq!(decoded.serial, 0);
+                        probes += 1;
+                        Pdu::Pong(codec::Pong {})
+                            .encode(&mut theirs, 0)
+                            .expect("the answer is written");
+                    }
+                    Err(err) => {
+                        let io = err.root_cause().downcast_ref::<std::io::Error>();
+                        assert!(
+                            io.map_or(false, |e| matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            )),
+                            "the server hung up on a peer that answered: {:#}",
+                            err
+                        );
+                    }
+                }
+            }
+            assert!(probes >= 2, "expected repeated probes, got {}", probes);
+            theirs
+        });
+
+        // The loop must still be running once the probe has been answered
+        // and the old timeout has long passed.
+        let outcome = smol::block_on(smol::future::or(
+            async {
+                process_async_with(stream, liveness).await?;
+                anyhow::bail!("the loop ended although the peer answered")
+            },
+            async {
+                smol::Timer::after(Duration::from_millis(900)).await;
+                Ok(())
+            },
+        ));
+        outcome.expect("the connection stays up");
+        peer.join().expect("the peer's expectations hold");
+    }
+
     /// The whole loop against a socket whose peer never writes: it must
     /// send a Ping and then give up, returning Ok so the handler drops and
     /// the client is unregistered.
