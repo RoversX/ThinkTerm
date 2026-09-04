@@ -67,7 +67,6 @@ fluent-langneg.workspace = true
 frecency.workspace = true
 futures.workspace = true
 hdrhistogram.workspace = true
-http_req.workspace = true
 ignore.workspace = true
 image.workspace = true
 lazy_static.workspace = true
@@ -106,6 +105,7 @@ termwiz-funcs.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true
 thinkterm-proto.workspace = true
+thinkterm-update.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
 thinkterm-syntax = { path = "../thinkterm-syntax" }
@@ -138,7 +138,6 @@ window-funcs.workspace = true
 window.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-plist.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 shared_library.workspace = true

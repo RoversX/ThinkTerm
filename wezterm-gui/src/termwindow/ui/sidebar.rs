@@ -3212,6 +3212,37 @@ impl crate::TermWindow {
                 settings_icon_size,
                 foreground,
             )?;
+            // A newer release exists: a dot on the gear's shoulder, ringed in
+            // the sidebar background so it reads on the icon rather than in
+            // it. This is the whole in-app notice; the page it leads to has
+            // the details and the button.
+            if crate::update::update_available() {
+                let dot = (settings_icon_size / 3).max(self.ui_px(5)) as f32;
+                let ring = dot + 2.0 * self.ui_f32(1.5);
+                let dot_x = (settings_icon_x + settings_icon_size) as f32 - dot * 0.75;
+                let dot_y = settings_icon_y as f32 - dot * 0.25;
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        dot_x - (ring - dot) / 2.0,
+                        dot_y - (ring - dot) / 2.0,
+                        ring,
+                        ring,
+                    ),
+                    chrome.workspace_sidebar_bg,
+                    ring / 2.0,
+                )
+                .context("sidebar update dot ring")?;
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(dot_x, dot_y, dot, dot),
+                    chrome.accent,
+                    dot / 2.0,
+                )
+                .context("sidebar update dot")?;
+            }
             // A truncated "S…" reads worse than no label: when the sidebar is
             // too narrow for the whole word, the gear icon stands alone (and
             // the row shrank to an icon pill above).

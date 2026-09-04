@@ -1,225 +1,62 @@
-use crate::ICON_DATA;
-use anyhow::anyhow;
-use config::{configuration, wezterm_version};
-use http_req::request::{HttpVersion, Request};
-use http_req::uri::Uri;
+use config::configuration;
 use mux::connui::ConnectionUI;
-use serde::*;
-use std::convert::TryFrom;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
-use termwiz::cell::{Hyperlink, Underline};
-use termwiz::color::AnsiColor;
-use termwiz::escape::csi::{Cursor, Sgr};
-use termwiz::escape::osc::{ITermDimension, ITermFileData, ITermProprietary};
-use termwiz::escape::{OneBased, OperatingSystemCommand, CSI};
 use wezterm_toast_notification::*;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Release {
-    pub url: String,
-    pub body: String,
-    pub html_url: String,
-    pub tag_name: String,
-    pub assets: Vec<Asset>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Asset {
-    pub name: String,
-    pub size: usize,
-    pub url: String,
-    pub browser_download_url: String,
-}
-
-/// The repository every update link points at. The update check, the toast,
-/// and the Settings Update/About pages all build their URLs from this, so a
-/// fork or a rename is one edit rather than a grep.
-pub const REPO_URL: &str = "https://github.com/RoversX/thinkterm";
-
-pub fn releases_url() -> String {
-    format!("{REPO_URL}/releases")
-}
-
-pub fn release_tag_url(tag: &str) -> String {
-    format!("{REPO_URL}/releases/tag/{tag}")
-}
-
-fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
-    let uri = Uri::try_from(uri)?;
-
-    let mut latest = Vec::new();
-    let _res = Request::new(&uri)
-        .version(HttpVersion::Http10)
-        .header("User-Agent", &format!("thinkterm/{}", wezterm_version()))
-        .send(&mut latest)
-        .map_err(|e| anyhow!("failed to query github releases: {}", e))?;
-
-    /*
-    println!("Status: {} {}", _res.status_code(), _res.reason());
-    println!("{}", String::from_utf8_lossy(&latest));
-    */
-
-    let latest: Release = serde_json::from_slice(&latest)?;
-    Ok(latest)
-}
-
-pub fn get_latest_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/RoversX/thinkterm/releases/latest")
-}
-
-#[allow(unused)]
-pub fn get_nightly_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/RoversX/thinkterm/releases/tags/nightly")
-}
+// The release lookup, the running version and the version comparison are
+// shared with `thinkterm update` and the mux client's remote update; the GUI
+// keeps its names for them so the Settings pages and the toast read the same.
+pub use thinkterm_update::{
+    get_latest_release_info, is_newer_release, release_tag_url, releases_url,
+    running_release_version, Release, REPO_URL,
+};
 
 lazy_static::lazy_static! {
     static ref UPDATER_WINDOW: Mutex<Option<ConnectionUI>> = Mutex::new(None);
 }
 
-pub fn load_last_release_info_and_set_banner() {
+/// Whether a release newer than this build is known. What the sidebar's
+/// settings button reads on every paint, so it is a flag and not a file:
+/// set from the cache at startup and by the checker after every check.
+///
+/// Nothing is written into terminal output any more. The upstream banner
+/// printed two rows and an icon into every new local shell and left them in
+/// its scrollback; a dot on the settings button says the same thing without
+/// taking any space, on remote panes too, and leads to the page that can
+/// act on it.
+static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+pub fn update_available() -> bool {
+    UPDATE_AVAILABLE.load(Ordering::Relaxed)
+}
+
+/// Record the flag; when it changes, ask every window to repaint so the dot
+/// appears or goes away. Only the checker thread calls this: it runs once
+/// the GUI is up, and spawning onto the main thread needs its scheduler.
+fn set_update_available(available: bool) {
+    let was = UPDATE_AVAILABLE.swap(available, Ordering::Relaxed);
+    if was != available {
+        promise::spawn::spawn_into_main_thread(async move {
+            crate::frontend::front_end().invalidate_all_windows();
+        })
+        .detach();
+    }
+}
+
+/// Seed the flag from the last check on disk, so the dot is right from the
+/// first frame rather than after the checker's first delay. Called before
+/// any window exists, so it only stores: the first paint reads it.
+pub fn load_last_release_info() {
     if !configuration().check_for_updates {
         return;
     }
-
-    let update_file_name = config::DATA_DIR.join("check_update");
-    if let Ok(data) = std::fs::read(update_file_name) {
-        let latest: Release = match serde_json::from_slice(&data) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-
-        let current = running_release_version();
-        let force_ui = always_show_update_ui();
-        if !is_newer_release(&latest.tag_name, &current) && !force_ui {
-            return;
-        }
-
-        set_banner_from_release_info(&latest);
-    }
-}
-
-fn set_banner_from_release_info(latest: &Release) {
-    let mux = crate::Mux::get();
-    let url = release_tag_url(&latest.tag_name);
-
-    let icon = ITermFileData {
-        name: None,
-        size: Some(ICON_DATA.len()),
-        width: ITermDimension::Automatic,
-        height: ITermDimension::Cells(2),
-        preserve_aspect_ratio: true,
-        inline: true,
-        do_not_move_cursor: false,
-        data: ICON_DATA.to_vec(),
-    };
-    let icon = OperatingSystemCommand::ITermProprietary(ITermProprietary::File(Box::new(icon)));
-    let top_line_pos = CSI::Cursor(Cursor::CharacterAndLinePosition {
-        line: OneBased::new(1),
-        col: OneBased::new(6),
-    });
-    let second_line_pos = CSI::Cursor(Cursor::CharacterAndLinePosition {
-        line: OneBased::new(2),
-        col: OneBased::new(6),
-    });
-    let link_on = OperatingSystemCommand::SetHyperlink(Some(Hyperlink::new(url)));
-    let underline_color = CSI::Sgr(Sgr::UnderlineColor(AnsiColor::Blue.into()));
-    let underline_on = CSI::Sgr(Sgr::Underline(Underline::Single));
-    let reset = CSI::Sgr(Sgr::Reset);
-    let link_off = OperatingSystemCommand::SetHyperlink(None);
-    mux.set_banner(Some(format!(
-        "{}{}ThinkTerm Update Available\r\n{}{}{}{}Click to see what's new{}{}\r\n",
-        icon,
-        top_line_pos,
-        second_line_pos,
-        link_on,
-        underline_color,
-        underline_on,
-        link_off,
-        reset,
-    )));
-}
-
-fn schedule_set_banner_from_release_info(latest: &Release) {
-    let current = running_release_version();
-    if !is_newer_release(&latest.tag_name, &current) {
-        return;
-    }
-    promise::spawn::spawn_into_main_thread({
-        let latest = latest.clone();
-        async move {
-            set_banner_from_release_info(&latest);
-        }
-    })
-    .detach();
-}
-
-/// The release version of the running build, for comparison against the tag
-/// of the latest GitHub release.
-///
-/// `wezterm_version()` is baked in at compile time from `.tag`, which only the
-/// release workflow writes -- and macOS is the one platform whose packages are
-/// built by hand rather than in CI, so its binaries carry a commit stamp that
-/// `is_newer_release` deliberately refuses to compare against a `v*` tag. The
-/// bundle's Info.plist does carry the release version, is read at runtime
-/// rather than compile time, and is already what Finder and the About panel
-/// show, so prefer it when we are running from inside an app bundle.
-pub fn running_release_version() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(version) = macos_bundle_version() {
-            return version;
-        }
-    }
-    wezterm_version().to_string()
-}
-
-/// `<bundle>.app/Contents/MacOS/<exe>` puts Info.plist one level up from the
-/// executable's directory. Returns None for a bare `cargo build` binary, which
-/// has no bundle and should keep reporting its commit stamp.
-#[cfg(target_os = "macos")]
-fn macos_bundle_version() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    version_from_info_plist(exe.parent()?.parent()?.join("Info.plist"))
-}
-
-#[cfg(target_os = "macos")]
-fn version_from_info_plist(path: std::path::PathBuf) -> Option<String> {
-    let value = plist::Value::from_file(path).ok()?;
-    let version = value
-        .as_dictionary()?
-        .get("CFBundleShortVersionString")?
-        .as_string()?
-        .trim()
-        .to_string();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version)
-    }
-}
-
-/// Is `latest` a release the running build should be told about?
-///
-/// The two strings only compare meaningfully when they use the same scheme.
-/// A CI build carries the release tag (the workflow writes `.tag`, which
-/// wezterm-version's build.rs prefers); anything built from a plain checkout
-/// carries a `<date>-<hash>` commit stamp instead. Comparing across the two
-/// with `>` is what made every `v*` release look permanently newer than every
-/// local build: 'v' sorts above every digit, so the banner never went away.
-fn is_newer_release(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| semver::Version::parse(s.trim_start_matches('v')).ok();
-    match (parse(latest), parse(current)) {
-        (Some(latest), Some(current)) => latest > current,
-        // Both on the commit-stamp scheme, which upstream still uses for its
-        // own tags. It starts with a zero-padded date, so lexicographic order
-        // is chronological order.
-        (None, None) => latest > current,
-        // One of each: there is no ordering between the schemes, and a build
-        // that never came from a release is not something to nag about.
-        _ => false,
-    }
+    let status = cached_update_status();
+    UPDATE_AVAILABLE.store(
+        status.update_available || always_show_update_ui(),
+        Ordering::Relaxed,
+    );
 }
 
 /// Everything the Settings > Update page can say without touching the network.
@@ -301,21 +138,6 @@ mod update_version_tests {
         assert!(!is_newer_release("20260101-000000-aaaaaaaa", STAMP));
     }
 
-    /// The bundle template is the version a hand-built macOS package reports,
-    /// so a release that forgets to bump it silently stops notifying users.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn bundle_template_carries_a_comparable_version() {
-        let plist = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../assets/macos/ThinkTerm.app/Contents/Info.plist");
-        let version = super::version_from_info_plist(plist)
-            .expect("the shipped Info.plist must declare CFBundleShortVersionString");
-        assert!(
-            semver::Version::parse(version.trim_start_matches('v')).is_ok(),
-            "Info.plist version {version:?} must parse as semver, or macOS \
-             builds cannot be compared against a release tag"
-        );
-    }
 }
 
 /// Returns true if the provided socket path is dead.
@@ -355,9 +177,10 @@ fn update_checker() {
 
         if configuration().check_for_updates {
             if let Ok(latest) = get_latest_release_info() {
-                schedule_set_banner_from_release_info(&latest);
                 let current = running_release_version();
-                if is_newer_release(&latest.tag_name, &current) || force_ui {
+                let newer = is_newer_release(&latest.tag_name, &current);
+                set_update_available(newer || force_ui);
+                if newer || force_ui {
                     log::info!(
                         "latest release {} is newer than current build {}",
                         latest.tag_name,
@@ -368,8 +191,8 @@ fn update_checker() {
 
                     if force_ui || socks.is_empty() || socks[0] == my_sock {
                         persistent_toast_notification_with_click_to_open_url(
-                            "ThinkTerm Update Available",
-                            "Click to see what's new",
+                            &crate::i18n::tr("update-toast-title"),
+                            &crate::i18n::tr("update-toast-body"),
                             &url,
                         );
                     }

@@ -645,3 +645,21 @@ settings-sidebar-description = Choisissez les panneaux proposés par la barre la
 settings-sidebar-files-description = Parcourir le répertoire de travail, et les répertoires distants via SFTP.
 settings-sidebar-notes-description = Notes Markdown conservées avec le projet.
 settings-sidebar-snippets-description = Commandes et textes enregistrés, à coller dans un panneau.
+
+# Notification de mise à jour et installation depuis la page Mise à jour logicielle.
+update-toast-title = Mise à jour de ThinkTerm disponible
+update-toast-body = Cliquez pour voir les nouveautés
+settings-update-install = Installer la mise à jour
+settings-update-installing = Installation… cette fenêtre reste utilisable pendant le remplacement des fichiers.
+settings-update-installed = ThinkTerm { $version } est installé. Quittez et rouvrez ThinkTerm pour l'utiliser.
+settings-update-install-failed = La mise à jour n'a pas pu être installée : { $error }
+settings-update-install-note = Installer la mise à jour remplace les fichiers sur place ; ThinkTerm continue d'exécuter la version actuelle jusqu'à sa réouverture.
+settings-update-method-script = Installé par le script d'installation (variante { $variant }).
+settings-update-method-macapp = ThinkTerm.app installé manuellement dans { $path } ; la mise à jour le remplace à cet endroit et ajoute les outils en ligne de commande dans ~/.local/bin.
+settings-update-method-appimage = Ceci est une AppImage : mettez-la à jour avec AppImageUpdate ou téléchargez la nouvelle AppImage depuis la page des versions.
+settings-update-method-homebrew = Installé avec Homebrew : exécutez `brew upgrade thinkterm`.
+settings-update-method-nix = Installé depuis le store Nix : mettez-le à jour via votre configuration Nix.
+settings-update-method-system = Installé par le gestionnaire de paquets du système : installez le nouveau paquet de la page des versions avec apt, dnf ou l'outil d'origine.
+settings-update-method-windows = Installé par l'installateur Windows ; la mise à jour télécharge le nouvel installateur et l'exécute.
+settings-update-method-source = Ceci est une compilation depuis les sources : mettez à jour le dépôt et recompilez.
+settings-update-method-unknown = Cette copie n'a pas été installée par le script d'installation ; ThinkTerm ne la remplacera pas. Mettez-la à jour comme elle a été installée.

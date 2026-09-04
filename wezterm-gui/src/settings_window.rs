@@ -194,7 +194,14 @@ fn format_archived_when(archived_at: i64) -> String {
 /// tinted status glyph on Software Update.
 enum HeroBadge {
     AppIcon,
-    Status { icon: SvgIcon, tint: LinearRgba },
+}
+
+/// An install run from the Update page, from the click to its outcome.
+#[derive(Debug, Clone)]
+enum UpdateInstall {
+    Running,
+    Installed { version: String },
+    Failed { error: String },
 }
 
 /// What the Update page's status card can say. Derived from the on-disk
@@ -223,13 +230,6 @@ fn status_tint_positive(appearance: Appearance) -> LinearRgba {
     match appearance {
         Appearance::Light | Appearance::LightHighContrast => rgba(52, 199, 89, 1.0),
         Appearance::Dark | Appearance::DarkHighContrast => rgba(48, 209, 88, 1.0),
-    }
-}
-
-fn status_tint_neutral(appearance: Appearance) -> LinearRgba {
-    match appearance {
-        Appearance::Light | Appearance::LightHighContrast => rgba(142, 142, 147, 1.0),
-        Appearance::Dark | Appearance::DarkHighContrast => rgba(120, 120, 128, 1.0),
     }
 }
 
@@ -737,6 +737,7 @@ enum SettingsAction {
     ResetInputDiagnostics,
     CopyInputDiagnostics,
     CheckForUpdates,
+    InstallUpdate,
     OpenLatestRelease,
     OpenReleasesIndex,
     OpenSourceRepository,
@@ -1246,6 +1247,13 @@ struct SettingsUiState {
     /// Set briefly after Check Now so the button can report that it ran even
     /// when the cached answer is unchanged.
     update_checked_until: Option<Instant>,
+    /// How this copy was installed, which decides whether the page can
+    /// install an update itself or only say who can. Read with the status:
+    /// it looks at the filesystem, so never on the paint path.
+    update_method: Option<thinkterm_update::InstallMethod>,
+    /// The install started from this page, if any. Runs on its own thread
+    /// and reports back through the instance id.
+    update_install: Option<UpdateInstall>,
     version_info_copied_until: Option<Instant>,
     sidebar_scrollbar_visible_until: Option<Instant>,
     content_scrollbar_visible_until: Option<Instant>,
@@ -1283,6 +1291,8 @@ impl SettingsUiState {
             input_diagnostics_copied_until: None,
             update_status: None,
             update_checked_until: None,
+            update_method: None,
+            update_install: None,
             version_info_copied_until: None,
             sidebar_scrollbar_visible_until: None,
             content_scrollbar_visible_until: None,
@@ -1665,7 +1675,6 @@ struct SettingsPalette {
     control_pressed_bg: LinearRgba,
     control_border: LinearRgba,
     card_bg: LinearRgba,
-    accent: LinearRgba,
     on_accent: LinearRgba,
     title: LinearRgba,
     text: LinearRgba,
@@ -1925,6 +1934,7 @@ impl SettingsWindow {
         // Same reasoning for the update cache: the window can open straight
         // onto Update or About, and both read it while painting.
         ui.update_status = Some(crate::update::cached_update_status());
+        ui.update_method = Some(thinkterm_update::InstallMethod::detect());
 
         let settings = Rc::new(RefCell::new(Self {
             instance_id,
@@ -3252,7 +3262,6 @@ impl SettingsWindow {
             control_pressed_bg: ui.control_pressed_bg,
             control_border: ui.control_border,
             card_bg: ui.card_bg,
-            accent: ui.accent,
             on_accent: ui.on_accent,
             title: ui.text,
             text: ui.text,
@@ -3378,6 +3387,7 @@ impl SettingsWindow {
             // the page picks up a check that ran while the window sat on
             // another section.
             self.ui.update_status = Some(crate::update::cached_update_status());
+            self.ui.update_method = Some(thinkterm_update::InstallMethod::detect());
         }
     }
 
@@ -3985,8 +3995,72 @@ impl SettingsWindow {
                 // one small read rather than a blocking HTTP request on the UI
                 // thread. The live check replaces this call, not the button.
                 self.ui.update_status = Some(crate::update::cached_update_status());
+            self.ui.update_method = Some(thinkterm_update::InstallMethod::detect());
                 self.ui.update_checked_until = Some(Instant::now() + Duration::from_millis(1400));
                 self.schedule_copied_state_clear(window);
+            }
+            SettingsAction::InstallUpdate => {
+                self.ui.open_dropdown = None;
+                if matches!(self.ui.update_install, Some(UpdateInstall::Running)) {
+                    return;
+                }
+                let Some(release) = self
+                    .ui
+                    .update_status
+                    .as_ref()
+                    .and_then(|status| status.latest.clone())
+                else {
+                    return;
+                };
+                let method = self
+                    .ui
+                    .update_method
+                    .clone()
+                    .unwrap_or_else(thinkterm_update::InstallMethod::detect);
+                self.ui.update_install = Some(UpdateInstall::Running);
+                window.invalidate();
+
+                // The installer downloads and replaces files: off the UI
+                // thread, with the outcome posted back to whichever settings
+                // window instance asked, if it is still open.
+                let instance_id = self.instance_id;
+                let window = window.clone();
+                std::thread::Builder::new()
+                    .name("thinkterm-update-install".into())
+                    .spawn(move || {
+                        let version = release.tag_name.trim_start_matches('v').to_string();
+                        let result = if cfg!(windows) {
+                            thinkterm_update::run_windows_installer(&release).map(|_| ())
+                        } else {
+                            match method.manifest_for_install() {
+                                Some(manifest) => thinkterm_update::run_local_installer_captured(
+                                    &manifest,
+                                    &release.tag_name,
+                                )
+                                .map(|_| ()),
+                                None => Err(anyhow::anyhow!("{}", method.how_to_update())),
+                            }
+                        };
+                        let outcome = match result {
+                            Ok(()) => UpdateInstall::Installed { version },
+                            Err(err) => UpdateInstall::Failed {
+                                error: format!("{err:#}"),
+                            },
+                        };
+                        promise::spawn::spawn_into_main_thread(async move {
+                            if let Some(settings) = settings_window_for_instance(instance_id) {
+                                let mut settings = settings.borrow_mut();
+                                settings.ui.update_install = Some(outcome);
+                                settings.ui.update_status =
+                                    Some(crate::update::cached_update_status());
+                                settings.ui.update_method =
+                                    Some(thinkterm_update::InstallMethod::detect());
+                                window.invalidate();
+                            }
+                        })
+                        .detach();
+                    })
+                    .ok();
             }
             SettingsAction::OpenLatestRelease => {
                 self.ui.open_dropdown = None;
@@ -7227,35 +7301,6 @@ impl SettingsWindow {
         Ok(())
     }
 
-    /// A filled, rounded tile with a white glyph centered in it -- the badge
-    /// that carries the Update page's status and the About page's app mark.
-    fn paint_status_badge(
-        &self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        icon: SvgIcon,
-        x: f32,
-        y: f32,
-        size: f32,
-        tint: LinearRgba,
-    ) -> anyhow::Result<()> {
-        // A disc rather than a rounded square: the badge states a status, and
-        // the app's own mark on About is the rounded square. The shadow is the
-        // same one a selected sidebar row gets, so the two lift by the same
-        // amount.
-        let radius = size / 2.0;
-        self.paint_active_row_shadow(layers, x, y, size, size, radius)?;
-        self.draw_rounded_frame(layers, 0, x, y, size, size, tint, tint, radius)?;
-        let glyph = (size * 0.5).round();
-        self.draw_svg_icon(
-            layers,
-            icon,
-            x + (size - glyph) / 2.0,
-            y + (size - glyph) / 2.0,
-            glyph,
-            LinearRgba::with_components(1.0, 1.0, 1.0, 1.0),
-        )
-    }
-
     /// Row geometry for the two app-level pages. Unlike `settings_row_step`
     /// these rows carry no explanation line, so they are a single line tall
     /// -- the shape macOS System Settings uses for a list of plain facts.
@@ -7402,6 +7447,35 @@ impl SettingsWindow {
         }
     }
 
+    /// One localized sentence on how this copy gets updated, from the
+    /// detected install method.
+    fn update_method_note(&self) -> String {
+        use thinkterm_update::InstallMethod;
+        match self.ui.update_method.as_ref() {
+            Some(InstallMethod::Script(m)) => settings_tr(
+                "settings-update-method-script",
+                &[("variant", m.variant.clone())],
+            ),
+            Some(InstallMethod::MacAppBundle(app)) => settings_tr(
+                "settings-update-method-macapp",
+                &[("path", app.display().to_string())],
+            ),
+            Some(InstallMethod::AppImage) => crate::i18n::tr("settings-update-method-appimage"),
+            Some(InstallMethod::Homebrew) => crate::i18n::tr("settings-update-method-homebrew"),
+            Some(InstallMethod::Nix) => crate::i18n::tr("settings-update-method-nix"),
+            Some(InstallMethod::SystemPackage) => {
+                crate::i18n::tr("settings-update-method-system")
+            }
+            Some(InstallMethod::WindowsInstaller) => {
+                crate::i18n::tr("settings-update-method-windows")
+            }
+            Some(InstallMethod::SourceBuild) => crate::i18n::tr("settings-update-method-source"),
+            Some(InstallMethod::Unknown) | None => {
+                crate::i18n::tr("settings-update-method-unknown")
+            }
+        }
+    }
+
     fn running_version_label(&self) -> String {
         self.ui
             .update_status
@@ -7452,9 +7526,6 @@ impl SettingsWindow {
         let mark_y = y + (height - mark) / 2.0;
         match badge {
             HeroBadge::AppIcon => self.draw_app_icon(layers, mark_x, mark_y, mark)?,
-            HeroBadge::Status { icon, tint } => {
-                self.paint_status_badge(layers, icon, mark_x, mark_y, mark, tint)?
-            }
         }
 
         let text_x = mark_x + mark + self.ui_px(24.0);
@@ -7603,16 +7674,14 @@ impl SettingsWindow {
 
         let hero = self.update_hero();
         let version = self.running_version_label();
-        let (icon, tint, headline, subline) = match &hero {
+        // The app icon, as on About: the page is about ThinkTerm, and the
+        // state is already in the headline.
+        let (headline, subline) = match &hero {
             UpdateHero::UpToDate => (
-                SvgIcon::Check,
-                status_tint_positive(appearance),
                 crate::i18n::tr("settings-update-current"),
                 settings_tr("settings-update-current-detail", &[("version", version)]),
             ),
             UpdateHero::Available { tag } => (
-                SvgIcon::Download,
-                palette.accent,
                 crate::i18n::tr("settings-update-available"),
                 settings_tr(
                     "settings-update-available-detail",
@@ -7620,8 +7689,6 @@ impl SettingsWindow {
                 ),
             ),
             UpdateHero::LocalBuild => (
-                SvgIcon::Package,
-                status_tint_neutral(appearance),
                 crate::i18n::tr("settings-update-local-build"),
                 settings_tr(
                     "settings-update-local-build-detail",
@@ -7629,8 +7696,6 @@ impl SettingsWindow {
                 ),
             ),
             UpdateHero::Unknown => (
-                SvgIcon::RefreshCw,
-                status_tint_neutral(appearance),
                 crate::i18n::tr("settings-update-unknown"),
                 settings_tr("settings-update-unknown-detail", &[("version", version)]),
             ),
@@ -7646,16 +7711,36 @@ impl SettingsWindow {
             crate::i18n::tr("settings-update-check-now")
         };
 
+        // The one button on the hero: install when there is something to
+        // install and this copy is ours to replace, check otherwise. While
+        // an install runs there is nothing to click.
+        let self_updatable = self
+            .ui
+            .update_method
+            .as_ref()
+            .is_some_and(|method| method.self_updatable() || cfg!(windows));
+        let hero_button = match (&hero, &self.ui.update_install) {
+            (_, Some(UpdateInstall::Running)) => None,
+            (UpdateHero::Available { .. }, Some(UpdateInstall::Installed { .. })) => {
+                Some((check_label, SettingsAction::CheckForUpdates))
+            }
+            (UpdateHero::Available { .. }, _) if self_updatable => Some((
+                crate::i18n::tr("settings-update-install"),
+                SettingsAction::InstallUpdate,
+            )),
+            _ => Some((check_label, SettingsAction::CheckForUpdates)),
+        };
+
         let hero_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let hero_height = self.paint_hero(
             layers,
             x,
             hero_y,
             max_width,
-            HeroBadge::Status { icon, tint },
+            HeroBadge::AppIcon,
             &headline,
             &subline,
-            Some((check_label, SettingsAction::CheckForUpdates)),
+            hero_button,
         )?;
 
         // Three plain facts, one line each: the labels say what they are, and
@@ -7701,16 +7786,52 @@ impl SettingsWindow {
             )?;
         }
 
+        // Under the facts: what an install would do here, or why this page
+        // cannot do one, and the outcome of the install just run.
         let note_y = card_y + card_height + gap;
-        self.draw_text(
-            layers,
-            &body_font,
-            x,
-            note_y,
-            &crate::i18n::tr("settings-update-manual-note"),
+        let line_step = self.metrics.cell_size.height as f32 + self.ui_px(6.0);
+        let mut notes: Vec<(String, LinearRgba)> = Vec::new();
+        match &self.ui.update_install {
+            Some(UpdateInstall::Running) => {
+                notes.push((crate::i18n::tr("settings-update-installing"), palette.text));
+            }
+            Some(UpdateInstall::Installed { version }) => notes.push((
+                settings_tr("settings-update-installed", &[("version", version.clone())]),
+                status_tint_positive(appearance),
+            )),
+            Some(UpdateInstall::Failed { error }) => notes.push((
+                settings_tr("settings-update-install-failed", &[("error", error.clone())]),
+                crate::ui::tokens::UiPalette::for_appearance(appearance).danger,
+            )),
+            None => {}
+        }
+        notes.push((
+            self.update_method_note(),
             palette.secondary_text,
-            max_width,
-        )?;
+        ));
+        if self_updatable && !matches!(self.ui.update_install, Some(UpdateInstall::Installed { .. })) {
+            notes.push((
+                crate::i18n::tr("settings-update-install-note"),
+                palette.secondary_text,
+            ));
+        }
+        let mut lines_drawn = 0usize;
+        for (text, color) in &notes {
+            let wrapped = self.wrap_settings_text(&body_font, text, max_width);
+            for line in wrapped {
+                self.draw_text(
+                    layers,
+                    &body_font,
+                    x,
+                    note_y + line_step * lines_drawn as f32,
+                    &line,
+                    *color,
+                    max_width,
+                )?;
+                lines_drawn += 1;
+            }
+        }
+        let note_y = note_y + line_step * lines_drawn.saturating_sub(1) as f32;
 
         let (link_label, link_action) = match &hero {
             UpdateHero::Available { .. } => (

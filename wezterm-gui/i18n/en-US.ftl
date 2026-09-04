@@ -648,3 +648,21 @@ settings-sidebar-description = Choose which panels the right sidebar offers. Tur
 settings-sidebar-files-description = Browse the working directory, and remote directories over SFTP.
 settings-sidebar-notes-description = Markdown notes kept alongside the project.
 settings-sidebar-snippets-description = Saved commands and text you can paste into a pane.
+
+# Update notice (toast) and the Software Update page's install flow.
+update-toast-title = ThinkTerm update available
+update-toast-body = Click to see what's new
+settings-update-install = Install Update
+settings-update-installing = Installing… this window keeps working while the files are replaced.
+settings-update-installed = Installed ThinkTerm { $version }. Quit and reopen ThinkTerm to use it.
+settings-update-install-failed = The update could not be installed: { $error }
+settings-update-install-note = Install Update replaces the files in place; ThinkTerm keeps running the current version until you reopen it.
+settings-update-method-script = Installed by the install script ({ $variant } variant).
+settings-update-method-macapp = ThinkTerm.app installed by hand at { $path }; installing an update replaces it there and adds the command-line tools under ~/.local/bin.
+settings-update-method-appimage = This is an AppImage: update it with AppImageUpdate, or download the new AppImage from the releases page.
+settings-update-method-homebrew = Installed with Homebrew: run `brew upgrade thinkterm`.
+settings-update-method-nix = Installed from the Nix store: update it through your Nix configuration.
+settings-update-method-system = Installed by the system package manager: install the new package from the releases page with apt, dnf or whatever installed this one.
+settings-update-method-windows = Installed by the Windows installer; installing an update downloads the new installer and runs it.
+settings-update-method-source = This is a build from source: pull the repository and build again.
+settings-update-method-unknown = This copy was not installed by the install script, so ThinkTerm will not replace it; update it the way it was installed.

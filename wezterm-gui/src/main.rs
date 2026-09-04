@@ -1165,7 +1165,7 @@ fn setup_mux(
             .unwrap_or(mux::DEFAULT_WORKSPACE),
     );
     mux.set_active_workspace(&default_workspace_name);
-    crate::update::load_last_release_info_and_set_banner();
+    crate::update::load_last_release_info();
     update_mux_domains(config)?;
     // Register ThinkTerm's saved SSH hosts as runtime mux domains so that
     // reconnecting / restoring remote sessions can resolve them by name.
@@ -1291,6 +1291,21 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     .detach();
 
     maybe_show_configuration_error_window();
+    // A debugging hook alongside THINKTERM_FRAME_DUMP: open the Settings
+    // window on a given section once the GUI is up, so a page can be
+    // captured from a scripted launch with no keyboard or mouse.
+    if let Some(page) = std::env::var_os("THINKTERM_OPEN_SETTINGS") {
+        promise::spawn::spawn_into_main_thread(async move {
+            smol::Timer::after(std::time::Duration::from_millis(2500)).await;
+            if page == "update" {
+                crate::settings_window::show_update_page();
+            } else {
+                crate::settings_window::show();
+            }
+        })
+        .detach();
+    }
+
     gui.run_forever()
 }
 

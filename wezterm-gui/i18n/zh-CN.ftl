@@ -633,3 +633,21 @@ settings-sidebar-description = 选择右侧栏提供哪些面板。全部关掉�
 settings-sidebar-files-description = 浏览工作目录，以及通过 SFTP 浏览远程目录。
 settings-sidebar-notes-description = 与项目放在一起的 Markdown 笔记。
 settings-sidebar-snippets-description = 保存的命令和文本，可以粘贴到面板中。
+
+# 更新提醒(系统通知)与"软件更新"页的安装流程。
+update-toast-title = ThinkTerm 有新版本
+update-toast-body = 点击查看更新内容
+settings-update-install = 安装更新
+settings-update-installing = 正在安装……替换文件期间本窗口可以继续使用。
+settings-update-installed = 已安装 ThinkTerm { $version }。退出并重新打开 ThinkTerm 即可使用新版本。
+settings-update-install-failed = 更新安装失败:{ $error }
+settings-update-install-note = "安装更新"会原地替换文件;在你重新打开之前,ThinkTerm 仍运行当前版本。
+settings-update-method-script = 由安装脚本安装({ $variant } 版本)。
+settings-update-method-macapp = 手动安装在 { $path } 的 ThinkTerm.app;安装更新会在原位置替换它,并把命令行工具放到 ~/.local/bin。
+settings-update-method-appimage = 这是 AppImage:用 AppImageUpdate 更新,或从发布页下载新的 AppImage。
+settings-update-method-homebrew = 通过 Homebrew 安装:运行 `brew upgrade thinkterm`。
+settings-update-method-nix = 来自 Nix store:通过你的 Nix 配置更新。
+settings-update-method-system = 由系统包管理器安装:从发布页下载新包,用 apt、dnf 或原来的方式安装。
+settings-update-method-windows = 由 Windows 安装器安装;安装更新会下载新安装器并运行。
+settings-update-method-source = 这是从源码构建的版本:拉取仓库后重新构建。
+settings-update-method-unknown = 这个副本不是由安装脚本安装的,ThinkTerm 不会替换它;请按原来的安装方式更新。

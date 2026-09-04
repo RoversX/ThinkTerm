@@ -633,3 +633,21 @@ settings-sidebar-description = 右サイドバーに表示するパネルを選�
 settings-sidebar-files-description = 作業ディレクトリと、SFTP 経由のリモートディレクトリを閲覧します。
 settings-sidebar-notes-description = プロジェクトと一緒に置く Markdown のノートです。
 settings-sidebar-snippets-description = 保存したコマンドやテキストを、ペインに貼り付けられます。
+
+# 更新通知(トースト)と「ソフトウェアアップデート」ページのインストール処理。
+update-toast-title = ThinkTerm の新しいバージョンがあります
+update-toast-body = クリックして更新内容を表示
+settings-update-install = アップデートをインストール
+settings-update-installing = インストール中… ファイルの置き換え中もこのウィンドウは使えます。
+settings-update-installed = ThinkTerm { $version } をインストールしました。ThinkTerm を終了して開き直すと新しいバージョンになります。
+settings-update-install-failed = アップデートをインストールできませんでした: { $error }
+settings-update-install-note = 「アップデートをインストール」はファイルをその場で置き換えます。開き直すまで ThinkTerm は現在のバージョンのまま動作します。
+settings-update-method-script = インストールスクリプトでインストールされています({ $variant } 版)。
+settings-update-method-macapp = { $path } に手動でインストールされた ThinkTerm.app です。アップデートはその場所で置き換え、コマンドラインツールを ~/.local/bin に追加します。
+settings-update-method-appimage = これは AppImage です。AppImageUpdate で更新するか、リリースページから新しい AppImage をダウンロードしてください。
+settings-update-method-homebrew = Homebrew でインストールされています。`brew upgrade thinkterm` を実行してください。
+settings-update-method-nix = Nix store からインストールされています。Nix の設定から更新してください。
+settings-update-method-system = システムのパッケージマネージャーでインストールされています。リリースページの新しいパッケージを apt や dnf など元の方法でインストールしてください。
+settings-update-method-windows = Windows インストーラーでインストールされています。アップデートは新しいインストーラーをダウンロードして実行します。
+settings-update-method-source = ソースからのビルドです。リポジトリを更新して再ビルドしてください。
+settings-update-method-unknown = このコピーはインストールスクリプトによるものではないため、ThinkTerm は置き換えません。元の方法で更新してください。
