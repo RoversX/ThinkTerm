@@ -778,8 +778,11 @@ enum NotReconnectableError {
 /// Walks the whole chain rather than just the root cause, so that adding a
 /// `.context()` anywhere on the way up cannot silently disable it.
 fn is_auth_cancelled(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.downcast_ref::<mux::ssh::AuthCancelledError>().is_some())
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<mux::ssh::AuthCancelledError>()
+            .is_some()
+    })
 }
 
 fn client_thread(
@@ -836,6 +839,11 @@ async fn client_thread_async(
     // arrive before the following tick.
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
     let mut pending_ping: Option<(u64, std::time::Instant)> = None;
+    // Measured from the last byte *received*. Measuring from the last loop
+    // event, as this used to, let every outbound request push the deadline
+    // back, so a client that kept asking and never got answered would
+    // never notice.
+    let mut keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
 
     loop {
         let rx_msg = rx.recv();
@@ -843,7 +851,7 @@ async fn client_thread_async(
             .wait_for_readable()
             .map(|_| Ok(ReaderMessage::Readable));
         let keepalive = async {
-            smol::Timer::after(KEEPALIVE_INTERVAL).await;
+            smol::Timer::at(keepalive_deadline).await;
             Ok(ReaderMessage::KeepaliveTick)
         };
 
@@ -922,6 +930,7 @@ async fn client_thread_async(
                 let serial = next_serial;
                 next_serial += 1;
                 pending_ping = Some((serial, std::time::Instant::now()));
+                keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
                 Pdu::Ping(Ping {})
                     .encode_async(&mut stream, serial)
                     .await
@@ -932,11 +941,24 @@ async fn client_thread_async(
                 match Pdu::decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
                         crate::domain::wake_thinkterm_frontend();
+                        keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
                         log::debug!(
                             "decoded serial {} {}",
                             decoded.serial,
                             decoded.pdu.pdu_name()
                         );
+                        // The server asking whether we are still here. Answered
+                        // right here, before registration and off the main
+                        // thread, so a stalled GUI never looks like a dead
+                        // client.
+                        if matches!(decoded.pdu, Pdu::Ping(_)) && decoded.serial == 0 {
+                            Pdu::Pong(Pong {})
+                                .encode_async(&mut stream, 0)
+                                .await
+                                .context("encoding pong")?;
+                            stream.flush().await.context("flushing pong")?;
+                            continue;
+                        }
                         if pending_ping.map_or(false, |(serial, _)| serial == decoded.serial) {
                             pending_ping = None;
                         } else if decoded.serial == 0 {
@@ -1796,12 +1818,10 @@ impl Client {
                         let mut ui = match &reconnect_ui {
                             Some(ui) => ui.clone(),
                             None => {
-                                let ui = ConnectionUI::new_lazy(
-                                    mux::connui::ConnectionUIParams {
-                                        host_domain_id: Some(local_domain_id),
-                                        ..Default::default()
-                                    },
-                                );
+                                let ui = ConnectionUI::new_lazy(mux::connui::ConnectionUIParams {
+                                    host_domain_id: Some(local_domain_id),
+                                    ..Default::default()
+                                });
                                 ui.title("ThinkTerm: Reconnecting...");
                                 reconnect_ui = Some(ui.clone());
                                 ui
@@ -1872,10 +1892,8 @@ impl Client {
                             if let Some(ui) = reconnect_ui.take() {
                                 ui.close();
                             }
-                            reader_connection_phase.store(
-                                ClientConnectionPhase::Suspended as u8,
-                                Ordering::Release,
-                            );
+                            reader_connection_phase
+                                .store(ClientConnectionPhase::Suspended as u8, Ordering::Release);
                             crate::domain::wake_thinkterm_frontend();
                             match resume_reconnect_rx.recv() {
                                 Ok(()) => {
@@ -1972,10 +1990,7 @@ impl Client {
     /// The reconnect loop surfaces the reason and stops after the current
     /// session dies.
     pub fn set_fatal_connection_error(&self, reason: String) {
-        self.fatal_connection_error
-            .lock()
-            .unwrap()
-            .replace(reason);
+        self.fatal_connection_error.lock().unwrap().replace(reason);
     }
 
     pub fn into_client_domain_config(self) -> ClientDomainConfig {
@@ -2000,10 +2015,9 @@ impl Client {
                     info.version_string,
                     info.codec_vers
                 );
-                if let Some(mismatch) = describe_server_build_mismatch(
-                    config::wezterm_version(),
-                    &info.version_string,
-                ) {
+                if let Some(mismatch) =
+                    describe_server_build_mismatch(config::wezterm_version(), &info.version_string)
+                {
                     log::warn!("{mismatch}");
                 }
                 match self
@@ -2352,21 +2366,16 @@ mod tests {
     #[test]
     fn an_identical_build_is_not_worth_warning_about() {
         assert_eq!(
-            describe_server_build_mismatch(
-                "20260814-011230-aaef9bfb",
-                "20260814-011230-aaef9bfb"
-            ),
+            describe_server_build_mismatch("20260814-011230-aaef9bfb", "20260814-011230-aaef9bfb"),
             None
         );
     }
 
     #[test]
     fn a_server_from_another_build_names_both_sides() {
-        let mismatch = describe_server_build_mismatch(
-            "20260815-150100-eab2bf7c",
-            "20260813-012155-816da4db",
-        )
-        .expect("differing builds are reported");
+        let mismatch =
+            describe_server_build_mismatch("20260815-150100-eab2bf7c", "20260813-012155-816da4db")
+                .expect("differing builds are reported");
         // Which side is which is the whole point of the message: the same two
         // version strings in the wrong order sends the user to restart the
         // wrong process.
