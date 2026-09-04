@@ -80,6 +80,7 @@ __pycache__/
 /thinkterm*.deb
 /thinkterm*.rpm
 /thinkterm*.tar.xz
+/thinkterm*.tar.gz
 /thinkterm.spec
 /thinkterm.rb
 

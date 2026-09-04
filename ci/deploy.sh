@@ -487,6 +487,56 @@ EOF
         mv pkg/debian pkg/thinkterm
         tar cJf $debname.tar.xz -C pkg thinkterm
         rm -rf pkg
+
+        # The tarballs install.sh downloads: one per variant, both built here
+        # rather than in the Fedora leg because this is the oldest glibc we
+        # build on, and a tarball has no package manager to refuse a host
+        # whose libc is too old -- install.sh checks the version instead.
+        #
+        #   thinkterm-<ver>-linux-<arch>         GUI + CLI (with the TUI linked
+        #                                        in) + mux server
+        #   thinkterm-server-<ver>-linux-<arch>  the same without the GUI, so
+        #                                        it needs no graphics library
+        #
+        # Both carry the wezterm shim that third-party tools expect on PATH
+        # whenever TERM_PROGRAM says WezTerm. The arch is uname -m as-is
+        # (x86_64, aarch64): install.sh runs the same command on the target
+        # host and wants a name it can build without a mapping table.
+        linux_tarball() {
+          local variant=$1 tardir
+          shift
+          if [[ "$BUILD_REASON" == "Schedule" ]] ; then
+            tardir=$variant-nightly-linux-$(uname -m)
+          else
+            tardir=$variant-$TAG_NAME-linux-$(uname -m)
+          fi
+          rm -rf "$tardir" "$tardir.tar.gz"
+          install -Dsm755 -t "$tardir/bin" "$@"
+          install -Dm644 -t "$tardir/share/shell-completion" assets/shell-completion/*
+          install -Dm644 -t "$tardir/share/shell-integration" assets/shell-integration/*
+          install -Dm644 -t "$tardir" NOTICE LICENSE.md LICENSE-MIT
+          if [[ "$variant" == thinkterm ]] ; then
+            install -Dm755 -t "$tardir/bin" assets/open-thinkterm-here assets/open-wezterm-here
+            install -Dm644 assets/wezterm.desktop "$tardir/share/applications/com.roversx.thinkterm.desktop"
+            install -Dm644 assets/icon/terminal.png "$tardir/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png"
+          fi
+          # --owner/--group so the archive does not carry the CI runner's
+          # uid, which would surface as a stray numeric owner on extraction
+          # as root.
+          tar czf "$tardir.tar.gz" --owner=0 --group=0 "$tardir"
+          rm -rf "$tardir"
+        }
+        linux_tarball thinkterm \
+          $TARGET_DIR/release/thinkterm \
+          $TARGET_DIR/release/wezterm \
+          $TARGET_DIR/release/thinkterm-mux-server \
+          $TARGET_DIR/release/thinkterm-gui \
+          $TARGET_DIR/release/strip-ansi-escapes
+        linux_tarball thinkterm-server \
+          $TARGET_DIR/release/thinkterm \
+          $TARGET_DIR/release/wezterm \
+          $TARGET_DIR/release/thinkterm-mux-server \
+          $TARGET_DIR/release/strip-ansi-escapes
       ;;
     esac
     ;;

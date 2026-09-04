@@ -63,6 +63,14 @@ It isn't a read-only mirror of the GUI. It's a peer client of the same authorita
 
 The use case is straightforward: SSH into a machine, or just skip the GUI, and your workspace is still right there. Run `thinkterm tui --help` for the current command-line options.
 
+On Linux and macOS, one command installs either variant for the current user, with no root and no package manager:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh
+```
+
+It asks whether you want the desktop build or the server build (CLI + TUI + mux server, no GUI and, on Linux, no graphics libraries); `sh -s -- --server` or `--desktop` skips the question. Linux gets a tarball unpacked under `~/.local` and needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, RHEL 10); macOS gets the signed `ThinkTerm.app` plus command-line links in `~/.local/bin`. Downloads are verified against the digest GitHub recorded for them. The mux server runs as your user; on Linux, `loginctl enable-linger $USER` keeps it alive after you log out.
+
 ---
 
 ## Agents can talk to each other

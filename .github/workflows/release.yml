@@ -41,7 +41,7 @@ on:
         type: boolean
         default: true
       linux_x86_64:
-        description: Linux x86_64 (deb + rpm + AppImage)
+        description: Linux x86_64 (deb + rpm + AppImage + tarballs)
         type: boolean
         default: true
       # arm64 hosted runners are free on public repos only. Ticking this on a
@@ -441,6 +441,7 @@ jobs:
           path: |
             thinkterm-*.deb
             thinkterm-*.tar.xz
+            thinkterm-*.tar.gz
             thinkterm-*.rpm
             ThinkTerm-*.AppImage
             ThinkTerm-*.AppImage.zsync
