@@ -374,7 +374,7 @@ install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-mux-server/
 /usr/share/licenses/thinkterm-mux-server/*
 
 %changelog
-* Mon Oct 2 2023 Wez Furlong
+* Fri Sep 4 2026 RoversX
 - See git for full changelog
 EOF
 
