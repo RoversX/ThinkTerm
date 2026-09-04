@@ -22,6 +22,11 @@
 #                     fetched.
 #   --dry-run         Say what would be done and stop before touching the disk.
 #
+# GITHUB_TOKEN in the environment is sent with every request. It is what lets
+# the script work against a private repository -- the API and the release
+# assets both refuse anonymous access there -- and lifts the anonymous API
+# rate limit on a public one.
+#
 # Windows has an installer on the releases page; this script stops there.
 #
 # Deliberately not here: version comparison, uninstall. Re-running the script
@@ -191,7 +196,11 @@ else
 fi
 
 fetch() {
-  curl -fsSL --retry 3 "$@"
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" "$@"
+  else
+    curl -fsSL --retry 3 "$@"
+  fi
 }
 
 # Where the app bundle goes on macOS. /Applications is writable by any admin
@@ -219,6 +228,7 @@ api="https://api.github.com/repos/$repo/releases"
 asset=""
 digest=""
 url=""
+asset_api_url=""
 
 asset_name() {
   case "$os/$variant" in
@@ -261,6 +271,19 @@ if [ -z "$from" ]; then
   # Anything but a hex string means the field was absent or null: install
   # unverified with a warning rather than fail a good download against junk.
   case "$digest" in *[!0-9a-f]* | "") digest="" ;; esac
+  # The asset's own API address, for a private repository: the download URL
+  # under github.com/.../releases/download answers only for public ones,
+  # while the API serves the bytes to a token with Accept: octet-stream. In
+  # the asset object "url" comes before "name", so it is the last "url"
+  # seen when the name line matches.
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    asset_api_url=$(printf '%s' "$release_json" \
+      | awk -v want="\"name\": \"$asset\"" '
+          /^ *"url": *"https:\/\/api\.github\.com\/repos\/[^"]*\/releases\/assets\/[0-9]+"/ {
+            u = $0; sub(/.*"url": *"/, "", u); sub(/".*/, "", u)
+          }
+          index($0, want) { print u; exit }')
+  fi
   if [ -z "$digest" ]; then
     printf '%s' "$release_json" | grep -qF "\"name\": \"$asset\"" \
       || die "release $version has no $asset; see https://github.com/$repo/releases/tag/$tag"
@@ -312,7 +335,11 @@ if [ -n "$from" ]; then
 else
   archive="$tmp/$asset"
   say "downloading..."
-  fetch -o "$archive" "$url" || die "download failed: $url"
+  if [ -n "$asset_api_url" ]; then
+    fetch -H "Accept: application/octet-stream" -o "$archive" "$asset_api_url" || die "download failed: $asset_api_url"
+  else
+    fetch -o "$archive" "$url" || die "download failed: $url"
+  fi
   if [ -n "$digest" ]; then
     if got=$(sha256 "$archive"); then
       [ "$got" = "$digest" ] || die "checksum mismatch for $asset
