@@ -695,10 +695,9 @@ impl ImageData {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Record an in-place change to `data`. Called after the change, not
-    /// under the data lock, so a reader that takes the generation first and
-    /// the payload second can only end up believing it is *behind*, never
-    /// ahead.
+    /// Record an in-place change to `data`. Called with the data lock
+    /// still held, so a reader that takes the payload and the generation
+    /// under one guard sees a matching pair.
     pub fn bump_generation(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }

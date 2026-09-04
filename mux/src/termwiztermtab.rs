@@ -126,6 +126,10 @@ impl TermWizTerminalPane {
 }
 
 impl Pane for TermWizTerminalPane {
+    fn render_state_is_contended(&self) -> bool {
+        self.terminal.try_lock().is_none()
+    }
+
     fn pane_id(&self) -> PaneId {
         self.pane_id
     }

@@ -17,7 +17,6 @@ thinkterm-proto.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 futures-lite.workspace = true
 termwiz.workspace = true
-wezterm-input-types.workspace = true
 thiserror.workspace = true
 varbincode.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }

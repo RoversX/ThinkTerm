@@ -732,12 +732,6 @@ impl TerminalState {
     /// it doubles as the glyph cache's key, and changing it per frame would
     /// rebuild the decoded image on every paint and reset the animation clock.
     fn kitty_touch_placements_for_image(&mut self, image_id: u32) {
-        // The identity stays; the generation says the pixels moved. A mux
-        // client holds a copy of the image, not the shared Arc, and this is
-        // the only signal that its copy has fallen behind.
-        if let Some(data) = self.kitty_img.id_to_data.get(&image_id) {
-            data.bump_generation();
-        }
         let placements: Vec<PlacementInfo> = self
             .kitty_img
             .placements
@@ -917,14 +911,14 @@ impl TerminalState {
             anyhow::anyhow!("missing target frame")
         })? as usize;
 
-        let img = Arc::clone(
+        let image = Arc::clone(
             self.kitty_img
                 .id_to_data
                 .get(&image_id)
                 .ok_or_else(|| anyhow::anyhow!("invalid image id {}", image_id))?,
         );
 
-        let mut img = img.data();
+        let mut img = image.data();
         match &mut *img {
             ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
                 anyhow::bail!("invalid image type")
@@ -1013,6 +1007,9 @@ impl TerminalState {
             }
         }
 
+        // Under the data lock, so whoever reads the payload and the
+        // generation together sees them agree.
+        image.bump_generation();
         drop(img);
         self.kitty_touch_placements_for_image(image_id);
 
@@ -1261,6 +1258,7 @@ impl TerminalState {
             }
         }
 
+        image.bump_generation();
         drop(anim);
 
         // Frames are appended behind the Mutex, so the total measured when

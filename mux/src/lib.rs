@@ -1045,11 +1045,22 @@ impl Mux {
     /// is free to drive.
     pub fn frontend_viewport_state(&self, tab_id: TabId) -> Option<FrontendViewportState> {
         let tab = self.get_tab(tab_id)?;
-        let lease = self.frontend_lease.lock();
-        let access = Self::access_state_locked(&lease);
-        let (owner, view, generation) = match lease.tabs.get(&tab_id) {
-            Some(state) => (state.owner.clone(), state.view.clone(), state.generation),
-            None => (None, None, 0),
+        // The lease is released before the tab is asked its size, the way
+        // the publishing path does it: Tab methods notify with their own
+        // lock held, and a subscriber that ever touches the lease would
+        // close a cycle.
+        let (owner, view, generation, access) = {
+            let lease = self.frontend_lease.lock();
+            let access = Self::access_state_locked(&lease);
+            match lease.tabs.get(&tab_id) {
+                Some(state) => (
+                    state.owner.clone(),
+                    state.view.clone(),
+                    state.generation,
+                    access,
+                ),
+                None => (None, None, 0, access),
+            }
         };
         Some(FrontendViewportState {
             tab_id,
@@ -1596,7 +1607,28 @@ impl Mux {
             lease.access_generation = generation;
             Self::access_state_locked(&lease)
         };
-        self.notify(MuxNotification::FrontendAccessChanged(state));
+        // Published from wherever the lease moved, which since connections
+        // run on their own threads includes a client's unregistration;
+        // subscribers are only ever run on the main thread.
+        self.notify_on_main_thread(MuxNotification::FrontendAccessChanged(state));
+    }
+
+    /// `notify`, from a thread that may not be the main one. Subscribers
+    /// assume the main thread (several spawn local tasks or reach
+    /// thread-local frontend state), and since connections run on their
+    /// own threads the lease moves from there too, when a client
+    /// unregisters.
+    fn notify_on_main_thread(&self, notification: MuxNotification) {
+        if self.is_main_thread() {
+            self.notify(notification);
+            return;
+        }
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Some(mux) = Mux::try_get() {
+                mux.notify(notification);
+            }
+        })
+        .detach();
     }
 
     fn publish_frontend_viewport_state(&self, tab_id: TabId) {
@@ -1616,7 +1648,7 @@ impl Mux {
         let Some(tab) = self.get_tab(tab_id) else {
             return;
         };
-        self.notify(MuxNotification::FrontendLeaseChanged(
+        self.notify_on_main_thread(MuxNotification::FrontendLeaseChanged(
             FrontendViewportState {
                 tab_id,
                 owner,
@@ -2524,10 +2556,15 @@ impl Mux {
     }
 
     pub fn get_window(&self, window_id: WindowId) -> Option<MappedRwLockReadGuard<'_, Window>> {
-        if !self.windows.read().contains_key(&window_id) {
+        // One acquisition: a check under one guard and an unwrap under the
+        // next was safe only while the main thread was the sole caller.
+        // Connection threads read windows now, and a window removed in the
+        // gap between the two would have been an unwrap of None.
+        let windows = self.windows.read();
+        if !windows.contains_key(&window_id) {
             return None;
         }
-        Some(RwLockReadGuard::map(self.windows.read(), |windows| {
+        Some(RwLockReadGuard::map(windows, |windows| {
             windows.get(&window_id).unwrap()
         }))
     }
@@ -2536,10 +2573,11 @@ impl Mux {
         &self,
         window_id: WindowId,
     ) -> Option<MappedRwLockWriteGuard<'_, Window>> {
-        if !self.windows.read().contains_key(&window_id) {
+        let windows = self.windows.write();
+        if !windows.contains_key(&window_id) {
             return None;
         }
-        Some(RwLockWriteGuard::map(self.windows.write(), |windows| {
+        Some(RwLockWriteGuard::map(windows, |windows| {
             windows.get_mut(&window_id).unwrap()
         }))
     }

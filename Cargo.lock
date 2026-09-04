@@ -868,7 +868,6 @@ dependencies = [
  "thinkterm-proto",
  "thiserror 1.0.69",
  "varbincode",
- "wezterm-input-types 0.1.0",
  "wezterm-term",
  "zstd",
 ]

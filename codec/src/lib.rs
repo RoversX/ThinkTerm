@@ -29,10 +29,10 @@ use std::io::Cursor;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use termwiz::escape::csi::KittyKeyboardFlags;
 use termwiz::hyperlink::Hyperlink;
 use termwiz::image::{ImageData, TextureCoordinate};
 use termwiz::input::KeyboardEncoding;
-use wezterm_input_types::KittyKeyboardFlags;
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
 use wezterm_term::color::ColorPalette;
@@ -492,9 +492,12 @@ macro_rules! pdu {
 /// 64: Image cells carry the image's generation, so a client notices when
 ///     an animation it already fetched has grown; GetImageCell can ask for
 ///     only the frames it lacks and is told the generation it received.
-///     The server probes silent clients with Ping and a client answers
-///     Pong; a remote pane reports its keyboard encoding.
-pub const CODEC_VERSION: usize = 64;
+///     The server probes silent clients with Ping and a client answers Pong.
+/// 65: A remote pane reports its keyboard encoding
+///     (GetPaneRenderChangesResponse.keyboard_encoding). Its own number,
+///     because a server built between the two changes would otherwise
+///     answer 64 and mis-decode every render push.
+pub const CODEC_VERSION: usize = 65;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1825,7 +1828,7 @@ mod golden {
         1, 4, 104, 111, 115, 116, 4, 117, 115, 101, 114, 100, 2, 3, 0, 128, 226, 207, 170, 6, 1, 7,
         100, 101, 102, 97, 117, 108, 116, 128, 226, 207, 170, 6, 1, 4,
     ];
-    // Re-captured for codec 64, when `keyboard_encoding` (the `3, 3`
+    // Re-captured for codec 65, when `keyboard_encoding` (the `3, 3`
     // after `alt_screen`: variant Kitty, flag bits 3) joined the response.
     const RENDER_CHANGES: &[u8] = &[
         1, 0, 1, 3, 3, 0, 0, 0, 1, 80, 24, 100, 121, 180, 127, 96, 128, 5, 128, 3, 0, 2, 0, 2, 5,
@@ -2197,7 +2200,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 64);
+        assert_eq!(CODEC_VERSION, 65);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {
