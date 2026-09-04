@@ -48,6 +48,7 @@ lazy_static::lazy_static! {
 #[derive(Clone)]
 pub struct PduSender {
     func: Arc<dyn Fn(DecodedPdu) -> anyhow::Result<()> + Send + Sync>,
+    closed: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl PduSender {
@@ -55,11 +56,28 @@ impl PduSender {
         (self.func)(pdu)
     }
 
+    /// Whether the connection behind this sender is gone, for work that
+    /// would otherwise wait on its behalf for a long time.
+    pub fn is_closed(&self) -> bool {
+        (self.closed)()
+    }
+
     pub fn new<T>(f: T) -> Self
     where
         T: Fn(DecodedPdu) -> anyhow::Result<()> + Send + Sync + 'static,
     {
-        Self { func: Arc::new(f) }
+        Self::with_closed(f, || false)
+    }
+
+    pub fn with_closed<T, C>(f: T, closed: C) -> Self
+    where
+        T: Fn(DecodedPdu) -> anyhow::Result<()> + Send + Sync + 'static,
+        C: Fn() -> bool + Send + Sync + 'static,
+    {
+        Self {
+            func: Arc::new(f),
+            closed: Arc::new(closed),
+        }
     }
 }
 
@@ -218,42 +236,87 @@ impl PerPane {
 /// How long a push waits for a busy pane before looking again: short at
 /// first, since a batch of ordinary output is applied in well under a
 /// millisecond, backing off so a pane stuck for seconds is not polled at
-/// full tilt.
+/// full tilt. After `PUSH_DEFERRAL_LIMIT` of nothing but contention the
+/// push gives up; the pane's next output schedules a fresh one, so a pane
+/// wedged for good costs one warning rather than a task for ever.
 const PUSH_RETRY_MIN: Duration = Duration::from_millis(2);
 const PUSH_RETRY_MAX: Duration = Duration::from_millis(50);
+const PUSH_DEFERRAL_LIMIT: Duration = Duration::from_secs(30);
+
+/// The one push slot of a pane, given back however the push ends: a task
+/// dropped without running, a bail, a panic -- a slot left taken would
+/// stop the pane from ever pushing to this connection again.
+struct PushSlot {
+    per_pane: Arc<Mutex<PerPane>>,
+    released: bool,
+}
+
+impl PushSlot {
+    fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            if let Ok(mut per_pane) = self.per_pane.lock() {
+                per_pane.release_push();
+            }
+        }
+    }
+}
+
+impl Drop for PushSlot {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 /// Push `pane_id`'s changes to this connection once its render state can
 /// be read without waiting.
 ///
-/// Every connection's I/O and every push runs on the one main thread,
-/// while each pane's parser holds the pane's terminal lock for as long as
-/// a batch of output takes to apply. Reading here while a pane was busy
-/// with, say, a very large image stalled every other client's handshake,
-/// ping and output until that batch was done -- with a runaway pane, for
-/// good. So the lock is probed first, and a busy pane's push is put off
-/// for as long as it takes: that pane's own output is what waits, nobody
-/// else's.
+/// Pushes run on the main thread with the rest of the mux's work, while
+/// each pane's parser holds the pane's terminal lock for as long as a
+/// batch of output takes to apply. Reading here while a pane was busy
+/// with, say, a very large image stalled every other pane's pushes and
+/// every request that needs the main thread until that batch was done --
+/// with a runaway pane, for good. So the lock is probed first, and a busy
+/// pane's push is put off: that pane's own output is what waits, nobody
+/// else's. The probe is a moment's glance, not a reservation; a pane that
+/// takes the lock back right after it still has to be waited for, once.
 async fn push_pane_changes_when_free(
     pane_id: PaneId,
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
+    let mut slot = PushSlot {
+        per_pane: Arc::clone(&per_pane),
+        released: false,
+    };
     let mut delay = PUSH_RETRY_MIN;
+    let started = Instant::now();
     loop {
+        if sender.is_closed() {
+            anyhow::bail!("connection closed while pane {pane_id} was busy");
+        }
         let Some(pane) = Mux::get().get_pane(pane_id) else {
-            per_pane.lock().unwrap().release_push();
             anyhow::bail!("no such pane {pane_id}");
         };
         if pane.render_state_is_contended() {
+            if started.elapsed() > PUSH_DEFERRAL_LIMIT {
+                log::warn!(
+                    "pane {pane_id} has been busy for {:?}; giving up on this push,                      its next output will try again",
+                    started.elapsed()
+                );
+                return Ok(());
+            }
             metrics::counter!("mux_server.push.deferred").increment(1);
             smol::Timer::after(delay).await;
             delay = (delay * 2).min(PUSH_RETRY_MAX);
             continue;
         }
-        per_pane.lock().unwrap().release_push();
-        let started = Instant::now();
+        // Released before the read, so output that lands during it
+        // schedules the next push rather than being carried by nobody.
+        slot.release();
+        let pushed_at = Instant::now();
         let pushed = maybe_push_pane_changes(&pane, sender, per_pane);
-        metrics::histogram!("mux_server.push.latency").record(started.elapsed());
+        metrics::histogram!("mux_server.push.latency").record(pushed_at.elapsed());
         return pushed;
     }
 }
@@ -573,6 +636,13 @@ impl SessionHandler {
         }
     }
 
+    /// The pane is gone: drop what was kept for it, the sent-image cache
+    /// above all, which otherwise outlived every pane this connection ever
+    /// saw.
+    pub(crate) fn forget_pane(&mut self, pane_id: PaneId) {
+        self.per_pane.remove(&pane_id);
+    }
+
     pub(crate) fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
         Arc::clone(
             self.per_pane
@@ -662,6 +732,12 @@ impl SessionHandler {
                 mut client_id,
                 is_proxy,
             }) => {
+                // Acknowledged first. Registering below can move the lease,
+                // which publishes from the main thread; queued now, the
+                // acknowledgement is on the wire ahead of that. Nothing is
+                // lost by the order: the next request on this connection
+                // is read only after this arm has returned.
+                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
                 if is_proxy {
                     if self.proxy_client_id.is_none() {
                         // Copy proxy identity, but don't assign it to the mux;
@@ -696,7 +772,6 @@ impl SessionHandler {
                     self.client_id.replace(client_id);
                     self.client_registration.replace(registration);
                 }
-                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
                 if !is_proxy {
                     self.push_frontend_state();
                 }
@@ -1362,7 +1437,16 @@ impl SessionHandler {
             }
 
             Pdu::GetThinkTermSessionState(_) => {
-                send_response(crate::thinkterm_session::snapshot().map(Pdu::ThinkTermSessionState));
+                // The snapshot asks every pane for its progress and title
+                // under the mux's window lock; done on the main thread so a
+                // busy pane holds up this request, not this thread's other
+                // connections and, through that lock, the mux itself.
+                spawn_into_main_thread(async move {
+                    send_response(
+                        crate::thinkterm_session::snapshot().map(Pdu::ThinkTermSessionState),
+                    );
+                })
+                .detach();
             }
 
             Pdu::EnsureThinkTermThread(request) => {
@@ -1509,11 +1593,16 @@ impl SessionHandler {
             Pdu::MutateThinkTermTree(MutateThinkTermTree { ops }) => {
                 // mutate() broadcasts to every connection when the batch
                 // changed something; the direct response here is what lets the
-                // caller reconcile even when it did not.
-                send_response(
-                    crate::thinkterm_tree::mutate(&ops)
-                        .map(|tree| Pdu::ThinkTermTreeState(ThinkTermTreeState { tree })),
-                );
+                // caller reconcile even when it did not. On the main thread:
+                // it walks the mux and persists to disk, and its broadcast
+                // must follow this response.
+                spawn_into_main_thread(async move {
+                    send_response(
+                        crate::thinkterm_tree::mutate(&ops)
+                            .map(|tree| Pdu::ThinkTermTreeState(ThinkTermTreeState { tree })),
+                    );
+                })
+                .detach();
             }
 
             Pdu::MovePaneToNewTab(request) => {

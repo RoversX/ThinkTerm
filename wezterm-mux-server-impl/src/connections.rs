@@ -15,8 +15,10 @@
 //! then a stuck pane, visible as such, rather than a server that has gone
 //! away.
 
+use futures::FutureExt;
 use smol::Executor;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, LazyLock};
 
 static EXECUTOR: LazyLock<Arc<Executor<'static>>> = LazyLock::new(|| {
@@ -44,7 +46,21 @@ pub fn spawn<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    EXECUTOR.spawn(future).detach();
+    // The executor catches a task's panic and hands it to whoever holds
+    // the task; detached, that would be nobody, and the connection would
+    // simply vanish. Say so, at least.
+    EXECUTOR
+        .spawn(async move {
+            if let Err(payload) = AssertUnwindSafe(future).catch_unwind().await {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("(no message)");
+                log::error!("a client connection panicked and was dropped: {message}");
+            }
+        })
+        .detach();
 }
 
 #[cfg(test)]

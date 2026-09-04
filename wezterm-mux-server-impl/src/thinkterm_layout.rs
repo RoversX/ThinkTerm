@@ -19,6 +19,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use wezterm_term::TerminalSize;
@@ -759,21 +760,22 @@ fn domain_for_entry(
     specs
         .get(&entry.pane_id)
         .and_then(|spec| spec.domain.as_deref())
-        // A saved domain name is meaningful here only for a domain this
-        // server runs itself. The name a client recorded is the client's
-        // name for *its* connection to this server, and a config shared
-        // between server and client gives the server a client domain of
-        // that same name, pointing back at itself. Spawning through it
-        // mirrored the server into itself without end.
+        // The name a client recorded is the client's name for *its*
+        // connection to this server, and a config shared between server
+        // and client gives the server a client domain of that same name,
+        // pointing back at its own socket. Spawning through it mirrored
+        // the server into itself without end. A client domain that leads
+        // elsewhere is as good as any other.
         .filter(|domain| {
             mux.get_domain_by_name(domain).is_some_and(|found| {
-                let client_domain = found.is::<wezterm_client::domain::ClientDomain>();
-                if client_domain {
+                let ours = leads_back_here(&found);
+                if ours {
                     log::debug!(
-                        "restoring a layout: domain {domain} is a client domain; using the default"
+                        "restoring a layout: domain {domain} leads back to this server; \
+                         using the default domain"
                     );
                 }
-                !client_domain
+                !ours
             })
         })
         .map(|domain| SpawnTabDomain::DomainName(domain.to_string()))
@@ -782,6 +784,21 @@ fn domain_for_entry(
         } else {
             SpawnTabDomain::CurrentPaneDomain
         })
+}
+
+/// Whether `domain` is a client domain for one of the unix sockets this
+/// server itself listens on.
+fn leads_back_here(domain: &Arc<dyn mux::domain::Domain>) -> bool {
+    let Some(client) = domain.downcast_ref::<wezterm_client::domain::ClientDomain>() else {
+        return false;
+    };
+    let Some(socket) = client.unix_socket_path() else {
+        return false;
+    };
+    config::configuration()
+        .unix_domains
+        .iter()
+        .any(|ours| ours.socket_path() == socket)
 }
 
 fn split_second_percent(

@@ -351,8 +351,13 @@ mod ossl;
 
 pub fn spawn_listener() -> anyhow::Result<()> {
     let config = configuration();
-    for unix_dom in &config.unix_domains {
+    // The environment is written before any thread that reads it exists:
+    // connection threads read it for the version handshake, and setenv
+    // against a concurrent getenv is not safe.
+    if let Some(unix_dom) = config.unix_domains.last() {
         std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
+    }
+    for unix_dom in &config.unix_domains {
         let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
         thread::spawn(move || {
             listener.run();

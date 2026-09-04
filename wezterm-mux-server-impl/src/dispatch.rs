@@ -45,7 +45,12 @@ pub(crate) struct Liveness {
     interval: Duration,
     timeout: Duration,
     last_inbound: Instant,
+    /// When the probe was decided on.
     probe_sent: Option<Instant>,
+    /// When it actually reached the kernel. The answer is given `timeout`
+    /// from here: the probe rides the same queue as pane output, and a
+    /// slow link with a busy pane can take a while to carry it.
+    probe_written: Option<Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,6 +82,7 @@ impl Liveness {
             timeout,
             last_inbound: now,
             probe_sent: None,
+            probe_written: None,
         }
     }
 
@@ -84,19 +90,27 @@ impl Liveness {
     pub fn heard(&mut self, now: Instant) {
         self.last_inbound = now;
         self.probe_sent = None;
+        self.probe_written = None;
+    }
+
+    /// The probe has left for the client.
+    pub fn probe_written(&mut self, now: Instant) {
+        if self.probe_sent.is_some() {
+            self.probe_written = Some(now);
+        }
     }
 
     /// When `check` next has something to say.
     pub fn next_check(&self) -> Instant {
         match self.probe_sent {
-            Some(sent) => sent + self.timeout,
+            Some(sent) => self.probe_written.unwrap_or(sent) + self.timeout,
             None => self.last_inbound + self.interval,
         }
     }
 
     pub fn check(&mut self, now: Instant) -> Verdict {
         if let Some(sent) = self.probe_sent {
-            if now >= sent + self.timeout {
+            if now >= self.probe_written.unwrap_or(sent) + self.timeout {
                 return Verdict::Dead(now - self.last_inbound);
             }
             return Verdict::Fine;
@@ -152,28 +166,35 @@ where
 
     let (item_tx, item_rx) = smol::channel::unbounded::<Item>();
 
-    let pdu_sender = PduSender::new({
-        let item_tx = item_tx.clone();
-        move |pdu| {
-            item_tx
-                .try_send(Item::WritePdu(pdu))
-                .map_err(|e| anyhow::anyhow!("{:?}", e))
-        }
-    });
+    let pdu_sender = PduSender::with_closed(
+        {
+            let item_tx = item_tx.clone();
+            move |pdu| {
+                item_tx
+                    .try_send(Item::WritePdu(pdu))
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))
+            }
+        },
+        {
+            let item_tx = item_tx.clone();
+            move || item_tx.is_closed()
+        },
+    );
     let mut handler = SessionHandler::new(pdu_sender);
 
     {
         // Notifications take one hop through the main thread's queue before
-        // they reach this connection. A mutation runs on the main thread,
+        // they reach this connection, and are turned into what the loop
+        // needs while there. Ordering: a mutation runs on the main thread,
         // notifies in the middle of its work and sends its response at the
         // end; with this loop on its own thread, a notification handed
         // over directly would be on the wire before the response to the
         // request that caused it, where the single-threaded server always
-        // sent the response first. Clients rely on that: a state push that
-        // overtakes its response leaves the response looking stale, and a
-        // frontend waits for state that has, as far as it is concerned,
-        // never arrived. The hop lands the notification after the response
-        // has been queued, restoring the order.
+        // sent the response first, and clients rely on that. Locking: what
+        // a notification needs from the mux (a pane's status, a window's
+        // workspace, the tree and session snapshots) is read on the main
+        // thread, so this connection's thread never holds a mux lock while
+        // it waits on a busy pane's terminal.
         let mux = Mux::get();
         let tx = item_tx.clone();
         mux.subscribe(move |n| {
@@ -183,8 +204,10 @@ where
             log::trace!("notification queued for the connection: {n:?}");
             let tx = tx.clone();
             promise::spawn::spawn_into_main_thread(async move {
-                if let Err(err) = tx.try_send(Item::Notif(n)) {
-                    log::trace!("notification not delivered: {err}");
+                if let Some(item) = item_for_notification(n) {
+                    if let Err(err) = tx.try_send(item) {
+                        log::trace!("notification not delivered: {err}");
+                    }
                 }
             })
             .detach();
@@ -247,9 +270,40 @@ where
             },
             Ok(Item::WritePdu(decoded)) => {
                 log::trace!("write {} serial {}", decoded.pdu.pdu_name(), decoded.serial);
-                match decoded.pdu.encode_async(&mut stream, decoded.serial).await {
-                    Ok(()) => {}
-                    Err(err) => {
+                let is_probe = decoded.serial == 0 && matches!(decoded.pdu, Pdu::Ping(_));
+                // A write that makes no progress at all is the one sure
+                // sign of a peer that died with data in flight: the
+                // liveness clock cannot run while this arm waits, so the
+                // wait itself is bounded.
+                let written = smol::future::or(
+                    async {
+                        decoded
+                            .pdu
+                            .encode_async(&mut stream, decoded.serial)
+                            .await
+                            .map_err(WriteFailure::Encode)?;
+                        stream.flush().await.map_err(WriteFailure::Flush)
+                    },
+                    async {
+                        smol::Timer::after(WRITE_STALL_LIMIT).await;
+                        Err(WriteFailure::Stalled)
+                    },
+                )
+                .await;
+                match written {
+                    Ok(()) => {
+                        if is_probe {
+                            liveness.probe_written(Instant::now());
+                        }
+                    }
+                    Err(WriteFailure::Stalled) => {
+                        log::warn!(
+                            "a write to the client made no progress for \
+                             {WRITE_STALL_LIMIT:?}; dropping the connection"
+                        );
+                        return Ok(());
+                    }
+                    Err(WriteFailure::Encode(err)) => {
                         if let Some(err) = err.root_cause().downcast_ref::<std::io::Error>() {
                             if err.kind() == std::io::ErrorKind::BrokenPipe {
                                 // Client disconnected: no need to make a noise
@@ -258,10 +312,7 @@ where
                         }
                         return Err(err).context("encoding PDU to client");
                     }
-                };
-                match stream.flush().await {
-                    Ok(()) => {}
-                    Err(err) => {
+                    Err(WriteFailure::Flush(err)) => {
                         if err.kind() == std::io::ErrorKind::BrokenPipe {
                             // Client disconnected: no need to make a noise
                             return Ok(());
@@ -274,19 +325,6 @@ where
                 log::trace!("notification: pane output {pane_id}");
                 handler.schedule_pane_push(pane_id);
             }
-            Ok(Item::Notif(MuxNotification::PaneAdded(_pane_id))) => {}
-            Ok(Item::Notif(MuxNotification::AgentStatusChanged(pane_id))) => {
-                // Read the status at send time so the payload is always the
-                // freshest classification, never a queued stale value.
-                let status = Mux::get().get_pane(pane_id).and_then(|p| p.agent_status());
-                send_notif_pdu(Pdu::AgentStatusChanged(codec::AgentStatusChanged {
-                    pane_id,
-                    status,
-                }));
-            }
-            Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
-                send_notif_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id }));
-            }
             Ok(Item::Notif(MuxNotification::Alert { pane_id, alert })) => {
                 {
                     let per_pane = handler.per_pane(pane_id);
@@ -295,102 +333,126 @@ where
                 }
                 handler.schedule_pane_push(pane_id);
             }
-            Ok(Item::Notif(MuxNotification::SaveToDownloads { .. })) => {}
-            Ok(Item::Notif(MuxNotification::AssignClipboard {
-                pane_id,
-                selection,
-                clipboard,
-            })) => {
-                send_notif_pdu(Pdu::SetClipboard(codec::SetClipboard {
-                    pane_id,
-                    clipboard,
-                    selection,
-                }));
+            Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
+                handler.forget_pane(pane_id);
+                send_notif_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id }));
             }
-            Ok(Item::Notif(MuxNotification::TabAddedToWindow { tab_id, window_id })) => {
-                send_notif_pdu(Pdu::TabAddedToWindow(codec::TabAddedToWindow {
-                    tab_id,
-                    window_id,
-                }));
+            Ok(Item::Notif(other)) => {
+                log::trace!("notification with nothing for the connection to do: {other:?}");
             }
-            Ok(Item::Notif(MuxNotification::WindowRemoved(_window_id))) => {}
-            Ok(Item::Notif(MuxNotification::WindowCreated(_window_id))) => {}
-            Ok(Item::Notif(MuxNotification::WindowInvalidated(_window_id))) => {}
-            Ok(Item::Notif(MuxNotification::WindowWorkspaceChanged(window_id))) => {
-                let workspace = {
-                    let mux = Mux::get();
-                    mux.get_window(window_id)
-                        .map(|w| w.get_workspace().to_string())
-                };
-                if let Some(workspace) = workspace {
-                    send_notif_pdu(Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
-                        window_id,
-                        workspace,
-                    }));
-                }
-            }
-            Ok(Item::Notif(MuxNotification::PaneFocused(pane_id))) => {
-                send_notif_pdu(Pdu::PaneFocused(codec::PaneFocused { pane_id }));
-            }
-            Ok(Item::Notif(MuxNotification::TabResized(tab_id))) => {
-                send_notif_pdu(Pdu::TabResized(codec::TabResized { tab_id }));
-            }
-            Ok(Item::Notif(MuxNotification::TabTitleChanged { tab_id, title })) => {
-                send_notif_pdu(Pdu::TabTitleChanged(codec::TabTitleChanged {
-                    tab_id,
-                    title,
-                }));
-            }
-            Ok(Item::Notif(MuxNotification::WindowTitleChanged { window_id, title })) => {
-                send_notif_pdu(Pdu::WindowTitleChanged(codec::WindowTitleChanged {
-                    window_id,
-                    title,
-                }));
-            }
-            Ok(Item::Notif(MuxNotification::WorkspaceRenamed {
-                old_workspace,
-                new_workspace,
-            })) => {
-                send_notif_pdu(Pdu::RenameWorkspace(codec::RenameWorkspace {
-                    old_workspace,
-                    new_workspace,
-                }));
-            }
-            Ok(Item::Notif(MuxNotification::ThinkTermTreeChanged)) => {
-                // The tree is small enough to resend whole; this is also the
-                // path that tells the client which mutated it that the server
-                // accepted the op.
-                send_notif_pdu(Pdu::ThinkTermTreeState(codec::ThinkTermTreeState {
-                    tree: crate::thinkterm_tree::snapshot(),
-                }));
-            }
-            Ok(Item::Notif(MuxNotification::ThinkTermSessionChanged)) => {
-                // A snapshot failure must not kill the connection — that
-                // would stop every pane's pushes for this client.
-                match crate::thinkterm_session::snapshot() {
-                    Ok(state) => send_notif_pdu(Pdu::ThinkTermSessionState(state)),
-                    Err(err) => {
-                        log::error!("ThinkTermSessionState snapshot failed: {err:#}")
-                    }
-                }
-            }
-            Ok(Item::Notif(MuxNotification::FrontendLeaseChanged(state))) => {
-                send_notif_pdu(Pdu::ClientViewportState(
-                    crate::sessionhandler::codec_viewport_state(state),
-                ));
-            }
-            Ok(Item::Notif(MuxNotification::FrontendAccessChanged(state))) => {
-                send_notif_pdu(Pdu::FrontendAccessState(
-                    crate::sessionhandler::codec_access_state(state),
-                ));
-            }
-            Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
-            Ok(Item::Notif(MuxNotification::Empty)) => {}
             Err(err) => {
                 log::error!("process_async Err {}", err);
                 return Ok(());
             }
         }
+    }
+}
+
+/// How long one PDU may take to reach the kernel before the peer is taken
+/// for dead. Generous: a large image over a slow link is minutes of
+/// transfer at worst, and a live peer keeps draining its end.
+const WRITE_STALL_LIMIT: Duration = Duration::from_secs(60);
+
+enum WriteFailure {
+    Encode(anyhow::Error),
+    Flush(std::io::Error),
+    Stalled,
+}
+
+/// What the connection loop needs for a mux notification, prepared on the
+/// main thread. Pane output, alerts and pane removal need the handler's
+/// own state and go through as they are; everything else becomes the PDU
+/// it will be sent as, with whatever the mux has to be asked read here.
+fn item_for_notification(n: MuxNotification) -> Option<Item> {
+    let write = |pdu: Pdu| Some(Item::WritePdu(DecodedPdu { serial: 0, pdu }));
+    match n {
+        MuxNotification::PaneOutput(_)
+        | MuxNotification::Alert { .. }
+        | MuxNotification::PaneRemoved(_) => Some(Item::Notif(n)),
+        MuxNotification::AgentStatusChanged(pane_id) => {
+            // Read the status at send time so the payload is always the
+            // freshest classification, never a queued stale value.
+            let status = Mux::get().get_pane(pane_id).and_then(|p| p.agent_status());
+            write(Pdu::AgentStatusChanged(codec::AgentStatusChanged {
+                pane_id,
+                status,
+            }))
+        }
+        MuxNotification::AssignClipboard {
+            pane_id,
+            selection,
+            clipboard,
+        } => write(Pdu::SetClipboard(codec::SetClipboard {
+            pane_id,
+            clipboard,
+            selection,
+        })),
+        MuxNotification::TabAddedToWindow { tab_id, window_id } => {
+            write(Pdu::TabAddedToWindow(codec::TabAddedToWindow {
+                tab_id,
+                window_id,
+            }))
+        }
+        MuxNotification::WindowWorkspaceChanged(window_id) => {
+            let workspace = Mux::get()
+                .get_window(window_id)
+                .map(|w| w.get_workspace().to_string())?;
+            write(Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
+                window_id,
+                workspace,
+            }))
+        }
+        MuxNotification::PaneFocused(pane_id) => {
+            write(Pdu::PaneFocused(codec::PaneFocused { pane_id }))
+        }
+        MuxNotification::TabResized(tab_id) => write(Pdu::TabResized(codec::TabResized { tab_id })),
+        MuxNotification::TabTitleChanged { tab_id, title } => {
+            write(Pdu::TabTitleChanged(codec::TabTitleChanged {
+                tab_id,
+                title,
+            }))
+        }
+        MuxNotification::WindowTitleChanged { window_id, title } => {
+            write(Pdu::WindowTitleChanged(codec::WindowTitleChanged {
+                window_id,
+                title,
+            }))
+        }
+        MuxNotification::WorkspaceRenamed {
+            old_workspace,
+            new_workspace,
+        } => write(Pdu::RenameWorkspace(codec::RenameWorkspace {
+            old_workspace,
+            new_workspace,
+        })),
+        // The tree is small enough to resend whole; this is also the path
+        // that tells the client which mutated it that the server accepted
+        // the op.
+        MuxNotification::ThinkTermTreeChanged => {
+            write(Pdu::ThinkTermTreeState(codec::ThinkTermTreeState {
+                tree: crate::thinkterm_tree::snapshot(),
+            }))
+        }
+        MuxNotification::ThinkTermSessionChanged => match crate::thinkterm_session::snapshot() {
+            Ok(state) => write(Pdu::ThinkTermSessionState(state)),
+            Err(err) => {
+                log::error!("ThinkTermSessionState snapshot failed: {err:#}");
+                None
+            }
+        },
+        MuxNotification::FrontendLeaseChanged(state) => write(Pdu::ClientViewportState(
+            crate::sessionhandler::codec_viewport_state(state),
+        )),
+        MuxNotification::FrontendAccessChanged(state) => write(Pdu::FrontendAccessState(
+            crate::sessionhandler::codec_access_state(state),
+        )),
+        MuxNotification::PaneAdded(_)
+        | MuxNotification::SaveToDownloads { .. }
+        | MuxNotification::WindowRemoved(_)
+        | MuxNotification::WindowCreated(_)
+        | MuxNotification::WindowInvalidated(_)
+        | MuxNotification::ActiveWorkspaceChanged(_)
+        | MuxNotification::Empty => None,
     }
 }
 
@@ -433,6 +495,22 @@ mod tests {
             Verdict::Probe,
             "and it is a fresh probe, not a death"
         );
+    }
+
+    #[test]
+    fn the_answer_window_opens_when_the_probe_actually_left() {
+        let t0 = Instant::now();
+        let mut liveness = Liveness::with_timing(t0, 10 * S, 20 * S);
+        assert_eq!(liveness.check(t0 + 10 * S), Verdict::Probe);
+        // Stuck behind pane output for a while before it was written.
+        liveness.probe_written(t0 + 25 * S);
+        assert_eq!(liveness.next_check(), t0 + 45 * S);
+        assert_eq!(
+            liveness.check(t0 + 30 * S),
+            Verdict::Fine,
+            "not yet: it only just left"
+        );
+        assert_eq!(liveness.check(t0 + 45 * S), Verdict::Dead(45 * S));
     }
 
     #[test]

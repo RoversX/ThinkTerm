@@ -25,10 +25,14 @@ use wezterm_term::StableRowIndex;
 /// inside the terminal's own image budget, since the entries here outlive
 /// the terminal's copy once it lets an image go.
 const MAX_IMAGES: usize = 32;
-const MAX_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) struct SentImages {
-    cache: LruCache<[u8; 32], Arc<ImageData>>,
+    /// Each image with its size when it came in. An animation grows after
+    /// that, so the total is an estimate; measuring every entry on every
+    /// insert meant a lock per image per frame on the main thread.
+    cache: LruCache<[u8; 32], (Arc<ImageData>, usize)>,
+    bytes: usize,
     max_bytes: usize,
 }
 
@@ -50,6 +54,7 @@ impl SentImages {
     fn with_limits(max_images: usize, max_bytes: usize) -> Self {
         Self {
             cache: LruCache::new(NonZeroUsize::new(max_images.max(1)).unwrap()),
+            bytes: 0,
             max_bytes,
         }
     }
@@ -75,21 +80,21 @@ impl SentImages {
             self.cache.promote(&hash);
             return;
         }
-        self.cache.put(hash, image);
-        // Sizes are read now rather than tracked, because an animation
-        // grows in place after it was put here.
-        while self.cache.len() > 1 && self.bytes() > self.max_bytes {
-            self.cache.pop_lru();
+        let size = image.len();
+        if let Some((_, evicted)) = self.cache.push(hash, (image, size)) {
+            self.bytes = self.bytes.saturating_sub(evicted.1);
+        }
+        self.bytes += size;
+        while self.cache.len() > 1 && self.bytes > self.max_bytes {
+            if let Some((_, (_, size))) = self.cache.pop_lru() {
+                self.bytes = self.bytes.saturating_sub(size);
+            }
         }
     }
 
     /// The image behind `hash`, if it was sent recently.
     pub fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<ImageData>> {
-        self.cache.get(hash).cloned()
-    }
-
-    fn bytes(&self) -> usize {
-        self.cache.iter().map(|(_, image)| image.len()).sum()
+        self.cache.get(hash).map(|(image, _)| Arc::clone(image))
     }
 }
 
@@ -102,12 +107,12 @@ impl SentImages {
 /// can verify the ones in front are still the same. Anything else, or a
 /// client holding nothing, gets the whole image.
 pub(crate) fn reply_for(image: &Arc<ImageData>, have_frames: u32) -> (u64, Arc<ImageData>, u32) {
-    // Generation first, payload second: a frame landing in between then
-    // makes the client ask once more, where the other order would leave
-    // it sure a stale copy was current.
+    // Payload and generation under the one guard: the terminal bumps the
+    // generation while it still holds the data lock, so what is read here
+    // is a matching pair.
+    let data = image.data();
     let generation = image.generation();
     if have_frames > 0 {
-        let data = image.data();
         if let ImageDataType::AnimRgba8 {
             width,
             height,
@@ -116,21 +121,22 @@ pub(crate) fn reply_for(image: &Arc<ImageData>, have_frames: u32) -> (u64, Arc<I
             hashes,
         } = &*data
         {
-            let have = have_frames as usize;
-            if have < frames.len() {
-                let tail = ImageDataType::AnimRgba8 {
-                    width: *width,
-                    height: *height,
-                    durations: durations.clone(),
-                    frames: frames[have..].to_vec(),
-                    hashes: hashes.clone(),
-                };
-                // Carries the original's hash although it is only part of
-                // it: the client files it under that hash, and never
-                // re-derives the hash from a delta.
-                let delta = Arc::new(ImageData::with_data_and_hash(tail, image.hash()));
-                return (generation, delta, have_frames);
-            }
+            let have = (have_frames as usize).min(frames.len());
+            // A client holding every frame (its generation was merely
+            // behind) gets an empty tail: the hashes let it confirm its
+            // frames are still the ones here, at no pixel cost.
+            let tail = ImageDataType::AnimRgba8 {
+                width: *width,
+                height: *height,
+                durations: durations.clone(),
+                frames: frames[have..].to_vec(),
+                hashes: hashes.clone(),
+            };
+            // Carries the original's hash although it is only part of
+            // it: the client files it under that hash, and never
+            // re-derives the hash from a delta.
+            let delta = Arc::new(ImageData::with_data_and_hash(tail, image.hash()));
+            return (generation, delta, have as u32);
         }
     }
     (generation, Arc::clone(image), 0)
@@ -242,20 +248,22 @@ mod tests {
     }
 
     #[test]
-    fn a_client_holding_nothing_or_everything_gets_the_whole_image() {
+    fn a_client_holding_nothing_gets_the_whole_image_and_one_holding_all_an_empty_tail() {
         let image = animation(&[1, 2]);
         let (_, payload, from) = reply_for(&image, 0);
         assert!(Arc::ptr_eq(&payload, &image));
         assert_eq!(from, 0);
+        // Holding everything: an empty tail, so the client can confirm
+        // what it has without a single pixel crossing.
         let (_, payload, from) = reply_for(&image, 2);
-        assert!(Arc::ptr_eq(&payload, &image));
-        assert_eq!(from, 0);
+        assert!(frames_of(&payload).is_empty());
+        assert_eq!(from, 2);
         let (_, payload, from) = reply_for(&image, 5);
         assert!(
-            Arc::ptr_eq(&payload, &image),
-            "a count from the future is not trusted"
+            frames_of(&payload).is_empty(),
+            "a count from the future is clamped"
         );
-        assert_eq!(from, 0);
+        assert_eq!(from, 2);
     }
 
     #[test]

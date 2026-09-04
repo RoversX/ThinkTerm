@@ -32,15 +32,19 @@ impl metrics::HistogramFn for Hist {
     }
 }
 
-struct Count(AtomicU64);
+struct Count {
+    value: AtomicU64,
+    /// What the last report saw, so a report shows the interval's count.
+    reported: AtomicU64,
+}
 
 impl metrics::CounterFn for Count {
     fn increment(&self, value: u64) {
-        self.0.fetch_add(value, Ordering::Relaxed);
+        self.value.fetch_add(value, Ordering::Relaxed);
     }
 
     fn absolute(&self, value: u64) {
-        self.0.store(value, Ordering::Relaxed);
+        self.value.store(value, Ordering::Relaxed);
     }
 }
 
@@ -74,42 +78,59 @@ pub fn init_from_env() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("installing the metrics recorder: {e}"))
 }
 
+/// One interval's numbers. Every histogram is reset once read, so a report
+/// describes the interval, not the process's whole life; the registry
+/// lock is dropped before anything is logged, since recording takes it
+/// too and a log write is slow.
 fn report(registry: &Mutex<Registry>, interval: u64) {
-    let registry = registry.lock().unwrap();
     let mut lines = vec![];
-    for (key, hist) in &registry.histograms {
-        let name = key.name();
-        if name.ends_with(".rate") {
-            let total = hist.total.swap(0, Ordering::Relaxed);
-            lines.push(format!("{key}: {}/s", total / interval));
-            continue;
+    {
+        let registry = registry.lock().unwrap();
+        for (key, hist) in &registry.histograms {
+            let name = key.name();
+            if name.ends_with(".rate") {
+                let total = hist.total.swap(0, Ordering::Relaxed);
+                if total > 0 {
+                    lines.push(format!("{key}: {}/s", total / interval));
+                }
+                continue;
+            }
+            let mut values = hist.values.lock().unwrap();
+            if values.is_empty() {
+                continue;
+            }
+            if name.ends_with(".size") {
+                lines.push(format!(
+                    "{key}: n={} p50={} p95={} max={}",
+                    values.len(),
+                    values.value_at_percentile(50.),
+                    values.value_at_percentile(95.),
+                    values.max()
+                ));
+            } else {
+                let at = |p| Duration::from_nanos(values.value_at_percentile(p));
+                lines.push(format!(
+                    "{key}: n={} p50={:.2?} p95={:.2?} p99={:.2?} max={:.2?}",
+                    values.len(),
+                    at(50.),
+                    at(95.),
+                    at(99.),
+                    Duration::from_nanos(values.max())
+                ));
+            }
+            values.reset();
         }
-        let values = hist.values.lock().unwrap();
-        if values.is_empty() {
-            continue;
-        }
-        if name.ends_with(".size") {
-            lines.push(format!(
-                "{key}: n={} p50={} p95={} max={}",
-                values.len(),
-                values.value_at_percentile(50.),
-                values.value_at_percentile(95.),
-                values.max()
-            ));
-        } else {
-            let at = |p| Duration::from_nanos(values.value_at_percentile(p));
-            lines.push(format!(
-                "{key}: n={} p50={:.2?} p95={:.2?} p99={:.2?} max={:.2?}",
-                values.len(),
-                at(50.),
-                at(95.),
-                at(99.),
-                Duration::from_nanos(values.max())
-            ));
+        for (key, count) in &registry.counters {
+            let now = count.value.load(Ordering::Relaxed);
+            let before = count.reported.swap(now, Ordering::Relaxed);
+            let delta = now.saturating_sub(before);
+            if delta > 0 {
+                lines.push(format!("{key}: +{delta}"));
+            }
         }
     }
-    for (key, count) in &registry.counters {
-        lines.push(format!("{key}: {}", count.0.load(Ordering::Relaxed)));
+    if lines.is_empty() {
+        return;
     }
     lines.sort();
     log::info!("mux stats\n{}", lines.join("\n"));
@@ -124,10 +145,12 @@ impl Recorder for Stats {
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata) -> Counter {
         let mut registry = self.registry.lock().unwrap();
-        let count = registry
-            .counters
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Count(AtomicU64::new(0))));
+        let count = registry.counters.entry(key.clone()).or_insert_with(|| {
+            Arc::new(Count {
+                value: AtomicU64::new(0),
+                reported: AtomicU64::new(0),
+            })
+        });
         Counter::from_arc(Arc::clone(count))
     }
 
