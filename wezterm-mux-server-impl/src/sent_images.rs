@@ -23,9 +23,13 @@ use wezterm_term::StableRowIndex;
 /// Per pane, per connection. The byte cap matters more than the count: a
 /// single picture can run to tens of megabytes, and this must stay well
 /// inside the terminal's own image budget, since the entries here outlive
-/// the terminal's copy once it lets an image go.
+/// the terminal's copy once it lets an image go. A few are kept whatever
+/// their size: a program streaming full-window frames replaces the
+/// picture faster than a fetch lands, and with only the newest frame held
+/// every fetch missed.
 const MAX_IMAGES: usize = 32;
-const MAX_BYTES: usize = 8 * 1024 * 1024;
+const MIN_KEPT: usize = 4;
+const MAX_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) struct SentImages {
     /// Each image with its size when it came in. An animation grows after
@@ -85,7 +89,7 @@ impl SentImages {
             self.bytes = self.bytes.saturating_sub(evicted.1);
         }
         self.bytes += size;
-        while self.cache.len() > 1 && self.bytes > self.max_bytes {
+        while self.cache.len() > MIN_KEPT && self.bytes > self.max_bytes {
             if let Some((_, (_, size))) = self.cache.pop_lru() {
                 self.bytes = self.bytes.saturating_sub(size);
             }
@@ -191,23 +195,34 @@ mod tests {
     #[test]
     fn the_oldest_image_goes_first_when_over_the_byte_budget() {
         let mut sent = SentImages::with_limits(10, 25);
-        let first = image(&[1u8; 10]);
-        let second = image(&[2u8; 10]);
-        let third = image(&[3u8; 10]);
-        sent.insert(Arc::clone(&first));
-        sent.insert(Arc::clone(&second));
-        sent.insert(Arc::clone(&third));
-        assert!(sent.get(&first.hash()).is_none(), "the oldest is let go");
-        assert!(sent.get(&second.hash()).is_some());
-        assert!(sent.get(&third.hash()).is_some());
+        let images: Vec<Arc<ImageData>> =
+            (1..=MIN_KEPT as u8 + 2).map(|n| image(&[n; 10])).collect();
+        for image in &images {
+            sent.insert(Arc::clone(image));
+        }
+        assert!(
+            sent.get(&images[0].hash()).is_none(),
+            "the oldest is let go"
+        );
+        assert!(sent.get(&images[1].hash()).is_none(), "and the next");
+        for image in &images[2..] {
+            assert!(
+                sent.get(&image.hash()).is_some(),
+                "the last few stay, over budget or not"
+            );
+        }
     }
 
     #[test]
-    fn one_image_is_always_kept_even_when_it_alone_exceeds_the_budget() {
+    fn a_few_images_are_always_kept_even_when_each_alone_exceeds_the_budget() {
         let mut sent = SentImages::with_limits(10, 5);
-        let big = image(&[9u8; 100]);
-        sent.insert(Arc::clone(&big));
-        assert!(sent.get(&big.hash()).is_some());
+        let big: Vec<Arc<ImageData>> = (0..MIN_KEPT as u8).map(|n| image(&[n + 9; 100])).collect();
+        for image in &big {
+            sent.insert(Arc::clone(image));
+        }
+        for image in &big {
+            assert!(sent.get(&image.hash()).is_some());
+        }
     }
 
     fn animation(pixels: &[u8]) -> Arc<ImageData> {

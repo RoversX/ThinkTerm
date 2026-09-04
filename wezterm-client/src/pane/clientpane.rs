@@ -245,6 +245,8 @@ pub struct ClientPane {
     /// before every key: a pane left at Xterm never gets kitty-protocol or
     /// win32-input-mode bytes, whatever the remote program asked for.
     keyboard_encoding: Mutex<KeyboardEncoding>,
+    /// Render pushes waiting to be applied, in the order they arrived.
+    render_deltas: Mutex<RenderDeltaQueue>,
     requested_size: Mutex<Option<TerminalSize>>,
     ignore_next_kill: Mutex<bool>,
     user_vars: Mutex<HashMap<String, String>>,
@@ -437,6 +439,7 @@ impl ClientPane {
             mouse_grabbed: Mutex::new(false),
             alt_screen: Mutex::new(alt_screen),
             keyboard_encoding: Mutex::new(KeyboardEncoding::Xterm),
+            render_deltas: Mutex::new(RenderDeltaQueue::default()),
             requested_size: Mutex::new(Some(size)),
             ignore_next_kill: Mutex::new(false),
             unseen_output: Mutex::new(false),
@@ -451,22 +454,40 @@ impl ClientPane {
         }
     }
 
+    async fn apply_render_delta(
+        &self,
+        mut delta: GetPaneRenderChangesResponse,
+        fetch_images: bool,
+    ) {
+        *self.mouse_grabbed.lock() = delta.mouse_grabbed;
+        *self.alt_screen.lock() = delta.alt_screen;
+        *self.keyboard_encoding.lock() = delta.keyboard_encoding.into();
+
+        let bonus_lines = std::mem::take(&mut delta.bonus_lines);
+        let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
+        let bonus_lines = hydrate_lines(client, delta.pane_id, bonus_lines, fetch_images).await;
+
+        self.renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta, bonus_lines);
+    }
+
     pub async fn process_unilateral(&self, pdu: Pdu) -> anyhow::Result<()> {
         match pdu {
-            Pdu::GetPaneRenderChangesResponse(mut delta) => {
-                *self.mouse_grabbed.lock() = delta.mouse_grabbed;
-                *self.alt_screen.lock() = delta.alt_screen;
-                *self.keyboard_encoding.lock() = delta.keyboard_encoding.into();
-
-                let bonus_lines = std::mem::take(&mut delta.bonus_lines);
-                let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
-                let bonus_lines = hydrate_lines(client, delta.pane_id, bonus_lines).await;
-
-                self.renderable
-                    .lock()
-                    .inner
-                    .borrow_mut()
-                    .apply_changes_to_surface(delta, bonus_lines);
+            Pdu::GetPaneRenderChangesResponse(delta) => {
+                // Queued, and applied one at a time in arrival order by a
+                // single task. Each push used to be its own task that
+                // awaited the images it named; several in flight at once
+                // finished in whatever order their fetches did, so an older
+                // push could land after a newer one and roll the rows back,
+                // and a program streaming pictures had every push fetching
+                // a frame that was already stale.
+                if self.render_deltas.lock().push(delta) {
+                    let local_pane_id = self.local_pane_id;
+                    promise::spawn::spawn(drain_render_deltas(local_pane_id)).detach();
+                }
             }
             Pdu::SetClipboard(SetClipboard {
                 clipboard,
@@ -1390,6 +1411,65 @@ impl Pane for ClientPane {
     }
 }
 
+#[derive(Default)]
+struct RenderDeltaQueue {
+    pending: std::collections::VecDeque<GetPaneRenderChangesResponse>,
+    draining: bool,
+}
+
+impl RenderDeltaQueue {
+    /// Queue `delta`; true when the caller has to start the drain.
+    fn push(&mut self, delta: GetPaneRenderChangesResponse) -> bool {
+        self.pending.push_back(delta);
+        !std::mem::replace(&mut self.draining, true)
+    }
+
+    /// The next push to apply and whether another already waits behind it,
+    /// or None once the drain is over.
+    fn take(&mut self) -> Option<(GetPaneRenderChangesResponse, bool)> {
+        match self.pending.pop_front() {
+            Some(delta) => Some((delta, !self.pending.is_empty())),
+            None => {
+                self.draining = false;
+                None
+            }
+        }
+    }
+}
+
+/// Marks the drain over when its task ends, however it ends, so a task
+/// dropped without finishing cannot leave every later push waiting.
+struct DrainingDeltas(PaneId);
+
+impl Drop for DrainingDeltas {
+    fn drop(&mut self) {
+        if let Some(pane) = Mux::get().get_pane(self.0) {
+            if let Some(pane) = pane.downcast_ref::<ClientPane>() {
+                pane.render_deltas.lock().draining = false;
+            }
+        }
+    }
+}
+
+async fn drain_render_deltas(local_pane_id: PaneId) {
+    let _draining = DrainingDeltas(local_pane_id);
+    loop {
+        let Some(pane) = Mux::get().get_pane(local_pane_id) else {
+            return;
+        };
+        let Some(pane) = pane.downcast_ref::<ClientPane>() else {
+            return;
+        };
+        let Some((delta, newer_waiting)) = pane.render_deltas.lock().take() else {
+            return;
+        };
+        // A push with a newer one already behind it is applied without
+        // asking for pictures: the newer push names the current ones, and
+        // rows whose pictures are missing keep showing the previous frame.
+        pane.apply_render_delta(delta, !newer_waiting).await;
+    }
+}
+
 struct PaneWriter {
     client: Arc<ClientInner>,
     remote_pane_id: TabId,
@@ -1869,6 +1949,37 @@ mod palette_delivery_tests {
         );
         assert!(queue.take().is_none(), "empty: the drain ends");
         assert!(queue.push(b"c"), "and the next write starts a new one");
+    }
+
+    #[test]
+    fn render_pushes_are_taken_in_order_and_know_when_another_waits() {
+        let mut queue = super::RenderDeltaQueue::default();
+        let delta = |seqno| codec::GetPaneRenderChangesResponse {
+            pane_id: 1,
+            mouse_grabbed: false,
+            alt_screen: false,
+            keyboard_encoding: Default::default(),
+            cursor_position: Default::default(),
+            dimensions: Default::default(),
+            dirty_lines: vec![],
+            title: String::new(),
+            working_dir: None,
+            bonus_lines: Vec::new().into(),
+            input_serial: None,
+            seqno,
+        };
+        assert!(queue.push(delta(1)), "the first push starts the drain");
+        assert!(!queue.push(delta(2)), "the second rides along");
+        let (first, newer_waiting) = queue.take().unwrap();
+        assert_eq!(first.seqno, 1);
+        assert!(
+            newer_waiting,
+            "so the first is applied without fetching pictures"
+        );
+        let (second, newer_waiting) = queue.take().unwrap();
+        assert_eq!(second.seqno, 2);
+        assert!(!newer_waiting, "the latest one fetches");
+        assert!(queue.take().is_none(), "and the drain ends");
     }
 
     #[test]

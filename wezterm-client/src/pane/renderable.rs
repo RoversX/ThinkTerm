@@ -988,7 +988,8 @@ impl RenderableInner {
             let result = match result {
                 Ok(result) => {
                     let lines =
-                        hydrate_lines(Arc::clone(&client), remote_pane_id, result.lines).await;
+                        hydrate_lines(Arc::clone(&client), remote_pane_id, result.lines, true)
+                            .await;
                     Ok(lines)
                 }
                 Err(err) => Err(err),
@@ -1212,12 +1213,18 @@ pub(crate) fn forget_images_for_domain(domain_id: DomainId) {
     }
 }
 
+/// Attach the images the serialized lines name. With `fetch_images` off,
+/// nothing is asked of the server: images already held are attached, and
+/// rows whose pictures would have to be fetched are left out, so the row
+/// the cache already shows stays -- the previous frame rather than a
+/// blank. Used for a push that a newer push has already overtaken.
 pub(crate) async fn hydrate_lines(
     client: Arc<ClientInner>,
     pane_id: PaneId,
     serialized_lines: SerializedLines,
+    fetch_images: bool,
 ) -> Vec<(StableRowIndex, Line)> {
-    let (lines, image_cells) = serialized_lines.extract_data();
+    let (mut lines, image_cells) = serialized_lines.extract_data();
 
     if image_cells.is_empty() {
         return lines;
@@ -1261,21 +1268,39 @@ pub(crate) async fn hydrate_lines(
         }
     }
 
+    if !fetch_images && !requests.is_empty() {
+        let unfetched: std::collections::HashSet<StableRowIndex> = image_cells
+            .iter()
+            .filter(|im| requests.contains_key(&im.data_hash))
+            .map(|im| im.line_idx)
+            .collect();
+        lines.retain(|(idx, _)| !unfetched.contains(idx));
+        requests.clear();
+    }
+
     // Concurrently, not one at a time: these are independent round trips, so
     // awaiting them serially cost a line with N distinct images N times the
     // latency.
+    let asked: Vec<([u8; 32], Option<Arc<ImageData>>, GetImageCell)> = requests
+        .into_iter()
+        .map(|(hash, (held, request))| (hash, held, request))
+        .collect();
     let fetched = futures::future::join_all(
-        requests
-            .into_values()
-            .map(|(held, request)| fetch_image(&client, held, request)),
+        asked
+            .iter()
+            .map(|(_, held, request)| fetch_image(&client, held.clone(), request.clone())),
     )
     .await;
 
-    for data in fetched.into_iter().flatten() {
+    for ((asked_for, _, _), data) in asked.into_iter().zip(fetched) {
+        let Some(data) = data else { continue };
         IMAGE_LRU
             .lock()
             .unwrap()
             .put((domain_id, data.hash()), Arc::clone(&data));
+        // Filed under the hash the cell named as well: the server may have
+        // answered with the picture now in the cell, whose hash differs.
+        data_by_hash.insert(asked_for, Arc::clone(&data));
         data_by_hash.insert(data.hash(), data);
     }
 
@@ -1336,6 +1361,13 @@ async fn fetch_image(
                 frames_from,
                 ..
             }) => {
+                if fresh.hash() != whole.data_hash {
+                    // Not the picture asked for but the one now in the cell:
+                    // a newer frame. Its own copy, never merged into the
+                    // one held for the old hash.
+                    fresh.set_generation(data_generation);
+                    return Some(fresh);
+                }
                 match &held {
                     None if frames_from == 0 => {
                         fresh.set_generation(data_generation);

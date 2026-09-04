@@ -1633,7 +1633,7 @@ pub struct SearchScrollbackResponse {
     pub results: Vec<thinkterm_proto::SearchResult>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetImageCell {
     pub pane_id: PaneId,
     pub line_idx: StableRowIndex,

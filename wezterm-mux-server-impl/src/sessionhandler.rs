@@ -1720,6 +1720,13 @@ impl SessionHandler {
                                     .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
 
                                 let (_, lines) = pane.get_lines(line_idx..line_idx + 1);
+                                // The picture now in the cell, should the one
+                                // asked for be gone: a program streaming frames
+                                // replaces it faster than a fetch can land, and
+                                // for a stream the newest frame is the one
+                                // wanted anyway. The client sees the hash it
+                                // actually got.
+                                let mut current = None;
                                 'found_data: for line in lines {
                                     if let Some(cell) = line.get_cell(cell_idx) {
                                         if let Some(images) = cell.attrs().images() {
@@ -1728,9 +1735,15 @@ impl SessionHandler {
                                                     data.replace(im.image_data().clone());
                                                     break 'found_data;
                                                 }
+                                                if current.is_none() {
+                                                    current = Some(im.image_data().clone());
+                                                }
                                             }
                                         }
                                     }
+                                }
+                                if data.is_none() {
+                                    data = current;
                                 }
                                 if let Some(found) = &data {
                                     per_pane
