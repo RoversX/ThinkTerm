@@ -65,35 +65,6 @@ link_to() {
   return 1
 }
 
-# The rpms named, labelled by package name and listed in the order given. Which
-# of them you want is not a question of architecture, so one row carries every
-# arch that was built, 64-bit first as elsewhere.
-#
-# The package list is spelled out by the caller rather than globbed: the
-# metapackage requires all three subpackages, so a row that links only some of
-# them tells the reader to run a dnf command that cannot resolve.
-rpm_links() {
-  local out='' f name pkg want
-  for want in x86 arm; do
-    for pkg in "$@"; do
-      for f in "$dist"/"$pkg"-[0-9]*.rpm; do
-        [ -f "$f" ] || continue
-        f=$(basename "$f")
-        case "$f" in
-          *arm64* | *aarch64*) [ "$want" = arm ] || continue ;;
-          *) [ "$want" = x86 ] || continue ;;
-        esac
-        name=$pkg
-        case "$want" in arm) name="$name (ARM64)" ;; esac
-        [ -z "$out" ] || out="$out · "
-        out="$out[$name]($base/$f)"
-      done
-    done
-  done
-  [ -n "$out" ] || return 1
-  printf '%s\n' "$out"
-}
-
 echo "<!-- What changed in this release goes above this line. Then delete it. -->"
 echo
 echo "## Downloads"
@@ -140,23 +111,32 @@ if appimage=$(links_by_arch '*.AppImage'); then
 $appimage
 "
 fi
-if deb=$(links_by_arch '*.deb'); then
+# The globs pin the digit after the name so thinkterm-* cannot also match
+# thinkterm-server-*. Only one of the two packages may be installed at a time.
+if deb=$(links_by_arch 'thinkterm-[0-9]*.deb'); then
   linux="$linux
 **DEB (Debian / Ubuntu)** — \`sudo apt install ./<file>.deb\`
 
 $deb
 "
 fi
-if rpm_full=$(rpm_links thinkterm thinkterm-common thinkterm-gui thinkterm-mux-server); then
+if deb_server=$(links_by_arch 'thinkterm-server-[0-9]*.deb'); then
   linux="$linux
-**RPM (Fedora / RHEL)** — put these in one directory, then \`sudo dnf install ./thinkterm-*.rpm\`
+**DEB, server only** (headless remote host, no GUI and no graphics libraries) — \`sudo apt install ./<file>.deb\`; replaces the desktop package if that is installed
 
-$rpm_full
+$deb_server
 "
 fi
-if rpm_server=$(rpm_links thinkterm-common thinkterm-mux-server); then
+if rpm_desktop=$(links_by_arch 'thinkterm-[0-9]*.rpm'); then
   linux="$linux
-**RPM, server only** (headless remote host) — \`sudo dnf install ./thinkterm-common-*.rpm ./thinkterm-mux-server-*.rpm\`, which pulls in no GUI libraries and still gives the host \`thinkterm tui\`
+**RPM (Fedora / RHEL)** — \`sudo dnf install ./<file>.rpm\`
+
+$rpm_desktop
+"
+fi
+if rpm_server=$(links_by_arch 'thinkterm-server-[0-9]*.rpm'); then
+  linux="$linux
+**RPM, server only** (headless remote host, no GUI and no graphics libraries) — \`sudo dnf install ./<file>.rpm\`; replaces the desktop package if that is installed
 
 $rpm_server
 "

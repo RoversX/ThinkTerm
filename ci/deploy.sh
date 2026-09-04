@@ -263,7 +263,16 @@ BUILDEOFEOF
           BUILD_REQUIRES=""
         fi
 
-        # Generate single spec with subpackages
+        # One spec, two packages, each complete on its own and refusing to
+        # co-install with the other. Distribution is a file from the releases
+        # page, where every dependency is another download the user has to
+        # find; a metapackage over subpackages produced exactly that failure.
+        #
+        #   thinkterm         GUI + CLI (with the TUI linked in) + mux server
+        #   thinkterm-server  the same without the GUI, so no graphics library
+        #
+        # Files the two share are listed under both: rpm allows it within a
+        # spec, and the Conflicts guarantee they are never installed together.
         cat > thinkterm.spec <<EOF
 Name: thinkterm
 Version: ${THINKTERM_RPM_VERSION}
@@ -273,45 +282,31 @@ License: GPL-3.0-only
 URL: https://github.com/RoversX/thinkterm
 Summary: ThinkTerm workspace-first terminal emulator.
 ${BUILD_REQUIRES}
-Requires: thinkterm-common, thinkterm-gui, thinkterm-mux-server
+Conflicts: thinkterm-server, wezterm
+Requires: openssl
+%if 0%{?suse_version}
+Requires: dbus-1, fontconfig, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-egl1, libwayland-cursor0, Mesa-libEGL1, libxcb-keysyms1, libxcb-ewmh2, libxcb-icccm4
+%else
+Requires: dbus, fontconfig, libxcb, libxkbcommon, libxkbcommon-x11, libwayland-client, libwayland-egl, libwayland-cursor, mesa-libEGL, xcb-util-keysyms, xcb-util-wm
+%endif
 
 %global debug_package %{nil}
 
 %description
 ThinkTerm is a terminal emulator with support for modern features
 such as fonts with ligatures, hyperlinks, tabs and multiple
-windows.
+windows. This package carries the GUI, the command line (including
+the TUI) and the multiplexer server.
 
-# Subpackage: thinkterm-common
-%package -n thinkterm-common
-Summary: ThinkTerm - Common CLI components
+%package -n thinkterm-server
+Summary: ThinkTerm - command line, TUI and multiplexer server, no GUI
+Conflicts: thinkterm, wezterm
 Requires: openssl
-%description -n thinkterm-common
-thinkterm-common provides the base CLI launcher and utilities shared by
-all ThinkTerm components.
-
-# Subpackage: thinkterm-gui
-%package -n thinkterm-gui
-Summary: ThinkTerm - GUI and multiplexer
-Requires: thinkterm-common
-%if 0%{?suse_version}
-Requires: dbus-1, fontconfig, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-egl1, libwayland-cursor0, Mesa-libEGL1, libxcb-keysyms1, libxcb-ewmh2, libxcb-icccm4
-%else
-Requires: dbus, fontconfig, libxcb, libxkbcommon, libxkbcommon-x11, libwayland-client, libwayland-egl, libwayland-cursor, mesa-libEGL, xcb-util-keysyms, xcb-util-wm
-%endif
-%description -n thinkterm-gui
-thinkterm-gui is a GPU-accelerated cross-platform terminal emulator with
-support for modern features such as fonts with ligatures, hyperlinks,
-tabs and multiple windows.
-
-# Subpackage: thinkterm-mux-server
-%package -n thinkterm-mux-server
-Summary: ThinkTerm - Multiplexer server (headless)
-Requires: openssl
-%description -n thinkterm-mux-server
-thinkterm-mux-server is a headless terminal multiplexer that can be used
-as a session manager for terminal sessions, without requiring X11,
-Wayland, or other GUI libraries.
+%description -n thinkterm-server
+thinkterm-server is ThinkTerm without the GUI: the thinkterm command
+line (with the TUI), the wezterm compatibility shim and the headless
+multiplexer server, for hosts that are reached over SSH. It needs no
+X11, Wayland or other graphics library.
 
 ${BUILD_SECTION}
 
@@ -338,20 +333,20 @@ install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python
 install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm/NOTICE
 install -Dm644 LICENSE.md %{buildroot}/usr/share/licenses/thinkterm/LICENSE.md
 install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm/LICENSE-MIT
-# A second copy owned by the standalone mux-server package: it links the
-# same third-party material and installs without thinkterm-common, and
-# one file owned by two packages would conflict on co-install.
-install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm-mux-server/NOTICE
-install -Dm644 LICENSE.md %{buildroot}/usr/share/licenses/thinkterm-mux-server/LICENSE.md
-install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-mux-server/LICENSE-MIT
+# The server package owns its own copy under its own name, so either
+# package can be installed on its own with the licenses it needs.
+install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm-server/NOTICE
+install -Dm644 LICENSE.md %{buildroot}/usr/share/licenses/thinkterm-server/LICENSE.md
+install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-server/LICENSE-MIT
 
 %files
-# Main package (metapackage) has no files
-
-%files -n thinkterm-common
 /usr/bin/thinkterm
 /usr/bin/wezterm
+/usr/bin/thinkterm-gui
+/usr/bin/thinkterm-mux-server
 /usr/bin/strip-ansi-escapes
+/usr/bin/open-thinkterm-here
+/usr/bin/open-wezterm-here
 /usr/share/licenses/thinkterm/*
 /usr/share/zsh/site-functions/_thinkterm
 /usr/share/fish/vendor_completions.d/thinkterm.fish
@@ -359,19 +354,23 @@ install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-mux-server/
 /etc/bash_completion.d/thinkterm
 /etc/bash_completion.d/wezterm
 /etc/profile.d/*
-
-%files -n thinkterm-gui
-/usr/bin/open-thinkterm-here
-/usr/bin/open-wezterm-here
-/usr/bin/thinkterm-gui
 /usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
 /usr/share/applications/com.roversx.thinkterm.desktop
 /usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 /usr/share/nautilus-python/extensions/wezterm-nautilus.py*
 
-%files -n thinkterm-mux-server
+%files -n thinkterm-server
+/usr/bin/thinkterm
+/usr/bin/wezterm
 /usr/bin/thinkterm-mux-server
-/usr/share/licenses/thinkterm-mux-server/*
+/usr/bin/strip-ansi-escapes
+/usr/share/licenses/thinkterm-server/*
+/usr/share/zsh/site-functions/_thinkterm
+/usr/share/fish/vendor_completions.d/thinkterm.fish
+/usr/share/fish/vendor_completions.d/wezterm.fish
+/etc/bash_completion.d/thinkterm
+/etc/bash_completion.d/wezterm
+/etc/profile.d/*
 
 %changelog
 * Fri Sep 4 2026 RoversX
@@ -387,22 +386,51 @@ EOF
 
         ;;
       Ubuntu*|Debian*|Pop)
-        rm -rf pkg
-        mkdir -p pkg/debian/usr/bin pkg/debian/DEBIAN pkg/debian/usr/share/{applications,wezterm}
+        # Two debs, each complete on its own and conflicting with the other:
+        #
+        #   thinkterm         GUI + CLI (with the TUI linked in) + mux server
+        #   thinkterm-server  the same without the GUI
+        #
+        # Each is assembled in its own tree so that dpkg-shlibdeps computes
+        # its Depends from its own binaries: a shared tree would hand the
+        # server package the GUI's X11/Wayland/EGL dependencies, which is the
+        # whole thing the split exists to avoid.
+        arch=$(dpkg-architecture -q DEB_BUILD_ARCH_CPU)
 
-        if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-          pkgname=thinkterm-nightly
-          conflicts=thinkterm
-        else
+        # build_deb <variant>: variant is "desktop" or "server".
+        build_deb() {
+          local variant=$1 pkgname conflicts debname root other
+          # Four package names exist: the two variants, each with a nightly
+          # twin. Whichever one this is, it conflicts with the other three.
           pkgname=thinkterm
-          conflicts=thinkterm-nightly
-        fi
+          [[ "$variant" != server ]] || pkgname=thinkterm-server
+          debname=$pkgname-$TAG_NAME
+          if [[ "$BUILD_REASON" == "Schedule" ]] ; then
+            pkgname=$pkgname-nightly
+            debname=$pkgname
+          fi
+          # ... and with a real wezterm package, which owns /usr/bin/wezterm too.
+          conflicts=wezterm
+          for other in thinkterm thinkterm-nightly thinkterm-server thinkterm-server-nightly ; do
+            [[ "$other" == "$pkgname" ]] && continue
+            conflicts="$conflicts, $other"
+          done
+          debname=$debname.$distro$distver
+          case $arch in
+            amd64) ;;
+            *) debname="${debname}.${arch}" ;;
+          esac
 
-        cat > pkg/debian/control <<EOF
+          root=pkg/$variant/debian
+          rm -rf "pkg/$variant"
+          mkdir -p $root/usr/bin $root/DEBIAN
+
+          if [[ "$variant" == desktop ]] ; then
+            cat > $root/DEBIAN/control <<EOF
 Package: $pkgname
 Version: ${TAG_NAME#nightly-}
 Conflicts: $conflicts
-Architecture: $(dpkg-architecture -q DEB_BUILD_ARCH_CPU)
+Architecture: $arch
 Maintainer: RoversX
 Section: utils
 Priority: optional
@@ -410,12 +438,11 @@ Homepage: https://github.com/RoversX/thinkterm
 Description: ThinkTerm workspace-first terminal emulator.
  ThinkTerm is a terminal emulator with support for modern features
  such as fonts with ligatures, hyperlinks, tabs and multiple
- windows.
+ windows. This package carries the GUI, the command line (including
+ the TUI) and the multiplexer server.
 Provides: x-terminal-emulator
-Source: https://github.com/RoversX/thinkterm
 EOF
-
-        cat > pkg/debian/postinst <<EOF
+            cat > $root/DEBIAN/postinst <<EOF
 #!/bin/sh
 set -e
 if [ "\$1" = "configure" ] ; then
@@ -423,8 +450,7 @@ if [ "\$1" = "configure" ] ; then
         update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator /usr/bin/open-thinkterm-here 20
 fi
 EOF
-
-        cat > pkg/debian/prerm <<EOF
+            cat > $root/DEBIAN/prerm <<EOF
 #!/bin/sh
 set -e
 if [ "\$1" = "remove" ]; then
@@ -432,60 +458,71 @@ if [ "\$1" = "remove" ]; then
 	update-alternatives --remove x-terminal-emulator /usr/bin/open-wezterm-here
 fi
 EOF
+            chmod 0755 $root/DEBIAN/postinst $root/DEBIAN/prerm
+          else
+            cat > $root/DEBIAN/control <<EOF
+Package: $pkgname
+Version: ${TAG_NAME#nightly-}
+Conflicts: $conflicts
+Architecture: $arch
+Maintainer: RoversX
+Section: utils
+Priority: optional
+Homepage: https://github.com/RoversX/thinkterm
+Description: ThinkTerm command line, TUI and multiplexer server, no GUI.
+ ThinkTerm without the GUI: the thinkterm command line (with the TUI),
+ the wezterm compatibility shim and the headless multiplexer server,
+ for hosts that are reached over SSH. It needs no X11, Wayland or
+ other graphics library.
+EOF
+          fi
 
-        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/thinkterm-mux-server
-        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/thinkterm-gui
-        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/thinkterm
-        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/wezterm
-        install -Dm755 -t pkg/debian/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
-        install -Dsm755 -t pkg/debian/usr/bin $TARGET_DIR/release/strip-ansi-escapes
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/thinkterm-mux-server
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/thinkterm
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/wezterm
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/strip-ansi-escapes
+          if [[ "$variant" == desktop ]] ; then
+            install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/thinkterm-gui
+            install -Dm755 -t $root/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
+            install -Dm644 assets/icon/terminal.png $root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
+            install -Dm644 assets/wezterm.desktop $root/usr/share/applications/com.roversx.thinkterm.desktop
+            install -Dm644 assets/wezterm.appdata.xml $root/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
+            install -Dm644 assets/wezterm-nautilus.py $root/usr/share/nautilus-python/extensions/wezterm-nautilus.py
+          fi
 
-        deps=$(cd pkg && dpkg-shlibdeps -O -e debian/usr/bin/*)
-        mv pkg/debian/postinst pkg/debian/DEBIAN/postinst
-        chmod 0755 pkg/debian/DEBIAN/postinst
-        mv pkg/debian/prerm pkg/debian/DEBIAN/prerm
-        chmod 0755 pkg/debian/DEBIAN/prerm
-        mv pkg/debian/control pkg/debian/DEBIAN/control
-        sed -i '/^Source:/d' pkg/debian/DEBIAN/control  # The `Source:` field needs to be valid in a binary package
-        echo $deps | sed -e 's/shlibs:Depends=/Depends: /' >> pkg/debian/DEBIAN/control
-        cat pkg/debian/DEBIAN/control
+          # dpkg-shlibdeps wants to run from the directory holding debian/.
+          local deps
+          deps=$(cd "pkg/$variant" && dpkg-shlibdeps -O -e debian/usr/bin/*)
+          echo $deps | sed -e 's/shlibs:Depends=/Depends: /' >> $root/DEBIAN/control
+          cat $root/DEBIAN/control
 
-        install -Dm644 assets/icon/terminal.png pkg/debian/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
-        install -Dm644 assets/wezterm.desktop pkg/debian/usr/share/applications/com.roversx.thinkterm.desktop
-        install -Dm644 assets/wezterm.appdata.xml pkg/debian/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
-        install -Dm644 assets/wezterm-nautilus.py pkg/debian/usr/share/nautilus-python/extensions/wezterm-nautilus.py
-        install -Dm644 assets/shell-completion/bash pkg/debian/usr/share/bash-completion/completions/thinkterm
-        install -Dm644 assets/shell-completion/zsh pkg/debian/usr/share/zsh/functions/Completion/Unix/_thinkterm
-        install -Dm644 assets/shell-completion/fish pkg/debian/usr/share/fish/vendor_completions.d/thinkterm.fish
-        ln -s thinkterm pkg/debian/usr/share/bash-completion/completions/wezterm
-        ln -s thinkterm.fish pkg/debian/usr/share/fish/vendor_completions.d/wezterm.fish
-        install -Dm644 assets/shell-integration/* -t pkg/debian/etc/profile.d
-        install -Dm644 NOTICE pkg/debian/usr/share/doc/$pkgname/NOTICE
-        install -Dm644 LICENSE.md pkg/debian/usr/share/doc/$pkgname/LICENSE.md
-        install -Dm644 LICENSE-MIT pkg/debian/usr/share/doc/$pkgname/LICENSE-MIT
+          install -Dm644 assets/shell-completion/bash $root/usr/share/bash-completion/completions/thinkterm
+          install -Dm644 assets/shell-completion/zsh $root/usr/share/zsh/functions/Completion/Unix/_thinkterm
+          install -Dm644 assets/shell-completion/fish $root/usr/share/fish/vendor_completions.d/thinkterm.fish
+          ln -s thinkterm $root/usr/share/bash-completion/completions/wezterm
+          ln -s thinkterm.fish $root/usr/share/fish/vendor_completions.d/wezterm.fish
+          install -Dm644 assets/shell-integration/* -t $root/etc/profile.d
+          install -Dm644 NOTICE $root/usr/share/doc/$pkgname/NOTICE
+          install -Dm644 LICENSE.md $root/usr/share/doc/$pkgname/LICENSE.md
+          install -Dm644 LICENSE-MIT $root/usr/share/doc/$pkgname/LICENSE-MIT
 
-        if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-          debname=thinkterm-nightly.$distro$distver
-        else
-          debname=thinkterm-$TAG_NAME.$distro$distver
-        fi
-        arch=$(dpkg-architecture -q DEB_BUILD_ARCH_CPU)
-        case $arch in
-          amd64)
-            ;;
-          *)
-            debname="${debname}.${arch}"
-            ;;
-        esac
+          fakeroot dpkg-deb --build $root $debname.deb
 
-        fakeroot dpkg-deb --build pkg/debian $debname.deb
-
-        if [[ "$BUILD_REASON" != '' ]] ; then
-          $SUDO apt-get install ./$debname.deb
-        fi
-
-        mv pkg/debian pkg/thinkterm
-        tar cJf $debname.tar.xz -C pkg thinkterm
+          if [[ "$variant" == desktop ]] ; then
+            # Installing the desktop deb is the smoke test that its Depends
+            # resolve on this distro. Only one of the two can be installed
+            # at a time, and this is the one with dependencies worth testing.
+            if [[ "$BUILD_REASON" != '' ]] ; then
+              $SUDO apt-get install ./$debname.deb
+            fi
+            # The raw tree, for people who want the files without dpkg.
+            mv $root pkg/$variant/thinkterm
+            tar cJf $debname.tar.xz -C pkg/$variant thinkterm
+          fi
+          rm -rf "pkg/$variant"
+        }
+        build_deb desktop
+        build_deb server
         rm -rf pkg
 
         # The tarballs install.sh downloads: one per variant, both built here
