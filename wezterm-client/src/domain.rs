@@ -1611,10 +1611,22 @@ impl ClientInner {
     }
 }
 
+/// Lease state the server pushed before this domain had an inner to keep
+/// it in. A server tells a registering client where the frontend lease
+/// stands right after the handshake, which is before the attach has built
+/// the inner; thrown away, that state never came again for a tab nobody
+/// touched, and the frontend sat behind "Restoring terminal state".
+#[derive(Default)]
+struct EarlyRemoteState {
+    access: Option<codec::FrontendAccessState>,
+    viewports: Vec<codec::ClientViewportState>,
+}
+
 pub struct ClientDomain {
     config: ClientDomainConfig,
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
+    early_remote_state: Mutex<EarlyRemoteState>,
     /// True while an attach is in flight (state() stays Detached until
     /// finish_attach installs the inner, so state alone can't dedupe).
     attaching: std::sync::atomic::AtomicBool,
@@ -1900,6 +1912,7 @@ impl ClientDomain {
             config,
             label,
             inner: Mutex::new(None),
+            early_remote_state: Mutex::new(EarlyRemoteState::default()),
             attaching: std::sync::atomic::AtomicBool::new(false),
             attach_retries: std::sync::atomic::AtomicUsize::new(0),
             resync_coordinator: Mutex::new(ResyncCoordinatorState::default()),
@@ -2140,6 +2153,7 @@ impl ClientDomain {
 
     pub fn process_remote_access_state(&self, state: codec::FrontendAccessState) {
         let Some(inner) = self.inner() else {
+            self.early_remote_state.lock().unwrap().access = Some(state);
             return;
         };
         if !inner.update_remote_access(state.clone()) {
@@ -2159,6 +2173,11 @@ impl ClientDomain {
 
     pub fn process_remote_viewport_state(&self, state: codec::ClientViewportState) {
         let Some(inner) = self.inner() else {
+            self.early_remote_state
+                .lock()
+                .unwrap()
+                .viewports
+                .push(state);
             return;
         };
         self.process_remote_access_state(state.access.clone());
@@ -3562,7 +3581,17 @@ impl ClientDomain {
             guard.replace(Arc::clone(&inner));
         }
 
-        Self::process_pane_list(inner, panes, primary_window_id, false, None)?;
+        Self::process_pane_list(Arc::clone(&inner), panes, primary_window_id, false, None)?;
+
+        // What the server said about the lease before there was an inner
+        // to hold it: applied now that the tabs it names exist here.
+        let early = std::mem::take(&mut *domain.early_remote_state.lock().unwrap());
+        if let Some(access) = early.access {
+            domain.process_remote_access_state(access);
+        }
+        for viewport in early.viewports {
+            domain.process_remote_viewport_state(viewport);
+        }
 
         Ok(())
     }
