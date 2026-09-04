@@ -732,6 +732,12 @@ impl TerminalState {
     /// it doubles as the glyph cache's key, and changing it per frame would
     /// rebuild the decoded image on every paint and reset the animation clock.
     fn kitty_touch_placements_for_image(&mut self, image_id: u32) {
+        // The identity stays; the generation says the pixels moved. A mux
+        // client holds a copy of the image, not the shared Arc, and this is
+        // the only signal that its copy has fallen behind.
+        if let Some(data) = self.kitty_img.id_to_data.get(&image_id) {
+            data.bump_generation();
+        }
         let placements: Vec<PlacementInfo> = self
             .kitty_img
             .placements

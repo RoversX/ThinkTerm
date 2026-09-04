@@ -15,6 +15,7 @@ use ordered_float::NotNan;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 #[cfg(feature = "std")]
@@ -327,8 +328,8 @@ impl ImageDataType {
     /// minted by different processes (this GUI, every mux server) from
     /// colliding in the client- and GPU-side caches that mix all sources.
     fn nonce_key() -> [u8; 32] {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU64, Ordering};
         static SALT: OnceLock<[u8; 16]> = OnceLock::new();
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let salt = SALT.get_or_init(|| {
@@ -624,6 +625,14 @@ pub enum ImageCellError {
 pub struct ImageData {
     data: Mutex<ImageDataType>,
     hash: [u8; 32],
+    /// Moves on every in-place change to `data`: an animation frame
+    /// appended or edited. The hash cannot carry that news, because it is
+    /// the picture's identity and the glyph cache's key, and a new one per
+    /// frame would restart the animation on every frame. So a holder of a
+    /// copy (a mux client) compares generations instead. Not serialized:
+    /// the copy is told the generation it was made from alongside.
+    #[cfg_attr(feature = "use_serde", serde(skip))]
+    generation: AtomicU64,
 }
 
 struct HexSlice<'a>(&'a [u8]);
@@ -641,6 +650,7 @@ impl std::fmt::Debug for ImageData {
         fmt.debug_struct("ImageData")
             .field("data", &self.data)
             .field("hash", &format_args!("{}", HexSlice(&self.hash)))
+            .field("generation", &self.generation())
             .finish()
     }
 }
@@ -667,6 +677,7 @@ impl ImageData {
         Self {
             data: Mutex::new(data),
             hash,
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -675,7 +686,26 @@ impl ImageData {
         Self {
             data: Mutex::new(data),
             hash,
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// How many in-place changes `data` has seen. See the field.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Record an in-place change to `data`. Called after the change, not
+    /// under the data lock, so a reader that takes the generation first and
+    /// the payload second can only end up believing it is *behind*, never
+    /// ahead.
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// For a copy: adopt the generation of the original it was made from.
+    pub fn set_generation(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Release);
     }
 
     /// Returns the in-memory footprint
@@ -737,10 +767,7 @@ mod tests {
         let b = mk(vec![vec![0xff, 0, 0, 0xff]; 2], hashes.clone());
         assert_eq!(a.compute_hash(), b.compute_hash());
         // Different per-frame keys must change the identity.
-        let c = mk(
-            vec![vec![0, 0, 0, 0xff]; 2],
-            vec![[1u8; 32], [3u8; 32]],
-        );
+        let c = mk(vec![vec![0, 0, 0, 0xff]; 2], vec![[1u8; 32], [3u8; 32]]);
         assert_ne!(a.compute_hash(), c.compute_hash());
     }
 }

@@ -487,7 +487,12 @@ macro_rules! pdu {
 ///     cold-start delivery and for `thinkterm cli agent list`.
 /// 62: Projects carry an archived state in the shared ThinkTerm tree
 ///     (TtProject.archived_at, TreeOp::SetProjectArchived).
-pub const CODEC_VERSION: usize = 63;
+/// 64: Image cells carry the image's generation, so a client notices when
+///     an animation it already fetched has grown; GetImageCell can ask for
+///     only the frames it lacks and is told the generation it received.
+///     The server probes silent clients with Ping and a client answers
+///     Pong; a remote pane reports its keyboard encoding.
+pub const CODEC_VERSION: usize = 64;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1395,6 +1400,10 @@ pub struct SerializedImageCell {
     pub bottom_right: TextureCoordinate,
     /// Image::data::hash() for the ImageCell::data field
     pub data_hash: [u8; 32],
+    /// `ImageData::generation()` at serialization: the payload behind a
+    /// hash changes in place as an animation grows, and this is how a
+    /// client that has the hash learns its copy is behind.
+    pub data_generation: u64,
     pub z_index: i32,
     pub padding_left: u16,
     pub padding_top: u16,
@@ -1526,6 +1535,7 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                             image_id: imcell.image_id(),
                             placement_id: imcell.placement_id(),
                             data_hash: imcell.image_data().hash(),
+                            data_generation: imcell.image_data().generation(),
                         });
                     }
                 }
@@ -1582,12 +1592,24 @@ pub struct GetImageCell {
     pub line_idx: StableRowIndex,
     pub cell_idx: usize,
     pub data_hash: [u8; 32],
+    /// The generation the client saw on the cell; informational.
+    pub data_generation: u64,
+    /// Animation frames the client already holds for this hash, so the
+    /// server can send only the ones after them. 0 asks for everything.
+    pub have_frames: u32,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct GetImageCellResponse {
     pub pane_id: PaneId,
     pub data: Option<Arc<ImageData>>,
+    /// The generation `data` was taken from.
+    pub data_generation: u64,
+    /// 0: `data` is the whole image. Otherwise `data` is an AnimRgba8
+    /// holding only the frames from this index on, together with the
+    /// durations and per-frame hashes of *every* frame, so the client can
+    /// check the frames it holds are still the ones in front.
+    pub frames_from: u32,
 }
 
 #[cfg(test)]
@@ -2128,7 +2150,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 63);
+        assert_eq!(CODEC_VERSION, 64);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {

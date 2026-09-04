@@ -1510,6 +1510,8 @@ impl SessionHandler {
                 line_idx,
                 cell_idx,
                 data_hash,
+                data_generation: _,
+                have_frames,
             }) => {
                 let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
@@ -1546,9 +1548,19 @@ impl SessionHandler {
                                         .insert(Arc::clone(found));
                                 }
                             }
+                            let (data_generation, data, frames_from) = match &data {
+                                Some(image) => {
+                                    let (generation, payload, from) =
+                                        crate::sent_images::reply_for(image, have_frames);
+                                    (generation, Some(payload), from)
+                                }
+                                None => (0, None, 0),
+                            };
                             Ok(Pdu::GetImageCellResponse(GetImageCellResponse {
                                 pane_id,
                                 data,
+                                data_generation,
+                                frames_from,
                             }))
                         },
                         send_response,

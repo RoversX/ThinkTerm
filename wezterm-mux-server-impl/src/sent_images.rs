@@ -16,7 +16,7 @@
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use termwiz::image::ImageData;
+use termwiz::image::{ImageData, ImageDataType};
 use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
 
@@ -93,6 +93,49 @@ impl SentImages {
     }
 }
 
+/// What to send for `image` to a client that already holds `have_frames`
+/// of it: the generation, the payload, and the index the payload's frames
+/// start at (0 for the whole image).
+///
+/// An animation the client has most of is answered with the frames after
+/// the ones it holds, plus the durations and hashes of every frame so it
+/// can verify the ones in front are still the same. Anything else, or a
+/// client holding nothing, gets the whole image.
+pub(crate) fn reply_for(image: &Arc<ImageData>, have_frames: u32) -> (u64, Arc<ImageData>, u32) {
+    // Generation first, payload second: a frame landing in between then
+    // makes the client ask once more, where the other order would leave
+    // it sure a stale copy was current.
+    let generation = image.generation();
+    if have_frames > 0 {
+        let data = image.data();
+        if let ImageDataType::AnimRgba8 {
+            width,
+            height,
+            durations,
+            frames,
+            hashes,
+        } = &*data
+        {
+            let have = have_frames as usize;
+            if have < frames.len() {
+                let tail = ImageDataType::AnimRgba8 {
+                    width: *width,
+                    height: *height,
+                    durations: durations.clone(),
+                    frames: frames[have..].to_vec(),
+                    hashes: hashes.clone(),
+                };
+                // Carries the original's hash although it is only part of
+                // it: the client files it under that hash, and never
+                // re-derives the hash from a delta.
+                let delta = Arc::new(ImageData::with_data_and_hash(tail, image.hash()));
+                return (generation, delta, have_frames);
+            }
+        }
+    }
+    (generation, Arc::clone(image), 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +202,68 @@ mod tests {
         let big = image(&[9u8; 100]);
         sent.insert(Arc::clone(&big));
         assert!(sent.get(&big.hash()).is_some());
+    }
+
+    fn animation(pixels: &[u8]) -> Arc<ImageData> {
+        Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![std::time::Duration::from_millis(40); pixels.len()],
+            frames: pixels.iter().map(|p| vec![*p; 4]).collect(),
+            hashes: pixels.iter().map(|p| [*p; 32]).collect(),
+        }))
+    }
+
+    fn frames_of(image: &ImageData) -> Vec<Vec<u8>> {
+        match &*image.data() {
+            ImageDataType::AnimRgba8 { frames, .. } => frames.clone(),
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn a_client_holding_some_frames_gets_only_the_rest() {
+        let image = animation(&[1, 2, 3, 4]);
+        image.bump_generation();
+        let (generation, payload, from) = reply_for(&image, 2);
+        assert_eq!(generation, 1);
+        assert_eq!(from, 2);
+        assert_eq!(frames_of(&payload), vec![vec![3; 4], vec![4; 4]]);
+        assert_eq!(payload.hash(), image.hash(), "filed under the same hash");
+        let data = payload.data();
+        let ImageDataType::AnimRgba8 {
+            hashes, durations, ..
+        } = &*data
+        else {
+            panic!("expected an animation, got {:?}", &*data);
+        };
+        assert_eq!(hashes.len(), 4, "every frame's hash, for the prefix check");
+        assert_eq!(durations.len(), 4);
+    }
+
+    #[test]
+    fn a_client_holding_nothing_or_everything_gets_the_whole_image() {
+        let image = animation(&[1, 2]);
+        let (_, payload, from) = reply_for(&image, 0);
+        assert!(Arc::ptr_eq(&payload, &image));
+        assert_eq!(from, 0);
+        let (_, payload, from) = reply_for(&image, 2);
+        assert!(Arc::ptr_eq(&payload, &image));
+        assert_eq!(from, 0);
+        let (_, payload, from) = reply_for(&image, 5);
+        assert!(
+            Arc::ptr_eq(&payload, &image),
+            "a count from the future is not trusted"
+        );
+        assert_eq!(from, 0);
+    }
+
+    #[test]
+    fn a_still_image_is_never_answered_with_a_delta() {
+        let image = image(b"still");
+        let (_, payload, from) = reply_for(&image, 1);
+        assert!(Arc::ptr_eq(&payload, &image));
+        assert_eq!(from, 0);
     }
 
     #[test]

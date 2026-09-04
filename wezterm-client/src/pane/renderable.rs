@@ -1191,58 +1191,52 @@ pub(crate) async fn hydrate_lines(
     let mut requests = HashMap::new();
     let mut data_by_hash = HashMap::new();
     for im in &image_cells {
-        if let Some(data) = IMAGE_LRU.lock().unwrap().get(&im.data_hash) {
-            data_by_hash.insert(im.data_hash, Arc::clone(data));
-        } else {
-            requests
-                .entry(&im.data_hash)
-                .or_insert_with(|| GetImageCell {
-                    pane_id,
-                    line_idx: im.line_idx,
-                    cell_idx: im.cell_idx,
-                    data_hash: im.data_hash,
+        let held = IMAGE_LRU.lock().unwrap().get(&im.data_hash).cloned();
+        match held {
+            // A copy at or past the generation the cell was sent with is
+            // current. An animation grows behind an unchanging hash, so
+            // the hash alone would say "have it" forever.
+            Some(data) if data.generation() >= im.data_generation => {
+                data_by_hash.insert(im.data_hash, data);
+            }
+            held => {
+                requests.entry(im.data_hash).or_insert_with(|| {
+                    let have_frames = held
+                        .as_ref()
+                        .map(|data| super::images::frame_count(&data.data()))
+                        .unwrap_or(0);
+                    (
+                        held,
+                        GetImageCell {
+                            pane_id,
+                            line_idx: im.line_idx,
+                            cell_idx: im.cell_idx,
+                            data_hash: im.data_hash,
+                            data_generation: im.data_generation,
+                            have_frames,
+                        },
+                    )
                 });
+            }
         }
     }
 
     // Concurrently, not one at a time: these are independent round trips, so
     // awaiting them serially cost a line with N distinct images N times the
-    // latency. It also lost the race more often — the server answers by
-    // matching the hash against whatever occupies that cell *now*, so every
-    // extra round trip spent waiting is another chance for a newer frame to
-    // have overwritten it.
+    // latency.
     let fetched = futures::future::join_all(
         requests
             .into_values()
-            .map(|request| client.client.get_image_cell(request)),
+            .map(|(held, request)| fetch_image(&client, held, request)),
     )
     .await;
 
-    for result in fetched {
-        match result {
-            Ok(GetImageCellResponse {
-                data: Some(data), ..
-            }) => {
-                IMAGE_LRU
-                    .lock()
-                    .unwrap()
-                    .put(data.hash(), Arc::clone(&data));
-                data_by_hash.insert(data.hash(), data);
-            }
-            Ok(GetImageCellResponse { data: None, .. }) => {
-                // Not an error: the cell holds a different image by the time
-                // the request lands, which is the ordinary outcome for a pane
-                // streaming frames faster than the round trip. This cell just
-                // renders without the image and the next frame supersedes it.
-                // Logging it at error level buried genuine problems under
-                // thousands of lines.
-                log::debug!("image cell no longer holds the requested hash");
-            }
-
-            Err(err) => {
-                log::error!("failed to retrieve image {err:#}");
-            }
-        }
+    for data in fetched.into_iter().flatten() {
+        IMAGE_LRU
+            .lock()
+            .unwrap()
+            .put(data.hash(), Arc::clone(&data));
+        data_by_hash.insert(data.hash(), data);
     }
 
     let mut line_by_idx = HashMap::new();
@@ -1273,6 +1267,64 @@ pub(crate) async fn hydrate_lines(
     }
 
     line_by_idx.into_iter().collect()
+}
+
+/// Fetch the image `request` names and bring `held`, the copy already
+/// filed under that hash, up to date in place; the Arc to file is returned.
+/// A delta the copy cannot take (its leading frames no longer match) is
+/// followed by one fetch of the whole image; a whole image the copy cannot
+/// take is adopted as a fresh Arc, and lines hydrated from now on point at
+/// that one.
+async fn fetch_image(
+    client: &Arc<ClientInner>,
+    held: Option<Arc<ImageData>>,
+    request: GetImageCell,
+) -> Option<Arc<ImageData>> {
+    let whole = GetImageCell {
+        have_frames: 0,
+        ..request
+    };
+    let asked_for_delta = request.have_frames > 0;
+    let mut response = client.client.get_image_cell(request).await;
+    for _ in 0..2 {
+        match response {
+            Ok(GetImageCellResponse {
+                data: Some(fresh),
+                data_generation,
+                frames_from,
+                ..
+            }) => {
+                let Some(held) = &held else {
+                    fresh.set_generation(data_generation);
+                    return Some(fresh);
+                };
+                if super::images::merge_into(held, &fresh, frames_from, data_generation) {
+                    return Some(Arc::clone(held));
+                }
+                if frames_from > 0 && asked_for_delta {
+                    log::debug!("image delta did not fit the copy held; fetching the whole image");
+                    response = client.client.get_image_cell(GetImageCell { ..whole }).await;
+                    continue;
+                }
+                fresh.set_generation(data_generation);
+                return Some(fresh);
+            }
+            Ok(GetImageCellResponse { data: None, .. }) => {
+                // Not an error: the image has been let go of on the server
+                // by the time the request lands, which is the ordinary
+                // outcome for a pane streaming frames faster than the round
+                // trip. This cell renders without it and the next frame
+                // supersedes it.
+                log::debug!("image cell no longer holds the requested hash");
+                return None;
+            }
+            Err(err) => {
+                log::error!("failed to retrieve image {err:#}");
+                return None;
+            }
+        }
+    }
+    None
 }
 
 impl RenderableState {

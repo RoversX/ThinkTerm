@@ -1081,6 +1081,37 @@ fn a_frame_dirties_the_rows_holding_its_placement() {
 }
 
 #[test]
+fn a_frame_moves_the_image_generation_but_not_its_hash() {
+    // A mux client holds a copy of the image and sees only the hash on the
+    // wire. The hash must stay (it is the glyph cache's key, and a new one
+    // per frame would restart the animation), so the generation is what
+    // tells the client its copy fell behind.
+    let mut term = term(640, 384, true);
+    term.advance_bytes("\x1b[H");
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+    let image = term
+        .screen()
+        .lines_in_phys_range(0..1)
+        .remove(0)
+        .get_cell(0)
+        .and_then(|c| c.attrs().images())
+        .and_then(|imgs| imgs.into_iter().next())
+        .map(|img| Arc::clone(img.image_data()))
+        .expect("the placement attached the image");
+    let (hash, generation) = (image.hash(), image.generation());
+
+    term.advance_bytes(FRAME_2X2);
+    std::assert_eq!(image.hash(), hash, "the identity must not change");
+    assert!(
+        image.generation() > generation,
+        "the generation must move: {} -> {}",
+        generation,
+        image.generation()
+    );
+}
+
+#[test]
 fn a_frame_for_a_placement_on_the_other_screen_dirties_that_screen() {
     // Frames keep arriving for a picture on the primary screen while a
     // full-screen app has the alternate one up. Dirtying the active screen
