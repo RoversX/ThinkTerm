@@ -575,12 +575,14 @@ say "  $sharedir/{bash-completion,zsh,fish}/... (completions)"
 # is the old build. Client and server refuse to talk across a protocol
 # change, so the next `thinkterm connect` would fail with a version error
 # unless it is restarted.
-if have pgrep && pgrep -u "$(id -u)" -x thinkterm-mux-server >/dev/null 2>&1; then
+# Matched on the command line: Linux truncates process names to 15
+# characters, so -x with the full binary name never matches there.
+if have pgrep && pgrep -u "$(id -u)" -f '[t]hinkterm-mux-server' >/dev/null 2>&1; then
   say
   say "A thinkterm-mux-server from before this install is still running. Restart it to pick up the new"
   say "version; until then a newer CLI or GUI may refuse to connect to it."
 fi
-if [ "$os" = macos ] && have pgrep && pgrep -u "$(id -u)" -x thinkterm-gui >/dev/null 2>&1; then
+if [ "$os" = macos ] && have pgrep && pgrep -u "$(id -u)" -f '[t]hinkterm-gui' >/dev/null 2>&1; then
   say
   say "ThinkTerm is running; the new version starts the next time you open it."
 fi
