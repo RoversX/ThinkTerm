@@ -101,6 +101,16 @@ _arguments "${_arguments_options[@]}" : \
 '*::prog -- Instead of executing your shell, run PROG. For example\: `thinkterm start -- bash -l` will spawn bash as if it were a login shell:_cmdambivalent' \
 && ret=0
 ;;
+(tui)
+_arguments "${_arguments_options[@]}" : \
+'--class=[Window class used to discover a running ThinkTerm GUI socket]:CLASS:_default' \
+'--tui-config=[Override the independent ThinkTerm TUI settings file]:PATH:_files' \
+'--prefer-mux[Prefer connecting to a background mux server. The default is to prefer connecting to a running ThinkTerm GUI instance]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::domains -- Mux client domains to show. Defaults to Local when omitted; remote domains can also be attached later from the Connections panel:_default' \
+&& ret=0
+;;
 (ls-fonts)
 _arguments "${_arguments_options[@]}" : \
 '(--list-system --codepoints)--text=[Explain which fonts are used to render the supplied text string]:TEXT:_default' \
@@ -310,6 +320,55 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(agent)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_thinkterm__cli__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thinkterm-cli-agent-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Controls the output format. "table" and "json" are possible formats]:FORMAT:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_thinkterm__cli__agent__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thinkterm-cli-agent-help-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_thinkterm__cli__help_commands" \
@@ -398,6 +457,26 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(agent)
+_arguments "${_arguments_options[@]}" : \
+":: :_thinkterm__cli__help__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thinkterm-cli-help-agent-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -458,6 +537,16 @@ _arguments "${_arguments_options[@]}" : \
 ':cast_file:_files' \
 && ret=0
 ;;
+(update)
+_arguments "${_arguments_options[@]}" : \
+'--version=[Install this release instead of the latest one (a downgrade is allowed)]:VERSION:_default' \
+'--check[Only report whether a newer release exists; install nothing]' \
+'-y[Install without asking for confirmation]' \
+'--yes[Install without asking for confirmation]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (shell-completion)
 _arguments "${_arguments_options[@]}" : \
 '--shell=[Which shell to generate for]:SHELL:(bash elvish fish power-shell zsh fig)' \
@@ -494,6 +583,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (connect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(tui)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -593,6 +686,26 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(agent)
+_arguments "${_arguments_options[@]}" : \
+":: :_thinkterm__help__cli__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:thinkterm-help-cli-agent-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
         esac
     ;;
 esac
@@ -610,6 +723,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (replay)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(update)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -638,6 +755,7 @@ _thinkterm_commands() {
 'ssh:Establish an ssh session' \
 'serial:Open a serial port' \
 'connect:Connect to ThinkTerm multiplexer' \
+'tui:Open the ThinkTerm terminal interface' \
 'ls-fonts:Display information about fonts' \
 'show-keys:Show key assignments' \
 'cli:Interact with experimental mux server' \
@@ -645,6 +763,7 @@ _thinkterm_commands() {
 'set-working-directory:Advise the terminal of the current working directory by emitting an OSC 7 escape sequence' \
 'record:Record a terminal session as an asciicast' \
 'replay:Replay an asciicast terminal session' \
+'update:Check for a newer release and install it' \
 'shell-completion:Generate shell completion information' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -677,6 +796,7 @@ _thinkterm__cli_commands() {
 'set-window-title:Change the title of a window' \
 'rename-workspace:Rename a workspace' \
 'zoom-pane:Zoom, unzoom, or toggle zoom state' \
+'agent:Query agent statuses' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thinkterm cli commands' commands "$@"
@@ -700,6 +820,37 @@ _thinkterm__cli__activate-tab_commands() {
 _thinkterm__cli__adjust-pane-size_commands() {
     local commands; commands=()
     _describe -t commands 'thinkterm cli adjust-pane-size commands' commands "$@"
+}
+(( $+functions[_thinkterm__cli__agent_commands] )) ||
+_thinkterm__cli__agent_commands() {
+    local commands; commands=(
+'list:List panes running detected coding agents' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thinkterm cli agent commands' commands "$@"
+}
+(( $+functions[_thinkterm__cli__agent__help_commands] )) ||
+_thinkterm__cli__agent__help_commands() {
+    local commands; commands=(
+'list:List panes running detected coding agents' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'thinkterm cli agent help commands' commands "$@"
+}
+(( $+functions[_thinkterm__cli__agent__help__help_commands] )) ||
+_thinkterm__cli__agent__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm cli agent help help commands' commands "$@"
+}
+(( $+functions[_thinkterm__cli__agent__help__list_commands] )) ||
+_thinkterm__cli__agent__help__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm cli agent help list commands' commands "$@"
+}
+(( $+functions[_thinkterm__cli__agent__list_commands] )) ||
+_thinkterm__cli__agent__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm cli agent list commands' commands "$@"
 }
 (( $+functions[_thinkterm__cli__get-pane-direction_commands] )) ||
 _thinkterm__cli__get-pane-direction_commands() {
@@ -733,6 +884,7 @@ _thinkterm__cli__help_commands() {
 'set-window-title:Change the title of a window' \
 'rename-workspace:Rename a workspace' \
 'zoom-pane:Zoom, unzoom, or toggle zoom state' \
+'agent:Query agent statuses' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'thinkterm cli help commands' commands "$@"
@@ -756,6 +908,18 @@ _thinkterm__cli__help__activate-tab_commands() {
 _thinkterm__cli__help__adjust-pane-size_commands() {
     local commands; commands=()
     _describe -t commands 'thinkterm cli help adjust-pane-size commands' commands "$@"
+}
+(( $+functions[_thinkterm__cli__help__agent_commands] )) ||
+_thinkterm__cli__help__agent_commands() {
+    local commands; commands=(
+'list:List panes running detected coding agents' \
+    )
+    _describe -t commands 'thinkterm cli help agent commands' commands "$@"
+}
+(( $+functions[_thinkterm__cli__help__agent__list_commands] )) ||
+_thinkterm__cli__help__agent__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm cli help agent list commands' commands "$@"
 }
 (( $+functions[_thinkterm__cli__help__get-pane-direction_commands] )) ||
 _thinkterm__cli__help__get-pane-direction_commands() {
@@ -915,6 +1079,7 @@ _thinkterm__help_commands() {
 'ssh:Establish an ssh session' \
 'serial:Open a serial port' \
 'connect:Connect to ThinkTerm multiplexer' \
+'tui:Open the ThinkTerm terminal interface' \
 'ls-fonts:Display information about fonts' \
 'show-keys:Show key assignments' \
 'cli:Interact with experimental mux server' \
@@ -922,6 +1087,7 @@ _thinkterm__help_commands() {
 'set-working-directory:Advise the terminal of the current working directory by emitting an OSC 7 escape sequence' \
 'record:Record a terminal session as an asciicast' \
 'replay:Replay an asciicast terminal session' \
+'update:Check for a newer release and install it' \
 'shell-completion:Generate shell completion information' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -954,6 +1120,7 @@ _thinkterm__help__cli_commands() {
 'set-window-title:Change the title of a window' \
 'rename-workspace:Rename a workspace' \
 'zoom-pane:Zoom, unzoom, or toggle zoom state' \
+'agent:Query agent statuses' \
     )
     _describe -t commands 'thinkterm help cli commands' commands "$@"
 }
@@ -976,6 +1143,18 @@ _thinkterm__help__cli__activate-tab_commands() {
 _thinkterm__help__cli__adjust-pane-size_commands() {
     local commands; commands=()
     _describe -t commands 'thinkterm help cli adjust-pane-size commands' commands "$@"
+}
+(( $+functions[_thinkterm__help__cli__agent_commands] )) ||
+_thinkterm__help__cli__agent_commands() {
+    local commands; commands=(
+'list:List panes running detected coding agents' \
+    )
+    _describe -t commands 'thinkterm help cli agent commands' commands "$@"
+}
+(( $+functions[_thinkterm__help__cli__agent__list_commands] )) ||
+_thinkterm__help__cli__agent__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm help cli agent list commands' commands "$@"
 }
 (( $+functions[_thinkterm__help__cli__get-pane-direction_commands] )) ||
 _thinkterm__help__cli__get-pane-direction_commands() {
@@ -1112,6 +1291,16 @@ _thinkterm__help__start_commands() {
     local commands; commands=()
     _describe -t commands 'thinkterm help start commands' commands "$@"
 }
+(( $+functions[_thinkterm__help__tui_commands] )) ||
+_thinkterm__help__tui_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm help tui commands' commands "$@"
+}
+(( $+functions[_thinkterm__help__update_commands] )) ||
+_thinkterm__help__update_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm help update commands' commands "$@"
+}
 (( $+functions[_thinkterm__imgcat_commands] )) ||
 _thinkterm__imgcat_commands() {
     local commands; commands=()
@@ -1161,6 +1350,16 @@ _thinkterm__ssh_commands() {
 _thinkterm__start_commands() {
     local commands; commands=()
     _describe -t commands 'thinkterm start commands' commands "$@"
+}
+(( $+functions[_thinkterm__tui_commands] )) ||
+_thinkterm__tui_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm tui commands' commands "$@"
+}
+(( $+functions[_thinkterm__update_commands] )) ||
+_thinkterm__update_commands() {
+    local commands; commands=()
+    _describe -t commands 'thinkterm update commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_thinkterm" ]; then

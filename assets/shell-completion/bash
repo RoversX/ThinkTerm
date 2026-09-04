@@ -58,6 +58,12 @@ _thinkterm() {
             thinkterm,start)
                 cmd="thinkterm__start"
                 ;;
+            thinkterm,tui)
+                cmd="thinkterm__tui"
+                ;;
+            thinkterm,update)
+                cmd="thinkterm__update"
+                ;;
             thinkterm__cli,activate-pane)
                 cmd="thinkterm__cli__activate__pane"
                 ;;
@@ -69,6 +75,9 @@ _thinkterm() {
                 ;;
             thinkterm__cli,adjust-pane-size)
                 cmd="thinkterm__cli__adjust__pane__size"
+                ;;
+            thinkterm__cli,agent)
+                cmd="thinkterm__cli__agent"
                 ;;
             thinkterm__cli,get-pane-direction)
                 cmd="thinkterm__cli__get__pane__direction"
@@ -118,6 +127,18 @@ _thinkterm() {
             thinkterm__cli,zoom-pane)
                 cmd="thinkterm__cli__zoom__pane"
                 ;;
+            thinkterm__cli__agent,help)
+                cmd="thinkterm__cli__agent__help"
+                ;;
+            thinkterm__cli__agent,list)
+                cmd="thinkterm__cli__agent__list"
+                ;;
+            thinkterm__cli__agent__help,help)
+                cmd="thinkterm__cli__agent__help__help"
+                ;;
+            thinkterm__cli__agent__help,list)
+                cmd="thinkterm__cli__agent__help__list"
+                ;;
             thinkterm__cli__help,activate-pane)
                 cmd="thinkterm__cli__help__activate__pane"
                 ;;
@@ -129,6 +150,9 @@ _thinkterm() {
                 ;;
             thinkterm__cli__help,adjust-pane-size)
                 cmd="thinkterm__cli__help__adjust__pane__size"
+                ;;
+            thinkterm__cli__help,agent)
+                cmd="thinkterm__cli__help__agent"
                 ;;
             thinkterm__cli__help,get-pane-direction)
                 cmd="thinkterm__cli__help__get__pane__direction"
@@ -178,6 +202,9 @@ _thinkterm() {
             thinkterm__cli__help,zoom-pane)
                 cmd="thinkterm__cli__help__zoom__pane"
                 ;;
+            thinkterm__cli__help__agent,list)
+                cmd="thinkterm__cli__help__agent__list"
+                ;;
             thinkterm__help,blocking-start)
                 cmd="thinkterm__help__blocking__start"
                 ;;
@@ -220,6 +247,12 @@ _thinkterm() {
             thinkterm__help,start)
                 cmd="thinkterm__help__start"
                 ;;
+            thinkterm__help,tui)
+                cmd="thinkterm__help__tui"
+                ;;
+            thinkterm__help,update)
+                cmd="thinkterm__help__update"
+                ;;
             thinkterm__help__cli,activate-pane)
                 cmd="thinkterm__help__cli__activate__pane"
                 ;;
@@ -231,6 +264,9 @@ _thinkterm() {
                 ;;
             thinkterm__help__cli,adjust-pane-size)
                 cmd="thinkterm__help__cli__adjust__pane__size"
+                ;;
+            thinkterm__help__cli,agent)
+                cmd="thinkterm__help__cli__agent"
                 ;;
             thinkterm__help__cli,get-pane-direction)
                 cmd="thinkterm__help__cli__get__pane__direction"
@@ -277,6 +313,9 @@ _thinkterm() {
             thinkterm__help__cli,zoom-pane)
                 cmd="thinkterm__help__cli__zoom__pane"
                 ;;
+            thinkterm__help__cli__agent,list)
+                cmd="thinkterm__help__cli__agent__list"
+                ;;
             *)
                 ;;
         esac
@@ -284,7 +323,7 @@ _thinkterm() {
 
     case "${cmd}" in
         thinkterm)
-            opts="-n -h -V --skip-config --config-file --config --help --version start blocking-start ssh serial connect ls-fonts show-keys cli imgcat set-working-directory record replay shell-completion help"
+            opts="-n -h -V --skip-config --config-file --config --help --version start blocking-start ssh serial connect tui ls-fonts show-keys cli imgcat set-working-directory record replay update shell-completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -354,7 +393,7 @@ _thinkterm() {
             return 0
             ;;
         thinkterm__cli)
-            opts="-h --no-auto-start --prefer-mux --class --help list list-clients proxy tlscreds move-pane-to-new-tab split-pane spawn send-text get-text activate-pane-direction get-pane-direction kill-pane activate-pane adjust-pane-size activate-tab set-tab-title set-window-title rename-workspace zoom-pane help"
+            opts="-h --no-auto-start --prefer-mux --class --help list list-clients proxy tlscreds move-pane-to-new-tab split-pane spawn send-text get-text activate-pane-direction get-pane-direction kill-pane activate-pane adjust-pane-size activate-tab set-tab-title set-window-title rename-workspace zoom-pane agent help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -459,6 +498,80 @@ _thinkterm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        thinkterm__cli__agent)
+            opts="-h --help list help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__cli__agent__help)
+            opts="list help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__cli__agent__help__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__cli__agent__help__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__cli__agent__list)
+            opts="-h --format --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         thinkterm__cli__get__pane__direction)
             opts="-h --pane-id --help Up Down Left Right Next Prev"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -504,7 +617,7 @@ _thinkterm() {
             return 0
             ;;
         thinkterm__cli__help)
-            opts="list list-clients proxy tlscreds move-pane-to-new-tab split-pane spawn send-text get-text activate-pane-direction get-pane-direction kill-pane activate-pane adjust-pane-size activate-tab set-tab-title set-window-title rename-workspace zoom-pane help"
+            opts="list list-clients proxy tlscreds move-pane-to-new-tab split-pane spawn send-text get-text activate-pane-direction get-pane-direction kill-pane activate-pane adjust-pane-size activate-tab set-tab-title set-window-title rename-workspace zoom-pane agent help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -562,6 +675,34 @@ _thinkterm() {
         thinkterm__cli__help__adjust__pane__size)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__cli__help__agent)
+            opts="list"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__cli__help__agent__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1108,7 +1249,7 @@ _thinkterm() {
             return 0
             ;;
         thinkterm__help)
-            opts="start blocking-start ssh serial connect ls-fonts show-keys cli imgcat set-working-directory record replay shell-completion help"
+            opts="start blocking-start ssh serial connect tui ls-fonts show-keys cli imgcat set-working-directory record replay update shell-completion help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1136,7 +1277,7 @@ _thinkterm() {
             return 0
             ;;
         thinkterm__help__cli)
-            opts="list list-clients proxy tlscreds move-pane-to-new-tab split-pane spawn send-text get-text activate-pane-direction get-pane-direction kill-pane activate-pane adjust-pane-size activate-tab set-tab-title set-window-title rename-workspace zoom-pane"
+            opts="list list-clients proxy tlscreds move-pane-to-new-tab split-pane spawn send-text get-text activate-pane-direction get-pane-direction kill-pane activate-pane adjust-pane-size activate-tab set-tab-title set-window-title rename-workspace zoom-pane agent"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1194,6 +1335,34 @@ _thinkterm() {
         thinkterm__help__cli__adjust__pane__size)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__help__cli__agent)
+            opts="list"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__help__cli__agent__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1583,6 +1752,34 @@ _thinkterm() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        thinkterm__help__tui)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__help__update)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         thinkterm__imgcat)
             opts="-h --width --height --no-preserve-aspect-ratio --position --no-move-cursor --hold --tmux-passthru --max-pixels --no-resample --resample-format --resample-filter --resize --show-resample-timing --help [FILE_NAME]"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -1824,6 +2021,46 @@ _thinkterm() {
                     return 0
                     ;;
                 --domain)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__tui)
+            opts="-h --class --prefer-mux --tui-config --help [DOMAIN]..."
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --class)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --tui-config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        thinkterm__update)
+            opts="-y -h --check --yes --version --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --version)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

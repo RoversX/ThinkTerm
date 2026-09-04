@@ -9,6 +9,7 @@ members = [
   "thinkterm-core",
   "thinkterm-proto",
   "thinkterm-tui",
+  "thinkterm-update",
   "deps/cairo",
   "wezterm",
   "wezterm-blob-leases",
@@ -76,6 +77,7 @@ colorgrad = "0.6"
 config = { path = "config" }
 thinkterm-core = { path = "thinkterm-core" }
 thinkterm-proto = { path = "thinkterm-proto" }
+thinkterm-update = { path = "thinkterm-update" }
 core-foundation = "=0.10.0"
 core-graphics = "=0.24.0"
 core-text = "=21.0.0"

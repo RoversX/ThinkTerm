@@ -253,6 +253,9 @@ enum SubCommand {
     #[command(name = "replay", about = "Replay an asciicast terminal session")]
     Replay(asciicast::PlayCommand),
 
+    #[command(name = "update", about = "Check for a newer release and install it")]
+    Update(UpdateCommand),
+
     /// Generate shell completion information
     #[command(name = "shell-completion")]
     ShellCompletion {
@@ -750,6 +753,136 @@ impl ImgCatCommand {
     }
 }
 
+/// `thinkterm update`: the one-command upgrade for a copy that install.sh
+/// put here. Anything else (a deb, Homebrew, an AppImage, a build from
+/// source) has its own updater, and the command names it instead of
+/// touching files it does not own.
+#[derive(Debug, Parser, Clone)]
+struct UpdateCommand {
+    /// Only report whether a newer release exists; install nothing.
+    #[arg(long)]
+    check: bool,
+
+    /// Install without asking for confirmation.
+    #[arg(long, short = 'y')]
+    yes: bool,
+
+    /// Install this release instead of the latest one (a downgrade is
+    /// allowed).
+    #[arg(long, value_name = "VERSION")]
+    version: Option<String>,
+}
+
+impl UpdateCommand {
+    fn run(&self) -> anyhow::Result<()> {
+        use thinkterm_update::{InstallMethod, INSTALL_SCRIPT_URL};
+
+        let current = thinkterm_update::running_release_version();
+        let method = InstallMethod::detect();
+
+        let target = match &self.version {
+            Some(tag) => thinkterm_update::get_release_by_tag(tag.trim_start_matches('v'))
+                .or_else(|_| thinkterm_update::get_release_by_tag(tag))
+                .with_context(|| format!("release {tag} not found"))?,
+            None => thinkterm_update::get_latest_release_info()
+                .context("looking up the latest release on GitHub")?,
+        };
+        let target_version = target.tag_name.trim_start_matches('v').to_string();
+
+        println!("running:  {current}");
+        if self.version.is_some() {
+            println!("target:   {target_version}");
+        } else {
+            println!("latest:   {target_version}");
+        }
+        println!("install:  {}", method.how_to_update());
+
+        let newer = thinkterm_update::is_newer_release(&target.tag_name, &current);
+        if self.version.is_none() && !newer {
+            if thinkterm_update::is_release_version(&current) {
+                println!("You are on the latest release.");
+            } else {
+                println!(
+                    "This is not a release build, so there is nothing to compare it against; \
+                     {} is the latest release.",
+                    target_version
+                );
+            }
+            return Ok(());
+        }
+        if self.check {
+            if newer {
+                println!("A newer release is available: {}", target.html_url);
+            } else {
+                println!("Release page: {}", target.html_url);
+            }
+            return Ok(());
+        }
+
+        if matches!(method, InstallMethod::WindowsInstaller) || (cfg!(windows) && matches!(method, InstallMethod::Unknown)) {
+            if !self.yes {
+                print!("Download the {target_version} installer and run it? It will close ThinkTerm and reopen it. [y/N] ");
+                std::io::stdout().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    println!("Not installing.");
+                    return Ok(());
+                }
+            }
+            thinkterm_update::run_windows_installer(&target)?;
+            println!("The installer is running; it finishes on its own.");
+            return Ok(());
+        }
+
+        let Some(manifest) = method.manifest_for_install() else {
+            println!();
+            println!("Not installing: {}.", method.how_to_update());
+            println!("Release page: {}", target.html_url);
+            if cfg!(unix) {
+                println!(
+                    "To switch this machine to script-managed installs instead, run:\n  \
+                     curl -fsSL {INSTALL_SCRIPT_URL} | sh"
+                );
+            }
+            return Ok(());
+        };
+
+        if !self.yes {
+            match &method {
+                InstallMethod::MacAppBundle(app) => print!(
+                    "Replace {} with {} and link its command-line tools under {}/bin? [y/N] ",
+                    app.display(),
+                    target_version,
+                    manifest.prefix
+                ),
+                _ => print!(
+                    "Install {} ({} variant, under {})? [y/N] ",
+                    target_version, manifest.variant, manifest.prefix
+                ),
+            }
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                println!("Not installing.");
+                return Ok(());
+            }
+        }
+
+        if let Err(err) = thinkterm_update::run_local_installer(&manifest, &target.tag_name) {
+            println!();
+            println!("The installer failed ({err:#}); nothing was changed.");
+            println!("If it refused this machine (glibc, musl, architecture), a release binary cannot run here.");
+            println!("{}", thinkterm_update::build_from_source_instructions(&target_version));
+            anyhow::bail!("update failed");
+        }
+        println!();
+        println!("Installed {target_version}. A running thinkterm-mux-server or GUI keeps the old build until it is restarted.");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Parser, Clone)]
 struct SetCwdCommand {
     /// The directory to specify.
@@ -894,6 +1027,7 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Cli(cli) => cli::run_cli(&opts, cli),
         SubCommand::Record(cmd) => cmd.run(init_config(&opts)?),
         SubCommand::Replay(cmd) => cmd.run(),
+        SubCommand::Update(cmd) => cmd.run(),
         SubCommand::Tui(cmd) => thinkterm_tui::run(
             init_config(&opts)?,
             thinkterm_tui::TuiOptions {

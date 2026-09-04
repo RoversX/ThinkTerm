@@ -6514,6 +6514,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "hex",
+ "http_req",
+ "log",
+ "plist",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7708,6 +7725,7 @@ dependencies = [
  "textwrap",
  "thinkterm-proto",
  "thinkterm-tui",
+ "thinkterm-update",
  "umask",
  "url",
  "wezterm-client",
@@ -7818,6 +7836,7 @@ dependencies = [
  "termwiz 0.24.0",
  "textwrap",
  "thinkterm-proto",
+ "thinkterm-update",
  "thiserror 1.0.69",
  "umask",
  "url",
@@ -8005,7 +8024,6 @@ dependencies = [
  "frecency",
  "futures",
  "hdrhistogram",
- "http_req",
  "ignore",
  "image",
  "k9",
@@ -8025,7 +8043,6 @@ dependencies = [
  "percent-encoding",
  "phf",
  "phf_codegen 0.10.0",
- "plist",
  "portable-pty",
  "promise",
  "pulldown-cmark",
@@ -8051,6 +8068,7 @@ dependencies = [
  "thinkterm-core",
  "thinkterm-proto",
  "thinkterm-syntax",
+ "thinkterm-update",
  "thiserror 1.0.69",
  "tiny-skia",
  "trash",

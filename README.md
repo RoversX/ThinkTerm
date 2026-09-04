@@ -71,6 +71,8 @@ curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh |
 
 It asks whether you want the desktop build or the server build (CLI + TUI + mux server, no GUI and, on Linux, no graphics libraries); `sh -s -- --server` or `--desktop` skips the question. Linux gets a tarball unpacked under `~/.local` and needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, RHEL 10); macOS gets the signed `ThinkTerm.app` plus command-line links in `~/.local/bin`. Downloads are verified against the digest GitHub recorded for them. The mux server runs as your user; on Linux, `loginctl enable-linger $USER` keeps it alive after you log out.
 
+`thinkterm update` upgrades an install the script made; for a deb, rpm, AppImage, Homebrew or source build it names the right way to update instead. When the desktop connects to a remote host whose mux server runs an incompatible version, it offers to install its own version there over the same SSH connection, and then to restart the server (which ends the sessions it holds).
+
 ---
 
 ## Agents can talk to each other
@@ -114,6 +116,7 @@ thinkterm connect <name>     Connect to a ThinkTerm multiplexer
 thinkterm ssh / serial       SSH session / serial port
 thinkterm cli <subcommand>   Interact with the mux server
 thinkterm imgcat <file>      Print an image to the terminal
+thinkterm update             Check for a newer release and install it
 ```
 
 Run `thinkterm --help` for the full list.
