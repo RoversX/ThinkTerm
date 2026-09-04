@@ -3,7 +3,6 @@ use async_ossl::AsyncSslStream;
 use config::TlsDomainServer;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslStream, SslVerifyMode};
 use openssl::x509::X509;
-use promise::spawn::spawn_into_main_thread;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
@@ -82,18 +81,16 @@ impl OpenSSLNetListener {
                                 log::error!("problem with peer cert: {}", err);
                                 break;
                             }
-                            spawn_into_main_thread(async move {
-                                log::error!("Making new AsyncSslStream");
-                                wezterm_mux_server_impl::dispatch::process(AsyncSslStream::new(
-                                    stream,
-                                ))
+                            wezterm_mux_server_impl::connections::spawn(async move {
+                                log::debug!("Making new AsyncSslStream");
+                                if let Err(err) = wezterm_mux_server_impl::dispatch::process(
+                                    AsyncSslStream::new(stream),
+                                )
                                 .await
-                                .map_err(|e| {
-                                    log::error!("process: {:?}", e);
-                                    e
-                                })
-                            })
-                            .detach();
+                                {
+                                    log::error!("process: {err:?}");
+                                }
+                            });
                         }
                         Err(e) => {
                             log::error!("failed TlsAcceptor: {}", e);

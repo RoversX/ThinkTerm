@@ -5,6 +5,7 @@ use mux::Mux;
 use std::sync::Arc;
 use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 
+pub mod connections;
 pub mod dispatch;
 pub mod local;
 pub mod pki;

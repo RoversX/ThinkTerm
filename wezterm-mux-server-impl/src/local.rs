@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Context as _};
 use config::{create_user_owned_dirs, UnixDomain};
-use promise::spawn::spawn_into_main_thread;
 use wezterm_uds::UnixListener;
 
 pub struct LocalListener {
@@ -21,13 +20,11 @@ impl LocalListener {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    spawn_into_main_thread(async move {
-                        crate::dispatch::process(stream).await.map_err(|e| {
-                            log::error!("{:#}", e);
-                            e
-                        })
-                    })
-                    .detach();
+                    crate::connections::spawn(async move {
+                        if let Err(err) = crate::dispatch::process(stream).await {
+                            log::error!("{err:#}");
+                        }
+                    });
                 }
                 Err(err) => {
                     log::error!("accept failed: {}", err);

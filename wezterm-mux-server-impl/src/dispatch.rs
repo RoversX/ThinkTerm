@@ -109,6 +109,10 @@ impl Liveness {
     }
 }
 
+/// One client connection, from accept to close. Runs on the connection
+/// threads (see `connections`), never on the main thread: everything
+/// here that changes the mux hops there explicitly, and everything that
+/// does not is answered whatever the main thread is doing.
 pub async fn process<T>(stream: T) -> anyhow::Result<()>
 where
     T: 'static,
