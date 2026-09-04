@@ -29,7 +29,7 @@ optdepends=(
   'python-nautilus: ThinkTerm context menu in Nautilus'
 )
 source=(
-  "wezterm::https://github.com/RoversX/thinkterm/releases/download/${_tag}/ThinkTerm-${_tag}-Ubuntu20.04.AppImage"
+  "wezterm::https://github.com/RoversX/thinkterm/releases/download/${_tag}/ThinkTerm-${_tag}-Ubuntu22.04-x86_64.AppImage"
 )
 sha256sums=(
   '@SHA256@'
