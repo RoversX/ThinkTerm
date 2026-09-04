@@ -536,6 +536,43 @@ impl SessionHandler {
         }
     }
 
+    /// Tell a client that has just registered where the frontend lease
+    /// stands: the access mode and every tab's ownership.
+    ///
+    /// The server otherwise pushes this state only when it changes, and a
+    /// renderer will not publish its own viewport until it knows whether
+    /// the tab is spoken for. A renderer reattaching to a tab that it, or
+    /// its predecessor, used to drive therefore waited for a push that was
+    /// never going to come, and sat behind "Restoring terminal state".
+    /// Queued behind the registration's acknowledgement on the same
+    /// channel, so it arrives after it.
+    fn push_frontend_state(&self) {
+        let mux = Mux::get();
+        let mut pdus = vec![Pdu::FrontendAccessState(codec_access_state(
+            mux.frontend_access_state(),
+        ))];
+        let tab_ids: Vec<TabId> = mux
+            .iter_windows()
+            .into_iter()
+            .filter_map(|window_id| mux.get_window(window_id))
+            .flat_map(|window| window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>())
+            .collect();
+        for tab_id in tab_ids {
+            if let Some(state) = mux.frontend_viewport_state(tab_id) {
+                pdus.push(Pdu::ClientViewportState(codec_viewport_state(state)));
+            }
+        }
+        for pdu in pdus {
+            if self
+                .to_write_tx
+                .send(DecodedPdu { serial: 0, pdu })
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
     pub(crate) fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
         Arc::clone(
             self.per_pane
@@ -659,7 +696,10 @@ impl SessionHandler {
                     self.client_id.replace(client_id);
                     self.client_registration.replace(registration);
                 }
-                send_response(Ok(Pdu::UnitResponse(UnitResponse {})))
+                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
+                if !is_proxy {
+                    self.push_frontend_state();
+                }
             }
             Pdu::SetFocusedPane(SetFocusedPane {
                 pane_id,
@@ -2189,6 +2229,42 @@ mod tests {
         assert_eq!(
             workspace_for_moved_pane(&mux, None, None, None),
             Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn a_registering_client_is_told_where_the_lease_stands() {
+        use super::{PduSender, SessionHandler};
+        use codec::{DecodedPdu, SetClientId};
+        use std::sync::Mutex;
+
+        // The registration path consults the process-wide mux, and parts of
+        // it schedule follow-up work; a scheduler that merely queues it is
+        // enough here.
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let _executor = promise::spawn::SimpleExecutor::new();
+
+        let sent: Arc<Mutex<Vec<DecodedPdu>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        let mut handler = SessionHandler::new(PduSender::new(move |pdu| {
+            sink.lock().unwrap().push(pdu);
+            Ok(())
+        }));
+        handler.process_one(DecodedPdu {
+            serial: 7,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: mux::client::generate_client_id(),
+                is_proxy: false,
+            }),
+        });
+
+        let sent = sent.lock().unwrap();
+        let names: Vec<(u64, &str)> = sent.iter().map(|d| (d.serial, d.pdu.pdu_name())).collect();
+        assert_eq!(
+            names,
+            vec![(7, "UnitResponse"), (0, "FrontendAccessState")],
+            "the acknowledgement first, then the state; no tabs, so no viewports"
         );
     }
 

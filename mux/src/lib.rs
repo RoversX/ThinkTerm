@@ -1038,6 +1038,29 @@ impl Mux {
         Self::access_state_locked(&self.frontend_lease.lock())
     }
 
+    /// The lease state of `tab_id` as it stands, for a client that has just
+    /// arrived and heard none of the changes that led here. Nothing is
+    /// bumped or published. A tab no renderer has ever claimed reports no
+    /// owner and no view, which is itself an answer: it tells a renderer it
+    /// is free to drive.
+    pub fn frontend_viewport_state(&self, tab_id: TabId) -> Option<FrontendViewportState> {
+        let tab = self.get_tab(tab_id)?;
+        let lease = self.frontend_lease.lock();
+        let access = Self::access_state_locked(&lease);
+        let (owner, view, generation) = match lease.tabs.get(&tab_id) {
+            Some(state) => (state.owner.clone(), state.view.clone(), state.generation),
+            None => (None, None, 0),
+        };
+        Some(FrontendViewportState {
+            tab_id,
+            owner,
+            canonical_size: tab.get_size(),
+            view,
+            generation,
+            access,
+        })
+    }
+
     /// Install the mode loaded by the mux-server persistence layer. This is
     /// intentionally one-shot so a configuration reload cannot overwrite a
     /// mode selected while this server process is running.

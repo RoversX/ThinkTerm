@@ -765,6 +765,11 @@ fn process_unilateral(
     Ok(())
 }
 
+/// Whether the server answering the handshake is the process asking.
+fn leads_back_to_this_process(own_server_id: Option<&str>, server_id: &str) -> bool {
+    own_server_id.is_some_and(|own| own == server_id)
+}
+
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 enum NotReconnectableError {
     #[error("Client was destroyed")]
@@ -2015,6 +2020,20 @@ impl Client {
                     info.version_string,
                     info.codec_vers
                 );
+                // A domain whose socket leads back to this very process. A
+                // config shared between a mux server and its clients lists
+                // the unix domain the server serves, and the server holds a
+                // client domain for it too. Attaching it would mirror every
+                // window this mux has as a new window in the same mux, which
+                // the mirror then mirrors again, without end.
+                let own_id = mux::Mux::try_get().map(|mux| mux.runtime_server_id().to_string());
+                if leads_back_to_this_process(own_id.as_deref(), &info.server_id) {
+                    anyhow::bail!(
+                        "refusing to attach: this connection leads back to this very process \
+                         (server id {})",
+                        info.server_id
+                    );
+                }
                 if let Some(mismatch) =
                     describe_server_build_mismatch(config::wezterm_version(), &info.version_string)
                 {
@@ -2459,5 +2478,15 @@ mod handshake_classification_tests {
         let msg = VersionHandshakeStalled { timeout_secs: 60 }.to_string();
         assert!(msg.contains("transient"), "{msg}");
         assert!(msg.contains("NOT a version mismatch"), "{msg}");
+    }
+
+    #[test]
+    fn a_server_with_our_own_id_is_never_attached() {
+        assert!(super::leads_back_to_this_process(Some("abc"), "abc"));
+        assert!(!super::leads_back_to_this_process(Some("abc"), "def"));
+        assert!(
+            !super::leads_back_to_this_process(None, "abc"),
+            "a process without a mux of its own cannot be the server"
+        );
     }
 }
