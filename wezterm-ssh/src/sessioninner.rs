@@ -28,6 +28,11 @@ pub(crate) struct DescriptorState {
     pub buf: VecDeque<u8>,
 }
 
+/// What one channel stream can hold on its way to or from the pipe. Each
+/// loop iteration moves at most this much per stream, so it bounds the
+/// throughput of a busy channel; 8 KiB made a mux client's output crawl.
+const CHANNEL_BUFFER: usize = 64 * 1024;
+
 pub(crate) struct ChannelInfo {
     pub channel_id: ChannelId,
     pub channel: ChannelWrap,
@@ -491,6 +496,28 @@ impl SessionInner {
                 return Ok(());
             }
 
+            // Reading from the session only pays off when every open stream
+            // has room for what may come: the packet waiting on the socket
+            // belongs to some stream, and libssh does not say which before
+            // it is read. With a full stream (the reader on the other side
+            // of its pipe is busy), a readable session socket woke poll at
+            // once, nothing could be done, and the loop was taken for a busy
+            // loop and sent to sleep for 50 milliseconds: one buffer per
+            // nap, a few hundred kilobytes a second, for as long as the
+            // reader lagged. Waiting on the pipe instead lets the next
+            // iteration run the moment it drains.
+            let every_stream_has_room = self.channels.values().all(|info| {
+                info.descriptors
+                    .iter()
+                    .skip(1)
+                    .filter(|state| state.fd.is_some())
+                    .all(|state| state.buf.len() < state.buf.capacity())
+            });
+            let session_events = if every_stream_has_room {
+                sess.get_poll_flags()
+            } else {
+                sess.get_poll_flags() & !POLLIN
+            };
             let mut poll_array = vec![
                 pollfd {
                     fd: self.sender_read.as_socket_descriptor(),
@@ -499,7 +526,7 @@ impl SessionInner {
                 },
                 pollfd {
                     fd: sess.as_socket_descriptor(),
-                    events: sess.get_poll_flags(),
+                    events: session_events,
                     revents: 0,
                 },
             ];
@@ -990,15 +1017,15 @@ impl SessionInner {
                 descriptors: [
                     DescriptorState {
                         fd: Some(read_from_agent),
-                        buf: VecDeque::with_capacity(8192),
+                        buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                     },
                     DescriptorState {
                         fd: Some(write_to_agent),
-                        buf: VecDeque::with_capacity(8192),
+                        buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                     },
                     DescriptorState {
                         fd: None,
-                        buf: VecDeque::with_capacity(8192),
+                        buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                     },
                 ],
             };
@@ -1089,15 +1116,15 @@ impl SessionInner {
             descriptors: [
                 DescriptorState {
                     fd: Some(read_from_stdin),
-                    buf: VecDeque::with_capacity(8192),
+                    buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                 },
                 DescriptorState {
                     fd: Some(write_to_stdout),
-                    buf: VecDeque::with_capacity(8192),
+                    buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                 },
                 DescriptorState {
                     fd: Some(write_to_stderr),
-                    buf: VecDeque::with_capacity(8192),
+                    buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                 },
             ],
         };
