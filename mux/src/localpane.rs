@@ -361,6 +361,12 @@ impl Pane for LocalPane {
         self.terminal.lock().current_seqno()
     }
 
+    fn render_state_is_contended(&self) -> bool {
+        // The parser thread holds this for the whole of a batch of output;
+        // a probe that fails is the batch still being applied.
+        self.terminal.try_lock().is_none()
+    }
+
     fn get_changed_since(
         &self,
         lines: Range<StableRowIndex>,

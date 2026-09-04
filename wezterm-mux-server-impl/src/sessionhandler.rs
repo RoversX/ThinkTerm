@@ -17,7 +17,7 @@ use mux::{
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use termwiz::surface::SequenceNo;
 use url::Url;
 
@@ -81,9 +81,23 @@ pub(crate) struct PerPane {
     /// Images already sent for this pane, so a fetch can be answered even
     /// after the cell they were attached to has moved on.
     sent_images: crate::sent_images::SentImages,
+    /// A push task exists for this pane and has not yet read the pane.
+    push_scheduled: bool,
 }
 
 impl PerPane {
+    /// Claim the one push slot; false when a push is already on its way,
+    /// which will carry whatever the caller wanted sent.
+    fn claim_push(&mut self) -> bool {
+        !std::mem::replace(&mut self.push_scheduled, true)
+    }
+
+    /// Give the slot back. Done just before the pane is read, so output
+    /// that lands during the read schedules the next push.
+    fn release_push(&mut self) {
+        self.push_scheduled = false;
+    }
+
     fn needs_application_palette(&self, palette: &Option<ColorPalette>) -> bool {
         self.last_sent_application_palette.as_ref() != Some(palette)
     }
@@ -198,6 +212,49 @@ impl PerPane {
             input_serial: force_with_input_serial,
             seqno: self.seqno,
         })
+    }
+}
+
+/// How long a push waits for a busy pane before looking again: short at
+/// first, since a batch of ordinary output is applied in well under a
+/// millisecond, backing off so a pane stuck for seconds is not polled at
+/// full tilt.
+const PUSH_RETRY_MIN: Duration = Duration::from_millis(2);
+const PUSH_RETRY_MAX: Duration = Duration::from_millis(50);
+
+/// Push `pane_id`'s changes to this connection once its render state can
+/// be read without waiting.
+///
+/// Every connection's I/O and every push runs on the one main thread,
+/// while each pane's parser holds the pane's terminal lock for as long as
+/// a batch of output takes to apply. Reading here while a pane was busy
+/// with, say, a very large image stalled every other client's handshake,
+/// ping and output until that batch was done -- with a runaway pane, for
+/// good. So the lock is probed first, and a busy pane's push is put off
+/// for as long as it takes: that pane's own output is what waits, nobody
+/// else's.
+async fn push_pane_changes_when_free(
+    pane_id: PaneId,
+    sender: PduSender,
+    per_pane: Arc<Mutex<PerPane>>,
+) -> anyhow::Result<()> {
+    let mut delay = PUSH_RETRY_MIN;
+    loop {
+        let Some(pane) = Mux::get().get_pane(pane_id) else {
+            per_pane.lock().unwrap().release_push();
+            anyhow::bail!("no such pane {pane_id}");
+        };
+        if pane.render_state_is_contended() {
+            metrics::counter!("mux_server.push.deferred").increment(1);
+            smol::Timer::after(delay).await;
+            delay = (delay * 2).min(PUSH_RETRY_MAX);
+            continue;
+        }
+        per_pane.lock().unwrap().release_push();
+        let started = Instant::now();
+        let pushed = maybe_push_pane_changes(&pane, sender, per_pane);
+        metrics::histogram!("mux_server.push.latency").record(started.elapsed());
+        return pushed;
     }
 }
 
@@ -490,15 +547,13 @@ impl SessionHandler {
     pub fn schedule_pane_push(&mut self, pane_id: PaneId) {
         let sender = self.to_write_tx.clone();
         let per_pane = self.per_pane(pane_id);
-        spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            let pane = mux
-                .get_pane(pane_id)
-                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-            maybe_push_pane_changes(&pane, sender, per_pane)?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+        // One push on its way per pane. A burst of output notifications
+        // used to queue a task each, and all but the first found nothing
+        // new to send.
+        if !per_pane.lock().unwrap().claim_push() {
+            return;
+        }
+        spawn_into_main_thread(push_pane_changes_when_free(pane_id, sender, per_pane)).detach();
     }
 
     pub fn process_one(&mut self, decoded: DecodedPdu) {
@@ -2130,6 +2185,21 @@ mod tests {
         assert_eq!(
             workspace_for_moved_pane(&mux, None, None, None),
             Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn only_one_push_is_scheduled_per_pane_at_a_time() {
+        let mut state = PerPane::default();
+        assert!(state.claim_push(), "nothing on its way: schedule one");
+        assert!(
+            !state.claim_push(),
+            "already on its way: it will carry this too"
+        );
+        state.release_push();
+        assert!(
+            state.claim_push(),
+            "released: the next notification schedules again"
         );
     }
 

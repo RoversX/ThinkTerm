@@ -13,6 +13,7 @@ use wezterm_gui_subcommands::*;
 use wezterm_mux_server_impl::update_mux_domains_for_server;
 
 mod daemonize;
+mod stats;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -235,6 +236,8 @@ fn run() -> anyhow::Result<()> {
     Mux::set_mux(&mux);
 
     install_shutdown_signal_handler()?;
+
+    stats::init_from_env()?;
 
     let executor = promise::spawn::SimpleExecutor::new();
 

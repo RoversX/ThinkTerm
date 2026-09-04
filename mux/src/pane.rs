@@ -286,6 +286,15 @@ pub trait Pane: Downcast + Send + Sync {
         KeyboardEncoding::Xterm
     }
 
+    /// Would reading render state (lines, cursor, dimensions) have to wait
+    /// for this pane's parser right now? A mux server asks before it reads
+    /// on behalf of a client, so its one thread is never stuck behind a
+    /// pane digesting a huge frame. A pane with nothing to wait for says
+    /// no.
+    fn render_state_is_contended(&self) -> bool {
+        false
+    }
+
     fn copy_user_vars(&self) -> HashMap<String, String> {
         HashMap::new()
     }
