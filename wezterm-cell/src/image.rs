@@ -200,7 +200,7 @@ impl ImageCell {
 pub enum ImageDataType {
     /// Data is in the native image file format
     /// (best for file formats that have animated content)
-    EncodedFile(Vec<u8>),
+    EncodedFile(#[cfg_attr(feature = "use_serde", serde(with = "serde_bytes"))] Vec<u8>),
     /// Data is in the native image file format,
     /// (best for file formats that have animated content)
     /// and is stored as a blob via the blob manager.
@@ -214,6 +214,11 @@ pub enum ImageDataType {
     ),
     /// Data is RGBA u8 data
     Rgba8 {
+        // Pixels travel as one byte string, not as a sequence of u8: serde
+        // would otherwise visit every byte of a multi-megabyte frame one
+        // at a time on both ends. The wire bytes are the same either way
+        // (a length, then the bytes), so nothing about the format changes.
+        #[cfg_attr(feature = "use_serde", serde(with = "serde_bytes"))]
         data: Vec<u8>,
         width: u32,
         height: u32,
@@ -224,9 +229,30 @@ pub enum ImageDataType {
         width: u32,
         height: u32,
         durations: Vec<Duration>,
+        #[cfg_attr(feature = "use_serde", serde(with = "frames_as_bytes"))]
         frames: Vec<Vec<u8>>,
         hashes: Vec<[u8; 32]>,
     },
+}
+
+/// Each animation frame as a byte string; see `Rgba8::data`.
+#[cfg(feature = "use_serde")]
+mod frames_as_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(frames: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(frames.iter().map(|frame| serde_bytes::Bytes::new(frame)))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Vec<u8>>, D::Error> {
+        let frames: Vec<serde_bytes::ByteBuf> = Deserialize::deserialize(deserializer)?;
+        Ok(frames
+            .into_iter()
+            .map(serde_bytes::ByteBuf::into_vec)
+            .collect())
+    }
 }
 
 impl std::fmt::Debug for ImageDataType {

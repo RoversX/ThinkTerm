@@ -1466,7 +1466,13 @@ async fn drain_render_deltas(local_pane_id: PaneId) {
         // A push with a newer one already behind it is applied without
         // asking for pictures: the newer push names the current ones, and
         // rows whose pictures are missing keep showing the previous frame.
+        let started = std::time::Instant::now();
         pane.apply_render_delta(delta, !newer_waiting).await;
+        log::debug!(
+            "render push for pane {local_pane_id} applied in {:?} (fetched pictures: {})",
+            started.elapsed(),
+            !newer_waiting
+        );
     }
 }
 

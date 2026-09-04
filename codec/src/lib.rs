@@ -315,13 +315,18 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
         if uncompressed.len() <= COMPRESS_THRESH {
             return Ok((uncompressed, false));
         }
-        // It's a little heavy; let's try compressing it
-        let mut compressed = Vec::new();
-        let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-        let mut encode = varbincode::Serializer::new(&mut compress);
-        t.serialize(&mut encode)?;
-        drop(encode);
-        compress.finish()?;
+        // Compress the bytes already produced rather than serializing a
+        // second time into the encoder, as this used to: for a
+        // multi-megabyte image that second pass was the larger cost. A
+        // large payload takes the fastest level; the pixels of a frame
+        // compress about as well at level 1 as at 3 and in a fraction of
+        // the time, which for a program streaming frames is the budget.
+        let level = if uncompressed.len() > LARGE_PAYLOAD {
+            1
+        } else {
+            zstd::DEFAULT_COMPRESSION_LEVEL
+        };
+        let compressed = zstd::bulk::compress(&uncompressed, level)?;
 
         log::debug!(
             "serialized+compress len {} vs {}",
@@ -336,6 +341,10 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
         }
     }
 }
+
+/// Payloads beyond this size are compressed at the fastest zstd level.
+#[cfg(not(target_family = "wasm"))]
+const LARGE_PAYLOAD: usize = 1024 * 1024;
 
 fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     mut r: R,
@@ -2550,5 +2559,62 @@ mod keyboard_encoding_tests {
             back,
             KeyboardEncoding::Kitty(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
+    }
+}
+
+#[cfg(test)]
+mod image_payload_tests {
+    use super::*;
+    use termwiz::image::ImageDataType;
+
+    fn varbincode_bytes<T: serde::Serialize>(t: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut ser = varbincode::Serializer::new(&mut buf);
+        t.serialize(&mut ser).unwrap();
+        buf
+    }
+
+    /// Pixels now travel as byte strings. varbincode writes a byte string
+    /// as a length and the bytes, and a sequence of u8 as a length and one
+    /// byte per element: the same bytes, so the wire format did not move.
+    #[test]
+    fn a_byte_string_is_encoded_exactly_like_a_sequence_of_bytes() {
+        let pixels: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
+        assert_eq!(
+            varbincode_bytes(&serde_bytes::ByteBuf::from(pixels.clone())),
+            varbincode_bytes(&pixels)
+        );
+        let frames = vec![pixels.clone(), vec![7u8; 10]];
+        let as_bytes: Vec<serde_bytes::ByteBuf> = frames
+            .iter()
+            .cloned()
+            .map(serde_bytes::ByteBuf::from)
+            .collect();
+        assert_eq!(varbincode_bytes(&as_bytes), varbincode_bytes(&frames));
+    }
+
+    #[test]
+    fn an_image_response_survives_the_wire() {
+        let still = ImageDataType::new_single_frame(4, 2, vec![9u8; 32]);
+        let anim = ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![std::time::Duration::from_millis(40); 2],
+            frames: vec![vec![1u8; 4], vec![2u8; 4]],
+            hashes: vec![[1u8; 32], [2u8; 32]],
+        };
+        for data in [still, anim] {
+            let pdu = Pdu::GetImageCellResponse(GetImageCellResponse {
+                pane_id: 3,
+                data: Some(Arc::new(ImageData::with_data(data))),
+                data_generation: 5,
+                frames_from: 0,
+            });
+            let mut wire = Vec::new();
+            pdu.encode(&mut wire, 9).unwrap();
+            let back = Pdu::decode(wire.as_slice()).unwrap();
+            assert_eq!(back.serial, 9);
+            assert_eq!(back.pdu, pdu);
+        }
     }
 }

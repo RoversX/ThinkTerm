@@ -1351,7 +1351,21 @@ async fn fetch_image(
         have_frames: 0,
         ..request
     };
+    let asked_at = Instant::now();
     let mut response = client.client.get_image_cell(request).await;
+    if log::log_enabled!(log::Level::Debug) {
+        let bytes = match &response {
+            Ok(GetImageCellResponse {
+                data: Some(data), ..
+            }) => data.len(),
+            _ => 0,
+        };
+        log::debug!(
+            "image fetch for pane {} took {:?} ({bytes} bytes)",
+            whole.pane_id,
+            asked_at.elapsed()
+        );
+    }
     let mut asked_for_whole = false;
     loop {
         match response {
