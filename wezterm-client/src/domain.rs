@@ -1904,7 +1904,7 @@ impl ClientDomain {
         self.inner()?.client.remote_os_release()
     }
 
-    fn inner(&self) -> Option<Arc<ClientInner>> {
+    pub(crate) fn inner(&self) -> Option<Arc<ClientInner>> {
         self.inner.lock().unwrap().as_ref().map(Arc::clone)
     }
 
@@ -5021,26 +5021,67 @@ impl ClientDomain {
         ui.async_run_and_log_error({
             let ui = ui.clone();
             async move {
-                let mut cloned_ui = ui.clone();
-                let client = spawn_into_new_thread(move || match &config {
-                    ClientDomainConfig::Unix(unix) => {
-                        let initial = true;
-                        let no_auto_start = false;
-                        Client::new_unix_domain(
-                            Some(domain_id),
-                            unix,
-                            initial,
-                            &mut cloned_ui,
-                            no_auto_start,
-                        )
-                    }
-                    ClientDomainConfig::Tls(tls) => Client::new_tls(domain_id, tls, &mut cloned_ui),
-                    ClientDomainConfig::Ssh(ssh) => Client::new_ssh(domain_id, ssh, &mut cloned_ui),
-                })
-                .await?;
+                let connect = |config: ClientDomainConfig, ui: ConnectionUI| {
+                    spawn_into_new_thread(move || {
+                        let mut cloned_ui = ui;
+                        match &config {
+                            ClientDomainConfig::Unix(unix) => {
+                                let initial = true;
+                                let no_auto_start = false;
+                                Client::new_unix_domain(
+                                    Some(domain_id),
+                                    unix,
+                                    initial,
+                                    &mut cloned_ui,
+                                    no_auto_start,
+                                )
+                            }
+                            ClientDomainConfig::Tls(tls) => {
+                                Client::new_tls(domain_id, tls, &mut cloned_ui)
+                            }
+                            ClientDomainConfig::Ssh(ssh) => {
+                                Client::new_ssh(domain_id, ssh, &mut cloned_ui)
+                            }
+                        }
+                    })
+                };
+                let mut client = connect(config.clone(), ui.clone()).await?;
 
                 ui.output_str("Checking server version\n");
-                client.verify_version_compat(&ui).await?;
+                if let Err(err) = client.verify_version_compat(&ui).await {
+                    // A codec mismatch over ssh is the one connect failure
+                    // this side can repair: the installer runs over the same
+                    // hop, at this client's version. Anything else, and a
+                    // declined offer, keeps the original error.
+                    let mismatch = err.downcast_ref::<crate::client::IncompatibleVersionError>();
+                    let (ClientDomainConfig::Ssh(ssh), Some(mismatch)) = (&config, mismatch)
+                    else {
+                        return Err(err);
+                    };
+                    let outcome = {
+                        let ssh = ssh.clone();
+                        let ui = ui.clone();
+                        let mismatch = mismatch.clone();
+                        spawn_into_new_thread(move || {
+                            crate::remote_update::offer_remote_update(&ssh, &ui, &mismatch)
+                        })
+                        .await
+                    };
+                    match outcome {
+                        Ok(crate::remote_update::RemoteUpdateOutcome::Updated {
+                            restarted: true,
+                        }) => {
+                            ui.output_str("Reconnecting to the updated server\n");
+                            client = connect(config.clone(), ui.clone()).await?;
+                            client.verify_version_compat(&ui).await?;
+                        }
+                        Ok(_) => return Err(err),
+                        Err(update_err) => {
+                            ui.output_str(&format!("Remote update failed: {update_err:#}\n"));
+                            return Err(err);
+                        }
+                    }
+                }
 
                 ui.output_str("Version check OK!  Requesting pane list...\n");
                 let panes = client.list_panes().await?;

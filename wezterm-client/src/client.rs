@@ -1243,13 +1243,19 @@ impl Reconnectable {
     /// This string is passed directly to SSH exec, so avoid shell-specific
     /// fallback logic here; users can set remote_wezterm_path or
     /// override_proxy_command when their remote binary has another name.
+    ///
+    /// `~/.local/bin` is tried first: it is where install.sh (and the remote
+    /// update that runs it) puts the binary, and a non-interactive ssh shell
+    /// does not source the startup files that would add it to PATH. A copy
+    /// the person installed there for their own user is also the more
+    /// deliberate choice over a system-wide one.
     fn remote_mux_command(path: &Option<String>, args: &str) -> String {
         match path {
             Some(path) => format!("{path} {args}"),
-            // The command runs via the remote user's shell: prefer a
-            // thinkterm binary, fall back to a wezterm one.
             None => format!(
-                "if command -v thinkterm >/dev/null 2>&1; \
+                "if [ -x \"$HOME/.local/bin/thinkterm\" ]; \
+                 then exec \"$HOME/.local/bin/thinkterm\" {args}; \
+                 elif command -v thinkterm >/dev/null 2>&1; \
                  then exec thinkterm {args}; else exec wezterm {args}; fi"
             ),
         }
@@ -1626,6 +1632,7 @@ impl Client {
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
         let client_id = mux::client::generate_client_id();
+        let reader_client_id = client_id.clone();
         let connection_phase = Arc::new(AtomicU8::new(ClientConnectionPhase::Registering as u8));
         let reader_connection_phase = Arc::clone(&connection_phase);
         let (resume_reconnect_tx, resume_reconnect_rx) = channel::<()>();
@@ -1905,7 +1912,7 @@ impl Client {
                 ui.close();
             }
 
-            async fn detach(local_domain_id: DomainId) -> anyhow::Result<()> {
+            async fn detach(local_domain_id: DomainId, client_id: ClientId) -> anyhow::Result<()> {
                 if let Some(mux) = Mux::try_get() {
                     let client_domain = mux
                         .get_domain(local_domain_id)
@@ -1916,13 +1923,30 @@ impl Client {
                             .ok_or_else(|| {
                                 anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
                             })?;
-                    client_domain.perform_detach();
+                    // A client that was replaced while it was still alive --
+                    // the attach path does that after updating a remote
+                    // server -- must not tear down the domain its successor
+                    // now owns.
+                    let owned = client_domain
+                        .inner()
+                        .map(|inner| inner.client.client_id == client_id)
+                        .unwrap_or(true);
+                    if owned {
+                        client_domain.perform_detach();
+                    } else {
+                        log::info!(
+                            "domain {} is now attached through another client; \
+                             the superseded client leaves it alone",
+                            local_domain_id
+                        );
+                    }
                 }
                 Ok(())
             }
             if let Some(domain_id) = local_domain_id {
+                let client_id = reader_client_id;
                 promise::spawn::spawn_into_main_thread(async move {
-                    detach(domain_id).await.ok();
+                    detach(domain_id, client_id).await.ok();
                 })
                 .detach();
             }
