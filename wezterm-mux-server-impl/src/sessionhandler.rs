@@ -77,6 +77,9 @@ pub(crate) struct PerPane {
     last_sent_application_palette: Option<Option<ColorPalette>>,
     seqno: SequenceNo,
     pub(crate) notifications: Vec<Alert>,
+    /// Images already sent for this pane, so a fetch can be answered even
+    /// after the cell they were attached to has moved on.
+    sent_images: crate::sent_images::SentImages,
 }
 
 impl PerPane {
@@ -172,6 +175,7 @@ impl PerPane {
         self.mouse_grabbed = mouse_grabbed;
         self.alt_screen = alt_screen;
 
+        self.sent_images.remember(&bonus_lines);
         let bonus_lines = bonus_lines.into();
         Some(GetPaneRenderChangesResponse {
             pane_id: pane.pane_id(),
@@ -691,8 +695,7 @@ impl SessionHandler {
                             // One pass over the window/tab topology:
                             // resolve_pane_id per agent pane would rescan
                             // every tab per entry.
-                            let mut workspace_by_pane =
-                                std::collections::HashMap::new();
+                            let mut workspace_by_pane = std::collections::HashMap::new();
                             for window_id in mux.iter_windows() {
                                 let Some(window) = mux.get_window(window_id) else {
                                     continue;
@@ -700,8 +703,7 @@ impl SessionHandler {
                                 let workspace = window.get_workspace().to_string();
                                 for tab in window.iter() {
                                     for pane in tab.iter_all_panes() {
-                                        workspace_by_pane
-                                            .insert(pane.pane_id(), workspace.clone());
+                                        workspace_by_pane.insert(pane.pane_id(), workspace.clone());
                                     }
                                 }
                             }
@@ -1469,6 +1471,7 @@ impl SessionHandler {
             }
 
             Pdu::GetLines(GetLines { pane_id, lines }) => {
+                let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
@@ -1486,6 +1489,11 @@ impl SessionHandler {
                                     lines_and_indices.push((stable_row, line));
                                 }
                             }
+                            per_pane
+                                .lock()
+                                .unwrap()
+                                .sent_images
+                                .remember(&lines_and_indices);
                             Ok(Pdu::GetLinesResponse(GetLinesResponse {
                                 pane_id,
                                 lines: lines_and_indices.into(),
@@ -1503,27 +1511,39 @@ impl SessionHandler {
                 cell_idx,
                 data_hash,
             }) => {
+                let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             let mux = Mux::get();
-                            let mut data = None;
+                            // What was sent is answered from memory: the
+                            // cell named here may have moved on since.
+                            let mut data = per_pane.lock().unwrap().sent_images.get(&data_hash);
 
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            if data.is_none() {
+                                let pane = mux
+                                    .get_pane(pane_id)
+                                    .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
 
-                            let (_, lines) = pane.get_lines(line_idx..line_idx + 1);
-                            'found_data: for line in lines {
-                                if let Some(cell) = line.get_cell(cell_idx) {
-                                    if let Some(images) = cell.attrs().images() {
-                                        for im in images {
-                                            if im.image_data().hash() == data_hash {
-                                                data.replace(im.image_data().clone());
-                                                break 'found_data;
+                                let (_, lines) = pane.get_lines(line_idx..line_idx + 1);
+                                'found_data: for line in lines {
+                                    if let Some(cell) = line.get_cell(cell_idx) {
+                                        if let Some(images) = cell.attrs().images() {
+                                            for im in images {
+                                                if im.image_data().hash() == data_hash {
+                                                    data.replace(im.image_data().clone());
+                                                    break 'found_data;
+                                                }
                                             }
                                         }
                                     }
+                                }
+                                if let Some(found) = &data {
+                                    per_pane
+                                        .lock()
+                                        .unwrap()
+                                        .sent_images
+                                        .insert(Arc::clone(found));
                                 }
                             }
                             Ok(Pdu::GetImageCellResponse(GetImageCellResponse {
@@ -1553,13 +1573,11 @@ impl SessionHandler {
                 }
             }
 
-            Pdu::GetServerOsRelease(_) => {
-                send_response(Ok(Pdu::GetServerOsReleaseResponse(
-                    GetServerOsReleaseResponse {
-                        os_release_id: local_os_release_id().clone(),
-                    },
-                )))
-            }
+            Pdu::GetServerOsRelease(_) => send_response(Ok(Pdu::GetServerOsReleaseResponse(
+                GetServerOsReleaseResponse {
+                    os_release_id: local_os_release_id().clone(),
+                },
+            ))),
 
             Pdu::GetTlsCreds(_) => {
                 catch(

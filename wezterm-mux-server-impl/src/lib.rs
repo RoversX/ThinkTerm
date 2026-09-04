@@ -8,6 +8,7 @@ use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 pub mod dispatch;
 pub mod local;
 pub mod pki;
+mod sent_images;
 pub mod sessionhandler;
 pub mod thinkterm_access;
 pub mod thinkterm_layout;
