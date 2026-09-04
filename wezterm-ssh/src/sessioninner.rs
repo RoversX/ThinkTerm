@@ -477,10 +477,18 @@ impl SessionInner {
         let initial_sleep_delay = Duration::from_millis(100);
         let max_sleep_delay = Duration::from_secs(2);
         let immediate_wakeup = Duration::from_millis(10);
-        let busy_loop_throttle = Duration::from_millis(50);
+        // Every event that could wake poll without there being anything to
+        // do is masked above; what remains is the odd spurious wakeup, and
+        // a long nap for one of those is throughput thrown away.
+        let busy_loop_throttle = Duration::from_millis(5);
         let busy_loop_warn_every = Duration::from_secs(30);
         let mut busy_loop_started: Option<Instant> = None;
         let mut busy_loop_last_warn: Option<Instant> = None;
+        // Immediate wakeups in a row that moved nothing. One is ordinary:
+        // libssh reports its socket readable while it holds half a packet,
+        // and the read that completes the packet hands over no bytes yet.
+        // Napping on every such turn cost a busy channel most of its time.
+        let mut idle_wakes: u32 = 0;
 
         loop {
             self.do_keepalive(sess)?;
@@ -538,7 +546,16 @@ impl SessionInner {
                         poll_array.push(pollfd {
                             fd: fd.as_socket_descriptor(),
                             events: if fd_num == 0 {
-                                POLLIN
+                                // Only while there is room to read into:
+                                // with the stdin buffer full (libssh is
+                                // not taking writes yet), a readable pipe
+                                // woke poll at once for nothing, and the
+                                // loop took itself for a busy loop.
+                                if state.buf.len() < state.buf.capacity() {
+                                    POLLIN
+                                } else {
+                                    0
+                                }
                             } else if !state.buf.is_empty() || info.exited {
                                 POLLOUT
                             } else {
@@ -617,6 +634,9 @@ impl SessionInner {
             if made_progress || !saw_revents || poll_elapsed >= immediate_wakeup {
                 busy_loop_started = None;
                 busy_loop_last_warn = None;
+                idle_wakes = 0;
+            } else if idle_wakes < 3 {
+                idle_wakes += 1;
             } else {
                 // Repeated immediate wakeups with no IO progress. The
                 // throttle below already caps this at ~20 iterations/sec,

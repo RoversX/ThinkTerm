@@ -449,14 +449,28 @@ macro_rules! pdu {
                       R: AsyncRead,
                       R: std::fmt::Debug
             {
+                let started = std::time::Instant::now();
                 let decoded = decode_raw_async(r, max_serial).await.context("decoding a PDU")?;
+                let read_took = started.elapsed();
                 match decoded.ident {
                     $(
                         $vers => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
+                            let deserialize_started = std::time::Instant::now();
+                            let pdu = Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?);
+                            if decoded.data.len() > 64 * 1024 {
+                                log::debug!(
+                                    "decode {} serial {}: {} bytes read in {:?}, deserialized in {:?}",
+                                    stringify!($name),
+                                    decoded.serial,
+                                    decoded.data.len(),
+                                    read_took,
+                                    deserialize_started.elapsed()
+                                );
+                            }
                             Ok(DecodedPdu {
                                 serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?)
+                                pdu,
                             })
                         }
                     ,)*
